@@ -21,7 +21,7 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+opentelemetry-otlp = { version = "0.31", features = ["tonic"] }
 
 # Metrics
 metrics = "0.24"
