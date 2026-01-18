@@ -15,7 +15,7 @@ workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-constant_time_eq = "0.3"
+constant_time_eq = "0.4"
 fcp-core = { path = "../fcp-core" }
 fcp-crypto = { path = "../fcp-crypto" }
 fcp-protocol = { path = "../fcp-protocol" }
