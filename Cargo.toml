@@ -108,7 +108,7 @@ raptorq = "2.0"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # WebSocket
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 
 # Streams
 tokio-stream = "0.1"
