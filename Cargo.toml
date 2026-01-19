@@ -89,7 +89,7 @@ hpke = "0.12"
 coset = "0.3"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
-rand = "0.8"
+rand = "0.9"
 rand_core = "0.6"
 
 # Identifiers

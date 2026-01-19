@@ -36,4 +36,4 @@ zeroize = { version = "1.8", features = ["derive"] }
 ciborium.workspace = true
 semver.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-rand = "0.8"
+rand = "0.9"
