@@ -118,7 +118,7 @@ tokio-stream = "0.1"
 # Testing
 wiremock = "0.6"
 pretty_assertions = "1.4"
-jsonschema = "0.29"
+jsonschema = "0.40"
 
 # Supply-chain hardening
 tough = { version = "0.21.0", features = ["http"] }
