@@ -65,5 +65,5 @@ windows = { version = "0.61", features = ["Win32_System_Time"] }
 # Testing
 tokio-test = "0.4"
 pretty_assertions.workspace = true
-rand_chacha = "0.3"
+rand_chacha = "0.9"
 tempfile = "3.15"
