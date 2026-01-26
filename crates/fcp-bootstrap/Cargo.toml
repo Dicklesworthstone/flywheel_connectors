@@ -59,7 +59,7 @@ rsntp = "4.1"
 
 [target.'cfg(windows)'.dependencies]
 # Windows time APIs
-windows = { version = "0.61", features = ["Win32_System_Time"] }
+windows = { version = "0.62", features = ["Win32_System_Time"] }
 
 [dev-dependencies]
 # Testing
