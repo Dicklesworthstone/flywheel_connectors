@@ -36,7 +36,7 @@ tracing = "0.1"
 semver = { version = "1", features = ["serde"] }
 
 # HTTP server (doctor endpoint)
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.8", features = ["json"] }
 
 [dev-dependencies]
 fcp-conformance = { path = "../fcp-conformance" }
