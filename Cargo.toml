@@ -142,7 +142,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Supply-chain hardening
 tough = { version = "0.21.0", features = ["http"] }
 sigstore = { version = "0.13.0", default-features = false, features = ["cosign", "verify", "rekor", "sigstore-trust-root", "rustls-tls"] }
-sigstore-trust-root = { version = "0.4.0", features = ["tuf"] }
+sigstore-trust-root = { version = "0.6.1", features = ["tuf"] }
 url = "2.5"
 
 # Internal crates
