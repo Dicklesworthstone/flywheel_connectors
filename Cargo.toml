@@ -134,7 +134,7 @@ pretty_assertions = "1.4"
 jsonschema = "0.29"
 regex = "1.11"
 proptest = "1.6"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

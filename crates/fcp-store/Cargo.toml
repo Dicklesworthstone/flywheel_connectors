@@ -34,7 +34,7 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 rand.workspace = true
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 fcp-testkit = { path = "../fcp-testkit", default-features = false }
 
 [[bench]]
