@@ -102,11 +102,11 @@ rand = "0.8"
 rand_core = "0.6"
 
 # Identifiers
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Bytes
-bytes = "1.9"
+bytes = "1.11"
 hex = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 bitflags = "2.6"
@@ -132,8 +132,8 @@ tokio-stream = "0.1"
 wiremock = "0.6"
 pretty_assertions = "1.4"
 jsonschema = "0.29"
-regex = "1.11"
-proptest = "1.6"
+regex = "1.12"
+proptest = "1.10"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # CLI

@@ -48,7 +48,7 @@ ed25519-dalek.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.0"
-insta = { version = "1.40", features = ["json", "redactions"] }
+insta = { version = "1.46", features = ["json", "redactions"] }
 predicates = "3.1"
 tempfile = "3.14"
 fcp-testkit = { path = "../fcp-testkit" }
