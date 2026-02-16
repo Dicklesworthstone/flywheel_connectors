@@ -21,7 +21,7 @@ ipnet = "2.9"
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml = "0.8"
+toml = "1.0"
 thiserror.workspace = true
 
 [dev-dependencies]
