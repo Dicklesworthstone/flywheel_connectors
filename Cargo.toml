@@ -139,7 +139,7 @@ raptorq = "2.0"
 
 # WASI runtime
 wasmtime = { version = "41.0", features = ["component-model"] }
-wasmtime-wasi = "41.0"
+wasmtime-wasi = "42.0"
 
 # HTTP client
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
