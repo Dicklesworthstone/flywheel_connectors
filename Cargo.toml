@@ -153,7 +153,7 @@ tokio-stream = "0.1"
 # Testing
 wiremock = "0.6"
 pretty_assertions = "1.4"
-jsonschema = "0.42"
+jsonschema = "0.44"
 regex = "1.12"
 proptest = "1.10"
 criterion = { version = "0.8", features = ["html_reports"] }
