@@ -42,7 +42,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-asupersync = { version = "0.3.1", default-features = false, features = ["tls", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", default-features = false, features = ["tls", "tls-native-roots"] }
 ciborium.workspace = true
 fcp-crypto = { workspace = true }
 toml.workspace = true

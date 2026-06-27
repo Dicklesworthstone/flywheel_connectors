@@ -12,7 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-asupersync = { version = "0.3.2", default-features = false, features = ["test-internals", "tracing-integration", "tls", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", default-features = false, features = ["test-internals", "tracing-integration", "tls", "tls-native-roots"] }
 fcp-async-core-macros = { path = "../fcp-async-core-macros" }
 futures-util.workspace = true
 hyper = "1.8.1"

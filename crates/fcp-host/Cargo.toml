@@ -38,7 +38,7 @@ fcp-telemetry.workspace = true
 # Async runtime
 async-trait = "0.1"
 futures-util = { workspace = true }
-asupersync = { version = "0.3.1" }
+asupersync = { version = "=0.3.4" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

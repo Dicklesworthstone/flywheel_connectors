@@ -45,7 +45,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-asupersync = { version = "0.3.1", default-features = false, features = ["tls", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", default-features = false, features = ["tls", "tls-native-roots"] }
 ciborium.workspace = true
 base64.workspace = true
 wiremock.workspace = true

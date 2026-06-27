@@ -25,7 +25,7 @@ fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-sdk = { path = "../../crates/fcp-sdk" }
 fcp-streaming = { path = "../../crates/fcp-streaming" }
-asupersync = { version = "0.3.1", default-features = false, features = ["tls", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", default-features = false, features = ["tls", "tls-native-roots"] }
 
 anyhow.workspace = true
 async-trait.workspace = true

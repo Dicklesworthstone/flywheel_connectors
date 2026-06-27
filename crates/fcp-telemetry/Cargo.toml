@@ -24,7 +24,7 @@ otlp = [
 fcp-core = { path = "../fcp-core" }
 fcp-prelude = { path = "../fcp-prelude" }
 fcp-async-core = { path = "../fcp-async-core" }
-asupersync = { version = "0.3.1", default-features = false }
+asupersync = { version = "=0.3.4", default-features = false }
 
 # Tracing
 tracing.workspace = true
