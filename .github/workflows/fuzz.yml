@@ -53,7 +53,7 @@ jobs:
           - session_transcript
           - zone_key_manifest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Skip if specific target requested
         if: inputs.target != 'all' && inputs.target != matrix.target
@@ -70,7 +70,7 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Download corpus (if cached)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_number }}
@@ -114,7 +114,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: steps.check.outputs.crashes == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crashes-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
@@ -122,14 +122,14 @@ jobs:
 
       - name: Upload fuzz log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-log-${{ matrix.target }}
           path: fuzz-${{ matrix.target }}.log
           retention-days: 7
 
       - name: Save corpus
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         if: always()
         with:
           path: fuzz/corpus/${{ matrix.target }}
@@ -145,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all logs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: fuzz-log-*
           path: logs
