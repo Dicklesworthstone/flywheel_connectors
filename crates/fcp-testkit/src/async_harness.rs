@@ -200,16 +200,10 @@ mod tests {
         assert_eq!(result, Ok("done"));
     }
 
-    // asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms. This test
-    // verifies SEMANTICS (a timeout shorter than the work returns Timeout). With
-    // the original 25ms timeout vs 200ms sleep, both deadlines collapse into one
-    // poll tick and the inner future is polled first, so `run_with_timeout`
-    // wrongly returns Ok. Retimed so the two deadlines differ by >600ms and both
-    // clear the floor: 300ms timeout vs 2s work. Original was 25ms vs 200ms.
     #[fcp_async_core::runtime::test]
     async fn run_with_timeout_times_out() {
-        let result = run_with_timeout(Duration::from_millis(300), async {
-            time::sleep(Duration::from_secs(2)).await;
+        let result = run_with_timeout(Duration::from_millis(25), async {
+            time::sleep(Duration::from_millis(200)).await;
             42_u8
         })
         .await;

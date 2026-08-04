@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -591,8 +592,13 @@ impl FcpConnector for FireworksConnector {
 }
 
 fn operations_info() -> Vec<OperationInfo> {
-    fireworks_operations_info()
-        .expect("embedded Fireworks manifest should validate for introspection")
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            fireworks_operations_info()
+                .expect("embedded Fireworks manifest should validate for introspection")
+        })
+        .clone()
 }
 
 fn fireworks_operations_info() -> FcpResult<Vec<OperationInfo>> {

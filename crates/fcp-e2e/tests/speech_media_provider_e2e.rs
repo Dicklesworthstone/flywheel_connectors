@@ -1205,9 +1205,12 @@ async fn accept_test_websocket(mut stream: TcpStream) -> (TestServerWebSocket, S
 }
 
 async fn send_json_frame(ws: &mut TestServerWebSocket, value: Value, context: &str) {
-    ws.send(&fcp_async_core::compatibility_cx(), ServerWsMessage::text(value.to_string()))
-        .await
-        .expect(context);
+    ws.send(
+        &fcp_async_core::compatibility_cx(),
+        ServerWsMessage::text(value.to_string()),
+    )
+    .await
+    .expect(context);
 }
 
 async fn recv_frame(
@@ -1278,7 +1281,9 @@ async fn expect_elevenlabs_audio_chunk(
 }
 
 async fn close_test_websocket(ws: &mut TestServerWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 struct EvidenceInput<'a> {

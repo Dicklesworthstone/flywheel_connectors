@@ -17,6 +17,7 @@ archetypes = [
     "streaming",
 ]
 format = "native"
+status = "proven"
 
 [connector.state]
 model = "stateless"

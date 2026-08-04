@@ -5,42 +5,36 @@
   "description": "Stable JSON output schema for `fwc connector state explain --json`.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "status",
-    "command",
-    "subcommand",
-    "schema_version",
-    "_truth_source",
-    "source",
-    "message",
-    "connector",
-    "state_root",
-    "canonical_storage",
-    "last_canonical_seq",
-    "mesh_replica_count",
-    "local_cache_path",
-    "local_cache_present",
-    "local_cache_marker_present",
-    "cache_marker",
-    "zone",
-    "live_host",
-    "evidence_handles",
-    "warnings",
-    "next_actions",
-    "availability"
+  "required": ["status", "command", "schema_version", "_truth_source"],
+  "oneOf": [
+    { "$ref": "#/$defs/offline_success" },
+    { "$ref": "#/$defs/host_success" },
+    { "$ref": "#/$defs/connector_resolution_error" },
+    { "$ref": "#/$defs/truth_source_unavailable" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
   ],
   "properties": {
-    "status": { "const": "ok" },
-    "command": { "const": "connector" },
-    "subcommand": { "const": "state explain" },
-    "schema_version": { "const": "1.0.0" },
-    "_truth_source": {
+    "status": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": ["ok", "error"]
     },
-    "source": { "const": "local-cache-markers" },
+    "command": {
+      "type": "string",
+      "enum": ["connector", "connector state explain"]
+    },
+    "subcommand": { "const": "state explain" },
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0.0", "fcp.fwc.truth-source.v1"]
+    },
+    "_truth_source": { "$ref": "#/$defs/truth_source" },
+    "source": {
+      "type": "string",
+      "enum": ["local-cache-markers", "host-admin-api"]
+    },
     "message": { "$ref": "#/$defs/non_empty_string" },
     "connector": { "$ref": "#/$defs/connector" },
+    "connector_id": { "$ref": "#/$defs/non_empty_string" },
     "state_root": { "$ref": "#/$defs/state_root" },
     "canonical_storage": {
       "type": "string",
@@ -48,6 +42,18 @@
     },
     "last_canonical_seq": { "$ref": "#/$defs/nullable_non_negative_integer" },
     "mesh_replica_count": { "$ref": "#/$defs/nullable_non_negative_integer" },
+    "canonical_state": { "$ref": "#/$defs/canonical_state" },
+    "host_payload_source": {
+      "type": "string",
+      "enum": ["host-cache-markers", "host-canonical-state", "host-admin-api"]
+    },
+    "host_registry_version": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_negative_integer" },
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
     "local_cache_path": { "$ref": "#/$defs/non_empty_string" },
     "local_cache_present": { "type": "boolean" },
     "local_cache_marker_present": { "type": "boolean" },
@@ -68,9 +74,155 @@
       "minItems": 1,
       "items": { "$ref": "#/$defs/non_empty_string" }
     },
+    "telemetry": { "$ref": "#/$defs/telemetry" },
+    "error": { "$ref": "#/$defs/error" },
     "availability": { "$ref": "#/$defs/command_availability" }
   },
   "$defs": {
+    "offline_success": {
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "source",
+        "message",
+        "connector",
+        "state_root",
+        "canonical_storage",
+        "last_canonical_seq",
+        "mesh_replica_count",
+        "local_cache_path",
+        "local_cache_present",
+        "local_cache_marker_present",
+        "cache_marker",
+        "zone",
+        "live_host",
+        "evidence_handles",
+        "warnings",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "state explain" },
+        "schema_version": { "const": "1.0.0" },
+        "_truth_source": { "const": "offline" },
+        "source": { "const": "local-cache-markers" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["canonical_state"] },
+          { "required": ["host_payload_source"] },
+          { "required": ["host_registry_version"] },
+          { "required": ["telemetry"] }
+        ]
+      }
+    },
+    "host_success": {
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "source",
+        "host_payload_source",
+        "message",
+        "connector",
+        "connector_id",
+        "state_root",
+        "canonical_storage",
+        "last_canonical_seq",
+        "mesh_replica_count",
+        "canonical_state",
+        "local_cache_path",
+        "local_cache_present",
+        "local_cache_marker_present",
+        "cache_marker",
+        "zone",
+        "live_host",
+        "telemetry",
+        "warnings",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "state explain" },
+        "schema_version": { "const": "1.0.0" },
+        "_truth_source": { "const": "host" },
+        "source": { "const": "host-admin-api" }
+      }
+    },
+    "connector_resolution_error": {
+      "required": ["status", "command", "schema_version", "_truth_source", "error"],
+      "properties": {
+        "status": { "const": "error" },
+        "command": {
+          "type": "string",
+          "enum": ["connector", "connector state explain"]
+        },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": { "$ref": "#/$defs/connector_resolution_error_body" }
+      }
+    },
+    "truth_source_unavailable": {
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "state explain" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": { "$ref": "#/$defs/truth_source_unavailable_error_body" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "state explain" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "const": "unavailable" },
+        "error": { "$ref": "#/$defs/truth_resolver_internal_error_body" }
+      }
+    },
+    "truth_source": {
+      "type": "string",
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
+    },
     "non_empty_string": {
       "type": "string",
       "minLength": 1
@@ -109,8 +261,7 @@
         "slug",
         "canonical_id",
         "name",
-        "version",
-        "manifest_path"
+        "version"
       ],
       "properties": {
         "requested_selector": { "$ref": "#/$defs/non_empty_string" },
@@ -131,6 +282,7 @@
           "type": "string",
           "enum": [
             "argument",
+            "host",
             "env:FCP_CONNECTOR_STATE",
             "env:FCP_CONFIG_DIR",
             "env:HOME",
@@ -146,7 +298,11 @@
       "properties": {
         "filename": { "const": ".fcp-cache-only" },
         "path": { "$ref": "#/$defs/non_empty_string" },
-        "present": { "type": "boolean" }
+        "present": { "type": "boolean" },
+        "status": {
+          "type": "string",
+          "enum": ["present", "missing", "not-a-file", "unreadable"]
+        }
       }
     },
     "zone": {
@@ -154,9 +310,6 @@
       "additionalProperties": false,
       "required": [
         "requested",
-        "supported_by_manifest",
-        "supported_zones",
-        "local_cache_path",
         "local_cache_marker_present"
       ],
       "properties": {
@@ -167,7 +320,16 @@
           "items": { "$ref": "#/$defs/non_empty_string" }
         },
         "local_cache_path": { "$ref": "#/$defs/nullable_non_empty_string" },
-        "local_cache_marker_present": { "type": "boolean" }
+        "local_cache_marker_present": { "type": "boolean" },
+        "cache_marker_status": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": ["present", "missing", "not-a-file", "unreadable"]
+            },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "live_host": {
@@ -179,10 +341,50 @@
         "endpoint_hash": { "$ref": "#/$defs/sha256" },
         "state": {
           "type": "string",
-          "enum": ["not-requested", "not-queried", "reachable", "unavailable"]
+          "enum": ["not-requested", "not-queried", "queried", "reachable", "unavailable"]
         },
         "route_available": { "type": "boolean" },
+        "route": { "$ref": "#/$defs/non_empty_string" },
         "reason": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "canonical_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_present",
+        "connector_id",
+        "zone_id",
+        "instance_id",
+        "model",
+        "root_object_id",
+        "head_object_id",
+        "state_schema_version",
+        "status_source"
+      ],
+      "properties": {
+        "root_present": { "type": "boolean" },
+        "connector_id": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "zone_id": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "instance_id": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "model": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "root_object_id": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "head_object_id": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "state_schema_version": { "$ref": "#/$defs/nullable_non_negative_integer" },
+        "status_source": {
+          "type": "string",
+          "enum": ["fcp-store", "not-supplied"]
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cache_hit_counter", "fall_through_counter", "fall_through_event"],
+      "properties": {
+        "cache_hit_counter": { "$ref": "#/$defs/non_empty_string" },
+        "fall_through_counter": { "$ref": "#/$defs/non_empty_string" },
+        "fall_through_event": { "$ref": "#/$defs/non_empty_string" }
       }
     },
     "evidence_handle": {
@@ -217,6 +419,88 @@
           }
         }
       ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["type", "message", "recoverable"],
+      "properties": {
+        "type": { "$ref": "#/$defs/non_empty_string" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" }
+      }
+    },
+    "connector_resolution_error_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message",
+        "recoverable",
+        "selector",
+        "did_you_mean",
+        "examples",
+        "next_actions"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["connector-not-found", "ambiguous-connector"]
+        },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "const": true },
+        "selector": { "$ref": "#/$defs/non_empty_string" },
+        "did_you_mean": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "examples": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "truth_source_unavailable_error_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "required", "actual", "message", "recoverable"],
+      "properties": {
+        "type": { "const": "truth-source-unavailable" },
+        "required": {
+          "type": "string",
+          "enum": ["mesh", "mesh-or-host", "any-live"]
+        },
+        "actual": { "$ref": "#/$defs/truth_source" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "const": true }
+      }
+    },
+    "truth_resolver_internal_error_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message",
+        "recoverable",
+        "redacted_cause",
+        "log_event",
+        "correlation_id",
+        "bead_reference"
+      ],
+      "properties": {
+        "type": { "const": "truth-resolver-internal-error" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "const": false },
+        "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+        "log_event": { "const": "fcp.truth_resolver.internal_error" },
+        "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+        "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+      }
     },
     "command_availability": {
       "type": "object",

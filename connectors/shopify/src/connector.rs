@@ -117,6 +117,22 @@ impl ShopifyConfig {
                 "shop_domain must be a bare Shopify hostname like store.myshopify.com".into(),
             );
         }
+        // `shop_domain` is interpolated directly into the request host
+        // (`https://{shop_domain}/admin/...`). Beyond the separators rejected
+        // above, a `\`, `@`, `:`, or whitespace can terminate or re-anchor the
+        // authority under the WHATWG URL parser (e.g.
+        // `attacker.com\x.myshopify.com` parses to host `attacker.com`),
+        // redirecting the access-token-bearing request. Restrict to
+        // bare-hostname characters.
+        if self
+            .shop_domain
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+        {
+            return Err(
+                "shop_domain must be a bare Shopify hostname like store.myshopify.com".into(),
+            );
+        }
         if !self.shop_domain.ends_with(".myshopify.com")
             || self
                 .shop_domain
@@ -1932,7 +1948,12 @@ mod tests {
             let signing_key = Ed25519SigningKey::generate();
             c.configure(tc()).await.unwrap();
             c.handshake(handshake_req_for(&signing_key)).await.unwrap();
-            let token = signed_token(&signing_key, c.instance_id(), CAP_PRODUCTS_READ, OP_PRODUCTS_LIST);
+            let token = signed_token(
+                &signing_key,
+                c.instance_id(),
+                CAP_PRODUCTS_READ,
+                OP_PRODUCTS_LIST,
+            );
             c.simulate(simulate_req(OP_PRODUCTS_LIST, json!({}), token))
                 .await
         })
@@ -1983,7 +2004,12 @@ mod tests {
             let signing_key = Ed25519SigningKey::generate();
             c.configure(tc()).await.unwrap();
             c.handshake(handshake_req_for(&signing_key)).await.unwrap();
-            let token = signed_token(&signing_key, c.instance_id(), CAP_PRODUCTS_READ, OP_PRODUCTS_GET);
+            let token = signed_token(
+                &signing_key,
+                c.instance_id(),
+                CAP_PRODUCTS_READ,
+                OP_PRODUCTS_GET,
+            );
             c.simulate(simulate_req(OP_PRODUCTS_GET, json!({}), token))
                 .await
         })
@@ -2004,7 +2030,12 @@ mod tests {
             let signing_key = Ed25519SigningKey::generate();
             c.configure(tc()).await.unwrap();
             c.handshake(handshake_req_for(&signing_key)).await.unwrap();
-            let token = signed_token(&signing_key, c.instance_id(), CAP_PRODUCTS_READ, OP_PRODUCTS_LIST);
+            let token = signed_token(
+                &signing_key,
+                c.instance_id(),
+                CAP_PRODUCTS_READ,
+                OP_PRODUCTS_LIST,
+            );
             c.simulate(simulate_req(
                 OP_PRODUCTS_CREATE,
                 json!({"title": "New product"}),
@@ -2155,6 +2186,36 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("shpat_secret"));
+    }
+
+    #[test]
+    fn config_validate_rejects_host_injecting_shop_domain() {
+        let cfg_with = |shop_domain: &str| ShopifyConfig {
+            shop_domain: shop_domain.into(),
+            auth: ShopifyAuth::AccessToken {
+                access_token: "shpat_secret".into(),
+            },
+            api_version: "2024-01".into(),
+            retry: HttpRetryConfig::default(),
+            request_timeout_ms: 30_000,
+        };
+
+        // The `\` and `@` variants end with `.myshopify.com` and contain no `/`,
+        // so they slip past the separator + suffix checks — the character
+        // allowlist is what blocks them from re-anchoring the request host.
+        for evil in [
+            "attacker.com\\x.myshopify.com",
+            "evil.com@x.myshopify.com",
+            "x.myshopify.com:8080",
+            "x .myshopify.com",
+            "https://example.com",
+        ] {
+            assert!(
+                cfg_with(evil).validate().is_err(),
+                "shop_domain {evil:?} must be rejected"
+            );
+        }
+        assert!(cfg_with("test-store.myshopify.com").validate().is_ok());
     }
 
     #[test]

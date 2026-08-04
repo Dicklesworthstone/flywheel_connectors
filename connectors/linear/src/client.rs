@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use fcp_prelude::CredentialId;
 use fcp_prelude::log_redaction::redact_url;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode, header};
 use tracing::debug;
@@ -130,7 +132,7 @@ impl LinearClient {
     /// without any side effects.
     pub async fn health_check(&self) -> LinearResult<()> {
         let query = r"query { viewer { id } }";
-        let _data = self.execute_graphql(query, None).await?;
+        let _data = self.execute_graphql(query, None, true).await?;
         Ok(())
     }
 
@@ -191,7 +193,9 @@ impl LinearClient {
             }
         ";
 
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        // NOT replay-safe: `issueCreate` mutation — a replay files a
+        // second issue. Linear has no idempotency-key header.
+        let data = self.execute_graphql(query, Some(variables), false).await?;
         let payload: IssueCreatePayload = serde_json::from_value(data["issueCreate"].clone())?;
 
         payload.issue.ok_or(LinearError::Api {
@@ -216,7 +220,7 @@ impl LinearClient {
         ";
 
         let variables = serde_json::json!({ "id": issue_id });
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        let data = self.execute_graphql(query, Some(variables), true).await?;
 
         if data["issue"].is_null() {
             return Err(LinearError::NotFound {
@@ -267,7 +271,9 @@ impl LinearClient {
             "input": serde_json::Value::Object(input),
         });
 
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        // Replay-safe: `issueUpdate` sets named fields to named values, so
+        // applying it twice converges on the same issue.
+        let data = self.execute_graphql(query, Some(variables), true).await?;
         let payload: IssueUpdatePayload = serde_json::from_value(data["issueUpdate"].clone())?;
 
         payload.issue.ok_or(LinearError::Api {
@@ -294,7 +300,7 @@ impl LinearClient {
         ";
 
         let variables = serde_json::json!({ "query": query_text });
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        let data = self.execute_graphql(query, Some(variables), true).await?;
 
         let nodes = data["searchIssues"]["nodes"]
             .as_array()
@@ -321,7 +327,7 @@ impl LinearClient {
             }
         ";
 
-        let data = self.execute_graphql(query, None).await?;
+        let data = self.execute_graphql(query, None, true).await?;
 
         let nodes = data["teams"]["nodes"]
             .as_array()
@@ -351,7 +357,7 @@ impl LinearClient {
         ";
 
         let variables = serde_json::json!({ "teamId": team_id });
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        let data = self.execute_graphql(query, Some(variables), true).await?;
 
         if data["team"].is_null() {
             return Err(LinearError::NotFound {
@@ -396,7 +402,9 @@ impl LinearClient {
             "body": body,
         });
 
-        let data = self.execute_graphql(query, Some(variables)).await?;
+        // NOT replay-safe: `commentCreate` mutation — a replay posts a
+        // second comment on the issue.
+        let data = self.execute_graphql(query, Some(variables), false).await?;
         let payload: CommentCreatePayload = serde_json::from_value(data["commentCreate"].clone())?;
 
         payload.comment.ok_or(LinearError::Api {
@@ -417,7 +425,7 @@ impl LinearClient {
             }
         ";
 
-        let data = self.execute_graphql(query, None).await?;
+        let data = self.execute_graphql(query, None, true).await?;
 
         let nodes = data["projects"]["nodes"]
             .as_array()
@@ -434,10 +442,26 @@ impl LinearClient {
 
     // ── Internal GraphQL helpers ─────────────────────────────────
 
+    /// Execute a GraphQL document against Linear's single endpoint.
+    ///
+    /// `replay_safe` states whether repeating this document can duplicate a
+    /// side effect (br-kxd3e). It has to be supplied per call because Linear
+    /// speaks GraphQL: queries and mutations travel over the SAME `POST
+    /// /graphql` request, so the HTTP verb carries no information about
+    /// whether a replay is safe. Deciding it here rather than in the helper is
+    /// the whole point — a mutation added later cannot inherit a query's
+    /// retry behaviour by accident.
+    ///
+    /// Linear has no idempotency-key header. `issueCreate` and `commentCreate`
+    /// do accept a client-supplied UUID `id`, which would make those retries
+    /// genuinely safe rather than merely refused — recorded as a follow-up on
+    /// the bead rather than done blind, because it needs Linear's real
+    /// duplicate-id error shape to handle correctly.
     async fn execute_graphql(
         &self,
         query: &str,
         variables: Option<serde_json::Value>,
+        replay_safe: bool,
     ) -> LinearResult<serde_json::Value> {
         let request = GraphQLRequest {
             query: query.to_string(),
@@ -493,13 +517,20 @@ impl LinearClient {
                         }
 
                         if status.is_server_error() {
-                            return AttemptOutcome::Retryable {
-                                error: LinearError::Api {
+                            // br-kxd3e: a 5xx means Linear RECEIVED the
+                            // document. For a mutation that means the issue or
+                            // comment may already exist. The 429 arm above is
+                            // deliberately ahead of this one: a rate limit was
+                            // refused WITHOUT executing, so it stays retryable
+                            // for mutations too.
+                            return AttemptOutcome::retryable_if_replayable(
+                                LinearError::Api {
                                     message: format!("Server error: {status}"),
                                     status_code: Some(status.as_u16()),
                                 },
-                                retry_after: None,
-                            };
+                                None,
+                                replay_safe,
+                            );
                         }
 
                         match response.text().await {
@@ -532,22 +563,27 @@ impl LinearClient {
                                 }
                                 Err(error) => AttemptOutcome::Terminal(LinearError::Json(error)),
                             },
-                            Err(error) if error.is_timeout() || error.is_connect() => {
-                                AttemptOutcome::Retryable {
-                                    error: LinearError::Http(error),
-                                    retry_after: None,
-                                }
-                            }
-                            Err(error) => AttemptOutcome::Terminal(LinearError::Http(error)),
+                            // A body-read failure happens AFTER the request was
+                            // fully sent, so it can never be proof of
+                            // non-delivery.
+                            Err(error) => AttemptOutcome::retryable_if_replayable(
+                                LinearError::Http(error),
+                                None,
+                                replay_safe,
+                            ),
                         }
                     }
-                    Err(error) if error.is_timeout() || error.is_connect() => {
-                        AttemptOutcome::Retryable {
-                            error: LinearError::Http(error),
-                            retry_after: None,
-                        }
+                    // br-kxd3e: `is_timeout()` is the TOTAL request timeout and
+                    // fires after the body was written; only a connect-phase
+                    // failure proves Linear never saw the document.
+                    Err(error) => {
+                        let replayable = replay_safe || !transport_error_reached_service(&error);
+                        AttemptOutcome::retryable_if_replayable(
+                            LinearError::Http(error),
+                            None,
+                            replayable,
+                        )
                     }
-                    Err(error) => AttemptOutcome::Terminal(LinearError::Http(error)),
                 }
             }
         })

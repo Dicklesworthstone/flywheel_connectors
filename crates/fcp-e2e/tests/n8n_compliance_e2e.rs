@@ -430,7 +430,12 @@ async fn n8n_default_deny_compliance_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["n8n.workflows.read"],
     );
-    let token = build_token(&signing_key, "n8n.workflows.read", &["n8n.workflows.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "n8n.workflows.read",
+        &["n8n.workflows.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "n8n.workflows.activate",
         json!({ "id": "1001", "active": true }),
@@ -479,7 +484,12 @@ async fn n8n_happy_path_compliance_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["n8n.workflows.read"],
     );
-    let token = build_token(&signing_key, "n8n.workflows.read", &["n8n.workflows.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "n8n.workflows.read",
+        &["n8n.workflows.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("n8n.workflows.list", json!({}), token);
 
     let suite = ConnectorSuite {

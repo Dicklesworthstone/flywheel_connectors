@@ -1,6 +1,6 @@
 [package]
 name = "fcp-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "FCP execution kernel — canonical owner of invoke lifecycle, connector traits, and deployment state machines"
 license = "Apache-2.0"

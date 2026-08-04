@@ -5,12 +5,13 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:67cbc0f7fc72a89c2a1e69e47deb1db28db411f7907e8dbb32ef7f5d64b9a402"
+interface_hash = "blake3-256:fcp.interface.v2:d56e7c6f38dbb1fb7e3ae36c5fbd80af35a20861b4830b6ccd89a60a716e8d38"
 
 [connector]
 id = "fcp.coda"
 name = "Coda Connector"
 version = "0.1.0"
+status = "proven"
 description = "Workspace-scoped Coda REST connector for docs, pages, tables, rows, formulas, controls, and mutation tracking"
 archetypes = ["operational"]
 format = "native"
@@ -28,7 +29,16 @@ forbidden = ["z:public", "z:community"]
 
 [capabilities]
 required = ["network.dns", "network.egress", "network.tls.sni"]
-optional = []
+optional = [
+    "coda.account.read",
+    "coda.controls.read",
+    "coda.docs.read",
+    "coda.formulas.read",
+    "coda.mutations.read",
+    "coda.rows.read",
+    "coda.rows.write",
+    "coda.tables.read",
+]
 forbidden = ["system.exec", "network.listen", "system.privileged"]
 
 [provides.operations."coda.account.whoami"]

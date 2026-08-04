@@ -234,7 +234,8 @@ impl SendGridClient {
 
     /// Get a single contact by ID.
     pub async fn get_contact(&self, id: &str) -> SendGridResult<serde_json::Value> {
-        self.get(&format!("/marketing/contacts/{id}")).await
+        let safe_id = sanitize_path_segment(id, "contact_id")?;
+        self.get(&format!("/marketing/contacts/{safe_id}")).await
     }
 
     // -- Lists --
@@ -251,7 +252,8 @@ impl SendGridClient {
 
     /// Delete a marketing list.
     pub async fn delete_list(&self, list_id: &str) -> SendGridResult<serde_json::Value> {
-        self.delete(&format!("/marketing/lists/{list_id}")).await
+        let safe_id = sanitize_path_segment(list_id, "list_id")?;
+        self.delete(&format!("/marketing/lists/{safe_id}")).await
     }
 
     // -- Templates --
@@ -263,15 +265,89 @@ impl SendGridClient {
 
     /// Get a single template by ID.
     pub async fn get_template(&self, template_id: &str) -> SendGridResult<serde_json::Value> {
-        self.get(&format!("/templates/{template_id}")).await
+        let safe_id = sanitize_path_segment(template_id, "template_id")?;
+        self.get(&format!("/templates/{safe_id}")).await
     }
 
     // -- Stats --
 
-    /// Get email delivery statistics.
-    pub async fn get_stats(&self, query: &str) -> SendGridResult<serde_json::Value> {
-        self.get(&format!("/stats?{query}")).await
+    /// Get email delivery statistics for a date range.
+    ///
+    /// `start_date` is required; `end_date` is optional. Both values are
+    /// percent-encoded before being placed in the query string so that hostile
+    /// input (e.g. a `start_date` carrying `&aggregated_by=...`) cannot inject
+    /// additional query parameters.
+    pub async fn get_stats(
+        &self,
+        start_date: &str,
+        end_date: Option<&str>,
+    ) -> SendGridResult<serde_json::Value> {
+        let safe_start = encode_query_value(start_date, "start_date")?;
+        let mut path = format!("/stats?start_date={safe_start}");
+        if let Some(end_date) = end_date {
+            let safe_end = encode_query_value(end_date, "end_date")?;
+            path.push_str("&end_date=");
+            path.push_str(&safe_end);
+        }
+        self.get(&path).await
     }
+}
+
+/// Hex digits used by [`encode_query_value`] when percent-encoding a byte.
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Validate that a user-supplied ID is safe to interpolate into a URL path segment.
+///
+/// Rejects empty strings, path-traversal sequences, slashes, and their
+/// percent-encoded equivalents. `reqwest` normalizes `..` segments, so an
+/// unsanitized id could otherwise reach a sibling endpoint under the same host.
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> SendGridResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SendGridError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(SendGridError::InvalidInput(format!(
+            "{field} contains path traversal characters"
+        )));
+    }
+    Ok(trimmed)
+}
+
+/// Percent-encode a value for safe inclusion in a URL query string.
+///
+/// Rejects empty values and encodes every character outside the unreserved set
+/// (`A-Z a-z 0-9 - _ . ~`), including `%`, so a value cannot alter the URL's
+/// query structure or smuggle additional parameters.
+fn encode_query_value(value: &str, field: &str) -> SendGridResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SendGridError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let mut encoded = String::with_capacity(trimmed.len() * 2);
+    for byte in trimmed.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX_UPPER[(byte >> 4) as usize] as char);
+                encoded.push(HEX_UPPER[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -410,5 +486,53 @@ mod tests {
         let cred = SendGridAuth::CredentialId(CredentialId::new());
         let dbg = format!("{cred:?}");
         assert!(!dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_accepts_uuid() {
+        let id = "3b1c8a4e-9f2d-4c6b-8e1a-0f5d2c7b9a13";
+        assert_eq!(sanitize_path_segment(id, "contact_id").unwrap(), id);
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_empty() {
+        assert!(sanitize_path_segment("  ", "contact_id").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal() {
+        assert!(sanitize_path_segment("a/../b", "list_id").is_err());
+        assert!(sanitize_path_segment("..", "list_id").is_err());
+        assert!(sanitize_path_segment("a%2Fb", "list_id").is_err());
+        assert!(sanitize_path_segment("a\\b", "template_id").is_err());
+    }
+
+    #[test]
+    fn encode_query_value_passes_plain_date() {
+        assert_eq!(
+            encode_query_value("2026-01-01", "start_date").unwrap(),
+            "2026-01-01"
+        );
+    }
+
+    #[test]
+    fn encode_query_value_encodes_param_injection() {
+        let encoded = encode_query_value("2026-01-01&aggregated_by=day", "start_date").unwrap();
+        assert!(!encoded.contains('&'));
+        assert!(!encoded.contains('='));
+        assert!(encoded.contains("%26"));
+        assert!(encoded.contains("%3D"));
+    }
+
+    #[test]
+    fn encode_query_value_encodes_percent_and_hash() {
+        let encoded = encode_query_value("a%b#c", "start_date").unwrap();
+        assert!(encoded.contains("%25"));
+        assert!(encoded.contains("%23"));
+    }
+
+    #[test]
+    fn encode_query_value_rejects_empty() {
+        assert!(encode_query_value("   ", "start_date").is_err());
     }
 }

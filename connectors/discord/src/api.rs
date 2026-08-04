@@ -234,6 +234,13 @@ impl DiscordApiClient {
         let body_bytes = body.map(serde_json::to_vec).transpose()?;
         let request_ctx = ctx.clone();
 
+        // Discord has no idempotency key: a replayed `POST /channels/{id}/messages`
+        // posts a second message. GET is a read and PATCH edits by content, so
+        // both are safe to repeat; POST is not, and is retried only when the
+        // failure provably happened before the request reached Discord.
+        // See br-kxd3e.
+        let replay_safe = !matches!(method, Method::Post);
+
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = &url;
             let method = method.clone();
@@ -253,16 +260,18 @@ impl DiscordApiClient {
                 {
                     Ok(response) => match Self::handle_response(&response) {
                         Ok(data) => AttemptOutcome::Success(data),
-                        Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: error.retry_after(),
-                            error,
-                        },
+                        Err(error) if error.is_retryable() => {
+                            let retry_after = error.retry_after();
+                            let replayable = replay_safe || error.replay_is_safe();
+                            AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                        }
                         Err(error) => AttemptOutcome::Terminal(error),
                     },
-                    Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: error.retry_after(),
-                        error,
-                    },
+                    Err(error) if error.is_retryable() => {
+                        let retry_after = error.retry_after();
+                        let replayable = replay_safe || error.replay_is_safe();
+                        AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                    }
                     Err(error) => AttemptOutcome::Terminal(error),
                 }
             }

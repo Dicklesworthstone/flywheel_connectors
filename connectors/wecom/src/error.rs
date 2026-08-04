@@ -4,13 +4,19 @@ use std::time::Duration;
 
 use fcp_async_core::AsyncError;
 use fcp_prelude::FcpError;
+use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorErrorMapping;
 
 pub type WeComResult<T> = Result<T, WeComError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WeComError {
-    #[error("HTTP transport error: {0}")]
+    // WeCom puts `corpsecret`/`access_token` in the request query string, and
+    // `reqwest::Error`'s `Display` appends the full request URL (query included,
+    // unredacted). Interpolating the reqwest error here (`{0}`) would leak the
+    // long-lived app secret into any surfaced/logged message, so Display carries
+    // no URL; the redaction-safe detail is built in `to_fcp_error`.
+    #[error("HTTP transport error")]
     Http(#[from] reqwest::Error),
 
     #[error("JSON parse error: {0}")]
@@ -64,13 +70,31 @@ impl WeComError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
-            Self::Http(error) => FcpError::External {
-                service: "wecom".into(),
-                message: error.to_string(),
-                status_code: error.status().map(|s| s.as_u16()),
-                retryable: self.is_retryable(),
-                retry_after: self.retry_after(),
-            },
+            Self::Http(error) => {
+                let kind = if error.is_timeout() {
+                    "timeout"
+                } else if error.is_connect() {
+                    "connect"
+                } else if error.is_body() || error.is_decode() {
+                    "body"
+                } else {
+                    "transport"
+                };
+                // `error.to_string()` would append the raw request URL, whose
+                // query string carries `corpsecret`/`access_token`. Surface the
+                // failure kind plus a redaction-safe URL (query dropped) instead.
+                let message = error.url().map_or_else(
+                    || format!("HTTP {kind} error"),
+                    |url| format!("HTTP {kind} error for url ({})", redact_url(url.as_str())),
+                );
+                FcpError::External {
+                    service: "wecom".into(),
+                    message,
+                    status_code: error.status().map(|s| s.as_u16()),
+                    retryable: self.is_retryable(),
+                    retry_after: self.retry_after(),
+                }
+            }
             Self::Json(error) => FcpError::Internal {
                 message: format!("JSON parse error: {error}"),
             },

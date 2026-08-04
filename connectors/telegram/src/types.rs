@@ -1232,7 +1232,7 @@ mod tests {
     fn reply_chain_value(depth: usize) -> Value {
         let mut reply = None;
         for idx in (0..depth).rev() {
-            let message_id = i64::try_from(idx).map_or(i64::MAX, |value| value);
+            let message_id = i64::try_from(idx).unwrap_or(i64::MAX);
             reply = Some(minimal_message_value(message_id, reply));
         }
         match reply {

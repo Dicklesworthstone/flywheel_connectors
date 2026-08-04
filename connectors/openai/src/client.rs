@@ -466,7 +466,8 @@ impl OpenAIClient {
         polling: VideoPollingOptions,
     ) -> OpenAIResult<VideoGenerationResponse> {
         let ctx = self.runtime.request_context();
-        let url = format!("{}/v1/videos/{video_id}", self.base_url);
+        let safe_video_id = sanitize_path_segment(video_id, "video_id")?;
+        let url = format!("{}/v1/videos/{safe_video_id}", self.base_url);
         for attempt in 0..polling.max_poll_attempts {
             let response: VideoGenerationResponse = self.get(&url).await?;
             match response.status.unwrap_or(VideoStatus::Unknown) {
@@ -692,7 +693,7 @@ impl OpenAIClient {
             params.push(format!("limit={limit}"));
         }
         if let Some(after) = after {
-            params.push(format!("after={after}"));
+            params.push(format!("after={}", encode_query_value(after, "after")?));
         }
         if !params.is_empty() {
             url.push('?');
@@ -709,7 +710,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn get_fine_tune(&self, job_id: &str) -> OpenAIResult<FineTuneJob> {
-        let url = format!("{}/v1/fine_tuning/jobs/{job_id}", self.base_url);
+        let safe_job_id = sanitize_path_segment(job_id, "job_id")?;
+        let url = format!("{}/v1/fine_tuning/jobs/{safe_job_id}", self.base_url);
         self.get(&url).await
     }
 
@@ -720,7 +722,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn cancel_fine_tune(&self, job_id: &str) -> OpenAIResult<FineTuneJob> {
-        let url = format!("{}/v1/fine_tuning/jobs/{job_id}/cancel", self.base_url);
+        let safe_job_id = sanitize_path_segment(job_id, "job_id")?;
+        let url = format!("{}/v1/fine_tuning/jobs/{safe_job_id}/cancel", self.base_url);
 
         let request = self
             .client
@@ -752,13 +755,14 @@ impl OpenAIClient {
         limit: Option<u32>,
         after: Option<&str>,
     ) -> OpenAIResult<FineTuneEventListResponse> {
-        let mut url = format!("{}/v1/fine_tuning/jobs/{job_id}/events", self.base_url);
+        let safe_job_id = sanitize_path_segment(job_id, "job_id")?;
+        let mut url = format!("{}/v1/fine_tuning/jobs/{safe_job_id}/events", self.base_url);
         let mut params = Vec::new();
         if let Some(limit) = limit {
             params.push(format!("limit={limit}"));
         }
         if let Some(after) = after {
-            params.push(format!("after={after}"));
+            params.push(format!("after={}", encode_query_value(after, "after")?));
         }
         if !params.is_empty() {
             url.push('?');
@@ -972,7 +976,7 @@ impl OpenAIClient {
             params.push(format!("limit={l}"));
         }
         if let Some(a) = after {
-            params.push(format!("after={a}"));
+            params.push(format!("after={}", encode_query_value(a, "after")?));
         }
         if !params.is_empty() {
             url.push('?');
@@ -988,7 +992,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn get_assistant(&self, assistant_id: &str) -> OpenAIResult<Assistant> {
-        let url = format!("{}/v1/assistants/{assistant_id}", self.base_url);
+        let safe_assistant_id = sanitize_path_segment(assistant_id, "assistant_id")?;
+        let url = format!("{}/v1/assistants/{safe_assistant_id}", self.base_url);
         self.get_v2(&url).await
     }
 
@@ -999,7 +1004,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn delete_assistant(&self, assistant_id: &str) -> OpenAIResult<serde_json::Value> {
-        let url = format!("{}/v1/assistants/{assistant_id}", self.base_url);
+        let safe_assistant_id = sanitize_path_segment(assistant_id, "assistant_id")?;
+        let url = format!("{}/v1/assistants/{safe_assistant_id}", self.base_url);
         self.delete_v2(&url).await
     }
 
@@ -1034,7 +1040,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn get_thread(&self, thread_id: &str) -> OpenAIResult<Thread> {
-        let url = format!("{}/v1/threads/{thread_id}", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let url = format!("{}/v1/threads/{safe_thread_id}", self.base_url);
         self.get_v2(&url).await
     }
 
@@ -1045,7 +1052,8 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn delete_thread(&self, thread_id: &str) -> OpenAIResult<serde_json::Value> {
-        let url = format!("{}/v1/threads/{thread_id}", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let url = format!("{}/v1/threads/{safe_thread_id}", self.base_url);
         self.delete_v2(&url).await
     }
 
@@ -1064,7 +1072,8 @@ impl OpenAIClient {
         content: &str,
         metadata: Option<serde_json::Value>,
     ) -> OpenAIResult<ThreadMessage> {
-        let url = format!("{}/v1/threads/{thread_id}/messages", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let url = format!("{}/v1/threads/{safe_thread_id}/messages", self.base_url);
         let mut body = serde_json::json!({
             "role": role,
             "content": content,
@@ -1087,13 +1096,14 @@ impl OpenAIClient {
         limit: Option<u32>,
         after: Option<&str>,
     ) -> OpenAIResult<ThreadMessageListResponse> {
-        let mut url = format!("{}/v1/threads/{thread_id}/messages", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let mut url = format!("{}/v1/threads/{safe_thread_id}/messages", self.base_url);
         let mut params = Vec::new();
         if let Some(l) = limit {
             params.push(format!("limit={l}"));
         }
         if let Some(a) = after {
-            params.push(format!("after={a}"));
+            params.push(format!("after={}", encode_query_value(a, "after")?));
         }
         if !params.is_empty() {
             url.push('?');
@@ -1117,7 +1127,8 @@ impl OpenAIClient {
         instructions: Option<&str>,
         metadata: Option<serde_json::Value>,
     ) -> OpenAIResult<Run> {
-        let url = format!("{}/v1/threads/{thread_id}/runs", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let url = format!("{}/v1/threads/{safe_thread_id}/runs", self.base_url);
         let mut body = serde_json::json!({
             "assistant_id": assistant_id,
         });
@@ -1137,7 +1148,12 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn get_run(&self, thread_id: &str, run_id: &str) -> OpenAIResult<Run> {
-        let url = format!("{}/v1/threads/{thread_id}/runs/{run_id}", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let safe_run_id = sanitize_path_segment(run_id, "run_id")?;
+        let url = format!(
+            "{}/v1/threads/{safe_thread_id}/runs/{safe_run_id}",
+            self.base_url
+        );
         self.get_v2(&url).await
     }
 
@@ -1153,13 +1169,14 @@ impl OpenAIClient {
         limit: Option<u32>,
         after: Option<&str>,
     ) -> OpenAIResult<RunListResponse> {
-        let mut url = format!("{}/v1/threads/{thread_id}/runs", self.base_url);
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let mut url = format!("{}/v1/threads/{safe_thread_id}/runs", self.base_url);
         let mut params = Vec::new();
         if let Some(l) = limit {
             params.push(format!("limit={l}"));
         }
         if let Some(a) = after {
-            params.push(format!("after={a}"));
+            params.push(format!("after={}", encode_query_value(a, "after")?));
         }
         if !params.is_empty() {
             url.push('?');
@@ -1175,8 +1192,10 @@ impl OpenAIClient {
     /// Returns an error on HTTP failures, rate limiting, or authentication errors.
     #[instrument(skip(self))]
     pub async fn cancel_run(&self, thread_id: &str, run_id: &str) -> OpenAIResult<Run> {
+        let safe_thread_id = sanitize_path_segment(thread_id, "thread_id")?;
+        let safe_run_id = sanitize_path_segment(run_id, "run_id")?;
         let url = format!(
-            "{}/v1/threads/{thread_id}/runs/{run_id}/cancel",
+            "{}/v1/threads/{safe_thread_id}/runs/{safe_run_id}/cancel",
             self.base_url
         );
         self.post_empty_v2(&url).await
@@ -1342,6 +1361,66 @@ fn sanitize_error_message(message: &str) -> String {
         .collect::<String>()
 }
 
+/// Hex digits used by [`encode_query_value`] when percent-encoding a byte.
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Validate that a caller-supplied id is safe to interpolate into a URL path
+/// segment.
+///
+/// OpenAI resource ids (`ft-…`, `asst_…`, `thread_…`, `run_…`, `msg_…`,
+/// `video_…`) are opaque tokens, but they arrive as connector input, so hostile
+/// values must be refused. `reqwest` normalizes `..` segments while building the
+/// request, so an unsanitized id could otherwise reach a sibling endpoint under
+/// `api.openai.com`.
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> OpenAIResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(OpenAIError::InvalidInput {
+            message: format!("{field} must not be empty"),
+        });
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(OpenAIError::InvalidInput {
+            message: format!("{field} contains path traversal characters"),
+        });
+    }
+    Ok(trimmed)
+}
+
+/// Percent-encode a value for safe inclusion in a URL query string.
+///
+/// Encodes every character outside the unreserved set (`A-Z a-z 0-9 - _ . ~`),
+/// including `%`, so a pagination cursor cannot smuggle additional query
+/// parameters (`after=cur&limit=9999`) or otherwise alter the URL structure.
+fn encode_query_value(value: &str, field: &str) -> OpenAIResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(OpenAIError::InvalidInput {
+            message: format!("{field} must not be empty"),
+        });
+    }
+    let mut encoded = String::with_capacity(trimmed.len() * 2);
+    for byte in trimmed.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX_UPPER[(byte >> 4) as usize] as char);
+                encoded.push(HEX_UPPER[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    Ok(encoded)
+}
+
 fn video_failure_message(response: &VideoGenerationResponse) -> String {
     response
         .error
@@ -1411,6 +1490,53 @@ fn parse_sse_event(event_str: &str) -> Option<OpenAIResult<ChatCompletionChunk>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_path_segment_accepts_opaque_ids() {
+        assert_eq!(
+            sanitize_path_segment("ft-abc123", "job_id").unwrap(),
+            "ft-abc123"
+        );
+        assert_eq!(
+            sanitize_path_segment("asst_9XyZ", "assistant_id").unwrap(),
+            "asst_9XyZ"
+        );
+        assert_eq!(
+            sanitize_path_segment("  thread_1  ", "thread_id").unwrap(),
+            "thread_1"
+        );
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_empty_and_traversal() {
+        assert!(sanitize_path_segment("   ", "job_id").is_err());
+        assert!(sanitize_path_segment("ft-abc/../admin", "job_id").is_err());
+        assert!(sanitize_path_segment("..", "job_id").is_err());
+        assert!(sanitize_path_segment("a%2Fb", "job_id").is_err());
+        assert!(sanitize_path_segment("a\\b", "run_id").is_err());
+    }
+
+    #[test]
+    fn encode_query_value_passes_plain_cursor() {
+        assert_eq!(
+            encode_query_value("ft-step-abc123", "after").unwrap(),
+            "ft-step-abc123"
+        );
+    }
+
+    #[test]
+    fn encode_query_value_encodes_param_smuggle() {
+        let encoded = encode_query_value("cur&limit=9999", "after").unwrap();
+        assert!(!encoded.contains('&'));
+        assert!(!encoded.contains('='));
+        assert!(encoded.contains("%26"));
+        assert!(encoded.contains("%3D"));
+    }
+
+    #[test]
+    fn encode_query_value_rejects_empty() {
+        assert!(encode_query_value("  ", "after").is_err());
+    }
 
     #[test]
     fn test_model_pricing() {

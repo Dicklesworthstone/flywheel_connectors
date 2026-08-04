@@ -1,7 +1,10 @@
 //! Square API client.
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::Client;
 use std::time::Duration;
@@ -181,6 +184,26 @@ impl SquareClient {
         let policy = self.retry_config.to_retry_policy();
         let body_clone = body.clone();
 
+        // Square deduplicates a POST only when the request body carries an
+        // `idempotency_key`. Some operations require one (the connector rejects
+        // the invoke without it); others send none. For those, a 5xx or a
+        // transport timeout — both of which can be reported after Square
+        // already took the payment, issued the refund, or created the order —
+        // must NOT be replayed. Reading the key off the body keeps this
+        // self-maintaining: an operation that starts sending one becomes
+        // retryable again with no change here. See br-kxd3e.
+        //
+        // `/orders/search` is the exception: Square expresses order search as a
+        // POST, so it has no idempotency key and needs none. Replaying a query
+        // creates nothing, and read paths must not lose their retries to this
+        // fix.
+        let read_only_post = path == "/orders/search";
+        let replay_safe = read_only_post
+            || body
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|key| !key.trim().is_empty());
+
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
             let client = self.client.clone();
@@ -197,11 +220,16 @@ impl SquareClient {
                     .await
                 {
                     Ok(r) => r,
+                    // Only a connect-phase failure proves the request never
+                    // left the client; `is_timeout()` covers the TOTAL request
+                    // timeout, which fires after the body was fully sent.
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: SquareError::Http(e),
-                            retry_after: None,
-                        };
+                        let replayable = replay_safe || !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            SquareError::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -213,6 +241,8 @@ impl SquareClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok())
                         .map(Duration::from_secs);
+                    // Square rejects a rate-limited request without performing
+                    // it, so replaying cannot duplicate anything.
                     return AttemptOutcome::Retryable {
                         error: SquareError::RateLimited {
                             retry_after_ms: retry_after
@@ -237,10 +267,8 @@ impl SquareClient {
                         message: text,
                     };
                     if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
+                        // 5xx/408/425 all mean Square RECEIVED the request.
+                        return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
                     }
                     return AttemptOutcome::Terminal(err);
                 }

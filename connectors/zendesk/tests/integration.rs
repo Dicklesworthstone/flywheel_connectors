@@ -542,20 +542,6 @@ async fn test_error_429_rate_limited() {
     );
 }
 
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms AND a `timeout`
-// under a deadline budget blocks ~the full budget. The connector classifies a
-// 500 as Retryable and `RetryLoop` backs off via `ctx.sleep(delay)`, which runs
-// `timeout(remaining_budget, sleep(delay))`. Under the defect that first backoff
-// blocks the connector's fixed 30s request budget, so the loop returns a
-// deadline `Timeout` (mapped to External{retryable:false}) instead of the 500's
-// External{retryable:true}. The retry count and the 30s budget are baked into
-// `ZendeskClient::new` and are NOT reachable from the public connector invoke
-// path, so this intent cannot be retimed at the test level without changing
-// production classification/retry config (disallowed). Ignored until asupersync
-// 0.3.3 restores sub-250ms timer fidelity. The retryable-vs-terminal mapping for
-// a 500 is still covered by the pure unit tests in src/error.rs and src/client.rs
-// (e.g. `with_retry_config(0)` cases), which do not exercise backoff sleeps.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn test_error_500_server_error() {
     let _ctx = AsyncTestContext::for_scenario("zendesk-error-500");
@@ -1087,4 +1073,82 @@ async fn test_list_satisfaction_ratings_no_filter() {
     assert_eq!(result["count"], 3);
     let ratings = result["satisfaction_ratings"].as_array().unwrap();
     assert_eq!(ratings.len(), 3);
+}
+
+// ============================================================================
+// Replay safety on retry (br-kxd3e)
+// ============================================================================
+//
+// Zendesk has no idempotency key wired here, so a 5xx retry on create_ticket
+// files a second support ticket. The assertion is the REQUEST COUNT.
+
+#[fcp_async_core::runtime::test]
+async fn create_ticket_is_not_retried_after_a_5xx() {
+    let _ctx = AsyncTestContext::for_scenario("zendesk-create-ticket-replay-safety");
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tickets.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let client = fcp_zendesk::client::ZendeskClient::new("testco", "agent@testco.com", "tok")
+        .unwrap()
+        .with_base_url(&mock_server.uri())
+        .with_retry_config(3);
+
+    let result = client
+        .create_ticket(&json!({ "subject": "help", "comment": { "body": "x" } }))
+        .await;
+    assert!(result.is_err());
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Zendesk received the create — retrying files a SECOND \
+         support ticket"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_ticket_still_retries_a_429() {
+    let _ctx = AsyncTestContext::for_scenario("zendesk-create-ticket-429");
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tickets.json"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tickets.json"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "ticket": { "id": 1, "subject": "help", "status": "new" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = fcp_zendesk::client::ZendeskClient::new("testco", "agent@testco.com", "tok")
+        .unwrap()
+        .with_base_url(&mock_server.uri())
+        .with_retry_config(3);
+
+    client
+        .create_ticket(&json!({ "subject": "help", "comment": { "body": "x" } }))
+        .await
+        .expect("a rate-limited create was refused without filing anything");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means Zendesk did NOT file the ticket, so backoff must be preserved"
+    );
 }

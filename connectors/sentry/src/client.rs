@@ -168,12 +168,20 @@ impl SentryClient {
         }
     }
 
+    /// Issue a request with retry.
+    ///
+    /// br-kxd3e: replay safety is derived from the verb, which is sound here
+    /// because this client uses each one for its standard meaning — GET reads,
+    /// PUT/PATCH set named fields to named values, DELETE converges, and only
+    /// POST creates. A replay of a POST after a 5xx creates a second object or
+    /// double-counts an ingested event.
     async fn request_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
     ) -> SentryResult<serde_json::Value> {
+        let replay_safe = http_method != "POST";
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -193,22 +201,18 @@ impl SentryClient {
             match req.send().await {
                 Ok(resp) => match self.handle_response(resp).await {
                     Ok(val) => AttemptOutcome::Success(val),
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 },
                 Err(err) => {
                     let err = SentryError::Http(err);
-                    if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    }
+                    let replayable = replay_safe || err.replay_is_safe();
+                    let retry_after = err.retry_after();
+                    AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
                 }
             }
         })
@@ -778,9 +782,23 @@ fn sanitize_path_segment(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
-/// Minimal URL encoding for version strings.
+/// Minimal, readability-preserving URL encoding for release version strings.
+///
+/// Sentry release versions are embedded as a path segment (e.g.
+/// `/organizations/{org}/releases/{version}/`). Beyond the display-oriented
+/// escapes (`%`, `+`, space, `@`), this also neutralizes the characters that
+/// would otherwise let a caller-supplied `version` escape that segment:
+/// `/`/`\` (segment splitting → `Url::parse` normalization), `..` (dot-segment
+/// traversal, e.g. `delete_release` with `../../organizations/<victim>/...`),
+/// and `?`/`#` (query/fragment injection against the API host). `%` is replaced
+/// first so the encodings emitted here are not double-encoded.
 fn urlencoded(s: &str) -> String {
     s.replace('%', "%25")
+        .replace("..", "%2E%2E")
+        .replace('/', "%2F")
+        .replace('\\', "%5C")
+        .replace('?', "%3F")
+        .replace('#', "%23")
         .replace('+', "%2B")
         .replace(' ', "%20")
         .replace('@', "%40")
@@ -1045,5 +1063,24 @@ mod tests {
     fn url_encode_multiple_specials() {
         let result = urlencoded("a@b+c d%e");
         assert_eq!(result, "a%40b%2Bc%20d%25e");
+    }
+
+    #[test]
+    fn urlencoded_neutralizes_path_traversal_and_injection() {
+        // A release version must not be able to escape its path segment. Each of
+        // these would otherwise redirect delete/get_release to another endpoint
+        // or inject a query/fragment.
+        let attack = "../../../organizations/victim/projects/proj";
+        let encoded = urlencoded(attack);
+        assert!(!encoded.contains('/'), "slash survived: {encoded}");
+        assert!(!encoded.contains(".."), "dot-segment survived: {encoded}");
+
+        assert_eq!(urlencoded("a/b"), "a%2Fb");
+        assert_eq!(urlencoded("a\\b"), "a%5Cb");
+        assert_eq!(urlencoded("v1?x=y"), "v1%3Fx=y");
+        assert_eq!(urlencoded("v1#frag"), "v1%23frag");
+        assert_eq!(urlencoded(".."), "%2E%2E");
+        // A normal semver-style release is left readable.
+        assert_eq!(urlencoded("v1.2.3"), "v1.2.3");
     }
 }

@@ -20,8 +20,24 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 /// Percent-encode a value for use as a single URL path segment.
-fn encode_path_segment(value: &str) -> String {
-    utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
+///
+/// Slashes are encoded, so the only residual traversal vector is a bare `.`/`..`
+/// segment that the server would normalize to a sibling endpoint (e.g.
+/// `list_repositories("..")` → `/2.0/repositories/../…` → `/2.0/…`). Workspace
+/// slugs, repo slugs, and PR ids never legitimately contain consecutive dots, so
+/// such values are rejected outright.
+fn encode_path_segment(value: &str) -> BitbucketResult<String> {
+    if value.is_empty() {
+        return Err(BitbucketError::InvalidInput(
+            "path segment must not be empty".into(),
+        ));
+    }
+    if value == "." || value.contains("..") {
+        return Err(BitbucketError::InvalidInput(
+            "path segment must not contain traversal sequences".into(),
+        ));
+    }
+    Ok(utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string())
 }
 
 use crate::{
@@ -238,7 +254,7 @@ impl BitbucketClient {
 
     /// List repositories in a workspace.
     pub async fn list_repositories(&self, workspace: &str) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
+        let ws = encode_path_segment(workspace)?;
         self.get(&format!("/repositories/{ws}")).await
     }
 
@@ -248,8 +264,8 @@ impl BitbucketClient {
         workspace: &str,
         repo_slug: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.get(&format!("/repositories/{ws}/{repo}")).await
     }
 
@@ -261,8 +277,8 @@ impl BitbucketClient {
         workspace: &str,
         repo_slug: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.get(&format!("/repositories/{ws}/{repo}/pullrequests"))
             .await
     }
@@ -274,9 +290,9 @@ impl BitbucketClient {
         repo_slug: &str,
         pr_id: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
-        let id = encode_path_segment(pr_id);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
+        let id = encode_path_segment(pr_id)?;
         self.get(&format!("/repositories/{ws}/{repo}/pullrequests/{id}"))
             .await
     }
@@ -288,8 +304,8 @@ impl BitbucketClient {
         repo_slug: &str,
         body: &serde_json::Value,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.post(&format!("/repositories/{ws}/{repo}/pullrequests"), body)
             .await
     }
@@ -302,8 +318,8 @@ impl BitbucketClient {
         workspace: &str,
         repo_slug: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.get(&format!("/repositories/{ws}/{repo}/refs/branches"))
             .await
     }
@@ -316,8 +332,8 @@ impl BitbucketClient {
         workspace: &str,
         repo_slug: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.get(&format!("/repositories/{ws}/{repo}/commits"))
             .await
     }
@@ -330,8 +346,8 @@ impl BitbucketClient {
         workspace: &str,
         repo_slug: &str,
     ) -> BitbucketResult<serde_json::Value> {
-        let ws = encode_path_segment(workspace);
-        let repo = encode_path_segment(repo_slug);
+        let ws = encode_path_segment(workspace)?;
+        let repo = encode_path_segment(repo_slug)?;
         self.get(&format!("/repositories/{ws}/{repo}/pipelines"))
             .await
     }
@@ -344,22 +360,37 @@ mod tests {
     // ── encode_path_segment tests ───────────────────────────────
     #[test]
     fn encode_path_segment_simple_slug_unchanged() {
-        assert_eq!(encode_path_segment("my-team"), "my-team");
+        assert_eq!(encode_path_segment("my-team").unwrap(), "my-team");
     }
 
     #[test]
     fn encode_path_segment_encodes_slashes() {
-        assert_eq!(encode_path_segment("a/b/c"), "a%2Fb%2Fc");
+        assert_eq!(encode_path_segment("a/b/c").unwrap(), "a%2Fb%2Fc");
     }
 
     #[test]
     fn encode_path_segment_encodes_spaces() {
-        assert_eq!(encode_path_segment("my team"), "my%20team");
+        assert_eq!(encode_path_segment("my team").unwrap(), "my%20team");
     }
 
     #[test]
     fn encode_path_segment_encodes_special_chars() {
-        assert_eq!(encode_path_segment("repo?q=1"), "repo%3Fq%3D1");
+        assert_eq!(encode_path_segment("repo?q=1").unwrap(), "repo%3Fq%3D1");
+    }
+
+    #[test]
+    fn encode_path_segment_rejects_traversal() {
+        // A bare `..`/`.` workspace or repo slug would normalize to a sibling
+        // endpoint (`/repositories/../…` → `/…`), changing the intended target.
+        for evil in ["..", ".", "../..", "a..b", ""] {
+            assert!(
+                matches!(
+                    encode_path_segment(evil),
+                    Err(BitbucketError::InvalidInput(_))
+                ),
+                "path segment {evil:?} must be rejected"
+            );
+        }
     }
 
     #[test]

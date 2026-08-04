@@ -189,6 +189,43 @@ fn invalid_patterns_fail_closed() {
     );
 }
 
+#[test]
+fn deserialization_enforces_constructor_invariants() {
+    // An empty `sequence` previously slipped past `new()` via serde and then
+    // panicked `find_matches` at `sequence[0]`. Deserialization must now reject
+    // it the same way the constructor does.
+    let empty_sequence = r#"{"name":"x","sequence":[],"max_window_ms":5}"#;
+    assert!(
+        serde_json::from_str::<EventPattern>(empty_sequence).is_err(),
+        "deserializing an empty-sequence pattern must fail, not build a panicking pattern"
+    );
+
+    // Other constructor invariants are enforced on the deserialize path too.
+    assert!(
+        serde_json::from_str::<EventPattern>(
+            r#"{"name":"","sequence":[{"event_type":"x"}],"max_window_ms":5}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<EventPattern>(
+            r#"{"name":"z","sequence":[{"event_type":"x"}],"max_window_ms":0}"#
+        )
+        .is_err()
+    );
+
+    // A valid pattern round-trips through serde and matches without panicking.
+    let valid = cross_zone_pattern(60_000);
+    let json = serde_json::to_string(&valid).expect("serialize");
+    let restored: EventPattern = serde_json::from_str(&json).expect("valid pattern deserializes");
+    assert_eq!(restored, valid);
+    let entries = vec![
+        entry("a", "capability.invoke", "z:work", 1, 1_000),
+        entry("b", "capability.invoke", "z:public", 2, 30_000),
+    ];
+    assert_eq!(restored.find_matches(&entries).len(), 1);
+}
+
 proptest! {
     #[test]
     fn window_boundary_is_inclusive(offset in 0_u64..=60_000) {

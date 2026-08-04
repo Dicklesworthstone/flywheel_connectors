@@ -1,6 +1,7 @@
 //! FCP `SendGrid` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
@@ -563,14 +564,9 @@ impl SendGridConnector {
         let end_date = input
             .get("end_date")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+            .filter(|s| !s.is_empty());
 
-        let query = if end_date.is_empty() {
-            format!("start_date={start_date}")
-        } else {
-            format!("start_date={start_date}&end_date={end_date}")
-        };
-        let resp = client.get_stats(&query).await?;
+        let resp = client.get_stats(start_date, end_date).await?;
         Ok(json!({ "stats": resp }))
     }
 
@@ -705,7 +701,10 @@ fn is_local_test_host(host: &str) -> bool {
 
 /// Build the operations info for introspection.
 fn operations_info() -> serde_json::Value {
-    serde_json::to_value(typed_operations_info()).unwrap_or_else(|_| json!([]))
+    static OPERATIONS: OnceLock<serde_json::Value> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| serde_json::to_value(typed_operations_info()).unwrap_or_else(|_| json!([])))
+        .clone()
 }
 
 fn typed_operations_info() -> Vec<OperationInfo> {

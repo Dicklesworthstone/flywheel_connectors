@@ -430,7 +430,12 @@ async fn monday_default_deny_compliance_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["monday.boards.read"],
     );
-    let token = build_token(&signing_key, "monday.boards.read", &["monday.boards.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "monday.boards.read",
+        &["monday.boards.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "monday.items.create",
         json!({ "board_id": "123456789", "item_name": "test item" }),
@@ -479,7 +484,12 @@ async fn monday_happy_path_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["monday.boards.read"],
     );
-    let token = build_token(&signing_key, "monday.boards.read", &["monday.boards.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "monday.boards.read",
+        &["monday.boards.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("monday.boards.list", json!({}), token);
 
     let suite = ConnectorSuite {

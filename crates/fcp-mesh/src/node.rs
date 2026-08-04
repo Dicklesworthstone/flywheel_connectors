@@ -37,7 +37,7 @@ use fcp_telemetry::trace_capture::{
 use fcp_telemetry::{TraceContext, metrics};
 use hex::encode;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::admission::{
     AdmissionController, AdmissionError, AdmissionPolicy, ObjectAdmissionClass,
@@ -2749,6 +2749,18 @@ impl MeshNode {
     /// rejects unsolicited payloads, validates zone/object/ESI bindings, stores
     /// accepted bytes locally, and announces the resulting local availability.
     ///
+    /// Content-address enforcement (`object_id == derive_id(header, body,
+    /// zone_key)`) is owned by the object store's injected
+    /// [`ObjectIdVerifier`](fcp_store::ObjectIdVerifier): `MeshNode` holds no
+    /// zone keys by design, so whoever constructs a live-network node MUST
+    /// inject a store built with a `KeyedObjectIdVerifier` for every served
+    /// zone (fails closed with `VerifierKeyMissing` on unknown zones).
+    /// Without it, a hostile peer can bind attacker-controlled bytes to a
+    /// legitimately requested object id — this method warns loudly when that
+    /// invariant is not met (bead mesh-node-content-id-verifier-wiring-h3xmd).
+    /// Trace-replay and test nodes replaying already-captured traces are the
+    /// only legitimate verifier-less callers.
+    ///
     /// # Errors
     ///
     /// Returns an error if the peer is no longer enrolled for the zone, if any
@@ -2762,6 +2774,17 @@ impl MeshNode {
         now_ms: u64,
     ) -> Result<GossipFetchApplyOutcome, MeshNodeError> {
         let peer = self.verify_gossip_fetch_plan_peer(plan)?;
+        if !objects.is_empty() && !self.object_store.has_object_id_verifier() {
+            warn!(
+                peer = plan.peer.as_str(),
+                zone_id = %plan.zone_id,
+                object_count = objects.len(),
+                "accepting peer-supplied objects into an object store without a \
+                 content-id verifier; live-network nodes MUST install a \
+                 KeyedObjectIdVerifier or a hostile peer can poison the cache \
+                 (bead mesh-node-content-id-verifier-wiring-h3xmd)"
+            );
+        }
         let requested_objects: BTreeSet<_> = plan.object_ids.iter().copied().collect();
         let requested_symbols: BTreeSet<_> = plan.symbols.iter().copied().collect();
         let mut outcome = GossipFetchApplyOutcome::default();
@@ -4926,6 +4949,123 @@ mod tests {
                 message_kind: "lease quorum",
             } if peer == "node-2"
         ));
+    }
+
+    fn test_node_with_verifier(name: &str, verifier: fcp_store::KeyedObjectIdVerifier) -> MeshNode {
+        let object_store = Arc::new(
+            MemoryObjectStore::new(MemoryObjectStoreConfig::default())
+                .with_verifier(verifier.into_arc()),
+        );
+        let symbol_store = Arc::new(MemorySymbolStore::new(MemorySymbolStoreConfig::default()));
+        let quarantine_store = Arc::new(QuarantineStore::new(ObjectAdmissionPolicy::default()));
+        MeshNode::new(
+            MeshNodeConfig::new(name).with_sender_instance_id(42),
+            object_store,
+            symbol_store,
+            quarantine_store,
+        )
+    }
+
+    fn enroll_fetch_peer(node: &mut MeshNode, peer_name: &str, zone_id: &ZoneId) -> NodeId {
+        let peer = NodeId::new(peer_name);
+        node.update_peer_state(
+            peer.clone(),
+            test_device_profile(peer_name),
+            HashSet::new(),
+            Vec::new(),
+            50_000,
+        );
+        node.update_peer_zones(&peer, zone_set(zone_id.clone()));
+        peer
+    }
+
+    #[test]
+    fn apply_gossip_fetch_payload_with_verifier_store_enforces_content_ids() {
+        // bead mesh-node-content-id-verifier-wiring-h3xmd: a live-network
+        // node's object store must carry a KeyedObjectIdVerifier so a peer
+        // cannot bind attacker-controlled bytes to a requested object id.
+        let zone_id = ZoneId::work();
+        // Same key test_stored_object derives ids under.
+        let object_id_key = ObjectIdKey::from_bytes([0x99; 32]);
+        let mut verifier = fcp_store::KeyedObjectIdVerifier::default();
+        verifier.insert(zone_id.clone(), object_id_key);
+        let mut node = test_node_with_verifier("node-verifier", verifier);
+        assert!(node.object_store().has_object_id_verifier());
+        enroll_fetch_peer(&mut node, "node-issuer", &zone_id);
+
+        let genuine = test_stored_object(&zone_id, "verifier-genuine", b"payload");
+        let genuine_id = genuine.object_id;
+        let mut forged = test_stored_object(&zone_id, "verifier-forged", b"original");
+        let forged_id = forged.object_id;
+        forged.body = b"attacker-swapped-bytes".to_vec();
+
+        fcp_async_core::runtime::block_on_sync(async {
+            let plan = GossipFetchPlan {
+                peer: TailscaleNodeId::new("node-issuer"),
+                zone_id: zone_id.clone(),
+                object_ids: vec![genuine_id],
+                symbols: Vec::new(),
+            };
+            let outcome = node
+                .apply_gossip_fetch_payload(&plan, vec![genuine], Vec::new(), 50_001)
+                .await
+                .expect("genuine content-addressed object must be admitted");
+            assert_eq!(outcome.objects_applied, vec![genuine_id]);
+
+            let plan = GossipFetchPlan {
+                peer: TailscaleNodeId::new("node-issuer"),
+                zone_id: zone_id.clone(),
+                object_ids: vec![forged_id],
+                symbols: Vec::new(),
+            };
+            let err = node
+                .apply_gossip_fetch_payload(&plan, vec![forged], Vec::new(), 50_002)
+                .await
+                .expect_err("forged (id, bytes) binding must be refused");
+            assert!(matches!(
+                err,
+                MeshNodeError::ObjectStore(fcp_store::ObjectStoreError::ContentIdMismatch { .. })
+            ));
+            assert!(
+                node.object_store().get(&forged_id).await.is_err(),
+                "forged object must not reach the store"
+            );
+        })
+        .expect("runtime");
+    }
+
+    #[test]
+    fn apply_gossip_fetch_payload_verifier_fails_closed_on_unknown_zone() {
+        // The verifier must fail closed (VerifierKeyMissing) for zones it has
+        // no ObjectIdKey for, instead of admitting unverifiable bytes.
+        let zone_id = ZoneId::work();
+        let other_zone: ZoneId = "z:private".parse().expect("zone id");
+        let mut verifier = fcp_store::KeyedObjectIdVerifier::default();
+        verifier.insert(other_zone, ObjectIdKey::from_bytes([0x99; 32]));
+        let mut node = test_node_with_verifier("node-verifier-closed", verifier);
+        enroll_fetch_peer(&mut node, "node-issuer", &zone_id);
+
+        let object = test_stored_object(&zone_id, "verifier-unknown-zone", b"payload");
+        let object_id = object.object_id;
+
+        fcp_async_core::runtime::block_on_sync(async {
+            let plan = GossipFetchPlan {
+                peer: TailscaleNodeId::new("node-issuer"),
+                zone_id: zone_id.clone(),
+                object_ids: vec![object_id],
+                symbols: Vec::new(),
+            };
+            let err = node
+                .apply_gossip_fetch_payload(&plan, vec![object], Vec::new(), 50_001)
+                .await
+                .expect_err("objects for zones without a verifier key must be refused");
+            assert!(matches!(
+                err,
+                MeshNodeError::ObjectStore(fcp_store::ObjectStoreError::VerifierKeyMissing { .. })
+            ));
+            assert!(node.object_store().get(&object_id).await.is_err());
+        })
+        .expect("runtime");
     }
 
     #[test]

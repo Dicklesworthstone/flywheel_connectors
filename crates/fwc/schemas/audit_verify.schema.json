@@ -3,26 +3,152 @@
   "$id": "fcp://schemas/fwc/audit-verify/truth-source-envelope/v1",
   "title": "FWC audit verify truth-source envelope v1",
   "description": "Top-level provenance envelope for `fwc audit verify --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "audit" },
-    "subcommand": { "const": "verify" },
-    "schema_version": {
-      "enum": ["fcp.fwc.audit_verify.v1", "fcp.fwc.truth-source.v1"]
-    },
-    "_truth_source": {
+  "oneOf": [
+    { "$ref": "#/definitions/audit_verify_success" },
+    { "$ref": "#/definitions/truth_source_unavailable" },
+    { "$ref": "#/definitions/truth_resolver_internal_error" }
+  ],
+  "definitions": {
+    "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
-    "error": {
+    "non_empty_string": { "type": "string", "minLength": 1 },
+    "nullable_string": {
+      "anyOf": [{ "$ref": "#/definitions/non_empty_string" }, { "type": "null" }]
+    },
+    "nullable_integer": {
+      "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }]
+    },
+    "audit_issue": {
       "type": "object",
-      "additionalProperties": true,
-      "required": ["type"],
+      "additionalProperties": false,
+      "required": ["code", "message"],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "code": { "$ref": "#/definitions/non_empty_string" },
+        "message": { "$ref": "#/definitions/non_empty_string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "object_id": { "$ref": "#/definitions/non_empty_string" }
+      }
+    },
+    "audit_verify_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "zone_id",
+        "chain_len",
+        "head_seq",
+        "head_event",
+        "issues",
+        "schema_version",
+        "_truth_source"
+      ],
+      "properties": {
+        "status": { "enum": ["ok", "warn", "fail"] },
+        "zone_id": { "$ref": "#/definitions/nullable_string" },
+        "chain_len": { "type": "integer", "minimum": 0 },
+        "head_seq": { "$ref": "#/definitions/nullable_integer" },
+        "head_event": { "$ref": "#/definitions/nullable_string" },
+        "issues": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/audit_issue" }
+        },
+        "schema_version": { "const": "fcp.fwc.audit_verify.v1" },
+        "_truth_source": { "$ref": "#/definitions/truth_source" }
+      }
+    },
+    "truth_source_unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "audit" },
+        "subcommand": { "const": "verify" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/definitions/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": { "enum": ["mesh", "mesh-or-host", "any-live"] },
+            "actual": { "$ref": "#/definitions/truth_source" },
+            "message": { "$ref": "#/definitions/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/non_empty_string" }
+        }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "audit" },
+        "subcommand": { "const": "verify" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/definitions/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/definitions/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/definitions/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/non_empty_string" }
+        }
       }
     }
   }

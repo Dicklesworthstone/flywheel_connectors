@@ -721,3 +721,74 @@ async fn poll_conversation_events_preserves_cursor_when_not_modified() {
     assert_eq!(result["cursor"]["last_common_read_id"], 41);
     assert_eq!(result["not_modified"], true);
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// `request_raw` is method-generic, so replay safety is derived from the HTTP
+// method and POST fails closed. A 5xx on a chat POST means the server received
+// the message; replaying it posts a duplicate into the room. Nextcloud Talk's
+// `referenceId` is documented for identifying a message afterwards, not as a
+// server-side dedup key, so there is no shape-(A) fix available here.
+//
+// The assertion is the REQUEST COUNT — "it still errors" would pass with the
+// bug present.
+
+#[fcp_async_core::runtime::test]
+async fn send_message_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room123"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let mut connector = NextcloudTalkConnector::new();
+    connector
+        .configure(json!({
+            "server_url": server.uri(),
+            "auth": {
+                "mode": "app_password",
+                "username": "alice",
+                "app_password": "app-material"
+            },
+            "network": { "allow_private_networks": true },
+            "retry": {
+                "max_retries": 3,
+                "initial_delay_ms": 1,
+                "max_delay_ms": 5,
+                "jitter_enabled": false
+            }
+        }))
+        .await
+        .expect("configure");
+    let signing_key = Ed25519SigningKey::generate();
+    let instance_id = test_instance_id();
+    handshake_connector(&mut connector, &signing_key, &instance_id).await;
+
+    let grant = generate_valid_token(&signing_key, CAP_WRITE, &[OP_SEND_MESSAGE], &instance_id);
+    let response = connector
+        .invoke(base_invoke(
+            connector.id(),
+            OP_SEND_MESSAGE,
+            grant,
+            json!({ "token": "room123", "message": "hello world" }),
+        ))
+        .await;
+    assert!(
+        response.is_err() || response.expect("invoke").status != InvokeStatus::Ok,
+        "the 503 should surface as a failure"
+    );
+
+    let chat_posts = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .count();
+    assert_eq!(
+        chat_posts, 1,
+        "a 503 means the server received the chat message — retrying posts a \
+         DUPLICATE into the room, and Talk has no server-side dedup key"
+    );
+}

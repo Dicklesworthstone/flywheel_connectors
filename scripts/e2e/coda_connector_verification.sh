@@ -6,12 +6,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/artifacts/e2e/coda_connector/${RUN_ID}}"
 REPO_TOOLCHAIN="${REPO_TOOLCHAIN:-nightly-2026-02-19}"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
+BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
 mkdir -p "${OUT_ROOT}/logs" "${OUT_ROOT}/evidence"
 
 OVERALL_STATUS="ok"
 EXIT_CODE=0
 export RCH_FORCE_REMOTE=1
+export RCH_REQUIRE_REMOTE
 REMOTE_TARGET_BASE="/tmp/rch-fcp-coda-${RUN_ID}"
 
 manifest_status="pending"
@@ -140,8 +144,13 @@ classify_step_failure() {
 
 command_uses_rch_exec() {
   local previous=""
+  local rch_name="${RCH_BIN##*/}"
   for arg in "$@"; do
-    if [[ "${previous}" == "rch" && "${arg}" == "exec" ]]; then
+    if [[ "${arg}" == "exec" ]] && {
+      [[ "${previous}" == "rch" ]] ||
+      [[ "${previous}" == "${RCH_BIN}" ]] ||
+      [[ "${previous##*/}" == "${rch_name}" ]]
+    }; then
       return 0
     fi
     previous="${arg}"
@@ -188,16 +197,20 @@ require_rch_remote_proof() {
 }
 
 require_cmd jq
-require_cmd rch
+require_cmd "${RCH_BIN}"
 
 manifest_check_cmd=(
   env
+  "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}"
+  RCH_FORCE_REMOTE=1
   RCH_VISIBILITY=verbose
-  rch
+  "${RCH_BIN}"
   exec
   --
   env
   "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}"
+  CARGO_INCREMENTAL=0
+  "CARGO_BUILD_JOBS=${BUILD_JOBS}"
   CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-fwc"
   cargo
   run
@@ -243,7 +256,7 @@ fi
 
 if run_logged \
   cargo_check \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-check" cargo check -p fcp-coda --all-targets
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-check" cargo check -p fcp-coda --all-targets
 then
   cargo_check_status="passed"
 else
@@ -253,7 +266,7 @@ fi
 
 if run_logged \
   format_check \
-  env -u RCH_FORCE_REMOTE -u RCH_REQUIRE_REMOTE RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-fmt" cargo fmt --manifest-path connectors/coda/Cargo.toml --check
+  env -u RCH_FORCE_REMOTE -u RCH_REQUIRE_REMOTE RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-fmt" cargo fmt --manifest-path connectors/coda/Cargo.toml --check
 then
   format_check_status="passed"
 else
@@ -263,7 +276,7 @@ fi
 
 if run_logged \
   health_guidance_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration health_unconfigured_includes_guidance -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration health_unconfigured_includes_guidance -- --nocapture
 then
   health_guidance_status="passed"
 else
@@ -273,7 +286,7 @@ fi
 
 if run_logged \
   doctor_guidance_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration doctor_unconfigured_reports_operator_guidance -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration doctor_unconfigured_reports_operator_guidance -- --nocapture
 then
   doctor_guidance_status="passed"
 else
@@ -283,7 +296,7 @@ fi
 
 if run_logged \
   self_check_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration self_check_ready_with_mock_coda_api_and_evidence -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration self_check_ready_with_mock_coda_api_and_evidence -- --nocapture
 then
   self_check_status="passed"
 else
@@ -293,7 +306,7 @@ fi
 
 if run_logged \
   retryable_self_check_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration self_check_retryable_coda_failure_reports_degraded -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration self_check_retryable_coda_failure_reports_degraded -- --nocapture
 then
   retryable_self_check_status="passed"
 else
@@ -303,7 +316,7 @@ fi
 
 if run_logged \
   pagination_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration invoke_docs_list_preserves_pagination_and_scope_evidence -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration invoke_docs_list_preserves_pagination_and_scope_evidence -- --nocapture
 then
   pagination_evidence_status="passed"
 else
@@ -313,7 +326,7 @@ fi
 
 if run_logged \
   dangerous_delete_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration invoke_rows_delete_tracks_async_mutation_evidence -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration invoke_rows_delete_tracks_async_mutation_evidence -- --nocapture
 then
   dangerous_delete_status="passed"
 else
@@ -323,7 +336,7 @@ fi
 
 if run_logged \
   compliance_evidence \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration introspection_emits_v3_compliance_evidence -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration introspection_emits_v3_compliance_evidence -- --nocapture
 then
   compliance_status="passed"
 else
@@ -333,7 +346,7 @@ fi
 
 if run_logged \
   integration_suite \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration -- --nocapture
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-integration" cargo test -p fcp-coda --test integration -- --nocapture
 then
   integration_suite_status="passed"
 else
@@ -343,7 +356,7 @@ fi
 
 if run_logged \
   crate_suite \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-crate" cargo test -p fcp-coda
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-crate" cargo test -p fcp-coda
 then
   crate_suite_status="passed"
 else
@@ -353,7 +366,7 @@ fi
 
 if run_logged \
   clippy \
-  env RCH_VISIBILITY=verbose rch exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-clippy" cargo clippy -p fcp-coda --all-targets -- -D warnings
+  env "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" RCH_FORCE_REMOTE=1 RCH_VISIBILITY=verbose "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 "CARGO_BUILD_JOBS=${BUILD_JOBS}" CARGO_TARGET_DIR="${REMOTE_TARGET_BASE}-clippy" cargo clippy -p fcp-coda --all-targets -- -D warnings
 then
   clippy_status="passed"
 else

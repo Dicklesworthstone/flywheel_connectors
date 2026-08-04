@@ -1,6 +1,6 @@
 # Browser Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/runtime drift documented
+> **Status**: runtime contract documented; manifest-derived operation metadata
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/browser_target_session_manager_verification.sh`
@@ -85,13 +85,13 @@ This README documents the runtime truth and keeps current drift visible:
 - Runtime `simulate` deserializes the request and unconditionally returns allowed; it does not check operation inventory, input shape, configured state, handshake state, capability token, or resource bindings.
 - Runtime verifies bound capability tokens with an empty resource URI list for every operation.
 - Manifest marks some risky browser operations as `requires_approval = "policy"` and dangerous operations as `interactive`.
-- Runtime introspection derives approval mode from safety tier, while direct invocation requires an `approval_token` only for the explicit execution-approval list.
+- Runtime introspection derives approval mode from manifest `requires_approval`, while direct invocation requires an `approval_token` only for the explicit execution-approval list.
 - `browser.navigate` and `browser.click` are risky operations but do not require a direct runtime `approval_token`.
 - `handle_shutdown()` reports shutdown status and signals the direct-CDP manager shutdown cleanup, but it does not fully clear stored config, client, verifier, or session state.
 - Manifest state hints mention browser profile state and page cache metadata, but the runtime session store in this slice is process-local.
 - The tracked target/session manager verification script covers direct-CDP manager JSONL evidence; there is still no full Browser connector verification bundle for every operation mode.
 
-A follow-up parity bead should make `simulate` enforce the same readiness and token checks as `invoke`, decide whether resource URI binding is required for browser targets, reconcile approval metadata with runtime enforcement, and clarify whether browser session objects need durable state.
+A follow-up parity bead should make `simulate` enforce the same readiness and token checks as `invoke`, decide whether resource URI binding is required for browser targets, reconcile manifest policy approval with runtime enforcement, and clarify whether browser session objects need durable state.
 
 ## First-Slice Scope
 
@@ -261,7 +261,7 @@ These are excluded on purpose:
 - control-mode split for direct CDP, proxy-capable `fcp-browser-control`, non-proxy workers, Rust-owned launcher fixture mode, and guarded native launcher mode
 - credential-reference degraded state when host token injection is required
 - sandbox, placement, network guard, and execution-planner profiles
-- operation metadata with capability, risk, safety tier, idempotency, approval mode, schemas, and hints
+- manifest-derived operation metadata with capability, risk, safety tier, idempotency, approval mode, schemas, and hints
 - bound capability-token verification during `invoke`
 - direct execution-approval token validation for JavaScript, form, cookies, session save/restore, and proxy changes
 - readable-content and document-output metadata caps

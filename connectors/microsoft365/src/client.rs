@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode, header};
 use tracing::warn;
@@ -262,13 +264,16 @@ impl M365Client {
         }
 
         let data = self
-            .execute(|| {
-                self.apply_auth(
-                    self.http
-                        .get(url.as_str())
-                        .header("ConsistencyLevel", "eventual"),
-                )
-            })
+            .execute(
+                || {
+                    self.apply_auth(
+                        self.http
+                            .get(url.as_str())
+                            .header("ConsistencyLevel", "eventual"),
+                    )
+                },
+                true,
+            )
             .await?;
         Ok(serde_json::from_value(data)?)
     }
@@ -590,7 +595,8 @@ impl M365Client {
             "startTime": start_time,
             "endTime": end_time,
         });
-        self.post_json(&url, &body).await
+        // Read-only POST: getSchedule queries availability and creates nothing.
+        self.post_json_replay_safe(&url, &body).await
     }
 
     // ── Tasks operations ─────────────────────────────────────────
@@ -832,11 +838,12 @@ impl M365Client {
     // ── HTTP helpers ─────────────────────────────────────────────
 
     async fn get(&self, url: &str) -> M365Result<serde_json::Value> {
-        self.execute(|| self.apply_auth(self.http.get(url))).await
+        self.execute(|| self.apply_auth(self.http.get(url)), true)
+            .await
     }
 
     async fn get_bytes(&self, url: &str) -> M365Result<Vec<u8>> {
-        self.execute_bytes(|| self.apply_auth(self.http.get(url)))
+        self.execute_bytes(|| self.apply_auth(self.http.get(url)), true)
             .await
     }
 
@@ -862,35 +869,58 @@ impl M365Client {
     }
 
     async fn get_text(&self, url: &str) -> M365Result<String> {
-        self.execute_text(|| self.apply_auth(self.http.get(url)))
+        self.execute_text(|| self.apply_auth(self.http.get(url)), true)
             .await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: fail-closed. The Graph POSTs behind this helper send mail
+    /// (`sendMail`, `reply`, `forward`) or create items, so a replay is
+    /// externally visible and irreversible. Read-only POSTs use
+    /// [`Self::post_json_replay_safe`].
     async fn post_json(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> M365Result<serde_json::Value> {
-        self.execute(|| self.apply_auth(self.http.post(url).json(body)))
+        self.execute(|| self.apply_auth(self.http.post(url).json(body)), false)
+            .await
+    }
+
+    /// POST whose replay cannot duplicate a side effect.
+    ///
+    /// Graph exposes some queries as POSTs because the request carries a body
+    /// (`calendar/getSchedule`); those create nothing.
+    async fn post_json_replay_safe(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> M365Result<serde_json::Value> {
+        self.execute(|| self.apply_auth(self.http.post(url).json(body)), true)
             .await
     }
 
     async fn post_json_no_content(&self, url: &str, body: &serde_json::Value) -> M365Result<()> {
-        self.execute_no_content(|| self.apply_auth(self.http.post(url).json(body)))
+        self.execute_no_content(|| self.apply_auth(self.http.post(url).json(body)), false)
             .await
     }
 
     async fn post_html(&self, url: &str, html: &str) -> M365Result<serde_json::Value> {
         let html = html.to_string();
-        self.execute(|| {
-            self.apply_auth(
-                self.http
-                    .post(url)
-                    .header(header::ACCEPT, "application/json")
-                    .header(header::CONTENT_TYPE, "text/html")
-                    .body(html.clone()),
-            )
-        })
+        // NOT replay-safe: creates a OneNote page.
+        self.execute(
+            || {
+                self.apply_auth(
+                    self.http
+                        .post(url)
+                        .header(header::ACCEPT, "application/json")
+                        .header(header::CONTENT_TYPE, "text/html")
+                        .body(html.clone()),
+                )
+            },
+            false,
+        )
         .await
     }
 
@@ -899,36 +929,41 @@ impl M365Client {
         url: &str,
         body: &serde_json::Value,
     ) -> M365Result<serde_json::Value> {
-        self.execute(|| self.apply_auth(self.http.patch(url).json(body)))
+        self.execute(|| self.apply_auth(self.http.patch(url).json(body)), true)
             .await
     }
 
     async fn patch_json_no_content(&self, url: &str, body: &serde_json::Value) -> M365Result<()> {
-        self.execute_no_content(|| self.apply_auth(self.http.patch(url).json(body)))
+        self.execute_no_content(|| self.apply_auth(self.http.patch(url).json(body)), true)
             .await
     }
 
     async fn put_bytes(&self, url: &str, content: &[u8]) -> M365Result<serde_json::Value> {
         let content = content.to_vec();
-        self.execute(|| {
-            self.apply_auth(
-                self.http
-                    .put(url)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .body(content.clone()),
-            )
-        })
+        // PUT of file content is idempotent: the same bytes to the same URL.
+        self.execute(
+            || {
+                self.apply_auth(
+                    self.http
+                        .put(url)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .body(content.clone()),
+                )
+            },
+            true,
+        )
         .await
     }
 
     async fn delete_no_content(&self, url: &str) -> M365Result<()> {
-        self.execute_no_content(|| self.apply_auth(self.http.delete(url)))
+        self.execute_no_content(|| self.apply_auth(self.http.delete(url)), true)
             .await
     }
 
     async fn execute(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> M365Result<serde_json::Value> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -943,10 +978,15 @@ impl M365Client {
                     match self.handle_error_status(status, &response, attempt).await {
                         ErrorAction::Return(err) => return AttemptOutcome::Terminal(err),
                         ErrorAction::Retry(err) => {
-                            return AttemptOutcome::Retryable {
-                                retry_after: err.retry_after(),
-                                error: err,
-                            };
+                            // 429 stays retryable — Graph throttled it WITHOUT
+                            // performing the work. A 5xx did reach Graph.
+                            let replayable = replay_safe || err.replay_is_safe();
+                            let retry_after = err.retry_after();
+                            return AttemptOutcome::retryable_if_replayable(
+                                err,
+                                retry_after,
+                                replayable,
+                            );
                         }
                         ErrorAction::Success => {}
                     }
@@ -959,10 +999,12 @@ impl M365Client {
                         Err(e) => AttemptOutcome::Terminal(M365Error::Http(e)),
                     }
                 }
-                Err(e) => AttemptOutcome::Retryable {
-                    retry_after: None,
-                    error: M365Error::Http(e),
-                },
+                // Only a connect-phase failure proves the request never
+                // reached Graph.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(M365Error::Http(e), None, replayable)
+                }
             }
         })
         .await
@@ -971,6 +1013,7 @@ impl M365Client {
     async fn execute_bytes(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> M365Result<Vec<u8>> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -985,10 +1028,15 @@ impl M365Client {
                     match self.handle_error_status(status, &response, attempt).await {
                         ErrorAction::Return(err) => return AttemptOutcome::Terminal(err),
                         ErrorAction::Retry(err) => {
-                            return AttemptOutcome::Retryable {
-                                retry_after: err.retry_after(),
-                                error: err,
-                            };
+                            // 429 stays retryable — Graph throttled it WITHOUT
+                            // performing the work. A 5xx did reach Graph.
+                            let replayable = replay_safe || err.replay_is_safe();
+                            let retry_after = err.retry_after();
+                            return AttemptOutcome::retryable_if_replayable(
+                                err,
+                                retry_after,
+                                replayable,
+                            );
                         }
                         ErrorAction::Success => {}
                     }
@@ -998,10 +1046,12 @@ impl M365Client {
                         Err(e) => AttemptOutcome::Terminal(M365Error::Http(e)),
                     }
                 }
-                Err(e) => AttemptOutcome::Retryable {
-                    retry_after: None,
-                    error: M365Error::Http(e),
-                },
+                // Only a connect-phase failure proves the request never
+                // reached Graph.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(M365Error::Http(e), None, replayable)
+                }
             }
         })
         .await
@@ -1010,6 +1060,7 @@ impl M365Client {
     async fn execute_text(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> M365Result<String> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -1024,10 +1075,15 @@ impl M365Client {
                     match self.handle_error_status(status, &response, attempt).await {
                         ErrorAction::Return(err) => return AttemptOutcome::Terminal(err),
                         ErrorAction::Retry(err) => {
-                            return AttemptOutcome::Retryable {
-                                retry_after: err.retry_after(),
-                                error: err,
-                            };
+                            // 429 stays retryable — Graph throttled it WITHOUT
+                            // performing the work. A 5xx did reach Graph.
+                            let replayable = replay_safe || err.replay_is_safe();
+                            let retry_after = err.retry_after();
+                            return AttemptOutcome::retryable_if_replayable(
+                                err,
+                                retry_after,
+                                replayable,
+                            );
                         }
                         ErrorAction::Success => {}
                     }
@@ -1037,10 +1093,12 @@ impl M365Client {
                         Err(e) => AttemptOutcome::Terminal(M365Error::Http(e)),
                     }
                 }
-                Err(e) => AttemptOutcome::Retryable {
-                    retry_after: None,
-                    error: M365Error::Http(e),
-                },
+                // Only a connect-phase failure proves the request never
+                // reached Graph.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(M365Error::Http(e), None, replayable)
+                }
             }
         })
         .await
@@ -1049,6 +1107,7 @@ impl M365Client {
     async fn execute_no_content(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> M365Result<()> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -1062,17 +1121,20 @@ impl M365Client {
                     let status = response.status();
                     match self.handle_error_status(status, &response, attempt).await {
                         ErrorAction::Return(err) => AttemptOutcome::Terminal(err),
-                        ErrorAction::Retry(err) => AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        },
+                        ErrorAction::Retry(err) => {
+                            let replayable = replay_safe || err.replay_is_safe();
+                            let retry_after = err.retry_after();
+                            AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                        }
                         ErrorAction::Success => AttemptOutcome::Success(()),
                     }
                 }
-                Err(e) => AttemptOutcome::Retryable {
-                    retry_after: None,
-                    error: M365Error::Http(e),
-                },
+                // Only a connect-phase failure proves the request never
+                // reached Graph.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(M365Error::Http(e), None, replayable)
+                }
             }
         })
         .await

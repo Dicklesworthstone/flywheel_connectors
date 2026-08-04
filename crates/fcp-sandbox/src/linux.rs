@@ -4,9 +4,15 @@
 //!
 //! 1. **seccomp-bpf**: Syscall filtering to block dangerous operations
 //! 2. **User namespaces**: UID/GID remapping for privilege separation
-//! 3. **Mount namespaces**: Filesystem isolation with bind mounts
+//! 3. **Mount namespaces**: `CLONE_NEWNS` isolation. NOTE: the current
+//!    implementation unshares the mount namespace but does NOT install bind
+//!    mounts or `pivot_root`, so it does not by itself confine filesystem
+//!    *paths*. Path confinement is delivered by Landlock (layer 5); when a
+//!    connector declares `fs_readonly_paths`/`fs_writable_paths` but Landlock
+//!    will not run, the sandbox fails closed rather than running unconfined.
 //! 4. **Network namespaces**: Network isolation (all traffic via Network Guard)
-//! 5. **Landlock** (optional, Linux 5.13+): Path-based access control
+//! 5. **Landlock** (optional, Linux 5.13+): Path-based access control — the
+//!    only wired path-confinement mechanism.
 //! 6. **rlimit**: Resource limits for memory, CPU time, file descriptors
 //!
 //! # Profile Mapping
@@ -17,6 +23,12 @@
 //! | strict_plus  | yes     | full       | required | microVM    |
 //! | moderate     | yes     | partial    | if avail | isolated   |
 //! | permissive   | minimal | none       | no       | shared     |
+//!
+//! When a policy declares filesystem path restrictions, path confinement
+//! requires Landlock to be both available and requested
+//! (`linux_use_landlock`); otherwise [`LinuxSandbox::apply`] and
+//! [`LinuxSandbox::apply_to_command`] fail closed. High-risk connectors that
+//! need guaranteed path confinement should run under the WASI runtime.
 
 #![cfg(target_os = "linux")]
 // Allow patterns common in low-level syscall/FFI code
@@ -759,9 +771,32 @@ impl Sandbox for LinuxSandbox {
         // Step 1: Apply resource limits
         self.apply_rlimits(policy)?;
 
-        // Step 2: Apply Landlock if available and requested
-        if self.landlock_available && policy.platform_flags.linux_use_landlock {
+        // Step 2: Apply Landlock, or fail closed if the policy declared
+        // filesystem restrictions we cannot actually enforce.
+        //
+        // Landlock is the only wired path-confinement mechanism on Linux:
+        // the mount namespace established via `apply_to_command` unshares
+        // CLONE_NEWNS but installs no bind mounts / pivot_root, and seccomp
+        // cannot filter `openat` by path. So if the connector declared
+        // `fs_readonly_paths` / `fs_writable_paths` but Landlock will not run
+        // (kernel < 5.13, or `linux_use_landlock` not requested), the
+        // declared confinement would be silently ignored — the connector
+        // could open arbitrary paths. Refuse rather than run unconfined
+        // (bead sandbox-linux-no-default-fs-confinement). High-risk
+        // connectors should run under the WASI runtime, whose FsCapabilityGate
+        // enforces path confinement independently of Landlock availability.
+        let landlock_will_apply =
+            self.landlock_available && policy.platform_flags.linux_use_landlock;
+        if landlock_will_apply {
             apply_landlock(policy)?;
+        } else if policy.declares_fs_path_restrictions() {
+            return Err(SandboxError::ApplyFailed(format!(
+                "connector declares filesystem path restrictions but no path-confinement \
+                 mechanism is active (landlock_available={}, linux_use_landlock={}); refusing \
+                 to run unconfined — enable Landlock (kernel 5.13+) or run this connector \
+                 under the WASI runtime",
+                self.landlock_available, policy.platform_flags.linux_use_landlock
+            )));
         }
 
         // Step 3: Apply seccomp filter (must be last as it restricts prctl)
@@ -781,6 +816,24 @@ impl Sandbox for LinuxSandbox {
         let policy_clone = policy.clone();
         let userns_available = self.userns_available;
         let landlock_available = self.landlock_available;
+
+        // Fail closed BEFORE registering pre_exec: the child closure cannot
+        // surface a rich error, and silently launching a connector that
+        // declared filesystem restrictions without a confinement mechanism is
+        // the bug this guards (bead sandbox-linux-no-default-fs-confinement).
+        // Same rationale as `apply`: Landlock is the only wired path-
+        // confinement mechanism; the unshared mount namespace installs no bind
+        // mounts, and seccomp cannot filter openat by path.
+        let landlock_will_apply = landlock_available && policy.platform_flags.linux_use_landlock;
+        if !landlock_will_apply && policy.declares_fs_path_restrictions() {
+            return Err(SandboxError::ApplyFailed(format!(
+                "connector declares filesystem path restrictions but no path-confinement \
+                 mechanism is active (landlock_available={landlock_available}, \
+                 linux_use_landlock={}); refusing to launch unconfined — enable Landlock \
+                 (kernel 5.13+) or run this connector under the WASI runtime",
+                policy.platform_flags.linux_use_landlock
+            )));
+        }
 
         // Pre-compute seccomp filter to avoid allocation in child
         let filter = self.build_seccomp_filter(policy);
@@ -1353,6 +1406,44 @@ mod tests {
         let sandbox = LinuxSandbox::new();
         assert!(sandbox.is_available());
         assert_eq!(sandbox.platform_name(), "linux");
+    }
+
+    /// bead sandbox-linux-no-default-fs-confinement: a policy that declares
+    /// filesystem path restrictions must NOT be launched unconfined. With
+    /// `linux_use_landlock` unset (the default), `apply_to_command` must fail
+    /// closed rather than register a pre_exec that never confines paths.
+    /// `apply_to_command` only *registers* the child hook, so the parent test
+    /// process is not mutated.
+    #[test]
+    fn apply_to_command_fails_closed_when_fs_restrictions_unenforced() {
+        let sandbox = LinuxSandbox::new();
+        // test_policy() declares readonly_paths and does not request Landlock.
+        let policy = test_policy();
+        assert!(policy.declares_fs_path_restrictions());
+        assert!(!policy.platform_flags.linux_use_landlock);
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        let err = sandbox.apply_to_command(&mut cmd, &policy).expect_err(
+            "declared fs restrictions without a confinement mechanism must fail closed",
+        );
+        assert!(matches!(err, SandboxError::ApplyFailed(_)), "got {err:?}");
+    }
+
+    /// The guard must NOT fire for a policy that declares no filesystem path
+    /// restrictions beyond the auto-added state dir — that would newly break
+    /// connectors that never asked to be path-confined.
+    #[test]
+    fn apply_to_command_allows_policy_without_fs_restrictions() {
+        let sandbox = LinuxSandbox::new();
+        let mut policy = test_policy();
+        policy.readonly_paths.clear();
+        policy.writable_paths = policy.state_dir.iter().cloned().collect();
+        assert!(!policy.declares_fs_path_restrictions());
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        sandbox
+            .apply_to_command(&mut cmd, &policy)
+            .expect("a policy with no declared fs restrictions must not fail closed");
     }
 
     #[test]

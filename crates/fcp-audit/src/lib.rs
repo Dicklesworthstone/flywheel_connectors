@@ -26,6 +26,7 @@ use fcp_crypto::{
     ed25519::SIGNATURE_SIZE as ED25519_SIGNATURE_SIZE,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use thiserror::Error;
 
@@ -940,18 +941,29 @@ impl ChainHead {
         self.coverage >= threshold
     }
 
-    /// Returns true iff this head carries at least one signature AND the
-    /// declared [`signature_count`](Self::signature_count) matches the actual
-    /// number of signatures present.
+    /// Returns true iff this head carries at least one signature, the declared
+    /// [`signature_count`](Self::signature_count) matches the actual number of
+    /// signatures present, AND every signature carries a distinct
+    /// `issuer_kid`.
     ///
     /// This method intentionally does NOT verify signatures cryptographically
     /// (that requires an issuer-key registry outside this crate's scope), but
-    /// it refuses to treat a producer-asserted numeric count as quorum when
-    /// no signatures are attached or when the count disagrees with the list.
+    /// it refuses to treat a producer-asserted numeric count as quorum when no
+    /// signatures are attached, when the count disagrees with the list, or when
+    /// the same signer appears more than once (which would let one key inflate
+    /// its way to any threshold). Cryptographic distinctness is enforced by
+    /// [`Self::verify_signatures`].
     #[must_use]
     pub fn has_quorum(&self) -> bool {
-        !self.signatures.is_empty()
-            && usize::try_from(self.signature_count).is_ok_and(|n| n == self.signatures.len())
+        if self.signatures.is_empty()
+            || !usize::try_from(self.signature_count).is_ok_and(|n| n == self.signatures.len())
+        {
+            return false;
+        }
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.signatures.len());
+        self.signatures
+            .iter()
+            .all(|sig| seen.insert(sig.issuer_kid.as_str()))
     }
 
     /// Returns true iff the declared [`signature_count`](Self::signature_count)
@@ -1051,6 +1063,10 @@ impl ChainHead {
             return Err(AuditError::EmptySignedHead { seq: self.head_seq });
         }
         let transcript = self.signing_bytes();
+        // Track resolved signer keys so a single key cannot satisfy an
+        // N-signer quorum by attaching the same signature N times — quorum is
+        // N *distinct* signers, not N signatures.
+        let mut seen_signers: HashSet<Vec<u8>> = HashSet::with_capacity(self.signatures.len());
         for sig in &self.signatures {
             let kid = KeyId::from_hex(&sig.issuer_kid)
                 .map_err(|_| AuditError::UnknownIssuer { seq: self.head_seq })?;
@@ -1058,6 +1074,9 @@ impl ChainHead {
                 key_lookup(&kid).ok_or(AuditError::UnknownIssuer { seq: self.head_seq })?;
             if verifying_key.key_id().as_slice() != kid.as_slice() {
                 return Err(AuditError::SignatureInvalid { seq: self.head_seq });
+            }
+            if !seen_signers.insert(kid.as_slice().to_vec()) {
+                return Err(AuditError::DuplicateSigner { seq: self.head_seq });
             }
             if sig.signature.is_empty() {
                 return Err(AuditError::EmptySignedHead { seq: self.head_seq });
@@ -2230,6 +2249,16 @@ pub enum AuditError {
         seq: u64,
     },
 
+    /// A quorum-signed head carried two or more signatures from the same
+    /// issuer key. Quorum requires N *distinct* signers; without a
+    /// distinctness check a single compromised key could inflate its
+    /// signature to satisfy any threshold.
+    #[error("duplicate quorum signer at seq {seq}")]
+    DuplicateSigner {
+        /// Sequence number of the head that carried a repeated signer.
+        seq: u64,
+    },
+
     /// Optimistic-CAS retry budget exhausted under same-zone
     /// contention (br-1a73y).
     ///
@@ -2272,6 +2301,7 @@ impl AuditError {
             Self::UnknownIssuer { .. } => "FCP-5017",
             Self::EmptySignedHead { .. } => "FCP-5018",
             Self::ContentionExhausted { .. } => "FCP-5019",
+            Self::DuplicateSigner { .. } => "FCP-5020",
         }
     }
 }
@@ -3380,6 +3410,79 @@ mod tests {
             matches!(result, Err(AuditError::EmptySignedHead { .. })),
             "expected EmptySignedHead for empty head signature, got {result:?}"
         );
+    }
+
+    #[test]
+    fn verify_signatures_rejects_duplicate_signer_inflating_quorum() {
+        // A single key must not satisfy an N-signer quorum by attaching the
+        // same valid signature N times: `verify_signatures` must reject the
+        // repeated signer, and `has_quorum` must not treat duplicate kids as a
+        // quorum.
+        let signing_key = Ed25519SigningKey::generate();
+        let verifying_key = signing_key.verifying_key();
+        let (_entries, mut head) = signed_chain_and_head(&signing_key);
+
+        // Set signature_count BEFORE computing the transcript: signing_bytes()
+        // commits to signature_count, so the signature must be over the count
+        // the verifier will recompute, otherwise SignatureInvalid fires first
+        // and masks the distinctness check under test.
+        head.signature_count = 3;
+
+        // One key signs the transcript; the same (kid, signature) is attached
+        // three times to fake a 3-signer quorum.
+        let transcript = head.signing_bytes();
+        let signature = signing_key.sign(&transcript);
+        let entry = HeadSignature {
+            issuer_kid: signing_key.key_id().to_hex(),
+            signature: signature.to_bytes().to_vec(),
+        };
+        head.signatures = vec![entry.clone(), entry.clone(), entry];
+
+        // Every individual signature is cryptographically valid, so the only
+        // thing standing between this and a forged quorum is the distinctness
+        // check.
+        let resolver =
+            |_kid: &KeyId| -> Option<Ed25519VerifyingKey> { Some(verifying_key.clone()) };
+        let result = head.verify_signatures(&resolver);
+        assert!(
+            matches!(result, Err(AuditError::DuplicateSigner { .. })),
+            "duplicate signer must be rejected, got {result:?}"
+        );
+
+        // Structural check (no crypto) must also refuse duplicate issuer_kids.
+        assert!(
+            !head.has_quorum(),
+            "has_quorum must not count repeated signers as a quorum"
+        );
+
+        // A genuinely distinct set of signers still verifies and has quorum.
+        let key_b = Ed25519SigningKey::generate();
+        let key_c = Ed25519SigningKey::generate();
+        head.signatures = vec![
+            HeadSignature {
+                issuer_kid: signing_key.key_id().to_hex(),
+                signature: signing_key.sign(&transcript).to_bytes().to_vec(),
+            },
+            HeadSignature {
+                issuer_kid: key_b.key_id().to_hex(),
+                signature: key_b.sign(&transcript).to_bytes().to_vec(),
+            },
+            HeadSignature {
+                issuer_kid: key_c.key_id().to_hex(),
+                signature: key_c.sign(&transcript).to_bytes().to_vec(),
+            },
+        ];
+        head.signature_count = 3;
+        let multi = std::collections::HashMap::from([
+            (signing_key.key_id().to_hex(), verifying_key.clone()),
+            (key_b.key_id().to_hex(), key_b.verifying_key()),
+            (key_c.key_id().to_hex(), key_c.verifying_key()),
+        ]);
+        let multi_resolver =
+            |kid: &KeyId| -> Option<Ed25519VerifyingKey> { multi.get(&kid.to_hex()).cloned() };
+        head.verify_signatures(&multi_resolver)
+            .expect("three distinct signers must verify");
+        assert!(head.has_quorum(), "three distinct signers form a quorum");
     }
 
     #[test]

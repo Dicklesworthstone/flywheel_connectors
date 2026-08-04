@@ -1,6 +1,6 @@
 # Tlon Connector V3 Contract
 
-> **Status**: implemented runtime surface; incubating provider maturity
+> **Status**: PROVEN runtime contract documented with remote Tlon verifier proof
 > **Bead**: `flywheel_connectors-6n7.18`
 > **Parent**: `flywheel_connectors-6n7`
 > **Verification script**: `scripts/e2e/tlon_connector_verification.sh`
@@ -11,7 +11,7 @@
 
 `fcp.tlon` exposes a credentialed Urbit Eyre channel runtime for Tlon and Urbit messaging. It supports direct-message send, channel send, and local target normalization through the FCP connector lifecycle and line-delimited JSON-RPC process loop.
 
-The runtime is implemented, but provider maturity is still incubating. It has loopback no-mock HTTP evidence against an Eyre-shaped server, not production evidence against a real Tlon or Urbit ship.
+The runtime contract is proven with remote verifier evidence, including loopback no-mock HTTP coverage against an Eyre-shaped server. It does not claim production evidence against a real Tlon or Urbit ship.
 
 ## Runtime Snapshot
 

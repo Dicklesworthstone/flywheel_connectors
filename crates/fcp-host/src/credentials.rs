@@ -21,6 +21,18 @@ const DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL: u32 = 5;
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: i64 = 60;
 const DEFAULT_QUOTA_COOLDOWN_SECS: i64 = 600;
 
+/// Upper bound on any credential cooldown window (7 days).
+///
+/// A provider `Retry-After` (or a direct caller-supplied duration) is clamped
+/// to this. Real providers never ask for more (Stripe's webhook retry horizon
+/// tops out around 3 days), and an unbounded value is a live panic vector:
+/// `chrono::Duration::from_std` accepts durations up to ~292 million years, but
+/// `DateTime<Utc> + Duration` panics (`checked_add_signed(..).expect(..)`) once
+/// the result exceeds `DateTime`'s ~year-262143 range, so a hostile
+/// `Retry-After` in that window would crash the host. Clamping keeps every
+/// cooldown deadline comfortably in range.
+const MAX_CREDENTIAL_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// Provider identifier for a credential pool.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1932,26 +1944,36 @@ fn cooldown_for_error(
     match kind {
         CredentialErrorKind::AuthFailed => Some(CredentialCooldown::Permanent),
         CredentialErrorKind::RateLimited => Some(CredentialCooldown::Until {
-            until: now + duration_from_std_or_secs(retry_after, DEFAULT_RATE_LIMIT_COOLDOWN_SECS),
+            until: cooldown_until(now, retry_after, DEFAULT_RATE_LIMIT_COOLDOWN_SECS),
         }),
         CredentialErrorKind::QuotaExhausted => Some(CredentialCooldown::Until {
-            until: now + duration_from_std_or_secs(retry_after, DEFAULT_QUOTA_COOLDOWN_SECS),
+            until: cooldown_until(now, retry_after, DEFAULT_QUOTA_COOLDOWN_SECS),
         }),
         CredentialErrorKind::RetryableProviderError => {
             retry_after.map(|retry_after| CredentialCooldown::Until {
-                until: now + Duration::from_std(retry_after).unwrap_or_else(|_| Duration::zero()),
+                until: cooldown_until(now, Some(retry_after), 0),
             })
         }
     }
 }
 
-fn duration_from_std_or_secs(retry_after: Option<StdDuration>, default_secs: i64) -> Duration {
-    retry_after.map_or_else(
-        || Duration::seconds(default_secs),
-        |retry_after| {
-            Duration::from_std(retry_after).unwrap_or_else(|_| Duration::seconds(default_secs))
-        },
-    )
+/// Compute a cooldown deadline `now + clamped(retry_after | default)`.
+///
+/// The delta is clamped to `[0, MAX_CREDENTIAL_COOLDOWN_SECS]` so that
+/// `DateTime + Duration` (which panics on overflow) can never be handed a
+/// value that exceeds `DateTime`'s range. The `checked_add_signed` fallback is
+/// belt-and-suspenders for the pathological case where `now` itself is already
+/// within the clamp window of `DateTime::MAX`.
+fn cooldown_until(
+    now: DateTime<Utc>,
+    retry_after: Option<StdDuration>,
+    default_secs: i64,
+) -> DateTime<Utc> {
+    let secs = retry_after.map_or(default_secs, |retry_after| {
+        i64::try_from(retry_after.as_secs()).unwrap_or(MAX_CREDENTIAL_COOLDOWN_SECS)
+    });
+    let delta = Duration::seconds(secs.clamp(0, MAX_CREDENTIAL_COOLDOWN_SECS));
+    now.checked_add_signed(delta).unwrap_or(now)
 }
 
 /// Parse an HTTP Retry-After value as seconds or an HTTP-date.
@@ -1962,8 +1984,14 @@ pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<StdDuration>
         return None;
     }
 
+    // Cap the parsed value: a `Retry-After` beyond the max cooldown window is
+    // hostile or buggy, and an uncapped value feeds the `DateTime + Duration`
+    // panic path downstream. `MAX_CREDENTIAL_COOLDOWN_SECS` is non-negative.
+    #[allow(clippy::cast_sign_loss)]
+    let max_secs = MAX_CREDENTIAL_COOLDOWN_SECS as u64;
+
     if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Some(StdDuration::from_secs(seconds));
+        return Some(StdDuration::from_secs(seconds.min(max_secs)));
     }
 
     let parsed = DateTime::parse_from_rfc2822(trimmed)
@@ -1972,7 +2000,10 @@ pub fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<StdDuration>
     if parsed <= now {
         return Some(StdDuration::ZERO);
     }
-    (parsed - now).to_std().ok()
+    (parsed - now)
+        .to_std()
+        .ok()
+        .map(|delta| delta.min(StdDuration::from_secs(max_secs)))
 }
 
 #[cfg(test)]
@@ -2981,6 +3012,41 @@ mod tests {
         pool.clear_cooldown(cred(0x01)).expect("manual clear");
         let primary = pool.acquire(now()).expect("primary restored");
         assert_eq!(primary.credential_id, cred(0x01));
+    }
+
+    #[test]
+    fn hostile_retry_after_is_clamped_and_never_panics() {
+        let now = now();
+
+        // A gigantic Retry-After seconds value fits in chrono::Duration but
+        // would overflow `DateTime + Duration` (panic). It must be clamped at
+        // parse time to at most the max cooldown window.
+        let parsed = parse_retry_after("100000000000000", now).expect("huge value parses");
+        assert!(
+            parsed <= StdDuration::from_secs(MAX_CREDENTIAL_COOLDOWN_SECS as u64),
+            "parse_retry_after must clamp hostile values, got {parsed:?}"
+        );
+
+        // Even if a direct caller bypasses parsing and hands cooldown_for_error
+        // an absurd duration, computing the deadline must not panic and must
+        // land within the clamp window.
+        let absurd = StdDuration::from_secs(u64::MAX);
+        for kind in [
+            CredentialErrorKind::RateLimited,
+            CredentialErrorKind::QuotaExhausted,
+            CredentialErrorKind::RetryableProviderError,
+        ] {
+            let cooldown = cooldown_for_error(kind, Some(absurd), now)
+                .expect("timed error kinds yield a cooldown");
+            let CredentialCooldown::Until { until } = cooldown else {
+                panic!("expected a bounded Until cooldown for {kind:?}");
+            };
+            let max_until = now + Duration::seconds(MAX_CREDENTIAL_COOLDOWN_SECS);
+            assert!(
+                until <= max_until && until >= now,
+                "cooldown for {kind:?} must be clamped in [now, now+max], got {until}"
+            );
+        }
     }
 
     #[test]

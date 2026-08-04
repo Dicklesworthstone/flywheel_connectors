@@ -51,6 +51,22 @@ impl DriveError {
         }
     }
 
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// Distinct from [`Self::is_retryable`]: a rate limit was refused WITHOUT
+    /// creating anything, so replaying is safe; a 5xx means Drive received the
+    /// request and may already have created the file or folder.
+    #[must_use]
+    pub fn replay_is_safe(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::Api { status_code, .. } => *status_code == 429,
+            Self::Http(e) => !fcp_sdk::migration::transport_error_reached_service(e),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {

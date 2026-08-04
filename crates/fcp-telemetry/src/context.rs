@@ -12,65 +12,58 @@
 //! - Trace flags (sampled, etc.)
 //! - Optional tracestate for vendor-specific context
 
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::Span;
 use uuid::Uuid;
 
-fn context_stacks() -> &'static Mutex<HashMap<String, Vec<Arc<TelemetryContext>>>> {
-    static STACKS: OnceLock<Mutex<HashMap<String, Vec<Arc<TelemetryContext>>>>> = OnceLock::new();
-    STACKS.get_or_init(|| Mutex::new(HashMap::new()))
+// A telemetry context is installed only for the duration of a single
+// `WithContext::poll` call, i.e. only while the owning future is executing
+// synchronously on the current OS thread. A thread-local stack is therefore
+// the correct store: every reader (`current_context()`) runs on the polling
+// thread, nested scopes push/pop in strict LIFO order, and no two
+// concurrently-scheduled tasks can ever observe each other's context.
+//
+// The previous design (a process-global map keyed by ambient task or thread
+// identity) allowed cross-task context bleed: asupersync `TaskId`s are only
+// unique within one runtime instance (and are arena-reused), so concurrent
+// runtimes — e.g. parallel `#[fcp_async_core::runtime::test]` tests — could
+// map distinct tasks to one shared slot, and no-`Cx` tasks multiplexed onto
+// the same worker thread shared a single thread-keyed slot (br-rkyb9).
+thread_local! {
+    static CONTEXT_STACK: RefCell<Vec<Arc<TelemetryContext>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-fn context_slot_key() -> String {
-    fcp_async_core::Cx::current().map_or_else(
-        || format!("thread:{:?}", std::thread::current().id()),
-        |cx| format!("task:{:?}", cx.task_id()),
-    )
+fn push_context(ctx: Arc<TelemetryContext>) {
+    CONTEXT_STACK.with(|stack| stack.borrow_mut().push(ctx));
 }
 
-fn push_context(ctx: Arc<TelemetryContext>) -> String {
-    let key = context_slot_key();
-    context_stacks()
-        .lock()
-        .entry(key.clone())
-        .or_default()
-        .push(ctx);
-    key
+fn pop_context() {
+    CONTEXT_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
 }
 
-fn pop_context(key: &str) {
-    let mut stacks = context_stacks().lock();
-    if let Some(stack) = stacks.get_mut(key) {
-        stack.pop();
-        if stack.is_empty() {
-            stacks.remove(key);
-        }
-    }
-}
-
-struct StackContextGuard {
-    key: String,
-}
+struct StackContextGuard;
 
 impl StackContextGuard {
     fn push_arc(ctx: Arc<TelemetryContext>) -> Self {
-        Self {
-            key: push_context(ctx),
-        }
+        push_context(ctx);
+        Self
     }
 }
 
 impl Drop for StackContextGuard {
     fn drop(&mut self) {
-        pop_context(&self.key);
+        pop_context();
     }
 }
 
@@ -731,13 +724,13 @@ where
 
 /// Get a clone of the current telemetry context.
 ///
-/// Returns `None` if no context is set.
+/// Returns `None` if no context is set. A context is "current" only while
+/// the enclosing [`with_context`] future is being polled on this thread;
+/// code running on other threads (or outside any `with_context` scope)
+/// observes `None`.
 #[must_use]
 pub fn current_context() -> Option<Arc<TelemetryContext>> {
-    context_stacks()
-        .lock()
-        .get(&context_slot_key())
-        .and_then(|stack| stack.last().cloned())
+    CONTEXT_STACK.with(|stack| stack.borrow().last().cloned())
 }
 
 /// Get the current correlation ID.
@@ -1683,6 +1676,58 @@ mod tests {
             Poll::Pending
         ));
         assert!(current_context().is_none());
+    }
+
+    /// Regression test for br-rkyb9: contexts installed by concurrently
+    /// running runtimes (the shape of parallel `#[runtime::test]` tests)
+    /// must never observe each other. The barrier guarantees both
+    /// `with_context` scopes are mid-poll at the same instant; under the
+    /// old process-global slot map, colliding slot keys made one task read
+    /// the other task's context.
+    #[test]
+    fn test_concurrent_runtimes_do_not_bleed_context() {
+        use std::future::poll_fn;
+        use std::sync::Barrier;
+
+        const ITERATIONS: usize = 32;
+
+        fn worker(zone: &'static str, barrier: Arc<Barrier>) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let runtime = fcp_async_core::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build fcp_async_core runtime");
+                for _ in 0..ITERATIONS {
+                    let barrier = Arc::clone(&barrier);
+                    let observed = runtime.block_on(with_context(
+                        TelemetryContext::new().zone_id(zone),
+                        async move {
+                            // Rendezvous while both scopes are mid-poll so
+                            // both contexts are installed concurrently.
+                            let mut synced = false;
+                            poll_fn(move |_| {
+                                if !synced {
+                                    synced = true;
+                                    barrier.wait();
+                                }
+                                Poll::Ready(())
+                            })
+                            .await;
+                            current_context().and_then(|ctx| ctx.zone_id.clone())
+                        },
+                    ));
+                    assert_eq!(observed, Some(zone.to_string()));
+                    let after = runtime.block_on(async { current_context() });
+                    assert!(after.is_none(), "context leaked past with_context scope");
+                }
+            })
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let a = worker("zone-a", Arc::clone(&barrier));
+        let b = worker("zone-b", barrier);
+        a.join().expect("worker a panicked");
+        b.join().expect("worker b panicked");
     }
 
     #[test]

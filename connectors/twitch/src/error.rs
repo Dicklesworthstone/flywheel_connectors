@@ -62,6 +62,22 @@ impl TwitchError {
         }
     }
 
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// Distinct from `is_retryable`: a rate-limited request was refused
+    /// WITHOUT being performed, so it stays safe to replay; a 5xx means the
+    /// service received the request and may already have applied it.
+    #[must_use]
+    pub fn replay_is_safe(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::Api { status, .. } => *status == 429,
+            Self::Http(e) => !fcp_sdk::migration::transport_error_reached_service(e),
+            _ => false,
+        }
+    }
+
     /// Suggested retry-after delay.
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {

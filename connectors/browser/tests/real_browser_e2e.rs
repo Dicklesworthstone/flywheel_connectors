@@ -16,7 +16,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -512,6 +512,11 @@ async fn run_live_browser_suite(
         json!({ "url": page_url, "wait_until": "networkidle", "timeout_ms": 10_000 }),
     )
     .await?;
+    logger.push(loopback_requests_log_entry(
+        correlation_id,
+        &evidence,
+        &site,
+    ));
     invoke_and_log(
         &connector,
         &signing_key,
@@ -533,6 +538,7 @@ async fn run_live_browser_suite(
     )
     .await?;
 
+    let readable_url = site.url("/readable-fixture");
     invoke_and_log(
         &connector,
         &signing_key,
@@ -540,10 +546,15 @@ async fn run_live_browser_suite(
         &mut logger,
         &evidence,
         "browser.navigate",
-        json!({ "url": site.url("/readable-fixture"), "wait_until": "load", "timeout_ms": 10_000 }),
+        json!({ "url": readable_url, "wait_until": "load", "timeout_ms": 10_000 }),
     )
     .await?;
-    invoke_and_log(
+    logger.push(loopback_requests_log_entry(
+        correlation_id,
+        &evidence,
+        &site,
+    ));
+    if let Err((mut logs, error)) = invoke_and_log(
         &connector,
         &signing_key,
         correlation_id,
@@ -552,7 +563,16 @@ async fn run_live_browser_suite(
         "browser.wait_for_selector",
         json!({ "selector": "#readable-fixture", "state": "visible", "timeout_ms": 5_000 }),
     )
-    .await?;
+    .await
+    {
+        logger.push(loopback_requests_log_entry(
+            correlation_id,
+            &evidence,
+            &site,
+        ));
+        logs.extend(logger.drain());
+        return Err((logs, error));
+    }
     let bounded_readable = invoke_and_log(
         &connector,
         &signing_key,
@@ -588,6 +608,7 @@ async fn run_live_browser_suite(
     )
     .await?;
 
+    let print_url = site.url("/print-fixture");
     invoke_and_log(
         &connector,
         &signing_key,
@@ -595,7 +616,7 @@ async fn run_live_browser_suite(
         &mut logger,
         &evidence,
         "browser.navigate",
-        json!({ "url": site.url("/print-fixture"), "wait_until": "load", "timeout_ms": 10_000 }),
+        json!({ "url": print_url, "wait_until": "load", "timeout_ms": 10_000 }),
     )
     .await?;
     invoke_and_log(
@@ -1120,7 +1141,10 @@ impl LaunchedBrowser {
 
         let port = wait_for_devtools_port(&mut child, &profile_dir).await?;
         let devtools_http_base = format!("http://127.0.0.1:{port}");
-        let page_websocket_url = discover_page_websocket_url(&devtools_http_base).await?;
+        let page_websocket_url = match create_page_websocket_url(&devtools_http_base).await {
+            Ok(page_websocket_url) => page_websocket_url,
+            Err(_) => discover_page_websocket_url(&devtools_http_base).await?,
+        };
 
         Ok(Self {
             child,
@@ -1842,6 +1866,39 @@ fn blocked_navigation_log_entry(correlation_id: &str) -> E2eLogEntry {
     )
 }
 
+fn loopback_requests_log_entry(
+    correlation_id: &str,
+    evidence: &OperationEvidenceContext,
+    site: &LoopbackSite,
+) -> E2eLogEntry {
+    operation_log_entry(
+        correlation_id,
+        "browser.loopback.requests",
+        HarnessStatus::Passed,
+        0,
+        json!({
+            "operation": "browser.loopback.requests",
+            "target_id": "loopback-site",
+            "target_id_hash": stable_hash(site.url("/").as_str()),
+            "endpoint_kind": evidence.endpoint_kind.as_str(),
+            "command_line": evidence.command_line.as_str(),
+            "git_revision": evidence.git_revision.as_str(),
+            "served_paths": site.request_paths(),
+            "url_redaction_decision": redact_url_for_artifact(site.url("/").as_str()),
+            "endpoint_policy_decision": "loopback_fixture",
+            "navigation_policy_decision": "not_applicable",
+            "retry_backoff": { "attempt": 0, "next_delay_ms": null },
+            "output": { "byte_count": 0 },
+            "cancellation_checkpoints": ["loopback_request_audit"],
+            "timeout_budget_ms": 0,
+            "no_orphan_task_shutdown_evidence": {
+                "harness_owned_processes": ["loopback_http_site"],
+                "status": "passed"
+            },
+        }),
+    )
+}
+
 fn evaluate_prerequisites<F>(
     env: &BTreeMap<String, String>,
     artifact_dir: &Path,
@@ -2311,6 +2368,11 @@ fn navigation_policy_decision_for_output(operation: &str, output: &Value) -> Val
 fn output_metrics(output: &Value) -> Value {
     json!({
         "byte_count": output.to_string().len(),
+        "title_chars": output.get("title").and_then(Value::as_str).map(str::len),
+        "title_hash": output
+            .get("title")
+            .and_then(Value::as_str)
+            .map(stable_hash),
         "image_bytes_base64": output.get("image_data").and_then(Value::as_str).map(str::len),
         "pdf_bytes_base64": output.get("pdf_data").and_then(Value::as_str).map(str::len),
         "width": output.get("width").and_then(Value::as_u64),
@@ -2328,6 +2390,7 @@ fn elapsed_ms(start: Instant) -> u64 {
 struct LoopbackSite {
     url_base: String,
     running: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -2340,10 +2403,15 @@ impl LoopbackSite {
             .map_err(|error| error.to_string())?;
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = Arc::clone(&running);
-        let handle = thread::spawn(move || serve_loopback(listener, thread_running));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            serve_loopback(listener, thread_running, thread_requests);
+        });
         Ok(Self {
             url_base: format!("http://{addr}"),
             running,
+            requests,
             handle: Some(handle),
         })
     }
@@ -2351,6 +2419,12 @@ impl LoopbackSite {
     #[must_use]
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.url_base, path)
+    }
+
+    fn request_paths(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .map_or_else(|_| Vec::new(), |requests| requests.clone())
     }
 }
 
@@ -2367,10 +2441,17 @@ impl Drop for LoopbackSite {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn serve_loopback(listener: TcpListener, running: Arc<AtomicBool>) {
+fn serve_loopback(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+) {
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => serve_loopback_request(stream),
+            Ok((stream, _)) => {
+                let request_log = Arc::clone(&requests);
+                thread::spawn(move || serve_loopback_request(stream, &request_log));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -2379,12 +2460,41 @@ fn serve_loopback(listener: TcpListener, running: Arc<AtomicBool>) {
     }
 }
 
-fn serve_loopback_request(mut stream: TcpStream) {
-    let mut buffer = [0_u8; 4096];
-    let n = stream.read(&mut buffer).unwrap_or(0);
-    let request = String::from_utf8_lossy(&buffer[..n]);
-    let path = request.split_whitespace().nth(1).unwrap_or("/");
-    let response = loopback_response_for_path(path);
+fn serve_loopback_request(mut stream: TcpStream, requests: &Mutex<Vec<String>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut request_bytes = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while request_bytes.len() < 16 * 1024 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                request_bytes.extend_from_slice(&buffer[..n]);
+                if request_bytes.windows(2).any(|window| window == b"\r\n") {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let Some(path) = parse_loopback_request_path(&request_bytes) else {
+        if let Ok(mut requests) = requests.lock() {
+            requests.push("[connection-without-request-line]".to_string());
+        }
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    };
+    if let Ok(mut requests) = requests.lock() {
+        requests.push(path.clone());
+    }
+    let response = loopback_response_for_path(&path);
     let wire_response = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nSet-Cookie: fcp_browser_e2e=loopback; Path=/; SameSite=Lax\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.status,
@@ -2394,6 +2504,20 @@ fn serve_loopback_request(mut stream: TcpStream) {
     );
     let _ = stream.write_all(wire_response.as_bytes());
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn parse_loopback_request_path(request_bytes: &[u8]) -> Option<String> {
+    let request = String::from_utf8_lossy(request_bytes);
+    let request_line = request
+        .lines()
+        .next()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let _version = parts.next()?;
+    matches!(method, "GET" | "HEAD").then(|| normalize_loopback_request_path(target))
 }
 
 struct LoopbackResponse {
@@ -2615,7 +2739,29 @@ fn loopback_site_serves_ready_page_and_joins_on_drop() {
 
     assert!(response.contains("HTTP/1.1 200 OK"));
     assert!(response.contains("id=\"ready\""));
+    assert_eq!(site.request_paths(), vec!["/"]);
     drop(site);
+}
+
+#[test]
+fn loopback_request_parser_keeps_distinct_paths() {
+    assert_eq!(
+        parse_loopback_request_path(b"GET /readable-fixture HTTP/1.1\r\nHost: 127.0.0.1\r\n"),
+        Some("/readable-fixture".to_string())
+    );
+    assert_eq!(
+        parse_loopback_request_path(
+            b"GET http://127.0.0.1:41831/print-fixture?download=1 HTTP/1.1\r\n"
+        ),
+        Some("/print-fixture".to_string())
+    );
+}
+
+#[test]
+fn loopback_request_parser_rejects_empty_connections() {
+    assert_eq!(parse_loopback_request_path(b""), None);
+    assert_eq!(parse_loopback_request_path(b"\r\n"), None);
+    assert_eq!(parse_loopback_request_path(b"GET"), None);
 }
 
 #[test]

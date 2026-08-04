@@ -775,16 +775,12 @@ async fn load_shedding_metrics_tracked() {
 
 #[fcp_async_core::runtime::test]
 async fn operation_timeout_triggers() {
-    // asupersync-uwp88: a sub-floor operation_timeout (the original 50ms) does
-    // not fire reliably against a competing op deadline. Keep the timeout above
-    // the ~250ms scheduler floor and the op sleep well beyond it (>600ms
-    // separation, sleep >300ms) so the timeout wins the race.
-    let layer = timeout_layer(Duration::from_millis(300));
+    let layer = timeout_layer(Duration::from_millis(50));
     let connector = ConnectorId::from_static("test:slow:1.0.0");
 
     let result: Result<(), ResilienceError<String>> = layer
         .execute(&connector, RequestPriority::Normal, "slow-op", async {
-            fcp_async_core::time::sleep(Duration::from_millis(1000)).await;
+            fcp_async_core::time::sleep(Duration::from_millis(200)).await;
             Ok(())
         })
         .await;
@@ -814,13 +810,8 @@ async fn operation_within_timeout_succeeds() {
 
 #[fcp_async_core::runtime::test]
 async fn timeout_counts_as_failure_for_circuit() {
-    // asupersync-uwp88: a sub-floor operation_timeout (the original 20ms) vs a
-    // 100ms op let the op finish first (success) so the circuit never opened.
-    // Keep the operation_timeout above the ~250ms scheduler floor and the op
-    // sleep far beyond it (>600ms separation, sleep >300ms) so each call
-    // reliably times out before completing.
     let layer = ResilienceLayer::new(ResilienceConfig {
-        operation_timeout: Some(Duration::from_millis(300)),
+        operation_timeout: Some(Duration::from_millis(20)),
         circuit_breaker: CircuitBreakerConfig {
             failure_threshold: 2,
             ..CircuitBreakerConfig::default()
@@ -833,7 +824,7 @@ async fn timeout_counts_as_failure_for_circuit() {
     for _ in 0..2 {
         let _: Result<(), ResilienceError<String>> = layer
             .execute(&connector, RequestPriority::Normal, "op", async {
-                fcp_async_core::time::sleep(Duration::from_millis(1000)).await;
+                fcp_async_core::time::sleep(Duration::from_millis(100)).await;
                 Ok(())
             })
             .await;
@@ -1067,12 +1058,8 @@ async fn composed_recovery_flow() {
 
 #[fcp_async_core::runtime::test]
 async fn metrics_track_all_outcomes() {
-    // asupersync-uwp88: an operation_timeout below the ~250ms scheduler floor
-    // gets clamped, so under concurrent test load a 20ms timeout vs a 100ms op
-    // could let the op finish first and the timeout went uncounted. Keep the
-    // timeout above the floor and the op sleep far beyond it.
     let layer = ResilienceLayer::new(ResilienceConfig {
-        operation_timeout: Some(Duration::from_millis(300)),
+        operation_timeout: Some(Duration::from_millis(20)),
         circuit_breaker: CircuitBreakerConfig {
             failure_threshold: 100, // high to avoid circuit interference
             ..CircuitBreakerConfig::default()
@@ -1091,7 +1078,7 @@ async fn metrics_track_all_outcomes() {
     // 1 timeout
     let _: Result<(), ResilienceError<String>> = layer
         .execute(&connector, RequestPriority::Normal, "slow", async {
-            fcp_async_core::time::sleep(Duration::from_millis(1000)).await;
+            fcp_async_core::time::sleep(Duration::from_millis(100)).await;
             Ok(())
         })
         .await;

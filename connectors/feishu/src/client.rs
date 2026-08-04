@@ -2,7 +2,10 @@
 
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
@@ -11,6 +14,56 @@ use std::{
     time::Duration,
 };
 use tracing::{debug, warn};
+use uuid::Uuid;
+
+/// Body field Feishu deduplicates messaging requests on.
+///
+/// Unlike Stripe's or Mastodon's header-based keys, Feishu takes the dedup
+/// value as a request-body field. Requests carrying the same value succeed at
+/// most once within an hour.
+const FEISHU_DEDUP_FIELD: &str = "uuid";
+
+/// Why replaying a Feishu POST cannot duplicate a side effect.
+///
+/// A 5xx or a timeout can both be reported after Feishu already acted, so
+/// retrying a POST needs one of these to hold (br-kxd3e).
+#[derive(Debug, Clone)]
+enum PostReplaySafety {
+    /// Feishu deduplicates on [`FEISHU_DEDUP_FIELD`]. Honoured by the message
+    /// send and reply endpoints.
+    DedupUuid(String),
+    /// Nothing to duplicate: either a read-only POST (Feishu models several
+    /// queries as `*_batch_query` POSTs) or an operation that converges on the
+    /// same state.
+    NothingToDuplicate,
+    /// No dedup mechanism, and a replay creates a second object.
+    NotSafe,
+}
+
+impl PostReplaySafety {
+    /// Mint a fresh dedup value for one logical send.
+    fn dedup_uuid() -> Self {
+        Self::DedupUuid(Uuid::new_v4().to_string())
+    }
+
+    /// Stamp the dedup value into the request body, if this endpoint takes one.
+    fn apply_to_body(&self, mut body: serde_json::Value) -> serde_json::Value {
+        if let Self::DedupUuid(value) = self
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                FEISHU_DEDUP_FIELD.to_owned(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+        body
+    }
+
+    /// Whether a request that reached Feishu may be sent again.
+    const fn is_replay_safe(&self) -> bool {
+        matches!(self, Self::DedupUuid(_) | Self::NothingToDuplicate)
+    }
+}
 
 use crate::error::{FeishuError, FeishuResult};
 use crate::types::{
@@ -190,7 +243,8 @@ impl FeishuClient {
         url.query_pairs_mut()
             .append_pair("receive_id_type", receive_id_type);
         let body = serde_json::to_value(req).map_err(FeishuError::Json)?;
-        self.post_api(runtime, &url, &body).await
+        self.post_api(runtime, &url, &body, PostReplaySafety::dedup_uuid())
+            .await
     }
 
     /// Reply to a message.
@@ -203,7 +257,8 @@ impl FeishuClient {
         let message_id = Self::sanitize_path_segment(message_id)?;
         let url = self.build_url(&["open-apis", "im", "v1", "messages", message_id, "reply"])?;
         let body = serde_json::to_value(req).map_err(FeishuError::Json)?;
-        self.post_api(runtime, &url, &body).await
+        self.post_api(runtime, &url, &body, PostReplaySafety::dedup_uuid())
+            .await
     }
 
     /// Get a message by ID.
@@ -338,8 +393,15 @@ impl FeishuClient {
             }],
             "with_url": true,
         });
-        let meta: DriveMetaBatchQueryResponse =
-            self.post_api(runtime, &meta_url, &meta_body).await?;
+        // Feishu models this lookup as a POST, but it only reads.
+        let meta: DriveMetaBatchQueryResponse = self
+            .post_api(
+                runtime,
+                &meta_url,
+                &meta_body,
+                PostReplaySafety::NothingToDuplicate,
+            )
+            .await?;
         let document = meta.metas.first().cloned().unwrap_or(DriveDocumentMeta {
             doc_token: Some(file_token.to_owned()),
             doc_type: Some(file_type.to_owned()),
@@ -361,11 +423,13 @@ impl FeishuClient {
             query.append_pair("file_type", file_type);
             query.append_pair("user_id_type", "open_id");
         }
+        // Also a read-only POST.
         let comment_batch: DriveCommentBatchQueryResponse = self
             .post_api(
                 runtime,
                 &comment_url,
                 &serde_json::json!({ "comment_ids": [comment_id] }),
+                PostReplaySafety::NothingToDuplicate,
             )
             .await?;
         let comment = comment_batch.items.first().cloned();
@@ -445,7 +509,9 @@ impl FeishuClient {
                 }],
             },
         });
-        self.post_api(runtime, &url, &body).await
+        // Drive comments take no dedup key, so a replay posts a second reply.
+        self.post_api(runtime, &url, &body, PostReplaySafety::NotSafe)
+            .await
     }
 
     /// Add a whole-document Feishu Drive comment.
@@ -472,7 +538,9 @@ impl FeishuClient {
                 "text": Self::escape_comment_text(text),
             }],
         });
-        self.post_api(runtime, &url, &body).await
+        // Same: a replay creates a SECOND comment on the document.
+        self.post_api(runtime, &url, &body, PostReplaySafety::NotSafe)
+            .await
     }
 
     /// Add or delete a Feishu Drive comment reaction.
@@ -502,7 +570,10 @@ impl FeishuClient {
             "reply_id": reply_id,
             "reaction_type": reaction_type,
         });
-        self.post_api(runtime, &url, &body).await
+        // The body names the target state (`action` is add or delete), so
+        // applying it twice converges rather than stacking.
+        self.post_api(runtime, &url, &body, PostReplaySafety::NothingToDuplicate)
+            .await
     }
 
     /// Health check: verify the Feishu API is reachable via token request.
@@ -606,17 +677,27 @@ impl FeishuClient {
     }
 
     /// Generic POST with API response extraction and retry.
+    ///
+    /// `replay_safety` states WHY replaying this POST cannot duplicate a side
+    /// effect — see [`PostReplaySafety`]. Every caller must supply one, so a
+    /// POST added later cannot inherit this retry loop without its author
+    /// deciding the question (br-kxd3e).
     async fn post_api<T: DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
         url: &Url,
         body: &serde_json::Value,
+        replay_safety: PostReplaySafety,
     ) -> FeishuResult<T> {
         let auth = format!("Bearer {}", self.ensure_tenant_access_token().await?);
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let url = url.to_string();
-        let body_clone = body.clone();
+        // The dedup key is stamped into the body ONCE, before the retry loop,
+        // so every attempt sends the same value. A per-attempt uuid would look
+        // like protection while providing exactly zero.
+        let body_clone = replay_safety.apply_to_body(body.clone());
+        let replay_safe = replay_safety.is_replay_safe();
         let client = self.client.clone();
         let token_cache = Arc::clone(&self.tenant_access_token);
 
@@ -633,10 +714,14 @@ impl FeishuClient {
                 let resp = match request.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: FeishuError::Http(e),
-                            retry_after: None,
-                        };
+                        // Only a connect-phase failure proves the request never
+                        // reached Feishu.
+                        let replayable = replay_safe || !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            FeishuError::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -676,10 +761,10 @@ impl FeishuClient {
                         message: text,
                     };
                     if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
+                        // A 5xx means Feishu RECEIVED the request and may have
+                        // acted on it. 429 is handled above, before this gate,
+                        // because it was refused without being performed.
+                        return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
                     }
                     return AttemptOutcome::Terminal(err);
                 }
@@ -695,10 +780,9 @@ impl FeishuClient {
                         message: api_resp.msg,
                     };
                     if err.is_retryable() {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
+                        // Feishu's own retryable application codes are returned
+                        // with HTTP 200, so the request definitely arrived.
+                        return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
                     }
                     return AttemptOutcome::Terminal(err);
                 }

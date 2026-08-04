@@ -24,14 +24,23 @@ use crate::{
 /// Default Pinecone control plane URL.
 pub const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.pinecone.io";
 
-/// Validate a path segment to prevent path traversal attacks.
+/// Validate a path segment to prevent path traversal and query/fragment
+/// injection. Pinecone index names are `[a-z0-9-]`-shaped, so rejecting slashes,
+/// any `..` substring, encoded slashes, and URL delimiters (`?`/`#`/`&`/`=`/`%`)
+/// never trips a legitimate name while stopping `x?y` (wrong-endpoint via query
+/// injection) and `..%2f..`.
 fn sanitize_path_segment(segment: &str) -> PineconeResult<&str> {
     if segment.trim().is_empty()
+        || segment == "."
         || segment.contains('/')
         || segment.contains('\\')
         || segment.contains('\0')
-        || segment == "."
-        || segment == ".."
+        || segment.contains("..")
+        || segment.contains('?')
+        || segment.contains('#')
+        || segment.contains('&')
+        || segment.contains('=')
+        || segment.contains('%')
     {
         return Err(PineconeError::InvalidInput(format!(
             "Invalid path segment: {segment}"

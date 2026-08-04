@@ -8,7 +8,9 @@ use serde_json::json;
 use tracing::debug;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{CloudflareError, CloudflareResult};
 use crate::types::*;
@@ -123,7 +125,7 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, "Verifying Cloudflare token");
                 let req = authenticate_request(client.get(&url), &auth);
-                handle_response::<VerifyToken>(req, attempt).await
+                handle_response::<VerifyToken>(req, attempt, true).await
             }
         })
         .await
@@ -242,7 +244,7 @@ impl CloudflareClient {
                 let req = authenticate_request(client.put(&url), &auth)
                     .header("Content-Type", "application/javascript")
                     .body(body);
-                handle_response::<WorkerScript>(req, attempt).await
+                handle_response::<WorkerScript>(req, attempt, true).await
             }
         })
         .await
@@ -364,7 +366,7 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, key = %key_log, "KV put");
                 let req = authenticate_request(client.put(&url), &auth).body(body);
-                handle_response::<serde_json::Value>(req, attempt).await
+                handle_response::<serde_json::Value>(req, attempt, true).await
             }
         })
         .await
@@ -425,12 +427,18 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET single");
                 let req = authenticate_request(client.get(&url), &auth);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: NOT replay-safe. Every caller of this helper CREATES a
+    /// resource and the provider offers no idempotency key, so a duplicate is a second DNS record.
+    /// Only a connect-phase failure is retried. A converging POST added
+    /// later needs its own helper rather than reusing this one.
     async fn post_json<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         runtime: &ConnectorRuntime,
@@ -450,7 +458,7 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "POST");
                 let req = authenticate_request(client.post(&url), &auth).json(&body);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, false).await
             }
         })
         .await
@@ -475,7 +483,7 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "PUT");
                 let req = authenticate_request(client.put(&url), &auth).json(&body);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -497,7 +505,7 @@ impl CloudflareClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "DELETE");
                 let req = authenticate_request(client.delete(&url), &auth);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -546,17 +554,26 @@ fn check_error_status<T>(
     None
 }
 
+/// Classify a response.
+///
+/// `replay_safe` gates only the post-transmission classes; the 429 arm stays
+/// retryable because the provider refused the request WITHOUT performing it
+/// (br-kxd3e).
 async fn handle_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, CloudflareError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: CloudflareError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(
+                CloudflareError::Http(e),
+                None,
+                replayable,
+            );
         }
     };
 
@@ -585,10 +602,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             message: sanitize_error_message(&text),
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }
@@ -639,6 +655,8 @@ async fn handle_list_response<T: serde::de::DeserializeOwned>(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            // Only a connect-phase failure proves the request never left us.
+            // Read path: always retryable.
             return AttemptOutcome::Retryable {
                 error: CloudflareError::Http(e),
                 retry_after: None,
@@ -665,6 +683,8 @@ async fn handle_list_response<T: serde::de::DeserializeOwned>(
             message: sanitize_error_message(&text),
         };
         if status >= 500 {
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
             return AttemptOutcome::Retryable {
                 error: err,
                 retry_after: None,

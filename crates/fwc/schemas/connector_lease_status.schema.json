@@ -3,26 +3,285 @@
   "$id": "fcp://schemas/fwc/connector-lease-status/truth-source-envelope/v1",
   "title": "FWC connector lease status truth-source envelope v1",
   "description": "Top-level provenance envelope for `fwc connector lease status --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "command", "subcommand", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "connector" },
-    "subcommand": { "const": "lease status" },
-    "schema_version": {
-      "enum": ["1.0.0", "fcp.fwc.truth-source.v1"]
-    },
-    "_truth_source": {
+  "oneOf": [
+    { "$ref": "#/$defs/connector_lease_status_success" },
+    { "$ref": "#/$defs/truth_source_unavailable_error" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
+  ],
+  "$defs": {
+    "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
-    "error": {
+    "truth_requirement": {
+      "type": "string",
+      "enum": ["mesh", "mesh-or-host", "any-live"]
+    },
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_string": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
+    "string_array": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "availability_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
+      "properties": {
+        "availability": { "$ref": "#/$defs/non_empty_string" },
+        "command": { "const": "connector" },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_selector", "slug", "canonical_id", "name", "version"],
+      "properties": {
+        "requested_selector": { "$ref": "#/$defs/non_empty_string" },
+        "slug": { "$ref": "#/$defs/non_empty_string" },
+        "canonical_id": { "$ref": "#/$defs/non_empty_string" },
+        "name": { "$ref": "#/$defs/non_empty_string" },
+        "version": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "context": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["type"],
+      "required": ["name"],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "name": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "ranked_holder": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["rank", "node", "node_id_hash"],
+      "properties": {
+        "rank": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "node": { "$ref": "#/$defs/non_empty_string" },
+        "node_id_hash": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "ranked_holders": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ranked_holder" }
+    },
+    "effective_target": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": true
+        },
+        { "type": "null" }
+      ]
+    },
+    "live_host": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["requested", "route_available"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "route_available": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/non_empty_string" },
+        "endpoint_hash": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "durable_validation": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "connector_lease_status_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "source",
+        "message",
+        "connector",
+        "zone_id",
+        "subject_id",
+        "purpose",
+        "holder_node_id_hash",
+        "fencing_token",
+        "expiry",
+        "quorum_signers_count",
+        "ranked_holders",
+        "effective_target",
+        "live_host",
+        "warnings",
+        "next_actions",
+        "_truth_source",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "lease status" },
+        "schema_version": { "const": "1.0.0" },
+        "source": {
+          "enum": ["offline-mesh-context", "host-admin-api"]
+        },
+        "host_payload_source": { "$ref": "#/$defs/non_empty_string" },
+        "host_registry_version": { "$ref": "#/$defs/non_empty_string" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "connector": { "$ref": "#/$defs/connector" },
+        "connector_id": { "$ref": "#/$defs/non_empty_string" },
+        "config_path": { "$ref": "#/$defs/non_empty_string" },
+        "current_context": { "$ref": "#/$defs/non_empty_string" },
+        "context": { "$ref": "#/$defs/context" },
+        "zone_id": { "$ref": "#/$defs/non_empty_string" },
+        "subject_id": { "$ref": "#/$defs/non_empty_string" },
+        "purpose": { "$ref": "#/$defs/non_empty_string" },
+        "holder_node_id_hash": { "$ref": "#/$defs/non_empty_string" },
+        "fencing_token": {
+          "anyOf": [
+            { "$ref": "#/$defs/non_empty_string" },
+            { "type": "null" }
+          ]
+        },
+        "expiry": { "$ref": "#/$defs/nullable_string" },
+        "durable_lease_seq": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            { "type": "null" }
+          ]
+        },
+        "quorum_signers_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "required_quorum_signers_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quorum_satisfied": { "type": "boolean" },
+        "durable_validation": { "$ref": "#/$defs/durable_validation" },
+        "lease_object_id": { "$ref": "#/$defs/nullable_string" },
+        "lease_evidence_source": { "$ref": "#/$defs/non_empty_string" },
+        "ranked_holders": { "$ref": "#/$defs/ranked_holders" },
+        "effective_target": { "$ref": "#/$defs/effective_target" },
+        "live_host": { "$ref": "#/$defs/live_host" },
+        "warnings": { "$ref": "#/$defs/string_array" },
+        "next_actions": { "$ref": "#/$defs/string_array" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "availability": { "$ref": "#/$defs/availability_envelope" }
+      }
+    },
+    "truth_source_unavailable_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "lease status" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": { "$ref": "#/$defs/truth_requirement" },
+            "actual": { "$ref": "#/$defs/truth_source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "connector" },
+        "subcommand": { "const": "lease status" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/string_array" }
       }
     }
   }

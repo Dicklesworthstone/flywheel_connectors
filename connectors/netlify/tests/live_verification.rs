@@ -103,46 +103,48 @@ async fn netlify_live_sandbox_deploy_listing_or_structured_skip_jsonl() {
 
     let signing_key = Ed25519SigningKey::generate();
     let connector = configured_connector(&env, &signing_key).await;
-    match connector.self_check().await {
-        Ok(report) => {
-            assert_eq!(
-                report.status,
-                SelfCheckStatus::Ok,
-                "Netlify sandbox self-check should pass"
-            );
-        }
-        Err(error) => {
-            emit_live_jsonl("failed", &error.to_string(), 0, &env.evidence_summary());
-            panic!("Netlify sandbox self-check failed: {error}");
-        }
+    let self_check = connector.self_check().await;
+    if let Err(error) = &self_check {
+        emit_live_jsonl("failed", &error.to_string(), 0, &env.evidence_summary());
     }
+    assert!(self_check.is_ok(), "Netlify sandbox self-check should pass");
+    let Ok(report) = self_check else {
+        return;
+    };
+    assert_eq!(
+        report.status,
+        SelfCheckStatus::Ok,
+        "Netlify sandbox self-check should pass"
+    );
 
     let site_id = env.env_vars.get(SITE_ID_ENV).expect("site id env is ready");
-    match invoke(
+    let deploy_listing = invoke(
         &connector,
         &signing_key,
         OP_DEPLOYS_LIST,
         json!({ "site_id": site_id }),
     )
-    .await
-    {
-        Ok(value) => {
-            let observed_count = value.as_array().map_or(0, Vec::len);
-            emit_live_jsonl(
-                "passed",
-                "",
-                observed_count,
-                &json!({
-                    "environment": env.evidence_summary(),
-                    "operation_result": "deploys.list completed",
-                }),
-            );
-        }
-        Err(error) => {
-            emit_live_jsonl("failed", &error.to_string(), 0, &env.evidence_summary());
-            panic!("Netlify sandbox deploy listing failed: {error}");
-        }
+    .await;
+    if let Err(error) = &deploy_listing {
+        emit_live_jsonl("failed", &error.to_string(), 0, &env.evidence_summary());
     }
+    assert!(
+        deploy_listing.is_ok(),
+        "Netlify sandbox deploy listing should pass"
+    );
+    let Ok(value) = deploy_listing else {
+        return;
+    };
+    let observed_count = value.as_array().map_or(0, Vec::len);
+    emit_live_jsonl(
+        "passed",
+        "",
+        observed_count,
+        &json!({
+            "environment": env.evidence_summary(),
+            "operation_result": "deploys.list completed",
+        }),
+    );
 }
 
 async fn configured_connector(
@@ -185,10 +187,8 @@ async fn configured_connector(
 }
 
 fn capability_for_operation(operation: &'static str) -> &'static str {
-    match operation {
-        OP_DEPLOYS_LIST => CAP_DEPLOYS_READ,
-        _ => panic!("unsupported operation {operation}"),
-    }
+    assert_eq!(operation, OP_DEPLOYS_LIST, "unsupported operation");
+    CAP_DEPLOYS_READ
 }
 
 fn capability_for(

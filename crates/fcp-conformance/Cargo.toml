@@ -70,6 +70,8 @@ fcp-host = { path = "../fcp-host" }
 fcp-oauth = { path = "../fcp-oauth" }
 fcp-sandbox = { path = "../fcp-sandbox" }
 fcp-streaming = { path = "../fcp-streaming" }
+fcp-sdk = { path = "../fcp-sdk" }
+fcp-provider-auth = { path = "../fcp-provider-auth" }
 fcp-audit = { path = "../fcp-audit" }
 fcp-policy = { path = "../fcp-policy" }
 fcp-kernel = { path = "../fcp-kernel" }

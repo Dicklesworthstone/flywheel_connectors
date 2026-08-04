@@ -390,7 +390,12 @@ async fn pinecone_allow_valid_token_connector_suite_passes() {
     let mut connector = PineconeConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["pinecone.query"]);
-    let token = build_token(&signing_key, "pinecone.query", &["pinecone.query"], connector.connector.instance_id().as_str());
+    let token = build_token(
+        &signing_key,
+        "pinecone.query",
+        &["pinecone.query"],
+        connector.connector.instance_id().as_str(),
+    );
     let invoke = invoke_request(
         "pinecone.query",
         json!({

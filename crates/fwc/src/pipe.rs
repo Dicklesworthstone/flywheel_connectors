@@ -60,12 +60,15 @@ pub struct MappingResult {
 ///
 /// Format: `"source.path -> target, source2 -> target2"`
 ///
+/// Commas inside double-quoted literal sources (e.g. `"hello, world" -> text`)
+/// do not split rules.
+///
 /// # Errors
 ///
 /// Returns an error if the operation fails.
 pub fn parse_map_expression(expr: &str) -> Result<MappingSpec, String> {
     let mut rules = Vec::new();
-    for segment in expr.split(',') {
+    for segment in split_top_level_commas(expr) {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
@@ -87,6 +90,29 @@ pub fn parse_map_expression(expr: &str) -> Result<MappingSpec, String> {
         return Err("no mapping rules found".to_owned());
     }
     Ok(MappingSpec { rules })
+}
+
+/// Split a map expression on commas that sit outside double-quoted spans.
+///
+/// Literal sources are written as double-quoted strings (see
+/// `resolve_source`), so a comma inside such a literal must not start a new
+/// mapping rule.
+fn split_top_level_commas(expr: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (idx, ch) in expr.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                segments.push(&expr[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&expr[start..]);
+    segments
 }
 
 /// Parse a JSON mapping file into a `MappingSpec`.
@@ -2090,6 +2116,30 @@ mod tests {
     fn parse_error_empty_expression() {
         let err = parse_map_expression("").unwrap_err();
         assert!(err.contains("no mapping rules"));
+    }
+
+    #[test]
+    fn parse_quoted_literal_with_comma() {
+        let spec = parse_map_expression("\"hello, world\" -> text, body -> desc").unwrap();
+        assert_eq!(spec.rules.len(), 2);
+        assert_eq!(spec.rules[0].source, "\"hello, world\"");
+        assert_eq!(spec.rules[0].target, "text");
+        assert_eq!(spec.rules[1].source, "body");
+        assert_eq!(spec.rules[1].target, "desc");
+    }
+
+    #[test]
+    fn parse_quoted_literal_with_multiple_commas() {
+        let spec = parse_map_expression("\"a, b, c\" -> tags").unwrap();
+        assert_eq!(spec.rules.len(), 1);
+        assert_eq!(spec.rules[0].source, "\"a, b, c\"");
+    }
+
+    #[test]
+    fn split_top_level_commas_basic() {
+        assert_eq!(split_top_level_commas("a, b"), vec!["a", " b"]);
+        assert_eq!(split_top_level_commas("\"a, b\""), vec!["\"a, b\""]);
+        assert_eq!(split_top_level_commas(""), vec![""]);
     }
 
     // ── parse_map_file ──────────────────────────────────────────────

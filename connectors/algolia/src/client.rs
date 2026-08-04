@@ -18,6 +18,30 @@ use crate::{
 /// The real URL is `https://{application_id}.algolia.net/1`.
 pub const DEFAULT_BASE_URL_TEMPLATE: &str = "https://{app_id}.algolia.net/1";
 
+/// Validate an Algolia application ID before it is interpolated into the
+/// request host (`https://{application_id}.algolia.net`).
+///
+/// Application IDs are short alphanumeric tokens (e.g. `LIA3RTV9ST`); only
+/// ASCII alphanumerics plus `-`/`_` are legitimate. Anything else (`.`, `/`,
+/// `\`, `@`, `:`, `?`, `#`, `%`, whitespace) could terminate or escape the
+/// intended host — e.g. `evil.com/` parses to host `evil.com` — redirecting the
+/// `X-Algolia-API-Key`-carrying request to an attacker-controlled server.
+fn validate_application_id(value: &str) -> AlgoliaResult<()> {
+    if value.is_empty() {
+        return Err(AlgoliaError::InvalidInput(
+            "application_id must not be empty".into(),
+        ));
+    }
+    for ch in value.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
+            return Err(AlgoliaError::InvalidInput(format!(
+                "application_id contains invalid character '{ch}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `Algolia` authentication credentials.
 #[derive(Clone)]
 pub struct AlgoliaAuth {
@@ -67,9 +91,11 @@ impl AlgoliaClient {
             .user_agent("fcp-algolia/0.1.0 (FCP connector)")
             .build()?;
 
-        let url = match base_url {
-            Some(u) => u.trim_end_matches('/').to_string(),
-            None => format!("https://{}.algolia.net/1", auth.application_id),
+        let url = if let Some(u) = base_url {
+            u.trim_end_matches('/').to_string()
+        } else {
+            validate_application_id(&auth.application_id)?;
+            format!("https://{}.algolia.net/1", auth.application_id)
         };
 
         Ok(Self {
@@ -253,6 +279,48 @@ fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> AlgoliaResult<&'a s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_new_rejects_host_injecting_application_id() {
+        // A crafted application_id must not break out of the
+        // `{application_id}.algolia.net` host and redirect the API-key-carrying
+        // request to an attacker-controlled server.
+        for evil in [
+            "evil.com/",
+            "evil.com\\",
+            "app.evil.com",
+            "app@evil.com",
+            "app:8080",
+            "app?x=1",
+            "app#frag",
+            "app%2f",
+            "app id",
+            "",
+        ] {
+            let auth = AlgoliaAuth {
+                application_id: evil.into(),
+                api_key: "KEY".into(),
+            };
+            assert!(
+                matches!(
+                    AlgoliaClient::new(auth, None),
+                    Err(AlgoliaError::InvalidInput(_))
+                ),
+                "application_id {evil:?} must be rejected"
+            );
+        }
+
+        for ok in ["APP123", "MY_APP", "test-app"] {
+            let auth = AlgoliaAuth {
+                application_id: ok.into(),
+                api_key: "KEY".into(),
+            };
+            assert!(
+                AlgoliaClient::new(auth, None).is_ok(),
+                "application_id {ok:?} must be accepted"
+            );
+        }
+    }
 
     #[test]
     fn auth_debug_redacts_key() {

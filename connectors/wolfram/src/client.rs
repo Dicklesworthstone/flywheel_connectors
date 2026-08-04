@@ -849,4 +849,31 @@ mod tests {
             "unsupported key should return internal error, got {err:?}"
         );
     }
+
+    #[fcp_async_core::runtime::test]
+    async fn transport_error_never_leaks_appid() {
+        const APP_ID: &str = "APPID-DEADBEEF-super-secret-key";
+        // Bind then drop a loopback socket so the port refuses connections
+        // deterministically. `query` sends GET /v2/query?input=..&appid=<APP_ID>;
+        // the connect failure yields a `reqwest::Error` carrying that URL, and
+        // the `appid` (API key) must never survive into any surfaced message.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let client = WolframClient::with_base_url(format!("http://127.0.0.1:{port}"));
+        let error = client
+            .query("2+2", APP_ID)
+            .await
+            .expect_err("connection to a closed loopback port must fail");
+
+        let display = error.to_string();
+        assert!(
+            !display.contains(APP_ID) && !display.contains("appid"),
+            "Display leaked the appid query: {display}"
+        );
+
+        let fcp = format!("{:?}", fcp_sdk::ConnectorErrorMapping::to_fcp_error(&error));
+        assert!(!fcp.contains(APP_ID), "FcpError leaked the appid: {fcp}");
+    }
 }

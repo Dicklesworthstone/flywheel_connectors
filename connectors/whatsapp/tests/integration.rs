@@ -1624,3 +1624,97 @@ async fn operation_mismatch_rejects_send_text() {
 
     assert!(matches!(result, Err(FcpError::OperationNotGranted { .. })));
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// The WhatsApp Cloud API has no idempotency key, so a 5xx retry delivers the
+// message a second time to a real person's phone. The assertion is the REQUEST
+// COUNT — "it still errors" would pass with the bug present.
+
+fn replay_test_client(server: &MockServer) -> WhatsAppClient {
+    WhatsAppClient::new(
+        &server.uri(),
+        PHONE_NUMBER_ID,
+        ACCESS_TOKEN,
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+    )
+    .expect("test client should initialize")
+}
+
+fn replay_test_runtime() -> fcp_sdk::ConnectorRuntime {
+    fcp_sdk::ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default())
+}
+
+/// A Meta-shaped 5xx. Using the real error envelope matters: the client parses
+/// it into `WhatsAppError::Api`, which is a DIFFERENT branch from a bodyless
+/// 5xx, and it is the branch production actually takes.
+fn meta_server_error() -> ResponseTemplate {
+    ResponseTemplate::new(503).set_body_json(json!({
+        "error": {
+            "message": "(#131026) Message undeliverable",
+            "type": "OAuthException",
+            "code": 131_026,
+            "fbtrace_id": "Az8n"
+        }
+    }))
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_text_message_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{PHONE_NUMBER_ID}/messages")))
+        .respond_with(meta_server_error())
+        .mount(&server)
+        .await;
+
+    let result = replay_test_client(&server)
+        .send_text_message(&replay_test_runtime(), "15551234567", "hello", false)
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Meta received the send — retrying delivers the message a \
+         SECOND time, and WhatsApp offers no idempotency key to prevent it"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_text_message_still_retries_a_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{PHONE_NUMBER_ID}/messages")))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{PHONE_NUMBER_ID}/messages")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messaging_product": "whatsapp",
+            "contacts": [{ "input": "15551234567", "wa_id": "15551234567" }],
+            "messages": [{ "id": "wamid.1" }]
+        })))
+        .mount(&server)
+        .await;
+
+    replay_test_client(&server)
+        .send_text_message(&replay_test_runtime(), "15551234567", "hello", false)
+        .await
+        .expect("a rate-limited send was refused without delivering anything");
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means the message was NOT sent, so backoff must be preserved"
+    );
+}

@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, Response, StatusCode, header};
 // tracing macros handled by RetryLoop internals
@@ -266,6 +268,7 @@ impl TwilioClient {
 
     /// Get a message by SID.
     pub async fn get_message(&self, message_sid: &str) -> TwilioResult<TwilioMessage> {
+        let message_sid = validate_sid(message_sid, "message_sid")?;
         let url = format!("{}/Messages/{message_sid}.json", self.base_url);
         let data = self.get(&url).await?;
         Ok(serde_json::from_value(data)?)
@@ -334,6 +337,7 @@ impl TwilioClient {
 
     /// Get a call by SID.
     pub async fn get_call(&self, call_sid: &str) -> TwilioResult<TwilioCall> {
+        let call_sid = validate_sid(call_sid, "call_sid")?;
         let url = format!("{}/Calls/{call_sid}.json", self.base_url);
         let data = self.get(&url).await?;
         Ok(serde_json::from_value(data)?)
@@ -341,6 +345,7 @@ impl TwilioClient {
 
     /// Hangup (end) a call by updating its status to "completed".
     pub async fn hangup_call(&self, call_sid: &str) -> TwilioResult<TwilioCall> {
+        let call_sid = validate_sid(call_sid, "call_sid")?;
         let url = format!("{}/Calls/{call_sid}.json", self.base_url);
         let payload = serde_json::json!({ "Status": "completed" });
         let data = self.post_form(&url, &payload).await?;
@@ -483,7 +488,16 @@ impl TwilioClient {
         recording_sid: &str,
         format: Option<&str>,
     ) -> TwilioResult<(String, String)> {
+        let recording_sid = validate_sid(recording_sid, "recording_sid")?;
+        // `ext` is interpolated into the request path; Twilio only serves mp3/wav
+        // recordings, so an allowlist both matches the API and prevents an
+        // attacker-supplied `format` (e.g. `mp3/../..`) from escaping the segment.
         let ext = format.unwrap_or("mp3");
+        if !matches!(ext, "mp3" | "wav") {
+            return Err(TwilioError::InvalidInput(
+                "recording format must be `mp3` or `wav`".into(),
+            ));
+        }
         let url = format!("{}/Recordings/{recording_sid}.{ext}", self.base_url);
         let data = self.get_bytes(&url).await?;
         let content_type = if ext == "wav" {
@@ -501,6 +515,8 @@ impl TwilioClient {
         message_sid: &str,
         media_sid: &str,
     ) -> TwilioResult<(String, String)> {
+        let message_sid = validate_sid(message_sid, "message_sid")?;
+        let media_sid = validate_sid(media_sid, "media_sid")?;
         let url = format!("{}/Messages/{message_sid}/Media/{media_sid}", self.base_url);
         let data = self.get_bytes(&url).await?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -516,6 +532,7 @@ impl TwilioClient {
         page_size: Option<u32>,
         page: Option<u32>,
     ) -> TwilioResult<MediaListResponse> {
+        let message_sid = validate_sid(message_sid, "message_sid")?;
         let base_url = format!("{}/Messages/{message_sid}/Media.json", self.base_url);
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(v) = page_size {
@@ -534,6 +551,8 @@ impl TwilioClient {
         message_sid: &str,
         media_sid: &str,
     ) -> TwilioResult<TwilioMediaResource> {
+        let message_sid = validate_sid(message_sid, "message_sid")?;
+        let media_sid = validate_sid(media_sid, "media_sid")?;
         let url = format!(
             "{}/Messages/{message_sid}/Media/{media_sid}.json",
             self.base_url
@@ -605,6 +624,7 @@ impl TwilioClient {
 
     /// Get a WhatsApp message by SID.
     pub async fn whatsapp_get(&self, message_sid: &str) -> TwilioResult<WhatsAppMessage> {
+        let message_sid = validate_sid(message_sid, "message_sid")?;
         let url = format!("{}/Messages/{message_sid}.json", self.base_url);
         let data = self.get(&url).await?;
         Ok(serde_json::from_value(data)?)
@@ -878,6 +898,7 @@ impl TwilioClient {
 
     /// Get a video room by SID or unique name.
     pub async fn get_video_room(&self, room_sid: &str) -> TwilioResult<TwilioVideoRoom> {
+        let room_sid = sanitize_path_segment(room_sid, "room_sid")?;
         let url = format!("{}/Rooms/{room_sid}", self.video_base_url);
         let data = self.get(&url).await?;
         Ok(serde_json::from_value(data)?)
@@ -903,6 +924,7 @@ impl TwilioClient {
 
     /// End a video room (set status to completed).
     pub async fn end_video_room(&self, room_sid: &str) -> TwilioResult<TwilioVideoRoom> {
+        let room_sid = sanitize_path_segment(room_sid, "room_sid")?;
         let url = format!("{}/Rooms/{room_sid}", self.video_base_url);
         let payload = serde_json::json!({
             "Status": "completed",
@@ -917,6 +939,7 @@ impl TwilioClient {
         room_sid: &str,
         status: Option<&str>,
     ) -> TwilioResult<VideoParticipantListResponse> {
+        let room_sid = sanitize_path_segment(room_sid, "room_sid")?;
         let base_url = format!("{}/Rooms/{room_sid}/Participants", self.video_base_url);
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(s) = status {
@@ -931,6 +954,7 @@ impl TwilioClient {
         &self,
         room_sid: &str,
     ) -> TwilioResult<VideoRecordingListResponse> {
+        let room_sid = sanitize_path_segment(room_sid, "room_sid")?;
         let url = format!("{}/Rooms/{room_sid}/Recordings", self.video_base_url);
         let data = self.get(&url).await?;
         Ok(serde_json::from_value(data)?)
@@ -939,7 +963,8 @@ impl TwilioClient {
     // ── HTTP helpers ─────────────────────────────────────────────
 
     async fn get(&self, url: &str) -> TwilioResult<serde_json::Value> {
-        self.execute(|| self.http.get(url)).await
+        // GET is idempotent.
+        self.execute(true, || self.http.get(url)).await
     }
 
     async fn get_with_params(
@@ -961,7 +986,8 @@ impl TwilioClient {
                 let _ = write!(url, "{key}={encoded}");
             }
         }
-        self.execute(|| self.http.get(&url)).await
+        // GET is idempotent.
+        self.execute(true, || self.http.get(&url)).await
     }
 
     async fn get_bytes(&self, url: &str) -> TwilioResult<Vec<u8>> {
@@ -1029,28 +1055,41 @@ impl TwilioClient {
         body: &serde_json::Value,
     ) -> TwilioResult<serde_json::Value> {
         let encoded = encode_form_body(&json_to_form_pairs(body));
-        self.execute(|| {
+        // NOT replay-safe: these POSTs send messages and place calls, and
+        // Twilio offers no idempotency key for them.
+        self.execute(false, || {
             self.http
                 .post(url)
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(encoded.clone())
         })
         .await
     }
 
     async fn delete(&self, url: &str) -> TwilioResult<()> {
-        let resp = self.execute(|| self.http.delete(url)).await;
+        // DELETE is idempotent per HTTP semantics.
+        let resp = self.execute(true, || self.http.delete(url)).await;
         match resp {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
+    /// Run a request under the retry policy.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a side
+    /// effect. It must be `false` for anything that creates a resource: Twilio
+    /// has no idempotency-key mechanism on the Messages or Calls APIs, so a
+    /// replayed `POST /Messages` sends a second SMS and bills for it. Only a
+    /// pre-transmission failure (a connect error) may be retried in that case.
+    ///
+    /// A 429 stays retryable regardless — Twilio rejects a rate-limited request
+    /// without performing it, so replaying it cannot duplicate anything.
+    ///
+    /// See br-kxd3e.
     async fn execute(
         &self,
+        replay_safe: bool,
         build_request: impl Fn() -> reqwest::RequestBuilder,
     ) -> TwilioResult<serde_json::Value> {
         let ctx = self.runtime.request_context();
@@ -1085,14 +1124,17 @@ impl TwilioClient {
 
                     if status.is_server_error() {
                         let body = response.text().await.unwrap_or_default();
-                        return AttemptOutcome::Retryable {
-                            error: TwilioError::Api {
+                        // A 5xx means Twilio RECEIVED the request; the message
+                        // may already have been queued for delivery.
+                        return AttemptOutcome::retryable_if_replayable(
+                            TwilioError::Api {
                                 message: format!("Server error {status}: {body}"),
                                 status_code: Some(status.as_u16()),
                                 error_code: None,
                             },
-                            retry_after: None,
-                        };
+                            None,
+                            replay_safe,
+                        );
                     }
 
                     if !status.is_success() {
@@ -1122,10 +1164,13 @@ impl TwilioClient {
                         Err(e) => AttemptOutcome::Terminal(TwilioError::Http(e)),
                     }
                 }
-                Err(e) => AttemptOutcome::Retryable {
-                    retry_after: None,
-                    error: TwilioError::Http(e),
-                },
+                // Only a connect-phase failure proves the request never left
+                // the client; `is_timeout()` covers the TOTAL request timeout,
+                // which fires after the body was fully sent.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(TwilioError::Http(e), None, replayable)
+                }
             }
         })
         .await
@@ -1154,6 +1199,58 @@ fn ensure_whatsapp_prefix(number: &str) -> String {
     } else {
         format!("whatsapp:{number}")
     }
+}
+
+/// Validate a Twilio resource SID before interpolating it into a request path.
+///
+/// Twilio SIDs are a 2-letter prefix followed by 32 hex characters — strictly
+/// `[A-Za-z0-9]`. Callers reach these values through `require_str`, which does
+/// no charset validation, so a `message_sid`/`call_sid`/`media_sid` such as
+/// `../Calls/CAxxxx` (or `REALID/actions/hangup#`) would normalize to a
+/// different resource or action than intended (e.g. a "get message" request
+/// reading a call, or an "answer" turning into a "hangup"). Rejecting any
+/// non-alphanumeric byte keeps every request pinned to the addressed resource.
+fn validate_sid<'a>(value: &'a str, field: &str) -> TwilioResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(TwilioError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    if trimmed.len() > 64 || !trimmed.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(TwilioError::InvalidInput(format!(
+            "{field} must be an alphanumeric Twilio SID"
+        )));
+    }
+    Ok(trimmed)
+}
+
+/// Validate a value that may be a Twilio SID *or* a resource unique name (such
+/// as a Video Room `UniqueName`), rejecting only the characters that would let
+/// it escape its URL path segment. Unlike [`validate_sid`], this permits the
+/// `-`/`_`/`.` that unique names may contain while still blocking traversal
+/// (`/`, `\`, `..`, encoded slashes) and query/fragment injection (`?`, `#`).
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> TwilioResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(TwilioError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(TwilioError::InvalidInput(format!(
+            "{field} contains path traversal or URL control characters"
+        )));
+    }
+    Ok(trimmed)
 }
 
 /// Flatten a `serde_json::Value` map into `application/x-www-form-urlencoded`
@@ -1222,6 +1319,36 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn validate_sid_rejects_cross_resource_traversal() {
+        for bad in [
+            "",
+            "   ",
+            "../Calls/CAxxxxxxxx",
+            "REALID/actions/hangup",
+            "SID#frag",
+            "SID?x=y",
+            "a/b",
+            "a\\b",
+            "MM..2f..2f",
+            &"M".repeat(65),
+        ] {
+            assert!(
+                validate_sid(bad, "message_sid").is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+        // Real 34-character Twilio SIDs pass (trimmed).
+        assert_eq!(
+            validate_sid("MM0123456789abcdef0123456789abcdef", "message_sid").unwrap(),
+            "MM0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            validate_sid(" CA0123456789abcdef0123456789abcdef ", "call_sid").unwrap(),
+            "CA0123456789abcdef0123456789abcdef"
+        );
+    }
 
     enum TestHttpBody {
         Json(serde_json::Value),

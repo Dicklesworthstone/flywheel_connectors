@@ -4,7 +4,10 @@
 //! All requests require the server password as a query parameter.
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::{Client, Method, Url, multipart};
 use serde_json::{Value, json};
@@ -1544,10 +1547,16 @@ impl BlueBubblesClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: BlueBubblesError::from_transport_error(e),
-                            retry_after: None,
-                        };
+                        // br-kxd3e: only a connect-phase failure proves the
+                        // send never reached BlueBubbles. See the note on the
+                        // 5xx arm below for why `tempGuid` does not license a
+                        // post-transmission replay.
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            BlueBubblesError::from_transport_error(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -1572,15 +1581,24 @@ impl BlueBubblesClient {
 
                 if !resp.status().is_success() {
                     let text = resp.text().await.unwrap_or_default();
-                    let decision = classify_http_status(status, None);
-                    let err = BlueBubblesError::from_api_response(status, &text);
-                    if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
-                    }
-                    return AttemptOutcome::Terminal(err);
+                    // br-kxd3e: every remaining retryable class here is a 5xx,
+                    // which means BlueBubbles received the send and may already
+                    // have delivered the message.
+                    //
+                    // This request DOES carry a stable `tempGuid` across
+                    // attempts, and an earlier pass through this sweep recorded
+                    // that as making the retry safe. That was an assumption, not
+                    // a verified fact: BlueBubbles documents `tempGuid` as a
+                    // client-side correlation id so a client can match its own
+                    // optimistic entry, NOT as a server-side deduplication key.
+                    // Nothing in this repo or in the API establishes that a
+                    // repeat of the same tempGuid is refused. Since the failure
+                    // mode is a duplicate iMessage to a real person, this fails
+                    // closed; the tempGuid is kept because it is still correct
+                    // and costs nothing. 429 is handled above, before this gate.
+                    return AttemptOutcome::Terminal(BlueBubblesError::from_api_response(
+                        status, &text,
+                    ));
                 }
 
                 match decode_json::<SendMessageResponse>(resp).await {

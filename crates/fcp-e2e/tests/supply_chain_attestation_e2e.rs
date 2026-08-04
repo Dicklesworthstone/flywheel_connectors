@@ -161,6 +161,19 @@ fn tuf_metadata_signature(signed: &Value, signing_key: &Ed25519SigningKey) -> St
     hex_lower(&signing_key.sign(&signed_bytes).to_bytes())
 }
 
+/// Build a TUF `meta` entry pinning a role file's version, length, and hash.
+fn tuf_meta_entry(version: u32, role_bytes: &[u8]) -> Value {
+    let hash = hash_sha256_prefixed(role_bytes)
+        .strip_prefix("sha256:")
+        .expect("sha256 prefix")
+        .to_string();
+    json!({
+        "version": version,
+        "length": role_bytes.len(),
+        "hashes": { "sha256": hash },
+    })
+}
+
 fn find_cosign() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("COSIGN_BIN") {
         let path = PathBuf::from(path);
@@ -361,14 +374,12 @@ fn write_tuf_metadata(
         }),
     );
     let mut roles = serde_json::Map::new();
-    roles.insert(
-        "root".to_string(),
-        json!({ "keyids": [key_id], "threshold": 1 }),
-    );
-    roles.insert(
-        "targets".to_string(),
-        json!({ "keyids": [key_id], "threshold": 1 }),
-    );
+    for role in ["root", "targets", "snapshot", "timestamp"] {
+        roles.insert(
+            role.to_string(),
+            json!({ "keyids": [key_id], "threshold": 1 }),
+        );
+    }
 
     let root_signed = json!({
         "_type": "root",
@@ -388,7 +399,7 @@ fn write_tuf_metadata(
     let targets_signed = json!({
         "_type": "targets",
         "version": 1,
-        "expires": expires,
+        "expires": expires.clone(),
         "targets": {
             target_path: {
                 "length": target_len,
@@ -401,11 +412,44 @@ fn write_tuf_metadata(
         "signed": targets_signed,
         "signatures": [{ "keyid": key_id, "sig": targets_signature }]
     });
+    let targets_bytes = serde_json::to_vec_pretty(&targets_json).expect("targets json");
+    std::fs::write(metadata_dir.join("targets.json"), &targets_bytes)
+        .expect("write targets metadata");
+
+    // snapshot vouches for targets.json, timestamp vouches for snapshot.json:
+    // the full TUF role chain the LocalTufVerifier walks. Each is written
+    // after the file it pins so the declared length/hash match on-disk bytes.
+    let snapshot_signed = json!({
+        "_type": "snapshot",
+        "version": 1,
+        "expires": expires.clone(),
+        "meta": { "targets.json": tuf_meta_entry(1, &targets_bytes) },
+    });
+    let snapshot_signature = tuf_metadata_signature(&snapshot_signed, &tuf_signing_key);
+    let snapshot_json = json!({
+        "signed": snapshot_signed,
+        "signatures": [{ "keyid": key_id, "sig": snapshot_signature }]
+    });
+    let snapshot_bytes = serde_json::to_vec_pretty(&snapshot_json).expect("snapshot json");
+    std::fs::write(metadata_dir.join("snapshot.json"), &snapshot_bytes)
+        .expect("write snapshot metadata");
+
+    let timestamp_signed = json!({
+        "_type": "timestamp",
+        "version": 1,
+        "expires": expires,
+        "meta": { "snapshot.json": tuf_meta_entry(1, &snapshot_bytes) },
+    });
+    let timestamp_signature = tuf_metadata_signature(&timestamp_signed, &tuf_signing_key);
+    let timestamp_json = json!({
+        "signed": timestamp_signed,
+        "signatures": [{ "keyid": key_id, "sig": timestamp_signature }]
+    });
     std::fs::write(
-        metadata_dir.join("targets.json"),
-        serde_json::to_vec_pretty(&targets_json).expect("targets json"),
+        metadata_dir.join("timestamp.json"),
+        serde_json::to_vec_pretty(&timestamp_json).expect("timestamp json"),
     )
-    .expect("write targets metadata");
+    .expect("write timestamp metadata");
 
     let pinned = TufRootMetadata {
         version: 1,
@@ -701,6 +745,12 @@ fn supply_chain_attestation_e2e() {
             require_tuf: true,
             require_sigstore: true,
             require_transparency: false,
+            // Owner-side attestation floor, enforced independently of the
+            // connector manifest's own [policy] table (br-g7jhf finding 1).
+            require_attestation_types: vec![AttestationType::InToto],
+            min_slsa_level: Some(2),
+            trusted_builders: vec![BUILDER_ID.to_string()],
+            require_attestation_expiry: true,
         },
     );
     let bundle = ConnectorBundle {

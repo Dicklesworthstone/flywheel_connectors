@@ -22,6 +22,7 @@ workspace = true
 [dependencies]
 fcp-async-core = { workspace = true }
 fcp-core = { workspace = true }
+fcp-manifest = { workspace = true }
 fcp-openai-compat = { workspace = true }
 fcp-prelude = { workspace = true }
 

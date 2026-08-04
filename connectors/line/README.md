@@ -1,6 +1,6 @@
 # LINE Connector V3 Contract
 
-> **Status**: implemented first-slice contract
+> **Status**: PROVEN
 > **Bead**: `flywheel_connectors-j05nu.8.6.1`
 > **Unblocks**: `flywheel_connectors-j05nu.8.6.2`
 > **Verification script**: `scripts/e2e/line_connector_verification.sh`
@@ -37,7 +37,7 @@ Important implementation truths from `connector.rs`, `client.rs`, and `manifest.
 - Configuration is `base_url`, `channel_access_token`, retry policy, and bounded `request_timeout_ms`.
 - The connector is bound to one Messaging API channel through one pre-issued channel access token.
 - The runtime now requires a non-empty `channel_access_token`; secretless proxy-injected auth is no longer accepted for this connector slice.
-- The accepted production API root is `https://api.line.me`, and configure-time validation now rejects non-LINE hosts while still allowing `localhost` and `127.0.0.1` overrides for test harnesses.
+- The accepted production API root is `https://api.line.me`, and manifest operation constraints deny localhost, private-range, tailnet-range, and IP-literal targets. Deterministic verifier mock servers are an explicit harness concern, not part of the graduated operation network policy.
 - `line.health` and `self_check()` are grounded in `GET /v2/bot/info`, and the readiness surface now emits operator guidance, verification-script references, provisioning details, and structured self-check evidence.
 - `line.messages.reply` depends on a reply token supplied from an external webhook flow, but the connector itself doesn't receive webhooks, verify signatures, or persist webhook state.
 - `line.messages.multicast` is implemented only for user IDs, not group chats or multi-person chats.
@@ -114,7 +114,7 @@ This slice is intentionally closer to "outbound bot operations" than to "complet
 | `line.menu.read` | Rich-menu listing |
 | `line.menu.write` | Rich-menu creation and deletion |
 
-## Accepted Operation Inventory
+## Operation Inventory
 
 | Operation | Endpoint shape | Capability | SafetyTier | RiskLevel | Idempotency | Notes |
 |-----------|----------------|------------|------------|-----------|-------------|-------|
@@ -174,17 +174,17 @@ The readiness closeout bead for this connector surface is `flywheel_connectors-j
 
 Operator guidance for verification:
 
-- Prefer a disposable LINE bot channel or a localhost mock server before exercising push, reply, multicast, or rich-menu mutations.
-- Keep one connector instance bound to one `channel_access_token`, and keep `base_url` on `https://api.line.me` unless the verification bundle is pointed at `localhost` or `127.0.0.1`.
+- Prefer a disposable LINE bot channel before exercising push, reply, multicast, or rich-menu mutations. Use localhost mock servers only inside the verifier harness, not as the graduated operation network policy.
+- Keep one connector instance bound to one `channel_access_token`, and keep live `base_url` on `https://api.line.me`.
 - Redact channel access tokens, Authorization headers, reply tokens, user IDs, group IDs, room IDs, `richMenuId` values, picture URLs, and copied request logs before sharing artifacts.
 - Treat `line.messages.reply` as dependent on a fresh webhook-sourced reply token that the connector itself does not mint or persist.
 - Common remediation:
   - `not_configured`: configure `channel_access_token`, timeout, retry policy, and a valid `base_url`, then rerun `self_check`.
   - `line_auth_rejected`: replace the token and confirm `GET /v2/bot/info` succeeds.
   - `reply_token_invalid_or_expired`: capture a fresh webhook event and rerun the reply path immediately.
-  - `membership_tier_restricted`: verify the official-account tier supports group member enumeration or rerun the pagination coverage against a localhost mock.
+  - `membership_tier_restricted`: verify the official-account tier supports group member enumeration or rerun the pagination coverage through the verifier mock harness.
   - `self_check_retryable`: wait for LINE to recover or increase timeout / retry settings before rerunning the verification bundle.
-  - `network_constraints_invalid`: use `https://api.line.me` for live runs or an explicit localhost override for deterministic tests.
+  - `network_constraints_invalid`: use `https://api.line.me` for live runs; mock-server localhost overrides are verifier-only.
 
 ## Verification Bundle
 
@@ -194,7 +194,7 @@ It writes replayable artifacts under `artifacts/e2e/line_connector/<timestamp>` 
 ## Operator Guidance
 
 Prerequisites:
-- Use a disposable LINE channel or localhost mock server, and avoid shared production channels for verification.
+- Use a disposable LINE channel for live verification, and avoid shared production channels. Localhost mock servers are reserved for deterministic verifier harness coverage.
 - Configure a dedicated channel access token for the target environment and keep the token/channel pairing stable while gathering evidence.
 - If you need reply-path evidence, obtain a fresh webhook-sourced `replyToken` from an external receiver because this connector does not ingest webhooks.
 
@@ -206,7 +206,7 @@ Redaction rules:
 - Treat bot display names, group names, message text, and chat-bar text as potentially sensitive operational data.
 
 Common remediation:
-- If `configure` rejects `base_url`, use `https://api.line.me` for live runs or `http://localhost` / `http://127.0.0.1` for deterministic mock-server tests.
+- If `configure` rejects `base_url`, use `https://api.line.me` for live runs; deterministic mock-server tests should stay inside the verifier harness.
 - If `self_check` reports `line_auth_rejected`, rotate the token and confirm `GET /v2/bot/info` succeeds for the intended channel.
 - If `line.group.members` fails in live verification, assume official-account tier restrictions first and fall back to the mock-server pagination test for deterministic coverage.
 - If verification hits 429s or transport timeouts, respect the upstream backoff window, lower concurrency, and rerun once the provider bucket recovers.
@@ -226,7 +226,7 @@ This contract is grounded in current repo code plus current official LINE docume
 
 - `connectors/line/src/connector.rs` defines the operation inventory, readiness behavior, and current capability mapping.
 - `connectors/line/src/client.rs` defines the concrete Messaging API endpoints, health probe, and the absence of retry-key propagation.
-- `connectors/line/manifest.toml` defines the current zone and network boundary assumptions, even though the follow-on runtime bead still needs to align it more closely with the accepted V3 contract.
+- `connectors/line/manifest.toml` defines the current zone, capability, and production network boundary assumptions for the accepted V3 contract.
 - LINE's Messaging API reference documents the current endpoint shapes, reply-token constraints, webhook-sourced recipient IDs, and endpoint-specific rate limits.
 - LINE's channel access token docs document the available token types and their validity characteristics.
 - LINE's webhook docs document the inbound event model and signature-verification requirement, which this connector intentionally leaves out of the current slice.

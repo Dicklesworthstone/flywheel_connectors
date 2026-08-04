@@ -1,7 +1,8 @@
 # Inworld Connector
 
 Native FCP connector for the current Inworld character and voice-agent APIs.
-Status: manifest-derived runtime contract documented.
+> **Status**: PROVEN runtime contract documented with remote Inworld verifier proof
+
 Interface hash: `blake3-256:fcp.interface.v2:4d069076fab4ef08a8245bac1815899c5718fbc2906ab34e859a61e31f407bd2`.
 
 The initial implementation focuses on the operational surfaces that Inworld
@@ -75,3 +76,18 @@ The integration suite starts real loopback WebSocket servers for Realtime and
 TTS, plus a `wiremock` Router endpoint. Manifest-derived runtime metadata tests
 guard the operation catalog against drift. Live provider verification is skipped
 unless the required Inworld credential environment variables are present.
+
+## Operator Guidance
+
+Rerun commands for promotion or incident verification:
+
+```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)" OUT_ROOT=".codex-targets/inworld-verification/${RUN_ID}" scripts/e2e/inworld_connector_verification.sh
+RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- env CARGO_TARGET_DIR=/Volumes/USB_NVME/cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -j 2 -p fcp-inworld --locked --tests -- --nocapture
+RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- env CARGO_TARGET_DIR=/Volumes/USB_NVME/cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo clippy -j 2 -p fcp-inworld --locked --all-targets -- -D warnings
+```
+
+Use loopback fixtures for routine proof. Live provider smoke remains opt-in and
+must provide the documented Inworld credential environment variables; fixture
+and retry evidence should stay redaction-safe and avoid raw prompts, audio,
+provider bodies, API keys, JWTs, and provider identifiers.

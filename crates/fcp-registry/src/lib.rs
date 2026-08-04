@@ -244,6 +244,22 @@ pub enum RegistryError {
     SlsaLevelInsufficient { required: u8 },
     #[error("attestation builder `{builder}` not in trusted builders list")]
     UntrustedBuilder { builder: String },
+    #[error("build-provenance attestation `{attestation}` declares no builder identity")]
+    BuilderIdentityMissing { attestation: String },
+    #[error("no build-provenance attestation names a trusted builder")]
+    TrustedBuilderProvenanceMissing,
+    #[error("TUF evidence carries no target hash, so the bundle binary is unbound")]
+    TufTargetUnbound,
+    #[error("TUF target hash mismatch (attested {attested}, bundle binary {bundle})")]
+    TufTargetBindingMismatch { attested: String, bundle: String },
+    #[error("Sigstore evidence carries no identity but operator config pins trusted identities")]
+    SigstoreIdentityUnbound,
+    #[error("Sigstore identity `{identity}` not in operator trusted identities")]
+    SigstoreIdentityUntrusted { identity: String },
+    #[error("Sigstore evidence carries no issuer but operator config pins trusted issuers")]
+    SigstoreIssuerUnbound,
+    #[error("Sigstore issuer `{issuer}` not in operator trusted issuers")]
+    SigstoreIssuerUntrusted { issuer: String },
     #[error("manifest signing bytes serialization failed: {0}")]
     SigningBytes(SerializationError),
     #[error("canonical serialization failed: {0}")]
@@ -322,7 +338,16 @@ pub struct RegistryTrustPolicy {
 pub struct SupplyChainEvidence {
     transparency_log_present: bool,
     tuf_verified: bool,
+    /// SHA-256 of the target the TUF verifier attested, normalized to
+    /// `sha256:<hex>`. `TufVerifier::verify_target` only proves the target
+    /// *path* is enumerated in validly-signed TUF metadata, so enforcement
+    /// re-binds this hash to the bundle binary (br-g7jhf finding 4).
+    tuf_target_hash: Option<String>,
     sigstore_verified: bool,
+    /// OIDC identity the Sigstore verifier adapter reported.
+    sigstore_identity: Option<String>,
+    /// OIDC issuer the Sigstore verifier adapter reported.
+    sigstore_issuer: Option<String>,
     pub attestations: Vec<AttestationEvidence>,
 }
 
@@ -359,9 +384,24 @@ impl SupplyChainEvidence {
     ///   [`TufVerifier::verify_target`] call, OR
     /// - [`Self::mark_tuf_verified_for_tests`] under `#[cfg(any(test,
     ///   feature = "test-mocks"))]`.
+    ///
+    /// This boolean alone means "the target path is enumerated in validly
+    /// signed TUF metadata", NOT "this binary matches the TUF target hash".
+    /// The byte binding lives in [`Self::tuf_target_hash`] and is enforced
+    /// by [`enforce_supply_chain_verification_config`].
     #[must_use]
     pub const fn tuf_verified(&self) -> bool {
         self.tuf_verified
+    }
+
+    /// SHA-256 (`sha256:<hex>`) of the target the TUF verifier attested.
+    ///
+    /// `None` when the verifier reported no target info, in which case the
+    /// evidence carries no byte binding and cannot satisfy a `require_tuf`
+    /// gate.
+    #[must_use]
+    pub fn tuf_target_hash(&self) -> Option<&str> {
+        self.tuf_target_hash.as_deref()
     }
 
     /// Whether a Sigstore verifier adapter has validated the bundle.
@@ -370,16 +410,33 @@ impl SupplyChainEvidence {
         self.sigstore_verified
     }
 
+    /// OIDC identity the Sigstore verifier adapter reported, if any.
+    #[must_use]
+    pub fn sigstore_identity(&self) -> Option<&str> {
+        self.sigstore_identity.as_deref()
+    }
+
+    /// OIDC issuer the Sigstore verifier adapter reported, if any.
+    #[must_use]
+    pub fn sigstore_issuer(&self) -> Option<&str> {
+        self.sigstore_issuer.as_deref()
+    }
+
     /// Promote this evidence with a TUF verification result.
     ///
-    /// Sets `tuf_verified = result.verified()`. Callers obtain `result`
-    /// from a real [`TufVerifier::verify_target`] invocation; a result
-    /// with `verified == false` leaves the flag untouched so a failed
+    /// Sets `tuf_verified = result.verified()` and records the attested
+    /// target hash. Callers obtain `result` from a real
+    /// [`TufVerifier::verify_target`] / `verify_target_bytes` invocation; a
+    /// result with `verified == false` leaves the flag untouched so a failed
     /// verification cannot silently upgrade the evidence.
     #[must_use]
     pub fn with_tuf_verification_result(mut self, result: &TufVerificationResult) -> Self {
         if result.verified {
             self.tuf_verified = true;
+            self.tuf_target_hash = result
+                .target
+                .as_ref()
+                .map(|target| normalize_sha256(&target.hash));
         }
         self
     }
@@ -397,6 +454,10 @@ impl SupplyChainEvidence {
     }
 
     /// Promote this evidence with a Sigstore verification result.
+    ///
+    /// Records the identity and issuer the adapter reported so
+    /// [`enforce_supply_chain_verification_config`] can re-check them
+    /// against the operator's trusted allowlists (br-g7jhf finding 5).
     #[must_use]
     pub fn with_sigstore_verification_result(
         mut self,
@@ -404,27 +465,39 @@ impl SupplyChainEvidence {
     ) -> Self {
         if result.verified {
             self.sigstore_verified = true;
+            self.sigstore_identity = result.identity.clone();
+            self.sigstore_issuer = result.issuer.clone();
         }
         self
     }
 
-    /// Test-only shortcut that stamps `tuf_verified = true` without
-    /// running a real TUF verifier. Gated behind `#[cfg(any(test,
-    /// feature = "test-mocks"))]` so downstream release builds cannot
-    /// reach it.
+    /// Test-only shortcut that stamps `tuf_verified = true` and binds the
+    /// attested target hash without running a real TUF verifier. Gated
+    /// behind `#[cfg(any(test, feature = "test-mocks"))]` so downstream
+    /// release builds cannot reach it. The hash argument is mandatory so a
+    /// test cannot accidentally produce evidence that the byte-binding gate
+    /// would reject for the wrong reason.
     #[cfg(any(test, feature = "test-mocks"))]
     #[must_use]
-    pub fn mark_tuf_verified_for_tests(mut self) -> Self {
+    pub fn mark_tuf_verified_for_tests(mut self, target_hash: &str) -> Self {
         self.tuf_verified = true;
+        self.tuf_target_hash = Some(normalize_sha256(target_hash));
         self
     }
 
-    /// Test-only shortcut that stamps `sigstore_verified = true`.
+    /// Test-only shortcut that stamps `sigstore_verified = true` with the
+    /// identity/issuer an adapter would have reported.
     /// Gated the same way as [`Self::mark_tuf_verified_for_tests`].
     #[cfg(any(test, feature = "test-mocks"))]
     #[must_use]
-    pub fn mark_sigstore_verified_for_tests(mut self) -> Self {
+    pub fn mark_sigstore_verified_for_tests(
+        mut self,
+        identity: Option<&str>,
+        issuer: Option<&str>,
+    ) -> Self {
         self.sigstore_verified = true;
+        self.sigstore_identity = identity.map(ToString::to_string);
+        self.sigstore_issuer = issuer.map(ToString::to_string);
         self
     }
 }
@@ -738,6 +811,13 @@ pub trait SigstoreVerifier: Send + Sync {
 }
 
 /// Configuration for supply-chain verification.
+///
+/// This is the **owner/operator** side of registry verification. Every field
+/// here is a floor that a publisher-supplied `manifest.toml` cannot lower:
+/// `verify_bundle` enforces this config *and* the manifest's own `[policy]`
+/// table, so the effective requirement is the stricter of the two on every
+/// axis (br-g7jhf finding 1). A connector that ships no `[policy]` table at
+/// all still has to satisfy everything declared here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SupplyChainVerificationConfig {
     /// Pinned TUF root for anti-rollback.
@@ -752,6 +832,19 @@ pub struct SupplyChainVerificationConfig {
     pub require_tuf: bool,
     /// Whether to require Sigstore verification.
     pub require_sigstore: bool,
+    /// Attestation types every bundle must carry, regardless of what the
+    /// connector manifest declares.
+    #[serde(default)]
+    pub require_attestation_types: Vec<AttestationType>,
+    /// Minimum SLSA level a build-provenance attestation must declare.
+    #[serde(default)]
+    pub min_slsa_level: Option<u8>,
+    /// Builders the operator trusts to produce connector binaries.
+    #[serde(default)]
+    pub trusted_builders: Vec<String>,
+    /// Whether every attestation must carry an `expires_at` timestamp.
+    #[serde(default)]
+    pub require_attestation_expiry: bool,
 }
 
 impl SupplyChainVerificationConfig {
@@ -821,11 +914,25 @@ impl SigstoreVerifier for NoOpSigstoreVerifier {
 
 /// Verifies a local TUF repository metadata set against a pinned root.
 ///
-/// The verifier reads real TUF role files (`root.json` and `targets.json`)
-/// from `metadata_dir`, validates root pinning, expiry, rollback, target
-/// length, SHA-256 target hash, and Ed25519 role-signature thresholds,
-/// then returns a private
-/// [`TufVerificationResult`] that can promote [`SupplyChainEvidence`].
+/// The verifier reads the four real TUF role files (`root.json`,
+/// `timestamp.json`, `snapshot.json`, `targets.json`) from `metadata_dir` and
+/// walks the full chain: root pinning, per-role expiry, root rollback,
+/// timestamp→snapshot and snapshot→targets version/length/hash binding,
+/// target length, SHA-256 target hash, and Ed25519 role-signature thresholds.
+/// It then returns a private [`TufVerificationResult`] that can promote
+/// [`SupplyChainEvidence`].
+///
+/// All four role files are mandatory. Skipping `timestamp.json` /
+/// `snapshot.json` would leave targets-level rollback and mix-and-match
+/// (pairing a fresh root with a stale signed `targets.json`) uncovered, which
+/// is the entire purpose of the TUF layer.
+///
+/// Freshness caveat: a directory-backed verifier holds no memory of previously
+/// seen metadata, so freeze detection reduces to the timestamp role's own
+/// expiry horizon (an expired `timestamp.json` surfaces as
+/// [`SupplyChainVerificationError::TufFreeze`]). Detecting a repository that
+/// re-serves *unexpired* stale metadata requires persisted client state, which
+/// is out of scope for this adapter.
 #[derive(Debug, Clone)]
 pub struct LocalTufVerifier {
     metadata_dir: PathBuf,
@@ -837,6 +944,16 @@ impl LocalTufVerifier {
         Self {
             metadata_dir: metadata_dir.into(),
         }
+    }
+
+    fn read_role_file(&self, file_name: &str) -> Result<Vec<u8>, SupplyChainVerificationError> {
+        let path = self.metadata_dir.join(file_name);
+        std::fs::read(&path).map_err(|source| {
+            SupplyChainVerificationError::Network(format!(
+                "failed to read TUF metadata `{}`: {source}",
+                path.display()
+            ))
+        })
     }
 
     /// Verify a target and its bytes against local TUF metadata.
@@ -919,20 +1036,67 @@ impl LocalTufVerifier {
             &root_signed_bytes,
         )?;
 
-        let targets_path = self.metadata_dir.join("targets.json");
-        let targets_bytes = std::fs::read(&targets_path).map_err(|source| {
-            SupplyChainVerificationError::Network(format!(
-                "failed to read TUF targets metadata `{}`: {source}",
-                targets_path.display()
-            ))
+        // ── timestamp role ────────────────────────────────────────────────
+        // The timestamp role is the freshness anchor: it is the only
+        // short-lived metadata in the chain, so an expired timestamp is the
+        // canonical freeze-attack signal (a repository replaying stale but
+        // validly signed metadata). Verifying it — and the snapshot it names
+        // — is what upgrades this client from "root + targets are signed" to
+        // real mix-and-match and targets-rollback coverage (br-g7jhf
+        // finding 6).
+        let timestamp_bytes = self.read_role_file("timestamp.json")?;
+        let timestamp: TufSignedEnvelope<TufTimestampSigned> =
+            parse_tuf_role(&timestamp_bytes, "timestamp")?;
+        let timestamp_signed_bytes = tuf_signed_bytes(&timestamp_bytes, "timestamp")?;
+        timestamp.require_role("timestamp")?;
+        ensure_not_expired(&timestamp.signed.expires).map_err(|err| match err {
+            SupplyChainVerificationError::TufExpired => SupplyChainVerificationError::TufFreeze,
+            other => other,
         })?;
-        let targets: TufSignedEnvelope<TufTargetsSigned> = serde_json::from_slice(&targets_bytes)
-            .map_err(|source| {
-            SupplyChainVerificationError::Network(format!(
-                "failed to parse TUF targets metadata `{}`: {source}",
-                targets_path.display()
-            ))
-        })?;
+        let timestamp_role = required_tuf_role(&root.signed.roles, "timestamp")?;
+        verify_tuf_role_signatures(
+            "timestamp",
+            timestamp_role,
+            &root.signed.keys,
+            &timestamp.signatures,
+            &timestamp_signed_bytes,
+        )?;
+
+        // ── snapshot role ─────────────────────────────────────────────────
+        let snapshot_bytes = self.read_role_file("snapshot.json")?;
+        let snapshot: TufSignedEnvelope<TufSnapshotSigned> =
+            parse_tuf_role(&snapshot_bytes, "snapshot")?;
+        let snapshot_meta =
+            required_tuf_meta(&timestamp.signed.meta, "timestamp", "snapshot.json")?;
+        verify_tuf_meta_binding(
+            "snapshot.json",
+            snapshot_meta,
+            &snapshot_bytes,
+            snapshot.signed.version,
+        )?;
+        let snapshot_signed_bytes = tuf_signed_bytes(&snapshot_bytes, "snapshot")?;
+        snapshot.require_role("snapshot")?;
+        ensure_not_expired(&snapshot.signed.expires)?;
+        let snapshot_role = required_tuf_role(&root.signed.roles, "snapshot")?;
+        verify_tuf_role_signatures(
+            "snapshot",
+            snapshot_role,
+            &root.signed.keys,
+            &snapshot.signatures,
+            &snapshot_signed_bytes,
+        )?;
+
+        // ── targets role ──────────────────────────────────────────────────
+        let targets_bytes = self.read_role_file("targets.json")?;
+        let targets: TufSignedEnvelope<TufTargetsSigned> =
+            parse_tuf_role(&targets_bytes, "targets")?;
+        let targets_meta = required_tuf_meta(&snapshot.signed.meta, "snapshot", "targets.json")?;
+        verify_tuf_meta_binding(
+            "targets.json",
+            targets_meta,
+            &targets_bytes,
+            targets.signed.version,
+        )?;
         let targets_signed_bytes = tuf_signed_bytes(&targets_bytes, "targets")?;
         targets.require_role("targets")?;
         ensure_not_expired(&targets.signed.expires)?;
@@ -989,7 +1153,12 @@ impl LocalTufVerifier {
                 target_path: target_path.to_string(),
                 hash: expected_hash,
                 length: target.length,
-                delegations: vec!["root".to_string(), "targets".to_string()],
+                delegations: vec![
+                    "root".to_string(),
+                    "timestamp".to_string(),
+                    "snapshot".to_string(),
+                    "targets".to_string(),
+                ],
             }),
         })
     }
@@ -1075,6 +1244,20 @@ impl CosignBlobVerifier {
 
     /// Verify a signed blob and return a private Sigstore result.
     ///
+    /// # Trust semantics of `declared_identity` / `declared_issuer`
+    ///
+    /// This verifier runs `cosign verify-blob --key <pubkey>`. Key-based
+    /// cosign verification authenticates the **signing key**, not an OIDC
+    /// identity — there is no certificate to extract an identity or issuer
+    /// from. The two arguments are therefore *operator-declared labels* that
+    /// name the key being pinned, and they are echoed into the result so
+    /// [`enforce_supply_chain_verification_config`] can match them against
+    /// the operator's own allowlist. They MUST come from operator
+    /// configuration; never source them from publisher- or bundle-controlled
+    /// data, which would make the allowlist self-satisfying. For a
+    /// certificate-derived identity, use a keyless [`SigstoreVerifier`]
+    /// implementation instead (br-g7jhf finding 5).
+    ///
     /// # Errors
     /// Returns [`SupplyChainVerificationError`] if the local artifact hash does
     /// not match `expected_artifact_hash` or the cosign process fails.
@@ -1082,8 +1265,8 @@ impl CosignBlobVerifier {
         &self,
         artifact_path: &Path,
         expected_artifact_hash: &str,
-        identity: Option<String>,
-        issuer: Option<String>,
+        declared_identity: Option<String>,
+        declared_issuer: Option<String>,
     ) -> Result<SigstoreVerificationResult, SupplyChainVerificationError> {
         let artifact = std::fs::read(artifact_path).map_err(|source| {
             SupplyChainVerificationError::Network(format!(
@@ -1125,8 +1308,8 @@ impl CosignBlobVerifier {
 
         Ok(SigstoreVerificationResult {
             verified: true,
-            identity,
-            issuer,
+            identity: declared_identity,
+            issuer: declared_issuer,
             rekor_log_index: None,
         })
     }
@@ -1237,6 +1420,7 @@ struct TufKeyValue {
 struct TufTargetsSigned {
     #[serde(rename = "_type")]
     role_type: String,
+    version: u32,
     expires: String,
     #[serde(default)]
     targets: HashMap<String, TufTargetMetadata>,
@@ -1249,10 +1433,119 @@ impl TufRoleName for TufTargetsSigned {
 }
 
 #[derive(Debug, Deserialize)]
+struct TufTimestampSigned {
+    #[serde(rename = "_type")]
+    role_type: String,
+    expires: String,
+    #[serde(default)]
+    meta: HashMap<String, TufMetaEntry>,
+}
+
+impl TufRoleName for TufTimestampSigned {
+    fn role_name(&self) -> &str {
+        &self.role_type
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TufSnapshotSigned {
+    #[serde(rename = "_type")]
+    role_type: String,
+    version: u32,
+    expires: String,
+    #[serde(default)]
+    meta: HashMap<String, TufMetaEntry>,
+}
+
+impl TufRoleName for TufSnapshotSigned {
+    fn role_name(&self) -> &str {
+        &self.role_type
+    }
+}
+
+/// A `meta` entry: one role file's expected version, and optionally its exact
+/// length and hashes, as declared by the role above it in the chain.
+#[derive(Debug, Deserialize)]
+struct TufMetaEntry {
+    version: u32,
+    #[serde(default)]
+    length: Option<u64>,
+    #[serde(default)]
+    hashes: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TufTargetMetadata {
     length: u64,
     #[serde(default)]
     hashes: HashMap<String, String>,
+}
+
+fn parse_tuf_role<T: serde::de::DeserializeOwned>(
+    metadata_bytes: &[u8],
+    role_name: &str,
+) -> Result<TufSignedEnvelope<T>, SupplyChainVerificationError> {
+    serde_json::from_slice(metadata_bytes).map_err(|source| {
+        SupplyChainVerificationError::Network(format!(
+            "failed to parse TUF {role_name} metadata: {source}"
+        ))
+    })
+}
+
+fn required_tuf_meta<'a>(
+    meta: &'a HashMap<String, TufMetaEntry>,
+    declaring_role: &str,
+    file_name: &str,
+) -> Result<&'a TufMetaEntry, SupplyChainVerificationError> {
+    meta.get(file_name).ok_or_else(|| {
+        SupplyChainVerificationError::Network(format!(
+            "TUF {declaring_role} metadata does not declare `{file_name}`"
+        ))
+    })
+}
+
+/// Bind a role file to the entry the role above it declared.
+///
+/// A version mismatch is a rollback / mix-and-match attempt: the served file
+/// is not the one the (independently signed) parent role vouched for.
+fn verify_tuf_meta_binding(
+    file_name: &str,
+    entry: &TufMetaEntry,
+    role_bytes: &[u8],
+    role_version: u32,
+) -> Result<(), SupplyChainVerificationError> {
+    if role_version != entry.version {
+        return Err(SupplyChainVerificationError::TufRollback {
+            current: entry.version,
+            got: role_version,
+        });
+    }
+    if let Some(expected_length) = entry.length {
+        let actual_length = u64::try_from(role_bytes.len()).map_err(|_| {
+            SupplyChainVerificationError::Network(format!(
+                "TUF {file_name} length does not fit into u64"
+            ))
+        })?;
+        if expected_length != actual_length {
+            return Err(SupplyChainVerificationError::TufTargetLengthMismatch {
+                target: file_name.to_string(),
+                expected: expected_length,
+                actual: actual_length,
+            });
+        }
+    }
+    if let Some(expected_hash) = entry.hashes.get("sha256") {
+        let expected_hash = normalize_sha256(expected_hash);
+        let actual_hash = hash_bytes(role_bytes);
+        if expected_hash != actual_hash {
+            return Err(SupplyChainVerificationError::TufTargetHashMismatch {
+                target: file_name.to_string(),
+                expected: expected_hash,
+                actual: actual_hash,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn normalize_sha256(value: &str) -> String {
@@ -1610,18 +1903,30 @@ impl SigstoreVerifier for MockSigstoreVerifier {
     ) -> Result<SigstoreVerificationResult, SupplyChainVerificationError> {
         let bundles = self.valid_bundles.lock().unwrap();
         if let Some(result) = bundles.get(artifact_hash) {
-            // Verify identity if specified
-            if let Some(identity) = &result.identity {
-                if !trusted_identities.is_empty() && !trusted_identities.contains(identity) {
+            // Allowlists fail CLOSED on a missing claim: a bundle whose
+            // certificate carries no identity cannot satisfy an identity
+            // allowlist by simply omitting the field (br-g7jhf finding 5).
+            if !trusted_identities.is_empty() {
+                let Some(identity) = &result.identity else {
+                    return Err(SupplyChainVerificationError::SigstoreIdentityMismatch {
+                        expected: trusted_identities.join(","),
+                        actual: "<none>".to_string(),
+                    });
+                };
+                if !trusted_identities.contains(identity) {
                     return Err(SupplyChainVerificationError::SigstoreIdentityMismatch {
                         expected: trusted_identities.join(","),
                         actual: identity.clone(),
                     });
                 }
             }
-            // Verify issuer if specified
-            if let Some(issuer) = &result.issuer {
-                if !trusted_issuers.is_empty() && !trusted_issuers.contains(issuer) {
+            if !trusted_issuers.is_empty() {
+                let Some(issuer) = &result.issuer else {
+                    return Err(SupplyChainVerificationError::SigstoreIssuerUntrusted {
+                        issuer: "<none>".to_string(),
+                    });
+                };
+                if !trusted_issuers.contains(issuer) {
                     return Err(SupplyChainVerificationError::SigstoreIssuerUntrusted {
                         issuer: issuer.clone(),
                     });
@@ -1732,6 +2037,10 @@ impl RegistryVerifier {
                 require_transparency: false,
                 require_tuf: false,
                 require_sigstore: false,
+                require_attestation_types: Vec::new(),
+                min_slsa_level: None,
+                trusted_builders: Vec::new(),
+                require_attestation_expiry: false,
             },
         }
     }
@@ -1816,6 +2125,7 @@ impl RegistryVerifier {
             &self.supply_chain_config,
             &manifest,
             supply_chain,
+            &binary_hash,
         )?;
 
         Ok(VerifiedConnectorBundle {
@@ -2426,6 +2736,148 @@ fn enforce_capability_ceiling(
     Ok(())
 }
 
+/// Attestation requirements enforced against [`SupplyChainEvidence`].
+///
+/// Two independent sources produce one of these: the connector manifest's own
+/// `[policy]` table (publisher-controlled) and the operator's
+/// [`SupplyChainVerificationConfig`] (owner-controlled). `verify_bundle` runs
+/// the gate once per source, so the effective requirement is the conjunction —
+/// strictly the stricter of the two on every axis — and a manifest that omits
+/// `[policy]` entirely cannot opt out of the owner's floor.
+struct AttestationRequirements<'a> {
+    require_attestation_types: &'a [AttestationType],
+    min_slsa_level: Option<u8>,
+    trusted_builders: &'a [String],
+    require_attestation_expiry: bool,
+}
+
+impl AttestationRequirements<'_> {
+    /// Whether any axis of this requirement set is engaged. When nothing is
+    /// engaged the gate is a no-op and evidence is not even required.
+    const fn is_active(&self) -> bool {
+        !self.require_attestation_types.is_empty()
+            || self.min_slsa_level.is_some()
+            || !self.trusted_builders.is_empty()
+            || self.require_attestation_expiry
+    }
+}
+
+/// Whether an attestation type makes a claim about *who built the artifact*.
+///
+/// SLSA levels and trusted-builder identities are build-provenance claims, so
+/// only these types can satisfy them. A `CodeReview` attestation carrying
+/// `slsa_level = 4` says nothing about the build (br-g7jhf findings 2 and 3).
+const fn is_build_provenance(attestation: AttestationType) -> bool {
+    matches!(
+        attestation,
+        AttestationType::InToto | AttestationType::ReproducibleBuild
+    )
+}
+
+fn enforce_attestation_requirements(
+    requirements: &AttestationRequirements<'_>,
+    evidence: Option<&SupplyChainEvidence>,
+) -> Result<(), RegistryError> {
+    if !requirements.is_active() {
+        return Ok(());
+    }
+
+    let evidence = evidence.ok_or(RegistryError::AttestationEvidenceMissing)?;
+    let now = u64::try_from(Utc::now().timestamp()).expect("system clock before year 2262");
+
+    // Fail-closed expiry-required gate runs BEFORE the expires_at <= now
+    // check so a policy with `require_attestation_expiry = true` rejects
+    // an attestation that has no expires_at field set at all. Without
+    // this, an evidence record with `expires_at = None` is treated as
+    // eternally fresh — a verifier-adapter regression would silently
+    // disable freshness enforcement on every connector under that policy.
+    if requirements.require_attestation_expiry {
+        if let Some(att) = evidence
+            .attestations
+            .iter()
+            .find(|att| att.expires_at.is_none())
+        {
+            return Err(RegistryError::AttestationExpiryMissing {
+                attestation: attestation_label(att.attestation_type).to_string(),
+            });
+        }
+    }
+
+    if let Some((attestation_type, expired_at)) = evidence
+        .attestations
+        .iter()
+        .filter_map(|att| {
+            att.expires_at
+                .map(|expires_at| (att.attestation_type, expires_at))
+        })
+        .find(|(_, expires_at)| *expires_at <= now)
+    {
+        return Err(RegistryError::AttestationExpired {
+            attestation: attestation_label(attestation_type).to_string(),
+            expired_at,
+        });
+    }
+
+    for required in requirements.require_attestation_types {
+        if !evidence
+            .attestations
+            .iter()
+            .any(|att| &att.attestation_type == required)
+        {
+            return Err(RegistryError::RequiredAttestationMissing {
+                attestation: attestation_label(*required).to_string(),
+            });
+        }
+    }
+
+    if let Some(required_level) = requirements.min_slsa_level {
+        // Scoped to build-provenance attestations: a code-review attestation
+        // that happens to carry a high `slsa_level` is not a build claim and
+        // must not satisfy the floor.
+        let meets_level = evidence
+            .attestations
+            .iter()
+            .filter(|att| is_build_provenance(att.attestation_type))
+            .any(|att| att.slsa_level.is_some_and(|level| level >= required_level));
+        if !meets_level {
+            return Err(RegistryError::SlsaLevelInsufficient {
+                required: required_level,
+            });
+        }
+    }
+
+    if !requirements.trusted_builders.is_empty() {
+        let trusted = |builder: &str| requirements.trusted_builders.iter().any(|tb| tb == builder);
+        let mut trusted_provenance = false;
+        for attestation in &evidence.attestations {
+            let build_provenance = is_build_provenance(attestation.attestation_type);
+            match attestation.builder_id.as_deref() {
+                Some(builder) => {
+                    if !trusted(builder) {
+                        return Err(RegistryError::UntrustedBuilder {
+                            builder: builder.to_string(),
+                        });
+                    }
+                    trusted_provenance |= build_provenance;
+                }
+                // A build-provenance attestation that simply omits builder_id
+                // must not slip past the rejection loop by being unnamed.
+                None if build_provenance => {
+                    return Err(RegistryError::BuilderIdentityMissing {
+                        attestation: attestation_label(attestation.attestation_type).to_string(),
+                    });
+                }
+                None => {}
+            }
+        }
+        if !trusted_provenance {
+            return Err(RegistryError::TrustedBuilderProvenanceMissing);
+        }
+    }
+
+    Ok(())
+}
+
 fn enforce_supply_chain_policy(
     manifest: &ConnectorManifest,
     evidence: Option<&SupplyChainEvidence>,
@@ -2449,118 +2901,22 @@ fn enforce_supply_chain_policy(
         }
     }
 
-    let attestation_policy_active = !policy.require_attestation_types.is_empty()
-        || policy.min_slsa_level.is_some()
-        || !policy.trusted_builders.is_empty()
-        || policy.require_attestation_expiry;
-    let attestation_evidence = if attestation_policy_active {
-        let evidence = evidence.ok_or(RegistryError::AttestationEvidenceMissing)?;
-        let now = u64::try_from(Utc::now().timestamp()).expect("system clock before year 2262");
-
-        // Fail-closed expiry-required gate runs BEFORE the expires_at <= now
-        // check so a manifest with `require_attestation_expiry = true` rejects
-        // an attestation that has no expires_at field set at all. Without
-        // this, an evidence record with `expires_at = None` is treated as
-        // eternally fresh — a verifier-adapter regression would silently
-        // disable freshness enforcement on every connector under that policy.
-        if policy.require_attestation_expiry {
-            if let Some(att) = evidence
-                .attestations
-                .iter()
-                .find(|att| att.expires_at.is_none())
-            {
-                return Err(RegistryError::AttestationExpiryMissing {
-                    attestation: attestation_label(att.attestation_type).to_string(),
-                });
-            }
-        }
-
-        if let Some((attestation_type, expired_at)) = evidence
-            .attestations
-            .iter()
-            .filter_map(|att| {
-                att.expires_at
-                    .map(|expires_at| (att.attestation_type, expires_at))
-            })
-            .find(|(_, expires_at)| *expires_at <= now)
-        {
-            return Err(RegistryError::AttestationExpired {
-                attestation: attestation_label(attestation_type).to_string(),
-                expired_at,
-            });
-        }
-        Some(evidence)
-    } else {
-        None
-    };
-
-    if !policy.require_attestation_types.is_empty() {
-        let evidence = attestation_evidence.ok_or(RegistryError::AttestationEvidenceMissing)?;
-        for required in &policy.require_attestation_types {
-            if !evidence
-                .attestations
-                .iter()
-                .any(|att| &att.attestation_type == required)
-            {
-                return Err(RegistryError::RequiredAttestationMissing {
-                    attestation: attestation_label(*required).to_string(),
-                });
-            }
-        }
-    }
-
-    if let Some(required_level) = policy.min_slsa_level {
-        let evidence = attestation_evidence.ok_or(RegistryError::AttestationEvidenceMissing)?;
-        let meets_level = evidence
-            .attestations
-            .iter()
-            .any(|att| att.slsa_level.is_some_and(|level| level >= required_level));
-        if !meets_level {
-            return Err(RegistryError::SlsaLevelInsufficient {
-                required: required_level,
-            });
-        }
-    }
-
-    if !policy.trusted_builders.is_empty() {
-        let evidence = attestation_evidence.ok_or(RegistryError::AttestationEvidenceMissing)?;
-        // At least one attestation must identify a trusted builder.
-        // Empty attestation lists or attestations without builder_id cannot
-        // satisfy a trusted_builders policy.
-        let has_trusted_builder = evidence.attestations.iter().any(|att| {
-            att.builder_id
-                .as_ref()
-                .is_some_and(|b| policy.trusted_builders.iter().any(|tb| tb == b))
-        });
-        if !has_trusted_builder {
-            let first_builder = evidence
-                .attestations
-                .iter()
-                .find_map(|a| a.builder_id.clone())
-                .unwrap_or_else(|| "<none>".to_string());
-            return Err(RegistryError::UntrustedBuilder {
-                builder: first_builder,
-            });
-        }
-        // Additionally reject any attestation that explicitly names an untrusted builder.
-        for attestation in &evidence.attestations {
-            if let Some(builder) = attestation.builder_id.as_ref() {
-                if !policy.trusted_builders.iter().any(|b| b == builder) {
-                    return Err(RegistryError::UntrustedBuilder {
-                        builder: builder.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(())
+    enforce_attestation_requirements(
+        &AttestationRequirements {
+            require_attestation_types: &policy.require_attestation_types,
+            min_slsa_level: policy.min_slsa_level,
+            trusted_builders: &policy.trusted_builders,
+            require_attestation_expiry: policy.require_attestation_expiry,
+        },
+        evidence,
+    )
 }
 
 fn enforce_supply_chain_verification_config(
     config: &SupplyChainVerificationConfig,
     manifest: &ConnectorManifest,
     evidence: Option<&SupplyChainEvidence>,
+    binary_hash: &str,
 ) -> Result<(), RegistryError> {
     if config.require_transparency {
         let entry_present = manifest
@@ -2587,6 +2943,19 @@ fn enforce_supply_chain_verification_config(
         if !evidence.tuf_verified() {
             return Err(RegistryError::TufVerificationRequired);
         }
+        // `verify_target` proves only that the target PATH is enumerated in
+        // validly signed TUF metadata. Bind the attested target hash to the
+        // bytes actually being installed, so `tuf_verified` cannot mean
+        // "some target of this name is signed" (br-g7jhf finding 4).
+        let attested = evidence
+            .tuf_target_hash()
+            .ok_or(RegistryError::TufTargetUnbound)?;
+        if !attested.eq_ignore_ascii_case(binary_hash) {
+            return Err(RegistryError::TufTargetBindingMismatch {
+                attested: attested.to_string(),
+                bundle: binary_hash.to_string(),
+            });
+        }
     }
 
     if config.sigstore_verification_required() {
@@ -2598,9 +2967,54 @@ fn enforce_supply_chain_verification_config(
         if !evidence.sigstore_verified() {
             return Err(RegistryError::SigstoreVerificationRequired);
         }
+        // Configuring trusted identities/issuers previously only flipped
+        // `sigstore_verification_required()` on; the allowlists themselves
+        // were never consulted, so a bundle signed by ANY identity passed.
+        // Enforce them here, failing closed when the adapter reported no
+        // identity/issuer at all (br-g7jhf finding 5).
+        if !config.trusted_sigstore_identities.is_empty() {
+            let identity = evidence
+                .sigstore_identity()
+                .ok_or(RegistryError::SigstoreIdentityUnbound)?;
+            if !config
+                .trusted_sigstore_identities
+                .iter()
+                .any(|trusted| trusted == identity)
+            {
+                return Err(RegistryError::SigstoreIdentityUntrusted {
+                    identity: identity.to_string(),
+                });
+            }
+        }
+        if !config.trusted_sigstore_issuers.is_empty() {
+            let issuer = evidence
+                .sigstore_issuer()
+                .ok_or(RegistryError::SigstoreIssuerUnbound)?;
+            if !config
+                .trusted_sigstore_issuers
+                .iter()
+                .any(|trusted| trusted == issuer)
+            {
+                return Err(RegistryError::SigstoreIssuerUntrusted {
+                    issuer: issuer.to_string(),
+                });
+            }
+        }
     }
 
-    Ok(())
+    // Owner attestation floor. Enforced independently of `manifest.policy`,
+    // which is parsed from the publisher-controlled connector TOML: a manifest
+    // that omits `[policy]` can no longer opt out of the operator's SLSA /
+    // attestation-type / trusted-builder requirements (br-g7jhf finding 1).
+    enforce_attestation_requirements(
+        &AttestationRequirements {
+            require_attestation_types: &config.require_attestation_types,
+            min_slsa_level: config.min_slsa_level,
+            trusted_builders: &config.trusted_builders,
+            require_attestation_expiry: config.require_attestation_expiry,
+        },
+        evidence,
+    )
 }
 
 fn attestation_label(attestation: AttestationType) -> &'static str {
@@ -3387,14 +3801,88 @@ mod tests {
         hex::encode(signing_key.sign(&signed_bytes).to_bytes())
     }
 
+    /// (Re)publish `snapshot.json` and `timestamp.json` for the `targets.json`
+    /// currently on disk.
+    ///
+    /// snapshot vouches for targets.json and timestamp vouches for
+    /// snapshot.json, so each file is written after the one it pins and its
+    /// declared length/hash match the bytes on disk. Tests that mutate
+    /// `targets.json` call this to model a repository that legitimately
+    /// re-published the upper roles, which lets the assertion reach the
+    /// targets-role signature check instead of stopping at the snapshot
+    /// binding.
+    fn write_test_tuf_snapshot_chain(metadata_dir: &Path, signing_key: &Ed25519SigningKey) {
+        let expires = test_tuf_expires();
+        let key_id = TEST_TUF_KEY_ID;
+        let targets_bytes =
+            std::fs::read(metadata_dir.join("targets.json")).expect("read targets metadata");
+
+        let snapshot_signed = json!({
+            "_type": "snapshot",
+            "version": 1,
+            "expires": expires,
+            "meta": {
+                "targets.json": tuf_meta_entry(1, &targets_bytes),
+            },
+        });
+        let snapshot_signature = sign_tuf_signed_payload(&snapshot_signed, signing_key);
+        let snapshot_json = json!({
+            "signed": snapshot_signed,
+            "signatures": [{ "keyid": key_id, "sig": snapshot_signature }],
+        });
+        let snapshot_bytes = serde_json::to_vec_pretty(&snapshot_json).expect("snapshot json");
+        std::fs::write(metadata_dir.join("snapshot.json"), &snapshot_bytes)
+            .expect("write snapshot metadata");
+
+        let timestamp_signed = json!({
+            "_type": "timestamp",
+            "version": 1,
+            "expires": expires,
+            "meta": {
+                "snapshot.json": tuf_meta_entry(1, &snapshot_bytes),
+            },
+        });
+        let timestamp_signature = sign_tuf_signed_payload(&timestamp_signed, signing_key);
+        let timestamp_json = json!({
+            "signed": timestamp_signed,
+            "signatures": [{ "keyid": key_id, "sig": timestamp_signature }],
+        });
+        std::fs::write(
+            metadata_dir.join("timestamp.json"),
+            serde_json::to_vec_pretty(&timestamp_json).expect("timestamp json"),
+        )
+        .expect("write timestamp metadata");
+    }
+
+    /// Key ID every TUF role in the test fixtures is signed under.
+    const TEST_TUF_KEY_ID: &str = "tuf-ed25519-test";
+
+    /// The expiry every `write_test_tuf_metadata` fixture stamps into its roles.
+    fn test_tuf_expires() -> String {
+        (Utc::now() + chrono::Duration::days(7)).to_rfc3339()
+    }
+
+    /// Build a TUF `meta` entry pinning a role file's version, length, and hash.
+    fn tuf_meta_entry(version: u32, role_bytes: &[u8]) -> serde_json::Value {
+        let hash = hash_bytes(role_bytes)
+            .strip_prefix("sha256:")
+            .expect("sha256 prefix")
+            .to_string();
+        json!({
+            "version": version,
+            "length": role_bytes.len(),
+            "hashes": { "sha256": hash },
+        })
+    }
+
     fn write_test_tuf_metadata(
         metadata_dir: &Path,
         target_path: &str,
         target_bytes: &[u8],
         signing_key: &Ed25519SigningKey,
     ) -> TufRootMetadata {
-        let key_id = "tuf-ed25519-test";
-        let expires = (Utc::now() + chrono::Duration::days(7)).to_rfc3339();
+        let key_id = TEST_TUF_KEY_ID;
+        let expires = test_tuf_expires();
         let public_hex = hex::encode(signing_key.verifying_key().to_bytes());
         let target_hash = hash_bytes(target_bytes)
             .strip_prefix("sha256:")
@@ -3412,14 +3900,12 @@ mod tests {
             }),
         );
         let mut roles = serde_json::Map::new();
-        roles.insert(
-            "root".to_string(),
-            json!({ "keyids": [key_id], "threshold": 1 }),
-        );
-        roles.insert(
-            "targets".to_string(),
-            json!({ "keyids": [key_id], "threshold": 1 }),
-        );
+        for role in ["root", "targets", "snapshot", "timestamp"] {
+            roles.insert(
+                role.to_string(),
+                json!({ "keyids": [key_id], "threshold": 1 }),
+            );
+        }
 
         let root_signed = json!({
             "_type": "root",
@@ -3452,11 +3938,11 @@ mod tests {
             "signed": targets_signed,
             "signatures": [{ "keyid": key_id, "sig": targets_signature }],
         });
-        std::fs::write(
-            metadata_dir.join("targets.json"),
-            serde_json::to_vec_pretty(&targets_json).expect("targets json"),
-        )
-        .expect("write targets metadata");
+        let targets_bytes = serde_json::to_vec_pretty(&targets_json).expect("targets json");
+        std::fs::write(metadata_dir.join("targets.json"), &targets_bytes)
+            .expect("write targets metadata");
+
+        write_test_tuf_snapshot_chain(metadata_dir, signing_key);
 
         TufRootMetadata {
             version: 1,
@@ -3662,7 +4148,10 @@ sig = "{sig}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: None,
@@ -3714,7 +4203,10 @@ sig = "{sig}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: None,
@@ -3763,7 +4255,10 @@ sig = "{sig}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: None,
@@ -4168,12 +4663,18 @@ sig = "{sig}"
             ..SupplyChainVerificationConfig::default()
         };
         let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        let binary_hash = hash_bytes(b"registry-binary");
 
         // Evidence carrying NO verified claims (the bypass payload).
         let evidence = SupplyChainEvidence::new();
 
-        let err = enforce_supply_chain_verification_config(&config, &manifest, Some(&evidence))
-            .expect_err("unverified evidence must be rejected");
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&evidence),
+            &binary_hash,
+        )
+        .expect_err("unverified evidence must be rejected");
         assert!(
             matches!(err, RegistryError::TufVerificationRequired),
             "expected TufVerificationRequired, got {err:?}"
@@ -4182,9 +4683,60 @@ sig = "{sig}"
         // Positive control: promoting via a real verification result
         // satisfies the gate. `mark_tuf_verified_for_tests` is the
         // cfg-gated equivalent used inside the crate's own tests.
-        let verified_evidence = SupplyChainEvidence::new().mark_tuf_verified_for_tests();
-        enforce_supply_chain_verification_config(&config, &manifest, Some(&verified_evidence))
-            .expect("tuf_verified=true must satisfy require_tuf");
+        let verified_evidence =
+            SupplyChainEvidence::new().mark_tuf_verified_for_tests(&binary_hash);
+        enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&verified_evidence),
+            &binary_hash,
+        )
+        .expect("tuf_verified=true bound to the bundle binary must satisfy require_tuf");
+    }
+
+    /// br-g7jhf finding 4: `TufVerifier::verify_target` only proves the target
+    /// PATH is enumerated in signed TUF metadata. Evidence with no target hash,
+    /// or one bound to different bytes, must not satisfy `require_tuf`.
+    #[test]
+    fn verify_bundle_rejects_tuf_evidence_not_bound_to_bundle_binary() {
+        let config = SupplyChainVerificationConfig {
+            require_tuf: true,
+            ..SupplyChainVerificationConfig::default()
+        };
+        let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        let binary_hash = hash_bytes(b"registry-binary");
+
+        let unbound = TufVerificationResult {
+            verified: true,
+            root_version: 1,
+            target: None,
+        };
+        let unbound_evidence = SupplyChainEvidence::new().with_tuf_verification_result(&unbound);
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&unbound_evidence),
+            &binary_hash,
+        )
+        .expect_err("tuf evidence with no target hash must be rejected");
+        assert!(
+            matches!(err, RegistryError::TufTargetUnbound),
+            "expected TufTargetUnbound, got {err:?}"
+        );
+
+        let other_hash = hash_bytes(b"a different connector binary");
+        let mismatched = SupplyChainEvidence::new().mark_tuf_verified_for_tests(&other_hash);
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&mismatched),
+            &binary_hash,
+        )
+        .expect_err("tuf evidence bound to other bytes must be rejected");
+        assert!(
+            matches!(err, RegistryError::TufTargetBindingMismatch { .. }),
+            "expected TufTargetBindingMismatch, got {err:?}"
+        );
     }
 
     /// Regression for br-pcmm8 (sigstore side).
@@ -4195,19 +4747,268 @@ sig = "{sig}"
             ..SupplyChainVerificationConfig::default()
         };
         let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        let binary_hash = hash_bytes(b"registry-binary");
 
         let evidence = SupplyChainEvidence::new();
 
-        let err = enforce_supply_chain_verification_config(&config, &manifest, Some(&evidence))
-            .expect_err("unverified sigstore evidence must be rejected");
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&evidence),
+            &binary_hash,
+        )
+        .expect_err("unverified sigstore evidence must be rejected");
         assert!(
             matches!(err, RegistryError::SigstoreVerificationRequired),
             "expected SigstoreVerificationRequired, got {err:?}"
         );
 
-        let verified_evidence = SupplyChainEvidence::new().mark_sigstore_verified_for_tests();
-        enforce_supply_chain_verification_config(&config, &manifest, Some(&verified_evidence))
-            .expect("sigstore_verified=true must satisfy require_sigstore");
+        let verified_evidence =
+            SupplyChainEvidence::new().mark_sigstore_verified_for_tests(None, None);
+        enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&verified_evidence),
+            &binary_hash,
+        )
+        .expect("sigstore_verified=true must satisfy require_sigstore");
+    }
+
+    /// br-g7jhf finding 5: configuring trusted Sigstore identities/issuers used
+    /// to only flip `sigstore_verification_required()` on — the allowlists
+    /// themselves were never consulted, so a bundle signed by ANY identity
+    /// passed. They must now be enforced, and fail closed on a missing claim.
+    #[test]
+    fn verify_bundle_enforces_trusted_sigstore_identity_and_issuer() {
+        let config = SupplyChainVerificationConfig {
+            trusted_sigstore_identities: vec!["github-actions".to_string()],
+            trusted_sigstore_issuers: vec![
+                "https://token.actions.githubusercontent.com".to_string(),
+            ],
+            ..SupplyChainVerificationConfig::default()
+        };
+        let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        let binary_hash = hash_bytes(b"registry-binary");
+
+        let unbound = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(None, None);
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&unbound),
+            &binary_hash,
+        )
+        .expect_err("sigstore evidence with no identity must not satisfy an identity allowlist");
+        assert!(
+            matches!(err, RegistryError::SigstoreIdentityUnbound),
+            "expected SigstoreIdentityUnbound, got {err:?}"
+        );
+
+        let wrong_identity = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(
+            Some("attacker-identity"),
+            Some("https://token.actions.githubusercontent.com"),
+        );
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&wrong_identity),
+            &binary_hash,
+        )
+        .expect_err("untrusted sigstore identity must be rejected");
+        assert!(
+            matches!(err, RegistryError::SigstoreIdentityUntrusted { .. }),
+            "expected SigstoreIdentityUntrusted, got {err:?}"
+        );
+
+        let wrong_issuer = SupplyChainEvidence::new()
+            .mark_sigstore_verified_for_tests(Some("github-actions"), Some("https://evil.example"));
+        let err = enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&wrong_issuer),
+            &binary_hash,
+        )
+        .expect_err("untrusted sigstore issuer must be rejected");
+        assert!(
+            matches!(err, RegistryError::SigstoreIssuerUntrusted { .. }),
+            "expected SigstoreIssuerUntrusted, got {err:?}"
+        );
+
+        let trusted = SupplyChainEvidence::new().mark_sigstore_verified_for_tests(
+            Some("github-actions"),
+            Some("https://token.actions.githubusercontent.com"),
+        );
+        enforce_supply_chain_verification_config(&config, &manifest, Some(&trusted), &binary_hash)
+            .expect("trusted identity and issuer must satisfy the allowlists");
+    }
+
+    /// br-g7jhf finding 1: the owner's `SupplyChainVerificationConfig` carries
+    /// its own attestation floor, enforced independently of the
+    /// publisher-controlled `manifest.policy`. A manifest with NO `[policy]`
+    /// table can no longer opt out of SLSA / attestation-type / builder
+    /// requirements.
+    #[test]
+    fn owner_config_attestation_floor_applies_without_manifest_policy() {
+        let config = SupplyChainVerificationConfig {
+            require_attestation_types: vec![AttestationType::InToto],
+            min_slsa_level: Some(3),
+            trusted_builders: vec!["trusted-builder".to_string()],
+            ..SupplyChainVerificationConfig::default()
+        };
+        let manifest = ConnectorManifest::parse_str(&unsigned_manifest_toml("")).unwrap();
+        assert!(
+            manifest.policy.is_none(),
+            "fixture must have no [policy] table for this regression to be meaningful"
+        );
+        let binary_hash = hash_bytes(b"registry-binary");
+
+        // The manifest-side gate is a no-op here — that is exactly the hole.
+        enforce_supply_chain_policy(&manifest, None)
+            .expect("no [policy] table means the manifest gate has nothing to enforce");
+
+        let err = enforce_supply_chain_verification_config(&config, &manifest, None, &binary_hash)
+            .expect_err("owner floor must demand attestation evidence");
+        assert!(
+            matches!(err, RegistryError::AttestationEvidenceMissing),
+            "expected AttestationEvidenceMissing, got {err:?}"
+        );
+
+        let weak = SupplyChainEvidence::new().with_attestations(vec![AttestationEvidence {
+            attestation_type: AttestationType::InToto,
+            slsa_level: Some(2),
+            builder_id: Some("trusted-builder".to_string()),
+            expires_at: None,
+        }]);
+        let err =
+            enforce_supply_chain_verification_config(&config, &manifest, Some(&weak), &binary_hash)
+                .expect_err("owner SLSA floor must reject a level-2 build provenance");
+        assert!(
+            matches!(err, RegistryError::SlsaLevelInsufficient { required: 3 }),
+            "expected SlsaLevelInsufficient, got {err:?}"
+        );
+
+        let compliant = SupplyChainEvidence::new().with_attestations(vec![AttestationEvidence {
+            attestation_type: AttestationType::InToto,
+            slsa_level: Some(3),
+            builder_id: Some("trusted-builder".to_string()),
+            expires_at: None,
+        }]);
+        enforce_supply_chain_verification_config(
+            &config,
+            &manifest,
+            Some(&compliant),
+            &binary_hash,
+        )
+        .expect("evidence meeting the owner floor must pass");
+    }
+
+    /// br-g7jhf finding 2: an attestation with `builder_id = None` used to be
+    /// skipped by the untrusted-builder rejection loop, so pairing one
+    /// trusted-builder attestation with one unnamed build-provenance
+    /// attestation passed both gates.
+    #[test]
+    fn unnamed_build_provenance_attestation_cannot_evade_trusted_builders() {
+        let requirements = AttestationRequirements {
+            require_attestation_types: &[],
+            min_slsa_level: None,
+            trusted_builders: &["trusted-builder".to_string()],
+            require_attestation_expiry: false,
+        };
+
+        let evasive = SupplyChainEvidence::new().with_attestations(vec![
+            AttestationEvidence {
+                attestation_type: AttestationType::InToto,
+                slsa_level: Some(3),
+                builder_id: Some("trusted-builder".to_string()),
+                expires_at: None,
+            },
+            AttestationEvidence {
+                attestation_type: AttestationType::ReproducibleBuild,
+                slsa_level: Some(3),
+                builder_id: None,
+                expires_at: None,
+            },
+        ]);
+        let err = enforce_attestation_requirements(&requirements, Some(&evasive))
+            .expect_err("unnamed build-provenance attestation must be rejected");
+        assert!(
+            matches!(err, RegistryError::BuilderIdentityMissing { .. }),
+            "expected BuilderIdentityMissing, got {err:?}"
+        );
+
+        // A non-build attestation may legitimately have no builder.
+        let mixed = SupplyChainEvidence::new().with_attestations(vec![
+            AttestationEvidence {
+                attestation_type: AttestationType::InToto,
+                slsa_level: Some(3),
+                builder_id: Some("trusted-builder".to_string()),
+                expires_at: None,
+            },
+            AttestationEvidence {
+                attestation_type: AttestationType::CodeReview,
+                slsa_level: None,
+                builder_id: None,
+                expires_at: None,
+            },
+        ]);
+        enforce_attestation_requirements(&requirements, Some(&mixed))
+            .expect("code-review attestations need no builder identity");
+
+        // Trusted builders with no build provenance at all fails closed.
+        let review_only = SupplyChainEvidence::new().with_attestations(vec![AttestationEvidence {
+            attestation_type: AttestationType::CodeReview,
+            slsa_level: None,
+            builder_id: Some("trusted-builder".to_string()),
+            expires_at: None,
+        }]);
+        let err = enforce_attestation_requirements(&requirements, Some(&review_only))
+            .expect_err("a trusted-builders policy needs build provenance");
+        assert!(
+            matches!(err, RegistryError::TrustedBuilderProvenanceMissing),
+            "expected TrustedBuilderProvenanceMissing, got {err:?}"
+        );
+    }
+
+    /// br-g7jhf finding 3: `min_slsa_level` accepted ANY attestation carrying a
+    /// high enough level, so a code-review attestation with `slsa_level = 4`
+    /// satisfied the floor even when the actual build provenance was level 0.
+    #[test]
+    fn min_slsa_level_only_counts_build_provenance_attestations() {
+        let requirements = AttestationRequirements {
+            require_attestation_types: &[],
+            min_slsa_level: Some(3),
+            trusted_builders: &[],
+            require_attestation_expiry: false,
+        };
+
+        let laundered = SupplyChainEvidence::new().with_attestations(vec![
+            AttestationEvidence {
+                attestation_type: AttestationType::CodeReview,
+                slsa_level: Some(4),
+                builder_id: None,
+                expires_at: None,
+            },
+            AttestationEvidence {
+                attestation_type: AttestationType::InToto,
+                slsa_level: Some(0),
+                builder_id: Some("builder".to_string()),
+                expires_at: None,
+            },
+        ]);
+        let err = enforce_attestation_requirements(&requirements, Some(&laundered))
+            .expect_err("a code-review SLSA level must not satisfy the build floor");
+        assert!(
+            matches!(err, RegistryError::SlsaLevelInsufficient { required: 3 }),
+            "expected SlsaLevelInsufficient, got {err:?}"
+        );
+
+        let genuine = SupplyChainEvidence::new().with_attestations(vec![AttestationEvidence {
+            attestation_type: AttestationType::InToto,
+            slsa_level: Some(3),
+            builder_id: Some("builder".to_string()),
+            expires_at: None,
+        }]);
+        enforce_attestation_requirements(&requirements, Some(&genuine))
+            .expect("build provenance at the required level must pass");
     }
 
     /// Regression for br-i5iv4: a failed TUF verification result MUST NOT
@@ -4402,7 +5203,10 @@ require_attestation_types = ["in-toto"]
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::CodeReview,
                         slsa_level: Some(2),
@@ -4463,7 +5267,10 @@ min_slsa_level = 3
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: Some(2),
@@ -4524,7 +5331,10 @@ trusted_builders = ["trusted-builder"]
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: Some(3),
@@ -5179,7 +5989,10 @@ trusted_builders = ["trusted-builder"]
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: Some(3),
@@ -5250,7 +6063,10 @@ sig = "{}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: true,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![],
                 };
 
@@ -5417,7 +6233,10 @@ require_attestation_types = ["in-toto", "code-review"]
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![
                         AttestationEvidence {
                             attestation_type: AttestationType::InToto,
@@ -6007,7 +6826,7 @@ sig = "base64:{sig_b64}"
             "local_tuf_verifier_rejects_tampered_targets_metadata_with_nonempty_signature",
             "verify",
             "tuf-adapter",
-            2,
+            3,
             || async {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let signing_key = Ed25519SigningKey::generate();
@@ -6043,6 +6862,30 @@ sig = "base64:{sig_b64}"
                 .expect("write tampered targets");
 
                 let verifier = LocalTufVerifier::new(dir.path());
+
+                // First line of defence: the snapshot role independently pinned
+                // targets.json's length and hash, so mutating targets.json is
+                // caught before its own signature is even checked (br-g7jhf
+                // finding 6).
+                let err = verifier
+                    .verify_target(&pinned, target_path)
+                    .await
+                    .expect_err("tampered targets metadata must fail the snapshot binding");
+                assert!(
+                    matches!(
+                        err,
+                        SupplyChainVerificationError::TufTargetHashMismatch { ref target, .. }
+                            if target == "targets.json"
+                    ),
+                    "expected snapshot->targets hash binding failure, got {err:?}"
+                );
+
+                // Now model a repository that also re-published snapshot and
+                // timestamp over the tampered targets.json. The binding is
+                // consistent again, so the original regression — an invalid
+                // targets-role signature must not pass the threshold — is the
+                // gate that fires.
+                write_test_tuf_snapshot_chain(dir.path(), &signing_key);
                 let err = verifier
                     .verify_target(&pinned, target_path)
                     .await
@@ -6063,6 +6906,144 @@ sig = "base64:{sig_b64}"
                 }
             },
         );
+    }
+
+    /// br-g7jhf finding 6: the TUF client used to read only `root.json` and
+    /// `targets.json`, so the two roles that actually provide freeze and
+    /// mix-and-match coverage were never consulted. All four roles are now
+    /// mandatory and cross-bound.
+    #[test]
+    fn local_tuf_verifier_requires_timestamp_and_snapshot_roles() {
+        run_registry_test(
+            "local_tuf_verifier_requires_timestamp_and_snapshot_roles",
+            "verify",
+            "tuf-adapter",
+            4,
+            || async {
+                let target_path = "connectors/fcp.test-1.0.0.tar.gz";
+                let target_bytes = b"test connector binary";
+
+                // 1. A repository serving no timestamp role fails closed rather
+                //    than silently degrading to root+targets verification.
+                let dir = tempfile::tempdir().expect("tempdir");
+                let signing_key = Ed25519SigningKey::generate();
+                let pinned =
+                    write_test_tuf_metadata(dir.path(), target_path, target_bytes, &signing_key);
+                std::fs::rename(
+                    dir.path().join("timestamp.json"),
+                    dir.path().join("timestamp.json.withheld"),
+                )
+                .expect("withhold timestamp metadata");
+                let err = LocalTufVerifier::new(dir.path())
+                    .verify_target_bytes(&pinned, target_path, target_bytes)
+                    .expect_err("a missing timestamp role must fail closed");
+                assert!(
+                    matches!(err, SupplyChainVerificationError::Network(ref msg)
+                        if msg.contains("timestamp.json")),
+                    "expected a timestamp read failure, got {err:?}"
+                );
+
+                // 2. An expired timestamp is the canonical freeze-attack signal.
+                let frozen = tempfile::tempdir().expect("tempdir");
+                let pinned_frozen =
+                    write_test_tuf_metadata(frozen.path(), target_path, target_bytes, &signing_key);
+                expire_test_tuf_role(frozen.path(), "timestamp.json", &signing_key);
+                let err = LocalTufVerifier::new(frozen.path())
+                    .verify_target_bytes(&pinned_frozen, target_path, target_bytes)
+                    .expect_err("an expired timestamp role must be refused");
+                assert!(
+                    matches!(err, SupplyChainVerificationError::TufFreeze),
+                    "expected TufFreeze, got {err:?}"
+                );
+
+                // 3. Mix-and-match: a validly signed snapshot from a different
+                //    repository state does not match the version timestamp
+                //    vouched for.
+                let mixed = tempfile::tempdir().expect("tempdir");
+                let pinned_mixed =
+                    write_test_tuf_metadata(mixed.path(), target_path, target_bytes, &signing_key);
+                bump_test_tuf_snapshot_version(mixed.path(), &signing_key);
+                let err = LocalTufVerifier::new(mixed.path())
+                    .verify_target_bytes(&pinned_mixed, target_path, target_bytes)
+                    .expect_err("snapshot not matching the timestamp meta must be refused");
+                assert!(
+                    matches!(err, SupplyChainVerificationError::TufRollback { .. }),
+                    "expected TufRollback, got {err:?}"
+                );
+
+                // 4. Positive control: the intact four-role chain still verifies
+                //    and records the full delegation path.
+                let ok = tempfile::tempdir().expect("tempdir");
+                let pinned_ok =
+                    write_test_tuf_metadata(ok.path(), target_path, target_bytes, &signing_key);
+                let result = LocalTufVerifier::new(ok.path())
+                    .verify_target_bytes(&pinned_ok, target_path, target_bytes)
+                    .expect("intact four-role TUF chain verifies");
+                assert_eq!(
+                    result.target().map(|target| target.delegations.as_slice()),
+                    Some(
+                        [
+                            "root".to_string(),
+                            "timestamp".to_string(),
+                            "snapshot".to_string(),
+                            "targets".to_string()
+                        ]
+                        .as_slice()
+                    )
+                );
+
+                RegistryLogData {
+                    reason_code: Some("local_tuf_full_role_chain_enforced".to_string()),
+                    target: Some(target_path.to_string()),
+                    ..RegistryLogData::default()
+                }
+            },
+        );
+    }
+
+    /// Re-sign a role file with an expiry in the past, leaving every other
+    /// field (and the signature validity) intact.
+    fn expire_test_tuf_role(metadata_dir: &Path, file_name: &str, signing_key: &Ed25519SigningKey) {
+        let path = metadata_dir.join(file_name);
+        let mut role: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read role")).expect("parse role");
+        let expired = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        role["signed"]["expires"] = json!(expired);
+        resign_test_tuf_role(&mut role, signing_key);
+        std::fs::write(&path, serde_json::to_vec_pretty(&role).expect("role json"))
+            .expect("write expired role");
+    }
+
+    /// Advance `snapshot.json` to a new validly signed version without touching
+    /// the `timestamp.json` that vouches for the old one.
+    fn bump_test_tuf_snapshot_version(metadata_dir: &Path, signing_key: &Ed25519SigningKey) {
+        let path = metadata_dir.join("snapshot.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read snapshot"))
+                .expect("parse snapshot");
+        snapshot["signed"]["version"] = json!(2);
+        resign_test_tuf_role(&mut snapshot, signing_key);
+        let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).expect("snapshot json");
+        std::fs::write(&path, &snapshot_bytes).expect("write bumped snapshot");
+
+        // Keep the timestamp's length/hash binding satisfied so the *version*
+        // mismatch is unambiguously what the verifier rejects.
+        let timestamp_path = metadata_dir.join("timestamp.json");
+        let mut timestamp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&timestamp_path).expect("read timestamp"))
+                .expect("parse timestamp");
+        timestamp["signed"]["meta"]["snapshot.json"] = tuf_meta_entry(1, &snapshot_bytes);
+        resign_test_tuf_role(&mut timestamp, signing_key);
+        std::fs::write(
+            &timestamp_path,
+            serde_json::to_vec_pretty(&timestamp).expect("timestamp json"),
+        )
+        .expect("write timestamp");
+    }
+
+    fn resign_test_tuf_role(role: &mut serde_json::Value, signing_key: &Ed25519SigningKey) {
+        let signature = sign_tuf_signed_payload(&role["signed"], signing_key);
+        role["signatures"] = json!([{ "keyid": TEST_TUF_KEY_ID, "sig": signature }]);
     }
 
     #[test]
@@ -6881,7 +7862,10 @@ sig = "base64:{sig_b64}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![],
                 };
 
@@ -6917,7 +7901,10 @@ sig = "base64:{sig_b64}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: None, // no level provided
@@ -6961,7 +7948,10 @@ sig = "base64:{sig_b64}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: None,
@@ -6972,7 +7962,13 @@ sig = "base64:{sig_b64}"
 
                 let err = enforce_supply_chain_policy(&manifest, Some(&evidence))
                     .expect_err("missing builder_id must not satisfy trusted_builders policy");
-                assert!(matches!(err, RegistryError::UntrustedBuilder { .. }));
+                // br-g7jhf finding 2 sharpened the taxonomy: an unnamed
+                // build-provenance attestation now names its own defect
+                // instead of being reported as an untrusted builder.
+                assert!(
+                    matches!(err, RegistryError::BuilderIdentityMissing { .. }),
+                    "expected BuilderIdentityMissing, got {err:?}"
+                );
 
                 RegistryLogData {
                     reason_code: Some("no_builder_id_rejected".to_string()),
@@ -8265,7 +9261,10 @@ sig = "{reg_sig}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![
                         AttestationEvidence {
                             attestation_type: AttestationType::InToto,
@@ -8316,7 +9315,10 @@ sig = "{reg_sig}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: Some(3),
@@ -8420,6 +9422,7 @@ sig = "{reg_sig}"
                     require_transparency: true,
                     require_tuf: true,
                     require_sigstore: true,
+                    ..SupplyChainVerificationConfig::default()
                 };
                 let debug = format!("{config:?}");
                 assert!(debug.contains("SupplyChainVerificationConfig"));
@@ -8984,6 +9987,7 @@ sig = "{reg_sig}"
             require_transparency: true,
             require_tuf: true,
             require_sigstore: false,
+            ..SupplyChainVerificationConfig::default()
         };
         let cloned = config.clone();
         assert!(cloned.require_transparency);
@@ -9027,7 +10031,10 @@ sig = "{reg_sig}"
         let evidence = SupplyChainEvidence {
             transparency_log_present: true,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![
                 AttestationEvidence {
                     attestation_type: AttestationType::InToto,
@@ -9991,7 +10998,10 @@ sig = "{}"
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: true,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![
                         AttestationEvidence {
                             attestation_type: AttestationType::InToto,
@@ -10060,7 +11070,10 @@ trusted_builders = ["trusted-ci"]
                 let evidence = SupplyChainEvidence {
                     transparency_log_present: false,
                     tuf_verified: false,
+                    tuf_target_hash: None,
                     sigstore_verified: false,
+                    sigstore_identity: None,
+                    sigstore_issuer: None,
                     attestations: vec![AttestationEvidence {
                         attestation_type: AttestationType::InToto,
                         slsa_level: Some(3),
@@ -10495,7 +11508,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: true,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(3),
@@ -10514,7 +11530,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: true,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![],
         };
         let debug = format!("{evidence:?}");
@@ -10535,7 +11554,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations,
         };
         assert_eq!(evidence.attestations.len(), 50);
@@ -10970,6 +11992,7 @@ trusted_builders = ["trusted-ci"]
             require_transparency: true,
             require_tuf: false,
             require_sigstore: true,
+            ..SupplyChainVerificationConfig::default()
         };
         let cloned = config.clone();
         assert!(config.require_transparency);
@@ -10987,6 +12010,7 @@ trusted_builders = ["trusted-ci"]
             require_transparency: false,
             require_tuf: false,
             require_sigstore: false,
+            ..SupplyChainVerificationConfig::default()
         };
         assert!(!config.require_transparency);
         assert!(!config.require_tuf);
@@ -11708,7 +12732,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(3), // exact match
@@ -11733,7 +12760,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(3),
@@ -11765,7 +12795,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(2), // one below
@@ -11794,7 +12827,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(4), // well above minimum
@@ -11818,7 +12854,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: Some(0),
@@ -11844,7 +12883,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: None,
@@ -11869,7 +12911,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: None,
@@ -11895,7 +12940,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![AttestationEvidence {
                 attestation_type: AttestationType::InToto,
                 slsa_level: None,
@@ -11920,7 +12968,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: false,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![
                 AttestationEvidence {
                     attestation_type: AttestationType::InToto,
@@ -12973,7 +14024,10 @@ trusted_builders = ["trusted-ci"]
         let evidence = SupplyChainEvidence {
             transparency_log_present: true,
             tuf_verified: false,
+            tuf_target_hash: None,
             sigstore_verified: false,
+            sigstore_identity: None,
+            sigstore_issuer: None,
             attestations: vec![],
         };
         assert!(evidence.transparency_log_present);
@@ -13067,6 +14121,7 @@ trusted_builders = ["trusted-ci"]
             require_transparency: false,
             require_tuf: false,
             require_sigstore: false,
+            ..SupplyChainVerificationConfig::default()
         };
         assert_eq!(config.trusted_sigstore_identities.len(), 100);
         assert_eq!(config.trusted_sigstore_issuers.len(), 50);

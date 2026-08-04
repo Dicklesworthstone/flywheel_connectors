@@ -310,7 +310,12 @@ async fn zendesk_default_deny_compliance_suite_passes() {
     let mut connector = ZendeskConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["zendesk.delete"]);
-    let token = build_token(&signing_key, "zendesk.delete", &["zendesk.delete"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "zendesk.delete",
+        &["zendesk.delete"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request("zendesk.get_ticket", json!({ "ticket_id": 12345 }), token);
 
     let dynamic = DynamicSuite {
@@ -377,7 +382,12 @@ async fn zendesk_allow_valid_token_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["zendesk.get_ticket"],
     );
-    let token = build_token(&signing_key, "zendesk.get_ticket", &["zendesk.get_ticket"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "zendesk.get_ticket",
+        &["zendesk.get_ticket"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request("zendesk.get_ticket", json!({ "ticket_id": 12345 }), token);
     let suite = ConnectorSuite {
         test_name: "zendesk_allow_valid_token".to_string(),

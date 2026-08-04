@@ -119,6 +119,16 @@ impl SlackClient {
         self
     }
 
+    /// Set the per-request timeout (for testing).
+    ///
+    /// Bounds the individual HTTP attempt. The runtime's overall request
+    /// deadline is left alone, so it stays the outer budget across retries.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
     /// Set retry configuration.
     #[must_use]
     pub const fn with_retry_config(
@@ -501,6 +511,7 @@ impl SlackClient {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
+        let replay_safe = post_replay_is_safe(method);
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = &url;
@@ -512,6 +523,8 @@ impl SlackClient {
                 };
                 match self.send_request(Method::Post, url, body_bytes).await {
                     Ok(resp) => {
+                        // A 429 was refused WITHOUT being performed, so it
+                        // stays retryable regardless of `replay_safe`.
                         if let Some(retry_result) = Self::check_rate_limit(&resp) {
                             return AttemptOutcome::Retryable {
                                 error: SlackError::RateLimited {
@@ -525,10 +538,13 @@ impl SlackClient {
                             Err(e) => AttemptOutcome::Terminal(SlackError::Json(e)),
                         }
                     }
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        // br-kxd3e: a transport failure that may have reached
+                        // Slack must not be replayed for a mutating method.
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 }
             }
@@ -623,9 +639,92 @@ impl SlackClient {
     }
 }
 
+/// Whether replaying a POST to this Slack Web API method cannot duplicate a
+/// side effect (br-kxd3e).
+///
+/// Slack has no general idempotency-key header, so replay safety has to come
+/// from the semantics of each method. The list is an ALLOWLIST and is
+/// deliberately fail-closed: a method that is not named here is treated as
+/// unsafe to replay, so a POST added later gets the safe behaviour without its
+/// author having to know this function exists.
+///
+/// Note the axis is "can a replay duplicate a side effect", not "is the HTTP
+/// verb idempotent" and not "does a second call return success". `chat.delete`
+/// and `reactions.add` both report an error on the second call, but neither
+/// performs the work twice, so replaying them is safe.
+fn post_replay_is_safe(method: &str) -> bool {
+    matches!(
+        method,
+        // The request names the exact target state, so applying it twice
+        // converges on the same message content / absence.
+        "chat.update" | "chat.delete"
+            // Set membership: re-adding a reaction that is already present
+            // does not produce a second reaction.
+            | "reactions.add"
+            // Mints a Socket Mode URL that expires unused within ~30s and is
+            // called repeatedly by design on every reconnect.
+            | "apps.connections.open"
+    )
+    // Deliberately absent, because a replay IS observable:
+    //   chat.postMessage       — a duplicate message in the channel
+    //   files.upload           — a duplicate file
+    //   conversations.setTopic — Slack posts a `channel_topic` event into the
+    //                            channel for each successful call
+}
+
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::post_replay_is_safe;
+
+    /// br-kxd3e: replaying these cannot duplicate a side effect.
+    #[test]
+    fn idempotent_post_methods_stay_replayable() {
+        for method in [
+            "chat.update",
+            "chat.delete",
+            "reactions.add",
+            "apps.connections.open",
+        ] {
+            assert!(
+                post_replay_is_safe(method),
+                "{method} converges on the same state when applied twice"
+            );
+        }
+    }
+
+    /// br-kxd3e: every method reachable through `post_json` that a replay
+    /// would duplicate. Each of these is a real POST call site in this client.
+    #[test]
+    fn mutating_post_methods_are_not_replayable() {
+        for method in ["chat.postMessage", "files.upload", "conversations.setTopic"] {
+            assert!(
+                !post_replay_is_safe(method),
+                "replaying {method} produces a user-visible duplicate"
+            );
+        }
+    }
+
+    /// The allowlist must fail closed: an unrecognised method — which is what
+    /// a POST added by a later author looks like — is not replayable.
+    #[test]
+    fn unknown_post_methods_fail_closed() {
+        for method in [
+            "chat.scheduleMessage",
+            "conversations.invite",
+            "admin.users.remove",
+            "",
+        ] {
+            assert!(
+                !post_replay_is_safe(method),
+                "{method:?} is not on the allowlist and must default to unsafe"
+            );
+        }
+    }
 }

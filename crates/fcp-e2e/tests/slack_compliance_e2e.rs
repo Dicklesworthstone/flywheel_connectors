@@ -326,7 +326,12 @@ async fn slack_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["slack.write"]);
     // Token grants "slack.write" but invoke targets "slack.get_channel_history" -> denial
-    let token = build_token(&signing_key, "slack.write", &["slack.write"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "slack.write",
+        &["slack.write"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "slack.get_channel_history",
         json!({ "channel": "C0123456789" }),

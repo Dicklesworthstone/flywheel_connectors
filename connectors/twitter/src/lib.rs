@@ -38,6 +38,7 @@
     clippy::struct_field_names,
     clippy::too_many_lines,
     clippy::unused_async,
+    clippy::unused_async_trait_impl,
     clippy::wildcard_imports
 )]
 

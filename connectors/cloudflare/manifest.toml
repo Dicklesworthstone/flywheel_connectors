@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:dc5a33ed3ff789e7f10cc4e60981751c813c63be823c0f60c855367158d17b3a"
+interface_hash = "blake3-256:fcp.interface.v2:8cea1db3ef8a3b1891d2ae910a23412fd21452d2317e1da2f1c0850b852c2eac"
 
 [connector]
 id = "fcp.cloudflare"
@@ -1111,9 +1111,11 @@ type = [
 ]
 
 [provides.operations."cloudflare.zones.list".output_schema.items.properties.id]
+description = "Cloudflare zone identifier."
 type = "string"
 
 [provides.operations."cloudflare.zones.list".output_schema.items.properties.name]
+description = "DNS zone name, such as example.com."
 type = "string"
 
 [provides.operations."cloudflare.zones.list".output_schema.items.properties.paused]

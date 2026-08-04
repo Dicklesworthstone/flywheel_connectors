@@ -1135,3 +1135,81 @@ async fn shared_generation_overlap_matches_canonical_gmail_metadata() {
     assert_eq!(introspection_history["capability"], "gmail.history.read");
     assert!(introspection_history["requires_approval"].is_null());
 }
+
+// ============================================================================
+// Replay safety on retry (br-kxd3e)
+// ============================================================================
+//
+// Gmail is the highest-harm case in this sweep: a retried send does not
+// duplicate a record somewhere, it puts a SECOND email in a real person's
+// inbox, and there is no idempotency key and no way to take it back.
+//
+// Gmail also models several state changes as POSTs (`modify`, `trash`) which
+// only name a target state, so those keep their retries. The pair of tests
+// below pins both halves of that distinction.
+
+fn replay_test_client(mock_server: &MockServer) -> GmailClient {
+    GmailClient::new("test-token")
+        .unwrap()
+        .with_base_url(mock_server.uri())
+        .with_retry_config(3, 1, 5)
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_message_is_not_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/users/me/messages/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let result = replay_test_client(&mock_server).send_message("raw").await;
+    assert!(result.is_err());
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Gmail received the send — retrying delivers a SECOND \
+         email, which cannot be undone"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn modify_message_is_still_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/users/me/messages/msg1/modify"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/users/me/messages/msg1/modify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg1",
+            "threadId": "t1",
+            "labelIds": ["INBOX"]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    replay_test_client(&mock_server)
+        .modify_message("msg1", &["INBOX".to_string()], &[])
+        .await
+        .expect("modify names a target label set, so the retry converges");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "a POST that names a target state rather than appending keeps its retry"
+    );
+}

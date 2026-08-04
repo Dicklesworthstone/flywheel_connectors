@@ -371,3 +371,133 @@ fn debug_output_redacts_api_token() {
     assert!(!debug_output.contains("super-secret-circleci-token"));
     assert!(debug_output.contains("[REDACTED]"));
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// The same shape as the confirmed github workflow_dispatch case that opened
+// the bead: a 5xx means CircleCI RECEIVED the trigger, so replaying it queues
+// a second pipeline — real compute, plus whatever that pipeline deploys.
+// CircleCI has no idempotency key, so the fix refuses the unsafe retry.
+//
+// The assertion is the REQUEST COUNT. "It still errors" would pass with the
+// bug present.
+
+fn retrying_client(server: &MockServer) -> CircleCiClient {
+    CircleCiClient::new(
+        &server.uri(),
+        TEST_TOKEN,
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+        500,
+    )
+    .expect("wiremock URI should build a CircleCI client")
+}
+
+#[fcp_async_core::runtime::test]
+async fn trigger_pipeline_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/project/gh/acme/app/pipeline"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let result = retrying_client(&server)
+        .trigger_pipeline(&test_runtime(), "gh/acme/app", &json!({ "branch": "main" }))
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means CircleCI received the trigger — retrying queues a SECOND \
+         pipeline run"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn rerun_workflow_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/workflow/wf-1/rerun"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+
+    let result = retrying_client(&server)
+        .rerun_workflow(&test_runtime(), "wf-1", true)
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a rerun creates a NEW workflow run, so a replay costs a second one"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn trigger_pipeline_still_retries_a_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/project/gh/acme/app/pipeline"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/project/gh/acme/app/pipeline"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "pipe-1",
+            "state": "created",
+            "number": 7
+        })))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .trigger_pipeline(&test_runtime(), "gh/acme/app", &json!({ "branch": "main" }))
+        .await
+        .expect("a rate-limited trigger was refused without starting anything");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means CircleCI did NOT queue the pipeline, so backoff must be preserved"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn cancel_workflow_is_still_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/workflow/wf-1/cancel"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/workflow/wf-1/cancel"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "message": "cancelled" })))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .cancel_workflow(&test_runtime(), "wf-1")
+        .await
+        .expect("cancel converges on the same state, so the retry is preserved");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "cancel is idempotent and must stay retryable"
+    );
+}

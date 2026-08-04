@@ -33,6 +33,7 @@ Important truths from `connector.rs`, `client.rs`, and `manifest.toml`:
 - Configuration is `base_url`, `access_token`, retry policy, and bounded `request_timeout_ms`.
 - One connector instance is bound to one injected Square bearer token.
 - The token can be a personal access token or a seller OAuth token that was provisioned out of band.
+- Runtime introspection derives operation descriptions, schemas, capabilities, risk levels, safety tiers, idempotency classes, approval modes, and AI hints from the strict `manifest.toml`.
 - The live runtime is request-response only. It does not expose webhook ingest, event streaming, or long-lived subscriptions.
 - The connector is merchant-scoped, but location-sensitive workflows still matter. `square.orders.list` requires explicit `location_ids`, `square.orders.create` requires one `location_id`, and `square.payments.create` can optionally rely on Square's main-location default if `location_id` is omitted.
 - `square.health` and `self_check()` are tied to the Locations API, which makes location visibility part of the readiness boundary.
@@ -130,7 +131,7 @@ The bundle captures:
 - `cargo fmt --manifest-path connectors/square/Cargo.toml --check` via `rch`
 - `cargo check -p fcp-square --all-targets` via `rch`
 - targeted readiness evidence for `health`, `doctor`, `self_check`, payments pagination, catalog filters, and high-risk payment creation
-- typed introspection compliance evidence
+- manifest/runtime typed introspection parity evidence
 - the Square integration suite and full crate test suite
 - `cargo clippy -p fcp-square --all-targets -- -D warnings` via `rch`
 
@@ -174,9 +175,9 @@ Rerun commands:
 
 This contract is grounded in the current connector implementation and current Square docs:
 
-- `connectors/square/src/connector.rs` defines the operation inventory, capability mapping, safety semantics, and readiness behavior.
+- `connectors/square/src/connector.rs` defines invoke routing, capability verification, deterministic operation ordering, manifest-derived runtime introspection, and readiness behavior.
 - `connectors/square/src/client.rs` defines the concrete REST endpoints and confirms the one-bearer-token request model.
-- `connectors/square/manifest.toml` defines the network allowlist and current non-goal boundary.
+- `connectors/square/manifest.toml` defines the operation inventory, metadata contract, network allowlist, and current non-goal boundary.
 - Square access tokens and environment mapping: https://developer.squareup.com/docs/build-basics/access-tokens
 - Square Sandbox overview: https://developer.squareup.com/docs/devtools/sandbox/overview
 - Square OAuth overview: https://developer.squareup.com/docs/oauth-api/overview

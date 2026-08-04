@@ -15,14 +15,23 @@ use crate::{
     types::{CollectionInfo, CountResult, ListCollectionsResult, ScrollResult},
 };
 
-/// Validate a path segment to prevent path traversal attacks.
+/// Validate a path segment to prevent path traversal and query/fragment
+/// injection. Qdrant collection names are `[A-Za-z0-9_-]`-shaped, so rejecting
+/// slashes, any `..` substring, encoded slashes, and URL delimiters
+/// (`?`/`#`/`&`/`=`/`%`) never trips a legitimate name while stopping
+/// `a?b` (wrong-endpoint via query injection) and `..%2f..`.
 fn sanitize_path_segment(segment: &str) -> QdrantResult<&str> {
     if segment.trim().is_empty()
+        || segment == "."
         || segment.contains('/')
         || segment.contains('\\')
         || segment.contains('\0')
-        || segment == "."
-        || segment == ".."
+        || segment.contains("..")
+        || segment.contains('?')
+        || segment.contains('#')
+        || segment.contains('&')
+        || segment.contains('=')
+        || segment.contains('%')
     {
         return Err(QdrantError::InvalidInput(format!(
             "Invalid path segment: {segment}"

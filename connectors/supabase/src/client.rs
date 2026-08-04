@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -376,7 +379,11 @@ impl SupabaseClient {
                     .header("Content-Type", content_type)
                     .header("x-upsert", if upsert { "true" } else { "false" });
                 req = req.body(body);
-                handle_json_response(req, attempt).await
+                // br-kxd3e: read the upload's own signal, same as the
+                // PostgREST path. With `x-upsert: true` a replay overwrites
+                // the same object key and converges; without it, a replay
+                // uploads a second object.
+                handle_json_response(req, attempt, upsert).await
             }
         })
         .await
@@ -476,6 +483,21 @@ impl SupabaseClient {
         let client = self.client.clone();
         let auth = self.auth.clone();
         let is_write = !matches!(method, Method::GET | Method::HEAD);
+        // br-kxd3e: replay safety is READ OFF THE REQUEST rather than declared
+        // per call site, so it stays correct as operations change.
+        //
+        // PostgREST semantics: GET/HEAD read; PATCH and DELETE carry a filter
+        // and converge on the same rows; PUT is an upsert. Only a bare POST
+        // inserts, and a replay of that inserts the rows a SECOND time.
+        //
+        // The exception is the connector's own upsert path, which announces
+        // itself in the `Prefer` header (`resolution=merge-duplicates` or
+        // `ignore-duplicates`). PostgREST resolves the conflict server-side,
+        // so replaying it converges — the same shape as square reading its
+        // own idempotency_key off the body.
+        let is_conflict_resolving_upsert =
+            prefer.iter().any(|value| value.starts_with("resolution="));
+        let replay_safe = method != Method::POST || is_conflict_resolving_upsert;
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let method = method.clone();
@@ -508,7 +530,7 @@ impl SupabaseClient {
                 if let Some(body) = body {
                     req = req.header("Content-Type", "application/json").json(&body);
                 }
-                handle_json_response(req, attempt).await
+                handle_json_response(req, attempt, replay_safe).await
             }
         })
         .await
@@ -567,20 +589,25 @@ fn apply_schema_headers(req: RequestBuilder, schema: &str, is_write: bool) -> Re
 async fn handle_json_response(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<JsonHttpResponse, SupabaseError> {
     let resp = match req.send().await {
         Ok(resp) => resp,
         Err(err) => {
-            return AttemptOutcome::Retryable {
-                error: SupabaseError::Http(err),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the insert never reached
+            // PostgREST.
+            let replayable = replay_safe || !transport_error_reached_service(&err);
+            return AttemptOutcome::retryable_if_replayable(
+                SupabaseError::Http(err),
+                None,
+                replayable,
+            );
         }
     };
 
     let status = resp.status();
     if !status.is_success() {
-        return handle_error_response::<JsonHttpResponse>(resp).await;
+        return handle_error_response::<JsonHttpResponse>(resp, replay_safe).await;
     }
 
     let headers = clone_json_headers(&resp);
@@ -624,7 +651,7 @@ async fn handle_binary_response(
 
     let status = resp.status();
     if !status.is_success() {
-        return handle_error_response::<BinaryHttpResponse>(resp).await;
+        return handle_error_response::<BinaryHttpResponse>(resp, true).await;
     }
 
     let headers = clone_binary_headers(&resp);
@@ -643,7 +670,15 @@ async fn handle_binary_response(
     })
 }
 
-async fn handle_error_response<T>(resp: Response) -> AttemptOutcome<T, SupabaseError> {
+/// Classify a PostgREST error response.
+///
+/// `replay_safe` gates only the post-transmission retry classes; the 429 arm
+/// above it stays retryable because PostgREST refused the request WITHOUT
+/// performing it (br-kxd3e).
+async fn handle_error_response<T>(
+    resp: Response,
+    replay_safe: bool,
+) -> AttemptOutcome<T, SupabaseError> {
     let status = resp.status();
     let retry_after = retry_after_header(resp.headers());
     let body = resp.text().await.unwrap_or_default();
@@ -689,7 +724,9 @@ async fn handle_error_response<T>(resp: Response) -> AttemptOutcome<T, SupabaseE
     ) {
         AttemptOutcome::Terminal(error)
     } else {
-        AttemptOutcome::Retryable { error, retry_after }
+        // A 5xx means PostgREST received the statement and may already have
+        // committed the insert.
+        AttemptOutcome::retryable_if_replayable(error, retry_after, replay_safe)
     }
 }
 

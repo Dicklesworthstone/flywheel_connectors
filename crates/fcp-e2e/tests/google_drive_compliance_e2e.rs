@@ -383,7 +383,12 @@ async fn google_drive_happy_path_connector_suite_passes() {
         &["drive.read"],
         instance_id.clone(),
     );
-    let token = build_token(&signing_key, instance_id.as_str(), "drive.read", &["drive.get_file"]);
+    let token = build_token(
+        &signing_key,
+        instance_id.as_str(),
+        "drive.read",
+        &["drive.get_file"],
+    );
     let invoke = invoke_request("drive.get_file", json!({ "file_id": "file_123" }), token);
 
     let suite = ConnectorSuite {

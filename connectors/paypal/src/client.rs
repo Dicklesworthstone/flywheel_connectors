@@ -414,7 +414,9 @@ impl PayPalClient {
     ) -> PayPalResult<InvoiceSendResponse> {
         let invoice_id = sanitize_path_segment(invoice_id, "invoice_id")?;
         let url = format!("{}/v2/invoicing/invoices/{invoice_id}/send", self.base_url);
-        let idempotency_key = idempotency_key.map(String::from);
+        // See `post_json`: sending an invoice is a side effect PayPal will
+        // repeat if the request is replayed without a stable request id.
+        let idempotency_key = resolve_request_id(idempotency_key);
         let mut force_refresh = false;
 
         loop {
@@ -432,10 +434,11 @@ impl PayPalClient {
                 let idempotency_key = idempotency_key.clone();
                 async move {
                     debug!(attempt, url = %redact_url(&url), "POST invoice send");
-                    let mut req = client.post(&url).bearer_auth(&token).json(&json!({}));
-                    if let Some(key) = &idempotency_key {
-                        req = req.header("PayPal-Request-Id", key.as_str());
-                    }
+                    let req = client
+                        .post(&url)
+                        .bearer_auth(&token)
+                        .json(&json!({}))
+                        .header("PayPal-Request-Id", idempotency_key.as_str());
                     let resp = match req.send().await {
                         Ok(r) => r,
                         Err(e) => {
@@ -551,7 +554,18 @@ impl PayPalClient {
     ) -> PayPalResult<T> {
         let url = url.to_string();
         let body = body.clone();
-        let idempotency_key = idempotency_key.map(String::from);
+        // EVERY POST carries a PayPal-Request-Id (br-kxd3e).
+        //
+        // `handle_response` retries on 5xx and on transport errors, both of
+        // which can be reported after PayPal already created the order, took
+        // the capture, or issued the refund. PayPal deduplicates on this header
+        // for the endpoints reached here (orders create/capture, payments
+        // refund, invoicing create), so generating one when the caller supplied
+        // none makes the retry genuinely safe rather than merely refused.
+        //
+        // Resolved ONCE, outside the retry closure, so every attempt presents
+        // the same value — a per-attempt id would provide exactly nothing.
+        let idempotency_key = resolve_request_id(idempotency_key);
         let mut force_refresh = false;
 
         loop {
@@ -570,10 +584,11 @@ impl PayPalClient {
                 let idempotency_key = idempotency_key.clone();
                 async move {
                     debug!(attempt, url = %redact_url(&url), "POST");
-                    let mut req = client.post(&url).bearer_auth(&token).json(&body);
-                    if let Some(key) = &idempotency_key {
-                        req = req.header("PayPal-Request-Id", key.as_str());
-                    }
+                    let req = client
+                        .post(&url)
+                        .bearer_auth(&token)
+                        .json(&body)
+                        .header("PayPal-Request-Id", idempotency_key.as_str());
                     handle_response::<T>(req, attempt).await
                 }
             })
@@ -587,6 +602,19 @@ impl PayPalClient {
             }
         }
     }
+}
+
+/// Resolve the `PayPal-Request-Id` for one logical call.
+///
+/// Returns the caller's key when there is one, otherwise a fresh id. Callers
+/// MUST invoke this outside their retry loop so every attempt of the same call
+/// presents the same value — that identity is the entire mechanism by which
+/// PayPal deduplicates a replayed order, capture, refund, or invoice send.
+fn resolve_request_id(idempotency_key: Option<&str>) -> String {
+    idempotency_key.map_or_else(
+        || format!("fcp2-retry-{}", uuid::Uuid::new_v4()),
+        String::from,
+    )
 }
 
 async fn handle_response<T: serde::de::DeserializeOwned>(

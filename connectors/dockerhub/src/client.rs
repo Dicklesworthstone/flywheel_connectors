@@ -6,7 +6,9 @@ use reqwest::{Client, RequestBuilder, header::HeaderMap};
 use tracing::debug;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{DockerHubError, DockerHubResult};
 use crate::types::*;
@@ -112,7 +114,10 @@ impl DockerHubClient {
                 async move {
                     debug!(attempt, "Docker Hub login");
                     let req = client.post(&url).json(&body);
-                    handle_response::<LoginResponse>(req, attempt).await
+                    // Replay-safe: a token mint reads credentials and
+                    // creates nothing durable — the sweep's standing rule for
+                    // OAuth-style token POSTs.
+                    handle_response::<LoginResponse>(req, attempt, true).await
                 }
             })
             .await?;
@@ -277,12 +282,18 @@ impl DockerHubClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET single");
                 let req = authenticate_request(client.get(&url), auth_header_value.as_deref());
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: NOT replay-safe. Every caller of this helper CREATES a
+    /// resource and the provider offers no idempotency key, so a duplicate is a second repository.
+    /// Only a connect-phase failure is retried. A converging POST added
+    /// later needs its own helper rather than reusing this one.
     async fn post_json<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         runtime: &ConnectorRuntime,
@@ -304,7 +315,7 @@ impl DockerHubClient {
                 debug!(attempt, url = %redact_url(&url), "POST");
                 let req = authenticate_request(client.post(&url), auth_header_value.as_deref())
                     .json(&body);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -327,7 +338,7 @@ impl DockerHubClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "DELETE");
                 let req = authenticate_request(client.delete(&url), auth_header_value.as_deref());
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -383,17 +394,26 @@ fn rate_limited_outcome<T>(headers: &HeaderMap) -> AttemptOutcome<T, DockerHubEr
     }
 }
 
+/// Classify a response.
+///
+/// `replay_safe` gates only the post-transmission classes; the 429 arm stays
+/// retryable because the provider refused the request WITHOUT performing it
+/// (br-kxd3e).
 async fn handle_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, DockerHubError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: DockerHubError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(
+                DockerHubError::Http(e),
+                None,
+                replayable,
+            );
         }
     };
 
@@ -422,10 +442,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }
@@ -467,6 +486,8 @@ async fn handle_paginated_response<T: serde::de::DeserializeOwned>(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            // Only a connect-phase failure proves the request never left us.
+            // Read path: always retryable.
             return AttemptOutcome::Retryable {
                 error: DockerHubError::Http(e),
                 retry_after: None,
@@ -493,6 +514,8 @@ async fn handle_paginated_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
             return AttemptOutcome::Retryable {
                 error: err,
                 retry_after: None,

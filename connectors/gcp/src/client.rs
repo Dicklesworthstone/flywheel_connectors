@@ -7,7 +7,9 @@ use serde_json::json;
 use tracing::{debug, info};
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{GcpError, GcpResult};
 use crate::jwt::{self, CachedToken};
@@ -349,7 +351,14 @@ impl GcpClient {
         object_name: &str,
     ) -> GcpResult<StorageObject> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
-        let object_name = sanitize_object_name(object_name, "object_name")?;
+        // Mirror `upload_object`: `sanitize_object_name` permits `/` for GCS
+        // hierarchy but leaves `?`/`#`/`&` intact, so also reject query/fragment
+        // characters — otherwise `secret.txt?alt=media` flips this metadata read
+        // into a raw media download.
+        let object_name = sanitize_query_param(
+            sanitize_object_name(object_name, "object_name")?,
+            "object_name",
+        )?;
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.storage_base, bucket, object_name
@@ -393,7 +402,9 @@ impl GcpClient {
                 let req = authenticate_request_static(client.post(&url), &token)
                     .header("Content-Type", ct)
                     .body(body);
-                handle_response::<StorageObject>(req, attempt).await
+                // Replay-safe: the object name is caller-chosen, so a
+                // re-upload overwrites rather than creating a second object.
+                handle_response::<StorageObject>(req, attempt, true).await
             }
         })
         .await
@@ -406,7 +417,13 @@ impl GcpClient {
         object_name: &str,
     ) -> GcpResult<serde_json::Value> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
-        let object_name = sanitize_object_name(object_name, "object_name")?;
+        // Mirror `upload_object`/`get_object`: block `?`/`#`/`&` (which
+        // `sanitize_object_name` permits) so a crafted object name cannot inject
+        // a query/fragment against the storage host.
+        let object_name = sanitize_query_param(
+            sanitize_object_name(object_name, "object_name")?,
+            "object_name",
+        )?;
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.storage_base, bucket, object_name
@@ -513,12 +530,18 @@ impl GcpClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET single");
                 let req = authenticate_request_static(client.get(&url), &token);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: NOT replay-safe. Every caller of this helper CREATES a
+    /// resource and the provider offers no idempotency key, so a replay deploys the Cloud Run service a SECOND time.
+    /// Only a connect-phase failure is retried. A converging POST added
+    /// later needs its own helper rather than reusing this one.
     async fn post_json<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         runtime: &ConnectorRuntime,
@@ -539,7 +562,7 @@ impl GcpClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "POST json");
                 let req = authenticate_request_static(client.post(&url), &token).json(&body);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -563,7 +586,8 @@ impl GcpClient {
                 debug!(attempt, url = %redact_url(&url), "POST empty");
                 let req = authenticate_request_static(client.post(&url), &token)
                     .header("Content-Length", "0");
-                handle_response::<serde_json::Value>(req, attempt).await
+                // Replay-safe: start/stop converge on a target instance state.
+                handle_response::<serde_json::Value>(req, attempt, true).await
             }
         })
         .await
@@ -582,7 +606,7 @@ impl GcpClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "DELETE");
                 let req = authenticate_request_static(client.delete(&url), &token);
-                handle_response::<serde_json::Value>(req, attempt).await
+                handle_response::<serde_json::Value>(req, attempt, true).await
             }
         })
         .await
@@ -602,17 +626,22 @@ fn authenticate_request_static(req: RequestBuilder, token: &str) -> RequestBuild
     }
 }
 
+/// Classify a response.
+///
+/// `replay_safe` gates only the post-transmission classes; the 429 arm stays
+/// retryable because the provider refused the request WITHOUT performing it
+/// (br-kxd3e).
 async fn handle_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, GcpError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: GcpError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(GcpError::Http(e), None, replayable);
         }
     };
 
@@ -667,10 +696,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }
@@ -708,6 +736,8 @@ async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            // Only a connect-phase failure proves the request never left us.
+            // Read path: always retryable.
             return AttemptOutcome::Retryable {
                 error: GcpError::Http(e),
                 retry_after: None,
@@ -745,6 +775,8 @@ async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
             message: text,
         };
         if status >= 500 {
+            // A 5xx means the provider received the request and may already
+            // have created the resource.
             return AttemptOutcome::Retryable {
                 error: err,
                 retry_after: None,

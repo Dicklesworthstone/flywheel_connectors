@@ -145,10 +145,19 @@ run_rch_step() {
   local name="$1"
   local target_suffix="$2"
   shift 2
+  local remote_env=(
+    "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}"
+    "CARGO_INCREMENTAL=0"
+    "CARGO_BUILD_JOBS=${BUILD_JOBS}"
+    "CARGO_TARGET_DIR=${TARGET_PREFIX}-${target_suffix}"
+    "MICROSOFT_FOUNDRY_CONNECTOR_E2E_JSONL=${LOG_JSONL}"
+    "MICROSOFT_FOUNDRY_E2E_COMMAND_LINE=${COMMAND_LINE}"
+    "MICROSOFT_FOUNDRY_E2E_GIT_REVISION=${MICROSOFT_FOUNDRY_E2E_GIT_REVISION}"
+  )
   if [[ "${name}" == "format_check" ]]; then
-    run_step "${name}" env -u RCH_FORCE_REMOTE -u RCH_REQUIRE_REMOTE RCH_VISIBILITY="${RCH_VISIBILITY}" "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${BUILD_JOBS}" CARGO_TARGET_DIR="${TARGET_PREFIX}-${target_suffix}" "$@"
+    run_step "${name}" env -u RCH_FORCE_REMOTE -u RCH_REQUIRE_REMOTE RCH_VISIBILITY="${RCH_VISIBILITY}" "${remote_env[@]}" "$@"
   else
-    run_step "${name}" env RCH_VISIBILITY="${RCH_VISIBILITY}" "${RCH_BIN}" exec -- env "RUSTUP_TOOLCHAIN=${REPO_TOOLCHAIN}" CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${BUILD_JOBS}" CARGO_TARGET_DIR="${TARGET_PREFIX}-${target_suffix}" "$@"
+    run_step "${name}" env RCH_VISIBILITY="${RCH_VISIBILITY}" "${RCH_BIN}" exec -- env "${remote_env[@]}" "$@"
   fi
 }
 
@@ -170,11 +179,39 @@ emit_json() {
     }' >>"${LOG_JSONL}"
 }
 
+harvest_e2e_log_records() {
+  local log_path="$1"
+  local line
+  local record
+  local prefix="MICROSOFT_FOUNDRY_CONNECTOR_E2E_RECORD="
+
+  [[ -f "${log_path}" ]] || return
+
+  while IFS= read -r line; do
+    case "${line}" in
+      "${prefix}"*)
+        record="${line#"${prefix}"}"
+        if jq -e '
+          type == "object"
+          and .record_type == "microsoft_foundry_connector_e2e"
+          and (.operation | type == "string")
+          and (.fixture_or_live_mode | type == "string")
+        ' <<<"${record}" >/dev/null 2>&1; then
+          if ! grep -Fqx "${record}" "${LOG_JSONL}"; then
+            printf '%s\n' "${record}" >>"${LOG_JSONL}"
+          fi
+        fi
+        ;;
+    esac
+  done <"${log_path}"
+}
+
 run_test() {
   local test_name="$1"
   local status
 
   status="$(run_rch_step "${test_name}" "integration-${test_name}" cargo test -p fcp-microsoft-foundry --test integration "${test_name}" -- --nocapture)"
+  harvest_e2e_log_records "${OUT_ROOT}/logs/${test_name}.log"
   if [[ "${status}" == "passed" ]]; then
     emit_json \
       "microsoft_foundry_connector_e2e_test" \

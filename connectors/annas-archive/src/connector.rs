@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
@@ -288,10 +289,15 @@ fn operations_info() -> Vec<OperationInfo> {
 }
 
 fn typed_operations_info() -> Vec<OperationInfo> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
-        .collect()
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {

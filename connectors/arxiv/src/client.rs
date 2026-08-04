@@ -174,7 +174,12 @@ impl ArxivClient {
 
             match status.as_u16() {
                 429 => Err(ArxivError::RateLimited {
-                    retry_after_ms: retry_after.unwrap_or(60) * 1000,
+                    // `retry_after` is a hostile `Retry-After` header value.
+                    // `* 1000` on the raw u64 overflows for anything above
+                    // ~1.8e16 — a panic in debug/test and, since the release
+                    // profile leaves `overflow-checks` unset, a silent wrap in
+                    // release that turns a long backoff into a near-zero one.
+                    retry_after_ms: retry_after.unwrap_or(60).saturating_mul(1000),
                 }),
                 404 => Err(ArxivError::NotFound { resource: detail }),
                 code => Err(ArxivError::ScholarApi {
@@ -202,13 +207,18 @@ impl ArxivClient {
             "/api/query?search_query={}&start={offset}&max_results={max}",
             urlencoded(query)
         );
+        // `sort_by` / `sort_order` are caller-supplied; percent-encode them like
+        // every other URL value in this client so a value such as
+        // `relevance&max_results=99999` cannot smuggle additional query
+        // parameters. arXiv's valid sort tokens are all unreserved characters,
+        // so legitimate values pass through unchanged.
         if let Some(sb) = sort_by {
             url.push_str("&sortBy=");
-            url.push_str(sb);
+            url.push_str(&urlencoded(sb));
         }
         if let Some(so) = sort_order {
             url.push_str("&sortOrder=");
-            url.push_str(so);
+            url.push_str(&urlencoded(so));
         }
         let xml = self.arxiv_get(&url).await?;
         let papers = xml_parser::parse_atom_entries(&xml);

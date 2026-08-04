@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:638985fd11611f74c9c390e4a8ca3d1e309a592de7ac15b6c251e2d4b214f885"
+interface_hash = "blake3-256:fcp.interface.v2:077576c9798e2f855de0615217d979736a21017d38e4dc59f2278fc43f98278f"
 
 [connector]
 id = "fcp.google_drive"
@@ -48,6 +48,7 @@ required = []
 type = "object"
 [provides.operations."drive.list_files".input_schema.properties.query]
 type = "string"
+description = "Drive search query (q parameter)"
 [provides.operations."drive.list_files".input_schema.properties.max_results]
 type = "integer"
 [provides.operations."drive.list_files".input_schema.properties.page_token]

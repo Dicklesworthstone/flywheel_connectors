@@ -12,6 +12,7 @@ id = "fcp.inworld"
 name = "Inworld"
 version = "0.1.0"
 description = "Inworld Realtime character and voice-agent connector with TTS WebSocket and Router chat support"
+status = "proven"
 archetypes = ["operational", "streaming", "bidirectional"]
 format = "native"
 

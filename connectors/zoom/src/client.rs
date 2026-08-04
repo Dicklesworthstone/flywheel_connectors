@@ -1,7 +1,10 @@
 //! Zoom API client with Server-to-Server OAuth.
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -454,6 +457,12 @@ impl ZoomClient {
     }
 
     /// Execute a POST request with retry and token acquisition.
+    /// Execute a POST request.
+    ///
+    /// br-kxd3e: every caller CREATES a Zoom resource and Zoom has no
+    /// idempotency key, so a replay that reached Zoom schedules a second
+    /// meeting. Note the token-mint failures above stay retryable on purpose:
+    /// if minting the OAuth token failed, the create request was never sent.
     async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
@@ -531,14 +540,19 @@ impl ZoomClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: ZoomError::Http(e),
-                            retry_after: None,
-                        };
+                        // Only a connect-phase failure proves the create never
+                        // reached Zoom.
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            ZoomError::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
                 let status = resp.status().as_u16();
+                // 429 stays retryable: refused WITHOUT scheduling anything.
                 if status == 429 {
                     let retry_after = resp
                         .headers()
@@ -558,7 +572,10 @@ impl ZoomClient {
 
                 if !resp.status().is_success() {
                     let text = resp.text().await.unwrap_or_default();
-                    let decision = classify_http_status(status, None);
+                    // Every remaining retryable class here is a 5xx, which
+                    // means Zoom RECEIVED the create and may already have
+                    // scheduled the meeting. 429 is handled above, before this
+                    // point, because it was refused without scheduling.
                     let err = if let Ok(api_err) = serde_json::from_str::<ApiErrorResponse>(&text) {
                         ZoomError::Api {
                             code: api_err.code,
@@ -570,12 +587,6 @@ impl ZoomClient {
                             message: text,
                         }
                     };
-                    if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
-                    }
                     return AttemptOutcome::Terminal(err);
                 }
 

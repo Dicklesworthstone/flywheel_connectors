@@ -54,7 +54,12 @@ impl JiraConnectorAdapter {
     /// (fixed) instance_id; expose it so test tokens can bind to it
     /// (instance-binding pattern, commit 16171621d).
     async fn connector_instance_id(&self) -> String {
-        self.connector.lock().await.instance_id().as_str().to_string()
+        self.connector
+            .lock()
+            .await
+            .instance_id()
+            .as_str()
+            .to_string()
     }
 }
 

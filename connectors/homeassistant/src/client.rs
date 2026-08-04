@@ -64,6 +64,26 @@ impl fmt::Debug for HomeAssistantAuth {
     }
 }
 
+/// Sanitize a path segment to prevent path traversal.
+///
+/// Permits `:`, `.`, and `+` so entity IDs (`light.kitchen`) and ISO-8601
+/// history timestamps (`2026-01-01T00:00:00+02:00`) pass unchanged.
+fn sanitize_path_segment(segment: &str) -> HomeAssistantResult<&str> {
+    if segment.trim().is_empty()
+        || segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains("..")
+        || segment.contains('\0')
+        || segment.contains('?')
+        || segment.contains('#')
+    {
+        return Err(HomeAssistantError::InvalidInput(
+            "Invalid path segment: contains illegal characters".into(),
+        ));
+    }
+    Ok(segment)
+}
+
 /// `Home Assistant` API client.
 pub struct HomeAssistantClient {
     client: Client,
@@ -509,6 +529,7 @@ impl HomeAssistantClient {
 
     /// Get a single entity state.
     pub async fn get_state(&self, entity_id: &str) -> HomeAssistantResult<serde_json::Value> {
+        let entity_id = sanitize_path_segment(entity_id)?;
         self.get(&format!("/states/{entity_id}"), None).await
     }
 
@@ -518,6 +539,7 @@ impl HomeAssistantClient {
         entity_id: &str,
         body: &serde_json::Value,
     ) -> HomeAssistantResult<serde_json::Value> {
+        let entity_id = sanitize_path_segment(entity_id)?;
         self.post(&format!("/states/{entity_id}"), body).await
     }
 
@@ -530,6 +552,8 @@ impl HomeAssistantClient {
         service: &str,
         body: &serde_json::Value,
     ) -> HomeAssistantResult<serde_json::Value> {
+        let domain = sanitize_path_segment(domain)?;
+        let service = sanitize_path_segment(service)?;
         self.post(&format!("/services/{domain}/{service}"), body)
             .await
     }
@@ -550,6 +574,7 @@ impl HomeAssistantClient {
         minimal_response: Option<bool>,
         significant_changes_only: Option<bool>,
     ) -> HomeAssistantResult<serde_json::Value> {
+        let timestamp = sanitize_path_segment(timestamp)?;
         let mut q = Vec::new();
         if let Some(e) = filter_entity_id {
             q.push(("filter_entity_id", e.to_string()));
@@ -789,6 +814,26 @@ mod tests {
         let dbg = format!("{auth:?}");
         assert!(!dbg.contains("secret-token"));
         assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_valid() {
+        assert!(sanitize_path_segment("light.kitchen").is_ok());
+        assert!(sanitize_path_segment("turn_on").is_ok());
+        assert!(sanitize_path_segment("2026-01-01T00:00:00+02:00").is_ok());
+        assert!(sanitize_path_segment("2026-01-01T00:00:00.123Z").is_ok());
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal() {
+        assert!(sanitize_path_segment("../etc/passwd").is_err());
+        assert!(sanitize_path_segment("foo/bar").is_err());
+        assert!(sanitize_path_segment("foo\\bar").is_err());
+        assert!(sanitize_path_segment("").is_err());
+        assert!(sanitize_path_segment("   ").is_err());
+        assert!(sanitize_path_segment("foo\0bar").is_err());
+        assert!(sanitize_path_segment("foo?bar=1").is_err());
+        assert!(sanitize_path_segment("foo#frag").is_err());
     }
 
     #[test]

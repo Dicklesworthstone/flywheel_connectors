@@ -423,6 +423,12 @@ impl FirebaseClient {
         query: Vec<(String, String)>,
         body: Option<Value>,
     ) -> FirebaseResult<Value> {
+        // br-kxd3e: derived from the verb, which is sound here because this
+        // client uses each one for its standard meaning. GET reads; PATCH and
+        // PUT write a document at a caller-chosen path, so they converge;
+        // DELETE converges. Only POST creates a document with a SERVER-chosen
+        // auto-id, so a replay makes a second document.
+        let replay_safe = method != Method::POST;
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -440,10 +446,12 @@ impl FirebaseClient {
                 );
                 match self.execute_once(method, &url, &query, body.as_ref()).await {
                     Ok(response) => AttemptOutcome::Success(response),
-                    Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: error.retry_after(),
-                        error,
-                    },
+                    Err(error) if error.is_retryable() => {
+                        // 429 stays retryable; a 5xx reached Firestore.
+                        let replayable = replay_safe || error.replay_is_safe();
+                        let retry_after = error.retry_after();
+                        AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                    }
                     Err(error) => AttemptOutcome::Terminal(error),
                 }
             }

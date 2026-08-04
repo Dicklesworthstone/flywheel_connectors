@@ -8,8 +8,46 @@ use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use uuid::Uuid;
+
 use crate::error::{MastodonError, MastodonResult};
 use crate::types::{Account, Instance, Notification, SearchResults, Status};
+
+/// Mastodon's status-deduplication header.
+///
+/// Documented on `POST /api/v1/statuses` only: "Provide this header with any
+/// arbitrary string to prevent duplicate submissions of the same status."
+const MASTODON_IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+
+/// Why replaying a Mastodon POST cannot duplicate a side effect.
+///
+/// A 5xx or a timeout can both be reported after Mastodon already acted, so
+/// retrying a POST needs one of these to be true (br-kxd3e).
+#[derive(Debug, Clone)]
+enum PostReplaySafety {
+    /// Mastodon deduplicates on [`MASTODON_IDEMPOTENCY_HEADER`]. Only the
+    /// status-creation endpoint honours it.
+    IdempotencyKey(String),
+    /// The endpoint sets a flag that is already set — favouriting or boosting
+    /// a status twice leaves exactly one favourite or boost — so a replay
+    /// converges on the same state.
+    AlreadyIdempotent,
+}
+
+impl PostReplaySafety {
+    /// Mint a fresh dedup key for one logical submission.
+    fn idempotency_key() -> Self {
+        Self::IdempotencyKey(format!("fcp2:retry:{}", Uuid::new_v4()))
+    }
+
+    /// The header value to attach, if this endpoint honours one.
+    fn idempotency_key_header(&self) -> Option<String> {
+        match self {
+            Self::IdempotencyKey(key) => Some(key.clone()),
+            Self::AlreadyIdempotent => None,
+        }
+    }
+}
 
 /// Mastodon API client with retry and runtime integration.
 pub struct MastodonClient {
@@ -70,6 +108,8 @@ impl MastodonClient {
             || segment.contains('\\')
             || segment.contains("..")
             || segment.contains('\0')
+            || segment.contains('?')
+            || segment.contains('#')
             || lower.contains("%2f")
             || lower.contains("%5c")
         {
@@ -168,22 +208,33 @@ impl MastodonClient {
     }
 
     /// Execute a POST request with retry.
+    ///
+    /// `replay_safety` states WHY replaying this POST cannot duplicate a side
+    /// effect — see [`PostReplaySafety`]. Every caller must supply one, so a
+    /// POST added later cannot inherit this retry loop without its author
+    /// deciding the question (br-kxd3e).
     async fn post_with_retry<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
         url: &str,
         body: &serde_json::Value,
+        replay_safety: PostReplaySafety,
     ) -> MastodonResult<T> {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let url = url.to_string();
         let body = body.clone();
+        // Resolved ONCE, outside the retry closure, so every attempt presents
+        // the same key. A per-attempt key would look like protection while
+        // providing exactly zero.
+        let idempotency_key = replay_safety.idempotency_key_header();
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
             let body = body.clone();
             let client = self.client.clone();
             let token = self.access_token.clone();
+            let idempotency_key = idempotency_key.clone();
             async move {
                 debug!(attempt, url = %redact_url(&url), "Mastodon POST request");
                 let request = if token.is_empty() {
@@ -191,7 +242,10 @@ impl MastodonClient {
                 } else {
                     client.post(&url).bearer_auth(&token)
                 };
-                let request = request.json(&body);
+                let mut request = request.json(&body);
+                if let Some(key) = idempotency_key.as_deref() {
+                    request = request.header(MASTODON_IDEMPOTENCY_HEADER, key);
+                }
 
                 let resp = match request.send().await {
                     Ok(r) => r,
@@ -402,7 +456,8 @@ impl MastodonClient {
         if let Some(spoiler) = spoiler_text {
             body["spoiler_text"] = serde_json::json!(spoiler);
         }
-        self.post_with_retry(runtime, &url, &body).await
+        self.post_with_retry(runtime, &url, &body, PostReplaySafety::idempotency_key())
+            .await
     }
 
     /// Delete a status.
@@ -424,8 +479,13 @@ impl MastodonClient {
     ) -> MastodonResult<Status> {
         let id = Self::sanitize_path_segment(id)?;
         let url = format!("{}/statuses/{}/favourite", self.base_url, id);
-        self.post_with_retry(runtime, &url, &serde_json::json!({}))
-            .await
+        self.post_with_retry(
+            runtime,
+            &url,
+            &serde_json::json!({}),
+            PostReplaySafety::AlreadyIdempotent,
+        )
+        .await
     }
 
     /// Boost (reblog) a status.
@@ -436,8 +496,13 @@ impl MastodonClient {
     ) -> MastodonResult<Status> {
         let id = Self::sanitize_path_segment(id)?;
         let url = format!("{}/statuses/{}/reblog", self.base_url, id);
-        self.post_with_retry(runtime, &url, &serde_json::json!({}))
-            .await
+        self.post_with_retry(
+            runtime,
+            &url,
+            &serde_json::json!({}),
+            PostReplaySafety::AlreadyIdempotent,
+        )
+        .await
     }
 
     /// Get an account by ID.

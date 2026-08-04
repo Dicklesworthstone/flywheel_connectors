@@ -21,5 +21,13 @@ expression: pretty_json(&config)
   ],
   "require_transparency": true,
   "require_tuf": true,
-  "require_sigstore": true
+  "require_sigstore": true,
+  "require_attestation_types": [
+    "in-toto"
+  ],
+  "min_slsa_level": 3,
+  "trusted_builders": [
+    "github-actions"
+  ],
+  "require_attestation_expiry": true
 }

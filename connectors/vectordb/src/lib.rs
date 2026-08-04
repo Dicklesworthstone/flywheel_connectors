@@ -23,7 +23,8 @@
     clippy::needless_pass_by_value,
     clippy::redundant_closure_for_method_calls,
     clippy::single_match_else,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    clippy::unused_async_trait_impl
 )]
 
 pub mod config;

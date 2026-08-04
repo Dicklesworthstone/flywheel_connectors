@@ -28,6 +28,11 @@ use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::proof_readiness::{
+    ProofReadinessReportOptions, build_readiness_report, load_targets_manifest,
+    system_time_from_unix_secs,
+};
+use crate::proof_request::build_proof_request_bundle;
 use crate::readiness::{idempotency_label, risk_level_label, safety_tier_label};
 
 const CAPABILITY_PASSPORT_SCHEMA: &str = "fcp.capability-passport.v1";
@@ -78,6 +83,10 @@ pub enum ProofCommand {
     Status(ProofStatusArgs),
     /// Report proof artifact pressure without deleting or mutating artifacts.
     Artifacts(ProofArtifactsArgs),
+    /// Report whether configured live-proof blockers are ready to run or cite.
+    Readiness(ProofReadinessArgs),
+    /// Generate redaction-safe proof request bundles for missing live evidence.
+    Request(ProofRequestArgs),
     /// Attach a proof outcome to Beads and record bounded coordination state.
     Handoff(ProofHandoffArgs),
     /// Normalize RCH worker telemetry into a remote-proof capacity decision.
@@ -314,6 +323,58 @@ pub struct ProofArtifactsArgs {
         default_value_t = DEFAULT_PROOF_ARTIFACT_PRESSURE_THRESHOLD_BYTES
     )]
     pub pressure_threshold_bytes: u64,
+}
+
+/// Arguments for `fwc proof readiness`.
+#[derive(Args, Debug, Clone, Serialize)]
+pub struct ProofReadinessArgs {
+    /// Proof-readiness target manifest.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "docs/proof/evidence_targets.toml"
+    )]
+    pub manifest: PathBuf,
+
+    /// Repository root used to resolve artifact roots and globs.
+    #[arg(long = "repo-root", value_name = "PATH", default_value = ".")]
+    pub repo_root: PathBuf,
+
+    /// Evaluate only one configured target id.
+    #[arg(long, value_name = "TARGET_ID")]
+    pub target: Option<String>,
+
+    /// Suppress fully satisfied targets.
+    #[arg(long = "only-missing", default_value_t = false)]
+    pub only_missing: bool,
+
+    /// Evaluation time in Unix seconds. Defaults to the current clock.
+    #[arg(long = "now-unix-secs")]
+    pub now_unix_secs: Option<u64>,
+}
+
+/// Arguments for `fwc proof request`.
+#[derive(Args, Debug, Clone, Serialize)]
+pub struct ProofRequestArgs {
+    /// Proof-readiness target manifest.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "docs/proof/evidence_targets.toml"
+    )]
+    pub manifest: PathBuf,
+
+    /// Repository root used to resolve artifact roots and globs.
+    #[arg(long = "repo-root", value_name = "PATH", default_value = ".")]
+    pub repo_root: PathBuf,
+
+    /// Generate a request for one configured target id.
+    #[arg(long, value_name = "TARGET_ID")]
+    pub target: Option<String>,
+
+    /// Evaluation time in Unix seconds. Defaults to the current clock.
+    #[arg(long = "now-unix-secs")]
+    pub now_unix_secs: Option<u64>,
 }
 
 /// Arguments for `fwc proof handoff`.
@@ -1114,6 +1175,8 @@ pub fn run(args: &ProofArgs) -> Result<ProofCommandResult> {
         ProofCommand::Passport(args) => passport(args),
         ProofCommand::Status(args) => status(args),
         ProofCommand::Artifacts(args) => artifacts(args),
+        ProofCommand::Readiness(args) => readiness(args),
+        ProofCommand::Request(args) => request(args),
         ProofCommand::Handoff(args) => handoff(args),
         ProofCommand::RchStatus(args) => rch_status(args),
     }
@@ -1506,6 +1569,111 @@ fn status(args: &ProofStatusArgs) -> Result<ProofCommandResult> {
         "Validated proof-bundle freshness without executing rerun commands.",
     );
     Ok(ProofCommandResult { payload, success })
+}
+
+fn readiness(args: &ProofReadinessArgs) -> Result<ProofCommandResult> {
+    let manifest = load_targets_manifest(&args.manifest)?;
+    if let Some(target_id) = &args.target {
+        if !manifest
+            .targets
+            .iter()
+            .any(|target| target.target_id == *target_id)
+        {
+            let known_targets = manifest
+                .targets
+                .iter()
+                .map(|target| target.target_id.clone())
+                .collect::<Vec<_>>();
+            return Ok(ProofCommandResult {
+                payload: json!({
+                    "status": "error",
+                    "error": {
+                        "type": "unknown-proof-target",
+                        "message": format!("Unknown proof-readiness target `{target_id}`."),
+                        "target_id": target_id,
+                        "known_targets": known_targets,
+                        "recoverable": true,
+                        "next_actions": [
+                            "Run `fwc proof readiness --json` to list configured proof-readiness targets.",
+                            "Use `--target <target_id>` with one of the known target ids."
+                        ]
+                    }
+                }),
+                success: false,
+            });
+        }
+    }
+
+    let now = args
+        .now_unix_secs
+        .map(system_time_from_unix_secs)
+        .unwrap_or_else(SystemTime::now);
+    let report = build_readiness_report(
+        &manifest,
+        &ProofReadinessReportOptions {
+            repo_root: args.repo_root.clone(),
+            now,
+            generated_at: None,
+            target_filter: args.target.clone(),
+            only_missing: args.only_missing,
+        },
+    )?;
+    Ok(ok(serde_json::to_value(report)?))
+}
+
+fn request(args: &ProofRequestArgs) -> Result<ProofCommandResult> {
+    let manifest = load_targets_manifest(&args.manifest)?;
+    if let Some(target_id) = &args.target {
+        if !manifest
+            .targets
+            .iter()
+            .any(|target| target.target_id == *target_id)
+        {
+            let known_targets = manifest
+                .targets
+                .iter()
+                .map(|target| target.target_id.clone())
+                .collect::<Vec<_>>();
+            return Ok(ProofCommandResult {
+                payload: json!({
+                    "status": "error",
+                    "error": {
+                        "type": "unknown-proof-target",
+                        "message": format!("Unknown proof-readiness target `{target_id}`."),
+                        "target_id": target_id,
+                        "known_targets": known_targets,
+                        "recoverable": true,
+                        "next_actions": [
+                            "Run `fwc proof request --json` to generate requests for configured missing proof targets.",
+                            "Use `--target <target_id>` with one of the known target ids."
+                        ]
+                    }
+                }),
+                success: false,
+            });
+        }
+    }
+
+    let now = args
+        .now_unix_secs
+        .map(system_time_from_unix_secs)
+        .unwrap_or_else(SystemTime::now);
+    let report = build_readiness_report(
+        &manifest,
+        &ProofReadinessReportOptions {
+            repo_root: args.repo_root.clone(),
+            now,
+            generated_at: None,
+            target_filter: args.target.clone(),
+            only_missing: true,
+        },
+    )?;
+    let mut payload = serde_json::to_value(build_proof_request_bundle(&manifest, &report)?)?;
+    insert_toon(
+        &mut payload,
+        "Generated redaction-safe proof request bundle without executing proof commands.",
+    );
+    Ok(ok(payload))
 }
 
 fn artifacts(args: &ProofArtifactsArgs) -> Result<ProofCommandResult> {

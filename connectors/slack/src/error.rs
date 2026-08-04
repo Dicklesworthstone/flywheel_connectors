@@ -6,6 +6,7 @@ use fcp_async_core::AsyncError;
 use fcp_async_core::http::HttpClientError;
 use fcp_prelude::FcpError;
 use fcp_sdk::ConnectorErrorMapping;
+use fcp_sdk::migration::http_client_error_reached_service;
 use thiserror::Error;
 
 /// Slack-specific errors.
@@ -20,6 +21,16 @@ pub enum SlackError {
         status_code: Option<u16>,
         /// Whether the failure was a timeout.
         is_timeout: bool,
+        /// Whether it is POSSIBLE that Slack received and acted on the request
+        /// before this failure was observed (br-kxd3e).
+        ///
+        /// `false` only for connection-establishment failures, which prove no
+        /// request bytes were written. A non-idempotent POST may only be
+        /// replayed when this is `false`; everything else — including a
+        /// timeout, which is the TOTAL request deadline and so fires after the
+        /// body may have been fully sent — must be treated as "may already
+        /// have executed".
+        reached_service: bool,
     },
 
     /// JSON serialization/deserialization failed
@@ -53,12 +64,16 @@ pub enum SlackError {
 
 impl SlackError {
     /// Create an HTTP transport error.
+    ///
+    /// Conservatively marked as having reached Slack: callers that can prove
+    /// otherwise construct the variant directly.
     #[must_use]
     pub fn http(message: impl Into<String>) -> Self {
         Self::Http {
             message: message.into(),
             status_code: None,
             is_timeout: false,
+            reached_service: true,
         }
     }
 
@@ -69,6 +84,9 @@ impl SlackError {
             message: format!("request timed out after {}ms", timeout.as_millis()),
             status_code: None,
             is_timeout: true,
+            // The timeout wraps the whole request, so it can elapse after the
+            // body was fully written and even after Slack acted on it.
+            reached_service: true,
         }
     }
 
@@ -83,6 +101,7 @@ impl SlackError {
             message: error.to_string(),
             status_code,
             is_timeout: false,
+            reached_service: http_client_error_reached_service(error),
         }
     }
 
@@ -97,6 +116,24 @@ impl SlackError {
             | AsyncError::Runtime { message } => Self::http(message),
             AsyncError::ChannelClosed => Self::http("request channel closed"),
             AsyncError::ChannelFull => Self::http("request channel full"),
+        }
+    }
+
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// This is deliberately NOT "was the error transient". A rate-limit
+    /// rejection is safe to replay because the request was refused *without*
+    /// being performed; a 5xx or a timeout is not, because Slack received it.
+    #[must_use]
+    pub const fn replay_is_safe(&self) -> bool {
+        match self {
+            // Refused before Slack performed the work.
+            Self::RateLimited { .. } => true,
+            Self::Http {
+                reached_service, ..
+            } => !*reached_service,
+            _ => false,
         }
     }
 
@@ -209,6 +246,7 @@ impl ConnectorErrorMapping for SlackError {
                 message: format!("request timed out after {timeout_ms}ms"),
                 status_code: None,
                 is_timeout: true,
+                reached_service: true,
             },
             AsyncError::Cancelled => Self::http("request cancelled"),
             AsyncError::ProtocolIo { message }
@@ -923,6 +961,68 @@ mod tests {
     fn connector_error_mapping_channel_full() {
         let err = from_async(AsyncError::ChannelFull);
         assert!(matches!(err, SlackError::Http { .. }));
+    }
+
+    // ── Replay safety (br-kxd3e) ─────────────────────────────────────
+
+    /// Only a connection-establishment failure proves Slack never saw the
+    /// request. `from_http_client_error` must carry that distinction through
+    /// instead of collapsing every transport failure into one shape.
+    #[test]
+    fn connect_phase_failures_are_replay_safe() {
+        let never_sent = SlackError::from_http_client_error(&HttpClientError::ConnectError(
+            std::io::Error::other("connection refused"),
+        ));
+        assert!(
+            never_sent.replay_is_safe(),
+            "a TCP connect failure means no request bytes were written"
+        );
+
+        let dns = SlackError::from_http_client_error(&HttpClientError::DnsError(
+            std::io::Error::other("nxdomain"),
+        ));
+        assert!(dns.replay_is_safe());
+    }
+
+    /// The class that motivated the bead: a failure observed after the body
+    /// may have been fully written must NOT be replayed.
+    #[test]
+    fn post_transmission_failures_are_not_replay_safe() {
+        let io = SlackError::from_http_client_error(&HttpClientError::Io(std::io::Error::other(
+            "connection reset",
+        )));
+        assert!(
+            !io.replay_is_safe(),
+            "an I/O failure can land after the request was sent"
+        );
+
+        // The total-request timeout is applied by `time::timeout` around the
+        // whole call, so it elapses after Slack may have already acted.
+        let timed_out = SlackError::timeout(Duration::from_millis(50));
+        assert!(
+            !timed_out.replay_is_safe(),
+            "the request timeout is not proof the request never arrived"
+        );
+        assert!(
+            timed_out.is_retryable(),
+            "still retryable in general — replay safety is the separate axis"
+        );
+
+        // Same for the async-core timeout path.
+        assert!(!from_async(AsyncError::Timeout { timeout_ms: 5000 }).replay_is_safe());
+    }
+
+    /// A rate-limited request was refused WITHOUT being performed, so it stays
+    /// safe to replay. Guarding this wrong would silently disable backoff.
+    #[test]
+    fn rate_limited_is_replay_safe() {
+        let err = SlackError::RateLimited {
+            retry_after_secs: 30,
+        };
+        assert!(
+            err.replay_is_safe(),
+            "429 means Slack rejected the request without doing the work"
+        );
     }
 
     #[test]

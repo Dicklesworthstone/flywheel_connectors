@@ -154,11 +154,20 @@ impl McpClient {
 
     /// Send a JSON-RPC request to the MCP server.
     #[instrument(skip(self, params), fields(mcp_method))]
+    /// Issue an MCP JSON-RPC call.
+    ///
+    /// Replay safety is derived from the MCP method: the discovery and read
+    /// methods are pure reads, while `tools/call` invokes an arbitrary
+    /// downstream tool whose effects this bridge cannot see (br-kxd3e).
     pub async fn rpc_call(
         &self,
         mcp_method: &str,
         params: serde_json::Value,
     ) -> McpBridgeResult<serde_json::Value> {
+        let replay_safe = matches!(
+            mcp_method,
+            "tools/list" | "resources/list" | "resources/read" | "prompts/list" | "initialize"
+        );
         let id = self.next_id();
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -203,10 +212,23 @@ impl McpClient {
                             error,
                         }
                     }
-                    Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: error.retry_after(),
-                        error,
-                    },
+                    Err(error) if error.is_retryable() => {
+                        // br-kxd3e: `tools/call` forwards an ARBITRARY tool
+                        // invocation on a downstream MCP server. This bridge
+                        // cannot know what that tool does, so it cannot know
+                        // whether replaying it duplicates a side effect —
+                        // which makes fail-closed the only defensible default.
+                        // A rate limit is still replayable: it was refused
+                        // WITHOUT the downstream tool running. The discovery
+                        // and read methods pass `replay_safe`.
+                        //
+                        // The auth/session-expiry arm above is deliberately
+                        // ahead of this one and stays retryable: those failures
+                        // are rejected before the tool executes.
+                        let replayable = replay_safe || error.replay_is_safe();
+                        let retry_after = error.retry_after();
+                        AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                    }
                     Err(error) => AttemptOutcome::Terminal(error),
                 }
             }

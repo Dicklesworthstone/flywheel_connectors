@@ -240,6 +240,7 @@ impl MailchimpClient {
 
     /// List members of an audience.
     pub async fn list_members(&self, list_id: &str) -> MailchimpResult<serde_json::Value> {
+        let list_id = sanitize_path_segment(list_id, "list_id")?;
         self.get(&format!("/lists/{list_id}/members")).await
     }
 
@@ -249,6 +250,8 @@ impl MailchimpClient {
         list_id: &str,
         subscriber_hash: &str,
     ) -> MailchimpResult<serde_json::Value> {
+        let list_id = sanitize_path_segment(list_id, "list_id")?;
+        let subscriber_hash = sanitize_path_segment(subscriber_hash, "subscriber_hash")?;
         self.delete(&format!("/lists/{list_id}/members/{subscriber_hash}"))
             .await
     }
@@ -262,9 +265,43 @@ impl MailchimpClient {
 
     /// Send a campaign.
     pub async fn send_campaign(&self, campaign_id: &str) -> MailchimpResult<serde_json::Value> {
+        let campaign_id = sanitize_path_segment(campaign_id, "campaign_id")?;
         self.post_empty(&format!("/campaigns/{campaign_id}/actions/send"))
             .await
     }
+}
+
+/// Validate that a caller-supplied ID is safe to interpolate into a URL path
+/// segment.
+///
+/// Rejects empty strings, path-traversal sequences, slashes, query/fragment
+/// delimiters, and percent-encoded slash equivalents. Without this, a
+/// `subscriber_hash` of `../../../lists/<victim>` on `delete_member` normalizes
+/// (via `Url::parse`) to `DELETE /lists/<victim>` — deleting an arbitrary
+/// audience instead of one member. Mailchimp list IDs, subscriber hashes, and
+/// campaign IDs are all `[A-Za-z0-9]`-shaped, so a legitimate value never trips
+/// these checks.
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> MailchimpResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MailchimpError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(MailchimpError::InvalidInput(format!(
+            "{field} contains path traversal or URL control characters"
+        )));
+    }
+    Ok(trimmed)
 }
 
 fn decode_success_body(status: StatusCode, body: &str) -> MailchimpResult<serde_json::Value> {
@@ -362,6 +399,38 @@ mod tests {
         let dbg = format!("{client:?}");
         assert!(!dbg.contains("secret"));
         assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal_and_control_chars() {
+        for bad in [
+            "",
+            "  ",
+            "../../../lists/victim",
+            "a/b",
+            "a\\b",
+            "id?query=x",
+            "id#frag",
+            "a%2f..%2fb",
+            "a%5cb",
+        ] {
+            assert!(
+                sanitize_path_segment(bad, "subscriber_hash").is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_path_segment_accepts_real_ids() {
+        assert_eq!(
+            sanitize_path_segment("9e67587f98a6f0d1a2b3c4d5", "subscriber_hash").unwrap(),
+            "9e67587f98a6f0d1a2b3c4d5"
+        );
+        assert_eq!(
+            sanitize_path_segment(" a1b2c3 ", "list_id").unwrap(),
+            "a1b2c3"
+        );
     }
 
     #[test]

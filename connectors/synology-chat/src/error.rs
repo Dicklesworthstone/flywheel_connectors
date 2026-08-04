@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use fcp_async_core::AsyncError;
 use fcp_prelude::FcpError;
+use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorErrorMapping;
 use fcp_sdk::migration::map_async_to_fcp_error;
 use thiserror::Error;
@@ -16,7 +17,13 @@ pub enum SynologyChatError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
-    #[error("http error: {0}")]
+    // The Synology Chat incoming-webhook URL embeds the posting credential as a
+    // `token` query parameter, and `reqwest::Error`'s `Display` appends the full
+    // request URL (query included, unredacted). Interpolating the reqwest error
+    // here (`{0}`) would leak that webhook token into any surfaced/logged
+    // message, so Display carries no URL; the redaction-safe detail is built in
+    // `to_fcp_error`.
+    #[error("http error")]
     Http(#[from] reqwest::Error),
 
     #[error("api error: status={status}, message={message}")]
@@ -75,13 +82,22 @@ impl SynologyChatError {
             Self::Http(error) if error.is_timeout() => FcpError::UpstreamTimeout {
                 service: "synology_chat".into(),
             },
-            Self::Http(error) => FcpError::External {
-                service: "synology_chat".into(),
-                message: error.to_string(),
-                status_code: error.status().map(|status| status.as_u16()),
-                retryable: self.is_retryable(),
-                retry_after: self.retry_after(),
-            },
+            Self::Http(error) => {
+                // `error.to_string()` would append the raw request URL, whose
+                // query string carries the webhook `token`. Surface a
+                // redaction-safe URL (query dropped) instead.
+                let message = error.url().map_or_else(
+                    || "http error".to_string(),
+                    |url| format!("http error for url ({})", redact_url(url.as_str())),
+                );
+                FcpError::External {
+                    service: "synology_chat".into(),
+                    message,
+                    status_code: error.status().map(|status| status.as_u16()),
+                    retryable: self.is_retryable(),
+                    retry_after: self.retry_after(),
+                }
+            }
             Self::Api {
                 status: 429,
                 retry_after_ms: Some(retry_after_ms),
@@ -200,6 +216,52 @@ mod tests {
                 assert!(!retryable);
             }
             other => assert!(matches!(other, FcpError::External { .. })),
+        }
+    }
+
+    #[test]
+    fn http_transport_error_never_leaks_webhook_token() {
+        const SECRET: &str = "synology-webhook-token-DEADBEEF-secret";
+        // Bind then immediately drop a loopback socket so the port refuses
+        // connections deterministically (no accept-loop thread, no flakiness).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener local addr").port();
+        drop(listener);
+
+        // The incoming-webhook POST targets a URL with `?token=<SECRET>`; a
+        // connect failure yields a `reqwest::Error` carrying that URL. The token
+        // in the query string must never survive into any surfaced message. The
+        // assertion is a negative, so it holds for any transport error variant.
+        let url = format!("http://127.0.0.1:{port}/webapi/entry.cgi?token={SECRET}");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("client should build");
+        let outcome = fcp_async_core::runtime::block_on_sync(async move {
+            client
+                .post(&url)
+                .send()
+                .await
+                .map_err(SynologyChatError::from)
+        })
+        .expect("runtime should drive the future to completion");
+        let error = outcome.expect_err("connection to a closed loopback port must fail");
+        assert!(
+            matches!(error, SynologyChatError::Http(_)),
+            "expected transport error, got {error:?}"
+        );
+
+        let display = error.to_string();
+        assert!(
+            !display.contains(SECRET) && !display.contains("token="),
+            "Display leaked the webhook token query: {display}"
+        );
+
+        if let FcpError::External { message, .. } = error.to_fcp_error() {
+            assert!(
+                !message.contains(SECRET) && !message.contains("token="),
+                "FcpError message leaked the webhook token query: {message}"
+            );
         }
     }
 }

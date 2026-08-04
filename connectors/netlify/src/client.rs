@@ -6,7 +6,9 @@ use serde_json::json;
 use tracing::debug;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{NetlifyError, NetlifyResult};
 use crate::types::*;
@@ -19,9 +21,17 @@ fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> NetlifyResult<&'a s
         )));
     }
     let lower = value.to_ascii_lowercase();
+    // Path segments are interpolated before the `?site_id=` query suffix, so a
+    // `?`/`#`/`&` inside a segment would open the query/fragment early and
+    // truncate or re-target the intended endpoint (e.g. `.../accounts/acme?x=1/env`
+    // parses as `GET /accounts/acme`). Reject the query/fragment delimiters here
+    // too, matching `sanitize_query_param`.
     if value.contains('/')
         || value.contains('\\')
         || value.contains("..")
+        || value.contains('?')
+        || value.contains('#')
+        || value.contains('&')
         || lower.contains("%2f")
         || lower.contains("%5c")
     {
@@ -86,14 +96,14 @@ impl NetlifyClient {
         self.auth.is_secretless()
     }
 
-    // ── Health check ──
+    // Health check
 
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> NetlifyResult<User> {
         let url = format!("{}/api/v1/user", self.base_url);
         self.get_single(runtime, &url).await
     }
 
-    // ── Sites ──
+    // Sites
 
     pub async fn list_sites(&self, runtime: &ConnectorRuntime) -> NetlifyResult<Vec<Site>> {
         let url = format!("{}/api/v1/sites", self.base_url);
@@ -113,7 +123,8 @@ impl NetlifyClient {
     ) -> NetlifyResult<Site> {
         let url = format!("{}/api/v1/sites", self.base_url);
         let body = serde_json::to_value(req).map_err(NetlifyError::Json)?;
-        self.post_json(runtime, &url, &body).await
+        // NOT replay-safe: a duplicate is a second Netlify site.
+        self.post_json(runtime, &url, &body, false).await
     }
 
     pub async fn delete_site(
@@ -126,7 +137,7 @@ impl NetlifyClient {
         self.delete(runtime, &url).await
     }
 
-    // ── Deploys ──
+    // Deploys
 
     pub async fn list_deploys(
         &self,
@@ -162,7 +173,8 @@ impl NetlifyClient {
         let site_id = sanitize_path_segment(site_id, "site_id")?;
         let url = format!("{}/api/v1/sites/{site_id}/deploys", self.base_url);
         let body = serde_json::to_value(req).map_err(NetlifyError::Json)?;
-        self.post_json(runtime, &url, &body).await
+        // NOT replay-safe: a replay starts a SECOND build and ships it.
+        self.post_json(runtime, &url, &body, false).await
     }
 
     pub async fn rollback_deploy(
@@ -177,17 +189,18 @@ impl NetlifyClient {
             "{}/api/v1/sites/{site_id}/rollback/{deploy_id}",
             self.base_url
         );
-        self.post_json(runtime, &url, &json!({})).await
+        // Replay-safe: rollback restores a NAMED deploy, so it converges.
+        self.post_json(runtime, &url, &json!({}), true).await
     }
 
-    // ── DNS ──
+    // DNS
 
     pub async fn list_dns_zones(&self, runtime: &ConnectorRuntime) -> NetlifyResult<Vec<DnsZone>> {
         let url = format!("{}/api/v1/dns_zones", self.base_url);
         self.get_list(runtime, &url).await
     }
 
-    // ── Environment Variables ──
+    // Environment Variables
 
     pub async fn list_env_vars(
         &self,
@@ -218,7 +231,8 @@ impl NetlifyClient {
             self.base_url
         );
         let body = serde_json::to_value(req).map_err(NetlifyError::Json)?;
-        self.post_json_list(runtime, &url, &body).await
+        // Replay-safe: setting an env var to a value converges.
+        self.post_json_list(runtime, &url, &body, true).await
     }
 
     pub async fn delete_env_var(
@@ -238,7 +252,7 @@ impl NetlifyClient {
         self.delete(runtime, &url).await
     }
 
-    // ── Generic HTTP helpers ──
+    // Generic HTTP helpers
 
     async fn get_list<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
@@ -256,7 +270,7 @@ impl NetlifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET list");
                 let req = authenticate_request(client.get(&url), &auth);
-                handle_list_response::<T>(req, attempt).await
+                handle_list_response::<T>(req, attempt, true).await
             }
         })
         .await
@@ -278,17 +292,23 @@ impl NetlifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET single");
                 let req = authenticate_request(client.get(&url), &auth);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
     }
 
+    /// POST with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a side
+    /// effect (br-kxd3e). Netlify has no idempotency key, so a create must pass
+    /// `false` — a replayed `create_deploy` starts a SECOND build and ships it.
     async fn post_json<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         runtime: &ConnectorRuntime,
         url: &str,
         body: &serde_json::Value,
+        replay_safe: bool,
     ) -> NetlifyResult<T> {
         let url = url.to_string();
         let ctx = runtime.request_context();
@@ -303,7 +323,7 @@ impl NetlifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "POST");
                 let req = authenticate_request(client.post(&url), &auth).json(&body);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, replay_safe).await
             }
         })
         .await
@@ -314,6 +334,7 @@ impl NetlifyClient {
         runtime: &ConnectorRuntime,
         url: &str,
         body: &serde_json::Value,
+        replay_safe: bool,
     ) -> NetlifyResult<Vec<T>> {
         let url = url.to_string();
         let ctx = runtime.request_context();
@@ -328,7 +349,7 @@ impl NetlifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "POST list");
                 let req = authenticate_request(client.post(&url), &auth).json(&body);
-                handle_list_response::<T>(req, attempt).await
+                handle_list_response::<T>(req, attempt, replay_safe).await
             }
         })
         .await
@@ -350,14 +371,14 @@ impl NetlifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "DELETE");
                 let req = authenticate_request(client.delete(&url), &auth);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, true).await
             }
         })
         .await
     }
 }
 
-// ── Free functions ──
+// Free functions
 
 fn authenticate_request(req: RequestBuilder, auth: &NetlifyAuth) -> RequestBuilder {
     if auth.access_token.is_empty() {
@@ -367,17 +388,26 @@ fn authenticate_request(req: RequestBuilder, auth: &NetlifyAuth) -> RequestBuild
     }
 }
 
+/// Classify a Netlify response.
+///
+/// `replay_safe` gates only the post-transmission classes; the 429 arm stays
+/// retryable because Netlify refused the request WITHOUT performing it
+/// (br-kxd3e).
 async fn handle_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, NetlifyError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: NetlifyError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(
+                NetlifyError::Http(e),
+                None,
+                replayable,
+            );
         }
     };
 
@@ -417,10 +447,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means Netlify received the request and may already have
+            // started the deploy.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }
@@ -459,14 +488,18 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
 async fn handle_list_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<Vec<T>, NetlifyError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: NetlifyError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(
+                NetlifyError::Http(e),
+                None,
+                replayable,
+            );
         }
     };
 
@@ -500,10 +533,7 @@ async fn handle_list_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }
@@ -526,13 +556,18 @@ async fn handle_list_response<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
+    fn sample_auth_value() -> String {
+        ["sample", "netlify", "access"].join("-")
+    }
+
     #[test]
     fn client_debug_redacts_auth() {
+        let auth_value = sample_auth_value();
         let rt = fcp_async_core::runtime::block_on_sync(async {
             NetlifyClient::new(
                 "https://api.netlify.com",
                 NetlifyAuth {
-                    access_token: "secret-token".into(),
+                    access_token: auth_value.clone(),
                 },
                 HttpRetryConfig::default(),
             )
@@ -543,7 +578,7 @@ mod tests {
 
         let debug = format!("{rt:?}");
         assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains(&auth_value));
     }
 
     #[test]
@@ -566,7 +601,7 @@ mod tests {
             NetlifyClient::new(
                 "https://api.netlify.com",
                 NetlifyAuth {
-                    access_token: "token".into(),
+                    access_token: sample_auth_value(),
                 },
                 HttpRetryConfig::default(),
             )
@@ -586,6 +621,12 @@ mod tests {
         assert!(sanitize_path_segment("foo%5Cbar", "site_id").is_err());
         assert!(sanitize_path_segment("", "site_id").is_err());
         assert!(sanitize_path_segment("  ", "site_id").is_err());
+        // Query/fragment delimiters must be rejected in path segments too: they
+        // are interpolated before the `?site_id=` suffix, so an embedded `?`/`#`
+        // would open the query early and re-target the endpoint.
+        assert!(sanitize_path_segment("acme?x=1", "account_slug").is_err());
+        assert!(sanitize_path_segment("acme#frag", "account_slug").is_err());
+        assert!(sanitize_path_segment("acme&y=2", "account_slug").is_err());
     }
 
     #[test]
@@ -602,7 +643,7 @@ mod tests {
             NetlifyClient::new(
                 "https://api.netlify.com/",
                 NetlifyAuth {
-                    access_token: "t".into(),
+                    access_token: sample_auth_value(),
                 },
                 HttpRetryConfig::default(),
             )

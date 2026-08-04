@@ -1,15 +1,17 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_openai_compat::RateLimitPolicy;
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
+    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
     CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass, InstanceId,
-    Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, RiskLevel,
-    SafetyTier, SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest, SimulateResponse,
-    SubscribeRequest, SubscribeResponse, UnsubscribeRequest, ZoneId,
+    FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, InstanceId, Introspection,
+    InvokeRequest, InvokeResponse, OperationId, OperationInfo, RequestId, SelfCheckReport,
+    SessionId, ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest,
+    SubscribeResponse, UnsubscribeRequest, ZoneId,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,6 +35,14 @@ const OP_MULTIMODAL: &str = "voyage.embeddings.create_multimodal";
 const OP_RERANK: &str = "voyage.rerank";
 const OP_MODELS: &str = "voyage.models.list";
 const OP_HEALTH: &str = "voyage.health";
+
+const OPERATION_ORDER: &[&str] = &[
+    OP_EMBEDDINGS,
+    OP_MULTIMODAL,
+    OP_RERANK,
+    OP_MODELS,
+    OP_HEALTH,
+];
 
 const CAP_EMBEDDINGS: &str = "voyage.embeddings";
 const CAP_RERANK: &str = "voyage.rerank";
@@ -550,151 +560,62 @@ impl FcpConnector for VoyageConnector {
 }
 
 fn operations_info() -> Vec<OperationInfo> {
-    vec![
-        OperationInfo {
-            id: OperationId::from_static(OP_EMBEDDINGS),
-            summary: "Create Voyage text embeddings".into(),
-            description: Some("Uses Voyage POST /embeddings with retrieval-aware input_type support.".into()),
-            input_schema: embeddings_schema(),
-            output_schema: json!({ "type": "object" }),
-            capability: CapabilityId::from_static(CAP_EMBEDDINGS),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "Use for high-quality query/document embeddings for RAG.".into(),
-                common_mistakes: vec!["Do not log input text or embedding vectors.".into()],
-                examples: vec![r#"{"model":"voyage-3.5","input":"hello","input_type":"document"}"#.into()],
-                related: vec![CapabilityId::from_static(CAP_RERANK)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_MULTIMODAL),
-            summary: "Create Voyage multimodal embeddings".into(),
-            description: Some("Uses Voyage POST /multimodalembeddings for interleaved text/image inputs.".into()),
-            input_schema: multimodal_schema(),
-            output_schema: json!({ "type": "object" }),
-            capability: CapabilityId::from_static(CAP_EMBEDDINGS),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "Use for Voyage multimodal retrieval vectors.".into(),
-                common_mistakes: vec!["Do not log image URLs, text, or vector contents.".into()],
-                examples: vec![r#"{"inputs":[{"content":[{"type":"text","text":"chart"}]}],"input_type":"query"}"#.into()],
-                related: vec![CapabilityId::from_static(CAP_EMBEDDINGS)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_RERANK),
-            summary: "Rerank documents with Voyage".into(),
-            description: Some("Uses Voyage POST /rerank with top_k and optional document return.".into()),
-            input_schema: rerank_schema(),
-            output_schema: json!({ "type": "object" }),
-            capability: CapabilityId::from_static(CAP_RERANK),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "Use after vector retrieval to refine candidate documents.".into(),
-                common_mistakes: vec!["Do not log query or document content.".into()],
-                examples: vec![r#"{"query":"q","documents":["d1","d2"],"top_k":1}"#.into()],
-                related: vec![CapabilityId::from_static(CAP_EMBEDDINGS)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_MODELS),
-            summary: "List documented Voyage models".into(),
-            description: Some("Returns a conservative static catalog from current Voyage docs.".into()),
-            input_schema: json!({ "type": "object", "properties": {} }),
-            output_schema: json!({ "type": "object" }),
-            capability: CapabilityId::from_static(CAP_MODELS),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "Use before selecting a Voyage model id.".into(),
-                common_mistakes: Vec::new(),
-                examples: vec!["{}".into()],
-                related: vec![CapabilityId::from_static(CAP_EMBEDDINGS)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_HEALTH),
-            summary: "Probe Voyage connector health".into(),
-            description: Some("Reports connector readiness and documented model catalog count.".into()),
-            input_schema: json!({ "type": "object", "properties": {} }),
-            output_schema: json!({ "type": "object" }),
-            capability: CapabilityId::from_static(CAP_HEALTH),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "Use for a bounded readiness check before user-visible Voyage calls.".into(),
-                common_mistakes: Vec::new(),
-                examples: vec!["{}".into()],
-                related: vec![CapabilityId::from_static(CAP_MODELS)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-    ]
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
-fn embeddings_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["input"],
-        "properties": {
-            "model": { "type": "string", "default": DEFAULT_EMBEDDING_MODEL },
-            "input": {},
-            "input_type": { "type": "string", "enum": ["query", "document"] },
-            "truncation": { "type": "boolean" },
-            "output_dimension": { "type": "integer", "enum": [256, 512, 1024, 2048] },
-            "output_dtype": { "type": "string", "enum": ["float", "int8", "uint8", "binary", "ubinary"] },
-            "provider_extensions": { "type": "object" }
-        }
-    })
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest =
+        ConnectorManifest::parse_str(MANIFEST_TOML).expect("embedded Voyage manifest should parse");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
 }
 
-fn multimodal_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["inputs"],
-        "properties": {
-            "model": { "type": "string", "default": DEFAULT_MULTIMODAL_MODEL },
-            "inputs": { "type": "array", "minItems": 1, "maxItems": 1000 },
-            "input_type": { "type": "string", "enum": ["query", "document"] },
-            "truncation": { "type": "boolean" },
-            "output_encoding": { "type": "string", "enum": ["base64"] },
-            "output_dimension": { "type": "integer", "enum": [256, 512, 1024, 2048] },
-            "provider_extensions": { "type": "object" }
-        }
-    })
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
 }
 
-fn rerank_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["query", "documents"],
-        "properties": {
-            "query": { "type": "string", "minLength": 1 },
-            "documents": { "type": "array", "minItems": 1, "maxItems": 1000 },
-            "model": { "type": "string", "default": DEFAULT_RERANK_MODEL },
-            "top_k": { "type": "integer", "minimum": 1 },
-            "return_documents": { "type": "boolean" },
-            "truncation": { "type": "boolean" },
-            "provider_extensions": { "type": "object" }
-        }
-    })
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
+    }
+}
+
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
 }
 
 fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
@@ -874,5 +795,49 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_ne!(actual, "sha256:voyage-connector-v1");
+    }
+
+    #[test]
+    fn operations_contain_expected_ids() {
+        let ops = operations_info();
+        let ids: Vec<&str> = ops.iter().map(|op| op.id.as_ref()).collect();
+        assert_eq!(ids, OPERATION_ORDER);
+    }
+
+    #[test]
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let runtime_ops = operations_info();
+        let manifest_ops = ordered_manifest_operations();
+
+        assert_eq!(runtime_ops.len(), manifest_ops.len());
+
+        for (runtime_op, (manifest_id, manifest_operation)) in
+            runtime_ops.iter().zip(manifest_ops.iter())
+        {
+            assert_eq!(runtime_op.id.as_ref(), manifest_id);
+            assert_eq!(runtime_op.summary, manifest_operation.description);
+            assert_eq!(
+                runtime_op.description.as_deref(),
+                Some(manifest_operation.description.as_str())
+            );
+            assert_eq!(runtime_op.input_schema, manifest_operation.input_schema);
+            assert_eq!(runtime_op.output_schema, manifest_operation.output_schema);
+            assert_eq!(runtime_op.capability, manifest_operation.capability);
+            assert_eq!(runtime_op.risk_level, manifest_operation.risk_level);
+            assert_eq!(runtime_op.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(runtime_op.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                runtime_op.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
+            );
+            assert_eq!(
+                serde_json::to_value(&runtime_op.ai_hints).unwrap(),
+                serde_json::to_value(&manifest_operation.ai_hints).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(runtime_op.rate_limit.as_ref()).unwrap(),
+                serde_json::to_value(manifest_operation.rate_limit.as_ref()).unwrap()
+            );
+        }
     }
 }

@@ -1,17 +1,17 @@
 //! Square connector implementation.
 
 use std::{
-    sync::atomic::Ordering,
+    sync::{OnceLock, atomic::Ordering},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier,
-    ConnectorId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    HealthSnapshot, IdempotencyClass, InstanceId, Introspection, InvokeRequest, InvokeResponse,
-    OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId, ShutdownRequest,
-    SimulateRequest, SimulateResponse,
+    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier, ConnectorId,
+    EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot,
+    InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
+    SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest, SimulateResponse,
 };
 use fcp_sdk::migration::HttpRetryConfig;
 use fcp_sdk::prelude::*;
@@ -21,6 +21,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{client::SquareClient, error::SquareError, types::*};
+
+#[cfg(test)]
+use fcp_prelude::{IdempotencyClass, RiskLevel, SafetyTier};
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 const SQUARE_IMPLEMENTATION_STATUS: &str = "first_slice";
@@ -55,6 +58,20 @@ const OP_CUSTOMERS_LIST: &str = "square.customers.list";
 const OP_CUSTOMERS_GET: &str = "square.customers.get";
 const OP_LOCATIONS_LIST: &str = "square.locations.list";
 const OP_HEALTH: &str = "square.health";
+const OPERATION_ORDER: &[&str] = &[
+    OP_PAYMENTS_LIST,
+    OP_PAYMENTS_GET,
+    OP_PAYMENTS_CREATE,
+    OP_PAYMENTS_REFUND,
+    OP_ORDERS_LIST,
+    OP_ORDERS_GET,
+    OP_ORDERS_CREATE,
+    OP_CATALOG_LIST,
+    OP_CUSTOMERS_LIST,
+    OP_CUSTOMERS_GET,
+    OP_LOCATIONS_LIST,
+    OP_HEALTH,
+];
 
 // Capability IDs
 const CAP_PAYMENTS_READ: &str = "square.payments.read";
@@ -568,408 +585,64 @@ impl Default for SquareConnector {
     }
 }
 
-/// Build the typed operations catalog.
+/// Build the typed operations catalog from the strict manifest.
 pub fn operations_info() -> Vec<OperationInfo> {
-    vec![
-        OperationInfo {
-            id: OperationId::from_static(OP_PAYMENTS_LIST),
-            summary: "List payments".into(),
-            description: Some("Lists payments processed by the Square account".into()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cursor": { "type": "string", "description": "Pagination cursor" },
-                    "location_id": { "type": "string", "description": "Filter by location" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "payments": { "type": "array" },
-                    "cursor": { "type": "string" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_PAYMENTS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When listing payments processed by Square".into(),
-                common_mistakes: vec![
-                    "Use cursor for pagination, not page numbers".into(),
-                ],
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_PAYMENTS_GET)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_PAYMENTS_GET),
-            summary: "Get a payment by ID".into(),
-            description: Some("Retrieves details of a specific payment".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["payment_id"],
-                "properties": {
-                    "payment_id": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "payment": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_PAYMENTS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When retrieving details of a specific payment".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_PAYMENTS_LIST)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_PAYMENTS_CREATE),
-            summary: "Create a payment".into(),
-            description: Some("Creates a new payment".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["source_id", "idempotency_key", "amount_money"],
-                "properties": {
-                    "source_id": { "type": "string", "description": "Payment source (nonce or card ID)" },
-                    "idempotency_key": { "type": "string", "description": "Unique key to prevent duplicate payments" },
-                    "amount_money": {
-                        "type": "object",
-                        "properties": {
-                            "amount": { "type": "integer", "description": "Amount in smallest denomination" },
-                            "currency": { "type": "string" }
-                        }
-                    },
-                    "location_id": { "type": "string" },
-                    "customer_id": { "type": "string" },
-                    "note": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "payment": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_PAYMENTS_WRITE),
-            risk_level: RiskLevel::High,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When creating a new payment charge".into(),
-                common_mistakes: vec![
-                    "Always provide a unique idempotency_key to prevent duplicate charges".into(),
-                    "Amount is in the smallest currency denomination (e.g., cents for USD)".into(),
-                ],
-                examples: Vec::new(),
-                related: Vec::new(),
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::Interactive),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_PAYMENTS_REFUND),
-            summary: "Refund a payment".into(),
-            description: Some("Creates a refund for a completed payment".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["idempotency_key", "payment_id", "amount_money"],
-                "properties": {
-                    "idempotency_key": { "type": "string" },
-                    "payment_id": { "type": "string" },
-                    "amount_money": {
-                        "type": "object",
-                        "properties": {
-                            "amount": { "type": "integer" },
-                            "currency": { "type": "string" }
-                        }
-                    },
-                    "reason": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "refund": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_PAYMENTS_WRITE),
-            risk_level: RiskLevel::High,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When refunding a completed payment".into(),
-                common_mistakes: vec![
-                    "Refund amount cannot exceed the original payment amount".into(),
-                    "Always provide a unique idempotency_key".into(),
-                ],
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_PAYMENTS_GET)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::Interactive),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ORDERS_LIST),
-            summary: "Search/list orders".into(),
-            description: Some("Searches orders for given locations".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["location_ids"],
-                "properties": {
-                    "location_ids": { "type": "array", "items": { "type": "string" } },
-                    "cursor": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "orders": { "type": "array" },
-                    "cursor": { "type": "string" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_ORDERS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When searching or listing orders".into(),
-                common_mistakes: vec![
-                    "At least one location_id is required".into(),
-                ],
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_ORDERS_GET)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ORDERS_GET),
-            summary: "Get an order by ID".into(),
-            description: Some("Retrieves details of a specific order".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["order_id"],
-                "properties": {
-                    "order_id": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "order": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_ORDERS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When retrieving details of a specific order".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_ORDERS_LIST)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ORDERS_CREATE),
-            summary: "Create an order".into(),
-            description: Some("Creates a new order".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["location_id", "line_items"],
-                "properties": {
-                    "location_id": { "type": "string" },
-                    "line_items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": { "type": "string" },
-                                "quantity": { "type": "string" },
-                                "base_price_money": { "type": "object" }
-                            }
-                        }
-                    },
-                    "idempotency_key": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "order": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_ORDERS_WRITE),
-            risk_level: RiskLevel::Medium,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::BestEffort,
-            ai_hints: AgentHint {
-                when_to_use: "When creating a new order".into(),
-                common_mistakes: vec![
-                    "Quantity must be a string, not a number".into(),
-                    "Amount is in smallest denomination (cents for USD)".into(),
-                    "Provide idempotency_key when retrying order creation to reduce duplicate side effects".into(),
-                ],
-                examples: Vec::new(),
-                related: Vec::new(),
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::Interactive),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_CATALOG_LIST),
-            summary: "List catalog objects".into(),
-            description: Some("Lists catalog items, categories, and variations".into()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cursor": { "type": "string" },
-                    "types": { "type": "string", "description": "Comma-separated types (ITEM, CATEGORY, etc.)" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "objects": { "type": "array" },
-                    "cursor": { "type": "string" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_CATALOG_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When listing catalog items, categories, or variations".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: Vec::new(),
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_CUSTOMERS_LIST),
-            summary: "List customers".into(),
-            description: Some("Lists all customers in the Square account".into()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cursor": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "customers": { "type": "array" },
-                    "cursor": { "type": "string" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_CUSTOMERS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When listing customers".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_CUSTOMERS_GET)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_CUSTOMERS_GET),
-            summary: "Get a customer by ID".into(),
-            description: Some("Retrieves details of a specific customer".into()),
-            input_schema: json!({
-                "type": "object",
-                "required": ["customer_id"],
-                "properties": {
-                    "customer_id": { "type": "string" }
-                }
-            }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "customer": { "type": "object" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_CUSTOMERS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When retrieving details of a specific customer".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: vec![CapabilityId::from_static(OP_CUSTOMERS_LIST)],
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_LOCATIONS_LIST),
-            summary: "List locations".into(),
-            description: Some("Lists all business locations in the Square account".into()),
-            input_schema: json!({ "type": "object" }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "locations": { "type": "array" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_LOCATIONS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When listing business locations".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: Vec::new(),
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_HEALTH),
-            summary: "Check Square API connectivity".into(),
-            description: Some("Validates API reachability and authentication".into()),
-            input_schema: json!({ "type": "object" }),
-            output_schema: json!({
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string" }
-                }
-            }),
-            capability: CapabilityId::from_static(CAP_LOCATIONS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: AgentHint {
-                when_to_use: "When checking if the Square API is reachable and credentials are valid".into(),
-                common_mistakes: Vec::new(),
-                examples: Vec::new(),
-                related: Vec::new(),
-            },
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::None),
-        },
-    ]
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
+}
+
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest = ConnectorManifest::parse_str(MANIFEST_TOML)
+        .expect("embedded Square manifest should validate");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
+}
+
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
+}
+
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
+    }
+}
+
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
 }
 
 fcp_core::impl_fcp_sealed!(SquareConnector);
@@ -1977,7 +1650,7 @@ mod tests {
     #[test]
     fn test_operations_info_count() {
         let ops = operations_info();
-        assert_eq!(ops.len(), 12);
+        assert_eq!(ops.len(), OPERATION_ORDER.len());
     }
 
     #[test]
@@ -1998,7 +1671,7 @@ mod tests {
         assert_eq!(op.safety_tier, SafetyTier::Safe);
         assert_eq!(op.risk_level, RiskLevel::Low);
         assert_eq!(op.idempotency, IdempotencyClass::Strict);
-        assert_eq!(op.requires_approval, Some(ApprovalMode::None));
+        assert_eq!(op.requires_approval, None);
     }
 
     #[test]
@@ -2070,6 +1743,80 @@ mod tests {
             .compute_interface_hash()
             .expect("compute interface hash");
         assert_eq!(computed, computed2);
+    }
+
+    #[test]
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).expect("manifest should validate");
+        let operations = operations_info();
+        assert_eq!(operations.len(), OPERATION_ORDER.len());
+
+        for (index, operation) in operations.iter().enumerate() {
+            assert_eq!(operation.id.as_str(), OPERATION_ORDER[index]);
+            let manifest_operation = manifest
+                .provides
+                .operations
+                .get(operation.id.as_str())
+                .expect("runtime operation should come from manifest");
+            assert_eq!(operation.summary, manifest_operation.description);
+            assert_eq!(
+                operation.description.as_ref(),
+                Some(&manifest_operation.description)
+            );
+            assert_eq!(operation.capability, manifest_operation.capability);
+            assert_eq!(operation.risk_level, manifest_operation.risk_level);
+            assert_eq!(operation.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(operation.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                operation.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
+            );
+            assert_eq!(
+                operation.ai_hints.when_to_use,
+                manifest_operation.ai_hints.when_to_use
+            );
+            assert_eq!(
+                operation.ai_hints.common_mistakes,
+                manifest_operation.ai_hints.common_mistakes
+            );
+            assert_eq!(
+                operation.ai_hints.examples,
+                manifest_operation.ai_hints.examples
+            );
+            assert_eq!(
+                operation.ai_hints.related,
+                manifest_operation.ai_hints.related
+            );
+            let runtime_rate_limit = operation
+                .rate_limit
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("runtime rate limit should serialize");
+            let manifest_rate_limit = manifest_operation
+                .rate_limit
+                .as_ref()
+                .map(|rate_limit| serde_json::to_value(&rate_limit.0))
+                .transpose()
+                .expect("manifest rate limit should serialize");
+            assert_eq!(runtime_rate_limit, manifest_rate_limit);
+        }
+    }
+
+    #[test]
+    fn manifest_schema_is_runtime_introspection_schema() {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).expect("manifest should validate");
+        for operation in operations_info() {
+            let manifest_operation = manifest
+                .provides
+                .operations
+                .get(operation.id.as_str())
+                .expect("runtime operation should come from manifest");
+            assert_eq!(operation.input_schema, manifest_operation.input_schema);
+            assert_eq!(operation.output_schema, manifest_operation.output_schema);
+        }
     }
 
     #[test]

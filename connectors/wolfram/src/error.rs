@@ -2,14 +2,19 @@
 
 use fcp_async_core::AsyncError;
 use fcp_prelude::FcpError;
+use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorErrorMapping;
 use thiserror::Error;
 
 /// Wolfram Alpha connector error.
 #[derive(Error, Debug)]
 pub enum WolframError {
+    // Wolfram passes `appid` (the API key) as a query param, and
+    // `reqwest::Error`'s `Display` appends the full request URL with the query
+    // string unredacted. Interpolating the reqwest error into Display (`{0}`)
+    // would leak the key; the redaction-safe detail is built in `to_fcp_error`.
     /// HTTP transport error.
-    #[error("HTTP error: {0}")]
+    #[error("HTTP transport error")]
     Http(#[from] reqwest::Error),
 
     /// API returned an error status code.
@@ -63,17 +68,25 @@ impl ConnectorErrorMapping for WolframError {
                     FcpError::UpstreamTimeout {
                         service: "wolfram_alpha".into(),
                     }
-                } else if e.is_connect() {
-                    FcpError::External {
-                        service: "wolfram_alpha".into(),
-                        message: format!("Connection failed: {e}"),
-                        status_code: None,
-                        retryable: true,
-                        retry_after: Some(std::time::Duration::from_secs(5)),
-                    }
                 } else {
-                    FcpError::Internal {
-                        message: format!("HTTP error: {e}"),
+                    // `{e}` would append the request URL, whose query string
+                    // carries `appid=<API_KEY>`. Surface a redaction-safe URL
+                    // (query dropped) instead of the raw reqwest error string.
+                    let redacted = e
+                        .url()
+                        .map_or_else(|| "unknown".to_string(), |u| redact_url(u.as_str()));
+                    if e.is_connect() {
+                        FcpError::External {
+                            service: "wolfram_alpha".into(),
+                            message: format!("connection failed for url ({redacted})"),
+                            status_code: None,
+                            retryable: true,
+                            retry_after: Some(std::time::Duration::from_secs(5)),
+                        }
+                    } else {
+                        FcpError::Internal {
+                            message: format!("HTTP transport error for url ({redacted})"),
+                        }
                     }
                 }
             }

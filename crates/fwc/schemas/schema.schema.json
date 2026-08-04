@@ -1,25 +1,485 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "fcp://schemas/fwc/schema/truth-source-envelope/v1",
-  "title": "FWC schema truth-source envelope v1",
-  "description": "Top-level provenance envelope for `fwc schema --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "command", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "schema" },
-    "schema_version": { "const": "fcp.fwc.truth-source.v1" },
-    "_truth_source": {
+  "$id": "fcp://schemas/fwc/schema/v1",
+  "title": "FWC Schema v1",
+  "description": "Stable JSON output schema for `fwc schema --json`, including truth-source metadata.",
+  "oneOf": [
+    { "$ref": "#/$defs/operation_success" },
+    { "$ref": "#/$defs/fields_success" },
+    { "$ref": "#/$defs/scaffold_success" },
+    { "$ref": "#/$defs/connector_success" },
+    { "$ref": "#/$defs/missing_host" },
+    { "$ref": "#/$defs/ambiguous_catalog_source" },
+    { "$ref": "#/$defs/resolution_error" },
+    { "$ref": "#/$defs/truth_source_unavailable" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
+  ],
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_non_empty_string": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "truth_source": {
       "type": "string",
       "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
     },
-    "error": {
+    "truth_requirement": {
+      "type": "string",
+      "enum": ["mesh", "mesh-or-host", "any-live"]
+    },
+    "schema_version": {
+      "const": "fcp.fwc.truth-source.v1"
+    },
+    "string_array": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "next_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "json_schema": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": [
+            "live-runtime",
+            "offline-artifact",
+            "unsupported",
+            "planned",
+            "unavailable",
+            "denied",
+            "unknown"
+          ]
+        },
+        "command": { "const": "schema" },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "cache_evidence": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["type"],
+      "required": ["hit", "validated", "etag", "source"],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "hit": { "type": "boolean" },
+        "validated": { "type": "boolean" },
+        "etag": {
+          "type": "string",
+          "pattern": "^blake3-256:"
+        },
+        "age_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "source": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["command", "source", "authoritative"],
+      "properties": {
+        "command": { "const": "schema" },
+        "source": {
+          "type": "string",
+          "enum": ["live_host_introspection", "workspace_manifest"]
+        },
+        "authoritative": { "type": "boolean" },
+        "caveat": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "connector_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug"],
+      "properties": {
+        "slug": { "$ref": "#/$defs/non_empty_string" },
+        "canonical_id": { "$ref": "#/$defs/non_empty_string" },
+        "name": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "operation_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector"],
+      "properties": {
+        "requested_selector": { "$ref": "#/$defs/non_empty_string" },
+        "selector": { "$ref": "#/$defs/non_empty_string" },
+        "canonical_id": { "$ref": "#/$defs/non_empty_string" },
+        "aliases": { "$ref": "#/$defs/string_array" },
+        "summary": { "type": "string" },
+        "capability": { "$ref": "#/$defs/non_empty_string" },
+        "risk_level": { "$ref": "#/$defs/non_empty_string" },
+        "safety_tier": { "$ref": "#/$defs/non_empty_string" },
+        "idempotency": { "$ref": "#/$defs/non_empty_string" },
+        "approval_mode": { "$ref": "#/$defs/non_empty_string" },
+        "supports_simulate": {}
+      }
+    },
+    "field_entry": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "#/$defs/non_empty_string" },
+        "required": { "type": "boolean" },
+        "type": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "description": { "$ref": "#/$defs/nullable_non_empty_string" }
+      }
+    },
+    "guidance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["when_to_use", "common_mistakes", "related"],
+      "properties": {
+        "when_to_use": { "type": "string" },
+        "common_mistakes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "related": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "success_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "source",
+        "schema_version",
+        "_truth_source",
+        "availability",
+        "provenance"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "schema" },
+        "source": {
+          "type": "string",
+          "enum": ["host-admin-api", "workspace-manifests"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["live-introspection", "offline-artifact"]
+        },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "scope": {
+          "type": "string",
+          "enum": ["connector", "operation", "fields", "scaffold"]
+        },
+        "connector": { "$ref": "#/$defs/connector_ref" },
+        "operation": { "$ref": "#/$defs/operation_ref" },
+        "schema": { "$ref": "#/$defs/json_schema" },
+        "input_schema": { "$ref": "#/$defs/json_schema" },
+        "output_schema": { "$ref": "#/$defs/json_schema" },
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/field_entry" }
+        },
+        "field_count": { "$ref": "#/$defs/non_negative_integer" },
+        "scaffold": { "$ref": "#/$defs/json_schema" },
+        "guidance": { "$ref": "#/$defs/guidance" },
+        "metadata_gaps": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "availability": { "$ref": "#/$defs/availability" },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "_cache": { "$ref": "#/$defs/cache_evidence" }
+      }
+    },
+    "operation_success": {
+      "allOf": [
+        { "$ref": "#/$defs/success_base" },
+        {
+          "required": [
+            "scope",
+            "connector",
+            "operation",
+            "input_schema",
+            "output_schema",
+            "guidance",
+            "next_actions"
+          ],
+          "properties": {
+            "scope": { "const": "operation" }
+          }
+        }
+      ]
+    },
+    "fields_success": {
+      "allOf": [
+        { "$ref": "#/$defs/success_base" },
+        {
+          "required": [
+            "scope",
+            "connector",
+            "operation",
+            "field_count",
+            "fields",
+            "next_actions"
+          ],
+          "properties": {
+            "scope": { "const": "fields" }
+          }
+        }
+      ]
+    },
+    "scaffold_success": {
+      "allOf": [
+        { "$ref": "#/$defs/success_base" },
+        {
+          "required": ["scope", "connector", "operation", "scaffold"],
+          "properties": {
+            "scope": { "const": "scaffold" }
+          }
+        }
+      ]
+    },
+    "connector_success": {
+      "allOf": [
+        { "$ref": "#/$defs/success_base" },
+        {
+          "required": ["scope", "connector", "schema", "next_actions"],
+          "properties": {
+            "scope": { "const": "connector" }
+          }
+        }
+      ]
+    },
+    "missing_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "details",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "schema" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "missing-host-endpoint" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": true }
+          }
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["connector"],
+          "properties": {
+            "connector": { "$ref": "#/$defs/non_empty_string" },
+            "operation": {
+              "anyOf": [
+                { "$ref": "#/$defs/non_empty_string" },
+                { "type": "null" }
+              ]
+            },
+            "require_source": {
+              "anyOf": [
+                { "$ref": "#/$defs/truth_requirement" },
+                { "type": "null" }
+              ]
+            }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "ambiguous_catalog_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "schema" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "ambiguous-catalog-source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": true }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "resolution_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "command", "schema_version", "_truth_source", "error"],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "schema" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "selector",
+            "did_you_mean",
+            "examples",
+            "next_actions"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "connector-not-found",
+                "ambiguous-connector",
+                "operation-not-found",
+                "ambiguous-operation"
+              ]
+            },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": true },
+            "selector": { "$ref": "#/$defs/non_empty_string" },
+            "did_you_mean": { "$ref": "#/$defs/string_array" },
+            "examples": { "$ref": "#/$defs/string_array" },
+            "next_actions": { "$ref": "#/$defs/next_actions" }
+          }
+        }
+      }
+    },
+    "truth_source_unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "schema" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": { "$ref": "#/$defs/truth_requirement" },
+            "actual": { "$ref": "#/$defs/truth_source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": true }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "schema" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/availability" }
       }
     }
   }

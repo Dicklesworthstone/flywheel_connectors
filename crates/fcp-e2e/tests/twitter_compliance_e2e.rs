@@ -372,7 +372,12 @@ async fn twitter_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["twitter.write"]);
     // Token grants "twitter.write" but invoke targets "twitter.tweet.get" -> denial
-    let token = build_token(&signing_key, "twitter.write", &["twitter.write"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "twitter.write",
+        &["twitter.write"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "twitter.tweet.get",
         json!({ "tweet_id": "1234567890123456789" }),
@@ -434,7 +439,12 @@ async fn twitter_allow_valid_token_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["twitter.tweet.get"],
     );
-    let token = build_token(&signing_key, "twitter.tweet.get", &["twitter.tweet.get"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "twitter.tweet.get",
+        &["twitter.tweet.get"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "twitter.tweet.get",
         json!({ "tweet_id": "1234567890123456789" }),

@@ -434,7 +434,12 @@ async fn roam_default_deny_compliance_suite_passes() {
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["roam.pages.read"]);
     // Token grants roam.pages.read capability but only for roam.pages.list operation.
     // Invoke targets roam.blocks.create which requires roam.blocks.write -- should be denied.
-    let token = build_token(&signing_key, "roam.pages.read", &["roam.pages.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "roam.pages.read",
+        &["roam.pages.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "roam.blocks.create",
         json!({ "page_uid": "abc123", "content": "test block" }),
@@ -480,7 +485,12 @@ async fn roam_happy_path_compliance_suite_passes() {
     let mut connector = RoamConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["roam.pages.read"]);
-    let token = build_token(&signing_key, "roam.pages.read", &["roam.pages.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "roam.pages.read",
+        &["roam.pages.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("roam.pages.list", json!({}), token);
 
     let suite = ConnectorSuite {

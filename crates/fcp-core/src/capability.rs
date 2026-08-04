@@ -2114,7 +2114,8 @@ impl CapabilityConstraints {
     /// # Errors
     ///
     /// Returns `CredentialValidationError::NotInCredentialAllow` if the credential
-    /// is not in `credential_allow` and `credential_allow` is non-empty.
+    /// is not in `credential_allow`. An empty `credential_allow` denies every
+    /// credential (default deny, C3.4).
     pub fn validate_credential(
         &self,
         credential_id: &CredentialId,

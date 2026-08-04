@@ -1,6 +1,6 @@
 # Google Drive Connector V3 Contract
 
-> **Status**: PROVEN runtime contract documented with manifest/runtime drift called out
+> **Status**: PROVEN runtime contract documented; runtime operation metadata derives from manifest
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/google_drive_connector_verification.sh`
@@ -60,7 +60,9 @@ This README documents the runtime truth and keeps current drift visible:
 
 - Manifest connector ID is `fcp.google_drive`, while runtime `BaseConnector` ID is `google-drive`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest optional capabilities include `media.download` and `media.upload`, but runtime introspection and capability verification use only `drive.read` and `drive.write`.
+- Runtime introspection derives operation descriptions, schemas, capability, risk, safety, idempotency, approval mode, rate limits, and AI hints from `manifest.toml`.
+- Manifest optional capabilities include `media.download` and `media.upload`, but operation metadata and capability verification use only `drive.read` and `drive.write`.
+- Manifest marks `drive.create_folder` as policy approval and `drive.upload_file`, `drive.trash_file`, and `drive.share_file` as interactive approval. Runtime introspection now exposes that approval intent, but `invoke` and `simulate` verify bound capability tokens only and do not verify approval tokens.
 - Runtime `drive.download_file` can return a JSON string in `content_base64` if the executor gives the client a JSON response body.
 - Runtime `drive.upload_file` advertises multipart upload but sends a JSON wrapper rather than constructing a true multipart request body or resumable upload session.
 - Runtime introspection says `max_results` has a maximum of 1000, but runtime input validation and client dispatch do not clamp the value.
@@ -68,7 +70,7 @@ This README documents the runtime truth and keeps current drift visible:
 - `self_check()` reports `DEFAULT_BASE_URL` in details even when a loopback or custom base URL was configured.
 - The dedicated tracked verification shell script is `scripts/e2e/google_drive_connector_verification.sh`.
 
-A follow-up parity bead should align connector ID spelling, reconcile media capabilities, fix upload/download response semantics, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
+A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, fix upload/download response semantics, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
 
 ## First-Slice Scope
 
@@ -172,7 +174,7 @@ These are excluded on purpose:
 - configuration and local client state
 - Drive API reachability and storage quota through the `about` endpoint in `doctor()`
 - provider-backed self-check through the same health path when credentials are materialized
-- operation metadata with capability, risk, safety tier, idempotency, schemas, and AI hints
+- operation metadata with capability, risk, safety tier, idempotency, approval mode, schemas, and AI hints
 - bound capability-token verification during `invoke`
 - simulation denial for unknown operation, unconfigured connector, missing handshake, invalid input, and bound capability-token mismatch
 - local-only `health()` behavior

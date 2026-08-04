@@ -5,12 +5,13 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:28b8503dbae1cfed51876dc24d1daeae578e071f5285e26e2c234dbd5eb5d469"
+interface_hash = "blake3-256:fcp.interface.v2:592ff6386e8abe4d5f23c111e6395e3572911a1085e52880add3d1aba5028b3a"
 
 [connector]
 id = "fcp.box"
 name = "Box Connector"
 version = "0.1.0"
+status = "proven"
 description = "FCP connector for Box cloud storage (files, folders, sharing)"
 archetypes = [
     "knowledge",

@@ -283,7 +283,7 @@ pub use formatting::{
 };
 
 /// Canonical connector error-mapping trait and async-runtime error conversion.
-pub use error_mapping::{ConnectorErrorMapping, map_async_to_fcp_error};
+pub use error_mapping::{ConnectorErrorMapping, map_async_to_fcp_error, redact_urls_in_error_text};
 
 /// Retry policy helpers.
 pub use retry::{RetryDecision, RetryPolicy};

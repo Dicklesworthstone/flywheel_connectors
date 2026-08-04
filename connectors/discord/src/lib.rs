@@ -33,6 +33,7 @@
     clippy::unnecessary_wraps,
     clippy::unreadable_literal,
     clippy::unused_async,
+    clippy::unused_async_trait_impl,
     clippy::wildcard_imports
 )]
 

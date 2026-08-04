@@ -56,6 +56,28 @@ impl JiraError {
         }
     }
 
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// Deliberately NOT the same question as [`Self::is_retryable`]. A
+    /// rate-limit rejection is safe to replay because Jira refused the request
+    /// *without* performing it; a 5xx is not, because Jira received it and may
+    /// already have created the issue, comment, or worklog. Collapsing the two
+    /// would silently disable rate-limit backoff on every write.
+    #[must_use]
+    pub fn replay_is_safe(&self) -> bool {
+        match self {
+            // Refused before Jira did the work.
+            Self::RateLimited { .. } => true,
+            Self::Api { status_code, .. } => *status_code == Some(429),
+            // Only a connect-phase failure proves the request never left us.
+            Self::Http(e) => !fcp_sdk::migration::transport_error_reached_service(e),
+            Self::Json(_) | Self::Unauthorized | Self::NotFound { .. } | Self::InvalidInput(_) => {
+                false
+            }
+        }
+    }
+
     /// Get the suggested retry delay.
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {

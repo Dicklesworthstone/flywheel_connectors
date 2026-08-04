@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
@@ -584,13 +585,24 @@ fn ordered_manifest_operations() -> FcpResult<Vec<(String, fcp_manifest::Operati
 }
 
 fn operations_info(implemented: bool) -> FcpResult<Vec<Value>> {
-    Ok(ordered_manifest_operations()?
-        .into_iter()
-        .map(|(id, operation)| {
-            let operation_info = operation_info_from_manifest(id, &operation);
-            introspect_operation_from_manifest(operation_info, &operation, implemented)
+    static OPERATIONS_IMPLEMENTED: OnceLock<FcpResult<Vec<Value>>> = OnceLock::new();
+    static OPERATIONS_UNIMPLEMENTED: OnceLock<FcpResult<Vec<Value>>> = OnceLock::new();
+    let cache = if implemented {
+        &OPERATIONS_IMPLEMENTED
+    } else {
+        &OPERATIONS_UNIMPLEMENTED
+    };
+    cache
+        .get_or_init(|| {
+            Ok(ordered_manifest_operations()?
+                .into_iter()
+                .map(|(id, operation)| {
+                    let operation_info = operation_info_from_manifest(id, &operation);
+                    introspect_operation_from_manifest(operation_info, &operation, implemented)
+                })
+                .collect())
         })
-        .collect())
+        .clone()
 }
 
 fn operation_order(operation_id: &str) -> usize {

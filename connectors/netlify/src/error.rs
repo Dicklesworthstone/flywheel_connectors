@@ -154,10 +154,11 @@ mod tests {
     fn not_found_maps_to_resource_not_found() {
         let err = NetlifyError::NotFound("site abc".into());
         let fcp = err.to_fcp_error();
-        match fcp {
-            FcpError::ResourceNotFound { resource } => assert_eq!(resource, "site abc"),
-            other => panic!("Expected ResourceNotFound, got {other:?}"),
-        }
+        assert!(matches!(&fcp, FcpError::ResourceNotFound { .. }));
+        let FcpError::ResourceNotFound { resource } = fcp else {
+            return;
+        };
+        assert_eq!(resource, "site abc");
     }
 
     #[test]
@@ -179,13 +180,12 @@ mod tests {
     fn config_error_maps_to_invalid_request() {
         let err = NetlifyError::Config("missing access_token".into());
         let fcp = err.to_fcp_error();
-        match fcp {
-            FcpError::InvalidRequest { code, message } => {
-                assert_eq!(code, 1001);
-                assert!(message.contains("missing access_token"));
-            }
-            other => panic!("Expected InvalidRequest, got {other:?}"),
-        }
+        assert!(matches!(&fcp, FcpError::InvalidRequest { .. }));
+        let FcpError::InvalidRequest { code, message } = fcp else {
+            return;
+        };
+        assert_eq!(code, 1001);
+        assert!(message.contains("missing access_token"));
     }
 
     #[test]
@@ -194,16 +194,16 @@ mod tests {
             retry_after_ms: 3_000,
         };
         let fcp = err.to_fcp_error();
-        match fcp {
-            FcpError::RateLimited {
-                retry_after_ms,
-                violation,
-            } => {
-                assert_eq!(retry_after_ms, 3_000);
-                assert!(violation.is_none());
-            }
-            other => panic!("Expected RateLimited, got {other:?}"),
-        }
+        assert!(matches!(&fcp, FcpError::RateLimited { .. }));
+        let FcpError::RateLimited {
+            retry_after_ms,
+            violation,
+        } = fcp
+        else {
+            return;
+        };
+        assert_eq!(retry_after_ms, 3_000);
+        assert!(violation.is_none());
     }
 
     #[test]
@@ -225,13 +225,12 @@ mod tests {
     fn invalid_input_maps_correctly() {
         let err = NetlifyError::InvalidInput("site_id required".into());
         let fcp = err.to_fcp_error();
-        match fcp {
-            FcpError::InvalidRequest { code, message } => {
-                assert_eq!(code, 1005);
-                assert_eq!(message, "site_id required");
-            }
-            other => panic!("Expected InvalidRequest, got {other:?}"),
-        }
+        assert!(matches!(&fcp, FcpError::InvalidRequest { .. }));
+        let FcpError::InvalidRequest { code, message } = fcp else {
+            return;
+        };
+        assert_eq!(code, 1005);
+        assert_eq!(message, "site_id required");
     }
 
     #[test]

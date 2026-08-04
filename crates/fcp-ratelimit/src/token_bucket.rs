@@ -696,27 +696,14 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn remaining_refreshes_after_elapsed_refill() {
-        // Smooth refill: 2 tokens / 2s window => one token every 1000ms.
-        //
-        // The refill interval (1000ms) is deliberately kept well above the
-        // asupersync runtime's idle I/O-poll granularity (the reactor wakes
-        // at most every IDLE_IO_POLL_MAX_TIMEOUT = 250ms when a sleep's timer
-        // deadline is the only pending work), so that a single sub-two-interval
-        // sleep crosses exactly one refill boundary. With a 100ms interval the
-        // real wall-clock sleep rounds up to ~250ms and silently crosses
-        // multiple intervals, which made the "exactly one token refilled"
-        // assertion non-deterministic after the 0.3.2 reactor wiring.
-        let config = RateLimitConfig::new(2, Duration::from_secs(2));
+        let config = RateLimitConfig::new(2, Duration::from_millis(100));
         let limiter = TokenBucket::from_config(&config);
 
         assert!(limiter.try_acquire().await);
         assert!(limiter.try_acquire().await);
         assert_eq!(limiter.remaining(), 0);
 
-        // One interval (1000ms) plus headroom, but strictly less than two
-        // intervals even after the reactor's ~250ms rounding: refills exactly
-        // one token, never two.
-        sleep(Duration::from_millis(1100)).await;
+        sleep(Duration::from_millis(60)).await;
 
         assert_eq!(limiter.remaining(), 1);
     }

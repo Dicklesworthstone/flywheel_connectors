@@ -1,290 +1,501 @@
-[format]
-type = "fcp-connector-manifest"
+[manifest]
+format = "fcp-connector-manifest"
 schema_version = "2.1"
+min_mesh_version = "2.0.0"
+min_protocol = "fcp2-sym/2.0"
+protocol_features = []
+max_datagram_bytes = 65000
+interface_hash = "blake3-256:fcp.interface.v2:2fa409d699f31c35749739a3bc4ed83fcad49604f7ab0ea7c7739d947c0bb32c"
 
 [connector]
 id = "fcp.netlify"
 name = "Netlify"
 version = "0.1.0"
-description = "Netlify connector for Sites, Deploys, DNS, and Environment Variables"
+description = "Netlify connector for sites, deploys, DNS zones, environment variables, and API-token verification"
 archetypes = ["operational"]
-homepage = "https://docs.netlify.com/api/get-started/"
+format = "native"
+status = "ready"
+
+[connector.state]
+model = "stateless"
+state_schema_version = "1"
+migration_hint = "No durable connector state; one Netlify personal access token is injected at runtime."
 
 [zones]
 home = "z:work"
 allowed_sources = ["z:work", "z:private"]
 allowed_targets = ["z:work"]
-tailscale_tag = "tag:fcp-work"
+forbidden = ["z:public", "z:community"]
 
 [capabilities]
-required = ["network.dns", "network.outbound"]
-optional = []
-forbidden = ["system.exec", "system.privileged"]
+required = [
+    "network.dns",
+    "network.egress",
+    "network.tls.sni",
+]
+optional = [
+    "netlify.sites.read",
+    "netlify.sites.write",
+    "netlify.deploys.read",
+    "netlify.deploys.write",
+    "netlify.dns.read",
+    "netlify.env.read",
+    "netlify.env.write",
+]
+forbidden = [
+    "system.exec",
+    "network.listen",
+    "system.privileged",
+]
 
-[provides.operations.sites_list]
-summary = "List Netlify sites"
+[provides.operations."netlify.sites.list"]
+description = "List all sites"
 capability = "netlify.sites.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", additionalProperties = false, properties = {} }
 output_schema = { type = "array", items = { type = "object" } }
 
-[provides.operations.sites_list.network_constraints]
+[provides.operations."netlify.sites.list".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.sites_list.ai_hints]
-when_to_use = "When you need to list all Netlify sites"
+[provides.operations."netlify.sites.list".ai_hints]
+when_to_use = "List Netlify sites."
+common_mistakes = []
+examples = []
+related = ["netlify.deploys.read"]
 
-[provides.operations.sites_get]
-summary = "Get site details"
+[provides.operations."netlify.sites.get"]
+description = "Get site details"
 capability = "netlify.sites.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", required = ["site_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" } } }
 output_schema = { type = "object" }
 
-[provides.operations.sites_get.network_constraints]
+[provides.operations."netlify.sites.get".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.sites_get.ai_hints]
-when_to_use = "When you need info about a specific Netlify site"
+[provides.operations."netlify.sites.get".ai_hints]
+when_to_use = "Get info about a specific site."
+common_mistakes = ["Use site_id, not site name."]
+examples = []
+related = ["netlify.sites.read"]
 
-[provides.operations.sites_create]
-summary = "Create a new site"
+[provides.operations."netlify.sites.create"]
+description = "Create a new site"
 capability = "netlify.sites.write"
-risk = "medium"
+risk_level = "medium"
 safety_tier = "risky"
+requires_approval = "none"
 idempotency = "strict"
 input_schema = { type = "object", required = ["name"], additionalProperties = false, properties = { name = { type = "string", description = "New Netlify site name" }, custom_domain = { type = "string", description = "Optional custom domain to attach" } } }
 output_schema = { type = "object" }
 
-[provides.operations.sites_create.network_constraints]
+[provides.operations."netlify.sites.create".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.sites_create.ai_hints]
-when_to_use = "When you need to create a new Netlify site"
+[provides.operations."netlify.sites.create".ai_hints]
+when_to_use = "Create a new Netlify site."
+common_mistakes = []
+examples = []
+related = ["netlify.sites.read"]
 
-[provides.operations.sites_delete]
-summary = "Delete a site"
+[provides.operations."netlify.sites.delete"]
+description = "Delete a site"
 capability = "netlify.sites.write"
-risk = "critical"
+risk_level = "critical"
 safety_tier = "dangerous"
+requires_approval = "interactive"
 idempotency = "strict"
 input_schema = { type = "object", required = ["site_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID to delete" } } }
 output_schema = { type = "object", required = ["deleted", "site_id"], additionalProperties = false, properties = { deleted = { type = "boolean", const = true }, site_id = { type = "string", description = "Deleted Netlify site ID" } } }
 
-[provides.operations.sites_delete.network_constraints]
+[provides.operations."netlify.sites.delete".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.sites_delete.ai_hints]
-when_to_use = "When you need to permanently delete a Netlify site"
+[provides.operations."netlify.sites.delete".ai_hints]
+when_to_use = "Permanently delete a site and all deploys."
+common_mistakes = ["Treating deletion as reversible."]
+examples = []
+related = ["netlify.sites.read"]
 
-[provides.operations.deploys_list]
-summary = "List deploys for a site"
+[provides.operations."netlify.deploys.list"]
+description = "List deploys for a site"
 capability = "netlify.deploys.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", required = ["site_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" } } }
 output_schema = { type = "array", items = { type = "object" } }
 
-[provides.operations.deploys_list.network_constraints]
+[provides.operations."netlify.deploys.list".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.deploys_list.ai_hints]
-when_to_use = "When you need to see deploy history for a site"
+[provides.operations."netlify.deploys.list".ai_hints]
+when_to_use = "See deploy history for a site."
+common_mistakes = []
+examples = []
+related = ["netlify.sites.read"]
 
-[provides.operations.deploys_get]
-summary = "Get deploy details"
+[provides.operations."netlify.deploys.get"]
+description = "Get deploy details"
 capability = "netlify.deploys.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", required = ["site_id", "deploy_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, deploy_id = { type = "string", description = "Netlify deploy ID" } } }
 output_schema = { type = "object" }
 
-[provides.operations.deploys_get.network_constraints]
+[provides.operations."netlify.deploys.get".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.deploys_get.ai_hints]
-when_to_use = "When you need to check the status of a specific deploy"
+[provides.operations."netlify.deploys.get".ai_hints]
+when_to_use = "Check deploy status."
+common_mistakes = []
+examples = []
+related = ["netlify.deploys.read"]
 
-[provides.operations.deploys_create]
-summary = "Create a deploy"
+[provides.operations."netlify.deploys.create"]
+description = "Create a deploy"
 capability = "netlify.deploys.write"
-risk = "high"
+risk_level = "high"
 safety_tier = "risky"
+requires_approval = "none"
 idempotency = "strict"
 input_schema = { type = "object", required = ["site_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, branch = { type = "string", description = "Optional Git branch for the deploy" }, title = { type = "string", description = "Optional deploy title" } } }
 output_schema = { type = "object" }
 
-[provides.operations.deploys_create.network_constraints]
+[provides.operations."netlify.deploys.create".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.deploys_create.ai_hints]
-when_to_use = "When you need to trigger a new deploy"
+[provides.operations."netlify.deploys.create".ai_hints]
+when_to_use = "Trigger a new deploy."
+common_mistakes = ["Expecting this operation to upload a ZIP archive or file digest set."]
+examples = []
+related = ["netlify.deploys.read"]
 
-[provides.operations.deploys_rollback]
-summary = "Rollback to a deploy"
+[provides.operations."netlify.deploys.rollback"]
+description = "Rollback to a deploy"
 capability = "netlify.deploys.write"
-risk = "high"
+risk_level = "high"
 safety_tier = "risky"
+requires_approval = "none"
 idempotency = "strict"
 input_schema = { type = "object", required = ["site_id", "deploy_id"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, deploy_id = { type = "string", description = "Deploy ID to roll back to" } } }
 output_schema = { type = "object" }
 
-[provides.operations.deploys_rollback.network_constraints]
+[provides.operations."netlify.deploys.rollback".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.deploys_rollback.ai_hints]
-when_to_use = "When you need to rollback a site to a previous deploy"
+[provides.operations."netlify.deploys.rollback".ai_hints]
+when_to_use = "Rollback a site to a previous deploy."
+common_mistakes = ["Forgetting that rollback changes the live site."]
+examples = []
+related = ["netlify.deploys.read"]
 
-[provides.operations.dns_list_zones]
-summary = "List DNS zones"
+[provides.operations."netlify.dns.list_zones"]
+description = "List DNS zones"
 capability = "netlify.dns.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", additionalProperties = false, properties = {} }
 output_schema = { type = "array", items = { type = "object" } }
 
-[provides.operations.dns_list_zones.network_constraints]
+[provides.operations."netlify.dns.list_zones".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.dns_list_zones.ai_hints]
-when_to_use = "When you need to list Netlify DNS zones"
+[provides.operations."netlify.dns.list_zones".ai_hints]
+when_to_use = "List Netlify DNS zones."
+common_mistakes = []
+examples = []
+related = []
 
-[provides.operations.env_list]
-summary = "List environment variables"
+[provides.operations."netlify.env.list"]
+description = "List environment variables"
 capability = "netlify.env.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "none"
 input_schema = { type = "object", required = ["site_id", "account_slug"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, account_slug = { type = "string", description = "Netlify account slug" } } }
 output_schema = { type = "array", items = { type = "object" } }
 
-[provides.operations.env_list.network_constraints]
+[provides.operations."netlify.env.list".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.env_list.ai_hints]
-when_to_use = "When you need to list environment variables for a site"
+[provides.operations."netlify.env.list".ai_hints]
+when_to_use = "List environment variables for a site."
+common_mistakes = ["Omitting account_slug."]
+examples = []
+related = ["netlify.env.write"]
 
-[provides.operations.env_set]
-summary = "Set environment variable"
+[provides.operations."netlify.env.set"]
+description = "Set environment variable"
 capability = "netlify.env.write"
-risk = "medium"
+risk_level = "medium"
 safety_tier = "risky"
+requires_approval = "none"
 idempotency = "strict"
 input_schema = { type = "object", required = ["site_id", "account_slug", "key", "value"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, account_slug = { type = "string", description = "Netlify account slug" }, key = { type = "string", description = "Environment variable key" }, value = { type = "string", description = "Environment variable value" }, context = { type = "string", description = "Optional Netlify environment context" }, is_secret = { type = "boolean", description = "Whether Netlify should treat the value as secret" } } }
 output_schema = { type = "array", items = { type = "object" } }
 
-[provides.operations.env_set.network_constraints]
+[provides.operations."netlify.env.set".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.env_set.ai_hints]
-when_to_use = "When you need to set or update an environment variable"
+[provides.operations."netlify.env.set".ai_hints]
+when_to_use = "Set or update an environment variable."
+common_mistakes = ["Forgetting that environment changes can trigger rebuilds."]
+examples = []
+related = ["netlify.env.read"]
 
-[provides.operations.env_delete]
-summary = "Delete environment variable"
+[provides.operations."netlify.env.delete"]
+description = "Delete environment variable"
 capability = "netlify.env.write"
-risk = "high"
+risk_level = "high"
 safety_tier = "dangerous"
+requires_approval = "interactive"
 idempotency = "strict"
 input_schema = { type = "object", required = ["site_id", "account_slug", "key"], additionalProperties = false, properties = { site_id = { type = "string", description = "Netlify site ID" }, account_slug = { type = "string", description = "Netlify account slug" }, key = { type = "string", description = "Environment variable key to delete" } } }
 output_schema = { type = "object", required = ["deleted", "key"], additionalProperties = false, properties = { deleted = { type = "boolean", const = true }, key = { type = "string", description = "Deleted environment variable key" } } }
 
-[provides.operations.env_delete.network_constraints]
+[provides.operations."netlify.env.delete".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.env_delete.ai_hints]
-when_to_use = "When you need to remove an environment variable — may break builds"
+[provides.operations."netlify.env.delete".ai_hints]
+when_to_use = "Remove an environment variable."
+common_mistakes = ["Deleting a key before confirming build dependencies."]
+examples = []
+related = ["netlify.env.read"]
 
-[provides.operations.health]
-summary = "Verify API token"
+[provides.operations."netlify.health"]
+description = "Verify API token"
 capability = "netlify.sites.read"
-risk = "low"
+risk_level = "low"
 safety_tier = "safe"
+requires_approval = "none"
 idempotency = "strict"
 input_schema = { type = "object", additionalProperties = false, properties = {} }
 output_schema = { type = "object", required = ["healthy", "user_id", "email"], additionalProperties = false, properties = { healthy = { type = "boolean", const = true }, user_id = { type = "string", description = "Netlify user ID" }, email = { type = ["string", "null"], description = "Netlify user email when available" } } }
 
-[provides.operations.health.network_constraints]
+[provides.operations."netlify.health".network_constraints]
 host_allow = ["api.netlify.com"]
 port_allow = [443]
-require_tls = true
+ip_allow = []
+cidr_deny = []
 deny_localhost = true
 deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
 max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 4194304
 
-[provides.operations.health.ai_hints]
-when_to_use = "When you need to verify Netlify API credentials"
+[provides.operations."netlify.health".ai_hints]
+when_to_use = "Check credentials."
+common_mistakes = []
+examples = []
+related = []
 
 [sandbox]
 profile = "strict"
 memory_mb = 128
 cpu_percent = 25
 wall_clock_timeout_ms = 30000
+fs_readonly_paths = []
+fs_writable_paths = []
 deny_exec = true
 deny_ptrace = true

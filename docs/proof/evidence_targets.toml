@@ -1,0 +1,106 @@
+schema_version = "fcp.fwc.proof-readiness-targets.v1"
+
+[[targets]]
+target_id = "pq_signing_csd"
+title = "PQ signing overhead StatPack for csd class"
+blocked_beads = ["flywheel_connectors-angoc.8.3"]
+artifact_schema = "fcp.pq-signing-overhead.v1"
+artifact_root = "artifacts/perf/pq_signing"
+artifact_globs = ["artifacts/perf/pq_signing/csd-*.json"]
+freshness_days = 30
+machine_classes = ["csd"]
+host_roles = []
+required_artifact_fields = ["schema_version", "machine_class", "git_sha", "sample_count", "summary"]
+command_template = "cargo bench -p fcp-crypto --bench hybrid_verify -- --samples 10000 --machine-class csd --statpack-out artifacts/perf/pq_signing/csd-<date>-<sha>.json"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens", "no_user_home_paths"]
+evidence_notes = ["Committed artifact must include machine_class=csd and a repository git SHA."]
+
+[[targets]]
+target_id = "pq_signing_contabo"
+title = "PQ signing overhead StatPack for Contabo class"
+blocked_beads = ["flywheel_connectors-angoc.8.3"]
+artifact_schema = "fcp.pq-signing-overhead.v1"
+artifact_root = "artifacts/perf/pq_signing"
+artifact_globs = ["artifacts/perf/pq_signing/contabo-*.json"]
+freshness_days = 30
+machine_classes = ["contabo"]
+host_roles = []
+required_artifact_fields = ["schema_version", "machine_class", "git_sha", "sample_count", "summary"]
+command_template = "cargo bench -p fcp-crypto --bench hybrid_verify -- --samples 10000 --machine-class contabo --statpack-out artifacts/perf/pq_signing/contabo-<date>-<sha>.json"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens", "no_user_home_paths"]
+evidence_notes = ["Committed artifact must summarize worker identity as machine_class plus hashed host identity only."]
+
+[[targets]]
+target_id = "pq_signing_laptop"
+title = "PQ signing overhead StatPack for laptop class"
+blocked_beads = ["flywheel_connectors-angoc.8.3"]
+artifact_schema = "fcp.pq-signing-overhead.v1"
+artifact_root = "artifacts/perf/pq_signing"
+artifact_globs = ["artifacts/perf/pq_signing/laptop-*.json"]
+freshness_days = 30
+machine_classes = ["laptop"]
+host_roles = []
+required_artifact_fields = ["schema_version", "machine_class", "git_sha", "sample_count", "summary"]
+command_template = "cargo bench -p fcp-crypto --bench hybrid_verify -- --samples 10000 --machine-class laptop --statpack-out artifacts/perf/pq_signing/laptop-<date>-<sha>.json"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens", "no_user_home_paths"]
+evidence_notes = ["Committed artifact must not include personal machine names or user-home paths."]
+
+[[targets]]
+target_id = "mesh_cutover_three_host_green"
+title = "Three-host mesh cutover gate telemetry"
+blocked_beads = ["flywheel_connectors-hr0rr.2.1"]
+artifact_schema = "fcp.mesh-cutover-gates.v1"
+artifact_root = "artifacts/mesh/cutover"
+artifact_globs = ["artifacts/mesh/cutover/three-host-green-*.json"]
+freshness_days = 14
+machine_classes = []
+host_roles = ["active", "standby-a", "standby-b"]
+required_artifact_fields = ["schema_version", "data_hash", "host_roles", "gate_count", "overall_status", "green_gate_ids"]
+command_template = "scripts/e2e/cutover_gates_3node.sh --hosts <redacted host list> --out artifacts/mesh/cutover/three-host-green-<date>-<sha>.json"
+redaction_policy = ["hash_host_ids", "no_raw_hostnames", "no_private_ips", "no_tokens", "no_loopback_urls"]
+evidence_notes = ["All host identity fields must be role names plus stable hashes, never raw endpoints."]
+
+[[targets]]
+target_id = "multi_machine_failover_gauntlet"
+title = "Production multi-machine fcp-host/fcp-mesh failover gauntlet"
+blocked_beads = ["flywheel_connectors-hr0rr.2.4"]
+artifact_schema = "fcp.multi-machine-failover-gauntlet.v1"
+artifact_root = "artifacts/mesh/failover"
+artifact_globs = ["artifacts/mesh/failover/gauntlet-*.json"]
+freshness_days = 14
+machine_classes = []
+host_roles = ["initial-holder", "successor-holder", "observer"]
+required_artifact_fields = ["schema_version", "git_sha", "host_roles", "lease_transfer", "replay_result", "audit_summary"]
+command_template = "scripts/e2e/multi_machine_failover_gauntlet.sh --hosts <redacted host list> --out artifacts/mesh/failover/gauntlet-<date>-<sha>.json"
+redaction_policy = ["hash_host_ids", "no_raw_hostnames", "no_private_ips", "no_tokens", "no_loopback_urls"]
+evidence_notes = ["Readiness requires real multi-machine execution, not local replay harness output alone."]
+
+[[targets]]
+target_id = "blake3_avx512_statpack"
+title = "BLAKE3 AVX-512 and aarch64 throughput StatPack"
+blocked_beads = ["flywheel_connectors-angoc.14.2"]
+artifact_schema = "fcp.crypto-throughput-statpack.v1"
+artifact_root = "artifacts/perf/crypto_dispatch"
+artifact_globs = ["artifacts/perf/crypto_dispatch/blake3-avx512-*.json", "artifacts/perf/crypto_dispatch/blake3-aarch64-*.json"]
+freshness_days = 30
+machine_classes = ["x86_64-avx512", "aarch64-neon"]
+host_roles = []
+required_artifact_fields = ["schema_version", "algorithm", "backend", "machine_class", "git_sha", "throughput_summary"]
+command_template = "cargo bench -p fcp-crypto --bench blake3_dispatch -- --statpack-out artifacts/perf/crypto_dispatch/blake3-<machine-class>-<date>-<sha>.json"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens", "no_user_home_paths"]
+evidence_notes = ["Label-only dispatch evidence is insufficient; throughput artifact must identify the backend actually measured."]
+
+[[targets]]
+target_id = "chacha20_avx2_statpack"
+title = "ChaCha20-Poly1305 AVX2/SSE3 backend throughput StatPack"
+blocked_beads = ["flywheel_connectors-angoc.14.3"]
+artifact_schema = "fcp.crypto-throughput-statpack.v1"
+artifact_root = "artifacts/perf/crypto_dispatch"
+artifact_globs = ["artifacts/perf/crypto_dispatch/chacha20-avx2-*.json", "artifacts/perf/crypto_dispatch/chacha20-sse3-*.json"]
+freshness_days = 30
+machine_classes = ["x86_64-avx2", "x86_64-sse3"]
+host_roles = []
+required_artifact_fields = ["schema_version", "algorithm", "backend", "machine_class", "git_sha", "throughput_summary"]
+command_template = "cargo bench -p fcp-crypto --bench chacha20_dispatch -- --statpack-out artifacts/perf/crypto_dispatch/chacha20-<machine-class>-<date>-<sha>.json"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens", "no_user_home_paths"]
+evidence_notes = ["Scalar fallback passing alone is insufficient; artifact must prove the accelerated backend throughput path."]

@@ -5,13 +5,13 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:7a84ddbc36efda935617a965320e46c0df7b5b547b6485c07ee00fbe14d8ae19"
+interface_hash = "blake3-256:fcp.interface.v2:5259bbb5dac0c306c2d64e1a15276345e0f1cd1efcace4a0d6c32dcbb1152c28"
 
 [connector]
 id = "fcp.tlon"
 name = "Tlon"
 version = "0.1.0"
-status = "incubating"
+status = "proven"
 description = "Tlon / Urbit connector for authenticated DM and channel send flows"
 archetypes = ["bidirectional"]
 format = "native"

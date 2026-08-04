@@ -1,6 +1,7 @@
 //! FCP `MongoDB` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
@@ -773,10 +774,15 @@ fn require_str<'a>(input: &'a serde_json::Value, field: &str) -> Result<&'a str,
 
 /// Build the operations info for introspection.
 fn operations_info() -> Vec<OperationInfo> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
-        .collect()
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, fcp_manifest::OperationSection)> {

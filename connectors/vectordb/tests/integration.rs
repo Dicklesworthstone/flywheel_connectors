@@ -520,7 +520,12 @@ async fn schema_create_collection_invalid_metric() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_top_k_min() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -535,7 +540,12 @@ async fn schema_query_vectors_top_k_min() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_top_k_max() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -550,7 +560,12 @@ async fn schema_query_vectors_top_k_max() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_top_k_zero() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -565,7 +580,12 @@ async fn schema_query_vectors_top_k_zero() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_top_k_exceeds_max() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -580,7 +600,12 @@ async fn schema_query_vectors_top_k_exceeds_max() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_empty_vector() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -595,7 +620,12 @@ async fn schema_query_vectors_empty_vector() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_non_numeric() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -610,7 +640,12 @@ async fn schema_query_vectors_non_numeric() {
 #[fcp_async_core::runtime::test]
 async fn schema_query_vectors_default_top_k() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -629,7 +664,12 @@ async fn schema_query_vectors_default_top_k() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_single() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -645,7 +685,12 @@ async fn schema_upsert_vectors_single() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_empty_batch() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -660,7 +705,12 @@ async fn schema_upsert_vectors_empty_batch() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_exceeds_max_batch() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let vectors: Vec<serde_json::Value> = (0..1001)
         .map(|i| json!({"id": format!("v{i}"), "values": [0.1]}))
@@ -679,7 +729,12 @@ async fn schema_upsert_vectors_exceeds_max_batch() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_max_batch_ok() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let vectors: Vec<serde_json::Value> = (0..1000)
         .map(|i| json!({"id": format!("v{i}"), "values": [0.1]}))
@@ -699,7 +754,12 @@ async fn schema_upsert_vectors_max_batch_ok() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_id_empty() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -714,7 +774,12 @@ async fn schema_upsert_vectors_id_empty() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_id_max_length() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let id_512 = "a".repeat(512);
     let result = invoke(
@@ -730,7 +795,12 @@ async fn schema_upsert_vectors_id_max_length() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_id_exceeds_max_length() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let id_513 = "a".repeat(513);
     let result = invoke(
@@ -746,7 +816,12 @@ async fn schema_upsert_vectors_id_exceeds_max_length() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_missing_id() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -761,7 +836,12 @@ async fn schema_upsert_vectors_missing_id() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_missing_values() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -776,7 +856,12 @@ async fn schema_upsert_vectors_missing_values() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_empty_values() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -791,7 +876,12 @@ async fn schema_upsert_vectors_empty_values() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_non_numeric_values() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -806,7 +896,12 @@ async fn schema_upsert_vectors_non_numeric_values() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_metadata_must_be_object() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -821,7 +916,12 @@ async fn schema_upsert_vectors_metadata_must_be_object() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_sparse_values_must_be_object() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -836,7 +936,12 @@ async fn schema_upsert_vectors_sparse_values_must_be_object() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_element_must_be_object() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -851,7 +956,12 @@ async fn schema_upsert_vectors_element_must_be_object() {
 #[fcp_async_core::runtime::test]
 async fn schema_upsert_vectors_with_metadata() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.write"]).await;
-    let token = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -873,7 +983,12 @@ async fn schema_upsert_vectors_with_metadata() {
 #[fcp_async_core::runtime::test]
 async fn schema_fetch_vectors_valid() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.fetch_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.fetch_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -891,7 +1006,12 @@ async fn schema_fetch_vectors_valid() {
 #[fcp_async_core::runtime::test]
 async fn schema_fetch_vectors_empty_ids() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.fetch_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.fetch_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -906,7 +1026,12 @@ async fn schema_fetch_vectors_empty_ids() {
 #[fcp_async_core::runtime::test]
 async fn schema_fetch_vectors_ids_non_string() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.fetch_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.fetch_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -921,7 +1046,12 @@ async fn schema_fetch_vectors_ids_non_string() {
 #[fcp_async_core::runtime::test]
 async fn schema_fetch_vectors_exceeds_max_ids() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.fetch_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.fetch_vectors"],
+        c.instance_id(),
+    );
 
     let ids: Vec<String> = (0..1001).map(|i| format!("id{i}")).collect();
     let result = invoke(
@@ -1162,7 +1292,12 @@ async fn error_missing_operation() {
 async fn error_unknown_operation() {
     let (c, key) =
         setup_connector("qdrant", "localhost:6333", &["vectordb.collections.read"]).await;
-    let token = generate_token(&key, "vectordb.collections.read", &["vectordb.nonexistent"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.collections.read",
+        &["vectordb.nonexistent"],
+        c.instance_id(),
+    );
 
     let result = invoke(&c, "vectordb.nonexistent", json!({}), &token).await;
     assert!(matches!(result, Err(FcpError::OperationNotGranted { .. })));
@@ -1226,7 +1361,12 @@ async fn error_capability_mismatch() {
 #[fcp_async_core::runtime::test]
 async fn error_missing_required_field_message() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let result = invoke(
         &c,
@@ -1960,7 +2100,12 @@ async fn metrics_track_successful_invoke() {
 #[fcp_async_core::runtime::test]
 async fn metrics_track_failed_invoke() {
     let (c, key) = setup_connector("qdrant", "localhost:6333", &["vectordb.vectors.read"]).await;
-    let token = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
 
     let health_before = c.handle_health();
     let errors_before = health_before["metrics"]["requests_error"]
@@ -2244,7 +2389,12 @@ async fn logged_error_taxonomy_operation_not_granted() -> Result<(), String> {
     let mut log = TestLog::new("vectordb_error_taxonomy_operation_not_granted");
     let (c, key) =
         setup_connector("qdrant", "localhost:6333", &["vectordb.collections.read"]).await;
-    let token = generate_token(&key, "vectordb.collections.read", &["vectordb.nonexistent"], c.instance_id());
+    let token = generate_token(
+        &key,
+        "vectordb.collections.read",
+        &["vectordb.nonexistent"],
+        c.instance_id(),
+    );
 
     let result = invoke(&c, "vectordb.nonexistent", json!({}), &token).await;
 
@@ -2629,7 +2779,12 @@ async fn logged_payload_bounds_enforcement() -> Result<(), String> {
     log.check(result.is_err(), "dimension 10001 must be rejected")?;
 
     // top_k bounds: 0 rejected
-    let token_r = generate_token(&key, "vectordb.vectors.read", &["vectordb.query_vectors"], c.instance_id());
+    let token_r = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.query_vectors"],
+        c.instance_id(),
+    );
     let result = invoke(
         &c,
         "vectordb.query_vectors",
@@ -2640,7 +2795,12 @@ async fn logged_payload_bounds_enforcement() -> Result<(), String> {
     log.check(result.is_err(), "top_k 0 must be rejected")?;
 
     // Upsert empty batch rejected
-    let token_upsert = generate_token(&key, "vectordb.vectors.write", &["vectordb.upsert_vectors"], c.instance_id());
+    let token_upsert = generate_token(
+        &key,
+        "vectordb.vectors.write",
+        &["vectordb.upsert_vectors"],
+        c.instance_id(),
+    );
     let result = invoke(
         &c,
         "vectordb.upsert_vectors",
@@ -2651,7 +2811,12 @@ async fn logged_payload_bounds_enforcement() -> Result<(), String> {
     log.check(result.is_err(), "empty vector batch must be rejected")?;
 
     // Fetch empty IDs rejected
-    let token_f = generate_token(&key, "vectordb.vectors.read", &["vectordb.fetch_vectors"], c.instance_id());
+    let token_f = generate_token(
+        &key,
+        "vectordb.vectors.read",
+        &["vectordb.fetch_vectors"],
+        c.instance_id(),
+    );
     let result = invoke(
         &c,
         "vectordb.fetch_vectors",
@@ -3090,8 +3255,12 @@ async fn simulate_all_nine_operations_allowed() {
     ];
 
     for (i, op) in ops.iter().enumerate() {
-        let token =
-            generate_token(&signing_key, "vectordb.vectors.read", &[op], connector.instance_id());
+        let token = generate_token(
+            &signing_key,
+            "vectordb.vectors.read",
+            &[op],
+            connector.instance_id(),
+        );
         let result = connector
             .handle_simulate(json!({
                 "type": "simulate",

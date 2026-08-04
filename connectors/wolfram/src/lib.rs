@@ -7,7 +7,8 @@
 #![allow(
     clippy::module_name_repetitions,
     clippy::missing_errors_doc,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::unused_async_trait_impl
 )]
 
 pub mod client;

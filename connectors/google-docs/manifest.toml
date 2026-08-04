@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:0000000000000000000000000000000000000000000000000000000000000000"
+interface_hash = "blake3-256:fcp.interface.v2:dae5df99cb8da7003d13538814b78ac90b4f94f3b3c5420183486bfb6682e806"
 
 [connector]
 id = "fcp.google_docs"
@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "FCP connector for Google Docs (get, create, and batch update documents)"
 archetypes = ["operational", "knowledge"]
 format = "wasi"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"

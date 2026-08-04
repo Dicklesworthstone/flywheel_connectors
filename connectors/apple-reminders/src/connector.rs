@@ -1,15 +1,16 @@
 //! `Apple Reminders` connector implementation.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier,
-    ConnectorId, ConnectorMetrics, EventCaps, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, HealthSnapshot, IdempotencyClass, Introspection, InvokeRequest,
-    InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
-    ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest, SubscribeResponse,
-    UnsubscribeRequest,
+    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier, ConnectorId,
+    ConnectorMetrics, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
+    HealthSnapshot, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
+    SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest, SimulateResponse,
+    SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
 };
 use fcp_sdk::prelude::*;
 use serde_json::json;
@@ -26,6 +27,13 @@ const OP_LIST_LISTS: &str = "apple_reminders.list_lists";
 const OP_LIST_REMINDERS: &str = "apple_reminders.list_reminders";
 const OP_CREATE_REMINDER: &str = "apple_reminders.create_reminder";
 const OP_COMPLETE_REMINDER: &str = "apple_reminders.complete_reminder";
+const OPERATION_ORDER: &[&str] = &[
+    OP_HEALTH,
+    OP_LIST_LISTS,
+    OP_LIST_REMINDERS,
+    OP_CREATE_REMINDER,
+    OP_COMPLETE_REMINDER,
+];
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorCheck {
@@ -98,194 +106,8 @@ impl AppleRemindersConnector {
 
     #[must_use]
     pub fn operations_info() -> Vec<OperationInfo> {
-        vec![
-            OperationInfo {
-                id: OperationId::from_static(OP_HEALTH),
-                summary: "Report Apple Reminders health".into(),
-                description: Some("Report platform support and connector configuration.".into()),
-                input_schema: json!({ "type": "object", "properties": {} }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "status": { "type": "string" },
-                        "platform": { "type": "string" },
-                        "manifest_hash": { "type": "string" }
-                    },
-                    "required": ["status", "platform", "manifest_hash"]
-                }),
-                capability: CapabilityId::from_static(CAP_READ),
-                risk_level: RiskLevel::Low,
-                safety_tier: SafetyTier::Safe,
-                idempotency: IdempotencyClass::Strict,
-                ai_hints: AgentHint {
-                    when_to_use: "Use this before Apple Reminders operations on a new macOS host or when diagnosing a failed reminder automation request.".into(),
-                    common_mistakes: vec![
-                        "Treating health success as proof that the Reminders app has already granted Automation permission.".into(),
-                        "Running this on a non-macOS host and interpreting the platform failure as missing reminder data.".into(),
-                    ],
-                    examples: vec!["{\"check\":\"platform-and-configuration\"}".into()],
-                    related: vec![CapabilityId::from_static(OP_LIST_LISTS)],
-                },
-                rate_limit: None,
-                requires_approval: Some(ApprovalMode::None),
-            },
-            OperationInfo {
-                id: OperationId::from_static(OP_LIST_LISTS),
-                summary: "List reminder lists".into(),
-                description: Some("List reminder lists.".into()),
-                input_schema: json!({ "type": "object", "properties": {} }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "lists": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string" },
-                                    "name": { "type": "string" }
-                                },
-                                "required": ["id", "name"]
-                            }
-                        }
-                    },
-                    "required": ["lists"]
-                }),
-                capability: CapabilityId::from_static(CAP_READ),
-                risk_level: RiskLevel::Low,
-                safety_tier: SafetyTier::Safe,
-                idempotency: IdempotencyClass::Strict,
-                ai_hints: AgentHint {
-                    when_to_use: "Use this when the agent needs the available Reminders lists before listing or creating reminders in a specific list.".into(),
-                    common_mistakes: vec![
-                        "Guessing a list name before inspecting the user's local Reminders lists.".into(),
-                        "Assuming list names are globally stable across machines or Apple IDs.".into(),
-                    ],
-                    examples: vec!["{\"scope\":\"all-lists\"}".into()],
-                    related: vec![CapabilityId::from_static(OP_LIST_REMINDERS)],
-                },
-                rate_limit: None,
-                requires_approval: Some(ApprovalMode::None),
-            },
-            OperationInfo {
-                id: OperationId::from_static(OP_LIST_REMINDERS),
-                summary: "List reminders".into(),
-                description: Some("List reminders in a specific list or across all lists.".into()),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "list_name": { "type": "string" }
-                    }
-                }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "reminders": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string" },
-                                    "title": { "type": "string" },
-                                    "list": { "type": "string" },
-                                    "completed": { "type": "boolean" },
-                                    "due": { "type": "string" }
-                                },
-                                "required": ["id", "title", "list", "completed", "due"]
-                            }
-                        }
-                    },
-                    "required": ["reminders"]
-                }),
-                capability: CapabilityId::from_static(CAP_READ),
-                risk_level: RiskLevel::Low,
-                safety_tier: SafetyTier::Safe,
-                idempotency: IdempotencyClass::Strict,
-                ai_hints: AgentHint {
-                    when_to_use: "Use this when the agent needs reminder inventory, optionally scoped to a known Reminders list.".into(),
-                    common_mistakes: vec![
-                        "Passing a display list name that has not been confirmed with list_lists.".into(),
-                        "Treating completed and active reminder filtering as implicit; inspect the returned reminder fields before deciding what is pending.".into(),
-                    ],
-                    examples: vec!["{\"list_name\":\"Personal\"}".into()],
-                    related: vec![CapabilityId::from_static(OP_CREATE_REMINDER)],
-                },
-                rate_limit: None,
-                requires_approval: Some(ApprovalMode::None),
-            },
-            OperationInfo {
-                id: OperationId::from_static(OP_CREATE_REMINDER),
-                summary: "Create a reminder".into(),
-                description: Some("Create a reminder in a target list.".into()),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["title"],
-                    "properties": {
-                        "title": { "type": "string" },
-                        "list_name": { "type": "string" }
-                    }
-                }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "title": { "type": "string" },
-                        "list": { "type": "string" }
-                    },
-                    "required": ["id", "title", "list"]
-                }),
-                capability: CapabilityId::from_static(CAP_WRITE),
-                risk_level: RiskLevel::Medium,
-                safety_tier: SafetyTier::Risky,
-                idempotency: IdempotencyClass::None,
-                ai_hints: AgentHint {
-                    when_to_use: "Use this to create a new reminder.".into(),
-                    common_mistakes: vec![
-                        "Apple Reminders automation requires permission on macOS.".into(),
-                    ],
-                    examples: vec!["{\"title\":\"Check deploy\",\"list_name\":\"Work\"}".into()],
-                    related: vec![CapabilityId::from_static(OP_LIST_REMINDERS)],
-                },
-                rate_limit: None,
-                requires_approval: Some(ApprovalMode::Policy),
-            },
-            OperationInfo {
-                id: OperationId::from_static(OP_COMPLETE_REMINDER),
-                summary: "Complete a reminder".into(),
-                description: Some("Mark a reminder complete by reminder identifier.".into()),
-                input_schema: json!({
-                    "type": "object",
-                    "required": ["reminder_id"],
-                    "properties": {
-                        "reminder_id": { "type": "string" }
-                    }
-                }),
-                output_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "title": { "type": "string" },
-                        "completed": { "type": "boolean" }
-                    },
-                    "required": ["id", "title", "completed"]
-                }),
-                capability: CapabilityId::from_static(CAP_WRITE),
-                risk_level: RiskLevel::Medium,
-                safety_tier: SafetyTier::Risky,
-                idempotency: IdempotencyClass::BestEffort,
-                ai_hints: AgentHint {
-                    when_to_use: "Use this to mark a reminder done.".into(),
-                    common_mistakes: vec![
-                        "Passing the reminder title instead of the stable reminder identifier returned by list_reminders.".into(),
-                        "Treating best-effort idempotency as strict exactly-once behavior; confirm the returned completed flag when the caller needs certainty.".into(),
-                    ],
-                    examples: vec!["{\"reminder_id\":\"x-apple-reminder://...\"}".into()],
-                    related: vec![CapabilityId::from_static(OP_LIST_REMINDERS)],
-                },
-                rate_limit: None,
-                requires_approval: Some(ApprovalMode::Policy),
-            },
-        ]
+        static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+        OPERATIONS.get_or_init(typed_operations_info).clone()
     }
 
     fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
@@ -557,6 +379,60 @@ fn granted_capabilities(requested: Vec<CapabilityId>) -> Vec<CapabilityGrant> {
         .collect()
 }
 
+fn typed_operations_info() -> Vec<OperationInfo> {
+    ordered_manifest_operations()
+        .into_iter()
+        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+        .collect()
+}
+
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest = ConnectorManifest::parse_str(MANIFEST_TOML)
+        .expect("embedded Apple Reminders manifest should validate");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
+}
+
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
+}
+
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
+    }
+}
+
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
@@ -618,11 +494,63 @@ mod tests {
     fn operations_catalog_contains_expected_entries() {
         let operations = AppleRemindersConnector::operations_info();
         assert_eq!(operations.len(), 5);
+        let operation_ids: Vec<_> = operations
+            .iter()
+            .map(|operation| operation.id.as_str())
+            .collect();
+        assert_eq!(operation_ids, OPERATION_ORDER);
         assert!(
             operations
                 .iter()
                 .any(|operation| operation.id.as_str() == OP_COMPLETE_REMINDER)
         );
+    }
+
+    #[test]
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let manifest = ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("embedded Apple Reminders manifest should validate");
+        let operations = AppleRemindersConnector::operations_info();
+
+        assert_eq!(operations.len(), manifest.provides.operations.len());
+        for operation in operations {
+            let manifest_operation = manifest
+                .provides
+                .operations
+                .get(operation.id.as_str())
+                .expect("runtime operation should be declared in manifest");
+            assert_eq!(operation.summary, manifest_operation.description);
+            assert_eq!(
+                operation.description.as_deref(),
+                Some(manifest_operation.description.as_str())
+            );
+            assert_eq!(operation.input_schema, manifest_operation.input_schema);
+            assert_eq!(operation.output_schema, manifest_operation.output_schema);
+            assert_eq!(operation.capability, manifest_operation.capability);
+            assert_eq!(operation.risk_level, manifest_operation.risk_level);
+            assert_eq!(operation.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(operation.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                operation.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
+            );
+            assert_eq!(
+                serde_json::to_value(&operation.ai_hints).expect("operation hints serialize"),
+                serde_json::to_value(&manifest_operation.ai_hints)
+                    .expect("manifest operation hints serialize")
+            );
+            assert_eq!(
+                serde_json::to_value(&operation.rate_limit)
+                    .expect("operation rate limit serializes"),
+                serde_json::to_value(
+                    manifest_operation
+                        .rate_limit
+                        .as_ref()
+                        .map(|rate_limit| &rate_limit.0)
+                )
+                .expect("manifest operation rate limit serializes")
+            );
+        }
     }
 
     #[test]

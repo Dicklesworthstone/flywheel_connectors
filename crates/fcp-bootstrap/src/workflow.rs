@@ -68,6 +68,31 @@ impl std::fmt::Display for BootstrapMode {
     }
 }
 
+/// Validate `MultiDevice` threshold parameters before they reach the
+/// asserting `ThresholdConfig::new`.
+///
+/// Mirrors the ceremony's invariants (`1 <= threshold <= device_count`) but
+/// returns a typed [`BootstrapError::Config`] instead of panicking, so a
+/// caller-supplied bad config fails closed at the boundary.
+fn validate_multi_device_params(threshold: u32, device_count: u32) -> BootstrapResult<()> {
+    if device_count < 1 {
+        return Err(BootstrapError::Config(
+            "multi-device bootstrap requires device_count >= 1".to_string(),
+        ));
+    }
+    if threshold < 1 {
+        return Err(BootstrapError::Config(
+            "multi-device bootstrap requires threshold >= 1".to_string(),
+        ));
+    }
+    if threshold > device_count {
+        return Err(BootstrapError::Config(format!(
+            "multi-device threshold {threshold} must not exceed device_count {device_count}"
+        )));
+    }
+    Ok(())
+}
+
 /// Configuration for the bootstrap workflow.
 #[derive(Debug)]
 pub struct BootstrapConfig {
@@ -165,6 +190,14 @@ impl BootstrapConfigBuilder {
         let mode = self
             .mode
             .ok_or_else(|| BootstrapError::Config("mode is required".to_string()))?;
+
+        if let BootstrapMode::MultiDevice {
+            device_count,
+            threshold,
+        } = &mode
+        {
+            validate_multi_device_params(*threshold, *device_count)?;
+        }
 
         Ok(BootstrapConfig {
             data_dir,
@@ -516,6 +549,14 @@ impl BootstrapWorkflow {
         threshold: u32,
         total: u32,
     ) -> BootstrapResult<GenesisState> {
+        // Fail closed on an invalid threshold BEFORE writing the phase lock:
+        // `ThresholdConfig::new` panics on `threshold < 1` or `threshold >
+        // total`, and writing the CeremonySetup lock first would leave a
+        // resumable partial-state marker that re-panics on every `resume()`
+        // (a stuck loop until `force_overwrite`). Validate all external config
+        // as hostile and surface a typed error instead of a panic.
+        validate_multi_device_params(threshold, total)?;
+
         self.phase = BootstrapPhase::CeremonySetup {
             participant_count: total,
             threshold,
@@ -963,6 +1004,55 @@ mod tests {
             .build();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_device_builder_rejects_invalid_threshold() {
+        let dir = tempdir().unwrap();
+        // threshold > device_count previously panicked inside
+        // ThresholdConfig::new; it must now fail closed with a typed error.
+        let result = BootstrapConfig::builder()
+            .data_dir(dir.path())
+            .mode(BootstrapMode::MultiDevice {
+                device_count: 2,
+                threshold: 3,
+            })
+            .build();
+        assert!(matches!(result, Err(BootstrapError::Config(_))));
+
+        // threshold == 0 and device_count == 0 are also rejected.
+        assert!(matches!(
+            BootstrapConfig::builder()
+                .data_dir(dir.path())
+                .mode(BootstrapMode::MultiDevice {
+                    device_count: 3,
+                    threshold: 0,
+                })
+                .build(),
+            Err(BootstrapError::Config(_))
+        ));
+        assert!(matches!(
+            BootstrapConfig::builder()
+                .data_dir(dir.path())
+                .mode(BootstrapMode::MultiDevice {
+                    device_count: 0,
+                    threshold: 0,
+                })
+                .build(),
+            Err(BootstrapError::Config(_))
+        ));
+
+        // A valid 2-of-3 config still builds.
+        assert!(
+            BootstrapConfig::builder()
+                .data_dir(dir.path())
+                .mode(BootstrapMode::MultiDevice {
+                    device_count: 3,
+                    threshold: 2,
+                })
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]

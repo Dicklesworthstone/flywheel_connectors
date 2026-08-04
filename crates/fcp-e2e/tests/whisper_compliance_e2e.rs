@@ -426,7 +426,12 @@ async fn whisper_default_deny_compliance_suite_passes() {
     let mut connector = WhisperConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["whisper.info"]);
-    let token = build_token(&signing_key, "whisper.info", &["whisper.health"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "whisper.info",
+        &["whisper.health"],
+        connector.instance_id.as_str(),
+    );
     // Token grants whisper.info for whisper.health, but we invoke whisper.transcribe
     // which requires whisper.transcription -- should be denied.
     let invoke = invoke_request(

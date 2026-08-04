@@ -203,7 +203,11 @@ async fn live_get_file_nonexistent() {
 
     let mut connector = TelegramConnector::new();
     let signing_key = setup_live_connector(&mut connector, &token).await;
-    let capability = generate_read_token(&signing_key, connector.instance_id().as_str(), "telegram.get_file");
+    let capability = generate_read_token(
+        &signing_key,
+        connector.instance_id().as_str(),
+        "telegram.get_file",
+    );
 
     // Invoke get_file with a nonexistent file_id — should return a structured
     // Telegram API error (400 "Bad Request: invalid file_id"), not a panic.

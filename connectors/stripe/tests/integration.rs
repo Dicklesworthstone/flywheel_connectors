@@ -417,6 +417,81 @@ async fn error_500_server_is_retryable() {
     );
 }
 
+/// Every Stripe POST carries an `Idempotency-Key` even when the caller
+/// supplied none, and presents the SAME key on every retry attempt.
+///
+/// `StripeClient::execute` retries on 5xx and on transport timeouts, both of
+/// which can be reported after Stripe already accepted the request. Without a
+/// stable key, one `create_customer` invoke could create up to `max_retries + 1`
+/// customers — and the equivalent path creates duplicate charges and refunds.
+/// A per-attempt key would be worse than none: it looks like protection while
+/// providing exactly zero. See br-kxd3e.
+#[fcp_async_core::runtime::test]
+async fn post_without_caller_key_sends_one_stable_idempotency_key_across_retries() {
+    struct RecordIdempotencyKey(Arc<Mutex<Vec<Option<String>>>>);
+
+    impl wiremock::Match for RecordIdempotencyKey {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            self.0.lock().unwrap().push(
+                request
+                    .headers
+                    .get("idempotency-key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+            );
+            true
+        }
+    }
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mock_server = MockServer::start().await;
+
+    // A 500 means Stripe RECEIVED the request — the dangerous case.
+    Mock::given(method("POST"))
+        .and(path("/v1/customers"))
+        .and(RecordIdempotencyKey(Arc::clone(&observed)))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/customers"))
+        .and(RecordIdempotencyKey(Arc::clone(&observed)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cus_1",
+            "object": "customer",
+            "email": "a@example.com"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = StripeClient::new("sk_test")
+        .unwrap()
+        .with_api_url(&format!("{}/v1", mock_server.uri()))
+        .with_retry_config(1);
+
+    client.create_customer("a@example.com", None).await.unwrap();
+
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed.len(),
+        2,
+        "expected the 500 to be retried exactly once, saw {observed:?}"
+    );
+    let first = observed[0]
+        .as_deref()
+        .expect("attempt 1 must carry a generated Idempotency-Key");
+    assert!(
+        first.starts_with("fcp2:retry:"),
+        "generated key should be self-identifying, got {first}"
+    );
+    assert_eq!(
+        observed[1].as_deref(),
+        Some(first),
+        "the retry must present the SAME key or Stripe cannot deduplicate it"
+    );
+}
+
 /// Resource not found via error enum maps correctly.
 #[test]
 fn error_not_found_maps_correctly() {

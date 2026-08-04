@@ -434,7 +434,12 @@ async fn zapier_default_deny_compliance_suite_passes() {
     );
     // Token grants zapier.zaps.read capability but only for zapier.zaps.list operation.
     // Invoke targets zapier.zaps.execute which requires zapier.zaps.write -- should be denied.
-    let token = build_token(&signing_key, "zapier.zaps.read", &["zapier.zaps.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "zapier.zaps.read",
+        &["zapier.zaps.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "zapier.zaps.execute",
         json!({ "action_id": "act_test", "params": {} }),
@@ -485,7 +490,12 @@ async fn zapier_allow_valid_token_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["zapier.zaps.read"],
     );
-    let token = build_token(&signing_key, "zapier.zaps.read", &["zapier.zaps.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "zapier.zaps.read",
+        &["zapier.zaps.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("zapier.zaps.list", json!({}), token);
     let suite = ConnectorSuite {
         test_name: "zapier_allow_valid_token".to_string(),

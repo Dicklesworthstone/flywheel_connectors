@@ -5,6 +5,7 @@
 //! - [`device`] - Device profile types for execution planning and capability reporting
 //! - [`gossip`] - Gossip protocol for metadata and object announcement
 //! - [`iblt`] - Production invertible bloom lookup tables for compact set differences
+//! - [`quorum`] - Compact BLS12-381 aggregate quorum certificates for mesh decisions
 //! - [`session`] - Session layer with authenticated handshake, key schedule, and anti-replay
 //! - [`symbol_request`] - Symbol request handling with bounded requests and targeted repair
 //! - [`transport`] - Transport path ranking + deterministic multipath selection
@@ -36,9 +37,11 @@ pub mod gossip;
 pub mod iblt;
 pub mod node;
 pub mod planner;
+pub mod quorum;
 pub mod replay;
 pub mod revocation;
 pub mod session;
+pub mod state_root;
 pub mod symbol_request;
 pub mod transport;
 
@@ -53,8 +56,10 @@ pub use gossip::*;
 pub use iblt::*;
 pub use node::*;
 pub use planner::*;
+pub use quorum::*;
 pub use replay::*;
 pub use revocation::*;
 pub use session::*;
+pub use state_root::*;
 pub use symbol_request::*;
 pub use transport::*;

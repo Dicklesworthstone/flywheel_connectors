@@ -392,7 +392,20 @@ async fn local_non_mock_list_connections_uses_people_request_boundary() {
         "provider_class": "local_sufficient",
         "operation": OP_LIST_CONNECTIONS,
         "method": "GET",
-        "request_line": observation.request_line,
+        "endpoint_shape": "GET /v1/people/me/connections?<redacted_query>",
+        "query_shape": {
+            "person_fields_present": observation.request_line.contains("personFields="),
+            "page_size_present": request_line_contains_query_pair(
+                &observation.request_line,
+                "pageSize",
+                "2",
+            )
+        },
+        "path_segment_policy": {
+            "loopback_endpoint_redacted": true,
+            "contact_resource_names_redacted": true,
+            "query_values_shape_only": true
+        },
         "auth_gate": {
             "mode": "bearer",
             "authorization_header_verified": observation.authorization_seen(),
@@ -452,7 +465,24 @@ async fn local_non_mock_self_check_uses_contact_groups_health_probe() {
         "provider_class": "local_sufficient",
         "operation": "self_check",
         "method": "GET",
-        "request_line": observation.request_line,
+        "endpoint_shape": "GET /v1/contactGroups?<redacted_query>",
+        "query_shape": {
+            "group_fields_present": request_line_contains_query_pair(
+                &observation.request_line,
+                "groupFields",
+                "name",
+            ),
+            "page_size_present": request_line_contains_query_pair(
+                &observation.request_line,
+                "pageSize",
+                "1",
+            )
+        },
+        "path_segment_policy": {
+            "loopback_endpoint_redacted": true,
+            "contact_group_resource_names_redacted": true,
+            "query_values_shape_only": true
+        },
         "authorization_header_verified": observation.authorization_seen(),
         "secret_leaked": false,
         "cleanup": "fixture_thread_joined",
@@ -513,7 +543,7 @@ async fn local_non_mock_create_contact_posts_people_body() {
         "provider_class": "local_sufficient",
         "operation": OP_CREATE_CONTACT,
         "method": "POST",
-        "request_line": observation.request_line,
+        "endpoint_shape": "POST /v1/people:createContact",
         "auth_gate": {
             "mode": "bearer",
             "authorization_header_verified": observation.authorization_seen(),
@@ -521,7 +551,14 @@ async fn local_non_mock_create_contact_posts_people_body() {
         },
         "body_shape": {
             "name_count": body["names"].as_array().map_or(0, Vec::len),
-            "email_count": body["emailAddresses"].as_array().map_or(0, Vec::len)
+            "email_count": body["emailAddresses"].as_array().map_or(0, Vec::len),
+            "contact_names_redacted": true,
+            "contact_emails_redacted": true
+        },
+        "path_segment_policy": {
+            "loopback_endpoint_redacted": true,
+            "contact_resource_names_redacted": true,
+            "contact_payload_redacted": true
         },
         "cleanup": "fixture_thread_joined",
         "result": "passed"
@@ -574,6 +611,11 @@ async fn local_non_mock_wrong_capability_fails_before_loopback_egress() {
         "operation": OP_CREATE_CONTACT,
         "denial": "wrong_capability",
         "loopback_egress_attempted": false,
+        "path_segment_policy": {
+            "loopback_endpoint_redacted": true,
+            "contact_resource_names_redacted": true,
+            "contact_payload_redacted": true
+        },
         "result": "passed"
     });
     println!("{artifact}");

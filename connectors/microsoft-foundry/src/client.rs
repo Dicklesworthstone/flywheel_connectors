@@ -447,14 +447,25 @@ pub fn host_hash(host: &str) -> String {
 
 fn validate_response_id(response_id: &str) -> Result<String, OpenAiError> {
     let trimmed = response_id.trim();
+    // The id is interpolated into `/responses/{id}/cancel` (and `/input_items`)
+    // on the trusted, host-validated base URL. `/`, `\`, and `..` let the server
+    // normalize to a sibling endpoint; `?`/`#` open a query/fragment that
+    // truncates the intended suffix; `%` enables encoded traversal (`%2f`,
+    // `%2e`). Response ids are opaque `resp_…` tokens, so none of these are
+    // legitimate. (Mirrors anthropic-vertex's `validate_path_component`.)
     if trimmed.is_empty()
         || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.contains('%')
         || trimmed
             .bytes()
             .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
     {
         return Err(OpenAiError::InvalidRequest {
-            message: "response_id must be a non-empty path segment".into(),
+            message: "response_id must be a single non-empty, non-traversing path segment".into(),
             param: Some("response_id".into()),
             code: Some("invalid_response_id".into()),
         });
@@ -483,6 +494,34 @@ fn checkpoint(cx: &Cx) -> Result<(), OpenAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_response_id_rejects_path_traversal() {
+        // A crafted response_id must not escape `/responses/{id}/…` to a
+        // sibling endpoint or inject a query/fragment on the trusted host.
+        for evil in [
+            "..",
+            "../cancel",
+            "x/../y",
+            "a\\b",
+            "x?api-version=attacker",
+            "x#frag",
+            "x%2f..",
+            "x%2e%2e",
+            "",
+            "  ",
+        ] {
+            assert!(
+                validate_response_id(evil).is_err(),
+                "response_id {evil:?} must be rejected"
+            );
+        }
+        // Opaque, well-formed response ids are accepted (and trimmed).
+        assert_eq!(
+            validate_response_id("  resp_abc123DEF  ").unwrap(),
+            "resp_abc123DEF"
+        );
+    }
 
     #[test]
     fn normalizes_official_foundry_endpoint_classes() {

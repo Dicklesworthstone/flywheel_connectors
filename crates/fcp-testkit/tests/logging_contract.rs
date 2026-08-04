@@ -221,16 +221,10 @@ async fn context_run_failure_preserves_variant() {
 }
 
 /// Nested context failures are distinguishable.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms. This test
-// verifies SEMANTICS (a tight child deadline fires before a looser parent
-// deadline, and the parent still has budget afterward), which survives a
-// coarser timer if the two deadlines are spread well apart. Retimed so the
-// competing deadlines differ by >600ms and the child deadline is >300ms:
-// parent 2s, child 300ms. Original was parent 100ms / child 20ms.
 #[fcp_async_core::runtime::test]
 async fn nested_failure_context_distinguishable() {
-    let parent = ExecutionContext::request_scoped(Duration::from_secs(2));
-    let child = parent.child().with_deadline(Duration::from_millis(300));
+    let parent = ExecutionContext::request_scoped(Duration::from_millis(100));
+    let child = parent.child().with_deadline(Duration::from_millis(20));
 
     let result = child
         .run(async { time::sleep(Duration::from_secs(60)).await })
@@ -242,11 +236,10 @@ async fn nested_failure_context_distinguishable() {
         "child should timeout first: {result:?}"
     );
 
-    // Parent should still have budget. Child burned ~300ms (floored up to
-    // ~500ms by the reactor), so the 2s parent retains well over 600ms.
+    // Parent should still have budget
     let remaining = parent.remaining_budget().expect("has deadline");
     assert!(
-        remaining > Duration::from_millis(600),
+        remaining > Duration::from_millis(30),
         "parent should have budget left: {remaining:?}"
     );
 }

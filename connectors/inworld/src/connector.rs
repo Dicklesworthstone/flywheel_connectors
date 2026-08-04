@@ -1,6 +1,7 @@
 //! FCP connector implementation for Inworld Realtime.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
@@ -505,7 +506,13 @@ impl FcpConnector for InworldConnector {
 }
 
 fn operations_info() -> Vec<OperationInfo> {
-    typed_operations_info().expect("embedded Inworld manifest should validate for introspection")
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            typed_operations_info()
+                .expect("embedded Inworld manifest should validate for introspection")
+        })
+        .clone()
 }
 
 fn typed_operations_info() -> FcpResult<Vec<OperationInfo>> {

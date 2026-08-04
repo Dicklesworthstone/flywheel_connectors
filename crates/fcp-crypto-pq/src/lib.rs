@@ -2297,12 +2297,22 @@ fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
 mod hex_vec {
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// Hard allocation bound for any hex-encoded byte envelope in this crate.
+    /// Exact, parameter-derived lengths are enforced at the use sites; this
+    /// cap only prevents unbounded allocation from hostile input.
+    const MAX_HEX_CHARS: usize = 2 * super::MAX_PUBLIC_MATRIX_EXPANDED_BYTES;
+
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&hex::encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
+        if s.len() > MAX_HEX_CHARS {
+            return Err(serde::de::Error::custom(format!(
+                "hex byte envelope exceeds {MAX_HEX_CHARS} characters"
+            )));
+        }
         hex::decode(&s).map_err(serde::de::Error::custom)
     }
 }
@@ -4429,6 +4439,14 @@ mod tests {
         let json = serde_json::to_string(&preimage).unwrap();
         let back: LatticePreimage = serde_json::from_str(&json).unwrap();
         verify(&zp_pub, h, &back, now, p).unwrap();
+    }
+
+    #[test]
+    fn hex_envelope_deserialize_rejects_oversized_input() {
+        let oversized = "f".repeat(2 * MAX_PUBLIC_MATRIX_EXPANDED_BYTES + 2);
+        let json = format!("{{\"bytes\":\"{oversized}\"}}");
+        let err = serde_json::from_str::<LatticePreimage>(&json).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
     }
 
     #[test]

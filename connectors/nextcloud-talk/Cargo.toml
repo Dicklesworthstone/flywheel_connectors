@@ -20,7 +20,7 @@ workspace = true
 [dependencies]
 fcp-core.workspace = true
 fcp-prelude.workspace = true
-fcp-sdk.workspace = true
+fcp-sdk = { workspace = true, features = ["connector-http"] }
 fcp-async-core.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }

@@ -1,9 +1,9 @@
 # Google People Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/runtime drift documented
+> **Status**: PROVEN runtime contract documented with manifest/runtime drift called out
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
-> **Verification script**: none tracked; use the commands below
+> **Verification script**: `scripts/e2e/google_people_connector_verification.sh`
 > **People API upstream**: https://developers.google.com/people/api/rest
 > **People connections upstream**: https://developers.google.com/people/api/rest/v1/people.connections
 > **People search contacts upstream**: https://developers.google.com/people/api/rest/v1/people/searchContacts
@@ -59,13 +59,12 @@ This README documents the runtime truth and keeps current drift visible:
 
 - Manifest connector ID is `fcp.google-people`, while runtime `BaseConnector` ID is `google-people`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest `[capabilities].optional` is empty even though manifest operations and runtime introspection use `people.contacts.read`, `people.profile.read`, `people.other_contacts.read`, `people.directory.read`, `people.contact_groups.read`, `people.contacts.write`, and `people.contacts.delete`.
 - Runtime capability-token verification currently uses an empty resource URI list for People operations. Capabilities are operation-bound but not resource-bound to a contact, directory person, group, or search corpus.
 - Manifest input schema for `people.update_contact` does not express the runtime `person.etag` requirement or the runtime `resource_name` versus `person.resourceName` consistency check.
 - Runtime `handle_shutdown` calls client shutdown, but it does not clear config, client, verifier, session, configured flags, or handshaken flags.
-- There is no dedicated tracked verification shell script for this connector.
+- The dedicated tracked verification shell script is `scripts/e2e/google_people_connector_verification.sh`.
 
-A follow-up parity bead should populate manifest optional capabilities, add resource URI binding, align manifest schemas with runtime update-contact validation, and reset lifecycle state consistently on shutdown.
+A follow-up parity bead should add resource URI binding, align manifest schemas with runtime update-contact validation, and reset lifecycle state consistently on shutdown.
 
 ## First-Slice Scope
 
@@ -78,7 +77,8 @@ The current Google People README slice documents the existing runtime surface:
 - bound capability-token verification during both `invoke` and `simulate`
 - provider error mapping, retry behavior, field-mask behavior, redaction posture, and health behavior
 - lifecycle, doctor, health, self-check, introspection, simulation, invoke, and shutdown surfaces
-- deterministic WireMock tests and direct proof commands
+- deterministic WireMock tests, local non-mock JSONL, and direct proof commands
+- the tracked verifier bundle that ties gauntlet, manifest, Cargo, local non-mock JSONL, redaction, and replay evidence together
 
 ## Auth And Scope Boundary
 
@@ -199,7 +199,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Verification Bundle
 
-There is no dedicated tracked `scripts/e2e/google_people_connector_verification.sh` bundle in this checkout. The closeout surface is the crate-local test suite plus direct `rch` proof commands.
+The dedicated tracked verifier is `scripts/e2e/google_people_connector_verification.sh`. It writes a replayable artifact bundle with logs, redaction-checked local non-mock JSONL, gauntlet evidence, manifest drift evidence, and a summary JSON.
 
 The verification surface captures:
 
@@ -207,6 +207,7 @@ The verification surface captures:
 - deterministic WireMock coverage for People API paths
 - auth, endpoint policy, provider error, lifecycle, simulation, and introspection tests
 - formatting, check, test, and clippy proof through `rch`
+- redaction-safe local non-mock JSONL for `people.list_connections`, `self_check`, `people.create_contact`, and wrong-capability denial
 - UBS on changed files before commit
 
 ## Operator Guidance
@@ -240,6 +241,7 @@ The verification surface captures:
 
 **Rerun commands**:
 
+- `RUN_ID=google-people-rerun-$(date -u +%Y%m%dT%H%M%SZ) bash -lc 'OUT_ROOT=/tmp/fcp-google-people-e2e/$RUN_ID RCH_FORCE_REMOTE=1 RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 scripts/e2e/google_people_connector_verification.sh'`
 - `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-google-people-readme cargo check -p fcp-google-people --all-targets`
 - `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-google-people-readme cargo test -p fcp-google-people --tests -- --nocapture`
 - `rch exec -- env CARGO_TARGET_DIR=/tmp/fcp-google-people-readme cargo clippy -p fcp-google-people --all-targets --no-deps -- -D warnings`

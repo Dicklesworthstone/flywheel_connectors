@@ -62,7 +62,22 @@ pub enum PaginationError {
     /// Pagination limit exceeded.
     #[error("pagination limit exceeded: {0}")]
     LimitExceeded(String),
+
+    /// The server kept claiming more pages without ever advancing.
+    #[error("pagination stalled: {0}")]
+    Stalled(String),
 }
+
+/// Hard ceiling on pages fetched by a single pagination call.
+///
+/// The item limit alone cannot bound the loop. A server answering
+/// `hasNextPage: true` with an EMPTY `items` array never advances `out.len()`,
+/// so `remaining` never shrinks and the loop spins forever issuing requests;
+/// with `limit: None` even non-empty pages are unbounded and end in OOM. This
+/// is the backstop for the case the cursor/offset advancement check below
+/// cannot see — a server that dutifully returns a *new* cursor every time but
+/// never actually terminates.
+const MAX_PAGES: usize = 10_000;
 
 /// Paginate a cursor-based API.
 pub async fn paginate_cursor<T, F, Fut>(
@@ -76,6 +91,7 @@ where
 {
     let mut out = Vec::new();
     let max_items = limit.map(|limit| limit.max_items);
+    let mut pages = 0usize;
     loop {
         if let Some(max_items) = max_items {
             if out.len() >= max_items {
@@ -83,6 +99,13 @@ where
                     "page limit reached".to_string(),
                 ));
             }
+        }
+
+        pages = pages.saturating_add(1);
+        if pages > MAX_PAGES {
+            return Err(PaginationError::Stalled(format!(
+                "exceeded {MAX_PAGES} pages without reaching the end of the connection"
+            )));
         }
 
         let page = fetch_page(cursor.clone()).await?;
@@ -105,10 +128,19 @@ where
         if !page.page_info.has_next_page {
             break;
         }
-        cursor.clone_from(&page.page_info.end_cursor);
-        if cursor.is_none() {
+        let next_cursor = page.page_info.end_cursor;
+        if next_cursor.is_none() {
             break;
         }
+        // A server that hands back the SAME cursor it was just given is not
+        // advancing: the next request would be byte-identical to this one, so
+        // the loop can only spin. Refuse rather than hang.
+        if next_cursor == cursor {
+            return Err(PaginationError::Stalled(
+                "server returned the same end_cursor it was given".to_string(),
+            ));
+        }
+        cursor = next_cursor;
     }
 
     Ok(out)
@@ -127,6 +159,7 @@ where
 {
     let mut out = Vec::new();
     let max_items = limit.map(|limit| limit.max_items);
+    let mut pages = 0usize;
     loop {
         if let Some(max_items) = max_items {
             if out.len() >= max_items {
@@ -134,6 +167,13 @@ where
                     "page limit reached".to_string(),
                 ));
             }
+        }
+
+        pages = pages.saturating_add(1);
+        if pages > MAX_PAGES {
+            return Err(PaginationError::Stalled(format!(
+                "exceeded {MAX_PAGES} pages without reaching the end of the collection"
+            )));
         }
 
         let page = fetch_page(offset).await?;
@@ -154,6 +194,14 @@ where
         out.extend(page.items);
 
         match page.next_offset {
+            // The offset must strictly increase. A repeated (or rewound)
+            // offset means the next request is one already made, so the loop
+            // can only spin.
+            Some(next) if next <= offset => {
+                return Err(PaginationError::Stalled(format!(
+                    "server returned next_offset {next} which does not advance past {offset}"
+                )));
+            }
             Some(next) => offset = next,
             None => break,
         }
@@ -460,6 +508,87 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(PaginationError::LimitExceeded(_))));
+    }
+
+    /// A server that keeps claiming `hasNextPage: true` while handing back the
+    /// SAME cursor never advances, and `out.len()` never grows — so the item
+    /// limit provides no protection and the loop spins forever issuing
+    /// requests. Must terminate with a typed error instead.
+    #[fcp_async_core::runtime::test]
+    async fn paginate_cursor_refuses_a_non_advancing_cursor() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let result: Result<Vec<i32>, _> = paginate_cursor(None, None, move |_cursor| {
+            let seen = std::sync::Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(CursorPage {
+                    items: Vec::new(),
+                    page_info: CursorPageInfo {
+                        has_next_page: true,
+                        end_cursor: Some("stuck".to_string()),
+                        total_count: None,
+                    },
+                })
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(PaginationError::Stalled(_))),
+            "expected Stalled, got {result:?}"
+        );
+        // First call gets `None`, second is handed "stuck" back — the repeat is
+        // detected there, so this terminates immediately rather than at MAX_PAGES.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// Same shape on the offset API: an offset that does not strictly increase
+    /// means the next request is one already made.
+    #[fcp_async_core::runtime::test]
+    async fn paginate_offset_refuses_a_non_advancing_offset() {
+        let result: Result<Vec<i32>, _> = paginate_offset(0, None, |_offset| async {
+            Ok(OffsetPage {
+                items: vec![1],
+                next_offset: Some(0),
+                total_count: None,
+            })
+        })
+        .await;
+        assert!(
+            matches!(result, Err(PaginationError::Stalled(_))),
+            "expected Stalled, got {result:?}"
+        );
+    }
+
+    /// Even a server that returns a genuinely NEW cursor every time must not be
+    /// able to run the loop unboundedly — the advancement check cannot see that
+    /// case, so the page ceiling is the backstop.
+    #[fcp_async_core::runtime::test]
+    async fn paginate_cursor_stops_at_the_page_ceiling() {
+        let page = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&page);
+        let result: Result<Vec<i32>, _> = paginate_cursor(None, None, move |_cursor| {
+            let counter = std::sync::Arc::clone(&counter);
+            async move {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(CursorPage {
+                    items: Vec::new(),
+                    page_info: CursorPageInfo {
+                        has_next_page: true,
+                        end_cursor: Some(format!("cursor-{n}")),
+                        total_count: None,
+                    },
+                })
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(PaginationError::Stalled(_))),
+            "expected Stalled, got {result:?}"
+        );
+        assert_eq!(page.load(std::sync::atomic::Ordering::Relaxed), MAX_PAGES);
     }
 
     #[fcp_async_core::runtime::test]

@@ -1914,71 +1914,71 @@ impl EnforcementCheck for RevocationCheck {
     }
 
     fn check(&self, ctx: &EnforcementContext, config: &EnforcementConfig) -> CheckOutcome {
-        // 1. Validate freshness of the revocation list.
-        match ctx.revocation_list_age_ms {
-            None => {
-                return CheckOutcome::Skip {
-                    reason: "revocation list age not available".into(),
-                };
-            }
-            Some(age) if age > config.revocation_max_age_ms => {
+        // 1. Exact-membership revocation is authoritative and INDEPENDENT of
+        //    list freshness: a known revocation in a configured registry must
+        //    deny even when the list's age is unknown. Freshness only needs the
+        //    age; membership needs only the registry + ids, so coupling them
+        //    (as the old `age.is_none() => Skip` short-circuit did) would let a
+        //    revoked artifact through whenever `revocation_list_age_ms` was
+        //    absent. Run membership first so it can never be bypassed.
+        if let Some(registry) = &config.revocation_registry {
+            // Check capability token revocation
+            if let Some(token_id) = &ctx.token_id
+                && registry.is_revoked(token_id)
+            {
                 return CheckOutcome::Deny {
-                    reason_code: "REVOCATION_LIST_STALE".into(),
-                    explanation: format!(
-                        "revocation list age {age}ms exceeds maximum {}ms",
-                        config.revocation_max_age_ms
-                    ),
+                    reason_code: "CAPABILITY_REVOKED".into(),
+                    explanation: format!("capability token '{token_id}' has been revoked"),
                 };
             }
-            _ => {}
+
+            // Check node attestation revocation
+            if let Some(att_id) = &ctx.node_attestation_id
+                && registry.is_revoked(att_id)
+            {
+                return CheckOutcome::Deny {
+                    reason_code: "NODE_ATTESTATION_REVOKED".into(),
+                    explanation: format!("node attestation '{att_id}' has been revoked"),
+                };
+            }
+
+            // Check issuer key revocation
+            if let Some(key_id) = &ctx.issuer_key_id
+                && registry.is_revoked(key_id)
+            {
+                return CheckOutcome::Deny {
+                    reason_code: "ISSUER_KEY_REVOKED".into(),
+                    explanation: format!("issuer key '{key_id}' has been revoked"),
+                };
+            }
+
+            // Check binary artifact revocation
+            if let Some(bin_id) = &ctx.binary_artifact_id
+                && registry.is_revoked(bin_id)
+            {
+                return CheckOutcome::Deny {
+                    reason_code: "BINARY_ARTIFACT_REVOKED".into(),
+                    explanation: format!("connector binary artifact '{bin_id}' has been revoked"),
+                };
+            }
         }
 
-        // 2. Perform concrete revocation lookups if a registry is available.
-        let Some(registry) = &config.revocation_registry else {
-            return CheckOutcome::Allow; // Fresh but no registry to check IDs against
-        };
-
-        // Check capability token revocation
-        if let Some(token_id) = &ctx.token_id
-            && registry.is_revoked(token_id)
-        {
-            return CheckOutcome::Deny {
-                reason_code: "CAPABILITY_REVOKED".into(),
-                explanation: format!("capability token '{token_id}' has been revoked"),
-            };
+        // 2. Validate freshness of the revocation list (a separate concern: a
+        //    stale list may be MISSING recent revocations). Membership above
+        //    already honored every revocation the local registry knows about.
+        match ctx.revocation_list_age_ms {
+            None => CheckOutcome::Skip {
+                reason: "revocation list age not available".into(),
+            },
+            Some(age) if age > config.revocation_max_age_ms => CheckOutcome::Deny {
+                reason_code: "REVOCATION_LIST_STALE".into(),
+                explanation: format!(
+                    "revocation list age {age}ms exceeds maximum {}ms",
+                    config.revocation_max_age_ms
+                ),
+            },
+            _ => CheckOutcome::Allow,
         }
-
-        // Check node attestation revocation
-        if let Some(att_id) = &ctx.node_attestation_id
-            && registry.is_revoked(att_id)
-        {
-            return CheckOutcome::Deny {
-                reason_code: "NODE_ATTESTATION_REVOKED".into(),
-                explanation: format!("node attestation '{att_id}' has been revoked"),
-            };
-        }
-
-        // Check issuer key revocation
-        if let Some(key_id) = &ctx.issuer_key_id
-            && registry.is_revoked(key_id)
-        {
-            return CheckOutcome::Deny {
-                reason_code: "ISSUER_KEY_REVOKED".into(),
-                explanation: format!("issuer key '{key_id}' has been revoked"),
-            };
-        }
-
-        // Check binary artifact revocation
-        if let Some(bin_id) = &ctx.binary_artifact_id
-            && registry.is_revoked(bin_id)
-        {
-            return CheckOutcome::Deny {
-                reason_code: "BINARY_ARTIFACT_REVOKED".into(),
-                explanation: format!("connector binary artifact '{bin_id}' has been revoked"),
-            };
-        }
-
-        CheckOutcome::Allow
     }
 }
 
@@ -5056,6 +5056,62 @@ mod tests {
             assert_eq!(reason_code, "CAPABILITY_REVOKED");
         } else {
             panic!("Expected denial for revoked token, got {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn revocation_check_denies_revoked_token_even_when_freshness_unknown() {
+        // Regression: a revoked token in a configured registry must be denied
+        // even when `revocation_list_age_ms` is absent. The old code
+        // short-circuited to Skip on missing freshness BEFORE consulting
+        // is_revoked, silently bypassing exact-membership revocation.
+        let mut registry = RevocationRegistry::new();
+        let token_id = ObjectId::from_bytes([0xAA; 32]);
+        let revocation = fcp_core::RevocationObject {
+            header: fcp_core::ObjectHeader {
+                zone_id: ZoneId::work(),
+                schema: SchemaId::new(
+                    "fcp.core",
+                    "RevocationObject",
+                    semver::Version::new(1, 0, 0),
+                ),
+                created_at: 1_700_000_000,
+                provenance: fcp_core::Provenance::new(ZoneId::work()),
+                refs: Vec::new(),
+                foreign_refs: Vec::new(),
+                ttl_secs: None,
+                placement: None,
+            },
+            scope: fcp_core::RevocationScope::Capability,
+            revoked: vec![token_id],
+            effective_at: 1000,
+            expires_at: None,
+            reason: "test".into(),
+            signature: [0u8; 64],
+        };
+        registry.add_revocation(&revocation);
+
+        let config = EnforcementConfig::default().with_revocation_registry(Arc::new(registry));
+
+        // No revocation_list_age_ms → freshness unknown.
+        let mut ctx = EnforcementContextBuilder::new()
+            .request_id("r1")
+            .connector_id("c1")
+            .operation("op1")
+            .zone_id("z1")
+            .principal("p1")
+            .build()
+            .unwrap();
+        assert!(ctx.revocation_list_age_ms.is_none());
+        ctx.token_id = Some(token_id);
+
+        let outcome = RevocationCheck.check(&ctx, &config);
+        assert!(
+            outcome.is_deny(),
+            "revoked token must be denied regardless of freshness availability, got {outcome:?}"
+        );
+        if let CheckOutcome::Deny { reason_code, .. } = &outcome {
+            assert_eq!(reason_code, "CAPABILITY_REVOKED");
         }
     }
 

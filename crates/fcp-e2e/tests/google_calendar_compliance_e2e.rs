@@ -383,7 +383,12 @@ async fn gcal_default_deny_compliance_suite_passes() {
         instance_id.clone(),
     );
     // Token grants "gcal.write" but invoke targets "gcal.get_event" -> denial
-    let token = build_token(&signing_key, instance_id.as_str(), "gcal.write", &["gcal.write"]);
+    let token = build_token(
+        &signing_key,
+        instance_id.as_str(),
+        "gcal.write",
+        &["gcal.write"],
+    );
     let invoke = invoke_request(
         "gcal.get_event",
         json!({ "calendar_id": "primary", "event_id": "event_e2e_123" }),
@@ -439,7 +444,12 @@ async fn gcal_happy_path_connector_suite_passes() {
         &["gcal.read"],
         instance_id.clone(),
     );
-    let token = build_token(&signing_key, instance_id.as_str(), "gcal.read", &["gcal.get_event"]);
+    let token = build_token(
+        &signing_key,
+        instance_id.as_str(),
+        "gcal.read",
+        &["gcal.get_event"],
+    );
     let invoke = invoke_request(
         "gcal.get_event",
         json!({ "calendar_id": "primary", "event_id": "event_e2e_123" }),

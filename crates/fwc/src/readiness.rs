@@ -624,7 +624,7 @@ impl CommandAvailability {
             },
             Self::Unsupported => vec![
                 "Check if a newer connector version supports this operation.".to_owned(),
-                format!("Use `fwc ops <connector>` to see available operations."),
+                "Use `fwc ops <connector>` to see available operations.".to_owned(),
             ],
             Self::Planned => vec![
                 "This feature is under development and not yet available.".to_owned(),

@@ -350,7 +350,12 @@ async fn google_docs_default_deny_compliance_suite_passes() {
         &["docs.write"],
         instance_id.clone(),
     );
-    let token = build_token(&signing_key, instance_id.as_str(), "docs.write", &["docs.create"]);
+    let token = build_token(
+        &signing_key,
+        instance_id.as_str(),
+        "docs.write",
+        &["docs.create"],
+    );
     let invoke = invoke_request("docs.get", json!({ "document_id": "doc_123" }), token);
 
     let dynamic = DynamicSuite {
@@ -400,7 +405,12 @@ async fn google_docs_happy_path_connector_suite_passes() {
         &["docs.read"],
         instance_id.clone(),
     );
-    let token = build_token(&signing_key, instance_id.as_str(), "docs.read", &["docs.get"]);
+    let token = build_token(
+        &signing_key,
+        instance_id.as_str(),
+        "docs.read",
+        &["docs.get"],
+    );
     let invoke = invoke_request("docs.get", json!({ "document_id": "doc_123" }), token);
 
     let suite = ConnectorSuite {

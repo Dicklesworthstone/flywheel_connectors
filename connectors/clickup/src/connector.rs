@@ -1,6 +1,7 @@
 //! FCP `ClickUp` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
@@ -649,10 +650,15 @@ fn require_str<'a>(input: &'a serde_json::Value, field: &str) -> Result<&'a str,
 
 /// Build typed operations info for introspection from the embedded manifest.
 fn typed_operations_info() -> Vec<OperationInfo> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
-        .collect()
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
@@ -704,7 +710,10 @@ fn operation_info_from_manifest(id: String, operation: &OperationSection) -> Ope
 
 /// Build the operations info for introspection (JSON format, used by simulate).
 fn operations_info() -> serde_json::Value {
-    serde_json::to_value(typed_operations_info()).unwrap_or_default()
+    static OPERATIONS: OnceLock<serde_json::Value> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| serde_json::to_value(typed_operations_info()).unwrap_or_default())
+        .clone()
 }
 
 #[cfg(test)]

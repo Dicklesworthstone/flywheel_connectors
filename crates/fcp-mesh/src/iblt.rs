@@ -39,7 +39,12 @@ pub struct IbltCell {
 
 impl IbltCell {
     fn apply(&mut self, object_id: ObjectId, delta: i32) {
-        self.count += delta;
+        // Saturating: `count` is `Deserialize`, so a peer can transmit any
+        // `i32` and drive this toward the bounds. A wrapping `+=` panics in
+        // debug builds (overflow) and silently corrupts the count in release.
+        // A saturated count can never equal ±1, so `pure_key` simply ignores
+        // the cell — same defensive stance as `pure_key` (see below).
+        self.count = self.count.saturating_add(delta);
         xor_into(&mut self.key_sum, object_id.as_bytes());
         self.hash_check ^= hash_check_for(object_id);
     }
@@ -48,7 +53,9 @@ impl IbltCell {
         let mut key_sum = self.key_sum;
         xor_into(&mut key_sum, &other.key_sum);
         Self {
-            count: self.count - other.count,
+            // Saturating for the same reason as `apply`: `other.count` is
+            // attacker-controlled, so `0 - i32::MIN` must not overflow.
+            count: self.count.saturating_sub(other.count),
             key_sum,
             hash_check: self.hash_check ^ other.hash_check,
         }
@@ -223,7 +230,28 @@ impl Iblt {
             }
         }
 
+        // Bound the peel loop. A legitimate difference sketch peels each of its
+        // items once (touching `IBLT_HASH_COUNT` cells apiece), so a clean
+        // decode performs O(cells) pops. An *inconsistent* sketch, which a
+        // hostile peer can craft — `subtract` runs on attacker-controlled peer
+        // cells and the `ReconcileRequest` carrying them is not content-signed —
+        // can oscillate forever: peeling one cell re-purifies its neighbours,
+        // which re-purify it, so `pending` never drains and a core pins at 100%.
+        // The cap is comfortably above any real decode (which needs < 4×cells
+        // pops); exceeding it means the sketch is undecodable, correctly
+        // surfaced as `complete == false` so callers fall back to list exchange.
+        let max_pops = working
+            .len()
+            .saturating_mul(IBLT_HASH_COUNT)
+            .saturating_add(working.len());
+        let mut pops = 0_usize;
+
         while let Some(index) = pending.pop_front() {
+            if pops >= max_pops {
+                break;
+            }
+            pops += 1;
+
             let Some((object_id, sign)) = working[index].pure_key() else {
                 continue;
             };
@@ -459,6 +487,67 @@ mod tests {
         let decoded_max = iblt_max.decode();
         assert!(!decoded_max.is_complete());
         assert_eq!(decoded_max.remaining_nonzero_cells, 1);
+    }
+
+    #[test]
+    fn decode_terminates_on_inconsistent_oscillating_sketch() {
+        // Regression (CPU-exhaustion DoS): a hostile peer can craft a sketch
+        // whose cells correspond to no real set. Here a single cell claims
+        // object X as a pure (+1) entry while the other two cells X hashes to
+        // stay empty. Peeling X from the pure cell re-purifies its two
+        // neighbours; peeling those re-purifies the first — an infinite cycle
+        // with counts trapped in {-1, 0, +1}. Without the peel-loop bound this
+        // `decode()` never returns and pins a core at 100% CPU. It must instead
+        // terminate and report the sketch as undecodable so the caller falls
+        // back to a paginated list exchange.
+        let cell_count = 64;
+        let mut sketch = Iblt::with_cell_count(cell_count).expect("valid cell count");
+        let x = object_id("oscillator-target");
+        let indices = Iblt::indices_for(x, cell_count);
+        sketch.cells[indices[0]] = IbltCell {
+            count: 1,
+            key_sum: *x.as_bytes(),
+            hash_check: hash_check_for(x),
+        };
+
+        // The assertion is secondary — the load-bearing property is that this
+        // call *returns at all*. A regression would hang the test (and the
+        // node) forever.
+        let decoded = sketch.decode();
+        assert!(
+            !decoded.is_complete(),
+            "an inconsistent oscillating sketch must decode as incomplete"
+        );
+    }
+
+    #[test]
+    fn cell_arithmetic_saturates_on_extreme_attacker_count() {
+        // Regression: `IbltCell::{subtract, apply}` are reached with
+        // attacker-controlled `count` values via the reconcile path. Wrapping
+        // arithmetic panics in debug (`0 - i32::MIN`, `i32::MAX + 1`) and
+        // silently corrupts in release; saturating arithmetic keeps both total
+        // and the result out of the ±1 pure range.
+        let local = IbltCell::default();
+        let hostile = IbltCell {
+            count: i32::MIN,
+            key_sum: [7_u8; 32],
+            hash_check: 9,
+        };
+        let diff = local.subtract(&hostile);
+        assert_eq!(
+            diff.count,
+            i32::MAX,
+            "0 - i32::MIN must saturate to i32::MAX"
+        );
+        assert!(diff.pure_key().is_none());
+
+        let mut cell = IbltCell {
+            count: i32::MAX,
+            key_sum: [0_u8; 32],
+            hash_check: 0,
+        };
+        cell.apply(object_id("apply-extreme"), 1);
+        assert_eq!(cell.count, i32::MAX, "i32::MAX + 1 must saturate");
     }
 
     #[test]

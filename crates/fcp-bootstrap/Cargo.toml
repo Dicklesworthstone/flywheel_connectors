@@ -39,8 +39,13 @@ rand.workspace = true
 rand_core.workspace = true
 subtle.workspace = true
 
-# BIP39 mnemonics for recovery phrases
-bip39 = "2.1"
+# BIP39 mnemonics for recovery phrases.
+# The `zeroize` feature makes `bip39::Mnemonic` derive `ZeroizeOnDrop`, which is
+# load-bearing: `Mnemonic` holds the authoritative 24-word secret (`[u16; 24]`)
+# from which the owner signing key is derived. Without this feature the secret
+# survives drop even though `RecoveryPhrase` wipes its redundant entropy copy,
+# breaking the crate's "all cryptographic material is zeroized on drop" contract.
+bip39 = { version = "2.1", features = ["zeroize"] }
 
 # Time handling
 chrono.workspace = true

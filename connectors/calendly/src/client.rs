@@ -174,16 +174,22 @@ impl CalendlyClient {
         page_token: Option<&str>,
     ) -> CalendlyResult<InviteeListResponse> {
         let uuid = sanitize_path_segment(event_uuid)?;
-        let mut url = format!("{}/scheduled_events/{}/invitees", self.base_url, uuid);
-        if let Some(c) = count {
-            url.push_str(&format!("?count={c}"));
-            if let Some(pt) = page_token {
-                url.push_str(&format!("&page_token={pt}"));
+        let base = format!("{}/scheduled_events/{}/invitees", self.base_url, uuid);
+        let mut url = Url::parse(&base).map_err(|e| CalendlyError::Api {
+            status: 0,
+            message: format!("invalid base URL: {e}"),
+            title: None,
+        })?;
+        if count.is_some() || page_token.is_some() {
+            let mut q = url.query_pairs_mut();
+            if let Some(c) = count {
+                q.append_pair("count", &c.to_string());
             }
-        } else if let Some(pt) = page_token {
-            url.push_str(&format!("?page_token={pt}"));
+            if let Some(pt) = page_token {
+                q.append_pair("page_token", pt);
+            }
         }
-        self.get_json(runtime, &url).await
+        self.get_json(runtime, url.as_str()).await
     }
 
     /// Create a scheduling link.
@@ -347,12 +353,21 @@ impl CalendlyClient {
     }
 
     /// Generic POST with retry + JSON deserialization.
+    /// POST with retry.
+    ///
+    /// br-kxd3e: NOT replay-safe. Every caller of this helper CREATES a
+    /// resource and the provider offers no idempotency key, so a duplicate is a second scheduling link.
+    /// Only a connect-phase failure is retried. A converging POST added
+    /// later needs its own helper rather than reusing this one.
     async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
         url: &str,
         body: &serde_json::Value,
     ) -> CalendlyResult<T> {
+        // br-kxd3e: NOT replay-safe. The only caller creates a scheduling
+        // link and Calendly offers no idempotency key.
+        let replay_safe = false;
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let url = url.to_string();
@@ -377,10 +392,14 @@ impl CalendlyClient {
                         Ok(v) => AttemptOutcome::Success(v),
                         Err(e) => AttemptOutcome::Terminal(CalendlyError::Json(e)),
                     },
-                    Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: e.retry_after(),
-                        error: e,
-                    },
+                    Err(e) if e.is_retryable() => {
+                        // 429 stays retryable — refused WITHOUT performing the
+                        // work. A 5xx means the request arrived.
+                        let replayable =
+                            replay_safe || matches!(e, CalendlyError::RateLimited { .. });
+                        let retry_after = e.retry_after();
+                        AttemptOutcome::retryable_if_replayable(e, retry_after, replayable)
+                    }
                     Err(e) => AttemptOutcome::Terminal(e),
                 }
             }

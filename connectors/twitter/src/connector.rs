@@ -2136,7 +2136,12 @@ mod tests {
             .handle_simulate(simulate_params(
                 "twitter.user.get",
                 json!({ "user_id": "123" }),
-                signed_token(&signing_key, connector.instance_id(), "twitter.read.public", "twitter.user.get"),
+                signed_token(
+                    &signing_key,
+                    connector.instance_id(),
+                    "twitter.read.public",
+                    "twitter.user.get",
+                ),
             ))
             .await
             .unwrap();
@@ -2163,7 +2168,12 @@ mod tests {
             .handle_simulate(simulate_params(
                 "twitter.tweet.create",
                 json!({ "text": "hello" }),
-                signed_token(&signing_key, connector.instance_id(), "twitter.read.public", "twitter.user.get"),
+                signed_token(
+                    &signing_key,
+                    connector.instance_id(),
+                    "twitter.read.public",
+                    "twitter.user.get",
+                ),
             ))
             .await
             .unwrap();
@@ -2191,7 +2201,12 @@ mod tests {
             .handle_simulate(simulate_params(
                 "twitter.user.get",
                 json!({}),
-                signed_token(&signing_key, connector.instance_id(), "twitter.read.public", "twitter.user.get"),
+                signed_token(
+                    &signing_key,
+                    connector.instance_id(),
+                    "twitter.read.public",
+                    "twitter.user.get",
+                ),
             ))
             .await
             .unwrap();

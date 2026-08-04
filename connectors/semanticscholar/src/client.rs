@@ -27,11 +27,14 @@ fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> SemanticScholarResu
     if trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains("..")
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.contains('&')
         || lower.contains("%2f")
         || lower.contains("%5c")
     {
         return Err(SemanticScholarError::InvalidInput(format!(
-            "{field} contains path traversal characters"
+            "{field} contains path traversal or query-injection characters"
         )));
     }
     Ok(trimmed)

@@ -1103,3 +1103,92 @@ fn git_revision() -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map_or_else(|| "unknown".to_string(), |value| value.trim().to_string())
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// signal-cli's REST daemon has no idempotency key, so a 5xx retry delivers the
+// message a second time. The assertion is the REQUEST COUNT — "it still
+// errors" would pass with the bug present.
+
+fn replay_test_client(server: &MockServer) -> fcp_signal::client::SignalClient {
+    let config: fcp_signal::types::SignalConfig = serde_json::from_value(json!({
+        "daemon_url": server.uri(),
+        "phone_number": ACCOUNT,
+        "retry": {
+            "max_retries": 3,
+            "initial_delay_ms": 1,
+            "max_delay_ms": 5,
+            "jitter_enabled": false
+        }
+    }))
+    .expect("signal config should deserialize");
+    fcp_signal::client::SignalClient::new(&config).expect("client should build")
+}
+
+fn replay_test_runtime() -> fcp_sdk::ConnectorRuntime {
+    fcp_sdk::ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default())
+}
+
+fn replay_test_send_request() -> fcp_signal::types::SendMessageRequest {
+    fcp_signal::types::SendMessageRequest {
+        recipients: vec![RECIPIENT.to_string()],
+        message: MESSAGE_BODY.to_string(),
+        attachments: Vec::new(),
+        quote_timestamp: None,
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_message_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/send"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": "daemon temporarily unavailable"
+        })))
+        .mount(&server)
+        .await;
+
+    let result = replay_test_client(&server)
+        .send_message(&replay_test_runtime(), &replay_test_send_request())
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means the daemon received the send — retrying delivers the \
+         message a SECOND time, and signal-cli offers no dedup key"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_message_still_retries_a_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/send"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/send"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "timestamp": 1_700_000_002_000_u64
+        })))
+        .mount(&server)
+        .await;
+
+    replay_test_client(&server)
+        .send_message(&replay_test_runtime(), &replay_test_send_request())
+        .await
+        .expect("a rate-limited send was refused without delivering anything");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means the message was NOT sent, so backoff must be preserved"
+    );
+}

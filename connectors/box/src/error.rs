@@ -329,152 +329,119 @@ mod tests {
 
     #[test]
     fn unauthorized_to_fcp_error() {
-        match BoxError::Unauthorized.to_fcp_error() {
+        assert!(matches!(
+            BoxError::Unauthorized.to_fcp_error(),
             FcpError::External {
                 service,
-                status_code,
-                retryable,
+                status_code: Some(401),
+                retryable: false,
                 ..
-            } => {
-                assert_eq!(service, "box");
-                assert_eq!(status_code, Some(401));
-                assert!(!retryable);
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if service == "box"
+        ));
     }
 
     #[test]
     fn forbidden_to_fcp_error() {
-        match BoxError::Forbidden.to_fcp_error() {
+        assert!(matches!(
+            BoxError::Forbidden.to_fcp_error(),
             FcpError::External {
                 service,
-                status_code,
-                retryable,
+                status_code: Some(403),
+                retryable: false,
                 ..
-            } => {
-                assert_eq!(service, "box");
-                assert_eq!(status_code, Some(403));
-                assert!(!retryable);
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if service == "box"
+        ));
     }
 
     #[test]
     fn not_found_to_fcp_error() {
-        match (BoxError::NotFound {
+        assert!(matches!(
+            (BoxError::NotFound {
             resource: "file_abc".into(),
         })
-        .to_fcp_error()
-        {
+            .to_fcp_error(),
             FcpError::External {
-                status_code,
+                status_code: Some(404),
                 message,
-                retryable,
+                retryable: false,
                 ..
-            } => {
-                assert_eq!(status_code, Some(404));
-                assert!(message.contains("file_abc"));
-                assert!(!retryable);
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if message.contains("file_abc")
+        ));
     }
 
     #[test]
     fn conflict_to_fcp_error() {
-        match (BoxError::Conflict {
+        assert!(matches!(
+            (BoxError::Conflict {
             message: "item_name_in_use".into(),
         })
-        .to_fcp_error()
-        {
+            .to_fcp_error(),
             FcpError::External {
-                status_code,
+                status_code: Some(409),
                 message,
-                retryable,
+                retryable: false,
                 ..
-            } => {
-                assert_eq!(status_code, Some(409));
-                assert!(message.contains("item_name_in_use"));
-                assert!(!retryable);
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if message.contains("item_name_in_use")
+        ));
     }
 
     #[test]
     fn rate_limited_to_fcp_error() {
-        match (BoxError::RateLimited {
+        assert!(matches!(
+            (BoxError::RateLimited {
             retry_after_ms: 60_000,
         })
-        .to_fcp_error()
-        {
+            .to_fcp_error(),
             FcpError::External {
-                status_code,
-                retryable,
-                retry_after,
+                status_code: Some(429),
+                retryable: true,
+                retry_after: Some(retry_after),
                 ..
-            } => {
-                assert_eq!(status_code, Some(429));
-                assert!(retryable);
-                assert_eq!(retry_after, Some(Duration::from_secs(60)));
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if retry_after == Duration::from_secs(60)
+        ));
     }
 
     #[test]
     fn api_error_to_fcp_error() {
-        match (BoxError::Api {
+        assert!(matches!(
+            (BoxError::Api {
             status_code: 503,
             message: "unavailable".into(),
         })
-        .to_fcp_error()
-        {
+            .to_fcp_error(),
             FcpError::External {
                 service,
-                status_code,
-                retryable,
+                status_code: Some(503),
+                retryable: true,
                 message,
                 ..
-            } => {
-                assert_eq!(service, "box");
-                assert_eq!(status_code, Some(503));
-                assert!(retryable);
-                assert_eq!(message, "unavailable");
-            }
-            other => panic!("expected External, got {other:?}"),
-        }
+            } if service == "box" && message == "unavailable"
+        ));
     }
 
     #[test]
     fn json_error_to_fcp_internal() {
         let bad: Result<serde_json::Value, _> = serde_json::from_str("{invalid");
-        match BoxError::Json(bad.unwrap_err()).to_fcp_error() {
-            FcpError::Internal { message } => assert!(message.starts_with("JSON error:")),
-            other => panic!("expected Internal, got {other:?}"),
-        }
+        assert!(matches!(
+            BoxError::Json(bad.unwrap_err()).to_fcp_error(),
+            FcpError::Internal { message } if message.starts_with("JSON error:")
+        ));
     }
 
     #[test]
     fn api_error_non_retryable_to_fcp_error() {
-        match (BoxError::Api {
-            status_code: 400,
-            message: "bad".into(),
-        })
-        .to_fcp_error()
-        {
+        assert!(matches!(
+            (BoxError::Api {
+                status_code: 400,
+                message: "bad".into(),
+            })
+            .to_fcp_error(),
             FcpError::External {
-                status_code,
-                retryable,
+                status_code: Some(400),
+                retryable: false,
                 ..
-            } => {
-                assert_eq!(status_code, Some(400));
-                assert!(!retryable);
             }
-            other => panic!("expected External, got {other:?}"),
-        }
+        ));
     }
 
     #[test]
@@ -625,22 +592,27 @@ mod tests {
 
     #[test]
     fn unauthorized_fcp_error_no_retry_after() {
-        match BoxError::Unauthorized.to_fcp_error() {
-            FcpError::External { retry_after, .. } => assert!(retry_after.is_none()),
-            other => panic!("expected External, got {other:?}"),
-        }
+        assert!(matches!(
+            BoxError::Unauthorized.to_fcp_error(),
+            FcpError::External {
+                retry_after: None,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn conflict_fcp_error_no_retry_after() {
-        match (BoxError::Conflict {
-            message: "dup".into(),
-        })
-        .to_fcp_error()
-        {
-            FcpError::External { retry_after, .. } => assert!(retry_after.is_none()),
-            other => panic!("expected External, got {other:?}"),
-        }
+        assert!(matches!(
+            (BoxError::Conflict {
+                message: "dup".into(),
+            })
+            .to_fcp_error(),
+            FcpError::External {
+                retry_after: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -654,13 +626,12 @@ mod tests {
 
     #[test]
     fn conflict_fcp_error_service() {
-        match (BoxError::Conflict {
+        assert!(matches!(
+            (BoxError::Conflict {
             message: "x".into(),
         })
-        .to_fcp_error()
-        {
-            FcpError::External { service, .. } => assert_eq!(service, "box"),
-            other => panic!("expected External, got {other:?}"),
-        }
+            .to_fcp_error(),
+            FcpError::External { service, .. } if service == "box"
+        ));
     }
 }

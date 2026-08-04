@@ -15,6 +15,7 @@
 //!
 //! # Modules
 //!
+//! - [`bls`] - BLS12-381 threshold-aggregate quorum signatures with proof-of-possession rogue-key defense
 //! - [`ed25519`] - Ed25519 signing and verification
 //! - [`frost`] - FROST threshold signing and distributed key generation
 //! - [`hybrid`] - Ed25519 + ML-DSA-65 signed envelopes
@@ -90,6 +91,7 @@
 #![warn(missing_docs)]
 
 pub mod aead;
+pub mod bls;
 pub mod canonicalize;
 pub mod cose;
 pub mod ed25519;
@@ -104,6 +106,7 @@ pub mod ml_dsa;
 pub mod owner_key;
 pub mod secret_fetch;
 pub mod shamir;
+pub mod vector_commit;
 pub mod x25519;
 pub mod xwing;
 
@@ -111,6 +114,10 @@ pub mod xwing;
 pub use aead::{
     AeadKey, ChaCha20Nonce, ChaCha20Poly1305Cipher, XChaCha20Nonce, XChaCha20Poly1305Cipher,
     chacha20_decrypt, chacha20_encrypt, xchacha20_decrypt, xchacha20_encrypt,
+};
+pub use bls::{
+    AggregateSignature, BlsError, BlsPublicKey, BlsSecretKey, BlsSignature, PopRegistry,
+    ProofOfPossession,
 };
 pub use canonicalize::{Signable, canonical_signing_bytes, schema_hash};
 pub use cose::{CapabilityTokenBuilder, CoseToken, CwtClaims};

@@ -30,6 +30,9 @@ pub enum TelnyxError {
 
     #[error("not found: {resource}")]
     NotFound { resource: String },
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub type TelnyxResult<T> = Result<T, TelnyxError>;
@@ -43,7 +46,9 @@ impl TelnyxError {
             Self::Api { status_code, .. } => {
                 matches!(status_code, Some(408 | 425 | 429 | 500..=599))
             }
-            Self::Json(_) | Self::Unauthorized | Self::NotFound { .. } => false,
+            Self::Json(_) | Self::Unauthorized | Self::NotFound { .. } | Self::InvalidInput(_) => {
+                false
+            }
         }
     }
 
@@ -104,6 +109,10 @@ impl TelnyxError {
             },
             Self::NotFound { resource } => FcpError::ResourceNotFound {
                 resource: resource.clone(),
+            },
+            Self::InvalidInput(message) => FcpError::InvalidRequest {
+                code: 1003,
+                message: message.clone(),
             },
         }
     }

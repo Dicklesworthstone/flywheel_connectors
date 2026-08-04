@@ -1117,10 +1117,20 @@ fn rerun_command_from_argv(id: String, argv: &[String]) -> Result<RerunCommand, 
 
 fn readme_status(status: &str) -> ClaimStatus {
     let normalized = status.to_ascii_uppercase();
-    if normalized.contains("PROVEN") {
-        ClaimStatus::Proven
-    } else if normalized.contains("NOT YET") {
+    // Negated proof phrasings ("NOT YET PROVEN", "UNPROVEN", "NOT PROVEN",
+    // "DISPROVEN") all contain the substring "PROVEN" but mean the opposite,
+    // so they MUST be checked before the bare `contains("PROVEN")` test.
+    // Otherwise a feature the README explicitly marks as not-proven is
+    // classified Proven, and claim_from_readme then suppresses its proof gap —
+    // silently reporting unproven work as fully proven.
+    let negated_proof = normalized.contains("NOT YET")
+        || normalized.contains("NOT PROVEN")
+        || normalized.contains("UNPROVEN")
+        || normalized.contains("DISPROVEN");
+    if negated_proof {
         ClaimStatus::Missing
+    } else if normalized.contains("PROVEN") {
+        ClaimStatus::Proven
     } else if normalized.contains("BLOCKED") {
         ClaimStatus::Blocked {
             reason: "README row marks the feature blocked".to_owned(),
@@ -1538,6 +1548,62 @@ mod tests {
                 .proof_gaps
                 .iter()
                 .any(|gap| gap.status == ProofGapStatus::Stale)
+        );
+    }
+
+    #[test]
+    fn readme_status_does_not_misclassify_negated_proof_as_proven() {
+        // Positive phrasings still classify as Proven (including incidental
+        // substrings like "NOTE" that are not negations).
+        assert!(matches!(readme_status("Proven"), ClaimStatus::Proven));
+        assert!(matches!(readme_status("PROVEN"), ClaimStatus::Proven));
+        assert!(matches!(
+            readme_status("Proven, see note"),
+            ClaimStatus::Proven
+        ));
+
+        // Negated phrasings all contain the substring "PROVEN" but must NOT be
+        // classified Proven, or claim_from_readme suppresses the proof gap and
+        // reports unproven work as fully proven.
+        for status in [
+            "Not yet proven",
+            "Not yet",
+            "Unproven",
+            "UNPROVEN",
+            "Not proven",
+            "Disproven",
+        ] {
+            assert!(
+                !matches!(readme_status(status), ClaimStatus::Proven),
+                "status {status:?} must not classify as Proven"
+            );
+            assert!(
+                matches!(
+                    readme_relationship(status),
+                    SupportRelationship::DoesNotSupport
+                ),
+                "status {status:?} must not support the claim"
+            );
+        }
+    }
+
+    #[test]
+    fn readme_row_marked_not_proven_yields_a_proof_gap() {
+        // End-to-end guard: a README row explicitly marked not-proven must
+        // produce a non-Proven claim carrying an outstanding proof gap.
+        let indexer = ProofGraphIndexer::new(NOW);
+        let claim = indexer
+            .claim_from_readme(&row(
+                "telemetry-otlp",
+                "Telemetry OTLP",
+                "Not yet proven",
+                90,
+            ))
+            .expect("claim from readme");
+        assert!(!matches!(claim.status, ClaimStatus::Proven));
+        assert!(
+            !claim.proof_gaps.is_empty(),
+            "a not-proven README claim must carry a proof gap"
         );
     }
 

@@ -155,6 +155,14 @@ impl AmplitudeClient {
         }
     }
 
+    /// Issue a request with retry.
+    ///
+    /// br-kxd3e: replay safety is derived from the verb. Only POST ingests, and
+    /// a replay after a 5xx DOUBLE-COUNTS the event in every downstream
+    /// dashboard and funnel. These providers all offer a per-event dedup id
+    /// (`insert_id` / `messageId` / `$insert_id`) that would make the retry
+    /// genuinely safe, but the events are caller-supplied here so the key may
+    /// be absent — recorded as a follow-up rather than assumed present.
     async fn request_with_retry<T>(
         &self,
         http_method: &'static str,
@@ -164,6 +172,7 @@ impl AmplitudeClient {
     where
         T: DeserializeOwned + Default,
     {
+        let replay_safe = http_method != "POST";
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -181,22 +190,18 @@ impl AmplitudeClient {
             match req.send().await {
                 Ok(resp) => match self.handle_response(resp).await {
                     Ok(val) => AttemptOutcome::Success(val),
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 },
                 Err(err) => {
                     let err = AmplitudeError::Http(err);
-                    if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    }
+                    let replayable = replay_safe || err.replay_is_safe();
+                    let retry_after = err.retry_after();
+                    AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
                 }
             }
         })

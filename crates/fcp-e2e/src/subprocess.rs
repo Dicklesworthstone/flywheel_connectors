@@ -36,7 +36,7 @@ impl ConnectorProcessRunner {
     ///
     /// # Errors
     /// Returns an IO error if the process fails to spawn or pipes cannot be opened.
-    #[allow(clippy::unused_async)] // Async for API consistency with other subprocess methods
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Async for API consistency with other subprocess methods
     pub async fn spawn(command: &str, args: &[&str], env: &[(&str, &str)]) -> io::Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args)

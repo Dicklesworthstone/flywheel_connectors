@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     hash::{Hash, Hasher},
     net::{IpAddr, ToSocketAddrs},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1111,13 +1111,18 @@ impl ZaloConnector {
 }
 
 fn zalo_operation_catalog() -> FcpResult<Vec<Value>> {
-    Ok(ordered_manifest_operations()?
-        .into_iter()
-        .map(|(id, operation)| {
-            let operation_info = operation_info_from_manifest(id, &operation);
-            introspect_operation_from_manifest(operation_info, &operation)
+    static OPERATIONS: OnceLock<FcpResult<Vec<Value>>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            Ok(ordered_manifest_operations()?
+                .into_iter()
+                .map(|(id, operation)| {
+                    let operation_info = operation_info_from_manifest(id, &operation);
+                    introspect_operation_from_manifest(operation_info, &operation)
+                })
+                .collect())
         })
-        .collect())
+        .clone()
 }
 
 fn ordered_manifest_operations() -> FcpResult<Vec<(String, fcp_manifest::OperationSection)>> {

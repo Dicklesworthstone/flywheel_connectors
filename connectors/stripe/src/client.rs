@@ -11,6 +11,7 @@ use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use percent_encoding::utf8_percent_encode;
 use reqwest::{Client, StatusCode, header};
 use tracing::debug;
+use uuid::Uuid;
 
 /// Percent-encoding set for Stripe path segments. Encodes everything that
 /// could enable path traversal or query injection while preserving characters
@@ -579,17 +580,37 @@ impl StripeClient {
         // request bodies (with bracket notation for nested fields); it does not
         // parse JSON. Encode the body here rather than sending `.json()`.
         let encoded = stripe_form_encode(body);
+        // EVERY POST carries an Idempotency-Key (br-kxd3e).
+        //
+        // `execute` retries on 5xx and on a transport timeout. Both of those
+        // can be reported AFTER Stripe already accepted the request, so
+        // replaying an unkeyed POST creates a second charge, refund, or
+        // subscription from one invoke. Stripe deduplicates on this header for
+        // 24h, which makes the retry genuinely safe rather than merely refused
+        // — strictly better than declining to retry.
+        //
+        // The key is resolved ONCE here, outside the retry closure, so every
+        // attempt of this call presents the same value. A per-attempt key would
+        // be worse than none: it would look like protection while providing
+        // exactly zero.
+        //
+        // A generated key is deliberately NOT reported in the invoke audit
+        // payload. That field means "the caller's idempotency key", which
+        // dedupes across invokes; this one only dedupes across the retry
+        // attempts of a single invoke. Conflating the two would tell an
+        // operator they have a cross-invoke guarantee they do not have.
+        let key = match idempotency_key {
+            Some(key) => key.to_string(),
+            None => format!("fcp2:retry:{}", Uuid::new_v4()),
+        };
         self.execute(|| {
-            let mut req = self.apply_auth(
+            self.apply_auth(
                 self.http
                     .post(url)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header("Idempotency-Key", key.as_str())
                     .body(encoded.clone()),
-            );
-            if let Some(key) = idempotency_key {
-                req = req.header("Idempotency-Key", key);
-            }
-            req
+            )
         })
         .await
     }
@@ -781,6 +802,7 @@ mod tests {
         status: u16,
         body: Option<serde_json::Value>,
         expected_headers: Vec<(&'static str, &'static str)>,
+        expected_header_prefixes: Vec<(&'static str, &'static str)>,
         absent_headers: Vec<&'static str>,
     }
 
@@ -797,6 +819,7 @@ mod tests {
                 status,
                 body: Some(body),
                 expected_headers: Vec::new(),
+                expected_header_prefixes: Vec::new(),
                 absent_headers: Vec::new(),
             }
         }
@@ -808,12 +831,18 @@ mod tests {
                 status,
                 body: None,
                 expected_headers: Vec::new(),
+                expected_header_prefixes: Vec::new(),
                 absent_headers: Vec::new(),
             }
         }
 
         fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
             self.expected_headers.push((name, value));
+            self
+        }
+
+        fn with_header_prefix(mut self, name: &'static str, prefix: &'static str) -> Self {
+            self.expected_header_prefixes.push((name, prefix));
             self
         }
 
@@ -891,6 +920,14 @@ mod tests {
         for (name, value) in response.expected_headers {
             let normalized = name.to_ascii_lowercase();
             assert_eq!(headers.get(&normalized).map(String::as_str), Some(value));
+        }
+        for (name, prefix) in response.expected_header_prefixes {
+            let normalized = name.to_ascii_lowercase();
+            let actual = headers.get(&normalized).map(String::as_str);
+            assert!(
+                actual.is_some_and(|value| value.starts_with(prefix)),
+                "expected header {name} to start with {prefix}, got {actual:?}"
+            );
         }
         for name in response.absent_headers {
             let normalized = name.to_ascii_lowercase();
@@ -1300,8 +1337,15 @@ mod tests {
         server.finish();
     }
 
+    /// A POST with no caller-supplied key still carries a GENERATED one.
+    ///
+    /// This test previously asserted the opposite (`without_header`), pinning
+    /// the behaviour that made `execute`'s 5xx/timeout retry able to create a
+    /// second payment intent from one call. A 5xx means Stripe received the
+    /// request; the only safe way to keep retrying it is to give Stripe
+    /// something to deduplicate on. See br-kxd3e.
     #[fcp_async_core::runtime::test]
-    async fn test_no_idempotency_header_when_none() {
+    async fn test_generated_idempotency_header_when_caller_supplies_none() {
         let server = TestApiServer::start(vec![
             TestHttpResponse::json(
                 "POST",
@@ -1315,7 +1359,7 @@ mod tests {
                 "status": "requires_payment_method"
                 }),
             )
-            .without_header("Idempotency-Key"),
+            .with_header_prefix("Idempotency-Key", "fcp2:retry:"),
         ]);
 
         let client = StripeClient::new("sk_test_key")

@@ -44,6 +44,16 @@ pub struct DiscordConfig {
     /// gateway bot metadata; this fails safe by serializing IDENTIFY frames.
     #[serde(default = "default_gateway_identify_max_concurrency")]
     pub gateway_identify_max_concurrency: u32,
+
+    /// Minimum spacing between IDENTIFY frames in the same concurrency bucket,
+    /// in milliseconds. Defaults to Discord's documented 5 s.
+    ///
+    /// Exposed as configuration rather than a `#[cfg(test)]` constant because
+    /// `cfg(test)` does NOT apply to integration tests: those link the library
+    /// built without it, so a shortened test-only window silently has no effect
+    /// there. Loopback gateway tests set this low explicitly (br-x13q4).
+    #[serde(default = "default_gateway_identify_window_ms")]
+    pub gateway_identify_window_ms: u64,
 }
 
 impl std::fmt::Debug for DiscordConfig {
@@ -60,6 +70,10 @@ impl std::fmt::Debug for DiscordConfig {
             .field(
                 "gateway_identify_max_concurrency",
                 &self.gateway_identify_max_concurrency,
+            )
+            .field(
+                "gateway_identify_window_ms",
+                &self.gateway_identify_window_ms,
             )
             .finish()
     }
@@ -80,6 +94,11 @@ const fn default_intents() -> u64 {
 
 const fn default_gateway_identify_max_concurrency() -> u32 {
     1
+}
+
+/// Discord documents a 5 s minimum between IDENTIFY frames per bucket.
+const fn default_gateway_identify_window_ms() -> u64 {
+    5_000
 }
 
 mod duration_secs {
@@ -171,6 +190,7 @@ impl Default for DiscordConfig {
             intents: default_intents(),
             shard: None,
             gateway_identify_max_concurrency: default_gateway_identify_max_concurrency(),
+            gateway_identify_window_ms: default_gateway_identify_window_ms(),
         }
     }
 }

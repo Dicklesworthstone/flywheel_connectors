@@ -261,11 +261,26 @@ fn retry_policy_respects_max_attempts() {
 #[test]
 fn retry_after_hint_overrides_computed_backoff() {
     let policy = RetryPolicy::new().with_jitter_enabled(false);
-    let hint = Duration::from_secs(120);
+    // A hint inside the policy's ceiling raises the delay above the computed
+    // backoff (default base is 1s).
+    let hint = Duration::from_secs(30);
     let decision = decision_from_http_status(429, Some(hint));
 
     let delay = policy.next_delay(0, decision, None).unwrap();
     assert_eq!(delay, hint);
+}
+
+/// `Retry-After` is attacker-controlled, so it raises the delay but must not
+/// escape `max_backoff_ms` — the same ceiling
+/// `retry_policy_caps_at_max_backoff` (below) already asserts for the computed
+/// backoff. The hint path used to bypass it entirely.
+#[test]
+fn retry_after_hint_cannot_exceed_max_backoff() {
+    let policy = RetryPolicy::new().with_jitter_enabled(false);
+    let decision = decision_from_http_status(429, Some(Duration::from_secs(31_536_000)));
+
+    let delay = policy.next_delay(0, decision, None).unwrap();
+    assert_eq!(delay, Duration::from_millis(policy.max_backoff_ms));
 }
 
 #[test]

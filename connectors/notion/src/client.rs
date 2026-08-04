@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, StatusCode, header};
@@ -258,7 +260,8 @@ impl NotionClient {
     pub async fn health_check(&self) -> NotionResult<()> {
         let url = format!("{}/search", self.api_url);
         let body = serde_json::json!({ "page_size": 1 });
-        self.post(&url, Some(body)).await?;
+        // `/search` with no query — read-only POST.
+        self.post(&url, Some(body), true).await?;
         Ok(())
     }
 
@@ -292,7 +295,8 @@ impl NotionClient {
     /// Create a page.
     pub async fn create_page(&self, body: serde_json::Value) -> NotionResult<Page> {
         let url = format!("{}/pages", self.api_url);
-        let data = self.post(&url, Some(body)).await?;
+        // NOT replay-safe: POST /pages creates a page.
+        let data = self.post(&url, Some(body), false).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -310,7 +314,7 @@ impl NotionClient {
         validate_notion_id(page_id, "page_id")?;
         let seg = encode_path_segment(page_id);
         let url = format!("{}/pages/{seg}", self.api_url);
-        let data = self.patch(&url, body).await?;
+        let data = self.patch(&url, body, true).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -320,7 +324,7 @@ impl NotionClient {
         let seg = encode_path_segment(page_id);
         let url = format!("{}/pages/{seg}", self.api_url);
         let body = serde_json::json!({ "archived": true });
-        let data = self.patch(&url, body).await?;
+        let data = self.patch(&url, body, true).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -344,7 +348,8 @@ impl NotionClient {
             validate_pagination_cursor(cursor, "start_cursor")?;
             body["start_cursor"] = serde_json::Value::String(cursor.into());
         }
-        let data = self.post(&url, Some(body)).await?;
+        // Read-only POST: Notion models database query this way.
+        let data = self.post(&url, Some(body), true).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -362,7 +367,8 @@ impl NotionClient {
         body: serde_json::Value,
     ) -> NotionResult<serde_json::Value> {
         let url = format!("{}/databases", self.api_url);
-        self.post(&url, Some(body)).await
+        // NOT replay-safe: POST /databases creates a database.
+        self.post(&url, Some(body), false).await
     }
 
     /// Update a database (PATCH title/properties/description).
@@ -374,7 +380,7 @@ impl NotionClient {
         validate_notion_id(database_id, "database_id")?;
         let seg = encode_path_segment(database_id);
         let url = format!("{}/databases/{seg}", self.api_url);
-        self.patch(&url, body).await
+        self.patch(&url, body, true).await
     }
 
     // ── Search ────────────────────────────────────────────────────
@@ -393,7 +399,8 @@ impl NotionClient {
         if let Some(f) = filter {
             body["filter"] = f;
         }
-        let data = self.post(&url, Some(body)).await?;
+        // `/search` is a read-only POST.
+        let data = self.post(&url, Some(body), true).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -425,7 +432,7 @@ impl NotionClient {
         validate_notion_id(block_id, "block_id")?;
         let seg = encode_path_segment(block_id);
         let url = format!("{}/blocks/{seg}", self.api_url);
-        self.patch(&url, body).await
+        self.patch(&url, body, true).await
     }
 
     /// Archive (soft-delete) a block.
@@ -434,7 +441,7 @@ impl NotionClient {
         let seg = encode_path_segment(block_id);
         let url = format!("{}/blocks/{seg}", self.api_url);
         let body = serde_json::json!({ "archived": true });
-        self.patch(&url, body).await
+        self.patch(&url, body, true).await
     }
 
     /// Append child blocks to a page or block.
@@ -447,7 +454,9 @@ impl NotionClient {
         let seg = encode_path_segment(block_id);
         let url = format!("{}/blocks/{seg}/children", self.api_url);
         let body = serde_json::json!({ "children": children });
-        let data = self.patch(&url, body).await?;
+        // NOT replay-safe: PATCH /blocks/{id}/children APPENDS —
+        // a PATCH that is not idempotent. Replaying adds the blocks twice.
+        let data = self.patch(&url, body, false).await?;
         Ok(serde_json::from_value(data)?)
     }
 
@@ -456,7 +465,8 @@ impl NotionClient {
     /// Add a comment to a page.
     pub async fn add_comment(&self, body: serde_json::Value) -> NotionResult<serde_json::Value> {
         let url = format!("{}/comments", self.api_url);
-        self.post(&url, Some(body)).await
+        // NOT replay-safe: POST /comments creates a comment.
+        self.post(&url, Some(body), false).await
     }
 
     /// List comments on a block or page.
@@ -471,31 +481,53 @@ impl NotionClient {
     // ── HTTP helpers ──────────────────────────────────────────────
 
     async fn get(&self, url: &str) -> NotionResult<serde_json::Value> {
-        self.execute(|| self.http.get(url)).await
+        self.execute(|| self.http.get(url), true).await
     }
 
+    /// POST with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). Notion has no idempotency key, and it models
+    /// several READ-ONLY operations as POSTs (`/search`, `/databases/{id}/
+    /// query`), so the verb decides nothing here in either direction.
     async fn post(
         &self,
         url: &str,
         body: Option<serde_json::Value>,
+        replay_safe: bool,
     ) -> NotionResult<serde_json::Value> {
-        self.execute(|| {
-            let mut req = self.http.post(url);
-            if let Some(b) = &body {
-                req = req.json(b);
-            }
-            req
-        })
+        self.execute(
+            || {
+                let mut req = self.http.post(url);
+                if let Some(b) = &body {
+                    req = req.json(b);
+                }
+                req
+            },
+            replay_safe,
+        )
         .await
     }
 
-    async fn patch(&self, url: &str, body: serde_json::Value) -> NotionResult<serde_json::Value> {
-        self.execute(|| self.http.patch(url).json(&body)).await
+    /// PATCH with retry.
+    ///
+    /// `replay_safe` is required rather than assumed: most Notion PATCHes set
+    /// named properties and converge, but `PATCH /blocks/{id}/children`
+    /// APPENDS, so replaying it adds the blocks a second time.
+    async fn patch(
+        &self,
+        url: &str,
+        body: serde_json::Value,
+        replay_safe: bool,
+    ) -> NotionResult<serde_json::Value> {
+        self.execute(|| self.http.patch(url).json(&body), replay_safe)
+            .await
     }
 
     async fn execute(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> NotionResult<serde_json::Value> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -541,13 +573,19 @@ impl NotionClient {
                         if status.is_server_error() {
                             let body = response.text().await.unwrap_or_default();
                             let body = truncate_body(body, 500);
-                            return AttemptOutcome::Retryable {
-                                error: NotionError::Api {
+                            // br-kxd3e: a 5xx means Notion RECEIVED the
+                            // request and may already have created the page,
+                            // database, comment, or appended the blocks. The
+                            // 429 arm above stays ahead of this one because a
+                            // rate limit was refused WITHOUT executing.
+                            return AttemptOutcome::retryable_if_replayable(
+                                NotionError::Api {
                                     message: format!("Server error {status}: {body}"),
                                     status_code: Some(status.as_u16()),
                                 },
-                                retry_after: None,
-                            };
+                                None,
+                                replay_safe,
+                            );
                         }
 
                         if !status.is_success() {
@@ -570,22 +608,26 @@ impl NotionClient {
                                 Ok(data) => AttemptOutcome::Success(data),
                                 Err(error) => AttemptOutcome::Terminal(NotionError::Json(error)),
                             },
-                            Err(error) if error.is_timeout() || error.is_connect() => {
-                                AttemptOutcome::Retryable {
-                                    error: NotionError::Http(error),
-                                    retry_after: None,
-                                }
-                            }
-                            Err(error) => AttemptOutcome::Terminal(NotionError::Http(error)),
+                            // A body-read failure lands after the request was
+                            // fully sent, so it is never proof of non-delivery.
+                            Err(error) => AttemptOutcome::retryable_if_replayable(
+                                NotionError::Http(error),
+                                None,
+                                replay_safe,
+                            ),
                         }
                     }
-                    Err(error) if error.is_timeout() || error.is_connect() => {
-                        AttemptOutcome::Retryable {
-                            error: NotionError::Http(error),
-                            retry_after: None,
-                        }
+                    // br-kxd3e: `is_timeout()` is the TOTAL request timeout and
+                    // fires after the body was written; only a connect-phase
+                    // failure proves Notion never saw the request.
+                    Err(error) => {
+                        let replayable = replay_safe || !transport_error_reached_service(&error);
+                        AttemptOutcome::retryable_if_replayable(
+                            NotionError::Http(error),
+                            None,
+                            replayable,
+                        )
                     }
-                    Err(error) => AttemptOutcome::Terminal(NotionError::Http(error)),
                 }
             }
         })

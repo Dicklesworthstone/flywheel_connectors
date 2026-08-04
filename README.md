@@ -1076,13 +1076,16 @@ fwc serve-mcp --host http://127.0.0.1:8787
 # Serve specific connectors only
 fwc serve-mcp --host http://127.0.0.1:8787 github slack gmail
 
+# Cap the live MCP surface at a risk ceiling (inclusive)
+fwc serve-mcp --host http://127.0.0.1:8787 --risk-max medium github
+
 # Offline tool schema export
 fwc export-tools --offline --format mcp --json
 fwc export-tools --offline --format claude github
 fwc export-tools --offline --format openai --risk-max medium --output tools.json
 ```
 
-`--risk-max` excludes operations above a risk threshold, preventing agents from accidentally invoking dangerous operations.
+`--risk-max` excludes operations above a risk threshold, preventing agents from accidentally invoking dangerous operations. Both `export-tools` and `serve-mcp` honor it with the same inclusive boundary semantics; a live `serve-mcp` server enforces the ceiling on `tools/list` and on `tools/call`, and tools without declared risk metadata are excluded whenever a ceiling is set.
 
 ---
 

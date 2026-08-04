@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path, query_param},
+    matchers::{body_string_contains, header, method, path, query_param},
 };
 
 const CLIENT_ID: &str = "test-client";
@@ -704,11 +704,16 @@ async fn assert_timeout_error() -> Result<(), String> {
 }
 
 async fn mount_token(server: &MockServer) {
+    // The OAuth client-credentials params must travel in the form-encoded body,
+    // never the URL query string (a secret in the query leaks via reqwest's
+    // Error Display). Matching on the body enforces that contract.
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
-        .and(query_param("client_id", CLIENT_ID))
-        .and(query_param("client_secret", CLIENT_SECRET))
-        .and(query_param("grant_type", "client_credentials"))
+        .and(body_string_contains(format!("client_id={CLIENT_ID}")))
+        .and(body_string_contains(format!(
+            "client_secret={CLIENT_SECRET}"
+        )))
+        .and(body_string_contains("grant_type=client_credentials"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": ACCESS_TOKEN,
             "expires_in": 3600,

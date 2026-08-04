@@ -1,7 +1,7 @@
 //! Tencent `QQ` bot connector.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -359,7 +359,10 @@ impl QqConnector {
     /// parses the same manifest strictly and checks every catalog entry against it.
     #[must_use]
     pub fn operations_info() -> Vec<OperationInfo> {
-        qq_operations_info().expect("embedded QQ manifest should validate")
+        static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+        OPERATIONS
+            .get_or_init(|| qq_operations_info().expect("embedded QQ manifest should validate"))
+            .clone()
     }
 
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {

@@ -348,9 +348,12 @@ async fn accept_openai_test_websocket(mut stream: TcpStream) -> (TestServerWebSo
 }
 
 async fn send_json_frame(ws: &mut TestServerWebSocket, value: serde_json::Value, context: &str) {
-    ws.send(&fcp_async_core::compatibility_cx(), ServerWsMessage::text(value.to_string()))
-        .await
-        .expect(context);
+    ws.send(
+        &fcp_async_core::compatibility_cx(),
+        ServerWsMessage::text(value.to_string()),
+    )
+    .await
+    .expect(context);
 }
 
 async fn recv_text_frame(ws: &mut TestServerWebSocket, context: &str) -> Option<String> {
@@ -363,7 +366,9 @@ async fn recv_text_frame(ws: &mut TestServerWebSocket, context: &str) -> Option<
 }
 
 async fn close_test_websocket(ws: &mut TestServerWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 /// Standard `OpenAI` chat completion success response.

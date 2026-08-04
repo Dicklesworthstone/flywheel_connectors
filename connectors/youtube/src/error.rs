@@ -4,14 +4,29 @@ use std::time::Duration;
 
 use fcp_async_core::AsyncError;
 use fcp_prelude::FcpError;
-use fcp_sdk::ConnectorErrorMapping;
+use fcp_sdk::{ConnectorErrorMapping, redact_urls_in_error_text};
 use thiserror::Error;
 
+/// Render a transport error without its URL query string.
+///
+/// YouTube authenticates API-key requests by appending `&key=<API_KEY>` to the
+/// query string, and `reqwest::Error`'s `Display` appends `" for url (<url>)"`
+/// — so forwarding it verbatim writes the API key into every log line and into
+/// `FcpError::External { message }`. The client already redacts every URL it
+/// logs itself; this closes the error-rendering path it does not control.
+fn redacted_http_error(error: &reqwest::Error) -> String {
+    redact_urls_in_error_text(&error.to_string())
+}
+
 /// YouTube-specific errors.
-#[derive(Error, Debug)]
+///
+/// `Debug` is hand-written (not derived) so the `Http` variant never prints the
+/// raw `reqwest::Error`, whose `url` field carries the API key. Both `Display`
+/// and `Debug` route it through [`redacted_http_error`].
+#[derive(Error)]
 pub enum YouTubeError {
     /// HTTP request failed
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", redacted_http_error(.0))]
     Http(#[from] reqwest::Error),
 
     /// JSON serialization/deserialization failed
@@ -46,6 +61,40 @@ pub enum YouTubeError {
     Forbidden { message: String },
 }
 
+impl std::fmt::Debug for YouTubeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => f
+                .debug_tuple("Http")
+                .field(&redacted_http_error(error))
+                .finish(),
+            Self::Json(error) => f.debug_tuple("Json").field(error).finish(),
+            Self::Api {
+                message,
+                status_code,
+            } => f
+                .debug_struct("Api")
+                .field("message", message)
+                .field("status_code", status_code)
+                .finish(),
+            Self::RateLimited { retry_after_ms } => f
+                .debug_struct("RateLimited")
+                .field("retry_after_ms", retry_after_ms)
+                .finish(),
+            Self::QuotaExceeded => f.write_str("QuotaExceeded"),
+            Self::Unauthorized => f.write_str("Unauthorized"),
+            Self::NotFound { resource } => f
+                .debug_struct("NotFound")
+                .field("resource", resource)
+                .finish(),
+            Self::Forbidden { message } => f
+                .debug_struct("Forbidden")
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
 impl YouTubeError {
     /// Check if this error is retryable.
     #[must_use]
@@ -54,6 +103,22 @@ impl YouTubeError {
             Self::Http(_) => true,
             Self::RateLimited { .. } => true,
             Self::Api { status_code, .. } => matches!(status_code, Some(500..=599 | 429)),
+            _ => false,
+        }
+    }
+
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// Distinct from [`Self::is_retryable`]: a rate limit was refused WITHOUT
+    /// posting anything, so replaying is safe; a 5xx means YouTube received
+    /// the request and may already have published the comment or caption.
+    #[must_use]
+    pub fn replay_is_safe(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::Api { status_code, .. } => *status_code == Some(429),
+            Self::Http(e) => !fcp_sdk::migration::transport_error_reached_service(e),
             _ => false,
         }
     }
@@ -73,7 +138,10 @@ impl YouTubeError {
         match self {
             Self::Http(e) => FcpError::External {
                 service: "youtube".into(),
-                message: e.to_string(),
+                // Redacted, not `e.to_string()`: this message travels to the
+                // host and into the receipt, and the raw form carries the URL
+                // (and therefore the `key=` API key).
+                message: redacted_http_error(e),
                 status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),

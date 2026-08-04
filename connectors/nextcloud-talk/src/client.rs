@@ -6,7 +6,10 @@ use fcp_prelude::log_redaction::redact_url;
 use std::time::Duration;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -328,8 +331,10 @@ impl NextcloudTalkClient {
             "/ocs/v2.php/apps/spreed/api/v1/chat/{}/read",
             encode_segment(token.as_str())
         );
+        // The form names the marker's target value, so applying it twice
+        // converges on the same read position.
         let raw = self
-            .request_raw(runtime, Method::POST, &path, Vec::new(), form)
+            .request_raw_replay_safe(runtime, Method::POST, &path, Vec::new(), form)
             .await?;
         Self::decode_ocs(&raw)
     }
@@ -374,8 +379,10 @@ impl NextcloudTalkClient {
             "/ocs/v2.php/apps/spreed/api/v4/room/{}/participants",
             encode_segment(token.as_str())
         );
+        // Room membership is a set: re-adding a participant who is already in
+        // the room does not produce a second membership.
         let raw = self
-            .request_raw(runtime, Method::POST, &path, Vec::new(), form)
+            .request_raw_replay_safe(runtime, Method::POST, &path, Vec::new(), form)
             .await?;
         Self::decode_ocs(&raw)
     }
@@ -432,8 +439,10 @@ impl NextcloudTalkClient {
             message_id.get()
         );
         let form = vec![("reaction".into(), request.reaction.clone())];
+        // Reactions are set membership too — the same reaction twice is one
+        // reaction.
         let raw = self
-            .request_raw(runtime, Method::POST, &path, Vec::new(), form)
+            .request_raw_replay_safe(runtime, Method::POST, &path, Vec::new(), form)
             .await?;
         Self::decode_ocs(&raw)
     }
@@ -514,13 +523,47 @@ impl NextcloudTalkClient {
         }
     }
 
+    /// Issue a request, deriving replay safety from the HTTP method.
+    ///
+    /// br-kxd3e: GET, DELETE, PUT, and HEAD are idempotent per HTTP semantics,
+    /// so replaying them is safe. POST is treated as NOT replay-safe, which
+    /// fails closed — a POST added later gets the safe behaviour without its
+    /// author having to know this exists. The POSTs that genuinely converge on
+    /// the same state opt in via [`Self::request_raw_replay_safe`].
     async fn request_raw(
+        &self,
+        runtime: &ConnectorRuntime,
+        method: Method,
+        path: &str,
+        query: Vec<(String, String)>,
+        form: Vec<(String, String)>,
+    ) -> NextcloudTalkResult<RawResponse> {
+        let replay_safe = method != Method::POST;
+        self.request_raw_with_replay_safety(runtime, method, path, query, form, replay_safe)
+            .await
+    }
+
+    /// Issue a POST whose replay cannot duplicate a side effect.
+    async fn request_raw_replay_safe(
+        &self,
+        runtime: &ConnectorRuntime,
+        method: Method,
+        path: &str,
+        query: Vec<(String, String)>,
+        form: Vec<(String, String)>,
+    ) -> NextcloudTalkResult<RawResponse> {
+        self.request_raw_with_replay_safety(runtime, method, path, query, form, true)
+            .await
+    }
+
+    async fn request_raw_with_replay_safety(
         &self,
         runtime: &ConnectorRuntime,
         method: Method,
         path: &str,
         mut query: Vec<(String, String)>,
         form: Vec<(String, String)>,
+        replay_safe: bool,
     ) -> NextcloudTalkResult<RawResponse> {
         query.push(("format".into(), "json".into()));
         if let Some(force_language) = &self.force_language {
@@ -554,10 +597,15 @@ impl NextcloudTalkClient {
                 let response = match request.send().await {
                     Ok(response) => response,
                     Err(error) => {
-                        return AttemptOutcome::Retryable {
-                            error: NextcloudTalkError::Http(error),
-                            retry_after: None,
-                        };
+                        // Only a connect-phase failure proves the request never
+                        // reached the server.
+                        let replayable =
+                            replay_safe || !transport_error_reached_service(&error);
+                        return AttemptOutcome::retryable_if_replayable(
+                            NextcloudTalkError::Http(error),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -585,10 +633,16 @@ impl NextcloudTalkClient {
                     let decision =
                         classify_http_status(status, retry_after.map(Duration::from_millis));
                     if error.is_retryable() && !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
+                        // A 429 was refused WITHOUT being performed, so it stays
+                        // retryable even for a non-replay-safe POST. Every other
+                        // retryable class here is a 5xx, which means the server
+                        // received the request and may have acted on it.
+                        let replayable = replay_safe || status == 429;
+                        return AttemptOutcome::retryable_if_replayable(
                             error,
-                            retry_after: retry_after.map(Duration::from_millis),
-                        };
+                            retry_after.map(Duration::from_millis),
+                            replayable,
+                        );
                     }
                     return AttemptOutcome::Terminal(error);
                 }

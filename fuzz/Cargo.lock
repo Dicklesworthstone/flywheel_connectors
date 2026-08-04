@@ -1948,6 +1948,7 @@ dependencies = [
  "fcp-async-core",
  "fcp-core",
  "fcp-google-discovery",
+ "fcp-manifest",
  "fcp-prelude",
  "fcp-sdk",
  "hex",

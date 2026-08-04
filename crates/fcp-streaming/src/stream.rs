@@ -885,19 +885,11 @@ mod tests {
         assert_eq!(rl.next().await, Some(77));
         assert!(rl.next().await.is_none());
         let elapsed = start.elapsed();
-        // After the sole item, `poll_next` schedules and then awaits exactly one
-        // interval's delay before discovering the inner stream is exhausted, so a
-        // single item costs at most one `interval` (50ms) of spacing — never the
-        // repeated per-item spacing a multi-item stream would accumulate.
-        //
-        // The asupersync runtime's reactor wakes a lone pending timer at its idle
-        // I/O-poll granularity (up to ~250ms), so a 50ms sleep can take ~250ms of
-        // real wall-clock time. The bound below stays comfortably under what a
-        // genuine regression (a second awaited delay, ~500ms+, or a hang) would
-        // produce while tolerating that single-interval reactor rounding.
+        // Single item: no delay after first item before stream ends
+        // The delay is scheduled but stream exhaustion happens before it matters
         assert!(
-            elapsed < Duration::from_millis(400),
-            "single item should incur at most one interval of delay: {elapsed:?}"
+            elapsed < Duration::from_millis(200),
+            "single item should not wait long: {elapsed:?}"
         );
     }
 

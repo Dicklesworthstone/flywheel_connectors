@@ -22,11 +22,6 @@ use fcp_async_core::{task, time};
 // ============================================================================
 
 /// Timeout fires within acceptable wall-clock tolerance.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms; a 10ms
-// timeout precision bound cannot be met. The PURPOSE of this test is
-// sub-250ms precision, so it is ignored rather than retimed (retiming
-// would erase its meaning). Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn timeout_precision_10ms() {
     let target = Duration::from_millis(10);
@@ -43,11 +38,6 @@ async fn timeout_precision_10ms() {
 }
 
 /// Timeout fires within acceptable wall-clock tolerance (50ms).
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms; a 50ms timeout
-// under a 60s sleep quantizes to the floor, so the upper bound (target + 15ms)
-// is met only intermittently. Sub-250ms precision IS the purpose of this test,
-// so it is ignored rather than retimed. Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn timeout_precision_50ms() {
     let target = Duration::from_millis(50);
@@ -63,12 +53,6 @@ async fn timeout_precision_50ms() {
 }
 
 /// Multiple sequential timeouts maintain cumulative precision.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms; the inner
-// `sleep(60s)` under a 20ms `timeout` collapses into one poll tick and the
-// inner future is polled first, so the timeout no longer fires at 20ms and
-// cumulative precision is unverifiable. Precision is this test's purpose, so
-// it is ignored (not retimed). Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn timeout_precision_cumulative() {
     let start = Instant::now();
@@ -93,11 +77,6 @@ async fn timeout_precision_cumulative() {
 // ============================================================================
 
 /// Sleep precision across multiple durations.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms, so a 5ms
-// sleep takes ~252ms and the per-duration upper bound (target + 15ms) cannot
-// be met. Sub-250ms precision IS the purpose of this sweep, so it is ignored
-// rather than retimed. Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn sleep_precision_sweep() {
     for target_ms in [5, 10, 25, 50, 100] {
@@ -386,12 +365,6 @@ async fn mpsc_channel_throughput() {
 // ============================================================================
 
 /// Timeout error path doesn't add latency beyond the timeout duration.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms, so a 20ms
-// timeout reports ~242ms of "overhead" that is reactor quantization, not
-// error-path cost. The point of this test is a sub-15ms latency bound on the
-// error path, which is unmeasurable under the floor, so it is ignored rather
-// than retimed. Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn error_path_no_excess_latency() {
     let start = Instant::now();
@@ -456,11 +429,6 @@ async fn consecutive_errors_no_accumulation() {
 // ============================================================================
 
 /// `Deadline::remaining()` tracks real wall-clock consumption.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms, so a 50ms
-// sleep consumes ~200ms of budget and the per-step 30..70ms tolerance window
-// cannot be met. This test's purpose is sub-250ms budget-accounting accuracy,
-// so it is ignored rather than retimed. Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn deadline_budget_tracks_wall_clock() {
     let deadline = fcp_async_core::Deadline::after(Duration::from_millis(200));
@@ -504,12 +472,6 @@ async fn expired_deadline_zero_budget_stable() {
 // ============================================================================
 
 /// Interval ticks maintain cadence accuracy.
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms, so a 20ms
-// interval period ticks at ~250ms and the cadence upper bound (expected +
-// 30ms) cannot be met. Cadence accuracy at sub-250ms periods IS the purpose
-// of this test, so it is ignored rather than retimed. Restore when asupersync
-// 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn interval_cadence_accuracy() {
     let period = Duration::from_millis(20);

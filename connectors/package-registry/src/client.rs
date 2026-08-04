@@ -540,8 +540,8 @@ impl PackageRegistryClient {
 
                 let path = format!(
                     "/api/v1/crates/{}/{}{}",
-                    encode_segment(name),
-                    encode_segment(&version),
+                    encode_segment(name)?,
+                    encode_segment(&version)?,
                     "/dependencies"
                 );
                 let payload = self.get_json(runtime, &path, &[]).await?;
@@ -707,7 +707,7 @@ impl PackageRegistryClient {
         match self.provider {
             RegistryProvider::CratesIo => {
                 let details = self.crates_details(runtime, name).await?;
-                let path = format!("/api/v1/crates/{}/downloads", encode_segment(name));
+                let path = format!("/api/v1/crates/{}/downloads", encode_segment(name)?);
                 let payload = self.get_json(runtime, &path, &[]).await?;
                 let points = payload
                     .get("version_downloads")
@@ -739,13 +739,13 @@ impl PackageRegistryClient {
     }
 
     async fn npm_packument(&self, runtime: &ConnectorRuntime, name: &str) -> Result<Value> {
-        let path = format!("/{}", encode_segment(name));
+        let path = format!("/{}", encode_segment(name)?);
         self.get_json(runtime, &path, &[]).await
     }
 
     async fn pypi_project(&self, runtime: &ConnectorRuntime, name: &str) -> Result<Value> {
         let normalized = normalize_pypi_name(name);
-        let path = format!("/pypi/{}/json", encode_segment(&normalized));
+        let path = format!("/pypi/{}/json", encode_segment(&normalized)?);
         self.get_json(runtime, &path, &[]).await
     }
 
@@ -758,19 +758,19 @@ impl PackageRegistryClient {
         let normalized = normalize_pypi_name(name);
         let path = format!(
             "/pypi/{}/{}/json",
-            encode_segment(&normalized),
-            encode_segment(version)
+            encode_segment(&normalized)?,
+            encode_segment(version)?
         );
         self.get_json(runtime, &path, &[]).await
     }
 
     async fn crates_details(&self, runtime: &ConnectorRuntime, name: &str) -> Result<Value> {
-        let path = format!("/api/v1/crates/{}", encode_segment(name));
+        let path = format!("/api/v1/crates/{}", encode_segment(name)?);
         self.get_json(runtime, &path, &[]).await
     }
 
     async fn crates_owners(&self, runtime: &ConnectorRuntime, name: &str) -> Result<Vec<String>> {
-        let path = format!("/api/v1/crates/{}/owners", encode_segment(name));
+        let path = format!("/api/v1/crates/{}/owners", encode_segment(name)?);
         let payload = self.get_json(runtime, &path, &[]).await?;
         Ok(payload
             .get("users")
@@ -909,11 +909,34 @@ fn validate_name(name: &str) -> Result<&str> {
     if trimmed.is_empty() {
         return Err(Error::InvalidInput("name must not be empty".into()));
     }
+    // A bare `.`/`..` package name would normalize to a sibling endpoint
+    // (`/{name}` → `/..` → registry root). Package names never legitimately
+    // contain consecutive dots.
+    if trimmed == "." || trimmed.contains("..") {
+        return Err(Error::InvalidInput(
+            "name must not contain path-traversal segments".into(),
+        ));
+    }
     Ok(trimmed)
 }
 
-fn encode_segment(input: &str) -> String {
-    utf8_percent_encode(input, PATH_SEGMENT).to_string()
+/// Percent-encode a value as a single URL path segment.
+///
+/// `PATH_SEGMENT` encodes slashes and other separators but not `.`, so a bare
+/// `.`/`..` segment (a package name or version) would survive to the server and
+/// normalize to a sibling endpoint (e.g. `/api/v1/crates/{name}/../dependencies`
+/// → `/api/v1/crates/dependencies`, dropping the name). Names and versions never
+/// legitimately contain consecutive dots, so such values are rejected.
+fn encode_segment(input: &str) -> Result<String> {
+    if input.is_empty() {
+        return Err(Error::InvalidInput("path segment must not be empty".into()));
+    }
+    if input == "." || input.contains("..") {
+        return Err(Error::InvalidInput(
+            "path segment must not contain traversal sequences".into(),
+        ));
+    }
+    Ok(utf8_percent_encode(input, PATH_SEGMENT).to_string())
 }
 
 fn latest_npm_version(payload: &Value) -> Option<String> {
@@ -1103,7 +1126,18 @@ mod tests {
 
     #[test]
     fn encode_segment_escapes_scoped_npm_name() {
-        assert_eq!(encode_segment("@scope/name"), "@scope%2Fname");
+        assert_eq!(encode_segment("@scope/name").unwrap(), "@scope%2Fname");
+    }
+
+    #[test]
+    fn encode_segment_rejects_traversal() {
+        // A bare `.`/`..` name or version would normalize to a sibling endpoint.
+        for evil in ["..", ".", "../..", "a..b", ""] {
+            assert!(
+                matches!(encode_segment(evil), Err(Error::InvalidInput(_))),
+                "path segment {evil:?} must be rejected"
+            );
+        }
     }
 
     #[test]

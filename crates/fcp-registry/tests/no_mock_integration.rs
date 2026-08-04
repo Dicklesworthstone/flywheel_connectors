@@ -50,7 +50,12 @@ fn sign_manifest(
     signing_key: &Ed25519SigningKey,
     binary_hash: &str,
 ) -> Base64Bytes {
-    let manifest = ConnectorManifest::parse_str(manifest_toml).expect("manifest");
+    // Parse UNCHECKED: this helper signs the still-unsigned manifest, and full
+    // validation rejects shapes that only become legal once the `[signatures]`
+    // section is appended (e.g. `policy.require_transparency_log = true`
+    // demands `signatures.transparency_log_entry`). Signing bytes are computed
+    // over the manifest signing view; validation is `verify_bundle`'s job.
+    let manifest = ConnectorManifest::parse_str_unchecked(manifest_toml).expect("manifest");
     let signing_bytes = fcp_registry::manifest_signing_bytes(&manifest).expect("signing bytes");
     let message = fcp_registry::signature_message(&signing_bytes, binary_hash);
     let signature =
@@ -511,8 +516,12 @@ trusted_builders = []
     let result = verifier.verify_bundle(&bundle, None, None, None);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
+    // Fail-closed on the missing transparency-log entry. Manifest validation
+    // now refuses this shape before the registry's own
+    // `RegistryError::TransparencyLogMissing` gate is reached, so assert on the
+    // subject of the refusal rather than on which layer produced it.
     assert!(
-        err.contains("transparency log"),
+        err.contains("transparency"),
         "expected transparency log error: {err}"
     );
 }
@@ -2401,6 +2410,10 @@ fn supply_chain_config_all_fields() {
         require_transparency: true,
         require_tuf: true,
         require_sigstore: true,
+        require_attestation_types: vec![AttestationType::InToto],
+        min_slsa_level: Some(2),
+        trusted_builders: vec!["github-actions".into()],
+        require_attestation_expiry: true,
     };
 
     assert!(config.tuf_pinned_root.is_some());
@@ -2408,4 +2421,8 @@ fn supply_chain_config_all_fields() {
     assert!(config.require_tuf);
     assert!(config.require_sigstore);
     assert_eq!(config.trusted_sigstore_identities.len(), 1);
+    assert_eq!(config.min_slsa_level, Some(2));
+    assert_eq!(config.trusted_builders.len(), 1);
+    assert!(config.require_attestation_expiry);
+    assert_eq!(config.require_attestation_types.len(), 1);
 }

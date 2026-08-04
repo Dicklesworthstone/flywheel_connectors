@@ -194,12 +194,14 @@ impl TerraformClient {
 
     /// List workspaces in an organization.
     pub async fn list_workspaces(&self, org_name: &str) -> TerraformResult<serde_json::Value> {
+        let org_name = sanitize_path_segment(org_name, "organization")?;
         self.get(&format!("/organizations/{org_name}/workspaces"))
             .await
     }
 
     /// Get a workspace by ID.
     pub async fn get_workspace(&self, workspace_id: &str) -> TerraformResult<serde_json::Value> {
+        let workspace_id = sanitize_path_segment(workspace_id, "workspace_id")?;
         self.get(&format!("/workspaces/{workspace_id}")).await
     }
 
@@ -209,6 +211,8 @@ impl TerraformClient {
         org_name: &str,
         workspace_name: &str,
     ) -> TerraformResult<serde_json::Value> {
+        let org_name = sanitize_path_segment(org_name, "organization")?;
+        let workspace_name = sanitize_path_segment(workspace_name, "workspace_name")?;
         self.get(&format!(
             "/organizations/{org_name}/workspaces/{workspace_name}"
         ))
@@ -224,6 +228,7 @@ impl TerraformClient {
 
     /// Get a run by ID.
     pub async fn get_run(&self, run_id: &str) -> TerraformResult<serde_json::Value> {
+        let run_id = sanitize_path_segment(run_id, "run_id")?;
         self.get(&format!("/runs/{run_id}")).await
     }
 
@@ -233,6 +238,7 @@ impl TerraformClient {
         run_id: &str,
         comment: Option<&str>,
     ) -> TerraformResult<serde_json::Value> {
+        let run_id = sanitize_path_segment(run_id, "run_id")?;
         let body = serde_json::json!({
             "comment": comment.unwrap_or("Applied via FCP Terraform connector")
         });
@@ -246,6 +252,7 @@ impl TerraformClient {
         run_id: &str,
         comment: Option<&str>,
     ) -> TerraformResult<serde_json::Value> {
+        let run_id = sanitize_path_segment(run_id, "run_id")?;
         let body = serde_json::json!({
             "comment": comment.unwrap_or("Discarded via FCP Terraform connector")
         });
@@ -255,6 +262,7 @@ impl TerraformClient {
 
     /// List runs in a workspace.
     pub async fn list_runs(&self, workspace_id: &str) -> TerraformResult<serde_json::Value> {
+        let workspace_id = sanitize_path_segment(workspace_id, "workspace_id")?;
         self.get(&format!("/workspaces/{workspace_id}/runs")).await
     }
 
@@ -262,11 +270,13 @@ impl TerraformClient {
 
     /// Get a plan by ID.
     pub async fn get_plan(&self, plan_id: &str) -> TerraformResult<serde_json::Value> {
+        let plan_id = sanitize_path_segment(plan_id, "plan_id")?;
         self.get(&format!("/plans/{plan_id}")).await
     }
 
     /// Get plan JSON output (structured plan output).
     pub async fn get_plan_json_output(&self, plan_id: &str) -> TerraformResult<serde_json::Value> {
+        let plan_id = sanitize_path_segment(plan_id, "plan_id")?;
         self.get(&format!("/plans/{plan_id}/json-output")).await
     }
 
@@ -277,6 +287,7 @@ impl TerraformClient {
         &self,
         workspace_id: &str,
     ) -> TerraformResult<serde_json::Value> {
+        let workspace_id = sanitize_path_segment(workspace_id, "workspace_id")?;
         self.get(&format!("/workspaces/{workspace_id}/current-state-version"))
             .await
     }
@@ -286,6 +297,7 @@ impl TerraformClient {
         &self,
         state_version_id: &str,
     ) -> TerraformResult<serde_json::Value> {
+        let state_version_id = sanitize_path_segment(state_version_id, "state_version_id")?;
         self.get(&format!("/state-versions/{state_version_id}/outputs"))
             .await
     }
@@ -297,6 +309,7 @@ impl TerraformClient {
         &self,
         workspace_id: &str,
     ) -> TerraformResult<serde_json::Value> {
+        let workspace_id = sanitize_path_segment(workspace_id, "workspace_id")?;
         self.get(&format!(
             "/workspaces/{workspace_id}/configuration-versions"
         ))
@@ -310,9 +323,42 @@ impl TerraformClient {
         &self,
         state_version_id: &str,
     ) -> TerraformResult<serde_json::Value> {
+        let state_version_id = sanitize_path_segment(state_version_id, "state_version_id")?;
         self.get(&format!("/state-versions/{state_version_id}/resources"))
             .await
     }
+}
+
+/// Validate that a caller-supplied Terraform Cloud identifier is safe to
+/// interpolate into a URL path segment.
+///
+/// Terraform organization names, workspace names, and prefixed resource IDs
+/// (`ws-…`, `run-…`, `plan-…`, `sv-…`) are all `[A-Za-z0-9_-]`-shaped, so this
+/// never rejects a legitimate value. Without it, a `run_id` of
+/// `../../workspaces/<victim>/runs` on the destructive `apply_run`/`discard_run`
+/// endpoints normalizes (via `Url::parse`) to a different run than intended, and
+/// an embedded `?`/`#` injects a query/fragment against the API host.
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> TerraformResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(TerraformError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(TerraformError::InvalidInput(format!(
+            "{field} contains path traversal or URL control characters"
+        )));
+    }
+    Ok(trimmed)
 }
 
 fn decode_success_body(status: StatusCode, body: &str) -> TerraformResult<serde_json::Value> {
@@ -338,6 +384,44 @@ mod tests {
         let dbg = format!("{auth:?}");
         assert!(!dbg.contains("secret-api-token"));
         assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal_and_control_chars() {
+        for bad in [
+            "",
+            "   ",
+            "../../workspaces/victim/runs",
+            "..",
+            "run-abc/../../runs",
+            "a/b",
+            "a\\b",
+            "run-abc?x=y",
+            "run-abc#frag",
+            "a%2f..%2fb",
+            "a%5cb",
+        ] {
+            assert!(
+                sanitize_path_segment(bad, "run_id").is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_path_segment_accepts_real_identifiers() {
+        assert_eq!(
+            sanitize_path_segment("run-CZcmD7eagjhyX0vN", "run_id").unwrap(),
+            "run-CZcmD7eagjhyX0vN"
+        );
+        assert_eq!(
+            sanitize_path_segment(" my-org_1 ", "organization").unwrap(),
+            "my-org_1"
+        );
+        assert_eq!(
+            sanitize_path_segment("ws-SihZTyXKfNXUWuUa", "workspace_id").unwrap(),
+            "ws-SihZTyXKfNXUWuUa"
+        );
     }
 
     #[test]

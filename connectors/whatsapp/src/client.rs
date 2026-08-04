@@ -1,7 +1,10 @@
 //! WhatsApp Business API client.
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::{Client, RequestBuilder, Url};
 use serde_json::json;
@@ -137,6 +140,13 @@ impl WhatsAppClient {
     }
 
     /// Send an arbitrary message payload with retry.
+    ///
+    /// br-kxd3e: every caller of this helper DELIVERS a message, and the
+    /// WhatsApp Cloud API has no idempotency key, so a replay that reached
+    /// Meta sends the message a second time. Only a connect-phase failure —
+    /// the one class that proves no request bytes were written — is retried
+    /// here. A 429 is refused WITHOUT the message being sent and stays
+    /// retryable; it is handled before the gate below.
     async fn send_message(
         &self,
         runtime: &ConnectorRuntime,
@@ -159,10 +169,12 @@ impl WhatsAppClient {
                 let resp = match request.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: WhatsAppError::Http(e),
-                            retry_after: None,
-                        };
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            WhatsAppError::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -192,36 +204,23 @@ impl WhatsAppClient {
 
                 if !resp.status().is_success() {
                     let text = resp.text().await.unwrap_or_default();
+                    // Every remaining retryable class here is a 5xx, which
+                    // means Meta RECEIVED the send and may already have
+                    // delivered it.
                     if let Ok(api_err) = serde_json::from_str::<ApiErrorResponse>(&text) {
-                        let decision = classify_http_status(status, None);
-                        let err = WhatsAppError::Api {
+                        return AttemptOutcome::Terminal(WhatsAppError::Api {
                             code: api_err.error.code,
                             message: api_err.error.message,
                             error_type: api_err.error.error_type,
                             subcode: api_err.error.error_subcode,
-                        };
-                        if !matches!(decision, RetryDecision::Terminal) {
-                            return AttemptOutcome::Retryable {
-                                error: err,
-                                retry_after: None,
-                            };
-                        }
-                        return AttemptOutcome::Terminal(err);
+                        });
                     }
-                    let decision = classify_http_status(status, None);
-                    let err = WhatsAppError::Api {
+                    return AttemptOutcome::Terminal(WhatsAppError::Api {
                         code: u32::from(status),
                         message: text,
                         error_type: "HttpError".into(),
                         subcode: None,
-                    };
-                    if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
-                    }
-                    return AttemptOutcome::Terminal(err);
+                    });
                 }
 
                 match resp.json::<SendMessageResponse>().await {

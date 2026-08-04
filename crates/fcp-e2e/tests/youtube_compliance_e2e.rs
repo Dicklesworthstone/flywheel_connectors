@@ -340,7 +340,12 @@ async fn youtube_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["youtube.write"]);
     // Token grants "youtube.write" but invoke targets "youtube.get_video" -> denial
-    let token = build_token(&signing_key, "youtube.write", &["youtube.write"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "youtube.write",
+        &["youtube.write"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "youtube.get_video",
         json!({ "video_id": "dQw4w9WgXcQ" }),
@@ -398,7 +403,12 @@ async fn youtube_allow_valid_token_connector_suite_passes() {
     // Introspection declares `youtube.get_video` requires capability
     // `youtube.read` (permission class), not the op id itself.
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["youtube.read"]);
-    let token = build_token(&signing_key, "youtube.read", &["youtube.get_video"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "youtube.read",
+        &["youtube.get_video"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "youtube.get_video",
         json!({ "video_id": "dQw4w9WgXcQ" }),

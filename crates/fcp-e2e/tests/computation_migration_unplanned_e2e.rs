@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SOURCE_NODE: &str = "node-alpha";
 const NODES: [&str; 5] = [
@@ -231,9 +231,11 @@ fn assert_report_matches_control(
     assert_eq!(report.source_node, SOURCE_NODE);
     assert_ne!(report.target_node, SOURCE_NODE);
     assert_eq!(report.source_exit_status["signal"], "SIGKILL");
-    assert!(report.source_exit_status["captured"]
-        .as_bool()
-        .unwrap_or(false));
+    assert!(
+        report.source_exit_status["captured"]
+            .as_bool()
+            .unwrap_or(false)
+    );
     assert!(report.resumption_latency_ms <= SLA_MS);
     assert_logging_contract(report);
 

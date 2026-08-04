@@ -526,7 +526,7 @@ impl SpotifyClient {
     ) -> SpotifyResult<serde_json::Value> {
         let mut path = "/me/player/play".to_string();
         if let Some(did) = device_id {
-            path = format!("{path}?device_id={did}");
+            path = format!("{path}?device_id={}", percent_encode(did));
         }
         let mut body = serde_json::json!({});
         if let Some(ctx) = context_uri {
@@ -542,7 +542,7 @@ impl SpotifyClient {
     pub async fn pause(&self, device_id: Option<&str>) -> SpotifyResult<serde_json::Value> {
         let mut path = "/me/player/pause".to_string();
         if let Some(did) = device_id {
-            path = format!("{path}?device_id={did}");
+            path = format!("{path}?device_id={}", percent_encode(did));
         }
         self.put_empty(&path).await
     }
@@ -551,7 +551,7 @@ impl SpotifyClient {
     pub async fn skip_next(&self, device_id: Option<&str>) -> SpotifyResult<serde_json::Value> {
         let mut path = "/me/player/next".to_string();
         if let Some(did) = device_id {
-            path = format!("{path}?device_id={did}");
+            path = format!("{path}?device_id={}", percent_encode(did));
         }
         self.post_empty(&path).await
     }
@@ -560,7 +560,7 @@ impl SpotifyClient {
     pub async fn skip_previous(&self, device_id: Option<&str>) -> SpotifyResult<serde_json::Value> {
         let mut path = "/me/player/previous".to_string();
         if let Some(did) = device_id {
-            path = format!("{path}?device_id={did}");
+            path = format!("{path}?device_id={}", percent_encode(did));
         }
         self.post_empty(&path).await
     }
@@ -573,7 +573,7 @@ impl SpotifyClient {
     ) -> SpotifyResult<serde_json::Value> {
         let mut path = format!("/me/player/seek?position_ms={position_ms}");
         if let Some(did) = device_id {
-            path = format!("{path}&device_id={did}");
+            path = format!("{path}&device_id={}", percent_encode(did));
         }
         self.put_empty(&path).await
     }
@@ -586,7 +586,7 @@ impl SpotifyClient {
     ) -> SpotifyResult<serde_json::Value> {
         let mut path = format!("/me/player/volume?volume_percent={volume_percent}");
         if let Some(did) = device_id {
-            path = format!("{path}&device_id={did}");
+            path = format!("{path}&device_id={}", percent_encode(did));
         }
         self.put_empty(&path).await
     }
@@ -599,7 +599,7 @@ impl SpotifyClient {
     ) -> SpotifyResult<serde_json::Value> {
         let mut path = format!("/me/player/shuffle?state={state}");
         if let Some(did) = device_id {
-            path = format!("{path}&device_id={did}");
+            path = format!("{path}&device_id={}", percent_encode(did));
         }
         self.put_empty(&path).await
     }
@@ -610,9 +610,9 @@ impl SpotifyClient {
         state: &str,
         device_id: Option<&str>,
     ) -> SpotifyResult<serde_json::Value> {
-        let mut path = format!("/me/player/repeat?state={state}");
+        let mut path = format!("/me/player/repeat?state={}", percent_encode(state));
         if let Some(did) = device_id {
-            path = format!("{path}&device_id={did}");
+            path = format!("{path}&device_id={}", percent_encode(did));
         }
         self.put_empty(&path).await
     }

@@ -2,7 +2,10 @@
 
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::Client;
 use std::time::Duration;
@@ -113,7 +116,11 @@ impl CircleCiClient {
             sanitize_path_segment(part)?;
         }
         let url = format!("{}/project/{}/pipeline", self.base_url, project_slug);
-        self.post_with_retry(runtime, &url, body).await
+        // NOT replay-safe: this queues a CI pipeline. Replaying it after a 5xx
+        // runs the build a second time — real compute, and whatever the
+        // pipeline itself deploys. Same shape as github's workflow_dispatch,
+        // the confirmed case that opened br-kxd3e.
+        self.post_with_retry(runtime, &url, body, false).await
     }
 
     /// List workflows for a pipeline.
@@ -151,7 +158,9 @@ impl CircleCiClient {
     ) -> Result<MessageResponse> {
         let id = sanitize_path_segment(workflow_id)?;
         let url = format!("{}/workflow/{id}/cancel", self.base_url);
-        self.post_with_retry(runtime, &url, &serde_json::json!({}))
+        // Replay-safe: cancelling an already-cancelled workflow converges on
+        // the same state rather than starting anything.
+        self.post_with_retry(runtime, &url, &serde_json::json!({}), true)
             .await
     }
 
@@ -165,7 +174,9 @@ impl CircleCiClient {
         let id = sanitize_path_segment(workflow_id)?;
         let url = format!("{}/workflow/{id}/rerun", self.base_url);
         let body = serde_json::json!({ "from_failed": from_failed });
-        self.post_with_retry(runtime, &url, &body).await
+        // NOT replay-safe: a rerun creates a NEW workflow run, so a replay
+        // costs a second one.
+        self.post_with_retry(runtime, &url, &body, false).await
     }
 
     /// List jobs for a workflow.
@@ -318,18 +329,25 @@ impl CircleCiClient {
                         };
                     }
                 };
-                handle_response(resp).await
+                // GET is idempotent per HTTP semantics, so replaying is safe.
+                handle_response(resp, true).await
             }
         })
         .await
     }
 
     /// Generic POST with retry, returning deserialized JSON.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). CircleCI offers no idempotency key, so a POST
+    /// that starts work must set it to `false`: a 5xx or a timeout can both be
+    /// reported after CircleCI already queued the run.
     async fn post_with_retry<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
         url: &str,
         body: &serde_json::Value,
+        replay_safe: bool,
     ) -> Result<T> {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -351,13 +369,17 @@ impl CircleCiClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: Error::Http(e),
-                            retry_after: None,
-                        };
+                        // Only a connect-phase failure proves the request never
+                        // reached CircleCI.
+                        let replayable = replay_safe || !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            Error::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
-                handle_response(resp).await
+                handle_response(resp, replay_safe).await
             }
         })
         .await
@@ -365,8 +387,12 @@ impl CircleCiClient {
 }
 
 /// Handle response: check status, parse JSON.
+///
+/// `replay_safe` gates only the post-transmission retry classes. A 429 is
+/// always retryable: it was refused WITHOUT the work being started.
 async fn handle_response<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, Error> {
     let status = resp.status().as_u16();
 
@@ -399,10 +425,9 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
         let decision = classify_http_status(status, None);
         let err = Error::Api { status, message };
         if !matches!(decision, RetryDecision::Terminal) {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means CircleCI received the request and may have already
+            // queued the pipeline; replaying it triggers a SECOND run.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }

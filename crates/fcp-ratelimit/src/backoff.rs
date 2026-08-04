@@ -97,8 +97,13 @@ impl BackoffStrategy for ExponentialBackoff {
             return Duration::ZERO;
         }
 
-        #[allow(clippy::cast_possible_wrap)]
-        let base = initial_secs * self.multiplier.powi(attempt as i32);
+        // Saturate the exponent rather than `as i32`: a very large `attempt`
+        // (>= 2^31) would wrap to a negative `i32`, making `powi` UNDERFLOW to
+        // ~0 and collapsing the backoff to ~zero (immediate retry) instead of
+        // capping at `max`. `i32::MAX` drives `powi` to +inf → the `!is_finite`
+        // guard below then correctly clamps to `max_secs`.
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        let base = initial_secs * self.multiplier.powi(exponent);
 
         // Guard against NaN/infinity from extreme multiplier or attempt values.
         let capped = if base.is_finite() {
@@ -115,9 +120,12 @@ impl BackoffStrategy for ExponentialBackoff {
             capped * jitter_factor
         });
 
-        // Final guard: Duration::from_secs_f64 panics on NaN/negative/infinite.
+        // Final guard: Duration::from_secs_f64 panics on NaN/negative/infinite
+        // AND on values that overflow the Duration range (e.g. when `max` is
+        // Duration::MAX, `max_secs` round-trips to ~2^64 s). try_from_secs_f64
+        // reports both as Err, which we map to the configured `max`.
         if result.is_finite() && result >= 0.0 {
-            Duration::from_secs_f64(result.min(max_secs))
+            Duration::try_from_secs_f64(result.min(max_secs)).unwrap_or(self.max)
         } else {
             self.max
         }
@@ -174,7 +182,10 @@ impl BackoffStrategy for DecorrelatedJitter {
         };
 
         let capped = next.min(max_secs);
-        self.previous = Duration::from_secs_f64(capped);
+        // try_from_secs_f64 avoids the panic from_secs_f64 raises when `capped`
+        // overflows the Duration range (e.g. `max == Duration::MAX`); fall back
+        // to the configured cap in that case.
+        self.previous = Duration::try_from_secs_f64(capped).unwrap_or(self.max);
         self.previous
     }
 
@@ -457,6 +468,41 @@ mod tests {
         // Very high attempt number should not overflow, just cap at max
         let d = backoff.next_backoff(1000);
         assert_eq!(d, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn exponential_backoff_u32_max_attempt_caps_at_max_not_zero() {
+        // Regression: `attempt as i32` wrapped negative for attempt >= 2^31,
+        // making `powi` underflow to ~0 and collapsing the backoff to ~ZERO
+        // (immediate retry). A saturated exponent must instead cap at `max`.
+        let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(60))
+            .with_jitter(None);
+        let d = backoff.next_backoff(u32::MAX);
+        assert_eq!(
+            d,
+            Duration::from_secs(60),
+            "huge attempt must cap at max, not collapse to ~zero"
+        );
+    }
+
+    #[test]
+    fn exponential_backoff_duration_max_cap_does_not_panic() {
+        // Regression: with max == Duration::MAX, `max_secs` round-trips to
+        // ~2^64 s, which `Duration::from_secs_f64` panics on. Must clamp to max.
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_secs(1), Duration::MAX).with_jitter(None);
+        let d = backoff.next_backoff(100);
+        assert_eq!(d, Duration::MAX);
+    }
+
+    #[test]
+    fn decorrelated_jitter_duration_max_cap_does_not_panic() {
+        // Regression: same Duration::from_secs_f64 overflow panic. A near-max
+        // base makes `capped` land at ~2^64 s (the exclusive Duration bound),
+        // which from_secs_f64 panics on. Must clamp to the configured max.
+        let mut backoff = DecorrelatedJitter::new(Duration::from_secs(u64::MAX), Duration::MAX);
+        let d = backoff.next_backoff(1);
+        assert_eq!(d, Duration::MAX);
     }
 
     // ── DecorrelatedJitter ──────────────────────────────────────────────

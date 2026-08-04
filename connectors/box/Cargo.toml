@@ -24,6 +24,7 @@ fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-sdk = { path = "../../crates/fcp-sdk" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 
 anyhow.workspace = true
 async-trait.workspace = true

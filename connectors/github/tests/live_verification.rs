@@ -128,7 +128,11 @@ async fn live_get_repo_public_repo() {
 
     let mut connector = GitHubConnector::new();
     let signing_key = setup_live_connector(&mut connector, &token).await;
-    let cap_token = generate_read_token(&signing_key, connector.instance_id().as_str(), "github.get_repo");
+    let cap_token = generate_read_token(
+        &signing_key,
+        connector.instance_id().as_str(),
+        "github.get_repo",
+    );
 
     let result = connector
         .handle_invoke(json!({
@@ -173,7 +177,11 @@ async fn live_search_repos() {
 
     let mut connector = GitHubConnector::new();
     let signing_key = setup_live_connector(&mut connector, &token).await;
-    let cap_token = generate_read_token(&signing_key, connector.instance_id().as_str(), "github.search_repos");
+    let cap_token = generate_read_token(
+        &signing_key,
+        connector.instance_id().as_str(),
+        "github.search_repos",
+    );
 
     let result = connector
         .handle_invoke(json!({
@@ -239,7 +247,11 @@ async fn live_error_mapping_invalid_token() {
         .await
         .expect("handshake should succeed");
 
-    let cap_token = generate_read_token(&signing_key, connector.instance_id().as_str(), "github.get_repo");
+    let cap_token = generate_read_token(
+        &signing_key,
+        connector.instance_id().as_str(),
+        "github.get_repo",
+    );
 
     let err = connector
         .handle_invoke(json!({

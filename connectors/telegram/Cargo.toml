@@ -26,7 +26,8 @@ workspace = true
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
-fcp-sdk = { path = "../../crates/fcp-sdk" }
+# `connector-http` gates `transport_error_reached_service` (see client.rs).
+fcp-sdk = { path = "../../crates/fcp-sdk", features = ["connector-http"] }
 
 percent-encoding.workspace = true
 anyhow.workspace = true

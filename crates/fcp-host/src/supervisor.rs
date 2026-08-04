@@ -1060,6 +1060,15 @@ pub struct WarmPoolRetentionPlan {
     pub pressure_replay_matches: Option<bool>,
     /// Warm-entry keys retained for future checkout.
     pub retained: Vec<WarmPoolKey>,
+    /// Indices (into the planned snapshot slice) of the entries retained for
+    /// future checkout. Unlike [`Self::retained`], which collapses to class
+    /// keys, these preserve entry identity — the caller MUST apply eviction by
+    /// these indices, because several live entries can share one `WarmPoolKey`
+    /// (same connector/zone/manifest/credential class) and a key-membership
+    /// filter would then retain every same-key entry, silently dropping the
+    /// planned eviction.
+    #[serde(skip)]
+    pub retained_indices: Vec<usize>,
     /// Deterministic evictions selected by the controller.
     pub evictions: Vec<WarmPoolEviction>,
     /// Redaction-safe evidence records for the evictions.
@@ -1081,6 +1090,7 @@ impl WarmPoolRetentionPlan {
             pressure_action: pressure_decision.map(|decision| decision.action.as_str().to_string()),
             pressure_replay_matches: pressure_decision.map(BackpressureDecision::replay_matches),
             retained: Vec::new(),
+            retained_indices: Vec::new(),
             evictions: Vec::new(),
             evidence: Vec::new(),
         }
@@ -1169,11 +1179,15 @@ impl AdaptiveWarmPoolController {
             decision,
         );
 
-        plan.retained = retained_indices
+        let final_indices: Vec<usize> = retained_indices
             .into_iter()
             .filter(|index| !evicted_indices.contains(index))
-            .map(|index| entries[index].key.clone())
             .collect();
+        plan.retained = final_indices
+            .iter()
+            .map(|&index| entries[index].key.clone())
+            .collect();
+        plan.retained_indices = final_indices;
         plan
     }
 
@@ -4274,6 +4288,12 @@ mod tests {
         );
 
         assert_eq!(plan.retained, vec![newest.key, middle.key]);
+        // `newest`/`middle`/`oldest_same_connector` all share one `WarmPoolKey`,
+        // so `retained` (keys) cannot distinguish which same-key entries survive
+        // — the caller must apply eviction by `retained_indices`. Index 2
+        // (oldest_same_connector, PerConnectorCap) and index 3 (oldest_global,
+        // GlobalRssCap) are evicted; only indices 0 and 1 are retained.
+        assert_eq!(plan.retained_indices, vec![0, 1]);
         assert!(plan.evictions.iter().any(|eviction| {
             eviction.key == oldest_same_connector.key
                 && eviction.reason == WarmPoolEvictionReason::PerConnectorCap

@@ -102,10 +102,23 @@ fn http_error_from_head(status: u16, reason: String, headers: &[(String, String)
     }
 }
 
+/// Pick the reconnect delay, honouring a server `Retry-After` but never
+/// letting it exceed the configured ceiling.
+///
+/// `Retry-After` is attacker-controlled: `parse_retry_after` maps an oversized
+/// integer to `Duration::from_secs(u64::MAX)`, so an unclamped
+/// `base.max(retry_after)` let one response header park the stream for ~584
+/// billion years — the sleep never resolves, the connector never reconnects,
+/// and its timer thread stays alive. `delay_for_attempt` already enforces
+/// `max_delay`; the server-supplied value has to be intersected with the same
+/// ceiling rather than allowed to override it. (`fcp-graphql`'s
+/// `RetryPolicy::decide` already clamps with `.min(max_delay)`.)
 fn reconnect_delay_for_error(handler: &ReconnectHandler, err: &StreamError) -> Duration {
-    let base = handler.config().delay_for_attempt(handler.attempts());
-    err.retry_after()
-        .map_or(base, |retry_after| base.max(retry_after))
+    let config = handler.config();
+    let base = config.delay_for_attempt(handler.attempts());
+    err.retry_after().map_or(base, |retry_after| {
+        base.max(retry_after).min(config.max_delay)
+    })
 }
 
 /// SSE event.
@@ -166,6 +179,22 @@ impl SseEvent {
 const DEFAULT_MAX_DATA_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SSE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
+/// Fixed cost charged against `max_data_bytes` for every retained `data:` line,
+/// on top of the line's own payload length.
+///
+/// A retained line costs a `String` header inside `data_lines` plus the `\n`
+/// separator `dispatch_event` inserts when it joins them — neither of which is
+/// payload. Accounting for payload bytes ALONE was unsound: `data:` with an
+/// empty value pushes a `String` while adding zero to the running total, so a
+/// peer streaming `data:\n` forever (and never sending the blank line that
+/// dispatches the event) grew `data_lines` without bound while
+/// `retained_bytes()` stayed pinned at 0 and the `BufferOverflow` guard never
+/// fired. Measured overshoot before this fix: ~96x the configured 1 MiB cap
+/// from 16 MiB of wire input. Charging the per-line overhead makes the
+/// accounted total an upper bound on the real heap footprint, which is what
+/// the guard needs.
+const DATA_LINE_OVERHEAD: usize = size_of::<String>() + 1;
+
 const fn clamp_sse_buffer_size(size: usize) -> usize {
     if size > MAX_SSE_BUFFER_SIZE {
         MAX_SSE_BUFFER_SIZE
@@ -205,8 +234,12 @@ struct SseParser {
     retry: Option<u64>,
     /// Last event ID (for reconnection).
     last_event_id: Option<String>,
-    /// Total bytes accumulated in `data_lines` (`DoS` protection).
-    data_bytes_len: usize,
+    /// Total retained cost of `data_lines` (`DoS` protection).
+    ///
+    /// This is NOT just the sum of the payload byte lengths: each retained
+    /// line is also charged [`DATA_LINE_OVERHEAD`]. See that constant for
+    /// why the payload-only accounting was unsound.
+    data_retained_bytes: usize,
     /// Maximum `data:` payload bytes retained for an in-progress event.
     max_data_bytes: usize,
     /// The previous `parse()` call consumed a CR as its final terminator.
@@ -234,7 +267,7 @@ impl SseParser {
             event_id: None,
             retry: None,
             last_event_id: None,
-            data_bytes_len: 0,
+            data_retained_bytes: 0,
             max_data_bytes,
             pending_cr_swallows_lf: false,
         }
@@ -323,10 +356,10 @@ impl SseParser {
         match field {
             "event" => self.event_type = Some(value.to_string()),
             "data" => {
-                let val_len = value.len();
-                if self.data_bytes_len.saturating_add(val_len) <= self.max_data_bytes {
+                let line_cost = value.len().saturating_add(DATA_LINE_OVERHEAD);
+                if self.data_retained_bytes.saturating_add(line_cost) <= self.max_data_bytes {
                     self.data_lines.push(value.to_string());
-                    self.data_bytes_len += val_len;
+                    self.data_retained_bytes += line_cost;
                 }
             }
             "id" if !value.contains('\0') => {
@@ -363,7 +396,7 @@ impl SseParser {
         }
 
         self.data_lines.clear();
-        self.data_bytes_len = 0;
+        self.data_retained_bytes = 0;
 
         Some(event)
     }
@@ -375,7 +408,7 @@ impl SseParser {
 
     /// Bytes currently retained for the in-progress event.
     fn retained_bytes(&self) -> usize {
-        self.buffer.len().saturating_add(self.data_bytes_len)
+        self.buffer.len().saturating_add(self.data_retained_bytes)
     }
 }
 
@@ -597,6 +630,24 @@ impl fmt::Debug for SseClient {
     }
 }
 
+/// Build the HTTP client used for SSE.
+///
+/// The transport's `max_body_size` is a cap on the TOTAL response body, and its
+/// counter accumulates across the whole response and is never reset — which is
+/// meaningless for an intentionally unbounded stream. Leaving it at the
+/// transport default (16 MiB) killed every long-lived SSE connection with
+/// `BodyTooLarge` once it had delivered that much: about 80 minutes for an
+/// endpoint pushing 200 KB/min. Where a supervisor reconnects with
+/// `Last-Event-ID` that degraded into a mysterious periodic reconnect rather
+/// than visible data loss, which is why it went unnoticed.
+///
+/// Memory is bounded by `SseConfig::max_buffer_size` instead, which caps what
+/// the parser RETAINS for an in-progress event — the correct bound for a stream,
+/// and one that is soundly accounted since the retained-bytes fix.
+fn sse_http_client() -> HttpClient {
+    HttpClientBuilder::new().max_body_size(usize::MAX).build()
+}
+
 impl SseClient {
     /// Create a new SSE client.
     #[must_use]
@@ -604,7 +655,7 @@ impl SseClient {
         Self {
             url: url.into(),
             config: SseConfig::default(),
-            http_client: Arc::new(HttpClientBuilder::new().build()),
+            http_client: Arc::new(sse_http_client()),
         }
     }
 
@@ -614,7 +665,7 @@ impl SseClient {
         Self {
             url: url.into(),
             config,
-            http_client: Arc::new(HttpClientBuilder::new().build()),
+            http_client: Arc::new(sse_http_client()),
         }
     }
 
@@ -847,6 +898,16 @@ enum ReconnectState {
     Connected(Box<SseStream>),
     /// Event receive in progress.
     Receiving(ReceiveFuture),
+    /// The stream is finished and will yield `None` from here on.
+    ///
+    /// Reaching a terminal outcome MUST move the state machine here before
+    /// returning. `Some(Err(_))` is a resumable `Stream` item, so a normal
+    /// consumer polls again after one — and leaving a *completed*
+    /// `Connecting`/`Receiving` future in `state` meant that next poll
+    /// re-polled an `async` block that had already returned `Ready`, which
+    /// panics with "`async fn` resumed after completion". This variant also
+    /// makes the stream properly fused after `None`.
+    Terminated,
 }
 
 impl ReconnectingSseStream {
@@ -892,12 +953,14 @@ impl Stream for ReconnectingSseStream {
                     Poll::Ready(()) => self.state = ReconnectState::Idle,
                     Poll::Pending => return Poll::Pending,
                 },
+                ReconnectState::Terminated => return Poll::Ready(None),
                 ReconnectState::Connecting(future) => match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(stream)) => {
                         self.state = ReconnectState::Connected(Box::new(stream));
                     }
                     Poll::Ready(Err(err)) => {
                         if err.is_terminal_backpressure() || !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
                         let delay = reconnect_delay_for_error(&self.handler, &err);
@@ -926,6 +989,7 @@ impl Stream for ReconnectingSseStream {
                     Poll::Ready((stream, Some(Err(err)))) => {
                         drop(stream);
                         if err.is_terminal_backpressure() || !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
                         let delay = reconnect_delay_for_error(&self.handler, &err);
@@ -935,6 +999,7 @@ impl Stream for ReconnectingSseStream {
                     Poll::Ready((stream, None)) => {
                         drop(stream);
                         if !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(None);
                         }
                         let delay = self
@@ -1835,16 +1900,65 @@ mod tests {
 
         let events = parser.parse(&Bytes::from("data: hello\n"));
         assert!(events.is_empty());
-        assert_eq!(parser.retained_bytes(), "hello".len());
+        assert_eq!(parser.retained_bytes(), "hello".len() + DATA_LINE_OVERHEAD);
 
         let events = parser.parse(&Bytes::from("data: world"));
         assert!(events.is_empty());
-        assert_eq!(parser.retained_bytes(), "hello".len() + "data: world".len());
+        assert_eq!(
+            parser.retained_bytes(),
+            "hello".len() + DATA_LINE_OVERHEAD + "data: world".len()
+        );
 
         let events = parser.parse(&Bytes::from("\n\n"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello\nworld");
         assert_eq!(parser.retained_bytes(), 0);
+    }
+
+    /// A peer that streams `data:` lines with empty values, and never sends
+    /// the blank line that would dispatch the event, must still be bounded by
+    /// `max_data_bytes`. Payload-only accounting charged such a line zero, so
+    /// `data_lines` grew without limit while `retained_bytes()` stayed pinned
+    /// at 0 and the `BufferOverflow` guard never fired.
+    #[test]
+    fn test_empty_data_lines_are_bounded_by_the_retained_limit() {
+        const MAX_DATA_BYTES: usize = 4096;
+        let mut parser = SseParser::with_max_data_bytes(MAX_DATA_BYTES);
+
+        // Far more empty `data:` lines than the cap could ever admit.
+        let flood = "data:\n".repeat(100_000);
+        let events = parser.parse(&Bytes::from(flood));
+
+        assert!(events.is_empty(), "no blank line, so nothing dispatches");
+        assert!(
+            parser.retained_bytes() <= MAX_DATA_BYTES,
+            "retained accounting must stay within the cap, got {}",
+            parser.retained_bytes()
+        );
+        assert!(
+            parser.data_lines.len() <= MAX_DATA_BYTES / DATA_LINE_OVERHEAD,
+            "retained line count must be bounded, got {}",
+            parser.data_lines.len()
+        );
+    }
+
+    /// The `\n` separators `dispatch_event` inserts are part of the retained
+    /// footprint, so a dispatched payload cannot exceed the configured cap.
+    #[test]
+    fn test_dispatched_data_stays_within_retained_limit() {
+        const MAX_DATA_BYTES: usize = 4096;
+        let mut parser = SseParser::with_max_data_bytes(MAX_DATA_BYTES);
+
+        let mut input = "data: a\n".repeat(5000);
+        input.push('\n');
+        let events = parser.parse(&Bytes::from(input));
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].data.len() <= MAX_DATA_BYTES,
+            "dispatched payload must respect the cap, got {}",
+            events[0].data.len()
+        );
     }
 
     // ── SseParser: multiple sequential parses ───────────────────────────

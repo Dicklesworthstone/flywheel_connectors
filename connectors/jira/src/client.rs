@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, Response, StatusCode};
 use tracing::{debug, instrument};
@@ -362,7 +364,8 @@ impl JiraClient {
     /// Create a new issue.
     #[instrument(skip(self, input))]
     pub async fn create_issue(&self, input: &serde_json::Value) -> JiraResult<CreateIssueResponse> {
-        self.post(&format!("{}/issue", self.base_url), input).await
+        self.post(&format!("{}/issue", self.base_url), input, false)
+            .await
     }
 
     /// Get an issue by key or ID.
@@ -425,7 +428,8 @@ impl JiraClient {
     /// Search issues using JQL (POST method for complex queries).
     #[instrument(skip(self, body))]
     pub async fn search_jql(&self, body: &serde_json::Value) -> JiraResult<SearchResult> {
-        self.post(&format!("{}/search", self.base_url), body).await
+        self.post(&format!("{}/search", self.base_url), body, true)
+            .await
     }
 
     // ── Transitions ──────────────────────────────────────────────
@@ -446,9 +450,13 @@ impl JiraClient {
         body: &serde_json::Value,
     ) -> JiraResult<()> {
         let issue_key = validate_issue_key(issue_key)?;
+        // NOT replay-safe: a transition body may carry an `update.comment`,
+        // and Jira permits self-loop transitions, so a replay can post a
+        // second comment. Fail closed rather than reason about the workflow.
         self.post_no_content(
             &format!("{}/issue/{issue_key}/transitions", self.base_url),
             body,
+            false,
         )
         .await
     }
@@ -486,9 +494,12 @@ impl JiraClient {
     /// Move issues to a sprint.
     #[instrument(skip(self, body))]
     pub async fn move_to_sprint(&self, sprint_id: u64, body: &serde_json::Value) -> JiraResult<()> {
+        // Replay-safe: sprint membership is a set, so moving the same
+        // issues in twice leaves them in the sprint once.
         self.post_no_content(
             &format!("{}/sprint/{sprint_id}/issue", self.agile_url),
             body,
+            true,
         )
         .await
     }
@@ -503,9 +514,11 @@ impl JiraClient {
         body: &serde_json::Value,
     ) -> JiraResult<JiraComment> {
         let issue_key = validate_issue_key(issue_key)?;
+        // NOT replay-safe: a duplicate is a second comment on the issue.
         self.post(
             &format!("{}/issue/{issue_key}/comment", self.base_url),
             body,
+            false,
         )
         .await
     }
@@ -571,9 +584,12 @@ impl JiraClient {
         body: &serde_json::Value,
     ) -> JiraResult<JiraWorklog> {
         let issue_key = validate_issue_key(issue_key)?;
+        // NOT replay-safe: a duplicate worklog double-counts logged time,
+        // which flows into billing and capacity reports.
         self.post(
             &format!("{}/issue/{issue_key}/worklog", self.base_url),
             body,
+            false,
         )
         .await
     }
@@ -726,7 +742,7 @@ impl JiraClient {
     ) -> JiraResult<JiraAutomationRule> {
         let project_id = validate_project_key(project_id)?;
         let url = format!("{}/project/{project_id}/rule", self.automation_url);
-        self.post(&url, body).await
+        self.post(&url, body, false).await
     }
 
     /// Update an automation rule.
@@ -797,7 +813,13 @@ impl JiraClient {
         .await
     }
 
-    async fn post<R>(&self, url: &str, body: &serde_json::Value) -> JiraResult<R>
+    /// POST with retry, returning a deserialized body.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a side
+    /// effect (br-kxd3e). Jira has no idempotency key, so a POST that creates
+    /// an issue, comment, or worklog must pass `false`: a 5xx means Jira
+    /// received it and may already have done the work.
+    async fn post<R>(&self, url: &str, body: &serde_json::Value, replay_safe: bool) -> JiraResult<R>
     where
         R: serde::de::DeserializeOwned + Send,
     {
@@ -811,23 +833,37 @@ impl JiraClient {
             match self.client.post(url).json(body).send().await {
                 Ok(response) => match self.handle_response(response).await {
                     Ok(data) => AttemptOutcome::Success(data),
-                    Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: e.retry_after(),
-                        error: e,
-                    },
+                    Err(e) if e.is_retryable() => {
+                        // `replay_is_safe()` keeps 429 retryable here — it was
+                        // refused WITHOUT being performed — while a 5xx is
+                        // gated on the caller's declaration.
+                        let replayable = replay_safe || e.replay_is_safe();
+                        let retry_after = e.retry_after();
+                        AttemptOutcome::retryable_if_replayable(e, retry_after, replayable)
+                    }
                     Err(e) => AttemptOutcome::Terminal(e),
                 },
-                Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                    error: JiraError::Http(e),
-                    retry_after: None,
-                },
-                Err(e) => AttemptOutcome::Terminal(JiraError::Http(e)),
+                // `is_timeout()` is the total request timeout and fires after
+                // the body was fully written; only a connect-phase failure
+                // proves the request never arrived.
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(JiraError::Http(e), None, replayable)
+                }
             }
         })
         .await
     }
 
-    async fn post_no_content(&self, url: &str, body: &serde_json::Value) -> JiraResult<()> {
+    /// POST with retry for endpoints that return no body.
+    ///
+    /// `replay_safe` carries the same meaning as in [`Self::post`].
+    async fn post_no_content(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        replay_safe: bool,
+    ) -> JiraResult<()> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -837,6 +873,8 @@ impl JiraClient {
 
             match self.client.post(url).json(body).send().await {
                 Ok(response) => {
+                    // 429 is checked before the replay gate: it was refused
+                    // WITHOUT being performed, so it stays retryable.
                     if let Some(retry_result) = Self::check_rate_limit(&response) {
                         return AttemptOutcome::Retryable {
                             error: JiraError::RateLimited {
@@ -857,19 +895,17 @@ impl JiraClient {
                     };
                     let err = Self::parse_error(status, &bytes, retry_after_ms);
                     if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
                     } else {
                         AttemptOutcome::Terminal(err)
                     }
                 }
-                Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                    error: JiraError::Http(e),
-                    retry_after: None,
-                },
-                Err(e) => AttemptOutcome::Terminal(JiraError::Http(e)),
+                Err(e) => {
+                    let replayable = replay_safe || !transport_error_reached_service(&e);
+                    AttemptOutcome::retryable_if_replayable(JiraError::Http(e), None, replayable)
+                }
             }
         })
         .await

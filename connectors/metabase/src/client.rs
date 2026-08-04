@@ -191,8 +191,37 @@ impl MetabaseClient {
 
     /// Run a saved question (card) and return query results.
     pub async fn run_card(&self, card_id: &str) -> MetabaseResult<serde_json::Value> {
-        self.post_empty(&format!("/card/{card_id}/query")).await
+        let safe_id = sanitize_path_segment(card_id, "card_id")?;
+        self.post_empty(&format!("/card/{safe_id}/query")).await
     }
+}
+
+/// Validate that a user-supplied ID is safe to interpolate into a URL path segment.
+///
+/// Rejects empty strings, path-traversal sequences, slashes, and their
+/// percent-encoded equivalents. Metabase card IDs are integers, but the host
+/// passes them through as strings, so hostile input must be refused before it
+/// reaches the URL (`reqwest` normalizes `..` segments, which would otherwise
+/// let `card_id` reach a sibling endpoint under the same host).
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> MetabaseResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(MetabaseError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(MetabaseError::InvalidInput(format!(
+            "{field} contains path traversal characters"
+        )));
+    }
+    Ok(trimmed)
 }
 
 fn decode_success_body(status: StatusCode, body: &str) -> MetabaseResult<serde_json::Value> {
@@ -456,5 +485,28 @@ mod tests {
         let label = cred.redacted_label();
         assert!(!label.contains("redacted"));
         assert!(label.starts_with("credential_id:"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_accepts_numeric_id() {
+        assert_eq!(sanitize_path_segment("42", "card_id").unwrap(), "42");
+    }
+
+    #[test]
+    fn sanitize_path_segment_trims_whitespace() {
+        assert_eq!(sanitize_path_segment("  7 ", "card_id").unwrap(), "7");
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_empty() {
+        assert!(sanitize_path_segment("   ", "card_id").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal() {
+        assert!(sanitize_path_segment("1/../admin", "card_id").is_err());
+        assert!(sanitize_path_segment("..", "card_id").is_err());
+        assert!(sanitize_path_segment("a%2Fb", "card_id").is_err());
+        assert!(sanitize_path_segment("a\\b", "card_id").is_err());
     }
 }

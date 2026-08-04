@@ -802,3 +802,79 @@ fn manifest_capability_section() -> &'static str {
         .expect("Confluence manifest should separate capabilities from operations");
     capability_section
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// Confluence has no idempotency key, so a 5xx retry on create_page publishes
+// a second page. The assertion is the REQUEST COUNT.
+
+fn retrying_client(server: &MockServer) -> ConfluenceClient {
+    ConfluenceClient::new(
+        &server.uri(),
+        TEST_EMAIL,
+        TEST_TOKEN,
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+    )
+    .expect("wiremock URI should build a Confluence client")
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_page_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/content"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let result = retrying_client(&server)
+        .create_page(&test_runtime(), &json!({ "title": "Page" }))
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Confluence received the create — retrying publishes a \
+         SECOND page"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_page_still_retries_a_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/content"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "1",
+            "type": "page",
+            "status": "current",
+            "title": "Page"
+        })))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .create_page(&test_runtime(), &json!({ "title": "Page" }))
+        .await
+        .expect("a rate-limited create was refused without publishing anything");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means Confluence did NOT create the page, so backoff is preserved"
+    );
+}

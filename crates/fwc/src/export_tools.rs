@@ -304,21 +304,24 @@ pub fn export_operation_infos(
     }
 }
 
+/// Rank a risk level for inclusive max-filtering. Unrecognized levels rank
+/// above `critical` so any recognized ceiling excludes them.
+pub fn risk_filter_rank(level: &str) -> u8 {
+    match level {
+        "low" => 0,
+        "medium" => 1,
+        "high" => 2,
+        "critical" => 3,
+        _ => 4,
+    }
+}
+
 /// Check if an operation passes the risk filter.
 pub fn passes_risk_filter(op: &DiscoveredOperation, risk_max: Option<&str>) -> bool {
     let Some(max) = risk_max else {
         return true;
     };
-    let rank = |level: &str| -> u8 {
-        match level {
-            "low" => 0,
-            "medium" => 1,
-            "high" => 2,
-            "critical" => 3,
-            _ => 4,
-        }
-    };
-    rank(&op.summary.risk_level) <= rank(max)
+    risk_filter_rank(&op.summary.risk_level) <= risk_filter_rank(max)
 }
 
 /// Check if an operation passes the capability filter.

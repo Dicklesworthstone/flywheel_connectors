@@ -11,6 +11,8 @@ pub mod connector_state;
 pub mod doctor;
 pub mod mesh_cmd;
 pub mod pipe;
+pub mod proof_readiness;
+pub mod proof_request;
 pub mod readiness;
 pub mod recovery;
 pub mod schema_nav;

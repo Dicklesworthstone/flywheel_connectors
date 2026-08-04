@@ -494,7 +494,12 @@ async fn trello_default_deny_compliance_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["trello.boards.read"],
     );
-    let token = build_token(&signing_key, "trello.boards.read", &["trello.boards.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "trello.boards.read",
+        &["trello.boards.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "trello.cards.delete",
         json!({ "card_id": "card_abc123" }),
@@ -546,7 +551,12 @@ async fn trello_allow_valid_token_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["trello.boards.read"],
     );
-    let token = build_token(&signing_key, "trello.boards.read", &["trello.boards.list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "trello.boards.read",
+        &["trello.boards.list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("trello.boards.list", json!({}), token);
     let suite = ConnectorSuite {
         test_name: "trello_allow_valid_token".to_string(),
@@ -608,7 +618,12 @@ async fn trello_dangerous_delete_emits_receipt_audit_and_stable_evidence() {
         signing_key.verifying_key().to_bytes(),
         &["trello.cards.write"],
     );
-    let token = build_token(&signing_key, "trello.cards.write", &["trello.cards.delete"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "trello.cards.write",
+        &["trello.cards.delete"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "trello.cards.delete",
         json!({ "card_id": "card_abc123" }),

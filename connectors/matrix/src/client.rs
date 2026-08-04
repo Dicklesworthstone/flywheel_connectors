@@ -585,10 +585,21 @@ impl MatrixClient {
 }
 
 /// Minimal URL encoding for path segments.
+///
+/// `/` and every other reserved byte is percent-encoded, so a caller-supplied
+/// value can never introduce extra path structure. The one remaining hazard is
+/// a segment consisting solely of dot characters (`.`, `..`, `...`): that is a
+/// relative dot-segment which `Url::parse` normalizes away, letting the value
+/// collapse a path level (e.g. `room_id = ".."` turns `/rooms/../members` into
+/// `/members`). Percent-encode the dots in that case; a single `.` inside an
+/// otherwise-normal identifier (server names, event types like
+/// `m.room.message`) is left readable.
 fn urlencoded(s: &str) -> String {
+    let is_dot_segment = !s.is_empty() && s.bytes().all(|b| b == b'.');
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
+            b'.' if is_dot_segment => out.push_str("%2E"),
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
@@ -608,6 +619,19 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration as StdDuration, Instant};
+
+    #[test]
+    fn urlencoded_neutralizes_dot_segments_but_keeps_dotted_ids_readable() {
+        // Pure dot-segments would normalize away in the request path.
+        assert_eq!(urlencoded(".."), "%2E%2E");
+        assert_eq!(urlencoded("."), "%2E");
+        assert_eq!(urlencoded("..."), "%2E%2E%2E");
+        // Slashes are always encoded, so multi-segment traversal can't form.
+        assert_eq!(urlencoded("a/b"), "a%2Fb");
+        // Dots inside a normal identifier stay readable (server decodes either way).
+        assert_eq!(urlencoded("m.room.message"), "m.room.message");
+        assert_eq!(urlencoded("!abc123:matrix.org"), "%21abc123%3Amatrix.org");
+    }
 
     enum TestHttpPath {
         Exact(&'static str),

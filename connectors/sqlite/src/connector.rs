@@ -4,11 +4,13 @@
 
 use std::path::{Component, Path};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityId, ConnectorId, FcpError, FcpResult, IdempotencyClass,
-    OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport,
+    ApprovalMode, BaseConnector, ConnectorId, FcpError, FcpResult, OperationId, OperationInfo,
+    SelfCheckReport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,6 +22,22 @@ use crate::{
     error::SqliteError,
     types::{BatchStatement, SqliteConfig, SqliteHealth, TransactionMode, TransactionState},
 };
+
+const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const OPERATION_ORDER: &[&str] = &[
+    "sqlite.query",
+    "sqlite.execute",
+    "sqlite.explain",
+    "sqlite.schema.tables",
+    "sqlite.schema.columns",
+    "sqlite.transaction.begin",
+    "sqlite.transaction.commit",
+    "sqlite.transaction.rollback",
+    "sqlite.batch",
+    "sqlite.health",
+    "sqlite.vacuum",
+    "sqlite.pragma",
+];
 
 /// Doctor check result.
 #[derive(Debug, Clone, Serialize)]
@@ -938,382 +956,63 @@ fn validate_database_path(database_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn op_info(
-    id: &'static str,
-    summary: &str,
-    input_schema: serde_json::Value,
-    output_schema: serde_json::Value,
-    capability: &'static str,
-    risk_level: RiskLevel,
-    safety_tier: SafetyTier,
-    idempotency: IdempotencyClass,
-    ai_hints: AgentHint,
-) -> OperationInfo {
-    OperationInfo {
-        id: OperationId::from_static(id),
-        summary: summary.into(),
-        description: None,
-        input_schema,
-        output_schema,
-        capability: CapabilityId::from_static(capability),
-        risk_level,
-        safety_tier,
-        idempotency,
-        ai_hints,
-        rate_limit: None,
-        requires_approval: None,
+fn operations_info() -> Vec<OperationInfo> {
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS.get_or_init(typed_operations_info).clone()
+}
+
+fn typed_operations_info() -> Vec<OperationInfo> {
+    ordered_manifest_operations()
+        .into_iter()
+        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+        .collect()
+}
+
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest =
+        ConnectorManifest::parse_str(MANIFEST_TOML).expect("embedded SQLite manifest should parse");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
+}
+
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
+}
+
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
     }
 }
 
-fn operations_info() -> Vec<OperationInfo> {
-    vec![
-        op_info(
-            "sqlite.query",
-            "Execute a parameterized read-only SQL query",
-            json!({
-                "type": "object",
-                "required": ["sql"],
-                "properties": {
-                    "sql": { "type": "string", "description": "A single read-only SQL statement" },
-                    "params": { "type": "array", "description": "Positional query parameters" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when querying inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "Query result with columns, rows, and row_count" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use for SELECT statements or other read-only queries against a local SQLite database.".into(),
-                common_mistakes: vec![
-                    "Passing a mutating statement to sqlite.query instead of sqlite.execute.".into(),
-                    "Omitting txn_id while a transaction is active.".into(),
-                ],
-                examples: vec![
-                    r#"{"sql":"SELECT id, name FROM tasks WHERE status = ?1","params":["open"]}"#
-                        .into(),
-                ],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-        op_info(
-            "sqlite.execute",
-            "Execute a parameterized mutating SQL statement",
-            json!({
-                "type": "object",
-                "required": ["sql"],
-                "properties": {
-                    "sql": { "type": "string", "description": "A single non-returning mutating or DDL SQL statement" },
-                    "params": { "type": "array", "description": "Positional statement parameters" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when executing inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "Execution result with rows_affected and last_insert_rowid" }
-                }
-            }),
-            "sqlite.write",
-            RiskLevel::Medium,
-            SafetyTier::Risky,
-            IdempotencyClass::None,
-            AgentHint {
-                when_to_use: "Use for INSERT, UPDATE, DELETE, CREATE TABLE, and other mutating SQLite statements.".into(),
-                common_mistakes: vec![
-                    "Using sqlite.execute for statements that return rows.".into(),
-                    "Trying to run ATTACH, DETACH, PRAGMA writes, or explicit transaction SQL.".into(),
-                ],
-                examples: vec![
-                    r#"{"sql":"UPDATE tasks SET status = ?1 WHERE id = ?2","params":["done",42]}"#
-                        .into(),
-                ],
-                related: vec![CapabilityId::from_static("sqlite.write")],
-            },
-        ),
-        op_info(
-            "sqlite.explain",
-            "Explain the query plan for a read-only SQL statement",
-            json!({
-                "type": "object",
-                "required": ["sql"],
-                "properties": {
-                    "sql": { "type": "string", "description": "A single read-only SQL statement" },
-                    "params": { "type": "array", "description": "Positional query parameters" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when explaining inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "plan": { "description": "EXPLAIN QUERY PLAN output" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to inspect query plans before executing or tuning read-only SQLite queries.".into(),
-                common_mistakes: vec!["Explaining a mutating statement instead of a read-only query.".into()],
-                examples: vec![
-                    r#"{"sql":"SELECT * FROM tasks WHERE due_at < ?1","params":["2026-06-01T00:00:00Z"]}"#
-                        .into(),
-                ],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-        op_info(
-            "sqlite.schema.tables",
-            "List application tables in the configured SQLite database",
-            json!({
-                "type": "object",
-                "properties": {
-                    "txn_id": { "type": "string", "description": "Active transaction id when introspecting inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "tables": { "type": "array", "description": "Tables in the main database" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to discover tables in the configured SQLite database.".into(),
-                common_mistakes: vec!["Expecting attached databases to appear in the first slice.".into()],
-                examples: vec![r#"{"scope":"main"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-        op_info(
-            "sqlite.schema.columns",
-            "Describe the columns for a SQLite table",
-            json!({
-                "type": "object",
-                "required": ["table"],
-                "properties": {
-                    "table": { "type": "string", "description": "Table name" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when introspecting inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "columns": { "type": "array", "description": "Detailed column metadata" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to inspect the declared schema for a specific SQLite table.".into(),
-                common_mistakes: vec!["Requesting columns for a non-existent table.".into()],
-                examples: vec![r#"{"table":"tasks"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-        op_info(
-            "sqlite.transaction.begin",
-            "Begin a SQLite transaction",
-            json!({
-                "type": "object",
-                "properties": {
-                    "mode": { "type": "string", "description": "Transaction mode: deferred, immediate, or exclusive" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "transaction": { "description": "Active transaction id and mode" }
-                }
-            }),
-            "sqlite.write",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::None,
-            AgentHint {
-                when_to_use: "Use to start an explicit transaction before multiple related writes.".into(),
-                common_mistakes: vec!["Starting a new transaction while one is already active.".into()],
-                examples: vec![r#"{"mode":"immediate"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.write")],
-            },
-        ),
-        op_info(
-            "sqlite.transaction.commit",
-            "Commit the active SQLite transaction",
-            json!({
-                "type": "object",
-                "required": ["txn_id"],
-                "properties": {
-                    "txn_id": { "type": "string", "description": "Transaction id returned by sqlite.transaction.begin" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "Commit status and transaction id" }
-                }
-            }),
-            "sqlite.write",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::BestEffort,
-            AgentHint {
-                when_to_use: "Use to persist all writes performed inside the active transaction.".into(),
-                common_mistakes: vec!["Committing with the wrong txn_id.".into()],
-                examples: vec![r#"{"txn_id":"txn_01HZY7R5V8E4Q3"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.write")],
-            },
-        ),
-        op_info(
-            "sqlite.transaction.rollback",
-            "Rollback the active SQLite transaction",
-            json!({
-                "type": "object",
-                "required": ["txn_id"],
-                "properties": {
-                    "txn_id": { "type": "string", "description": "Transaction id returned by sqlite.transaction.begin" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "Rollback status and transaction id" }
-                }
-            }),
-            "sqlite.write",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::BestEffort,
-            AgentHint {
-                when_to_use: "Use to discard writes in the active SQLite transaction.".into(),
-                common_mistakes: vec!["Rolling back a transaction that is no longer active.".into()],
-                examples: vec![r#"{"txn_id":"txn_01HZY7R5V8E4Q3"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.write")],
-            },
-        ),
-        op_info(
-            "sqlite.batch",
-            "Execute multiple SQLite statements atomically via a savepoint",
-            json!({
-                "type": "object",
-                "required": ["statements"],
-                "properties": {
-                    "statements": { "type": "array", "description": "Statements to execute, each with sql and params" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when batching inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "results": { "description": "Per-statement execution results" }
-                }
-            }),
-            "sqlite.write",
-            RiskLevel::Medium,
-            SafetyTier::Risky,
-            IdempotencyClass::None,
-            AgentHint {
-                when_to_use: "Use to run multiple related writes atomically in one SQLite batch.".into(),
-                common_mistakes: vec!["Providing an empty batch.".into()],
-                examples: vec![
-                    r#"{"statements":[{"sql":"INSERT INTO tasks(name) VALUES (?1)","params":["write release notes"]},{"sql":"UPDATE counters SET value = value + 1 WHERE name = ?1","params":["tasks_created"]}]}"#
-                        .into(),
-                ],
-                related: vec![CapabilityId::from_static("sqlite.write")],
-            },
-        ),
-        op_info(
-            "sqlite.health",
-            "Run a local SQLite health probe",
-            json!({
-                "type": "object",
-                "properties": {}
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "health": { "description": "Health probe details for the configured database" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to confirm the configured SQLite database is reachable and responsive.".into(),
-                common_mistakes: vec![
-                    "Treating health success as proof that a specific table or pragma exists.".into(),
-                ],
-                examples: vec![r#"{"check":"local-database"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-        op_info(
-            "sqlite.vacuum",
-            "Run VACUUM against the configured SQLite database",
-            json!({
-                "type": "object",
-                "properties": {}
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "VACUUM completion result" }
-                }
-            }),
-            "sqlite.admin",
-            RiskLevel::Medium,
-            SafetyTier::Risky,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to rebuild and compact the SQLite database when no transaction is active.".into(),
-                common_mistakes: vec!["Running VACUUM while a transaction is active.".into()],
-                examples: vec![r#"{"confirm":"compact-local-database"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.admin")],
-            },
-        ),
-        op_info(
-            "sqlite.pragma",
-            "Read an allowlisted SQLite pragma value",
-            json!({
-                "type": "object",
-                "required": ["name"],
-                "properties": {
-                    "name": { "type": "string", "description": "Allowlisted pragma name" },
-                    "txn_id": { "type": "string", "description": "Active transaction id when reading pragmas inside a transaction" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "properties": {
-                    "result": { "description": "Pragma query result" }
-                }
-            }),
-            "sqlite.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Use to inspect safe SQLite configuration values such as journal_mode or user_version.".into(),
-                common_mistakes: vec!["Trying to write a pragma via sqlite.pragma instead of using a supported admin flow.".into()],
-                examples: vec![r#"{"name":"journal_mode"}"#.into()],
-                related: vec![CapabilityId::from_static("sqlite.read")],
-            },
-        ),
-    ]
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
 }
 
 #[cfg(test)]
@@ -1361,27 +1060,12 @@ mod tests {
 
     #[test]
     fn operations_include_first_slice_sqlite_surface() {
-        let ids = operations_info()
-            .into_iter()
-            .map(|operation| operation.id.to_string())
+        let operations = operations_info();
+        let ids = operations
+            .iter()
+            .map(|operation| operation.id.as_str())
             .collect::<Vec<_>>();
-
-        for expected in [
-            "sqlite.query",
-            "sqlite.execute",
-            "sqlite.explain",
-            "sqlite.schema.tables",
-            "sqlite.schema.columns",
-            "sqlite.transaction.begin",
-            "sqlite.transaction.commit",
-            "sqlite.transaction.rollback",
-            "sqlite.batch",
-            "sqlite.health",
-            "sqlite.vacuum",
-            "sqlite.pragma",
-        ] {
-            assert!(ids.iter().any(|id| id == expected), "missing {expected}");
-        }
+        assert_eq!(ids, OPERATION_ORDER);
     }
 
     #[test]
@@ -1424,77 +1108,48 @@ mod tests {
     }
 
     #[test]
-    fn manifest_ai_hints_match_runtime_catalog() {
-        let manifest = toml::from_str::<toml::Table>(include_str!("../manifest.toml"))
-            .expect("SQLite manifest should parse as TOML");
-        let operations = manifest
-            .get("provides")
-            .and_then(toml::Value::as_table)
-            .and_then(|provides| provides.get("operations"))
-            .and_then(toml::Value::as_table)
-            .expect("SQLite manifest must declare operations");
-        let runtime_ids = operations_info()
-            .into_iter()
-            .map(|operation| operation.id.to_string())
-            .collect::<Vec<_>>();
-        let sensitive_markers = ["api_key", "password", "secret", "token", "@example.com"];
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let manifest =
+            ConnectorManifest::parse_str(MANIFEST_TOML).expect("SQLite manifest should parse");
+        let operations = operations_info();
 
-        assert_eq!(operations.len(), runtime_ids.len());
-        for (operation_id, operation) in operations {
-            let operation = operation
-                .as_table()
-                .expect("manifest operation entry must be a table");
-            let ai_hints = operation
-                .get("ai_hints")
-                .and_then(toml::Value::as_table)
-                .expect("manifest operation must include ai_hints");
-            assert!(
-                runtime_ids.contains(operation_id),
-                "manifest operation {operation_id} missing from runtime catalog"
+        assert_eq!(operations.len(), manifest.provides.operations.len());
+        for operation in operations {
+            let manifest_operation = manifest
+                .provides
+                .operations
+                .get(operation.id.as_str())
+                .expect("runtime operation should be declared in manifest");
+            assert_eq!(operation.summary, manifest_operation.description);
+            assert_eq!(
+                operation.description.as_deref(),
+                Some(manifest_operation.description.as_str())
             );
-            assert!(
-                ai_hints
-                    .get("when_to_use")
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|when_to_use| !when_to_use.trim().is_empty()),
-                "{operation_id} must explain when to use the operation"
+            assert_eq!(operation.input_schema, manifest_operation.input_schema);
+            assert_eq!(operation.output_schema, manifest_operation.output_schema);
+            assert_eq!(operation.capability, manifest_operation.capability);
+            assert_eq!(operation.risk_level, manifest_operation.risk_level);
+            assert_eq!(operation.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(operation.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                operation.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
             );
-            let common_mistakes = ai_hints
-                .get("common_mistakes")
-                .and_then(toml::Value::as_array)
-                .expect("manifest ai_hints must declare common_mistakes");
-            assert!(
-                common_mistakes
-                    .iter()
-                    .any(|mistake| mistake.as_str().is_some_and(|text| !text.trim().is_empty())),
-                "{operation_id} must document a concrete mistake"
+            assert_eq!(
+                serde_json::to_value(&operation.ai_hints).expect("operation hints serialize"),
+                serde_json::to_value(&manifest_operation.ai_hints)
+                    .expect("manifest operation hints serialize")
             );
-            let examples = ai_hints
-                .get("examples")
-                .and_then(toml::Value::as_array)
-                .expect("manifest ai_hints must declare examples");
-            assert!(
-                examples
-                    .iter()
-                    .any(|example| example.as_str().is_some_and(|text| !text.trim().is_empty())),
-                "{operation_id} must include a synthetic example"
+            let expected_rate_limit = manifest_operation
+                .rate_limit
+                .as_ref()
+                .map(|rate_limit| rate_limit.0.clone());
+            assert_eq!(
+                serde_json::to_value(&operation.rate_limit)
+                    .expect("operation rate limit serializes"),
+                serde_json::to_value(&expected_rate_limit)
+                    .expect("manifest operation rate limit serializes")
             );
-            for example in examples {
-                assert!(example.is_str(), "{operation_id} example must be a string");
-                let example = example.as_str().unwrap_or("");
-                let parsed = serde_json::from_str::<serde_json::Value>(example);
-                assert!(
-                    matches!(parsed.as_ref(), Ok(value) if value.is_object()),
-                    "{operation_id} example should be a JSON object: {example}"
-                );
-                let lower = example.to_ascii_lowercase();
-                for marker in sensitive_markers {
-                    assert!(
-                        !lower.contains(marker),
-                        "{operation_id} example should not include sensitive marker {marker}"
-                    );
-                }
-            }
         }
     }
 

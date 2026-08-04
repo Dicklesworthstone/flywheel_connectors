@@ -9,7 +9,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -294,6 +294,69 @@ fn chrono_duration(duration: StdDuration) -> AuthResult<TimeDelta> {
         .map_err(|_| invalid_config("ttl", "duration is outside chrono range"))
 }
 
+/// Resolve a TTL into an absolute expiry, rejecting values that would overflow
+/// the timestamp instead of panicking.
+///
+/// `TimeDelta::from_std` only rejects durations outside `TimeDelta`'s own range
+/// (~9.2e15 s), but `DateTime<Utc>` tops out near year 262143 (~8.2e12 s from
+/// now) and `DateTime + TimeDelta` is an `expect` internally. Everything in the
+/// gap between those two bounds passed validation and then panicked. Since
+/// `expires_in` comes straight off a provider token response — a `u64` parsed
+/// from attacker-influenceable JSON — `{"expires_in": 9000000000000000}` was
+/// enough to panic the handler task. Fail closed with a typed error instead.
+/// Whether a refreshed scope string stays within the originally granted set.
+///
+/// RFC 6749 §6: a refresh response MUST NOT include any scope the resource
+/// owner did not originally grant. An empty `granted` means the grant scope was
+/// never observed (the provider omitted it on the original exchange), which
+/// cannot be meaningfully narrowed, so it accepts rather than failing closed on
+/// missing information.
+fn refreshed_scope_is_subset(granted: &str, refreshed: &str) -> bool {
+    let granted_scopes: HashSet<&str> = granted.split_whitespace().collect();
+    if granted_scopes.is_empty() {
+        return true;
+    }
+    refreshed
+        .split_whitespace()
+        .all(|scope| granted_scopes.contains(scope))
+}
+
+/// Decide the granted scope to keep after a refresh response.
+///
+/// Two failure modes this closes, both mirroring the fcp-oauth production path:
+/// - An OMITTED scope must preserve the previously granted one rather than
+///   dropping it, otherwise the next refresh has nothing to narrow against and
+///   the widening guard below is permanently disarmed.
+/// - A WIDENED scope is rejected: a compromised or misbehaving token endpoint
+///   answering `read` with `read write admin` must not silently escalate what
+///   the profile is authorized for.
+fn resolve_refreshed_scope(
+    granted: Option<&str>,
+    refreshed: Option<String>,
+) -> AuthResult<Option<String>> {
+    match refreshed {
+        None => Ok(granted.map(ToString::to_string)),
+        Some(refreshed) => {
+            if let Some(granted) = granted {
+                if !refreshed_scope_is_subset(granted, &refreshed) {
+                    return Err(invalid_config(
+                        "scope",
+                        "refresh response expanded the granted scope",
+                    ));
+                }
+            }
+            Ok(Some(refreshed))
+        }
+    }
+}
+
+fn expiry_from_ttl(duration: StdDuration, field: &'static str) -> AuthResult<DateTime<Utc>> {
+    let delta = chrono_duration(duration)?;
+    Utc::now()
+        .checked_add_signed(delta)
+        .ok_or_else(|| invalid_config(field, "expiry overflows the representable timestamp range"))
+}
+
 /// Secret string wrapper that redacts every formatting path and zeroizes on drop.
 #[derive(Eq)]
 pub struct RedactedSecret(Zeroizing<String>);
@@ -357,7 +420,17 @@ impl fmt::Display for RedactedSecret {
 pub struct SigV4SigningContext {
     /// HTTP method such as `GET` or `POST`.
     pub method: String,
-    /// Absolute path component. Empty paths are canonicalized to `/`.
+    /// **Wire** path component — the absolute path exactly as it will appear in
+    /// the request line, percent-encoded (`url::Url::path()` produces it
+    /// directly, as `/bucket/my%20key`). Empty paths are canonicalized to `/`.
+    ///
+    /// The signer percent-DECODES this before building the canonical URI,
+    /// because that is what the service does with what it receives. Passing an
+    /// already-decoded path here signs a different resource than the one the
+    /// request targets whenever the path contains anything needing an escape.
+    ///
+    /// This matches `fcp_sdk::sigv4::SignableRequest::uri`; the two crates
+    /// must not diverge.
     pub uri_path: String,
     /// Query parameters before `SigV4` URI encoding.
     pub query_params: BTreeMap<String, String>,
@@ -629,6 +702,14 @@ pub struct OAuthDeviceCodeAuth {
     pub token_url: String,
     /// Requested scope string.
     pub scope: String,
+    /// Scope the provider actually GRANTED, as reported on the token response.
+    ///
+    /// Distinct from [`Self::scope`], which is only what was *requested*.
+    /// Refreshes are issued against this value so a user who consented to a
+    /// narrower set (or later revoked part of it) is not silently re-asked for
+    /// the full original scope on every refresh — RFC 6749 §6 forbids
+    /// requesting a scope that was never granted.
+    pub granted_scope: Option<String>,
     /// Current access token, if the flow has completed.
     pub access_token: Option<RedactedSecret>,
     /// Current refresh token, if the provider issued one.
@@ -662,6 +743,7 @@ impl OAuthDeviceCodeAuth {
             device_code_url: config.device_code_url,
             token_url: config.token_url,
             scope: config.scope,
+            granted_scope: None,
             access_token: None,
             refresh_token: None,
             expires_at: None,
@@ -674,6 +756,7 @@ impl OAuthDeviceCodeAuth {
             access_token,
             refresh_token,
             expires_at,
+            scope,
             ..
         } = tokens;
         let access_slot = &mut self.access_token;
@@ -681,18 +764,26 @@ impl OAuthDeviceCodeAuth {
         let refresh_slot = &mut self.refresh_token;
         *refresh_slot = refresh_token;
         self.expires_at = expires_at;
+        // Record what was actually granted; the token response is the only
+        // place this is ever observable.
+        self.granted_scope = scope;
     }
 
     /// Build refresh-token flow configuration from this auth state.
+    ///
+    /// Refreshes are issued against the GRANTED scope when one was observed,
+    /// falling back to the configured request scope only when the provider
+    /// never reported one.
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidConfig`] when stored OAuth fields are invalid.
     pub fn refresh_config(&self) -> AuthResult<OAuthRefreshTokenConfig> {
-        let scope = if self.scope.is_empty() {
+        let effective = self.granted_scope.as_deref().unwrap_or(&self.scope);
+        let scope = if effective.is_empty() {
             None
         } else {
-            Some(self.scope.clone())
+            Some(effective.to_string())
         };
         OAuthRefreshTokenConfig::public_client(
             self.client_id.clone(),
@@ -733,31 +824,47 @@ impl OAuthDeviceCodeAuth {
         let config = self.refresh_config()?;
         let grant = self.refresh_grant()?;
         let tokens = OAuthRefreshTokenFlow::refresh(cx, &config, &grant, transport).await?;
-        self.apply_refreshed_tokens(tokens);
-        Ok(())
+        self.apply_refreshed_tokens(tokens)
     }
 
-    fn apply_refreshed_tokens(&mut self, tokens: OAuthTokens) {
+    fn apply_refreshed_tokens(&mut self, tokens: OAuthTokens) -> AuthResult<()> {
         let OAuthTokens {
             access_token: fresh_access,
             refresh_token: fresh_refresh,
             expires_at,
+            scope,
             ..
         } = tokens;
+        // Scope first: a widening response must be rejected BEFORE any state is
+        // mutated, so a refused refresh cannot leave half-applied material.
+        let granted_scope = resolve_refreshed_scope(self.granted_scope.as_deref(), scope)?;
+
         let access_slot = &mut self.access_token;
         *access_slot = Some(fresh_access);
         if let Some(material) = fresh_refresh {
             let refresh_slot = &mut self.refresh_token;
             *refresh_slot = Some(material);
         }
-        self.expires_at = expires_at;
+        // Preserve a known expiry when the provider omits `expires_in`.
+        // RFC 6749 §5.1 makes `expires_in` RECOMMENDED, not required, and
+        // several providers omit it on refresh. Clobbering a known TTL to
+        // `None` turned the profile into a never-expiring one:
+        // `requires_refresh_in()` then returned `None`, the refresh policy
+        // classified it `NotRefreshable`, and every expiry gate
+        // (`apply_bearer_token`, the host's egress injector) is written as
+        // `if let Some(expires_at)` — so the stale bearer was injected
+        // indefinitely and never refreshed again. Same bug class already
+        // fixed on the fcp-oauth production path (br-62b0adc34).
+        self.expires_at = expires_at.or(self.expires_at);
+        self.granted_scope = granted_scope;
+        Ok(())
     }
 
     fn validate_config(&self) -> AuthResult<()> {
         validate_non_empty(&self.client_id, "client_id")?;
         validate_no_crlf(&self.client_id, "client_id")?;
-        validate_oauth_endpoint(&self.device_code_url, "device_code_url")?;
-        validate_oauth_endpoint(&self.token_url, "token_url")?;
+        parse_oauth_url(&self.device_code_url, "device_code_url")?;
+        parse_oauth_url(&self.token_url, "token_url")?;
         validate_no_crlf(&self.scope, "scope")
     }
 }
@@ -915,9 +1022,15 @@ impl OAuthDeviceCodeChallenge {
         validate_no_crlf(self.device_code.expose_secret(), "device_code")?;
         validate_non_empty(&self.user_code, "user_code")?;
         validate_no_crlf(&self.user_code, "user_code")?;
-        validate_oauth_endpoint(&self.verification_uri, "verification_uri")?;
+        // These two are the least-trusted inputs in the whole flow — they come
+        // verbatim from the provider's device-code response and are handed to
+        // an operator (or a browser) to open. A non-empty/no-CRLF check is not
+        // enough: it accepted `javascript:` and other non-HTTP schemes, and
+        // the host echoes the value straight back in its API response. Parse
+        // them and pin the scheme like every operator-supplied endpoint.
+        parse_oauth_url(&self.verification_uri, "verification_uri")?;
         if let Some(uri) = self.verification_uri_complete.as_deref() {
-            validate_oauth_endpoint(uri, "verification_uri_complete")?;
+            parse_oauth_url(uri, "verification_uri_complete")?;
         }
         if self.interval.is_zero() {
             return Err(invalid_config("interval", "must be greater than zero"));
@@ -975,9 +1088,8 @@ impl OAuthTokens {
             token_type: "Bearer".to_string(),
             refresh_token: refresh_token.map(RedactedSecret::new).transpose()?,
             expires_at: expires_in
-                .map(chrono_duration)
-                .transpose()?
-                .map(|duration| Utc::now() + duration),
+                .map(|ttl| expiry_from_ttl(ttl, "expires_in"))
+                .transpose()?,
             scope,
         })
     }
@@ -1398,6 +1510,11 @@ pub struct OAuthAuthCodeAuth {
     pub use_pkce: bool,
     /// Extra provider-specific authorization URL parameters.
     pub extra_authorize_params: BTreeMap<String, String>,
+    /// Scope the provider actually GRANTED, as reported on the token response.
+    ///
+    /// See [`OAuthDeviceCodeAuth::granted_scope`] for why refreshes are issued
+    /// against this rather than the requested [`Self::scope`].
+    pub granted_scope: Option<String>,
     /// Current access token, if the flow has completed.
     pub access_token: Option<RedactedSecret>,
     /// Current refresh token, if the provider issued one.
@@ -1469,6 +1586,7 @@ impl OAuthAuthCodeAuth {
             scope: config.scope,
             use_pkce: config.use_pkce,
             extra_authorize_params: config.extra_authorize_params,
+            granted_scope: None,
             access_token: None,
             refresh_token: None,
             expires_at: None,
@@ -1481,6 +1599,7 @@ impl OAuthAuthCodeAuth {
             access_token,
             refresh_token,
             expires_at,
+            scope,
             ..
         } = tokens;
         let access_slot = &mut self.access_token;
@@ -1488,18 +1607,23 @@ impl OAuthAuthCodeAuth {
         let refresh_slot = &mut self.refresh_token;
         *refresh_slot = refresh_token;
         self.expires_at = expires_at;
+        self.granted_scope = scope;
     }
 
     /// Build refresh-token flow configuration from this auth state.
+    ///
+    /// Refreshes are issued against the GRANTED scope when one was observed —
+    /// see [`OAuthDeviceCodeAuth::refresh_config`].
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidConfig`] when stored OAuth fields are invalid.
     pub fn refresh_config(&self) -> AuthResult<OAuthRefreshTokenConfig> {
-        let scope = if self.scope.is_empty() {
+        let effective = self.granted_scope.as_deref().unwrap_or(&self.scope);
+        let scope = if effective.is_empty() {
             None
         } else {
-            Some(self.scope.clone())
+            Some(effective.to_string())
         };
         let secret_material = self
             .client_secret
@@ -1545,24 +1669,34 @@ impl OAuthAuthCodeAuth {
         let config = self.refresh_config()?;
         let grant = self.refresh_grant()?;
         let tokens = OAuthRefreshTokenFlow::refresh(cx, &config, &grant, transport).await?;
-        self.apply_refreshed_tokens(tokens);
-        Ok(())
+        self.apply_refreshed_tokens(tokens)
     }
 
-    fn apply_refreshed_tokens(&mut self, tokens: OAuthTokens) {
+    fn apply_refreshed_tokens(&mut self, tokens: OAuthTokens) -> AuthResult<()> {
         let OAuthTokens {
             access_token: fresh_access,
             refresh_token: fresh_refresh,
             expires_at,
+            scope,
             ..
         } = tokens;
+        // Reject a widening scope before mutating anything — see
+        // `OAuthDeviceCodeAuth::apply_refreshed_tokens`.
+        let granted_scope = resolve_refreshed_scope(self.granted_scope.as_deref(), scope)?;
+
         let access_slot = &mut self.access_token;
         *access_slot = Some(fresh_access);
         if let Some(material) = fresh_refresh {
             let refresh_slot = &mut self.refresh_token;
             *refresh_slot = Some(material);
         }
-        self.expires_at = expires_at;
+        // Preserve a known expiry when the provider omits `expires_in` —
+        // see the identical guard on `OAuthDeviceCodeAuth::apply_refreshed_tokens`
+        // for why clobbering it to `None` silently disables both the refresh
+        // loop and every downstream expiry gate.
+        self.expires_at = expires_at.or(self.expires_at);
+        self.granted_scope = granted_scope;
+        Ok(())
     }
 
     fn validate_config(&self) -> AuthResult<()> {
@@ -2303,7 +2437,7 @@ impl JwtAuth {
 
     fn regenerate_jwt(&self) -> AuthResult<JwtCachedToken> {
         let jwt = RedactedSecret::new((self.generator)()?)?;
-        let expires_at = Utc::now() + chrono_duration(self.ttl)?;
+        let expires_at = expiry_from_ttl(self.ttl, "ttl")?;
         let cached = JwtCachedToken {
             token: jwt,
             expires_at,
@@ -2386,8 +2520,13 @@ pub struct SigV4SignedAuth {
 
 impl fmt::Debug for SigV4SignedAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `authorization` embeds `Credential=<ACCESS_KEY_ID>/<scope>` plus the
+        // request signature. `SigV4Auth` keeps `access_key` in a
+        // `RedactedSecret` precisely so it never reaches a log line, so
+        // printing the header verbatim here would have leaked it right back
+        // out through any `format!("{signed:?}")`.
         f.debug_struct("SigV4SignedAuth")
-            .field("authorization", &self.authorization)
+            .field("authorization", &"[REDACTED]")
             .field("x_amz_date", &self.x_amz_date)
             .field("x_amz_content_sha256", &self.x_amz_content_sha256)
             .field(
@@ -2397,6 +2536,105 @@ impl fmt::Debug for SigV4SignedAuth {
             .field("signed_headers", &self.signed_headers)
             .finish()
     }
+}
+
+/// Number of URI-encoding passes applied to the canonical request's path.
+///
+/// Mirrors `fcp_sdk::sigv4::CanonicalPathEncoding`; the two crates sign the
+/// same resource and must agree byte-for-byte on how the path is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalPathEncoding {
+    /// Encode each path segment once — Amazon S3.
+    Single,
+    /// Encode each path segment twice — every other AWS service.
+    Double,
+}
+
+/// Whether the canonical URI path has RFC 3986 dot segments resolved.
+///
+/// A second, independent axis from [`CanonicalPathEncoding`], and independent in
+/// AWS's own signer too: `aws-c-auth` carries `should_normalize_uri_path` and
+/// `use_double_uri_encode` as separate flags.
+///
+/// S3 treats the path as an opaque object key, so `/a/../b` names a literal key
+/// containing `..` and must be signed as written; every other service resolves it
+/// to `/b` before signing.
+///
+/// Mirrors `fcp_sdk::sigv4::CanonicalPathNormalization`; the two crates sign the
+/// same resource and must agree byte-for-byte on how the path is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalPathNormalization {
+    /// Resolve `.` / `..` and collapse duplicate slashes — every service but S3.
+    RemoveDotSegments,
+    /// Sign the path exactly as supplied — Amazon S3.
+    Preserve,
+}
+
+/// Per-call overrides for [`SigV4Auth::sign_traced`].
+///
+/// These are signing-call options, deliberately NOT fields on [`SigV4Auth`].
+/// `SigV4Auth` is a credential/config value that derives `PartialEq`, so folding
+/// behaviour knobs into it would make two otherwise-identical auth
+/// configurations compare unequal over a difference that is not part of the
+/// credential at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigV4SigningOptions {
+    /// Overrides the service-derived path-normalisation profile when set.
+    ///
+    /// Production callers should leave this `None`:
+    /// [`SigV4Auth::canonical_path_normalization`] derives it from the service
+    /// name. It exists so the signer can be driven per case against AWS's
+    /// published vectors, which carry the profile in each case's
+    /// `context.normalize` while every case names the same service.
+    pub path_normalization: Option<CanonicalPathNormalization>,
+    /// Whether `x-amz-content-sha256` joins the signed header set. Default
+    /// `true`.
+    ///
+    /// Set `false` to sign exactly the headers supplied. AWS's published vectors
+    /// sign a service that does not carry the header, so leaving it in makes
+    /// every vector mismatch for a reason unrelated to the canonicalisation
+    /// rules they exist to pin.
+    pub sign_content_sha256_header: bool,
+    /// Sign without `x-amz-security-token`, leaving the caller to add the token
+    /// to the request *after* signing. Default `false`.
+    ///
+    /// This is AWS's own `omit_session_token` signing flag. The token is omitted
+    /// from the *signature*, not from the request:
+    /// [`SigV4SignedAuth::x_amz_security_token`] is still populated.
+    pub omit_session_token: bool,
+}
+
+impl Default for SigV4SigningOptions {
+    fn default() -> Self {
+        Self {
+            path_normalization: None,
+            sign_content_sha256_header: true,
+            omit_session_token: false,
+        }
+    }
+}
+
+/// Intermediate artifacts produced by one `SigV4` signing pass.
+///
+/// `SigV4` is a pipeline — canonical request, then string-to-sign, then
+/// signature — and each stage hashes into the next. Comparing only the final
+/// signature against a reference tells you *that* a signer diverged but not
+/// *where*, because every stage collapses into an opaque hex digest.
+///
+/// Mirrors `fcp_sdk::sigv4::SigV4Trace`, so one differential harness can drive
+/// both signers and localise a mismatch to a single stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigV4Trace {
+    /// Canonical request (AWS "Task 1").
+    pub canonical_request: String,
+    /// String to sign (AWS "Task 2").
+    pub string_to_sign: String,
+    /// Hex-encoded signature (AWS "Task 3").
+    pub signature: String,
+    /// Semicolon-joined lowercase signed header names.
+    pub signed_headers: String,
+    /// `<date>/<region>/<service>/aws4_request`.
+    pub credential_scope: String,
 }
 
 /// AWS `SigV4` auth configuration.
@@ -2440,6 +2678,43 @@ impl SigV4Auth {
         })
     }
 
+    /// How many times this service's canonical URI path is encoded.
+    ///
+    /// `SigV4` requires each path segment to be URI-encoded **twice** for every
+    /// service except Amazon S3, which requires exactly **once**. Signing S3
+    /// with the double-encoded form (or anything else with the single-encoded
+    /// form) produces a canonical request the service will not reproduce, and
+    /// the request is rejected with `SignatureDoesNotMatch`.
+    ///
+    /// The comparison is case-insensitive because `service` is a public field:
+    /// [`SigV4Auth::new`] lowercases it, but a struct literal does not.
+    #[must_use]
+    pub fn canonical_path_encoding(&self) -> CanonicalPathEncoding {
+        if self.service.eq_ignore_ascii_case("s3") {
+            CanonicalPathEncoding::Single
+        } else {
+            CanonicalPathEncoding::Double
+        }
+    }
+
+    /// Whether this service's canonical URI has dot segments resolved.
+    ///
+    /// Same S3-vs-everything-else split as [`Self::canonical_path_encoding`], and
+    /// case-insensitive for the same reason.
+    ///
+    /// S3 stays on `Preserve` and that is the point of the split, not an
+    /// optimisation: an S3 object key may legitimately contain `..` or a double
+    /// slash, so `/a/../b` names a literal key there while every other service
+    /// resolves it to `/b`.
+    #[must_use]
+    pub fn canonical_path_normalization(&self) -> CanonicalPathNormalization {
+        if self.service.eq_ignore_ascii_case("s3") {
+            CanonicalPathNormalization::Preserve
+        } else {
+            CanonicalPathNormalization::RemoveDotSegments
+        }
+    }
+
     /// Sign a request context and return the headers `SigV4` must apply.
     ///
     /// # Errors
@@ -2450,6 +2725,26 @@ impl SigV4Auth {
         context: &SigV4SigningContext,
         request_headers: &BTreeMap<String, String>,
     ) -> AuthResult<SigV4SignedAuth> {
+        self.sign_traced(context, request_headers, SigV4SigningOptions::default())
+            .map(|(signed, _trace)| signed)
+    }
+
+    /// Sign a request context, additionally returning every intermediate
+    /// artifact.
+    ///
+    /// Same computation as [`Self::sign`], which delegates here with
+    /// [`SigV4SigningOptions::default`]; see [`SigV4Trace`] for why the
+    /// intermediates are worth surfacing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AuthError`] when required request context or headers are invalid.
+    pub fn sign_traced(
+        &self,
+        context: &SigV4SigningContext,
+        request_headers: &BTreeMap<String, String>,
+        options: SigV4SigningOptions,
+    ) -> AuthResult<(SigV4SignedAuth, SigV4Trace)> {
         validate_non_empty(&self.region, "region")?;
         validate_non_empty(&self.service, "service")?;
         let signing_time = context.signing_time.unwrap_or_else(Utc::now);
@@ -2460,39 +2755,68 @@ impl SigV4Auth {
 
         let mut headers = request_headers.clone();
         headers.insert("x-amz-date".to_string(), amz_date.clone());
-        headers.insert(
-            "x-amz-content-sha256".to_string(),
-            context.payload_hash.clone(),
-        );
-        if let Some(session_token) = &self.session_token {
+        if options.sign_content_sha256_header {
             headers.insert(
-                "x-amz-security-token".to_string(),
-                session_token.expose_secret().to_string(),
+                "x-amz-content-sha256".to_string(),
+                context.payload_hash.clone(),
             );
+        }
+        if let Some(session_token) = &self.session_token {
+            if !options.omit_session_token {
+                headers.insert(
+                    "x-amz-security-token".to_string(),
+                    session_token.expose_secret().to_string(),
+                );
+            }
         }
 
         let (canonical_headers, signed_headers) = canonical_headers(&headers)?;
-        let canonical_request = canonical_request(context, &canonical_headers, &signed_headers);
+        let canonical_request = canonical_request(
+            context,
+            &canonical_headers,
+            &signed_headers,
+            self.canonical_path_encoding(),
+            options
+                .path_normalization
+                .unwrap_or_else(|| self.canonical_path_normalization()),
+        );
         let canonical_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
         let string_to_sign =
             format!("{SIGV4_ALGORITHM}\n{amz_date}\n{credential_scope}\n{canonical_hash}");
         let signing_key = self.derive_signing_key(&date_stamp);
         let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        // `", "` after each comma, matching AWS's own documented examples and
+        // `fcp_sdk::sigv4`. Both spacings are accepted by AWS — the Authorization
+        // header is not part of the signed material — but the two crates emitting
+        // different bytes meant a golden header captured from one could not be
+        // reused against the other, which is a trap for exactly the kind of
+        // cross-crate fixture sharing this parity work exists to enable.
         let authorization = format!(
-            "{SIGV4_ALGORITHM} Credential={}/{credential_scope},SignedHeaders={signed_headers},Signature={signature}",
+            "{SIGV4_ALGORITHM} Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
             self.access_key.expose_secret(),
         );
 
-        Ok(SigV4SignedAuth {
-            authorization,
-            x_amz_date: amz_date,
-            x_amz_content_sha256: context.payload_hash.clone(),
-            x_amz_security_token: self
-                .session_token
-                .as_ref()
-                .map(|token| token.expose_secret().to_string()),
-            signed_headers,
-        })
+        Ok((
+            SigV4SignedAuth {
+                authorization,
+                x_amz_date: amz_date,
+                x_amz_content_sha256: context.payload_hash.clone(),
+                // Populated even when `omit_session_token` is set: the token is
+                // omitted from the signature, not from the request.
+                x_amz_security_token: self
+                    .session_token
+                    .as_ref()
+                    .map(|token| token.expose_secret().to_string()),
+                signed_headers: signed_headers.clone(),
+            },
+            SigV4Trace {
+                canonical_request,
+                string_to_sign,
+                signature,
+                signed_headers,
+                credential_scope,
+            },
+        ))
     }
 
     fn derive_signing_key(&self, date_stamp: &str) -> Vec<u8> {
@@ -3021,11 +3345,13 @@ fn canonical_request(
     context: &SigV4SigningContext,
     canonical_headers: &str,
     signed_headers: &str,
+    path_encoding: CanonicalPathEncoding,
+    path_normalization: CanonicalPathNormalization,
 ) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{signed_headers}\n{}",
         context.method,
-        canonical_uri(&context.uri_path),
+        canonical_uri(&context.uri_path, path_encoding, path_normalization),
         canonical_query(&context.query_params),
         canonical_headers,
         context.payload_hash,
@@ -3072,16 +3398,90 @@ fn canonical_query(params: &BTreeMap<String, String>) -> String {
         .join("&")
 }
 
-fn canonical_uri(path: &str) -> String {
-    let path = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
+/// Percent-decode a wire path back to the raw bytes the service will see.
+///
+/// Invalid UTF-8 is replaced rather than rejected: the canonical URI is only
+/// ever compared against the service's own rendering, and a request whose path
+/// is not valid UTF-8 will fail on its own merits rather than here.
+fn percent_decode_path(path: &str) -> String {
+    percent_encoding::percent_decode_str(path)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn uri_encode_path(path: &str) -> String {
     path.split('/')
         .map(uri_encode)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Build the canonical URI for a request.
+///
+/// The service percent-decodes the path it receives and then re-encodes it to
+/// canonicalize, so the signer has to do the same thing: decode the wire path,
+/// then apply the service's required number of encoding passes. Encoding the
+/// wire path directly (the previous behaviour) is only equivalent when the path
+/// contains nothing that needed escaping in the first place — which is why
+/// plain ASCII keys signed correctly while a key with a space, a literal `%`,
+/// or any non-ASCII character produced `SignatureDoesNotMatch`.
+///
+/// Ported verbatim from `fcp_sdk::sigv4`; see br-1nqg7 and br-0lsi3.
+fn canonical_uri(
+    wire_path: &str,
+    encoding: CanonicalPathEncoding,
+    normalization: CanonicalPathNormalization,
+) -> String {
+    let wire_path = if wire_path.starts_with('/') {
+        wire_path.to_string()
+    } else {
+        format!("/{wire_path}")
+    };
+    // Normalise the WIRE path, before decoding. Order matters, and matches both
+    // `fcp_sdk::sigv4` and AWS's own signer (`aws-c-auth` normalises the URI path
+    // it was handed and only then encodes). Decoding first would turn an encoded
+    // `%2F` inside a segment into a real separator, and normalisation would then
+    // treat it as one — silently signing a different resource than the request
+    // targets. Dot segments are unreserved and so are never percent-encoded on
+    // the wire, which is why normalising first loses nothing.
+    let normalized = match normalization {
+        CanonicalPathNormalization::RemoveDotSegments => remove_dot_segments(&wire_path),
+        CanonicalPathNormalization::Preserve => wire_path,
+    };
+    let once = uri_encode_path(&percent_decode_path(&normalized));
+    match encoding {
+        CanonicalPathEncoding::Single => once,
+        CanonicalPathEncoding::Double => uri_encode_path(&once),
+    }
+}
+
+/// Resolve `.` and `..` segments and collapse duplicate slashes, per RFC 3986
+/// §6.2.2.3 plus AWS's additional empty-segment collapsing.
+///
+/// Verified against AWS's published vectors: `/example/..`, `//` and `/./` all
+/// canonicalise to `/`; `/./example` to `/example`; `//example//` to `/example/`.
+/// A trailing slash on the input is preserved when any segment survives.
+///
+/// Ported from `fcp_sdk::sigv4` so both signers render a joined path the same
+/// way. Its absence here was a live `SignatureDoesNotMatch` for every non-S3
+/// caller that built a path by joining segments and landed a `//`, `.` or `..`.
+fn remove_dot_segments(path: &str) -> String {
+    let mut resolved: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // An empty segment is a duplicate (or leading/trailing) slash.
+            "" | "." => {}
+            ".." => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    if resolved.is_empty() {
+        return "/".to_string();
+    }
+    let trailing = if path.ends_with('/') { "/" } else { "" };
+    format!("/{}{trailing}", resolved.join("/"))
 }
 
 fn uri_encode(value: &str) -> String {
@@ -3132,6 +3532,28 @@ pub enum AuthMethodKind {
     Jwt(JwtAuth),
     /// AWS `SigV4` auth config.
     SigV4(SigV4Auth),
+}
+
+impl AuthMethodKind {
+    /// The refresh token this method currently holds, if any.
+    ///
+    /// Used as the compare-and-swap witness for store-backed refreshes: it is
+    /// the one piece of state a provider rotates, so a mismatch is proof that
+    /// another refresh already landed and this response is stale.
+    #[must_use]
+    pub fn refresh_token_material(&self) -> Option<&str> {
+        match self {
+            Self::OAuthDeviceCode(method) => method
+                .refresh_token
+                .as_ref()
+                .map(RedactedSecret::expose_secret),
+            Self::OAuthAuthCode(method) => method
+                .refresh_token
+                .as_ref()
+                .map(RedactedSecret::expose_secret),
+            Self::ApiKey(_) | Self::SetupToken(_) | Self::Jwt(_) | Self::SigV4(_) => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -3425,6 +3847,31 @@ pub trait AuthProfileStore: Send + Sync {
     /// Returns an [`AuthError`] when profile identity fields are invalid.
     async fn save_profile(&self, profile: AuthProfile) -> AuthResult<()>;
 
+    /// Save a profile only if the stored refresh token still matches
+    /// `expected_refresh_token`.
+    ///
+    /// Returns `Ok(false)` — leaving the store untouched — when it does not,
+    /// which means another refresh already rotated the credential and this
+    /// response is stale.
+    ///
+    /// Store-backed refresh is otherwise a read-modify-write with no lock held
+    /// across the provider round trip: two concurrent refreshes both snapshot
+    /// the same profile, both present the same refresh token, and the later
+    /// save wins. With refresh-token rotation (Google, Okta, Auth0) the
+    /// winner's exchange has already invalidated the loser's token, so the
+    /// value that lands in the store is dead and every later refresh fails
+    /// `invalid_grant` until an operator re-runs the login flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AuthError`] when profile identity fields are invalid, or
+    /// [`AuthError::ProfileNotFound`] when the profile no longer exists.
+    async fn save_profile_if_unchanged(
+        &self,
+        profile: AuthProfile,
+        expected_refresh_token: Option<&str>,
+    ) -> AuthResult<bool>;
+
     /// Delete one provider profile.
     ///
     /// # Errors
@@ -3516,12 +3963,30 @@ where
             return TokenRefreshOutcome::Skipped(decision);
         }
 
+        // Capture the refresh token we are about to spend, BEFORE the provider
+        // round trip rotates it. It is the compare-and-swap witness: if the
+        // stored value has moved on by the time we write back, another refresh
+        // already landed and ours is stale.
+        let expected_refresh_token = profile
+            .method
+            .refresh_token_material()
+            .map(ToString::to_string);
+
         if let Err(error) = profile.method.refresh(cx).await {
             return TokenRefreshOutcome::Failed { decision, error };
         }
 
-        match self.store.save_profile(profile).await {
-            Ok(()) => TokenRefreshOutcome::Refreshed(decision),
+        match self
+            .store
+            .save_profile_if_unchanged(profile, expected_refresh_token.as_deref())
+            .await
+        {
+            // Losing the race is not a failure: the winner's result is already
+            // stored and is strictly fresher than ours. Discarding our response
+            // is the whole point — writing it would install a refresh token the
+            // provider already invalidated.
+            Ok(true) => TokenRefreshOutcome::Refreshed(decision),
+            Ok(false) => TokenRefreshOutcome::Skipped(decision),
             Err(error) => TokenRefreshOutcome::Failed { decision, error },
         }
     }
@@ -3608,6 +4073,34 @@ impl AuthProfileStore for InMemoryAuthProfileStore {
         Ok(())
     }
 
+    async fn save_profile_if_unchanged(
+        &self,
+        mut profile: AuthProfile,
+        expected_refresh_token: Option<&str>,
+    ) -> AuthResult<bool> {
+        validate_non_empty(&profile.id, "profile_id")?;
+        validate_non_empty(&profile.label, "label")?;
+        profile.provider = canonical_provider(&profile.provider)?;
+
+        // The compare and the swap happen under ONE write guard — taking a read
+        // guard to compare and then a write guard to store would reintroduce
+        // the race this method exists to close.
+        let mut profiles = self.profiles.write();
+        let key = (profile.provider.clone(), profile.id.clone());
+        let outcome = match profiles.get(&key) {
+            None => Err(AuthError::ProfileNotFound {
+                provider: profile.provider.clone(),
+                profile_id: profile.id.clone(),
+            }),
+            Some(stored) => Ok(stored.method.refresh_token_material() == expected_refresh_token),
+        };
+        if matches!(outcome, Ok(true)) {
+            profiles.insert(key, profile);
+        }
+        drop(profiles);
+        outcome
+    }
+
     async fn delete_profile(&self, provider: &str, profile_id: &str) -> AuthResult<()> {
         let provider = canonical_provider(provider)?;
         validate_non_empty(profile_id, "profile_id")?;
@@ -3668,6 +4161,17 @@ mod tests {
             session_token.map(str::to_string),
             "us-east-1",
             "s3",
+        )
+        .unwrap()
+    }
+
+    fn sigv4_auth_for_service(service: &str) -> SigV4Auth {
+        SigV4Auth::new(
+            aws_example_access_key(),
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None::<String>,
+            "us-east-1",
+            service,
         )
         .unwrap()
     }
@@ -3956,7 +4460,13 @@ mod tests {
         );
 
         let mut openai_request = AuthRequest::new();
-        run(async { openai.method.build_request_auth(&cx(), &mut openai_request).await }).unwrap();
+        run(async {
+            openai
+                .method
+                .build_request_auth(&cx(), &mut openai_request)
+                .await
+        })
+        .unwrap();
         assert_eq!(
             openai_request.value_for("Authorization"),
             Some("Bearer fixture-openai-key")
@@ -4152,10 +4662,9 @@ mod tests {
             OAuthDeviceCodeProviderResponse::SlowDown,
             OAuthDeviceCodeProviderResponse::Authorized(expected_tokens.clone()),
         ]);
-        let mut flow = run(async {
-            OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &transport).await
-        })
-        .unwrap();
+        let mut flow =
+            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &transport).await })
+                .unwrap();
 
         assert_eq!(flow.challenge().user_code, "ABCD-EFGH");
         assert_eq!(flow.poll_interval(), StdDuration::from_secs(5));
@@ -4196,7 +4705,8 @@ mod tests {
                 reason: "operator denied browser authorization".to_string(),
             }]);
         let mut denied_flow =
-            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &denied).await }).unwrap();
+            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &denied).await })
+                .unwrap();
 
         let denied_error = run(async { denied_flow.poll(&cx(), &denied).await }).unwrap_err();
         assert_eq!(
@@ -4213,7 +4723,8 @@ mod tests {
                 reason: "device code expired".to_string(),
             }]);
         let mut expired_flow =
-            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &expired).await }).unwrap();
+            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &expired).await })
+                .unwrap();
 
         let expired_error = run(async { expired_flow.poll(&cx(), &expired).await }).unwrap_err();
         assert_eq!(
@@ -4232,10 +4743,9 @@ mod tests {
         challenge.interval = StdDuration::ZERO;
         let transport = ScriptedDeviceTransport::new([]).with_challenge(challenge);
 
-        let error = run(async {
-            OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &transport).await
-        })
-        .unwrap_err();
+        let error =
+            run(async { OAuthDeviceCodeFlow::start(&cx(), oauth_config(), &transport).await })
+                .unwrap_err();
 
         assert_eq!(
             error,
@@ -4518,6 +5028,346 @@ mod tests {
         );
     }
 
+    /// RFC 6749 §5.1 makes `expires_in` RECOMMENDED, not required, and several
+    /// providers omit it on refresh. Clobbering a known expiry to `None` made
+    /// the profile never-expiring: `requires_refresh_in()` returned `None`, the
+    /// refresh loop classified it not-refreshable, and every downstream expiry
+    /// gate is `if let Some(expires_at)` — so the stale bearer would be
+    /// injected forever. The prior expiry must survive an omitted `expires_in`.
+    #[test]
+    fn oauth_refresh_preserves_expiry_when_provider_omits_expires_in() {
+        let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+        auth.apply_tokens(oauth_tokens());
+        let before = auth
+            .requires_refresh_in()
+            .expect("fixture tokens carry an expiry");
+
+        let transport = ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "refreshed-access-token",
+                None, // provider omitted `expires_in`
+                Option::<String>::None,
+                Option::<String>::None,
+            )
+            .unwrap(),
+        )]);
+        run(async { auth.refresh_with_transport(&cx(), &transport).await }).unwrap();
+
+        let after = auth
+            .requires_refresh_in()
+            .expect("an omitted expires_in must not turn the profile never-expiring");
+        assert!(
+            after <= before,
+            "preserved expiry should still be counting down: before={before:?} after={after:?}"
+        );
+
+        // Same guard on the authorization-code path.
+        let mut auth = OAuthAuthCodeAuth::confidential_client(
+            "fixture-client",
+            "fixture-client-secret",
+            "https://auth.example.test/authorize",
+            "https://auth.example.test/token",
+            "https://agent.example.test/oauth/callback",
+            "chat messages",
+            true,
+        )
+        .unwrap();
+        auth.apply_tokens(oauth_tokens());
+        assert!(auth.requires_refresh_in().is_some());
+        let transport = ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "refreshed-access-token",
+                None,
+                Option::<String>::None,
+                Option::<String>::None,
+            )
+            .unwrap(),
+        )]);
+        run(async { auth.refresh_with_transport(&cx(), &transport).await }).unwrap();
+        assert!(
+            auth.requires_refresh_in().is_some(),
+            "auth-code path must preserve the expiry too"
+        );
+    }
+
+    /// RFC 6749 §6: a refresh MUST NOT request a scope that was never granted.
+    /// The granted scope was being discarded entirely, so every refresh
+    /// re-requested the originally CONFIGURED scope — which a user who
+    /// consented to less (or later revoked part of it) never authorized.
+    #[test]
+    fn oauth_refresh_requests_the_granted_scope_not_the_configured_one() {
+        let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+        // Configured scope is "chat messages"; the provider granted only "chat".
+        assert_eq!(auth.scope, "chat messages");
+        auth.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token"),
+                Some("chat"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(auth.granted_scope.as_deref(), Some("chat"));
+
+        let config = auth.refresh_config().unwrap();
+        assert_eq!(
+            config.scope.as_deref(),
+            Some("chat"),
+            "refresh must ask for what was granted, not what was configured"
+        );
+    }
+
+    /// An omitted scope on refresh must preserve the recorded grant. Dropping it
+    /// would leave nothing to narrow against, permanently disarming the
+    /// widening guard below.
+    #[test]
+    fn oauth_refresh_preserves_granted_scope_when_provider_omits_it() {
+        let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+        auth.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token"),
+                Some("chat"),
+            )
+            .unwrap(),
+        );
+
+        let transport = ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "refreshed-access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Option::<String>::None,
+                Option::<String>::None,
+            )
+            .unwrap(),
+        )]);
+        run(async { auth.refresh_with_transport(&cx(), &transport).await }).unwrap();
+
+        assert_eq!(auth.granted_scope.as_deref(), Some("chat"));
+    }
+
+    /// A token endpoint answering a `chat` refresh with `chat admin` must be
+    /// refused rather than silently escalating what the profile can do.
+    #[test]
+    fn oauth_refresh_rejects_a_widened_scope() {
+        let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+        auth.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token"),
+                Some("chat"),
+            )
+            .unwrap(),
+        );
+
+        let transport = ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "escalated-access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Option::<String>::None,
+                Some("chat admin"),
+            )
+            .unwrap(),
+        )]);
+        let err = run(async { auth.refresh_with_transport(&cx(), &transport).await })
+            .expect_err("a widened scope must be refused");
+        assert!(
+            matches!(err, AuthError::InvalidConfig { .. }),
+            "expected InvalidConfig, got {err:?}"
+        );
+        // Nothing was applied: the scope check runs before any mutation.
+        assert_eq!(auth.granted_scope.as_deref(), Some("chat"));
+        assert_eq!(
+            auth.access_token
+                .as_ref()
+                .map(RedactedSecret::expose_secret),
+            Some("access-token"),
+            "a refused refresh must not leave half-applied token material"
+        );
+
+        // Narrowing is legitimate and must be accepted.
+        let mut narrowing = OAuthDeviceCodeAuth::from_config(oauth_config());
+        narrowing.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token"),
+                Some("chat messages"),
+            )
+            .unwrap(),
+        );
+        let transport = ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "narrowed-access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Option::<String>::None,
+                Some("chat"),
+            )
+            .unwrap(),
+        )]);
+        run(async { narrowing.refresh_with_transport(&cx(), &transport).await }).unwrap();
+        assert_eq!(narrowing.granted_scope.as_deref(), Some("chat"));
+    }
+
+    /// Store-backed refresh is a read-modify-write across a provider round
+    /// trip. Without a compare-and-swap the later save wins, and with
+    /// refresh-token rotation the loser's token was already invalidated by the
+    /// winner's exchange — so the value that lands is dead.
+    #[test]
+    fn store_refresh_rejects_a_stale_write_after_a_concurrent_rotation() {
+        let store = InMemoryAuthProfileStore::new();
+
+        let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+        auth.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token-v1"),
+                Option::<String>::None,
+            )
+            .unwrap(),
+        );
+        let profile = AuthProfile::new(
+            "p1",
+            "example",
+            AuthMethodKind::OAuthDeviceCode(auth.clone()),
+            "label",
+            0,
+        )
+        .unwrap();
+        run(async { store.save_profile(profile.clone()).await }).unwrap();
+
+        // A concurrent refresh lands first, rotating the stored token to v2.
+        let mut winner = auth.clone();
+        winner.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token-v2",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token-v2"),
+                Option::<String>::None,
+            )
+            .unwrap(),
+        );
+        let winner_profile = AuthProfile::new(
+            "p1",
+            "example",
+            AuthMethodKind::OAuthDeviceCode(winner),
+            "label",
+            0,
+        )
+        .unwrap();
+        assert!(
+            run(async {
+                store
+                    .save_profile_if_unchanged(winner_profile, Some("refresh-token-v1"))
+                    .await
+            })
+            .unwrap(),
+            "the first writer holds the expected token and must win"
+        );
+
+        // Our in-flight refresh still believes the stored token is v1.
+        let mut loser = auth;
+        loser.apply_tokens(
+            OAuthTokens::bearer(
+                "access-token-stale",
+                Some(StdDuration::from_secs(3_600)),
+                Some("refresh-token-stale"),
+                Option::<String>::None,
+            )
+            .unwrap(),
+        );
+        let loser_profile = AuthProfile::new(
+            "p1",
+            "example",
+            AuthMethodKind::OAuthDeviceCode(loser),
+            "label",
+            0,
+        )
+        .unwrap();
+        assert!(
+            !run(async {
+                store
+                    .save_profile_if_unchanged(loser_profile, Some("refresh-token-v1"))
+                    .await
+            })
+            .unwrap(),
+            "a stale writer must be refused, not silently clobber the winner"
+        );
+
+        let stored = run(async { store.get_profile("example", "p1").await }).unwrap();
+        assert_eq!(
+            stored.method.refresh_token_material(),
+            Some("refresh-token-v2"),
+            "the winner's rotated token must survive"
+        );
+    }
+
+    /// `expires_in` arrives as a `u64` from a provider JSON body. `TimeDelta`
+    /// accepts values far beyond what `DateTime<Utc>` can represent, and
+    /// `DateTime + TimeDelta` panics internally — so a hostile token response
+    /// used to abort the handler task instead of failing closed.
+    #[test]
+    fn oauth_tokens_reject_expires_in_that_overflows_the_timestamp_range() {
+        let err = OAuthTokens::bearer(
+            "access-token",
+            Some(StdDuration::from_secs(9_000_000_000_000_000)),
+            Option::<String>::None,
+            Option::<String>::None,
+        )
+        .expect_err("an overflowing expires_in must be rejected, not panic");
+        assert!(
+            matches!(err, AuthError::InvalidConfig { .. }),
+            "expected InvalidConfig, got {err:?}"
+        );
+
+        // A sane TTL still works.
+        assert!(
+            OAuthTokens::bearer(
+                "access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Option::<String>::None,
+                Option::<String>::None,
+            )
+            .is_ok()
+        );
+    }
+
+    /// `verification_uri` is provider-controlled and is handed to an operator
+    /// or browser to open, so it must be scheme-pinned like every other
+    /// endpoint rather than merely non-empty and CRLF-free.
+    #[test]
+    fn device_code_challenge_rejects_non_http_verification_uri() {
+        let err = OAuthDeviceCodeChallenge::new(
+            "device-code",
+            "USER-CODE",
+            "javascript:fetch('https://evil.example')",
+            Option::<String>::None,
+            Utc::now() + TimeDelta::minutes(5),
+            StdDuration::from_secs(5),
+        )
+        .expect_err("non-http verification_uri must be refused");
+        assert!(
+            matches!(err, AuthError::InvalidConfig { .. }),
+            "expected InvalidConfig, got {err:?}"
+        );
+
+        assert!(
+            OAuthDeviceCodeChallenge::new(
+                "device-code",
+                "USER-CODE",
+                "https://auth.example.test/device",
+                Option::<String>::None,
+                Utc::now() + TimeDelta::minutes(5),
+                StdDuration::from_secs(5),
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn oauth_auth_code_refresh_rotates_refresh_token_and_redacts_config_debug() {
         let mut auth = OAuthAuthCodeAuth::confidential_client(
@@ -4578,10 +5428,9 @@ mod tests {
             reason: "refresh token expired".to_string(),
         }]);
 
-        let error = run(async {
-            OAuthRefreshTokenFlow::refresh(&cx(), &config, &grant, &rejected).await
-        })
-        .unwrap_err();
+        let error =
+            run(async { OAuthRefreshTokenFlow::refresh(&cx(), &config, &grant, &rejected).await })
+                .unwrap_err();
         assert_eq!(
             error,
             AuthError::ProviderRejected {
@@ -4601,10 +5450,9 @@ mod tests {
         let malformed =
             ScriptedRefreshTransport::new([OAuthRefreshProviderResponse::Authorized(bad_tokens)]);
 
-        let error = run(async {
-            OAuthRefreshTokenFlow::refresh(&cx(), &config, &grant, &malformed).await
-        })
-        .unwrap_err();
+        let error =
+            run(async { OAuthRefreshTokenFlow::refresh(&cx(), &config, &grant, &malformed).await })
+                .unwrap_err();
         assert_eq!(
             error,
             AuthError::InvalidConfig {
@@ -4619,7 +5467,8 @@ mod tests {
         let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
         let transport = ScriptedRefreshTransport::new([]);
 
-        let error = run(async { auth.refresh_with_transport(&cx(), &transport).await }).unwrap_err();
+        let error =
+            run(async { auth.refresh_with_transport(&cx(), &transport).await }).unwrap_err();
 
         assert_eq!(
             error,
@@ -4681,6 +5530,312 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
+    // ── Canonical URI encoding (br-0lsi3, porting br-1nqg7) ──────────
+
+    /// Canonical URI under the real S3 profile: single-encode, preserve dot
+    /// segments.
+    fn canonical_uri_s3(path: &str) -> String {
+        canonical_uri(
+            path,
+            CanonicalPathEncoding::Single,
+            CanonicalPathNormalization::Preserve,
+        )
+    }
+
+    /// Canonical URI under the real non-S3 profile: double-encode, resolve dot
+    /// segments. Both axes move together in production, so tests pair them the
+    /// same way rather than exercising combinations no service uses.
+    fn canonical_uri_other(path: &str) -> String {
+        canonical_uri(
+            path,
+            CanonicalPathEncoding::Double,
+            CanonicalPathNormalization::RemoveDotSegments,
+        )
+    }
+
+    /// S3 requires exactly ONE encoding pass; every other service requires two.
+    /// `canonical_uri` previously encoded the wire path once regardless of
+    /// service, which is correct only for a path that needed no escaping.
+    #[test]
+    fn canonical_uri_encodes_once_for_s3_and_twice_for_other_services() {
+        // `%20` on the wire decodes to a space, which S3 canonicalizes back to
+        // `%20` — not `%2520`.
+        assert_eq!(
+            canonical_uri_s3("/bucket/my%20report.pdf"),
+            "/bucket/my%20report.pdf"
+        );
+        assert_eq!(
+            canonical_uri_other("/bucket/my%20report.pdf"),
+            "/bucket/my%2520report.pdf"
+        );
+    }
+
+    /// The port of `remove_dot_segments` into this crate.
+    ///
+    /// This was a LIVE `SignatureDoesNotMatch` bug, not a cosmetic gap: this
+    /// signer had no normalisation at all, so any non-S3 caller that built a path
+    /// by joining segments and landed a `//`, `/./` or `/../` signed the literal
+    /// path while the service signed the resolved one. `fcp-sdk` was fixed first;
+    /// this crate carries an independent signer and was still exposed.
+    #[test]
+    fn non_s3_resolves_dot_segments_and_s3_preserves_them() {
+        for (input, resolved) in [
+            ("/example/..", "/"),
+            ("/example1/example2/../..", "/"),
+            ("//", "/"),
+            ("/./", "/"),
+            ("/./example", "/example"),
+            ("//example//", "/example/"),
+        ] {
+            assert_eq!(
+                canonical_uri_other(input),
+                resolved,
+                "non-S3 must resolve {input}"
+            );
+        }
+
+        // S3 must NOT normalise: an object key may legitimately contain `..` or
+        // a double slash, so `/a/../b` names a literal key there. One input, two
+        // different canonical URIs — so a future refactor cannot collapse the two
+        // axes into one.
+        assert_eq!(canonical_uri_s3("/bucket/a/../b"), "/bucket/a/../b");
+        assert_eq!(canonical_uri_other("/bucket/a/../b"), "/bucket/b");
+    }
+
+    /// The normalisation profile must be threaded into the string that is
+    /// actually signed, not merely exist as an unused selector.
+    ///
+    /// Asserting on the canonical request is what makes this meaningful:
+    /// comparing two `Authorization` headers would differ anyway, because the
+    /// service name also feeds the credential scope.
+    #[test]
+    fn path_normalization_reaches_the_canonical_request() {
+        let context = SigV4SigningContext::new("GET", "/example/..", EMPTY_PAYLOAD_SHA256).unwrap();
+        let uri_line = |normalization| {
+            canonical_request(
+                &context,
+                "host:e\n",
+                "host",
+                CanonicalPathEncoding::Single,
+                normalization,
+            )
+            .lines()
+            .nth(1)
+            .unwrap()
+            .to_string()
+        };
+
+        assert_eq!(uri_line(CanonicalPathNormalization::RemoveDotSegments), "/");
+        assert_eq!(
+            uri_line(CanonicalPathNormalization::Preserve),
+            "/example/.."
+        );
+    }
+
+    /// The selector must key off the service, and must not be defeated by a
+    /// struct literal that skips `SigV4Auth::new`'s lowercasing.
+    #[test]
+    fn canonical_path_normalization_preserves_only_for_s3() {
+        assert_eq!(
+            sigv4_auth(None).canonical_path_normalization(),
+            CanonicalPathNormalization::Preserve
+        );
+        assert_eq!(
+            sigv4_auth_for_service("execute-api").canonical_path_normalization(),
+            CanonicalPathNormalization::RemoveDotSegments
+        );
+        let uppercase = SigV4Auth {
+            service: "S3".to_string(),
+            ..sigv4_auth(None)
+        };
+        assert_eq!(
+            uppercase.canonical_path_normalization(),
+            CanonicalPathNormalization::Preserve
+        );
+    }
+
+    /// `omit_session_token` keeps the token off the SIGNATURE, not off the wire.
+    #[test]
+    fn omit_session_token_drops_the_token_from_the_signed_set_only() {
+        let auth = sigv4_auth(Some("AQoDYXdzEXAMPLETOKEN"));
+        let context = SigV4SigningContext::new("POST", "/", EMPTY_PAYLOAD_SHA256)
+            .unwrap()
+            .with_signing_time(sigv4_time());
+        let headers = BTreeMap::from([("host".to_string(), "example.amazonaws.com".to_string())]);
+
+        let options = SigV4SigningOptions {
+            sign_content_sha256_header: false,
+            omit_session_token: true,
+            ..SigV4SigningOptions::default()
+        };
+        let (signed, trace) = auth.sign_traced(&context, &headers, options).unwrap();
+
+        assert_eq!(trace.signed_headers, "host;x-amz-date");
+        assert!(!trace.canonical_request.contains("x-amz-security-token"));
+        assert_eq!(
+            signed.x_amz_security_token.as_deref(),
+            Some("AQoDYXdzEXAMPLETOKEN"),
+            "the token is omitted from the signature, NOT from the request"
+        );
+
+        // The default signs it, and the two shapes must differ.
+        let (_, default_trace) = auth
+            .sign_traced(
+                &context,
+                &headers,
+                SigV4SigningOptions {
+                    sign_content_sha256_header: false,
+                    ..SigV4SigningOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            default_trace.signed_headers,
+            "host;x-amz-date;x-amz-security-token"
+        );
+        assert_ne!(
+            trace.signature, default_trace.signature,
+            "omitting the token must change the signature, or the flag is inert"
+        );
+    }
+
+    /// `sign` must stay a pure delegation to `sign_traced`, or the traced path
+    /// could drift from the production one and the vector harness would be
+    /// checking something nothing ships.
+    #[test]
+    fn sign_and_sign_traced_agree() {
+        let auth = sigv4_auth(None);
+        let context = SigV4SigningContext::new("GET", "/bucket/key.txt", EMPTY_PAYLOAD_SHA256)
+            .unwrap()
+            .with_signing_time(sigv4_time());
+        let headers = BTreeMap::from([("host".to_string(), "e.amazonaws.com".to_string())]);
+
+        let plain = auth.sign(&context, &headers).unwrap();
+        let (traced, trace) = auth
+            .sign_traced(&context, &headers, SigV4SigningOptions::default())
+            .unwrap();
+
+        assert_eq!(plain, traced);
+        assert!(plain.authorization.contains(&trace.signature));
+        assert!(plain.authorization.contains(&trace.credential_scope));
+        assert_eq!(plain.signed_headers, trace.signed_headers);
+    }
+
+    /// The property that makes this change safe to land without live AWS
+    /// access: for a path built only from unreserved characters, BOTH the new
+    /// single- and double-pass forms equal the old single-encode-the-wire-path
+    /// behaviour. Every caller in the workspace today passes such a path, so
+    /// no signature that verifies now stops verifying.
+    #[test]
+    fn canonical_uri_is_unchanged_for_paths_needing_no_escape() {
+        for path in [
+            "/",
+            "/bucket/plain.pdf",
+            "/model/invoke",
+            "/path/to/file.txt",
+        ] {
+            let legacy = uri_encode_path(path);
+            assert_eq!(
+                canonical_uri_s3(path),
+                legacy,
+                "single-pass encoding must be a no-op change for {path}"
+            );
+            assert_eq!(
+                canonical_uri_other(path),
+                legacy,
+                "double-pass encoding must also be a no-op change for {path}"
+            );
+        }
+    }
+
+    /// Characters the URL parser leaves unescaped (`&`, `+`, `:`) still get
+    /// encoded by the canonicalizer, matching what the service computes after
+    /// decoding. The widely-repeated claim that a raw `&` breaks S3 signing is
+    /// false — it round-trips; see br-1nqg7.
+    #[test]
+    fn canonical_uri_encodes_aws_reserved_characters_left_raw_by_the_url_parser() {
+        assert_eq!(canonical_uri_s3("/bucket/Q&A.pdf"), "/bucket/Q%26A.pdf");
+        assert_eq!(canonical_uri_s3("/bucket/a+b.pdf"), "/bucket/a%2Bb.pdf");
+        assert_eq!(canonical_uri_s3("/bucket/a:b.pdf"), "/bucket/a%3Ab.pdf");
+    }
+
+    /// A literal `%` in the key arrives as `%25` and must survive the
+    /// decode/re-encode round trip rather than becoming `%2525`.
+    #[test]
+    fn canonical_uri_round_trips_a_literal_percent() {
+        assert_eq!(canonical_uri_s3("/bucket/50%25.pdf"), "/bucket/50%25.pdf");
+    }
+
+    /// Non-ASCII keys are the most common real-world trigger — any accented or
+    /// CJK filename arrives percent-encoded and was double-encoded before.
+    #[test]
+    fn canonical_uri_handles_non_ascii_keys() {
+        assert_eq!(
+            canonical_uri_s3("/bucket/e%C3%B1e.pdf"),
+            "/bucket/e%C3%B1e.pdf"
+        );
+    }
+
+    /// The selector must key off the service, and must not be defeated by a
+    /// struct literal that skips `SigV4Auth::new`'s lowercasing.
+    #[test]
+    fn canonical_path_encoding_selects_single_only_for_s3() {
+        assert_eq!(
+            sigv4_auth(None).canonical_path_encoding(),
+            CanonicalPathEncoding::Single
+        );
+        assert_eq!(
+            sigv4_auth_for_service("execute-api").canonical_path_encoding(),
+            CanonicalPathEncoding::Double
+        );
+        let uppercase = SigV4Auth {
+            service: "S3".to_string(),
+            ..sigv4_auth(None)
+        };
+        assert_eq!(
+            uppercase.canonical_path_encoding(),
+            CanonicalPathEncoding::Single
+        );
+    }
+
+    /// Proves the mode is actually threaded into the string that gets signed,
+    /// rather than merely existing as an unused selector. Asserting on the
+    /// canonical request is what makes this meaningful — comparing two
+    /// `Authorization` headers would differ anyway, because the service name
+    /// also appears in the credential scope.
+    #[test]
+    fn path_encoding_reaches_the_canonical_request() {
+        let context =
+            SigV4SigningContext::new("GET", "/bucket/my%20report.pdf", EMPTY_PAYLOAD_SHA256)
+                .unwrap();
+
+        let s3_line = canonical_request(
+            &context,
+            "host:e\n",
+            "host",
+            CanonicalPathEncoding::Single,
+            CanonicalPathNormalization::Preserve,
+        )
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+        let other_line = canonical_request(
+            &context,
+            "host:e\n",
+            "host",
+            CanonicalPathEncoding::Double,
+            CanonicalPathNormalization::RemoveDotSegments,
+        )
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+        assert_eq!(s3_line, "/bucket/my%20report.pdf");
+        assert_eq!(other_line, "/bucket/my%2520report.pdf");
+    }
+
     #[test]
     fn sigv4_signs_aws_get_bucket_lifecycle_vector() {
         let auth = sigv4_auth(None);
@@ -4702,8 +5857,13 @@ mod tests {
             request.value_for("x-amz-content-sha256"),
             Some(EMPTY_PAYLOAD_SHA256)
         );
+        // `", "` after each comma, matching AWS's documented examples and
+        // `fcp_sdk::sigv4`. The SIGNATURE below is byte-identical to what this test
+        // asserted under the old comma-only spacing, which is the proof that the
+        // Authorization header's formatting is outside the signed material — only
+        // the canonical request is hashed.
         let expected_authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
+            "AWS4-HMAC-SHA256 Credential={}/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
             aws_example_access_key()
         );
         assert_eq!(
@@ -4924,7 +6084,8 @@ mod tests {
             TokenRefreshPolicy::new(StdDuration::from_secs(3_600)),
         );
 
-        let outcome = run(async { actor.refresh_profile(&cx(), "bootstrap", "setup").await }).unwrap();
+        let outcome =
+            run(async { actor.refresh_profile(&cx(), "bootstrap", "setup").await }).unwrap();
 
         assert!(matches!(
             outcome,
@@ -4949,7 +6110,8 @@ mod tests {
         let store = Arc::new(InMemoryAuthProfileStore::new());
         let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
 
-        let error = run(async { actor.refresh_profile(&cx(), "openai", "work").await }).unwrap_err();
+        let error =
+            run(async { actor.refresh_profile(&cx(), "openai", "work").await }).unwrap_err();
 
         assert_eq!(
             error,

@@ -12,32 +12,85 @@ use fcp_prelude::{
     SubscribeRequest, SubscribeResponse, SubscribeResult,
 };
 
+/// How many times `max_events` a buffer may grow purely because entries are
+/// still awaiting an ack, before the oldest unacked entry is dropped anyway.
+const DEFAULT_ACK_SLACK_FACTOR: usize = 4;
+
+/// Maximum topics accepted from a single [`SubscribeRequest`].
+pub const MAX_TOPICS_PER_SUBSCRIBE: usize = 64;
+
+/// Maximum length of an accepted topic name, in bytes.
+pub const MAX_TOPIC_LEN: usize = 128;
+
+/// Maximum number of distinct topics an [`EventStreamManager`] will track on
+/// behalf of subscribers.
+pub const MAX_TRACKED_TOPICS: usize = 256;
+
+/// Whether a client-supplied topic name is acceptable.
+///
+/// Topics are identifiers, not free text: they are echoed back to the client,
+/// used as map keys, and appear in logs. Restricting them to a small charset
+/// keeps a subscriber from retaining arbitrary attacker-chosen strings.
+#[must_use]
+pub fn topic_name_is_valid(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.len() <= MAX_TOPIC_LEN
+        && topic
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+}
+
 /// Replay buffer sizing limits.
 #[derive(Debug, Clone, Copy)]
 pub struct BufferLimits {
     /// Minimum number of events retained for replay.
     pub min_events: usize,
-    /// Maximum number of events retained (may be exceeded by pending acks).
+    /// Soft maximum: events past this are evicted once they have been acked.
     pub max_events: usize,
+    /// Absolute ceiling on retained events, INCLUDING those still awaiting an
+    /// ack.
+    ///
+    /// `max_events` alone is not a bound: eviction stops at the first unacked
+    /// entry, so a consumer that simply stops sending acks pins the front of
+    /// the buffer and both the buffer and the pending-ack set grow for as long
+    /// as events keep arriving. Past this ceiling the oldest entry is dropped
+    /// even if unacked. Losing replay for a consumer that stopped acking is
+    /// strictly better than unbounded growth, and it is observable via
+    /// [`EventStreamManager::dropped_unacked`]. See br-l2ack.
+    pub hard_max_events: usize,
 }
 
 impl BufferLimits {
     /// Create buffer limits ensuring `max_events >= min_events`.
+    ///
+    /// `hard_max_events` defaults to `DEFAULT_ACK_SLACK_FACTOR × max_events`,
+    /// leaving a slow consumer room to catch up before anything is dropped.
     #[must_use]
     pub fn new(min_events: usize, max_events: usize) -> Self {
+        let max_events = max_events.max(min_events);
         Self {
             min_events,
-            max_events: max_events.max(min_events),
+            max_events,
+            hard_max_events: max_events
+                .saturating_mul(DEFAULT_ACK_SLACK_FACTOR)
+                .max(max_events),
         }
+    }
+
+    /// Override the absolute retention ceiling.
+    ///
+    /// Clamped to at least `max_events`, since a ceiling below the soft maximum
+    /// would make the soft maximum unreachable.
+    #[must_use]
+    pub fn with_hard_max(mut self, hard_max_events: usize) -> Self {
+        self.hard_max_events = hard_max_events.max(self.max_events);
+        self
     }
 }
 
 impl Default for BufferLimits {
     fn default() -> Self {
-        Self {
-            min_events: 10,
-            max_events: 100,
-        }
+        Self::new(10, 100)
     }
 }
 
@@ -104,6 +157,10 @@ struct TopicState {
     next_seq: u64,
     buffer: VecDeque<EventEnvelope>,
     pending_acks: HashSet<u64>,
+    /// Events dropped from the buffer while still unacked, because the hard
+    /// retention ceiling was reached. Non-zero means a consumer has stopped
+    /// acking and has lost replay coverage.
+    dropped_unacked: u64,
 }
 
 impl TopicState {
@@ -138,6 +195,8 @@ impl TopicState {
     }
 
     fn trim_buffer(&mut self, limits: BufferLimits) {
+        // Soft trim: drop acked events down to `max_events`, stopping at the
+        // first entry still awaiting an ack so replay stays available for it.
         while self.buffer.len() > limits.max_events {
             let Some(front) = self.buffer.front() else {
                 break;
@@ -146,6 +205,30 @@ impl TopicState {
                 break;
             }
             self.buffer.pop_front();
+        }
+
+        // Hard ceiling: the loop above stops at the first unacked entry, so a
+        // consumer that simply stops acking pins the front and the buffer grows
+        // without bound. Past the ceiling, evict the oldest entry anyway and
+        // drop its ack obligation with it — that is what keeps `pending_acks`
+        // bounded by the buffer rather than by the consumer's behaviour, and it
+        // is why no separate pending-ack TTL is needed.
+        while self.buffer.len() > limits.hard_max_events {
+            let Some(front) = self.buffer.pop_front() else {
+                break;
+            };
+            if self.pending_acks.remove(&front.seq) {
+                self.dropped_unacked = self.dropped_unacked.saturating_add(1);
+                tracing::warn!(
+                    topic = %front.topic,
+                    seq = front.seq,
+                    retained = self.buffer.len(),
+                    hard_max_events = limits.hard_max_events,
+                    dropped_unacked_total = self.dropped_unacked,
+                    "replay buffer hit its hard ceiling; dropping an unacked event \
+                     (consumer is not acking)"
+                );
+            }
         }
     }
 
@@ -646,7 +729,29 @@ impl EventStreamManager {
         let mut confirmed = Vec::new();
         let mut cursors = HashMap::new();
 
-        for topic in &req.topics {
+        // `confirmed_topics` used to echo back every topic the client named,
+        // creating retained state for each one. That made the response
+        // misleading — a typo looked identical to a subscription that would
+        // never fire — and let a client grow the topic map without bound.
+        // Only topics actually accepted are created and confirmed. See br-l2ack.
+        for topic in req.topics.iter().take(MAX_TOPICS_PER_SUBSCRIBE) {
+            if !topic_name_is_valid(topic) {
+                tracing::warn!(topic = %topic, "rejecting invalid topic name in subscribe");
+                continue;
+            }
+            // An already-tracked topic is always accepted; only the creation of
+            // a NEW one is capped, so reaching the ceiling cannot break
+            // existing subscribers.
+            let known = self.topics.contains_key(topic);
+            if !known && self.topics.len() >= MAX_TRACKED_TOPICS {
+                tracing::warn!(
+                    topic = %topic,
+                    tracked = self.topics.len(),
+                    max_tracked_topics = MAX_TRACKED_TOPICS,
+                    "refusing new topic: tracked-topic ceiling reached"
+                );
+                continue;
+            }
             let state = self.topics.entry(topic.clone()).or_default();
             confirmed.push(topic.clone());
             if let Some(cursor) = state.latest_cursor() {
@@ -692,6 +797,23 @@ impl EventStreamManager {
             response,
             replay_events,
         })
+    }
+
+    /// Number of events dropped from a topic's buffer while still unacked.
+    ///
+    /// Non-zero means the consumer stopped acking, the hard retention ceiling
+    /// was reached, and replay coverage for that topic has gaps. See br-l2ack.
+    #[must_use]
+    pub fn dropped_unacked(&self, topic: &str) -> u64 {
+        self.topics
+            .get(topic)
+            .map_or(0, |state| state.dropped_unacked)
+    }
+
+    /// Number of distinct topics currently tracked.
+    #[must_use]
+    pub fn tracked_topics(&self) -> usize {
+        self.topics.len()
     }
 
     /// Remove subscriptions for topics and return how many were removed.
@@ -1155,6 +1277,125 @@ mod tests {
     fn pending_acks_unknown_topic_is_zero() {
         let manager = EventStreamManager::new(caps(true, true, 3));
         assert_eq!(manager.pending_acks("nonexistent"), 0);
+    }
+
+    // ── Unbounded-growth regressions (br-l2ack) ──────────────────────
+
+    fn subscribe_req(topics: Vec<String>) -> SubscribeRequest {
+        SubscribeRequest {
+            r#type: "subscribe".to_string(),
+            id: RequestId::new("req-l2ack"),
+            topics,
+            since: None,
+            max_events_per_sec: None,
+            batch_ms: None,
+            window_size: None,
+            capability_token: None,
+        }
+    }
+
+    /// A consumer that simply stops acking used to pin the front of the buffer
+    /// and grow both the buffer and the pending-ack set for as long as events
+    /// kept arriving. The hard ceiling bounds both.
+    #[test]
+    fn buffer_is_bounded_when_consumer_never_acks() {
+        let limits = BufferLimits::new(1, 4); // hard ceiling 16
+        let mut manager = EventStreamManager::with_limits(caps(true, true, 1), limits);
+
+        for _ in 0..500 {
+            manager.emit("t", sample_event_data());
+        }
+
+        assert!(
+            manager.dropped_unacked("t") > 0,
+            "the ceiling must actually engage; nothing was dropped"
+        );
+        // `pending_acks` is bounded BY the buffer, which is why no separate
+        // pending-ack TTL is needed.
+        assert!(
+            manager.pending_acks("t") <= limits.hard_max_events,
+            "pending acks {} exceeded the hard ceiling {}",
+            manager.pending_acks("t"),
+            limits.hard_max_events
+        );
+    }
+
+    /// Acking normally must not trip the ceiling — the fix must not cost a
+    /// well-behaved consumer any replay coverage.
+    #[test]
+    fn well_behaved_consumer_never_loses_unacked_events() {
+        let mut manager =
+            EventStreamManager::with_limits(caps(true, true, 1), BufferLimits::new(1, 4));
+
+        for _ in 0..500 {
+            let envelope = manager.emit("t", sample_event_data());
+            let ack = EventAck::new("t", vec![envelope.seq]).with_cursors(vec![envelope.cursor]);
+            manager.handle_ack(&ack);
+        }
+
+        assert_eq!(manager.dropped_unacked("t"), 0);
+        assert_eq!(manager.pending_acks("t"), 0);
+    }
+
+    /// `confirmed_topics` used to echo back whatever the client sent, so a typo
+    /// was indistinguishable from a real subscription and every distinct string
+    /// was retained forever.
+    #[test]
+    fn subscribe_rejects_invalid_topic_names() {
+        let mut manager = EventStreamManager::new(caps(true, false, 1));
+        let req = subscribe_req(vec![
+            "good.topic".to_string(),
+            String::new(),
+            "has space".to_string(),
+            "bad/slash".to_string(),
+            "x".repeat(MAX_TOPIC_LEN + 1),
+        ]);
+
+        let outcome = manager.handle_subscribe(&req).unwrap();
+
+        assert_eq!(outcome.response.result.confirmed_topics, vec!["good.topic"]);
+        assert_eq!(
+            manager.tracked_topics(),
+            1,
+            "rejected topics must not create retained state"
+        );
+    }
+
+    #[test]
+    fn subscribe_caps_topics_per_request() {
+        let mut manager = EventStreamManager::new(caps(true, false, 1));
+        let topics: Vec<String> = (0..MAX_TOPICS_PER_SUBSCRIBE * 3)
+            .map(|i| format!("topic.{i}"))
+            .collect();
+
+        let outcome = manager.handle_subscribe(&subscribe_req(topics)).unwrap();
+
+        assert_eq!(
+            outcome.response.result.confirmed_topics.len(),
+            MAX_TOPICS_PER_SUBSCRIBE
+        );
+        assert_eq!(manager.tracked_topics(), MAX_TOPICS_PER_SUBSCRIBE);
+    }
+
+    /// Repeated subscribes must not grow the topic map without bound, and
+    /// hitting the ceiling must not break topics that already exist.
+    #[test]
+    fn subscribe_refuses_new_topics_past_the_tracking_ceiling() {
+        let mut manager = EventStreamManager::new(caps(true, false, 1));
+        for chunk in 0..(MAX_TRACKED_TOPICS / MAX_TOPICS_PER_SUBSCRIBE + 4) {
+            let topics: Vec<String> = (0..MAX_TOPICS_PER_SUBSCRIBE)
+                .map(|i| format!("t.{chunk}.{i}"))
+                .collect();
+            manager.handle_subscribe(&subscribe_req(topics)).unwrap();
+        }
+
+        assert_eq!(manager.tracked_topics(), MAX_TRACKED_TOPICS);
+
+        // An already-tracked topic is still accepted at the ceiling.
+        let outcome = manager
+            .handle_subscribe(&subscribe_req(vec!["t.0.0".to_string()]))
+            .unwrap();
+        assert_eq!(outcome.response.result.confirmed_topics, vec!["t.0.0"]);
     }
 
     #[test]

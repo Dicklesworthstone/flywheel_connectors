@@ -429,23 +429,40 @@ async fn local_non_mock_oauth_streams_and_user_requests_cross_loopback_boundary(
     let observations = fixture.join();
     assert_eq!(observations.len(), 3);
 
+    // The client-credentials parameters travel in a form-encoded BODY, never in
+    // the query string. That is a deliberate secrecy property, not a style
+    // choice: reqwest's `Error` `Display` impl appends the full request URL, so
+    // a `client_secret` in the query would leak into every transport-error
+    // message and log line. See the comment on `TwitchClient::acquire_token`.
     let token_request = &observations[0];
-    assert!(
-        token_request
-            .request_line
-            .starts_with("POST /oauth2/token?")
+    assert_eq!(token_request.request_line, "POST /oauth2/token HTTP/1.1");
+    assert_header(
+        &token_request.headers,
+        "content-type",
+        "application/x-www-form-urlencoded",
     );
     assert!(
         token_request
-            .request_line
-            .contains("client_id=local-twitch-client")
+            .body
+            .contains(&format!("client_id={CLIENT_ID}"))
     );
+    assert!(token_request.body.contains("grant_type=client_credentials"));
     assert!(
         token_request
-            .request_line
-            .contains("grant_type=client_credentials")
+            .body
+            .contains(&format!("client_secret={CLIENT_SECRET}"))
     );
-    assert!(token_request.body.is_empty());
+    // Pin the leak-safety property itself: nothing secret may reach the URL.
+    assert!(
+        !token_request.request_line.contains(CLIENT_SECRET),
+        "client_secret must never appear in the request line: {}",
+        token_request.request_line
+    );
+    assert!(
+        !token_request.request_line.contains(CLIENT_ID),
+        "client_id must never appear in the request line: {}",
+        token_request.request_line
+    );
 
     let streams_request = &observations[1];
     assert_eq!(

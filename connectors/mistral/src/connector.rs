@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -1019,13 +1020,18 @@ impl Default for MistralConnector {
 }
 
 fn operations_info() -> FcpResult<Vec<Value>> {
-    Ok(ordered_manifest_operations()?
-        .into_iter()
-        .map(|(id, operation)| {
-            let operation_info = operation_info_from_manifest(id, &operation);
-            introspect_operation_from_manifest(operation_info, &operation)
+    static OPERATIONS: OnceLock<FcpResult<Vec<Value>>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            Ok(ordered_manifest_operations()?
+                .into_iter()
+                .map(|(id, operation)| {
+                    let operation_info = operation_info_from_manifest(id, &operation);
+                    introspect_operation_from_manifest(operation_info, &operation)
+                })
+                .collect())
         })
-        .collect())
+        .clone()
 }
 
 fn ordered_manifest_operations() -> FcpResult<Vec<(String, fcp_manifest::OperationSection)>> {

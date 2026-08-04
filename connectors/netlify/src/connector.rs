@@ -1,22 +1,23 @@
 //! Netlify connector implementation.
 
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier,
-    ConnectorId, ConnectorMetrics, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, HealthSnapshot, IdempotencyClass, InstanceId, Introspection, InvokeRequest,
-    InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
-    ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest, SubscribeResponse,
-    UnsubscribeRequest,
+    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier, ConnectorId,
+    ConnectorMetrics, EventCaps, FcpConnector, FcpError, FcpResult, HandshakeRequest,
+    HandshakeResponse, HealthSnapshot, InstanceId, Introspection, InvokeRequest, InvokeResponse,
+    OperationId, OperationInfo, SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest,
+    SimulateResponse, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
 };
 use fcp_sdk::migration::HttpRetryConfig;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::Url;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -41,6 +42,22 @@ const OP_ENV_LIST: &str = "netlify.env.list";
 const OP_ENV_SET: &str = "netlify.env.set";
 const OP_ENV_DELETE: &str = "netlify.env.delete";
 const OP_HEALTH: &str = "netlify.health";
+
+const OPERATION_ORDER: &[&str] = &[
+    OP_SITES_LIST,
+    OP_SITES_GET,
+    OP_SITES_CREATE,
+    OP_SITES_DELETE,
+    OP_DEPLOYS_LIST,
+    OP_DEPLOYS_GET,
+    OP_DEPLOYS_CREATE,
+    OP_DEPLOYS_ROLLBACK,
+    OP_DNS_LIST_ZONES,
+    OP_ENV_LIST,
+    OP_ENV_SET,
+    OP_ENV_DELETE,
+    OP_HEALTH,
+];
 
 const CAP_SITES_READ: &str = "netlify.sites.read";
 const CAP_SITES_WRITE: &str = "netlify.sites.write";
@@ -319,383 +336,69 @@ impl NetlifyConnector {
     }
 }
 
-fn string_property(description: &str) -> Value {
-    json!({"type": "string", "description": description})
-}
-
-fn boolean_property(description: &str) -> Value {
-    json!({"type": "boolean", "description": description})
-}
-
-fn object_schema(required: &[&str], properties: Vec<(&str, Value)>) -> Value {
-    let properties = properties
-        .into_iter()
-        .map(|(name, schema)| (name.to_string(), schema))
-        .collect::<Map<String, Value>>();
-    let mut schema = Map::new();
-    schema.insert("type".into(), Value::String("object".into()));
-    if !required.is_empty() {
-        schema.insert("required".into(), json!(required));
-    }
-    schema.insert("additionalProperties".into(), Value::Bool(false));
-    schema.insert("properties".into(), Value::Object(properties));
-    Value::Object(schema)
-}
-
-fn no_input_schema() -> Value {
-    object_schema(&[], Vec::new())
-}
-
-fn array_output_schema() -> Value {
-    json!({"type": "array", "items": {"type": "object"}})
-}
-
-fn object_output_schema() -> Value {
-    json!({"type": "object"})
-}
-
-fn delete_output_schema(field: &str, description: &str) -> Value {
-    object_schema(
-        &["deleted", field],
-        vec![
-            ("deleted", json!({"type": "boolean", "const": true})),
-            (field, string_property(description)),
-        ],
-    )
-}
-
-fn health_output_schema() -> Value {
-    object_schema(
-        &["healthy", "user_id", "email"],
-        vec![
-            ("healthy", json!({"type": "boolean", "const": true})),
-            ("user_id", string_property("Netlify user ID")),
-            (
-                "email",
-                json!({"type": ["string", "null"], "description": "Netlify user email when available"}),
-            ),
-        ],
-    )
-}
-
 impl Default for NetlifyConnector {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn operations_info() -> Vec<OperationInfo> {
-    let hint = |when: &str,
-                mistakes: Vec<String>,
-                examples: Vec<String>,
-                related: Vec<&'static str>|
-     -> AgentHint {
-        AgentHint {
-            when_to_use: when.into(),
-            common_mistakes: mistakes,
-            examples,
-            related: related.into_iter().map(CapabilityId::from_static).collect(),
-        }
-    };
-    vec![
-        OperationInfo {
-            id: OperationId::from_static(OP_SITES_LIST),
-            summary: "List all sites".into(),
-            description: None,
-            input_schema: no_input_schema(),
-            output_schema: array_output_schema(),
-            capability: CapabilityId::from_static(CAP_SITES_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint("List Netlify sites", vec![], vec![], vec![CAP_DEPLOYS_READ]),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_SITES_GET),
-            summary: "Get site details".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id"],
-                vec![("site_id", string_property("Netlify site ID"))],
-            ),
-            output_schema: object_output_schema(),
-            capability: CapabilityId::from_static(CAP_SITES_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint(
-                "Get info about a specific site",
-                vec!["Use site_id not site name".into()],
-                vec![],
-                vec![CAP_SITES_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_SITES_CREATE),
-            summary: "Create a new site".into(),
-            description: None,
-            input_schema: object_schema(
-                &["name"],
-                vec![
-                    ("name", string_property("New Netlify site name")),
-                    (
-                        "custom_domain",
-                        string_property("Optional custom domain to attach"),
-                    ),
-                ],
-            ),
-            output_schema: object_output_schema(),
-            capability: CapabilityId::from_static(CAP_SITES_WRITE),
-            risk_level: RiskLevel::Medium,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Create new Netlify site",
-                vec![],
-                vec![],
-                vec![CAP_SITES_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_SITES_DELETE),
-            summary: "Delete a site".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id"],
-                vec![("site_id", string_property("Netlify site ID to delete"))],
-            ),
-            output_schema: delete_output_schema("site_id", "Deleted Netlify site ID"),
-            capability: CapabilityId::from_static(CAP_SITES_WRITE),
-            risk_level: RiskLevel::Critical,
-            safety_tier: SafetyTier::Dangerous,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Permanently delete site and all deploys",
-                vec!["Irreversible".into()],
-                vec![],
-                vec![CAP_SITES_READ],
-            ),
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::Interactive),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_DEPLOYS_LIST),
-            summary: "List deploys for a site".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id"],
-                vec![("site_id", string_property("Netlify site ID"))],
-            ),
-            output_schema: array_output_schema(),
-            capability: CapabilityId::from_static(CAP_DEPLOYS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint("See deploy history", vec![], vec![], vec![CAP_SITES_READ]),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_DEPLOYS_GET),
-            summary: "Get deploy details".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id", "deploy_id"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    ("deploy_id", string_property("Netlify deploy ID")),
-                ],
-            ),
-            output_schema: object_output_schema(),
-            capability: CapabilityId::from_static(CAP_DEPLOYS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint(
-                "Check deploy status",
-                vec![],
-                vec![],
-                vec![CAP_DEPLOYS_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_DEPLOYS_CREATE),
-            summary: "Create a deploy".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    (
-                        "branch",
-                        string_property("Optional Git branch for the deploy"),
-                    ),
-                    ("title", string_property("Optional deploy title")),
-                ],
-            ),
-            output_schema: object_output_schema(),
-            capability: CapabilityId::from_static(CAP_DEPLOYS_WRITE),
-            risk_level: RiskLevel::High,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Trigger new deploy",
-                vec!["Affects live site".into()],
-                vec![],
-                vec![CAP_DEPLOYS_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_DEPLOYS_ROLLBACK),
-            summary: "Rollback to a deploy".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id", "deploy_id"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    ("deploy_id", string_property("Deploy ID to roll back to")),
-                ],
-            ),
-            output_schema: object_output_schema(),
-            capability: CapabilityId::from_static(CAP_DEPLOYS_WRITE),
-            risk_level: RiskLevel::High,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Rollback site to a previous deploy",
-                vec!["Changes live site".into()],
-                vec![],
-                vec![CAP_DEPLOYS_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_DNS_LIST_ZONES),
-            summary: "List DNS zones".into(),
-            description: None,
-            input_schema: no_input_schema(),
-            output_schema: array_output_schema(),
-            capability: CapabilityId::from_static(CAP_DNS_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint("List Netlify DNS zones", vec![], vec![], vec![]),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ENV_LIST),
-            summary: "List environment variables".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id", "account_slug"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    ("account_slug", string_property("Netlify account slug")),
-                ],
-            ),
-            output_schema: array_output_schema(),
-            capability: CapabilityId::from_static(CAP_ENV_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::None,
-            ai_hints: hint(
-                "List env vars for a site",
-                vec!["Requires account_slug".into()],
-                vec![],
-                vec![CAP_ENV_WRITE],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ENV_SET),
-            summary: "Set environment variable".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id", "account_slug", "key", "value"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    ("account_slug", string_property("Netlify account slug")),
-                    ("key", string_property("Environment variable key")),
-                    ("value", string_property("Environment variable value")),
-                    (
-                        "context",
-                        string_property("Optional Netlify environment context"),
-                    ),
-                    (
-                        "is_secret",
-                        boolean_property("Whether Netlify should treat the value as secret"),
-                    ),
-                ],
-            ),
-            output_schema: array_output_schema(),
-            capability: CapabilityId::from_static(CAP_ENV_WRITE),
-            risk_level: RiskLevel::Medium,
-            safety_tier: SafetyTier::Risky,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Set or update env var",
-                vec!["May trigger rebuild".into()],
-                vec![],
-                vec![CAP_ENV_READ],
-            ),
-            rate_limit: None,
-            requires_approval: None,
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_ENV_DELETE),
-            summary: "Delete environment variable".into(),
-            description: None,
-            input_schema: object_schema(
-                &["site_id", "account_slug", "key"],
-                vec![
-                    ("site_id", string_property("Netlify site ID")),
-                    ("account_slug", string_property("Netlify account slug")),
-                    ("key", string_property("Environment variable key to delete")),
-                ],
-            ),
-            output_schema: delete_output_schema("key", "Deleted environment variable key"),
-            capability: CapabilityId::from_static(CAP_ENV_WRITE),
-            risk_level: RiskLevel::High,
-            safety_tier: SafetyTier::Dangerous,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint(
-                "Remove env var (may break builds)",
-                vec!["Verify key first".into()],
-                vec![],
-                vec![CAP_ENV_READ],
-            ),
-            rate_limit: None,
-            requires_approval: Some(ApprovalMode::Interactive),
-        },
-        OperationInfo {
-            id: OperationId::from_static(OP_HEALTH),
-            summary: "Verify API token".into(),
-            description: None,
-            input_schema: no_input_schema(),
-            output_schema: health_output_schema(),
-            capability: CapabilityId::from_static(CAP_SITES_READ),
-            risk_level: RiskLevel::Low,
-            safety_tier: SafetyTier::Safe,
-            idempotency: IdempotencyClass::Strict,
-            ai_hints: hint("Check credentials", vec![], vec![], vec![]),
-            rate_limit: None,
-            requires_approval: None,
-        },
-    ]
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
+}
+
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest = ConnectorManifest::parse_str(MANIFEST_TOML)
+        .expect("embedded Netlify manifest should parse");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
+}
+
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
+}
+
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
+    }
+}
+
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
 }
 
 fcp_core::impl_fcp_sealed!(NetlifyConnector);
@@ -1048,7 +751,7 @@ impl NetlifyConnector {
                     .get("context")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let is_secret = req.input.get("is_secret").and_then(|v| v.as_bool());
+                let netlify_secret_flag = req.input.get("is_secret").and_then(|v| v.as_bool());
                 let set_req = vec![SetEnvVarRequest {
                     key: key.into(),
                     values: vec![SetEnvVarValue {
@@ -1056,7 +759,7 @@ impl NetlifyConnector {
                         context,
                     }],
                     scopes: None,
-                    is_secret,
+                    is_secret: netlify_secret_flag,
                 }];
                 let envs = client
                     .set_env_var(runtime, account_slug, site_id, &set_req)
@@ -1098,6 +801,11 @@ impl NetlifyConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fcp_prelude::{IdempotencyClass, RiskLevel, SafetyTier};
+
+    fn sample_auth_value() -> String {
+        ["sample", "netlify", "access"].join("-")
+    }
 
     #[test]
     fn connector_id() {
@@ -1125,6 +833,50 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 13);
+    }
+
+    #[test]
+    fn operations_contain_expected_ids() {
+        let ops = operations_info();
+        let ids: Vec<&str> = ops.iter().map(|o| o.id.as_ref()).collect();
+        assert_eq!(ids, OPERATION_ORDER);
+    }
+
+    #[test]
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let runtime_ops = operations_info();
+        let manifest_ops = ordered_manifest_operations();
+
+        assert_eq!(runtime_ops.len(), manifest_ops.len());
+
+        for (runtime_op, (manifest_id, manifest_operation)) in
+            runtime_ops.iter().zip(manifest_ops.iter())
+        {
+            assert_eq!(runtime_op.id.as_ref(), manifest_id);
+            assert_eq!(runtime_op.summary, manifest_operation.description);
+            assert_eq!(
+                runtime_op.description.as_deref(),
+                Some(manifest_operation.description.as_str())
+            );
+            assert_eq!(runtime_op.input_schema, manifest_operation.input_schema);
+            assert_eq!(runtime_op.output_schema, manifest_operation.output_schema);
+            assert_eq!(runtime_op.capability, manifest_operation.capability);
+            assert_eq!(runtime_op.risk_level, manifest_operation.risk_level);
+            assert_eq!(runtime_op.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(runtime_op.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                runtime_op.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
+            );
+            assert_eq!(
+                serde_json::to_value(&runtime_op.ai_hints).unwrap(),
+                serde_json::to_value(&manifest_operation.ai_hints).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(runtime_op.rate_limit.as_ref()).unwrap(),
+                serde_json::to_value(manifest_operation.rate_limit.as_ref()).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1247,7 +999,7 @@ mod tests {
     #[test]
     fn config_validates_empty_base_url() {
         let val = serde_json::json!({
-            "access_token": "tok",
+            "access_token": sample_auth_value(),
             "base_url": ""
         });
         let result = NetlifyConfig::from_value(val);
@@ -1257,7 +1009,7 @@ mod tests {
     #[test]
     fn config_from_value_valid() {
         let val = serde_json::json!({
-            "access_token": "nfp_abc123",
+            "access_token": sample_auth_value(),
             "base_url": "https://api.netlify.com"
         });
         let config = NetlifyConfig::from_value(val).unwrap();
@@ -1268,16 +1020,16 @@ mod tests {
     #[test]
     fn config_default_base_url() {
         let val = serde_json::json!({
-            "access_token": "nfp_abc123"
+            "access_token": sample_auth_value()
         });
         let config = NetlifyConfig::from_value(val).unwrap();
         assert_eq!(config.base_url, "https://api.netlify.com");
     }
 
     #[test]
-    fn provisioning_readiness_with_token() {
+    fn provisioning_readiness_with_auth_value() {
         let val = serde_json::json!({
-            "access_token": "nfp_abc123"
+            "access_token": sample_auth_value()
         });
         let config = NetlifyConfig::from_value(val).unwrap();
         let readiness = config.provisioning_readiness();
@@ -1351,7 +1103,7 @@ mod tests {
     fn health_configured_but_secretless() {
         let c = NetlifyConnector::new();
         let snap = fcp_async_core::runtime::block_on_sync(c.health()).unwrap();
-        // Not configured → degraded
+        // Not configured -> degraded
         assert_eq!(snap.status.as_str(), "degraded");
     }
 

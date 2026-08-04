@@ -1744,3 +1744,120 @@ fn introspection_emits_v3_compliance_evidence() {
         serde_json::to_string_pretty(&value).unwrap()
     );
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// A 5xx or a timeout can both be reported after Feishu already delivered the
+// message, so a bare retry sends it twice. Feishu deduplicates messaging
+// requests on a `uuid` BODY field (not a header, unlike Stripe/Mastodon),
+// which makes the retry genuinely safe rather than merely refused.
+//
+// These pin the DISTINCTION: a per-attempt uuid would still "succeed" here,
+// so what is asserted is that both attempts carry the SAME value.
+
+fn test_runtime() -> fcp_sdk::ConnectorRuntime {
+    fcp_sdk::ConnectorRuntime::new(fcp_sdk::ConnectorRuntimeConfig::default())
+}
+
+fn replay_test_client(server: &MockServer) -> fcp_feishu::client::FeishuClient {
+    fcp_feishu::client::FeishuClient::new(
+        &server.uri(),
+        APP_ID,
+        APP_SECRET,
+        fcp_sdk::migration::HttpRetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .expect("wiremock URI should build a Feishu client")
+}
+
+/// Request bodies for the message endpoints, in arrival order.
+async fn message_request_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .filter(|r| r.url.path().contains("/im/v1/messages"))
+        .map(|r| serde_json::from_slice(&r.body).expect("request body should be JSON"))
+        .collect()
+}
+
+#[fcp_async_core::runtime::test]
+async fn send_message_presents_one_stable_dedup_uuid_across_attempts() {
+    let server = MockServer::start().await;
+    mock_auth_endpoint(&server, 200).await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 0,
+            "msg": "ok",
+            "data": { "message_id": "om_1" }
+        })))
+        .mount(&server)
+        .await;
+
+    let request = fcp_feishu::types::SendMessageRequest {
+        receive_id: "ou_1".into(),
+        msg_type: "text".into(),
+        content: "{\"text\":\"hi\"}".into(),
+    };
+    replay_test_client(&server)
+        .send_message(&test_runtime(), "open_id", &request)
+        .await
+        .expect("the retry should succeed");
+
+    let bodies = message_request_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "the 503 should have been retried");
+
+    let first = bodies[0]["uuid"].as_str().unwrap_or_default();
+    assert!(
+        !first.is_empty(),
+        "send_message must carry a `uuid` so Feishu can deduplicate the retry"
+    );
+    assert_eq!(
+        first,
+        bodies[1]["uuid"].as_str().unwrap_or_default(),
+        "both attempts must present the SAME uuid — a per-attempt value would \
+         let Feishu treat the retry as a new message and deliver it twice"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn add_whole_comment_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    mock_auth_endpoint(&server, 200).await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/drive/v1/files/doc-1/new_comments"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let result = replay_test_client(&server)
+        .add_whole_comment(&test_runtime(), "doc-1", "docx", "hello")
+        .await;
+    assert!(result.is_err());
+
+    let comment_requests = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .filter(|r| r.url.path().ends_with("/new_comments"))
+        .count();
+    assert_eq!(
+        comment_requests, 1,
+        "Drive comments take no dedup key, and a 503 means Feishu received the \
+         request — a retry posts a SECOND comment"
+    );
+}

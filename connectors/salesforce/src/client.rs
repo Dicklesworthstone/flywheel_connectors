@@ -136,6 +136,44 @@ fn escape_soql_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// Validate a user-supplied SOQL field reference.
+///
+/// The `fields` list is interpolated verbatim into the `SELECT` clause (and into
+/// the `?fields=` query parameter for `get_account`); neither is escaped at the
+/// SOQL or URL layer. An unrestricted field name therefore allows SOQL injection
+/// (breaking out of the column list to change the queried object, add subqueries,
+/// or widen the `WHERE`) and query-parameter smuggling. A legitimate SOQL field
+/// reference is an identifier or a relationship dot-path (e.g. `Account.Name`),
+/// so restricting to `[A-Za-z0-9_.]` preserves real usage while rejecting every
+/// injection vector. The exact (untrimmed) bytes are checked because those are
+/// the bytes that get interpolated.
+fn validate_soql_field(field: &str) -> SalesforceResult<()> {
+    if field.is_empty() {
+        return Err(SalesforceError::InvalidInput(
+            "field name must not be empty".into(),
+        ));
+    }
+    if !field
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    {
+        return Err(SalesforceError::InvalidInput(format!(
+            "field '{field}' is not a valid SOQL field reference"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate every entry of an optional user-supplied field list.
+fn validate_soql_fields(fields: Option<&[String]>) -> SalesforceResult<()> {
+    if let Some(fields) = fields {
+        for field in fields {
+            validate_soql_field(field)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> SalesforceResult<&'a str> {
     if value.trim().is_empty() {
@@ -367,6 +405,7 @@ impl SalesforceClient {
         fields: Option<&[String]>,
     ) -> SalesforceResult<serde_json::Value> {
         let account_id = sanitize_path_segment(account_id, "account_id")?;
+        validate_soql_fields(fields)?;
         let qs = fields.map_or_else(String::new, |f| format!("?fields={}", f.join(",")));
         self.get(&format!("/sobjects/Account/{account_id}{qs}"))
             .await
@@ -378,6 +417,7 @@ impl SalesforceClient {
         fields: Option<&[String]>,
         limit: Option<i64>,
     ) -> SalesforceResult<serde_json::Value> {
+        validate_soql_fields(fields)?;
         let cols = fields.map_or_else(|| "Id, Name, Industry".to_string(), |f| f.join(", "));
         let mut query = format!("SELECT {cols} FROM Account");
         if let Some(l) = limit {
@@ -395,6 +435,7 @@ impl SalesforceClient {
         limit: Option<i64>,
         account_id: Option<&str>,
     ) -> SalesforceResult<serde_json::Value> {
+        validate_soql_fields(fields)?;
         let cols = fields.map_or_else(
             || "Id, FirstName, LastName, Email".to_string(),
             |f| f.join(", "),
@@ -434,6 +475,7 @@ impl SalesforceClient {
         limit: Option<i64>,
         status: Option<&str>,
     ) -> SalesforceResult<serde_json::Value> {
+        validate_soql_fields(fields)?;
         let cols = fields.map_or_else(
             || "Id, FirstName, LastName, Company, Status".to_string(),
             |f| f.join(", "),
@@ -466,6 +508,7 @@ impl SalesforceClient {
         limit: Option<i64>,
         stage: Option<&str>,
     ) -> SalesforceResult<serde_json::Value> {
+        validate_soql_fields(fields)?;
         let cols = fields.map_or_else(
             || "Id, Name, StageName, Amount, CloseDate".to_string(),
             |f| f.join(", "),
@@ -498,6 +541,7 @@ impl SalesforceClient {
         limit: Option<i64>,
         status: Option<&str>,
     ) -> SalesforceResult<serde_json::Value> {
+        validate_soql_fields(fields)?;
         let cols = fields.map_or_else(
             || "Id, Subject, Status, Priority".to_string(),
             |f| f.join(", "),
@@ -875,5 +919,50 @@ mod tests {
             sanitize_path_segment("abc-def_ghi", "id").unwrap(),
             "abc-def_ghi"
         );
+    }
+
+    // -- validate_soql_field(s) tests --
+
+    #[test]
+    fn validate_soql_field_accepts_identifier_and_relationship() {
+        assert!(validate_soql_field("Name").is_ok());
+        assert!(validate_soql_field("Account.Name").is_ok());
+        assert!(validate_soql_field("Custom_Field__c").is_ok());
+        assert!(validate_soql_field("Owner.Profile.Name").is_ok());
+    }
+
+    #[test]
+    fn validate_soql_field_rejects_empty() {
+        assert!(validate_soql_field("").is_err());
+    }
+
+    #[test]
+    fn validate_soql_field_rejects_soql_injection() {
+        // Breaking out of the column list / changing the queried object.
+        assert!(validate_soql_field("Id FROM User WHERE Name != ''").is_err());
+        assert!(validate_soql_field("Id), (SELECT Name FROM Contacts").is_err());
+        assert!(validate_soql_field("Id,Secret").is_err());
+        assert!(validate_soql_field("COUNT(Id)").is_err());
+    }
+
+    #[test]
+    fn validate_soql_field_rejects_query_param_smuggling_and_whitespace() {
+        // Interpolated into `?fields=` for get_account; must not carry `&`/`=`
+        // or surrounding whitespace that would break the URL query.
+        assert!(validate_soql_field("Name&admin=true").is_err());
+        assert!(validate_soql_field(" Name ").is_err());
+    }
+
+    #[test]
+    fn validate_soql_fields_none_is_ok() {
+        assert!(validate_soql_fields(None).is_ok());
+    }
+
+    #[test]
+    fn validate_soql_fields_rejects_when_any_entry_is_bad() {
+        let good = vec!["Id".to_string(), "Name".to_string()];
+        assert!(validate_soql_fields(Some(&good)).is_ok());
+        let bad = vec!["Id".to_string(), "Name) FROM User--".to_string()];
+        assert!(validate_soql_fields(Some(&bad)).is_err());
     }
 }

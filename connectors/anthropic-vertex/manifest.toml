@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:pending-anthropic-vertex"
+interface_hash = "blake3-256:fcp.interface.v2:9d2088335a6679fac37d753453840186d171cb7a7e75e06cff971ba1fc4e61d7"
 
 [connector]
 id = "fcp.anthropic-vertex"
@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "Claude Messages connector for Google Vertex AI partner model endpoints, using Vertex auth and rawPredict or streamRawPredict routing"
 archetypes = ["operational", "streaming"]
 format = "native"
+status = "proven"
 
 [connector.state]
 model = "stateless"
@@ -28,7 +29,7 @@ forbidden = ["z:public", "z:community"]
 
 [capabilities]
 required = ["network.dns", "network.egress", "network.tls.sni"]
-optional = []
+optional = ["anthropic_vertex.messages", "anthropic_vertex.models.read"]
 forbidden = ["system.exec", "network.listen", "system.privileged"]
 
 [sandbox]
@@ -36,6 +37,8 @@ profile = "strict"
 memory_mb = 256
 cpu_percent = 50
 wall_clock_timeout_ms = 240000
+deny_exec = true
+deny_ptrace = true
 
 [provides.operations."anthropic_vertex.messages.create"]
 description = "Invoke Claude Messages through Google Vertex AI rawPredict."

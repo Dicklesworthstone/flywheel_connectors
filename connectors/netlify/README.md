@@ -1,6 +1,6 @@
 # Netlify Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/introspection/API drift documented
+> **Status**: runtime contract documented; manifest/introspection parity enforced; API drift documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -39,7 +39,8 @@ Important runtime truths the contract preserves:
 - Manifest ID is `fcp.netlify`.
 - `BaseConnector` runtime ID is `fcp.netlify`.
 - Manifest version is `0.1.0`.
-- Manifest format is `wasi`.
+- Manifest format is `native`.
+- Runtime introspection operation metadata is derived from the checked-in manifest, including operation IDs, order, schemas, capability, risk, safety, idempotency, approval metadata, AI hints, and rate limits.
 - Configuration accepts:
   - `access_token`
   - `base_url`
@@ -104,8 +105,6 @@ Path and query handling:
 This README documents runtime truth and keeps current drift visible:
 
 - Netlify documents API paths under `https://api.netlify.com/api/v1`. Runtime defaults the base to `https://api.netlify.com` and appends `/api/v1` in each client helper.
-- The manifest operation table keys are snake-case names such as `sites_list` and `deploys_create`; runtime operation IDs are dotted names such as `netlify.sites.list` and `netlify.deploys.create`.
-- Manifest required capabilities use `network.dns` and `network.outbound`; current root guidance generally uses `network.egress` and `network.tls.sni` for provider connectors.
 - Configuration accepts `account_slug`, but runtime env operations still require `account_slug` in each invoke input.
 - Configuration validation only rejects an empty `base_url`. The stricter base URL policy is surfaced through provisioning readiness, health, doctor, and self-check; `invoke()` itself does not re-check that policy before building requests.
 - Local base URL policy accepts `api.netlify.com` over HTTPS and localhost-style test hosts. Manifest network constraints deny localhost and private ranges because production operation is expected to target Netlify.
@@ -119,7 +118,7 @@ This README documents runtime truth and keeps current drift visible:
 - `health()` is a live provider operation while `self_check()` is also a live provider probe. The local lifecycle `health()` method is not live.
 - No dedicated tracked verification shell script exists for this connector.
 
-A follow-up parity bead should enforce base URL policy before invoke, add a real credential-ID or egress-injection path if secretless mode is desired, make `simulate()` validate operation/input/capability state, bind capability tokens to Netlify resource URIs, reconcile manifest capability names with root connector conventions, add approval metadata for live-site deploy and env mutations, and either implement or explicitly reject deploy file upload flows.
+A follow-up parity bead should enforce base URL policy before invoke, add a real credential-ID or egress-injection path if secretless mode is desired, make `simulate()` validate operation/input/capability state, bind capability tokens to Netlify resource URIs, add approval metadata for live-site deploy and env mutations, and either implement or explicitly reject deploy file upload flows.
 
 ## First-Slice Scope
 
@@ -130,7 +129,7 @@ The current Netlify README slice documents the existing runtime surface:
 - Local health, doctor, live self-check, introspection, simulate, invoke, and shutdown behavior
 - Capability-token verification and current empty resource-URI binding
 - Provider error mapping, path/query sanitization, retry behavior, and timeout behavior
-- Runtime/manifest/provider-doc drift around operation IDs, network capabilities, approval metadata, base URL policy, secretless auth, env scopes, deploy uploads, and simulation
+- Remaining runtime/provider-doc drift around approval metadata, base URL policy, secretless auth, env scopes, deploy uploads, and simulation
 - Existing integration-test orientation through manifest schema checks, operation introspection checks, and WireMock-backed provider flows
 
 ## Auth And Zone Boundary
@@ -147,7 +146,7 @@ The current Netlify README slice documents the existing runtime surface:
   - `netlify.dns.read`
   - `netlify.env.read`
   - `netlify.env.write`
-- Manifest required capabilities are `network.dns` and `network.outbound`.
+- Manifest required capabilities are `network.dns`, `network.egress`, and `network.tls.sni`.
 - Manifest forbids `system.exec` and `system.privileged`.
 - The connector does not intentionally persist Netlify tokens, site payloads, deploy payloads, DNS zones, env values, request counters, or error counters outside process memory.
 - Netlify payloads can contain site names, custom domains, deploy metadata, DNS zones, environment variable keys and values, account slugs, user IDs, and user email addresses. Treat live output as work-zone sensitive unless the host supplies a stricter zone policy.
@@ -190,6 +189,10 @@ ubs connectors/netlify/README.md
 For code changes in this connector, use the workspace-required proof lane from the root `AGENTS.md`:
 
 ```bash
+env CARGO_TARGET_DIR=/tmp/fcp-netlify-manifest CARGO_INCREMENTAL=0 cargo run -p fwc -- manifest fix --check --json connectors/netlify/manifest.toml
+env CARGO_TARGET_DIR=/tmp/fcp-netlify CARGO_INCREMENTAL=0 cargo check -p fcp-netlify --all-targets
+env CARGO_TARGET_DIR=/tmp/fcp-netlify CARGO_INCREMENTAL=0 cargo clippy -p fcp-netlify --all-targets --no-deps -- -D warnings
+env CARGO_TARGET_DIR=/tmp/fcp-netlify CARGO_INCREMENTAL=0 cargo test -p fcp-netlify --all-targets -- --nocapture
 rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 rch exec -- cargo fmt --check

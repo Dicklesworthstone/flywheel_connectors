@@ -385,13 +385,18 @@ async fn recv_text(ws: &mut TestServerWebSocket, context: &str) -> String {
 }
 
 async fn send_json(ws: &mut TestServerWebSocket, value: serde_json::Value, context: &str) {
-    ws.send(&fcp_async_core::compatibility_cx(), Message::text(value.to_string()))
-        .await
-        .expect(context);
+    ws.send(
+        &fcp_async_core::compatibility_cx(),
+        Message::text(value.to_string()),
+    )
+    .await
+    .expect(context);
 }
 
 async fn close_test_websocket(ws: &mut TestServerWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 async fn subscription_wrong_id_error(frame: serde_json::Value) -> GraphqlClientError {
@@ -1854,22 +1859,6 @@ async fn subscription_full_result_buffer_handles_ping_then_closes_on_overflow() 
     );
 }
 
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms. This test
-// drives a real two-connection TCP/WebSocket reconnect handshake: the server
-// closes connection 0 and loops back to `accept()`, while the client detects the
-// disconnect, waits `reconnect_delay`, and reconnects to deliver the
-// post-reconnect payload. Under the floored reactor the client- and server-side
-// handshake timers (disconnect detection on the stream read, `ack_timeout`, the
-// fastwebsockets handshake) all quantize independently, so the reconnect attempt
-// races ahead of the server's next `accept()` and observes `Connection refused`;
-// the run also balloons to ~42s as the floored timers compound. Unlike a single
-// deadline, this is a multi-party timing handshake whose synchronization the
-// floor breaks: retiming `reconnect_delay` alone (tried at 400ms, verified
-// failing) cannot recover it because the desync is in the connect/handshake
-// window, not the inter-attempt delay. Ignored (policy c → b) until asupersync
-// 0.3.3 restores sub-250ms timer fidelity. Reconnect *config* semantics remain
-// covered by the `reconnect_config_*` unit tests in src/subscription.rs.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[fcp_async_core::runtime::test]
 async fn subscription_reconnects_after_disconnect() {
     let mut ctx = TestContext::new("subscription_reconnects_after_disconnect");
@@ -1937,9 +1926,7 @@ async fn subscription_reconnects_after_disconnect() {
     let mut ws = WsConfig::new()
         .with_connect_timeout(Duration::from_secs(2))
         .with_auto_reconnect(true);
-    // asupersync-uwp88: retimed from 20ms to 400ms (see #[ignore] above for why
-    // retiming alone is insufficient under the 0.3.2 floor).
-    ws.reconnect_delay = Duration::from_millis(400);
+    ws.reconnect_delay = Duration::from_millis(20);
     ws.max_reconnect_attempts = Some(3);
 
     let client =

@@ -304,7 +304,8 @@ impl GoogleCalendarClient {
     pub async fn freebusy(&self, request: &FreeBusyRequest) -> GCalResult<FreeBusyResponse> {
         let url = format!("{}/freeBusy", self.base_url);
         let body = serde_json::to_value(request).map_err(GoogleCalendarError::Json)?;
-        self.post_json(&url, &body).await
+        // Read-only POST: freeBusy queries availability and creates nothing.
+        self.post_json_replay_safe(&url, &body).await
     }
 
     // ── Event instances ─────────────────────────────────────────
@@ -350,7 +351,7 @@ impl GoogleCalendarClient {
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> GCalResult<T> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Json)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
@@ -377,13 +378,34 @@ impl GoogleCalendarClient {
         self.get(&url).await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: fail-closed. A replay of `events.insert` or `events.quickAdd`
+    /// creates a SECOND calendar event, which also mails a second set of
+    /// invitations to the attendees. Read-only POSTs use
+    /// [`Self::post_json_replay_safe`].
     async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> GCalResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json)
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
+            .await?;
+        decode_json_response(response)
+    }
+
+    /// POST whose replay cannot duplicate a side effect.
+    ///
+    /// `freeBusy` is a query that Google exposes as a POST because the request
+    /// carries a body; it creates nothing.
+    async fn post_json_replay_safe<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> GCalResult<T> {
+        let response = self
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
@@ -394,24 +416,31 @@ impl GoogleCalendarClient {
         body: &serde_json::Value,
     ) -> GCalResult<T> {
         let response = self
-            .execute_with_retry("PUT", url, Some(body), GoogleResponseMode::Json)
+            .execute_with_retry("PUT", url, Some(body), GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
 
     async fn delete(&self, url: &str) -> GCalResult<()> {
         let _ = self
-            .execute_with_retry("DELETE", url, None, GoogleResponseMode::Auto)
+            .execute_with_retry("DELETE", url, None, GoogleResponseMode::Auto, true)
             .await?;
         Ok(())
     }
 
+    /// Execute with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). It is a parameter rather than a function of
+    /// `http_method` because Google models several state changes — and some
+    /// pure reads — as POSTs, so the verb alone decides nothing.
     async fn execute_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
+        replay_safe: bool,
     ) -> GCalResult<GoogleExecuteResponse> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
@@ -427,10 +456,14 @@ impl GoogleCalendarClient {
                 .await
             {
                 Ok(response) => AttemptOutcome::Success(response),
-                Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                    retry_after: e.retry_after(),
-                    error: e,
-                },
+                Err(e) if e.is_retryable() => {
+                    // A rate limit was refused WITHOUT performing the work, so
+                    // it stays retryable; a 5xx means Google received the
+                    // request and may already have done it.
+                    let replayable = replay_safe || e.replay_is_safe();
+                    let retry_after = e.retry_after();
+                    AttemptOutcome::retryable_if_replayable(e, retry_after, replayable)
+                }
                 Err(e) => AttemptOutcome::Terminal(e),
             }
         })

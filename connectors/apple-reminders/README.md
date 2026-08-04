@@ -1,6 +1,6 @@
 # Apple Reminders Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/introspection/platform drift documented
+> **Status**: runtime contract documented; manifest-derived operation metadata; platform drift documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -23,6 +23,11 @@ The current crate exposes these runtime operation IDs:
 - `apple_reminders.list_reminders`
 - `apple_reminders.create_reminder`
 - `apple_reminders.complete_reminder`
+
+Runtime introspection derives operation descriptions, schemas, risk, safety,
+idempotency, approval mode, and AI hints from the checked-in manifest operation
+sections. Manifest `requires_approval = "none"` serializes as omitted
+`requires_approval` in `OperationInfo`; policy approval remains explicit.
 
 Important runtime truths the contract preserves:
 

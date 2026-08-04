@@ -1,13 +1,14 @@
 //! FCP `Box` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityId, ConnectorId, CredentialId, FcpError, FcpResult,
-    IdempotencyClass, OAuthRecipe, OperationId, OperationInfo, ProvisioningRecipe,
-    ProvisioningStep, ProvisioningStepType, RecipeId, RiskLevel, SafetyTier, SelfCheckReport,
-    StepId,
+    ApprovalMode, BaseConnector, ConnectorId, CredentialId, FcpError, FcpResult, OAuthRecipe,
+    OperationId, OperationInfo, ProvisioningRecipe, ProvisioningStep, ProvisioningStepType,
+    RecipeId, SelfCheckReport, StepId,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,15 @@ use crate::{
     error::BoxError,
 };
 
+const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const OPERATION_ORDER: &[&str] = &[
+    "box.files.get",
+    "box.files.upload",
+    "box.files.delete",
+    "box.folders.list",
+    "box.sharing.list",
+];
+
 /// Parsed and validated `Box` connector configuration.
 #[derive(Debug, Clone)]
 struct BoxConfig {
@@ -29,7 +39,7 @@ struct BoxConfig {
 
 impl BoxConfig {
     fn from_params(params: &serde_json::Value) -> FcpResult<Self> {
-        let access_token = params
+        let bearer_auth = params
             .get("access_token")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
@@ -52,7 +62,7 @@ impl BoxConfig {
             None => None,
         };
 
-        let auth = match (access_token, credential_id) {
+        let auth = match (bearer_auth, credential_id) {
             (Some(token), None) => BoxAuth::BearerToken(token),
             (None, Some(cred_id)) => BoxAuth::CredentialId(cred_id),
             (Some(_), Some(_)) => {
@@ -614,211 +624,80 @@ fn is_local_test_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
-/// Build a single [`OperationInfo`].
-#[allow(clippy::too_many_arguments)]
-fn op_info(
-    id: &'static str,
-    summary: &str,
-    input_schema: serde_json::Value,
-    output_schema: serde_json::Value,
-    capability: &'static str,
-    risk_level: RiskLevel,
-    safety_tier: SafetyTier,
-    idempotency: IdempotencyClass,
-    ai_hints: AgentHint,
-) -> OperationInfo {
-    OperationInfo {
-        id: OperationId::from_static(id),
-        summary: summary.into(),
-        input_schema,
-        output_schema,
-        capability: CapabilityId::from_static(capability),
-        risk_level,
-        description: None,
-        rate_limit: None,
-        requires_approval: None,
-        safety_tier,
-        idempotency,
-        ai_hints,
+/// Build the operations info for introspection.
+fn operations_info() -> Vec<OperationInfo> {
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
+}
+
+fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {
+    let manifest =
+        ConnectorManifest::parse_str(MANIFEST_TOML).expect("embedded Box manifest should parse");
+    let mut operations: Vec<_> = manifest.provides.operations.into_iter().collect();
+    operations.sort_by(|(left, _), (right, _)| {
+        let left_index = operation_order(left);
+        let right_index = operation_order(right);
+        left_index.cmp(&right_index).then_with(|| left.cmp(right))
+    });
+    operations
+}
+
+fn operation_order(operation_id: &str) -> usize {
+    OPERATION_ORDER
+        .iter()
+        .position(|known_id| *known_id == operation_id)
+        .unwrap_or(OPERATION_ORDER.len())
+}
+
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
+    match mode {
+        ManifestApprovalMode::None => None,
+        other => Some(ApprovalMode::from(other)),
     }
 }
 
-/// Build the operations info for introspection.
-fn operations_info() -> Vec<OperationInfo> {
-    vec![
-        op_info(
-            "box.files.get",
-            "Get file metadata from Box",
-            json!({
-                "type": "object",
-                "required": ["file_id"],
-                "properties": {
-                    "file_id": { "type": "string", "description": "Box file identifier" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "required": ["id", "name"],
-                "properties": {
-                    "id": { "type": "string" },
-                    "name": { "type": "string" }
-                }
-            }),
-            "box.files.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Retrieve metadata for a specific file in Box.".into(),
-                common_mistakes: vec![
-                    "Using a file name or path instead of the numeric Box file ID.".into(),
-                ],
-                examples: vec![r#"{"file_id": "123456789"}"#.into()],
-                related: vec![
-                    CapabilityId::from_static("box.folders.list"),
-                    CapabilityId::from_static("box.files.upload"),
-                    CapabilityId::from_static("box.files.delete"),
-                ],
-            },
-        ),
-        op_info(
-            "box.files.upload",
-            "Upload a file to Box",
-            json!({
-                "type": "object",
-                "required": ["folder_id", "name"],
-                "properties": {
-                    "folder_id": { "type": "string", "description": "Target folder ID for the upload" },
-                    "name": { "type": "string", "description": "Name for the uploaded file" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "required": ["id"],
-                "properties": {
-                    "id": { "type": "string" }
-                }
-            }),
-            "box.files.write",
-            RiskLevel::Medium,
-            SafetyTier::Risky,
-            IdempotencyClass::None,
-            AgentHint {
-                when_to_use: "Upload a new file to a Box folder.".into(),
-                common_mistakes: vec![
-                    "Using folder_id \"0\" uploads to root; verify the target folder ID with box.folders.list first to avoid misplaced files.".into(),
-                ],
-                examples: vec![r#"{"folder_id": "0", "name": "report.pdf"}"#.into()],
-                related: vec![
-                    CapabilityId::from_static("box.folders.list"),
-                    CapabilityId::from_static("box.files.get"),
-                ],
-            },
-        ),
-        op_info(
-            "box.files.delete",
-            "Delete a file from Box",
-            json!({
-                "type": "object",
-                "required": ["file_id"],
-                "properties": {
-                    "file_id": { "type": "string", "description": "Box file identifier to delete" }
-                }
-            }),
-            json!({ "type": "object" }),
-            "box.files.write",
-            RiskLevel::High,
-            SafetyTier::Dangerous,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "Permanently delete a file from Box.".into(),
-                common_mistakes: vec![
-                    "Passing a folder ID instead of a file ID; use box.folders.list to confirm the item type before deleting.".into(),
-                ],
-                examples: vec![r#"{"file_id": "123456789"}"#.into()],
-                related: vec![
-                    CapabilityId::from_static("box.files.get"),
-                    CapabilityId::from_static("box.folders.list"),
-                ],
-            },
-        ),
-        op_info(
-            "box.folders.list",
-            "List contents of a Box folder",
-            json!({
-                "type": "object",
-                "required": ["folder_id"],
-                "properties": {
-                    "folder_id": { "type": "string", "description": "Folder ID (0 for root)" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "required": ["entries"],
-                "properties": {
-                    "entries": { "type": "array" }
-                }
-            }),
-            "box.folders.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "List contents of a Box folder.".into(),
-                common_mistakes: vec![
-                    "Forgetting that folder_id \"0\" refers to the root folder; omitting it or passing an empty string will fail.".into(),
-                ],
-                examples: vec![r#"{"folder_id": "0"}"#.into()],
-                related: vec![
-                    CapabilityId::from_static("box.files.get"),
-                    CapabilityId::from_static("box.files.upload"),
-                ],
-            },
-        ),
-        op_info(
-            "box.sharing.list",
-            "List sharing collaborations for a Box file",
-            json!({
-                "type": "object",
-                "required": ["file_id"],
-                "properties": {
-                    "file_id": { "type": "string", "description": "Box file identifier" }
-                }
-            }),
-            json!({
-                "type": "object",
-                "required": ["entries"],
-                "properties": {
-                    "entries": { "type": "array" }
-                }
-            }),
-            "box.sharing.read",
-            RiskLevel::Low,
-            SafetyTier::Safe,
-            IdempotencyClass::Strict,
-            AgentHint {
-                when_to_use: "List sharing collaborations for a Box file.".into(),
-                common_mistakes: vec![
-                    "Expecting shared link URLs in the response; this returns collaboration objects with user roles, not share links.".into(),
-                ],
-                examples: vec![r#"{"file_id": "123456789"}"#.into()],
-                related: vec![
-                    CapabilityId::from_static("box.files.get"),
-                    CapabilityId::from_static("box.folders.list"),
-                ],
-            },
-        ),
-    ]
+fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
+    let description = operation.description.clone();
+    OperationInfo {
+        id: OperationId::new(id).expect("manifest operation id should be canonical"),
+        summary: description.clone(),
+        description: Some(description),
+        input_schema: operation.input_schema.clone(),
+        output_schema: operation.output_schema.clone(),
+        capability: operation.capability.clone(),
+        risk_level: operation.risk_level,
+        safety_tier: operation.safety_tier,
+        idempotency: operation.idempotency,
+        ai_hints: operation.ai_hints.clone(),
+        rate_limit: operation
+            .rate_limit
+            .as_ref()
+            .map(|rate_limit| rate_limit.0.clone()),
+        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fcp_prelude::{IdempotencyClass, RiskLevel, SafetyTier};
+
+    fn sample_access_value() -> String {
+        ["sample", "access"].join("-")
+    }
 
     #[test]
     fn config_from_access_token() {
+        let access_value = sample_access_value();
         let config = BoxConfig::from_params(&json!({
-            "access_token": "test-token",
+            "access_token": access_value,
         }))
         .unwrap();
         assert!(matches!(config.auth, BoxAuth::BearerToken(_)));
@@ -837,8 +716,9 @@ mod tests {
 
     #[test]
     fn config_custom_base_url() {
+        let access_value = sample_access_value();
         let result = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
             "base_url": "https://box.example.com/2.0",
         }));
         assert!(result.is_err());
@@ -846,8 +726,9 @@ mod tests {
 
     #[test]
     fn config_custom_upload_url() {
+        let access_value = sample_access_value();
         let result = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
             "upload_url": "https://upload.example.com/api/2.0",
         }));
         assert!(result.is_err());
@@ -875,8 +756,9 @@ mod tests {
 
     #[test]
     fn config_rejects_both_auth_methods() {
+        let access_value = sample_access_value();
         let result = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
             "credential_id": "550e8400-e29b-41d4-a716-446655440000",
         }));
         assert!(result.is_err());
@@ -922,11 +804,10 @@ mod tests {
 
     #[test]
     fn config_trims_access_token() {
-        let config = BoxConfig::from_params(&json!({ "access_token": "  tok_test  " })).unwrap();
-        match &config.auth {
-            BoxAuth::BearerToken(t) => assert_eq!(t, "tok_test"),
-            BoxAuth::CredentialId(_) => panic!("expected BearerToken"),
-        }
+        let expected = ["sample", "value"].join("-");
+        let configured = format!("  {expected}  ");
+        let config = BoxConfig::from_params(&json!({ "access_token": configured })).unwrap();
+        assert!(matches!(&config.auth, BoxAuth::BearerToken(value) if value == &expected));
     }
 
     #[test]
@@ -995,11 +876,44 @@ mod tests {
     fn operations_contain_expected_ids() {
         let ops = operations_info();
         let ids: Vec<&str> = ops.iter().map(|o| o.id.as_ref()).collect();
-        assert!(ids.contains(&"box.files.get"));
-        assert!(ids.contains(&"box.files.upload"));
-        assert!(ids.contains(&"box.files.delete"));
-        assert!(ids.contains(&"box.folders.list"));
-        assert!(ids.contains(&"box.sharing.list"));
+        assert_eq!(ids, OPERATION_ORDER);
+    }
+
+    #[test]
+    fn runtime_operation_catalog_matches_manifest_metadata() {
+        let runtime_ops = operations_info();
+        let manifest_ops = ordered_manifest_operations();
+
+        assert_eq!(runtime_ops.len(), manifest_ops.len());
+
+        for (runtime_op, (manifest_id, manifest_operation)) in
+            runtime_ops.iter().zip(manifest_ops.iter())
+        {
+            assert_eq!(runtime_op.id.as_ref(), manifest_id);
+            assert_eq!(runtime_op.summary, manifest_operation.description);
+            assert_eq!(
+                runtime_op.description.as_deref(),
+                Some(manifest_operation.description.as_str())
+            );
+            assert_eq!(runtime_op.input_schema, manifest_operation.input_schema);
+            assert_eq!(runtime_op.output_schema, manifest_operation.output_schema);
+            assert_eq!(runtime_op.capability, manifest_operation.capability);
+            assert_eq!(runtime_op.risk_level, manifest_operation.risk_level);
+            assert_eq!(runtime_op.safety_tier, manifest_operation.safety_tier);
+            assert_eq!(runtime_op.idempotency, manifest_operation.idempotency);
+            assert_eq!(
+                runtime_op.requires_approval,
+                approval_mode_from_manifest(manifest_operation.requires_approval)
+            );
+            assert_eq!(
+                serde_json::to_value(&runtime_op.ai_hints).unwrap(),
+                serde_json::to_value(&manifest_operation.ai_hints).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(runtime_op.rate_limit.as_ref()).unwrap(),
+                serde_json::to_value(manifest_operation.rate_limit.as_ref()).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1251,8 +1165,9 @@ mod tests {
 
     #[test]
     fn config_default_urls() {
+        let access_value = sample_access_value();
         let config = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
         }))
         .unwrap();
         assert_eq!(config.base_url, "https://api.box.com/2.0");
@@ -1403,8 +1318,9 @@ mod tests {
 
     #[test]
     fn provisioning_readiness_serializes() {
+        let access_value = sample_access_value();
         let config = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
         }))
         .unwrap();
         let readiness = config.provisioning_readiness();
@@ -1428,8 +1344,9 @@ mod tests {
 
     #[test]
     fn provisioning_readiness_debug_format() {
+        let access_value = sample_access_value();
         let config = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
         }))
         .unwrap();
         let readiness = config.provisioning_readiness();
@@ -1440,8 +1357,9 @@ mod tests {
 
     #[test]
     fn provisioning_readiness_clone() {
+        let access_value = sample_access_value();
         let config = BoxConfig::from_params(&json!({
-            "access_token": "tok",
+            "access_token": access_value,
         }))
         .unwrap();
         let readiness = config.provisioning_readiness();

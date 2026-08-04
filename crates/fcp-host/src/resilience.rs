@@ -543,6 +543,13 @@ impl BackpressureFairnessContext {
         let shed_count = usize::try_from(self.shed_count).unwrap_or(usize::MAX);
         let total_count = usize::try_from(self.admitted_count.saturating_add(self.shed_count))
             .unwrap_or(usize::MAX);
+        if total_count == 0 {
+            // No traffic yet in this window means nothing has been shed. Without
+            // this guard `ratio_per_mille(0, 0)` returns 1000 (its full-pressure
+            // sentinel for a zero denominator), which would hand a fresh, empty
+            // window a bogus 50% starvation credit in `pressure_per_mille`.
+            return 0;
+        }
         to_u16(ratio_per_mille(shed_count, total_count))
     }
 
@@ -1552,6 +1559,19 @@ impl Default for ResilienceLayer {
     }
 }
 
+/// Outcome of the load-shed / backpressure gate for a request that was *not*
+/// shed. Carries the observability the controller decided on so that the
+/// delay/warning metric and log fire only once admission is actually
+/// guaranteed — after the routing, circuit, and bulkhead gates also pass —
+/// rather than in `check_load_shed`, where a request later rejected downstream
+/// would still be counted as delayed/warned. See bead `bp-metric-overcount`.
+struct AdmissionControl {
+    /// Bounded backpressure delay to apply before acquiring a bulkhead permit.
+    delay: Option<Duration>,
+    /// The controller's decision, retained for the deferred metric + log.
+    decision: BackpressureDecision,
+}
+
 impl ResilienceLayer {
     /// Create a resilience layer with the supplied configuration.
     #[must_use]
@@ -1696,7 +1716,7 @@ impl ResilienceLayer {
     {
         let state = self.connector_state(connector_id);
         let effective_load = self.record_request(&state);
-        let backpressure_delay = self.check_load_shed(
+        let admission = self.check_load_shed(
             &state,
             connector_id,
             priority,
@@ -1710,7 +1730,7 @@ impl ResilienceLayer {
                 .cancel_probe_reservation(probe_reservation);
             return Err(error);
         }
-        if let Some(delay) = backpressure_delay {
+        if let Some(delay) = admission.delay {
             // br-6bgp1: actually apply the controller's `Delay`
             // before claiming a bulkhead permit. The sleep is bounded
             // (1-10ms) so a single decision cannot starve a request;
@@ -1727,6 +1747,17 @@ impl ResilienceLayer {
                 return Err(error);
             }
         };
+        // Admission is now guaranteed. Record the deferred backpressure
+        // delay/warning observability so the metrics count only requests that
+        // actually cleared every gate, never ones rejected downstream.
+        Self::record_admission_backpressure(
+            &state,
+            connector_id,
+            priority,
+            operation,
+            effective_load,
+            &admission,
+        );
         if probe_reservation.is_some() {
             state.metrics.probe_requests.fetch_add(1, Ordering::Relaxed);
         }
@@ -1753,7 +1784,7 @@ impl ResilienceLayer {
         operation: &str,
         effective_load: u32,
         fairness: Option<BackpressureFairnessContext>,
-    ) -> Result<Option<Duration>, ResilienceError<E>> {
+    ) -> Result<AdmissionControl, ResilienceError<E>> {
         let decision = self
             .backpressure_controller
             .decide(backpressure_controller_input(
@@ -1786,20 +1817,33 @@ impl ResilienceLayer {
             });
         }
 
-        // br-6bgp1: surface and apply the controller's `Delay` action.
-        // Pre-fix the action was a no-op — control fell through to
-        // bulkhead acquisition with no sleep, so the documented
-        // contract ("Delay work through existing queueing/backoff
-        // paths") was silently violated whenever the bulkhead had
-        // free permits.
-        //
-        // br-uwih7: surface the controller's `AdmitWithWarning`
-        // action. Pre-fix this admit branch emitted no log and no
-        // metric, so the documented contract ("Admit work while
-        // exposing warning evidence to operators") was silently
-        // violated for every elevated-risk admission.
+        // br-6bgp1 (Delay) / br-uwih7 (AdmitWithWarning): the controller's
+        // delay and warning actions are surfaced to operators via a metric and
+        // log. That observability is *not* emitted here: a request that clears
+        // load shedding can still be rejected by the routing, circuit, or
+        // bulkhead gates that run after this function returns, and a delayed
+        // request has not even slept yet. Emitting now would count phantom
+        // delays/warnings for never-admitted requests (bead bp-metric-overcount).
+        // Instead we return the decision and let `execute_inner` record it via
+        // `record_admission_backpressure` once admission is guaranteed.
         let delay = backpressure_delay_duration(&decision);
-        if let Some(delay) = delay {
+        Ok(AdmissionControl { delay, decision })
+    }
+
+    /// Emit the deferred backpressure delay/warning metric and log for a request
+    /// that has now passed every admission gate (load shed, routing, circuit,
+    /// bulkhead). Counting here — rather than in `check_load_shed` — ensures the
+    /// `backpressure_delays` / `backpressure_warnings` metrics reflect only
+    /// requests that were actually admitted (bead bp-metric-overcount).
+    fn record_admission_backpressure(
+        state: &ConnectorState,
+        connector_id: &ConnectorId,
+        priority: RequestPriority,
+        operation: &str,
+        effective_load: u32,
+        admission: &AdmissionControl,
+    ) {
+        if let Some(delay) = admission.delay {
             let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
             state
                 .metrics
@@ -1810,11 +1854,11 @@ impl ResilienceLayer {
                 operation,
                 delay_ms,
                 priority = ?priority,
-                backpressure_state = decision.state.as_str(),
-                backpressure_action = decision.action.as_str(),
+                backpressure_state = admission.decision.state.as_str(),
+                backpressure_action = admission.decision.action.as_str(),
                 "request delayed due to backpressure"
             );
-        } else if decision.action == BackpressureAction::AdmitWithWarning {
+        } else if admission.decision.action == BackpressureAction::AdmitWithWarning {
             state
                 .metrics
                 .backpressure_warnings
@@ -1824,14 +1868,12 @@ impl ResilienceLayer {
                 operation,
                 load_per_mille = effective_load,
                 priority = ?priority,
-                backpressure_state = decision.state.as_str(),
-                backpressure_action = decision.action.as_str(),
-                fallback_trigger = ?decision.fallback_trigger,
+                backpressure_state = admission.decision.state.as_str(),
+                backpressure_action = admission.decision.action.as_str(),
+                fallback_trigger = ?admission.decision.fallback_trigger,
                 "request admitted with backpressure warning"
             );
         }
-
-        Ok(delay)
     }
 
     fn check_routing<E>(
@@ -2291,12 +2333,21 @@ impl CircuitBreaker {
         inner.probe_in_flight = false;
         inner.successes = 0;
 
-        let opened = if inner.state == CircuitState::HalfOpen {
-            open_circuit(&mut inner, &self.config)
-        } else {
-            inner.failures = inner.failures.saturating_add(1);
-            inner.failures >= self.config.failure_threshold
-                && open_circuit(&mut inner, &self.config)
+        let opened = match inner.state {
+            // A failure from a request that was admitted while Closed can complete
+            // *after* other concurrent failures have already tripped the breaker.
+            // The breaker is already open — such a straggler must not re-run
+            // `open_circuit` (which would reset `opened_until`, pushing the first
+            // recovery probe later than the configured `open_duration`, and
+            // double-count `circuit_opened`). Mirror `record_success`, which also
+            // no-ops in the Open state.
+            CircuitState::Open => false,
+            CircuitState::HalfOpen => open_circuit(&mut inner, &self.config),
+            CircuitState::Closed => {
+                inner.failures = inner.failures.saturating_add(1);
+                inner.failures >= self.config.failure_threshold
+                    && open_circuit(&mut inner, &self.config)
+            }
         };
         drop(inner);
         opened
@@ -2316,6 +2367,16 @@ struct Bulkhead {
     permits: Arc<Semaphore>,
     config: BulkheadConfig,
     queued: AtomicUsize,
+}
+
+/// Decrements the bulkhead's `queued` counter on drop, so the count is released
+/// on both normal completion and cancellation of the queue-wait future.
+struct QueuedGuard<'a>(&'a AtomicUsize);
+
+impl Drop for QueuedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2344,13 +2405,21 @@ impl Bulkhead {
             return Err(BulkheadAcquireError::QueueFull);
         }
 
+        // Decrement `queued` via a drop guard rather than a plain statement after
+        // the await: if the enclosing `execute` future is cancelled (e.g. client
+        // disconnect) while parked in the queue wait, a bare `fetch_sub` would
+        // never run, permanently over-counting `queued`. That phantom count
+        // eventually pins `queued >= max_queued`, so every later waiter is
+        // rejected with `QueueFull` even with no real waiters (the queue bricks),
+        // and it also inflates `pressure_per_mille`. The guard runs on both normal
+        // completion and cancellation.
+        let _queued_guard = QueuedGuard(&self.queued);
+
         let permit_result = time::timeout(
             self.config.queue_timeout,
             Arc::clone(&self.permits).acquire_owned(),
         )
         .await;
-
-        self.queued.fetch_sub(1, Ordering::SeqCst);
 
         match permit_result {
             Ok(Ok(permit)) => Ok(permit),
@@ -3742,6 +3811,107 @@ mod tests {
         assert_eq!(metrics.successes, 1);
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn bp_metric_overcount_delay_rejected_by_circuit_is_not_counted() {
+        // Regression (bead bp-metric-overcount): a request whose backpressure
+        // decision is `Delay` but which is then rejected by the circuit breaker
+        // must NOT increment `backpressure_delays` — the delay never happened.
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 2,
+                // Long enough that the breaker stays Open for the second call.
+                open_duration: Duration::from_secs(30),
+                window_duration: Duration::from_secs(1),
+                failure_predicate: FailurePredicate::AnyError,
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+
+        // Admit and fail one request at low load to trip the breaker Open.
+        layer.set_base_load_per_mille(0);
+        let opened = layer
+            .execute(&connector_id, RequestPriority::Normal, "invoke", async {
+                Err::<(), _>("boom")
+            })
+            .await;
+        assert!(matches!(opened, Err(ResilienceError::Inner("boom"))));
+        assert_eq!(layer.circuit_state(&connector_id), CircuitState::Open);
+
+        // Now raise load so the next request's decision is `Delay`, then submit
+        // it. The circuit gate rejects it before admission, so no delay metric.
+        layer.set_base_load_per_mille(900);
+        assert_eq!(
+            layer
+                .backpressure_decision(&connector_id, RequestPriority::Normal, "invoke")
+                .action,
+            BackpressureAction::Delay
+        );
+        let rejected = layer
+            .execute(&connector_id, RequestPriority::Normal, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(ResilienceError::CircuitOpen { .. })));
+
+        let metrics = layer.metrics(&connector_id);
+        assert_eq!(
+            metrics.backpressure_delays, 0,
+            "a Delay request rejected by the circuit must not be counted as delayed"
+        );
+        assert_eq!(metrics.backpressure_warnings, 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bp_metric_overcount_warning_rejected_by_circuit_is_not_counted() {
+        // Regression (bead bp-metric-overcount): a request whose backpressure
+        // decision is `AdmitWithWarning` but which is then rejected by the
+        // circuit breaker must NOT increment `backpressure_warnings` — it was
+        // never admitted.
+        let layer = ResilienceLayer::new(ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 2,
+                open_duration: Duration::from_secs(30),
+                window_duration: Duration::from_secs(1),
+                failure_predicate: FailurePredicate::AnyError,
+            },
+            ..ResilienceConfig::default()
+        });
+        let connector_id = test_connector_id();
+
+        layer.set_base_load_per_mille(0);
+        let opened = layer
+            .execute(&connector_id, RequestPriority::High, "invoke", async {
+                Err::<(), _>("boom")
+            })
+            .await;
+        assert!(matches!(opened, Err(ResilienceError::Inner("boom"))));
+        assert_eq!(layer.circuit_state(&connector_id), CircuitState::Open);
+
+        layer.set_base_load_per_mille(950);
+        assert_eq!(
+            layer
+                .backpressure_decision(&connector_id, RequestPriority::High, "invoke")
+                .action,
+            BackpressureAction::AdmitWithWarning
+        );
+        let rejected = layer
+            .execute(&connector_id, RequestPriority::High, "invoke", async {
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(ResilienceError::CircuitOpen { .. })));
+
+        let metrics = layer.metrics(&connector_id);
+        assert_eq!(metrics.backpressure_delays, 0);
+        assert_eq!(
+            metrics.backpressure_warnings, 0,
+            "an AdmitWithWarning request rejected by the circuit must not be counted"
+        );
+    }
+
     #[test]
     fn backpressure_controller_admits_normal_load() {
         let controller = BackpressureController::default();
@@ -4123,6 +4293,32 @@ mod tests {
     }
 
     #[test]
+    fn shed_ratio_zero_traffic_grants_no_starvation_credit() {
+        // Regression: a fresh fairness window that has processed no traffic has,
+        // by definition, shed nothing. `ratio_per_mille(0, 0)` returns its
+        // zero-denominator sentinel of 1000, so without the zero-traffic guard
+        // `shed_ratio_per_mille` would report full shedding and hand the empty
+        // window a bogus 500-per-mille starvation credit that masks real
+        // imbalance in `pressure_per_mille`.
+        let ctx = BackpressureFairnessContext::new(BackpressureFairnessContextInput {
+            connector_class: "request_response_saas".to_string(),
+            zone_id: "z:work".to_string(),
+            capability: "cap".to_string(),
+            connector_class_pressure_per_mille: 0,
+            zone_share_per_mille: 400,
+            capability_share_per_mille: 0,
+            target_share_per_mille: 0,
+            admitted_count: 0,
+            shed_count: 0,
+        });
+
+        assert_eq!(ctx.shed_ratio_per_mille(), 0);
+        // imbalance = 400, saturation = 0, starvation_credit = 0 → pressure = 400.
+        // (A phantom 1000 shed ratio would give a 500 credit → pressure = 0.)
+        assert_eq!(ctx.pressure_per_mille(), 400);
+    }
+
+    #[test]
     fn fairness_load_shedding_evidence_record_is_jsonl_and_redacted() {
         let fairness = BackpressureFairnessContext::new(BackpressureFairnessContextInput {
             connector_class: "request_response_saas".to_string(),
@@ -4183,15 +4379,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn timeout_only_failure_predicate_trips_on_timeout() {
-        // asupersync-uwp88: 0.3.2 floors timer wakes at ~250ms; competing
-        // deadlines sit >600ms apart so the race resolves deterministically.
         let layer = ResilienceLayer::new(ResilienceConfig {
-            operation_timeout: Some(Duration::from_millis(300)),
+            operation_timeout: Some(Duration::from_millis(25)),
             circuit_breaker: CircuitBreakerConfig {
                 failure_threshold: 1,
                 success_threshold: 1,
-                open_duration: Duration::from_secs(5),
-                window_duration: Duration::from_secs(10),
+                open_duration: Duration::from_millis(30),
+                window_duration: Duration::from_secs(1),
                 failure_predicate: FailurePredicate::TimeoutsOnly,
             },
             ..ResilienceConfig::default()
@@ -4200,7 +4394,7 @@ mod tests {
 
         let result = layer
             .execute(&connector_id, RequestPriority::Normal, "invoke", async {
-                time::sleep(Duration::from_secs(2)).await;
+                time::sleep(Duration::from_millis(60)).await;
                 Ok::<(), &str>(())
             })
             .await;
@@ -4211,21 +4405,18 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn probe_reservation_rolls_back_when_circuit_is_still_open() {
-        // asupersync-uwp88: 0.3.2 floors timer wakes at ~250ms; the original
-        // 100/200ms choreography is scaled x10 so each sleep lands in the
-        // intended window even with ~250ms of wake slop.
         let layer = ResilienceLayer::new(ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
                 failure_threshold: 1,
                 success_threshold: 1,
-                open_duration: Duration::from_secs(2),
-                window_duration: Duration::from_secs(10),
+                open_duration: Duration::from_millis(200),
+                window_duration: Duration::from_secs(1),
                 failure_predicate: FailurePredicate::AnyError,
             },
             health: HealthRouterConfig {
                 unhealthy_threshold: 1,
                 recovery_success_threshold: 1,
-                probe_interval: Duration::from_secs(1),
+                probe_interval: Duration::from_millis(100),
                 ..HealthRouterConfig::default()
             },
             ..ResilienceConfig::default()
@@ -4243,7 +4434,7 @@ mod tests {
             ConnectorHealth::Unavailable { .. }
         ));
 
-        time::sleep(Duration::from_millis(1100)).await;
+        time::sleep(Duration::from_millis(110)).await;
         let rejected = layer
             .execute(&connector_id, RequestPriority::Normal, "invoke", async {
                 Ok::<(), &str>(())
@@ -4252,7 +4443,7 @@ mod tests {
         assert!(matches!(rejected, Err(ResilienceError::CircuitOpen { .. })));
         assert_eq!(layer.metrics(&connector_id).probe_requests, 0);
 
-        time::sleep(Duration::from_millis(1100)).await;
+        time::sleep(Duration::from_millis(100)).await;
         let recovered = layer
             .execute(&connector_id, RequestPriority::Normal, "invoke", async {
                 Ok::<(), &str>(())
@@ -4652,6 +4843,32 @@ mod tests {
     }
 
     #[test]
+    fn record_failure_on_already_open_circuit_is_noop() {
+        // Regression: a request admitted while the breaker was still Closed can
+        // fail *after* concurrent failures have already tripped the breaker. Such
+        // a straggler must not re-run `open_circuit` — that would push
+        // `opened_until` later than the configured `open_duration` (delaying the
+        // first recovery probe) and double-count the circuit-opened transition.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration: Duration::from_secs(30),
+            ..CircuitBreakerConfig::default()
+        });
+
+        // First failure trips the breaker and reports the open transition.
+        assert!(cb.record_failure());
+        assert_eq!(cb.state(), CircuitState::Open);
+        let opened_until = lock_unpoisoned(&cb.inner).opened_until;
+        assert!(opened_until.is_some());
+
+        // The straggler failure is a no-op: it reports `false` (no new
+        // transition) and leaves `opened_until` untouched.
+        assert!(!cb.record_failure());
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert_eq!(lock_unpoisoned(&cb.inner).opened_until, opened_until);
+    }
+
+    #[test]
     fn cancel_inflight_probe_clears_probe_flag() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 1,
@@ -4774,6 +4991,30 @@ mod tests {
         // Give it a moment to enqueue
         time::sleep(Duration::from_millis(10)).await;
         assert!(bh.queued.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bulkhead_queued_released_when_wait_future_cancelled() {
+        // Regression: if the enclosing request future is cancelled (e.g. client
+        // disconnect) while parked in the queue wait, the `queued` counter must
+        // still be released. A bare post-await `fetch_sub` would be skipped on
+        // cancellation, permanently over-counting `queued` until it pins at
+        // `max_queued` and bricks the queue with phantom `QueueFull` rejections.
+        let bh = Bulkhead::new(BulkheadConfig {
+            max_concurrent: 1,
+            max_queued: 4,
+            queue_timeout: Duration::from_secs(30),
+        });
+        // Hold the only permit so the next acquire must enqueue and park.
+        let _hold = bh.acquire().await.unwrap();
+
+        // Cancel the waiter by timing out the *enclosing* future well before the
+        // 30s internal queue_timeout could ever fire. This drops the parked
+        // acquire future mid-wait, which must run the queued drop guard.
+        let cancelled = time::timeout(Duration::from_millis(20), bh.acquire()).await;
+        assert!(cancelled.is_err());
+
+        assert_eq!(bh.queued.load(Ordering::SeqCst), 0);
     }
 
     #[fcp_async_core::runtime::test]
@@ -6594,11 +6835,8 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn execute_timeout_records_metric() {
-        // asupersync-uwp88: 0.3.2 floors timer wakes at ~250ms, so competing
-        // deadlines must sit well apart (>600ms) for the race to resolve
-        // deterministically.
         let layer = ResilienceLayer::new(ResilienceConfig {
-            operation_timeout: Some(Duration::from_millis(300)),
+            operation_timeout: Some(Duration::from_millis(10)),
             circuit_breaker: CircuitBreakerConfig {
                 failure_threshold: 100, // High to avoid circuit tripping
                 ..CircuitBreakerConfig::default()
@@ -6608,7 +6846,7 @@ mod tests {
         let cid = test_connector_id();
         let result = layer
             .execute(&cid, RequestPriority::Normal, "op", async {
-                time::sleep(Duration::from_secs(2)).await;
+                time::sleep(Duration::from_millis(50)).await;
                 Ok::<_, &str>(())
             })
             .await;

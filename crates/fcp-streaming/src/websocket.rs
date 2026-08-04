@@ -126,10 +126,22 @@ fn http_error_from_response(response: &HttpResponse) -> StreamError {
     }
 }
 
+/// Pick the reconnect delay, honouring a server `Retry-After` but never
+/// letting it exceed the configured ceiling.
+///
+/// `Retry-After` is attacker-controlled: `parse_retry_after` maps an oversized
+/// integer to `Duration::from_secs(u64::MAX)`, so an unclamped
+/// `base.max(retry_after)` let one response header park the stream for ~584
+/// billion years — the sleep never resolves, the connector never reconnects,
+/// and its timer thread stays alive. `delay_for_attempt` already enforces
+/// `max_delay`; the server-supplied value has to be intersected with the same
+/// ceiling rather than allowed to override it.
 fn reconnect_delay_for_error(handler: &ReconnectHandler, err: &StreamError) -> Duration {
-    let base = handler.config().delay_for_attempt(handler.attempts());
-    err.retry_after()
-        .map_or(base, |retry_after| base.max(retry_after))
+    let config = handler.config();
+    let base = config.delay_for_attempt(handler.attempts());
+    err.retry_after().map_or(base, |retry_after| {
+        base.max(retry_after).min(config.max_delay)
+    })
 }
 
 fn websocket_error(err: WsError) -> StreamError {
@@ -910,6 +922,16 @@ enum ReconnectState {
     Connected(Box<WsConnection>),
     /// Message receive in progress.
     Receiving(ReceiveFuture),
+    /// The stream is finished and will yield `None` from here on.
+    ///
+    /// Reaching a terminal outcome MUST move the state machine here before
+    /// returning. `Some(Err(_))` is a resumable `Stream` item, so a normal
+    /// consumer polls again after one — and leaving a *completed*
+    /// `Connecting`/`Receiving` future in `state` meant that next poll
+    /// re-polled an `async` block that had already returned `Ready`, which
+    /// panics with "`async fn` resumed after completion". This variant also
+    /// makes the stream properly fused after `None`.
+    Terminated,
 }
 
 impl ReconnectingWsStream {
@@ -982,6 +1004,7 @@ impl Stream for ReconnectingWsStream {
                     Poll::Ready(()) => self.state = ReconnectState::Idle,
                     Poll::Pending => return Poll::Pending,
                 },
+                ReconnectState::Terminated => return Poll::Ready(None),
                 ReconnectState::Connecting(future) => match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(connection)) => {
                         self.note_connection_established();
@@ -989,6 +1012,7 @@ impl Stream for ReconnectingWsStream {
                     }
                     Poll::Ready(Err(err)) => {
                         if !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
                         let delay = reconnect_delay_for_error(&self.handler, &err);
@@ -1019,6 +1043,7 @@ impl Stream for ReconnectingWsStream {
                         drop(connection);
                         self.note_connection_lost();
                         if !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(None);
                         }
                         let attempt = self.handler.attempts();
@@ -1030,6 +1055,7 @@ impl Stream for ReconnectingWsStream {
                         drop(connection);
                         self.note_connection_lost();
                         if !self.handler.can_reconnect() {
+                            self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
                         let delay = reconnect_delay_for_error(&self.handler, &err);
@@ -1539,26 +1565,14 @@ mod tests {
 
             let client = WsClient::with_config(url, config);
             let mut stream = client.stream();
-            // Drive the reconnecting stream directly rather than wrapping it in
-            // an outer `timeout(...)` hang-guard.
-            //
-            // The reconnect path is internally bounded: the first recv surfaces
-            // the server EOF, the stream waits its `reconnect_delay`, and the
-            // second `connect()` is itself wrapped in `connect_timeout`, so a
-            // genuinely stuck reconnect still resolves to an error rather than
-            // hanging. Wrapping `stream.next()` in an *additional* outer timer
-            // here makes three independent timers (outer guard + reconnect-delay
-            // sleep + inner connect timeout) live across a single nested poll
-            // chain, and the asupersync runtime drops the second connect's I/O
-            // readiness wake under that arrangement — the stream recovers in
-            // ~0.5s on its own but never completes when polled through the extra
-            // timeout. Awaiting the stream directly exercises the same recovery
-            // without tripping that multi-timer composition.
-            let item = stream
-                .next()
-                .await
-                .expect("stream item")
-                .expect("reconnected message");
+            let item = timeout(
+                Duration::from_secs(1),
+                Box::pin(async { stream.next().await }),
+            )
+            .await
+            .expect("stream should not hang")
+            .expect("stream item")
+            .expect("reconnected message");
 
             assert_eq!(item, WsMessage::text("recovered"));
         });

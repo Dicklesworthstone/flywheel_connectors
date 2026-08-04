@@ -15,11 +15,36 @@ use thiserror::Error;
 pub const CEP_ANOMALY_ALERT_SCHEMA_VERSION: &str = "fcp.audit.cep_anomaly_alert.v1";
 
 /// A validated audit-chain event pattern.
+///
+/// Deserialization is routed through [`EventPattern::new`] via `try_from` so a
+/// pattern loaded from disk/wire is subject to the same invariants as one built
+/// in code (non-empty name and sequence, non-zero window, no empty predicate).
+/// Without this, serde would populate the private fields directly and an empty
+/// `sequence` would panic [`EventPattern::find_matches`] at `sequence[0]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EventPatternWire")]
 pub struct EventPattern {
     name: String,
     sequence: Vec<EventPredicate>,
     max_window_ms: u64,
+}
+
+/// Deserialization shadow for [`EventPattern`]: carries the raw fields so
+/// `TryFrom` can enforce the constructor invariants before an `EventPattern`
+/// exists.
+#[derive(Deserialize)]
+struct EventPatternWire {
+    name: String,
+    sequence: Vec<EventPredicate>,
+    max_window_ms: u64,
+}
+
+impl TryFrom<EventPatternWire> for EventPattern {
+    type Error = EventPatternError;
+
+    fn try_from(wire: EventPatternWire) -> Result<Self, Self::Error> {
+        Self::new(wire.name, wire.sequence, wire.max_window_ms)
+    }
 }
 
 impl EventPattern {
@@ -90,9 +115,16 @@ impl EventPattern {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
+        // Defense in depth: `new()`/`try_from` reject an empty sequence, but
+        // guard the hot-path index so `find_matches` is total even if a future
+        // in-crate construction path ever bypasses the constructor.
+        let Some(first_predicate) = self.sequence.first() else {
+            return Vec::new();
+        };
+
         let mut matches = Vec::new();
         for start_index in 0..ordered.len() {
-            if !self.sequence[0].matches(ordered[start_index]) {
+            if !first_predicate.matches(ordered[start_index]) {
                 continue;
             }
             if let Some(matched) = self.match_from(&ordered, start_index) {

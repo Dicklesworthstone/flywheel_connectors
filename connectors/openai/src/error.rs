@@ -63,6 +63,15 @@ pub enum OpenAIError {
         /// HTTP status code
         status_code: Option<u16>,
     },
+
+    /// Caller-supplied input rejected before any request was sent
+    /// (e.g. an id carrying path-traversal characters or a pagination
+    /// cursor that would smuggle additional query parameters).
+    #[error("Invalid input: {message}")]
+    InvalidInput {
+        /// Error message
+        message: String,
+    },
 }
 
 impl OpenAIError {
@@ -128,6 +137,10 @@ impl OpenAIError {
             Self::Json(e) => FcpError::MalformedFrame {
                 code: 2004,
                 message: format!("JSON parsing error: {e}"),
+            },
+            Self::InvalidInput { message } => FcpError::InvalidRequest {
+                code: 2005,
+                message: message.clone(),
             },
             Self::Overloaded { retry_after_ms } => FcpError::External {
                 service: "openai".into(),

@@ -24,7 +24,11 @@ fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-oauth = { path = "../../crates/fcp-oauth" }
-fcp-sdk = { path = "../../crates/fcp-sdk" }
+# `connector-http` gates `transport_error_reached_service`, which client.rs
+# uses to decide whether a failed request may be replayed. Without it this
+# crate only compiles when some other workspace member happens to turn the
+# feature on, so `cargo check -p fcp-github` alone fails.
+fcp-sdk = { path = "../../crates/fcp-sdk", features = ["connector-http"] }
 
 anyhow.workspace = true
 async-trait.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "fcp-evidence"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "FCP evidence system — canonical owner of receipts, audit chain, checkpoints, and revocation"
 license = "Apache-2.0"

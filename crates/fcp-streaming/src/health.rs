@@ -173,7 +173,27 @@ impl StreamHealthTracker {
         self.last_heartbeat = Some(Instant::now());
     }
 
-    /// Evaluate health based on elapsed time since last heartbeat.
+    /// Timestamp the timeouts are measured from: the last heartbeat if one
+    /// has ever arrived, otherwise the moment the connection came up.
+    ///
+    /// `TrackerBuilder::new` starts in `Connected` with `last_heartbeat =
+    /// None`, so keying the timeouts off `last_heartbeat` alone meant a peer
+    /// that completed the handshake and then went permanently silent never
+    /// left `Connected`: `state().is_available()` stayed `true` and
+    /// `to_connector_health()` reported `Healthy` forever. That is exactly the
+    /// zombie connection `zombie_timeout` exists to catch, and it applied to
+    /// the first connection of every tracker — the one an adversarial peer
+    /// controls. Falling back to `connected_since` closes the hole while
+    /// leaving post-reconnect behaviour unchanged (`record_reconnected` and
+    /// `reset` both stamp `last_heartbeat`).
+    const fn liveness_baseline(&self) -> Option<Instant> {
+        match self.last_heartbeat {
+            Some(last) => Some(last),
+            None => self.connected_since,
+        }
+    }
+
+    /// Evaluate health based on elapsed time since the last liveness signal.
     ///
     /// Call this periodically (e.g., on a timer or before returning health status).
     /// Drives the state transitions:
@@ -184,14 +204,14 @@ impl StreamHealthTracker {
 
         match self.state {
             StreamHealthState::Connected => {
-                if let Some(last) = self.last_heartbeat {
+                if let Some(last) = self.liveness_baseline() {
                     if now.duration_since(last) > self.config.heartbeat_timeout {
                         self.state = StreamHealthState::Degraded;
                     }
                 }
             }
             StreamHealthState::Degraded => {
-                if let Some(last) = self.last_heartbeat {
+                if let Some(last) = self.liveness_baseline() {
                     if now.duration_since(last) > self.config.zombie_timeout {
                         self.state = StreamHealthState::Unhealthy;
                     }
@@ -372,13 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn no_heartbeat_ever_stays_connected_until_evaluate() {
-        // If no heartbeat was ever recorded, last_heartbeat is None,
-        // so the timeout check doesn't trigger.
+    fn silent_first_connection_degrades_then_goes_unhealthy() {
+        // A peer that completes the handshake and then never sends anything is
+        // exactly the zombie `zombie_timeout` exists to catch. Because the
+        // tracker starts `Connected` with `last_heartbeat = None`, keying the
+        // timeouts off `last_heartbeat` alone left it reporting Healthy
+        // forever — on the one connection an adversarial peer controls. The
+        // timeouts now fall back to `connected_since`.
         let mut tracker = fast_tracker();
+        assert_eq!(tracker.evaluate(), StreamHealthState::Connected);
+
         std::thread::sleep(Duration::from_millis(80));
-        let state = tracker.evaluate();
-        assert_eq!(state, StreamHealthState::Connected);
+        assert_eq!(tracker.evaluate(), StreamHealthState::Degraded);
+        assert!(!matches!(
+            tracker.to_connector_health(),
+            fcp_core::ConnectorHealth::Healthy
+        ));
+
+        std::thread::sleep(Duration::from_millis(160));
+        assert_eq!(tracker.evaluate(), StreamHealthState::Unhealthy);
+        assert!(!tracker.state().is_available());
     }
 
     // ── State transitions: Degraded → Connected (recovery) ──────────

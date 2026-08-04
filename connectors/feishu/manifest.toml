@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:95bfd29963c389e91327c203a1d84af6d90bb0e4327720138e3091ed7a76f333"
+interface_hash = "blake3-256:fcp.interface.v2:381ffe6ff8fb60ead8f442188b1ec435c31bdffdccf2935ad54f655717aa8f92"
 
 [connector]
 id = "fcp.feishu"
@@ -14,7 +14,7 @@ version = "0.1.0"
 description = "Tenant-scoped Feishu/Lark connector for bot messaging, chat discovery, directory reads, known docs and sheets reads, calendar reads, host-forwarded webhook ingestion, document-comment automation, and connectivity verification"
 archetypes = ["operational"]
 format = "native"
-status = "ready"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"
@@ -81,21 +81,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -133,21 +128,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -184,21 +174,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -247,21 +232,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -307,21 +287,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -367,21 +342,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -429,21 +399,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -487,21 +452,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -538,21 +498,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -590,21 +545,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -646,21 +596,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -705,21 +650,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -762,21 +702,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -814,21 +749,16 @@ type = "object"
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -895,21 +825,16 @@ type = [
 host_allow = [
     "open.feishu.cn",
     "open.larksuite.com",
-    "localhost",
-    "127.0.0.1",
 ]
-port_allow = [
-    443,
-    80,
-]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
 require_sni = true
 spki_pins = []
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0

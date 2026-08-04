@@ -1,6 +1,6 @@
 # SQLite Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/runtime drift documented
+> **Status**: runtime contract documented; runtime operation metadata derives from manifest
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -37,7 +37,7 @@ Important runtime truths the contract preserves:
 - Package and binary name are `fcp-sqlite`.
 - Runtime `BaseConnector` ID is `sqlite`.
 - Manifest connector ID and handshake connector ID are `fcp.sqlite`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:sqlite-first-slice-placeholder`.
+- Manifest interface hash is `blake3-256:fcp.interface.v2:0133b7c75dee87ffe347dcda9891710ebc43f66092c02c42d72b2b1dfcb5e4ae`.
 - Configuration requires `database_path` or its alias `path`.
 - `database_path` is trimmed and rejected when missing or blank.
 - `:memory:` is accepted and opens an in-memory database.
@@ -55,7 +55,7 @@ Important runtime truths the contract preserves:
 - Runtime opens no network connections.
 - Runtime `invoke` uses `operation_id`, not `operation`.
 - Runtime `invoke` checks connector readiness but does not verify `capability_token`.
-- Runtime does not verify approval tokens for write, batch, pragma, or vacuum operations.
+- Runtime does not verify approval tokens for `sqlite.execute`, `sqlite.batch`, or `sqlite.vacuum`.
 - `simulate` only checks whether `operation_id` is present in the local operation inventory.
 - `handle_configure()` creates a fresh SQLite client, clears session and transaction state, sets configured, and clears handshaken state.
 - `handle_handshake()` requires configuration and a client, accepts an optional `session_id`, and returns `sqlite.read`, `sqlite.write`, and `sqlite.admin` capability strings.
@@ -68,8 +68,8 @@ Important runtime truths the contract preserves:
 
 This README documents runtime truth and keeps current drift visible:
 
-- Manifest marks `sqlite.execute`, `sqlite.batch`, and `sqlite.vacuum` as requiring interactive approval. Runtime operation metadata sets `requires_approval = None`, and invoke checks no approval token.
-- Runtime operation metadata advertises `sqlite.read`, `sqlite.write`, and `sqlite.admin`, but the manifest optional capability list is empty.
+- Runtime introspection derives operation descriptions, schemas, capabilities, risk, safety, idempotency, approval mode, rate limits, and AI hints from `manifest.toml`.
+- Manifest marks `sqlite.execute`, `sqlite.batch`, and `sqlite.vacuum` as requiring interactive approval, and runtime operation metadata now exposes that approval intent. Invoke still checks no approval token.
 - Runtime does not verify capability tokens even though the connector is a local database mutation surface.
 - Manifest says singleton-writer state stores configured database path and transaction state. Runtime keeps configuration, session, and active transaction state in process memory only.
 - Runtime uses one connector-wide active transaction. Concurrent callers share that state and must pass the matching `txn_id` while a transaction is open.
@@ -80,7 +80,7 @@ This README documents runtime truth and keeps current drift visible:
 - Runtime path policy rejects `..` components but does not create a durable sandbox boundary by itself; filesystem containment still depends on host/sandbox policy.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should add bound capability-token verification, add approval-token verification for mutating/admin operations, align manifest capability declarations with runtime capabilities, decide whether SQLite state should be durable outside process memory, document or redesign the single-active-transaction model for concurrency, and add a tracked verification bundle.
+A follow-up parity bead should add bound capability-token verification, add approval-token verification for mutating/admin operations, decide whether SQLite state should be durable outside process memory, document or redesign the single-active-transaction model for concurrency, and add a tracked verification bundle.
 
 ## First-Slice Scope
 
@@ -91,7 +91,7 @@ The current SQLite README slice documents the existing runtime surface:
 - SQLite authorizer policy for denying dangerous SQL actions
 - connector-local transaction state and batch savepoint behavior
 - lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
-- runtime/manifest drift around capability and approval enforcement
+- remaining capability-token and approval-token enforcement gaps
 - deterministic connector tests and direct proof commands
 
 ## Auth And Scope Boundary
@@ -130,17 +130,17 @@ The current SQLite README slice documents the existing runtime surface:
 | Operation | Runtime behavior | Capability | SafetyTier | RiskLevel | Idempotency | Required input |
 |-----------|------------------|------------|------------|-----------|-------------|----------------|
 | `sqlite.query` | Run read-only SQL and return rows | `sqlite.read` | `Safe` | `Low` | `Strict` | `sql`; optional `params`, `txn_id` |
-| `sqlite.execute` | Run one mutating or DDL statement | `sqlite.write` | `Risky` | `Medium` | `BestEffort` | `sql`; optional `params`, `txn_id` |
+| `sqlite.execute` | Run one mutating or DDL statement | `sqlite.write` | `Risky` | `Medium` | `None` | `sql`; optional `params`, `txn_id` |
 | `sqlite.explain` | Run `EXPLAIN QUERY PLAN` for read-only SQL | `sqlite.read` | `Safe` | `Low` | `Strict` | `sql`; optional `params`, `txn_id` |
 | `sqlite.schema.tables` | List main user tables excluding `sqlite_%` | `sqlite.read` | `Safe` | `Low` | `Strict` | none |
 | `sqlite.schema.columns` | Read `pragma_table_xinfo` for one table | `sqlite.read` | `Safe` | `Low` | `Strict` | `table` |
-| `sqlite.transaction.begin` | Begin `deferred`, `immediate`, or `exclusive` transaction | `sqlite.write` | `Risky` | `Medium` | `None` | optional `mode` |
-| `sqlite.transaction.commit` | Commit the active transaction | `sqlite.write` | `Risky` | `Medium` | `None` | `txn_id` |
-| `sqlite.transaction.rollback` | Roll back the active transaction | `sqlite.write` | `Risky` | `Medium` | `None` | `txn_id` |
+| `sqlite.transaction.begin` | Begin `deferred`, `immediate`, or `exclusive` transaction | `sqlite.write` | `Safe` | `Low` | `None` | optional `mode` |
+| `sqlite.transaction.commit` | Commit the active transaction | `sqlite.write` | `Safe` | `Low` | `BestEffort` | `txn_id` |
+| `sqlite.transaction.rollback` | Roll back the active transaction | `sqlite.write` | `Safe` | `Low` | `BestEffort` | `txn_id` |
 | `sqlite.batch` | Run nonempty statement list under savepoint | `sqlite.write` | `Risky` | `Medium` | `None` | `statements` |
 | `sqlite.health` | Return database health and active transaction ID | `sqlite.read` | `Safe` | `Low` | `Strict` | none |
-| `sqlite.vacuum` | Run `VACUUM` outside transactions | `sqlite.admin` | `Dangerous` | `High` | `None` | none |
-| `sqlite.pragma` | Run an allowlisted read-only pragma | `sqlite.admin` | `Risky` | `Medium` | `Strict` | `name`; optional `argument` |
+| `sqlite.vacuum` | Run `VACUUM` outside transactions | `sqlite.admin` | `Risky` | `Medium` | `Strict` | none |
+| `sqlite.pragma` | Run an allowlisted read-only pragma | `sqlite.read` | `Safe` | `Low` | `Strict` | `name`; optional `argument` |
 
 ## PRAGMA Allowlist
 
@@ -205,7 +205,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Source Notes
 
-- `connectors/sqlite/src/connector.rs` defines configuration parsing, lifecycle handlers, operation catalog, introspection, simulation, and invoke dispatch.
+- `connectors/sqlite/src/connector.rs` defines configuration parsing, lifecycle handlers, manifest-derived operation catalog, introspection, simulation, and invoke dispatch.
 - `connectors/sqlite/src/client.rs` defines rusqlite connection setup, authorizer policy, SQL classification, transaction state helpers, schema helpers, pragma handling, batch behavior, health probes, and value conversion.
 - `connectors/sqlite/src/types.rs` defines runtime request/response and introspection shapes.
 - `connectors/sqlite/src/error.rs` defines connector error classes and FCP error conversion.

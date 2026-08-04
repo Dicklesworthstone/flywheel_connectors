@@ -135,6 +135,7 @@ fn append_e2e_record(record: &Value) {
         .expect("e2e JSONL should open");
     writeln!(file, "{record}").expect("e2e JSONL line should write");
     println!("MICROSOFT_FOUNDRY_CONNECTOR_E2E_JSONL={}", path.display());
+    println!("MICROSOFT_FOUNDRY_CONNECTOR_E2E_RECORD={record}");
 }
 
 fn command_line() -> String {

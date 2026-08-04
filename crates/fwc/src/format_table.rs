@@ -255,8 +255,13 @@ fn render_delimited(
 /// Escape a cell for delimited output (CSV quoting rules).
 fn escape_delimited(value: &str, delimiter: char) -> String {
     let needs_quoting = match delimiter {
-        ',' => value.contains(',') || value.contains('"') || value.contains('\n'),
-        '\t' => value.contains('\t'),
+        ',' => {
+            value.contains(',')
+                || value.contains('"')
+                || value.contains('\n')
+                || value.contains('\r')
+        }
+        '\t' => value.contains('\t') || value.contains('\n') || value.contains('\r'),
         _ => false,
     };
     if needs_quoting {
@@ -293,9 +298,15 @@ fn render_markdown_table(columns: &[String], rows: &[Vec<String>], no_headers: b
     out
 }
 
-/// Escape pipe characters in markdown table cells.
+/// Escape pipe characters and line breaks in markdown table cells.
+///
+/// A literal newline inside a cell would split the row across lines and
+/// corrupt the table, so line breaks are rendered as `<br>`.
 fn escape_markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|")
+    value
+        .replace('|', "\\|")
+        .replace("\r\n", "<br>")
+        .replace(['\n', '\r'], "<br>")
 }
 
 /// Empty result string for tabular output.
@@ -861,6 +872,24 @@ mod tests {
     #[test]
     fn escape_markdown_with_pipe() {
         assert_eq!(escape_markdown_cell("a | b | c"), "a \\| b \\| c");
+    }
+
+    #[test]
+    fn escape_markdown_with_newline() {
+        assert_eq!(escape_markdown_cell("line1\nline2"), "line1<br>line2");
+        assert_eq!(escape_markdown_cell("line1\r\nline2"), "line1<br>line2");
+        assert_eq!(escape_markdown_cell("line1\rline2"), "line1<br>line2");
+    }
+
+    #[test]
+    fn escape_csv_with_carriage_return() {
+        assert_eq!(escape_delimited("a\rb", ','), "\"a\rb\"");
+    }
+
+    #[test]
+    fn escape_tsv_with_newline() {
+        assert_eq!(escape_delimited("a\nb", '\t'), "\"a\nb\"");
+        assert_eq!(escape_delimited("a\rb", '\t'), "\"a\rb\"");
     }
 
     // ── Column auto-detection ───────────────────────────────────────

@@ -1,25 +1,370 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "fcp://schemas/fwc/search/truth-source-envelope/v1",
-  "title": "FWC search truth-source envelope v1",
-  "description": "Top-level provenance envelope for `fwc search --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "command", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "search" },
-    "schema_version": { "const": "fcp.fwc.truth-source.v1" },
-    "_truth_source": {
+  "$id": "fcp://schemas/fwc/search/v1",
+  "title": "FWC Search v1",
+  "description": "Stable JSON output schema for `fwc search --json`, including truth-source metadata.",
+  "oneOf": [
+    { "$ref": "#/$defs/search_success" },
+    { "$ref": "#/$defs/search_missing_host" },
+    { "$ref": "#/$defs/search_ambiguous_catalog_source" },
+    { "$ref": "#/$defs/truth_source_unavailable" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
+  ],
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullable_non_empty_string": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
+    "truth_source": {
       "type": "string",
       "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
     },
-    "error": {
+    "schema_version": {
+      "const": "fcp.fwc.truth-source.v1"
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": [
+            "live-runtime",
+            "offline-artifact",
+            "unsupported",
+            "planned",
+            "unavailable",
+            "denied",
+            "unknown"
+          ]
+        },
+        "command": { "$ref": "#/$defs/non_empty_string" },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "search_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connector",
+        "connector_name",
+        "connector_status",
+        "hidden_by_default",
+        "non_live_rationale",
+        "graduation_guidance",
+        "operation",
+        "selector",
+        "summary",
+        "capability",
+        "risk_level",
+        "safety_tier",
+        "idempotency",
+        "score",
+        "match_reasons"
+      ],
+      "properties": {
+        "connector": { "$ref": "#/$defs/non_empty_string" },
+        "connector_name": { "$ref": "#/$defs/non_empty_string" },
+        "connector_status": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "hidden_by_default": { "type": "boolean" },
+        "non_live_rationale": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "graduation_guidance": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "operation": { "$ref": "#/$defs/non_empty_string" },
+        "selector": { "$ref": "#/$defs/non_empty_string" },
+        "summary": { "$ref": "#/$defs/non_empty_string" },
+        "capability": { "$ref": "#/$defs/non_empty_string" },
+        "risk_level": { "$ref": "#/$defs/non_empty_string" },
+        "safety_tier": { "$ref": "#/$defs/non_empty_string" },
+        "idempotency": { "$ref": "#/$defs/non_empty_string" },
+        "score": { "type": "integer" },
+        "match_reasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "provenance": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["type"],
+      "required": ["command", "source", "authoritative"],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "command": { "const": "search" },
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "authoritative": { "type": "boolean" }
+      }
+    },
+    "cache_evidence": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["hit", "validated", "etag", "source"],
+      "properties": {
+        "hit": { "type": "boolean" },
+        "validated": { "type": "boolean" },
+        "etag": {
+          "type": "string",
+          "pattern": "^blake3-256:"
+        },
+        "age_ms": { "$ref": "#/$defs/non_negative_integer" },
+        "source": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "search_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "source",
+        "mode",
+        "message",
+        "query",
+        "filters",
+        "total_results",
+        "results",
+        "next_actions",
+        "schema_version",
+        "_truth_source",
+        "availability",
+        "provenance"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "search" },
+        "source": {
+          "type": "string",
+          "enum": ["host-admin-api", "workspace-manifests"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["live-introspection", "offline-artifact"]
+        },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "query": { "type": "string" },
+        "filters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "filter_gaps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "metadata_gaps": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "hidden_connectors_in_catalog": { "$ref": "#/$defs/non_negative_integer" },
+        "total_results": { "$ref": "#/$defs/non_negative_integer" },
+        "results": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/search_result" }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "availability": { "$ref": "#/$defs/availability" },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "_cache": { "$ref": "#/$defs/cache_evidence" }
+      }
+    },
+    "search_missing_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "details",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "search" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "missing-host-endpoint" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["query", "filters", "require_source"],
+          "properties": {
+            "query": { "type": "string" },
+            "filters": { "type": "object", "additionalProperties": true },
+            "require_source": {
+              "anyOf": [
+                { "type": "string", "enum": ["mesh", "mesh-or-host", "any-live"] },
+                { "type": "null" }
+              ]
+            }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "search_ambiguous_catalog_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "search" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "ambiguous-catalog-source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "truth_source_unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "search" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": {
+              "type": "string",
+              "enum": ["mesh", "mesh-or-host", "any-live"]
+            },
+            "actual": { "$ref": "#/$defs/truth_source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "availability": { "$ref": "#/$defs/availability" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "search" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
+        "availability": { "$ref": "#/$defs/availability" }
       }
     }
   }

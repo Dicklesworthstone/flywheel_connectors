@@ -580,16 +580,6 @@ fn runtime_lifecycle_tracing_contract() {
     assert!(retry.has_field("error"), "missing 'error' field");
 }
 
-// asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms AND a `timeout`
-// under a deadline budget can block ~the full budget. `RetryLoop` backs off via
-// `ctx.sleep(delay)`, which runs `timeout(remaining_budget, sleep(delay))`; the
-// first backoff therefore blocks the entire 30s request budget and returns
-// `Timeout` before the second and third retries can run. Only one retry event is
-// emitted instead of three, so the intent (three incrementing retry attempts)
-// cannot be exercised under the floored reactor — retiming cannot recover it
-// because the pathology scales with the budget, not the delay. Ignored (not
-// retimed). Restore when asupersync 0.3.3 lands.
-#[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
 #[test]
 fn multiple_retries_emit_incrementing_attempts() {
     let (result, events) = run_with_tracing(|| {

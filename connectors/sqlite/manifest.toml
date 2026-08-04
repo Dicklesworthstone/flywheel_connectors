@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:sqlite-first-slice-placeholder"
+interface_hash = "blake3-256:fcp.interface.v2:79dd10052d57c442680b6ddd5dc40df0b4153ce4e9fccfc82c72db42c1b0ba5f"
 
 [connector]
 id = "fcp.sqlite"
@@ -28,7 +28,7 @@ forbidden = ["z:public", "z:community", "z:work"]
 
 [capabilities]
 required = ["storage.state"]
-optional = []
+optional = ["sqlite.read", "sqlite.write", "sqlite.admin"]
 forbidden = [
     "system.exec",
     "network.listen",
@@ -68,6 +68,7 @@ required = ["result"]
 
 [provides.operations."sqlite.query".output_schema.properties.result]
 type = "object"
+description = "Query result with columns, rows, and row_count"
 
 [provides.operations."sqlite.query".network_constraints]
 host_allow = ["none.invalid"]
@@ -129,6 +130,7 @@ required = ["result"]
 
 [provides.operations."sqlite.execute".output_schema.properties.result]
 type = "object"
+description = "Execution result with rows_affected and last_insert_rowid"
 
 [provides.operations."sqlite.execute".network_constraints]
 host_allow = ["none.invalid"]
@@ -190,6 +192,7 @@ required = ["plan"]
 
 [provides.operations."sqlite.explain".output_schema.properties.plan]
 type = "object"
+description = "EXPLAIN QUERY PLAN output"
 
 [provides.operations."sqlite.explain".network_constraints]
 host_allow = ["none.invalid"]
@@ -242,6 +245,7 @@ required = ["tables"]
 
 [provides.operations."sqlite.schema.tables".output_schema.properties.tables]
 type = "array"
+description = "Tables in the main database"
 
 [provides.operations."sqlite.schema.tables".network_constraints]
 host_allow = ["none.invalid"]
@@ -298,6 +302,7 @@ required = ["columns"]
 
 [provides.operations."sqlite.schema.columns".output_schema.properties.columns]
 type = "array"
+description = "Detailed column metadata"
 
 [provides.operations."sqlite.schema.columns".network_constraints]
 host_allow = ["none.invalid"]
@@ -350,6 +355,7 @@ required = ["transaction"]
 
 [provides.operations."sqlite.transaction.begin".output_schema.properties.transaction]
 type = "object"
+description = "Active transaction id and mode"
 
 [provides.operations."sqlite.transaction.begin".network_constraints]
 host_allow = ["none.invalid"]
@@ -403,6 +409,7 @@ required = ["result"]
 
 [provides.operations."sqlite.transaction.commit".output_schema.properties.result]
 type = "object"
+description = "Commit status and transaction id"
 
 [provides.operations."sqlite.transaction.commit".network_constraints]
 host_allow = ["none.invalid"]
@@ -455,6 +462,7 @@ required = ["result"]
 
 [provides.operations."sqlite.transaction.rollback".output_schema.properties.result]
 type = "object"
+description = "Rollback status and transaction id"
 
 [provides.operations."sqlite.transaction.rollback".network_constraints]
 host_allow = ["none.invalid"]
@@ -511,6 +519,7 @@ required = ["results"]
 
 [provides.operations."sqlite.batch".output_schema.properties.results]
 type = "array"
+description = "Per-statement execution results"
 
 [provides.operations."sqlite.batch".network_constraints]
 host_allow = ["none.invalid"]
@@ -559,6 +568,7 @@ required = ["health"]
 
 [provides.operations."sqlite.health".output_schema.properties.health]
 type = "object"
+description = "Health probe details for the configured database"
 
 [provides.operations."sqlite.health".network_constraints]
 host_allow = ["none.invalid"]
@@ -605,6 +615,7 @@ required = ["result"]
 
 [provides.operations."sqlite.vacuum".output_schema.properties.result]
 type = "object"
+description = "VACUUM completion result"
 
 [provides.operations."sqlite.vacuum".network_constraints]
 host_allow = ["none.invalid"]
@@ -661,6 +672,7 @@ required = ["result"]
 
 [provides.operations."sqlite.pragma".output_schema.properties.result]
 type = "object"
+description = "Pragma query result"
 
 [provides.operations."sqlite.pragma".network_constraints]
 host_allow = ["none.invalid"]

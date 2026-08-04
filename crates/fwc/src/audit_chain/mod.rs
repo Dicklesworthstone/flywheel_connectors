@@ -1884,6 +1884,7 @@ fn signer_error_to_issue(
         fcp_audit::AuditError::SignatureInvalid { seq } => ("audit.signature_invalid", Some(*seq)),
         fcp_audit::AuditError::UnknownIssuer { seq } => ("audit.unknown_issuer", Some(*seq)),
         fcp_audit::AuditError::EmptySignedHead { seq } => ("audit.empty_signed_head", Some(*seq)),
+        fcp_audit::AuditError::DuplicateSigner { seq } => ("audit.duplicate_signer", Some(*seq)),
         _ => ("audit.signature_verification_error", None),
     };
     let object_id = seq.and_then(|seq| {

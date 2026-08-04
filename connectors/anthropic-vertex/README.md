@@ -1,5 +1,6 @@
 # Anthropic Vertex Connector
 
+> **Status**: PROVEN
 > **Verification script**: `scripts/e2e/anthropic_vertex_connector_verification.sh`
 
 `fcp-anthropic-vertex` is a separate FCP connector for Claude on Google Vertex AI. It is not an extension of the direct `connectors/anthropic` API-key connector: Vertex uses Google auth, Google project/location routing, and model-in-URL `rawPredict` / `streamRawPredict` endpoints.

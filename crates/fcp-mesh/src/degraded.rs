@@ -58,6 +58,13 @@ pub enum DegradedTransportError {
     Incomplete { received: u32, needed: u32 },
 
     /// Schema hash mismatch after reconstruction.
+    ///
+    /// Part of the stable degraded-transport error contract for consumers
+    /// that know the expected schema of a reconstructed payload. The decoder
+    /// itself cannot raise this: the reconstructed wire payload carries the
+    /// claimed schema hash but nothing to compare it against (see
+    /// [`DegradedModeDecoder::finish_reconstruction`] for the verification
+    /// deferral; bead degraded-reconstruct-objectid-verify-qtmop).
     #[error("schema hash mismatch: expected {expected:?}, got {actual:?}")]
     SchemaHashMismatch {
         expected: [u8; 32],
@@ -65,6 +72,13 @@ pub enum DegradedTransportError {
     },
 
     /// Object ID mismatch after reconstruction.
+    ///
+    /// Part of the stable degraded-transport error contract for promotion
+    /// boundaries that re-derive the content address. The decoder itself
+    /// cannot raise this: `derive_id` needs the object's `ObjectHeader` and
+    /// the zone `ObjectIdKey`, neither of which exists at the degraded
+    /// transport layer (see [`DegradedModeDecoder::finish_reconstruction`];
+    /// bead degraded-reconstruct-objectid-verify-qtmop).
     #[error("object ID mismatch")]
     ObjectIdMismatch,
 
@@ -901,6 +915,21 @@ impl DegradedModeDecoder {
         Ok(None)
     }
 
+    /// Finalize a completed RaptorQ reconstruction into an envelope.
+    ///
+    /// Content-address verification is deliberately deferred here
+    /// (investigated under bead degraded-reconstruct-objectid-verify-qtmop):
+    /// the reconstructed wire payload is `len ‖ schema_hash ‖ payload` with
+    /// no `ObjectHeader`, and the decoder holds the zone AEAD key but never
+    /// the zone `ObjectIdKey`, so `object_id == derive_id(...)` cannot be
+    /// recomputed at this layer. The envelope's `object_id`/`schema_hash`
+    /// are transport metadata: per-symbol AEAD context binding (object id,
+    /// zone, epoch, sender) stops non-zone-members from forging them, and a
+    /// zone-key holder gains nothing here because every trust decision
+    /// happens downstream — gossip payloads are independently
+    /// signature-verified at dispatch, and promotion into any object store
+    /// must pass that store's injected `ObjectIdVerifier` (see
+    /// `MeshNode::apply_gossip_fetch_payload`).
     fn finish_reconstruction(
         &mut self,
         pending_key: &PendingReconstructionKey,
@@ -1035,6 +1064,13 @@ pub trait ControlPlaneHandler: Send + Sync {
 }
 
 /// Simple in-memory handler that stores Required objects.
+///
+/// Test/replay fixture only: it indexes envelopes by their *claimed*
+/// `object_id` without content-address verification (which is impossible at
+/// this layer — see [`DegradedModeDecoder::finish_reconstruction`]). A
+/// production handler that promotes reconstructed payloads into an object
+/// store must route the write through a store with an injected
+/// `ObjectIdVerifier` instead of trusting the envelope's id.
 #[derive(Default)]
 pub struct InMemoryControlPlaneHandler {
     state: std::sync::Mutex<InMemoryReplayState>,

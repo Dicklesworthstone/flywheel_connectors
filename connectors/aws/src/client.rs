@@ -7,7 +7,9 @@ use serde::Deserialize;
 use tracing::debug;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::sigv4::{
     AwsCredentials, EMPTY_PAYLOAD_HASH, SigV4Signer, SignableRequest, SigningScope,
 };
@@ -217,7 +219,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, "S3 list buckets");
                 let req = sign_request(client.get(&url), &auth, &region, "s3", "GET", &url, &[]);
-                handle_json_response::<Vec<S3Bucket>>(req, attempt).await
+                handle_json_response::<Vec<S3Bucket>>(req, attempt, true).await
             }
         })
         .await
@@ -433,7 +435,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, "EC2 describe instances");
                 let req = sign_request(client.get(&url), &auth, &region, "ec2", "GET", &url, &[]);
-                handle_json_response::<Vec<Ec2Instance>>(req, attempt).await
+                handle_json_response::<Vec<Ec2Instance>>(req, attempt, true).await
             }
         })
         .await
@@ -463,7 +465,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, instance_id, "EC2 start instance");
                 let req = sign_request(client.post(&url), &auth, &region, "ec2", "POST", &url, &[]);
-                handle_json_response::<Ec2StateChange>(req, attempt).await
+                handle_json_response::<Ec2StateChange>(req, attempt, true).await
             }
         })
         .await
@@ -493,7 +495,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, instance_id, "EC2 stop instance");
                 let req = sign_request(client.post(&url), &auth, &region, "ec2", "POST", &url, &[]);
-                handle_json_response::<Ec2StateChange>(req, attempt).await
+                handle_json_response::<Ec2StateChange>(req, attempt, true).await
             }
         })
         .await
@@ -523,7 +525,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, instance_id, "EC2 terminate instance");
                 let req = sign_request(client.post(&url), &auth, &region, "ec2", "POST", &url, &[]);
-                handle_json_response::<Ec2StateChange>(req, attempt).await
+                handle_json_response::<Ec2StateChange>(req, attempt, true).await
             }
         })
         .await
@@ -548,7 +550,7 @@ impl AwsClient {
                 debug!(attempt, "Lambda list functions");
                 let req =
                     sign_request(client.get(&url), &auth, &region, "lambda", "GET", &url, &[]);
-                handle_json_response::<Vec<LambdaFunction>>(req, attempt).await
+                handle_json_response::<Vec<LambdaFunction>>(req, attempt, true).await
             }
         })
         .await
@@ -588,7 +590,11 @@ impl AwsClient {
                     &payload_bytes,
                 )
                 .json(&payload);
-                handle_json_response::<LambdaInvokeResponse>(req, attempt).await
+                // NOT replay-safe: a replay runs the function a SECOND time,
+                // with whatever side effects it has. Lambda's Invoke API has
+                // no idempotency token — AWS's own guidance is to make the
+                // FUNCTION idempotent, which this connector cannot verify.
+                handle_json_response::<LambdaInvokeResponse>(req, attempt, false).await
             }
         })
         .await
@@ -615,7 +621,7 @@ impl AwsClient {
             async move {
                 debug!(attempt, "STS get caller identity");
                 let req = sign_request(client.post(&url), &auth, &region, "sts", "POST", &url, &[]);
-                handle_json_response::<CallerIdentity>(req, attempt).await
+                handle_json_response::<CallerIdentity>(req, attempt, true).await
             }
         })
         .await
@@ -733,17 +739,26 @@ fn check_error_status<T>(status: u16) -> Option<AttemptOutcome<T, AwsError>> {
     None
 }
 
+/// Classify an AWS JSON response.
+///
+/// `replay_safe` states whether repeating this request can duplicate a side
+/// effect (br-kxd3e). Note the 503 handling below: this client maps 503 to a
+/// rate limit, which is right for S3 (`SlowDown`) but NOT for Lambda, where a
+/// 503 `ServiceException` means the request DID reach the service. So 503 is
+/// only treated as a safe throttle when the caller is replay-safe anyway; a
+/// non-replay-safe caller gets it as terminal. A 429 is a throttle everywhere
+/// and stays retryable unconditionally.
 async fn handle_json_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     _attempt: u32,
+    replay_safe: bool,
 ) -> AttemptOutcome<T, AwsError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: AwsError::Http(e),
-                retry_after: None,
-            };
+            // Only a connect-phase failure proves the request never left us.
+            let replayable = replay_safe || !transport_error_reached_service(&e);
+            return AttemptOutcome::retryable_if_replayable(AwsError::Http(e), None, replayable);
         }
     };
 
@@ -753,7 +768,7 @@ async fn handle_json_response<T: serde::de::DeserializeOwned>(
         return outcome;
     }
 
-    if status == 429 || status == 503 {
+    if status == 429 || (status == 503 && replay_safe) {
         let retry_after = resp
             .headers()
             .get("retry-after")
@@ -775,10 +790,9 @@ async fn handle_json_response<T: serde::de::DeserializeOwned>(
             message: text,
         };
         if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
+            // A 5xx means AWS received the request; for lambda_invoke that
+            // means the function may already have run.
+            return AttemptOutcome::retryable_if_replayable(err, None, replay_safe);
         }
         return AttemptOutcome::Terminal(err);
     }

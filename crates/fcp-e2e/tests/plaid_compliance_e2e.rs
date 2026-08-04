@@ -328,7 +328,12 @@ async fn plaid_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["plaid.link"]);
     // Token grants "plaid.link" but invoke targets "plaid.accounts_get" -> denial
-    let token = build_token(&signing_key, "plaid.link", &["plaid.link"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "plaid.link",
+        &["plaid.link"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "plaid.accounts_get",
         json!({ "access_token": "access-sandbox-test" }),
@@ -388,7 +393,12 @@ async fn plaid_allow_valid_token_connector_suite_passes() {
         signing_key.verifying_key().to_bytes(),
         &["plaid.accounts_get"],
     );
-    let token = build_token(&signing_key, "plaid.accounts_get", &["plaid.accounts_get"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "plaid.accounts_get",
+        &["plaid.accounts_get"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "plaid.accounts_get",
         json!({ "access_token": "access-sandbox-e2e" }),

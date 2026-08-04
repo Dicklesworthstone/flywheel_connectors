@@ -16,8 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 fcp-core.workspace = true
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-prelude.workspace = true
-fcp-sdk.workspace = true
+# `connector-http` gates `transport_error_reached_service` (see client.rs).
+fcp-sdk = { workspace = true, features = ["connector-http"] }
 fcp-async-core.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
@@ -34,6 +36,5 @@ chrono = { workspace = true, features = ["serde"] }
 [dev-dependencies]
 ciborium.workspace = true
 fcp-crypto.workspace = true
-fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit.workspace = true
 wiremock.workspace = true

@@ -818,4 +818,55 @@ mod tests {
             .expect_err("signature mismatch must fail");
         assert!(matches!(error, WeComError::Unauthorized(_)));
     }
+
+    #[test]
+    fn http_transport_error_never_leaks_corpsecret() {
+        const SECRET: &str = "corpsecret-DEADBEEF-super-secret-value";
+        // Bind then immediately drop a loopback socket so the port refuses
+        // connections deterministically (no accept-loop thread, no flakiness).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener local addr").port();
+        drop(listener);
+
+        let client = WeComClient::new(
+            WeComConfig::from_value(json!({
+                "base_url": format!("http://127.0.0.1:{port}"),
+                "corp_id": "ww-corp-id",
+                "agent_id": 1_000_002_u64,
+                "agent_secret": SECRET,
+                "request_timeout_ms": 500_u64,
+            }))
+            .expect("loopback config should parse"),
+        )
+        .expect("client should build");
+
+        // `access_token` sends GET /cgi-bin/gettoken?corpid=..&corpsecret=<SECRET>.
+        // The connect failure produces a `reqwest::Error` carrying that URL; the
+        // query string (with the long-lived app secret) must never survive into
+        // any surfaced message. The assertion is a negative, so it holds for any
+        // transport error variant the environment yields.
+        let outcome = fcp_async_core::runtime::block_on_sync(client.access_token())
+            .expect("runtime should drive the future to completion");
+        let error = outcome.expect_err("connection to a closed loopback port must fail");
+        assert!(
+            matches!(error, WeComError::Http(_)),
+            "expected transport error, got {error:?}"
+        );
+
+        let display = error.to_string();
+        assert!(
+            !display.contains(SECRET) && !display.contains("corpsecret"),
+            "Display leaked the corpsecret query: {display}"
+        );
+
+        match error.to_fcp_error() {
+            FcpError::External { message, .. } => {
+                assert!(
+                    !message.contains(SECRET) && !message.contains("corpsecret"),
+                    "FcpError message leaked the corpsecret query: {message}"
+                );
+            }
+            other => panic!("expected External FcpError, got {other:?}"),
+        }
+    }
 }

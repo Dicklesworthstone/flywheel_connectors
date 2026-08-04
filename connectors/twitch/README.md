@@ -1,8 +1,9 @@
 # Twitch Connector V3 Contract
 
-> **Status**: planning contract
+> **Status**: PROVEN
 > **Bead**: `flywheel_connectors-j05nu.8.5.1`
 > **Unblocks**: `flywheel_connectors-j05nu.8.5.2`
+> **Verification script**: `scripts/e2e/twitch_connector_verification.sh`
 > **Primary upstream**: https://dev.twitch.tv/docs/api/reference
 
 ## Purpose
@@ -86,7 +87,7 @@ Inference from the official docs: the current client-credentials-only runtime ca
 | `twitch.read` | Read-only Helix discovery for streams, users, channels, clips, and games |
 | `twitch.write` | Future broadcaster/bot mutations after user-token auth is implemented |
 
-## Accepted Operation Inventory
+## Operation Inventory
 
 | Operation | Endpoint | Capability | SafetyTier | RiskLevel | Idempotency | Notes |
 |-----------|----------|------------|------------|-----------|-------------|-------|
@@ -136,6 +137,20 @@ Verification script: `scripts/e2e/twitch_connector_verification.sh`
 The verifier runs the local non-mock loopback Twitch OAuth/Helix proof, the
 connector test suite, formatting, check, and clippy through `rch`, and records
 non-green infrastructure blockers instead of treating local fallback as proof.
+
+## Operator Guidance
+
+Prerequisites:
+
+- Use Twitch app credentials with the client-credentials grant for the accepted read-only Helix slice.
+- Keep production API traffic on `https://api.twitch.tv` and OAuth traffic on `https://id.twitch.tv`.
+- Do not enable the prototype write surfaces until user-token auth and broadcaster or bot consent are modeled explicitly.
+
+Rerun commands:
+
+- `RUN_ID=<timestamp> OUT_ROOT=.codex-targets/twitch-verification/<timestamp> RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 bash scripts/e2e/twitch_connector_verification.sh`
+- `bash scripts/graduation/run_gauntlet.sh --jsonl .codex-targets/twitch-verification/<timestamp>/evidence/twitch_gauntlet_after_promotion.jsonl connectors/twitch`
+- `rch exec -- cargo test -p fcp-conformance --test graduation_gauntlet_conformance all_proven_connectors_pass_gauntlet -- --nocapture`
 
 ## Source Notes
 

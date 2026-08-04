@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:39a41f4eb2300f7c21febdb8f1043e1c997a1a55bef10c5d70b38734ac9fc44c"
+interface_hash = "blake3-256:fcp.interface.v2:c945f59d7ce61fe3c2b2d3d3b305a3605c75d0d00e2d5826449d713aaacc72fe"
 
 [connector]
 id = "fcp.square"
@@ -148,9 +148,11 @@ type = "object"
 
 [provides.operations."square.payments.list".input_schema.properties.cursor]
 type = "string"
+description = "Pagination cursor"
 
 [provides.operations."square.payments.list".input_schema.properties.location_id]
 type = "string"
+description = "Filter by location"
 
 [provides.operations."square.payments.list".output_schema]
 required = ["payments"]
@@ -240,12 +242,21 @@ type = "object"
 
 [provides.operations."square.payments.create".input_schema.properties.source_id]
 type = "string"
+description = "Payment source (nonce or card ID)"
 
 [provides.operations."square.payments.create".input_schema.properties.idempotency_key]
 type = "string"
+description = "Unique key to prevent duplicate payments"
 
 [provides.operations."square.payments.create".input_schema.properties.amount_money]
 type = "object"
+
+[provides.operations."square.payments.create".input_schema.properties.amount_money.properties.amount]
+type = "integer"
+description = "Amount in smallest denomination"
+
+[provides.operations."square.payments.create".input_schema.properties.amount_money.properties.currency]
+type = "string"
 
 [provides.operations."square.payments.create".input_schema.properties.location_id]
 type = "string"
@@ -304,6 +315,12 @@ type = "string"
 
 [provides.operations."square.payments.refund".input_schema.properties.amount_money]
 type = "object"
+
+[provides.operations."square.payments.refund".input_schema.properties.amount_money.properties.amount]
+type = "integer"
+
+[provides.operations."square.payments.refund".input_schema.properties.amount_money.properties.currency]
+type = "string"
 
 [provides.operations."square.payments.refund".input_schema.properties.reason]
 type = "string"
@@ -493,6 +510,7 @@ type = "string"
 
 [provides.operations."square.catalog.list".input_schema.properties.types]
 type = "string"
+description = "Comma-separated types (ITEM, CATEGORY, etc.)"
 
 [provides.operations."square.catalog.list".output_schema]
 required = ["objects"]

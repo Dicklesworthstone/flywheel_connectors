@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use fcp_apple_reminders::AppleRemindersConnector;
 use fcp_apple_reminders::error::AppleRemindersError;
+use fcp_manifest::ManifestApprovalMode;
 use fcp_prelude::{ApprovalMode, FcpConnector, FcpError, IdempotencyClass, RiskLevel, SafetyTier};
 use fcp_testkit::{OperationContract, assert_operation_contracts};
 use serde_json::Value;
@@ -112,7 +113,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             RiskLevel::Low,
             SafetyTier::Safe,
             IdempotencyClass::Strict,
-            ApprovalMode::None,
+            None,
         ),
         (
             OP_LIST_LISTS,
@@ -120,7 +121,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             RiskLevel::Low,
             SafetyTier::Safe,
             IdempotencyClass::Strict,
-            ApprovalMode::None,
+            None,
         ),
         (
             OP_LIST_REMINDERS,
@@ -128,7 +129,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             RiskLevel::Low,
             SafetyTier::Safe,
             IdempotencyClass::Strict,
-            ApprovalMode::None,
+            None,
         ),
         (
             OP_CREATE_REMINDER,
@@ -136,7 +137,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             RiskLevel::Medium,
             SafetyTier::Risky,
             IdempotencyClass::None,
-            ApprovalMode::Policy,
+            Some(ApprovalMode::Policy),
         ),
         (
             OP_COMPLETE_REMINDER,
@@ -144,7 +145,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             RiskLevel::Medium,
             SafetyTier::Risky,
             IdempotencyClass::BestEffort,
-            ApprovalMode::Policy,
+            Some(ApprovalMode::Policy),
         ),
     ];
 
@@ -173,8 +174,7 @@ fn apple_reminders_advertises_complete_operation_matrix_with_user_facing_metadat
             "{operation_id} idempotency drifted"
         );
         assert_eq!(
-            operation.requires_approval,
-            Some(approval),
+            operation.requires_approval, approval,
             "{operation_id} approval policy drifted"
         );
         assert!(
@@ -285,8 +285,18 @@ fn apple_reminders_manifest_matches_introspection_and_local_bridge_security_cont
             introspection_op["idempotency"].as_str(),
             "{operation_id} idempotency drifted"
         );
+        let manifest_approval: ManifestApprovalMode = manifest_op["requires_approval"]
+            .clone()
+            .try_into()
+            .expect("manifest approval mode should deserialize");
+        let expected_approval = match manifest_approval {
+            ManifestApprovalMode::None => None,
+            ManifestApprovalMode::Policy => Some("policy"),
+            ManifestApprovalMode::Interactive => Some("interactive"),
+            ManifestApprovalMode::ElevationToken => Some("elevation_token"),
+        };
         assert_eq!(
-            manifest_op["requires_approval"].as_str(),
+            expected_approval,
             introspection_op["requires_approval"].as_str(),
             "{operation_id} approval mode drifted"
         );

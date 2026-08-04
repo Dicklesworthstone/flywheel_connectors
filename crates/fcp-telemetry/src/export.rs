@@ -1095,7 +1095,33 @@ fn render_prometheus_handle(handle: &PrometheusHandle) -> String {
 /// to serve `/metrics`.
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 
-fn serve_prometheus_connection(mut stream: TcpStream, handle: &PrometheusHandle) -> io::Result<()> {
+/// Per-connection socket deadline for the Prometheus scrape server.
+///
+/// The accept loop in [`init_prometheus_exporter`] handles connections
+/// serially on a single thread, so without a deadline one peer that opens a
+/// connection and then sends nothing (or streams bytes without a terminating
+/// `\n`, or never drains the response) parks the handler in `read_until` /
+/// `write` forever and blackouts every subsequent scrape. The `MAX_REQUEST_
+/// LINE_BYTES` cap (br-87yi2) bounds heap growth but not blocking time; this
+/// timeout bounds the time. A legitimate scrape sends a <32-byte request line
+/// and drains a small response well within this window, so any peer that
+/// exceeds it is a stall we want to drop.
+const PROMETHEUS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn serve_prometheus_connection(stream: TcpStream, handle: &PrometheusHandle) -> io::Result<()> {
+    serve_prometheus_connection_with_timeout(stream, handle, PROMETHEUS_CONNECTION_TIMEOUT)
+}
+
+fn serve_prometheus_connection_with_timeout(
+    mut stream: TcpStream,
+    handle: &PrometheusHandle,
+    timeout: Duration,
+) -> io::Result<()> {
+    // Fail closed on a slow/idle peer instead of blocking the single-threaded
+    // accept loop indefinitely.
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
     let request_line_result = {
         let mut reader = BufReader::new(stream.try_clone()?);
         // Read at most MAX_REQUEST_LINE_BYTES + 1 — the +1 lets us
@@ -1653,6 +1679,43 @@ mod tests {
         assert!(
             response.contains("HTTP/1.1 414 URI Too Long"),
             "oversized request line must yield 414, got: {response}"
+        );
+    }
+
+    /// A peer that opens a connection and sends nothing (a slowloris /
+    /// idle-connection stall) must NOT park the single-threaded accept loop
+    /// forever: the per-connection read timeout makes the handler return
+    /// promptly with a timeout error instead. Without the fix this test would
+    /// hang until the harness kills it.
+    #[test]
+    fn test_prometheus_idle_connection_times_out_instead_of_hanging() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Short timeout keeps the test fast while exercising the exact
+            // deadline path the production wrapper uses.
+            serve_prometheus_connection_with_timeout(stream, &handle, Duration::from_millis(200))
+        });
+
+        // Connect but never send a request line and never close the write
+        // half — the classic idle-peer stall.
+        let _client = TcpStream::connect(addr).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = server.join().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an idle peer must surface a timeout error, not a served response"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "handler must return promptly on an idle peer (took {elapsed:?})"
         );
     }
 

@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:d08f67f0c141966ba956221b0d022797bf43e1ae4b69aaf6e9b53452a8114eb7"
+interface_hash = "blake3-256:fcp.interface.v2:de759a7f23b3f0726e5cbe26dc44041c857c834e7ccda31b20873c99f2b898f9"
 
 [connector]
 id = "fcp.intercom"
@@ -199,6 +199,10 @@ type = "object"
 [provides.operations."intercom.contacts.list".input_schema.properties.per_page]
 maximum = 150
 type = "integer"
+
+[provides.operations."intercom.contacts.list".input_schema.properties.starting_after]
+description = "Cursor for the next page of results"
+type = "string"
 
 [provides.operations."intercom.contacts.list".input_schema.properties.query]
 description = "Search query object"

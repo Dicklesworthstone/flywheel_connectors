@@ -214,6 +214,9 @@ pub struct McpServerConfig {
     /// Optional connector filter — only expose this specific connector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connector_filter: Option<String>,
+    /// Optional risk ceiling — only expose tools at or below this risk level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_max: Option<String>,
     /// Whether to expose resources.
     #[serde(default = "default_true")]
     pub include_resources: bool,
@@ -232,6 +235,7 @@ impl Default for McpServerConfig {
             transport: TransportMode::default(),
             zone_filter: None,
             connector_filter: None,
+            risk_max: None,
             include_resources: true,
             include_prompts: true,
         }
@@ -259,6 +263,12 @@ impl McpServerConfig {
     /// Builder: set connector filter.
     pub fn with_connector_filter(mut self, connector: impl Into<String>) -> Self {
         self.connector_filter = Some(connector.into());
+        self
+    }
+
+    /// Builder: set the maximum risk level to expose (inclusive).
+    pub fn with_risk_max(mut self, risk_max: impl Into<String>) -> Self {
+        self.risk_max = Some(risk_max.into());
         self
     }
 
@@ -755,7 +765,23 @@ fn tool_matches_server_filters(tool: &McpToolDefinition, config: &McpServerConfi
         .zone_filter
         .as_deref()
         .is_none_or(|zone| tool.supports_zone(zone));
-    connector_ok && zone_ok
+    let risk_ok = tool_passes_risk_filter(tool, config.risk_max.as_deref());
+    connector_ok && zone_ok && risk_ok
+}
+
+/// Same inclusive ceiling semantics as `export_tools::passes_risk_filter`. A
+/// tool without declared risk metadata ranks above `critical`, so any
+/// recognized ceiling excludes it (default deny).
+fn tool_passes_risk_filter(tool: &McpToolDefinition, risk_max: Option<&str>) -> bool {
+    let Some(max) = risk_max else {
+        return true;
+    };
+    let level = tool
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.risk_level.as_deref())
+        .unwrap_or("undeclared");
+    export_tools::risk_filter_rank(level) <= export_tools::risk_filter_rank(max)
 }
 
 fn filtered_tools(state: &McpServerState) -> impl Iterator<Item = &McpToolDefinition> + '_ {
@@ -903,6 +929,22 @@ fn validate_tool_access(
             "tool": tool.name(),
             "connector_id": tool.connector_id(),
             "required_connector": connector_filter,
+        })));
+    }
+
+    if !tool_passes_risk_filter(tool, state.config.risk_max.as_deref()) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Tool `{}` is hidden by the active risk ceiling.",
+            tool.name()
+        ))
+        .with_data(json!({
+            "type": "risk-ceiling-exceeded",
+            "tool": tool.name(),
+            "risk_level": tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.risk_level.as_deref()),
+            "risk_max": state.config.risk_max,
         })));
     }
 
@@ -2154,6 +2196,24 @@ mod tests {
             ))
     }
 
+    fn risk_annotated_tool(name: &str, risk_level: &str) -> McpToolDefinition {
+        McpToolDefinition::new(
+            name,
+            "Risk-annotated fixture tool",
+            json!({"type": "object"}),
+            "github",
+            name.rsplit('.').next().unwrap_or(name),
+        )
+        .with_annotations(Some(export_tools::McpToolAnnotations {
+            risk_level: Some(risk_level.to_owned()),
+            safety_tier: None,
+            idempotency: None,
+            capability: None,
+            read_only: None,
+            destructive: None,
+        }))
+    }
+
     fn sample_token(zone: &str) -> Value {
         serde_json::to_value(
             ToolCapabilityToken::new(ZoneId::new(zone.to_owned()), "agent:test")
@@ -2478,6 +2538,7 @@ mod tests {
         assert_eq!(c.transport, TransportMode::Stdio);
         assert!(c.zone_filter.is_none());
         assert!(c.connector_filter.is_none());
+        assert!(c.risk_max.is_none());
         assert!(c.include_resources);
         assert!(c.include_prompts);
     }
@@ -2509,6 +2570,12 @@ mod tests {
     }
 
     #[test]
+    fn config_builder_risk_max() {
+        let c = McpServerConfig::new().with_risk_max("medium");
+        assert_eq!(c.risk_max.as_deref(), Some("medium"));
+    }
+
+    #[test]
     fn config_builder_without_resources() {
         let c = McpServerConfig::new().without_resources();
         assert!(!c.include_resources);
@@ -2524,10 +2591,12 @@ mod tests {
     fn config_serde_roundtrip() {
         let c = McpServerConfig::new()
             .with_transport(TransportMode::Sse { port: 4000 })
-            .with_zone_filter("staging");
+            .with_zone_filter("staging")
+            .with_risk_max("high");
         let json = serde_json::to_string(&c).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.zone_filter.as_deref(), Some("staging"));
+        assert_eq!(back.risk_max.as_deref(), Some("high"));
     }
 
     // ── Server Info ─────────────────────────────────────────────────
@@ -3164,6 +3233,60 @@ mod tests {
         assert_eq!(tools[0]["name"], "github.project_issue");
     }
 
+    #[test]
+    fn handle_tools_list_risk_max_is_inclusive_boundary() {
+        let state = McpServerState::builder()
+            .with_config(McpServerConfig::new().with_risk_max("medium"))
+            .with_tool(risk_annotated_tool("github.read_issue", "low"))
+            .with_tool(risk_annotated_tool("github.create_issue", "medium"))
+            .with_tool(risk_annotated_tool("github.delete_repo", "high"))
+            .with_tool(risk_annotated_tool("github.transfer_org", "critical"))
+            .build();
+        let req = make_request("tools/list", None);
+        let resp = handle_request(&state, &req);
+        let tools = resp.result().unwrap()["tools"].as_array().unwrap().clone();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["github.read_issue", "github.create_issue"]);
+    }
+
+    #[test]
+    fn handle_tools_list_risk_max_critical_includes_critical() {
+        let state = McpServerState::builder()
+            .with_config(McpServerConfig::new().with_risk_max("critical"))
+            .with_tool(risk_annotated_tool("github.transfer_org", "critical"))
+            .build();
+        let req = make_request("tools/list", None);
+        let resp = handle_request(&state, &req);
+        let tools = resp.result().unwrap()["tools"].as_array().unwrap().clone();
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn handle_tools_list_risk_max_excludes_tools_without_risk_metadata() {
+        let state = McpServerState::builder()
+            .with_config(McpServerConfig::new().with_risk_max("critical"))
+            .with_tool(sample_tool())
+            .with_tool(risk_annotated_tool("github.read_issue", "low"))
+            .build();
+        let req = make_request("tools/list", None);
+        let resp = handle_request(&state, &req);
+        let tools = resp.result().unwrap()["tools"].as_array().unwrap().clone();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["github.read_issue"]);
+    }
+
+    #[test]
+    fn handle_tools_list_without_risk_max_includes_unannotated_tools() {
+        let state = McpServerState::builder()
+            .with_tool(sample_tool())
+            .with_tool(risk_annotated_tool("github.delete_repo", "high"))
+            .build();
+        let req = make_request("tools/list", None);
+        let resp = handle_request(&state, &req);
+        let tools = resp.result().unwrap()["tools"].as_array().unwrap().clone();
+        assert_eq!(tools.len(), 2);
+    }
+
     // ── handle_request: tools/call ──────────────────────────────────
 
     #[test]
@@ -3177,6 +3300,51 @@ mod tests {
             })),
         );
         let resp = handle_request(&state, &req);
+        assert!(resp.is_error());
+        let error = resp.error.as_ref().unwrap();
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("transport-bound tool handler"));
+    }
+
+    #[test]
+    fn handle_tools_call_refuses_tool_above_risk_ceiling() {
+        let state = McpServerState::builder()
+            .with_config(McpServerConfig::new().with_risk_max("medium"))
+            .with_tool(risk_annotated_tool("github.delete_repo", "high"))
+            .build();
+        let req = make_request(
+            "tools/call",
+            Some(json!({
+                "name": "github.delete_repo",
+                "arguments": {}
+            })),
+        );
+        let resp = handle_request(&state, &req);
+        assert!(resp.is_error());
+        let error = resp.error.as_ref().unwrap();
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("risk ceiling"));
+        let data = error.data.as_ref().unwrap();
+        assert_eq!(data["type"], "risk-ceiling-exceeded");
+        assert_eq!(data["risk_level"], "high");
+        assert_eq!(data["risk_max"], "medium");
+    }
+
+    #[test]
+    fn handle_tools_call_allows_tool_at_risk_ceiling() {
+        let state = McpServerState::builder()
+            .with_config(McpServerConfig::new().with_risk_max("medium"))
+            .with_tool(risk_annotated_tool("github.create_issue", "medium"))
+            .build();
+        let req = make_request(
+            "tools/call",
+            Some(json!({
+                "name": "github.create_issue",
+                "arguments": {}
+            })),
+        );
+        let resp = handle_request(&state, &req);
+        // Passes the risk gate; fails only at the transport-handler boundary.
         assert!(resp.is_error());
         let error = resp.error.as_ref().unwrap();
         assert_eq!(error.code, INTERNAL_ERROR);

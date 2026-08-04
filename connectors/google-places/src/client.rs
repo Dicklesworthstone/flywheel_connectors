@@ -156,6 +156,7 @@ impl GooglePlacesClient {
             "place_details field mask",
         )?;
         let place = input.place.trim_start_matches('/');
+        validate_place_resource(place)?;
         let url = format!("{}/v1/{}", self.base_url, place);
         let mut request = self
             .client
@@ -166,5 +167,50 @@ impl GooglePlacesClient {
         }
         let response = request.send().await?;
         Self::decode_response(response).await
+    }
+}
+
+/// Validate a Places resource name before interpolating it into the request
+/// path (`{base}/v1/{place}`).
+///
+/// A valid place resource is `places/{PLACE_ID}`, so the single structural `/`
+/// is allowed, but a literal `?` or `#` would inject a query string or fragment
+/// against the allowlisted Google host, and `..` / encoded slashes would
+/// traverse to a sibling endpoint. Mirrors the resource-name guard used by the
+/// google-chat / google-docs connectors.
+fn validate_place_resource(place: &str) -> GooglePlacesResult<()> {
+    let lower = place.to_ascii_lowercase();
+    if place.is_empty()
+        || place.contains("..")
+        || place.contains('?')
+        || place.contains('#')
+        || place.contains('\\')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(GooglePlacesError::Config(format!(
+            "place resource name contains invalid characters: {place:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_place_resource_accepts_resource_name() {
+        assert!(validate_place_resource("places/ChIJN1t_tDeuEmsRUsoyG83frY4").is_ok());
+    }
+
+    #[test]
+    fn validate_place_resource_rejects_injection() {
+        assert!(validate_place_resource("").is_err());
+        assert!(validate_place_resource("places/abc?key=evil").is_err());
+        assert!(validate_place_resource("places/abc#frag").is_err());
+        assert!(validate_place_resource("places/../v1/other").is_err());
+        assert!(validate_place_resource("places\\abc").is_err());
+        assert!(validate_place_resource("places/abc%2f..").is_err());
     }
 }

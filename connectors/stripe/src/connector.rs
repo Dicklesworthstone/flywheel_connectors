@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use chrono::Utc;
@@ -571,7 +571,8 @@ impl StripeConnector {
     }
 
     fn operations_info() -> Vec<OperationInfo> {
-        typed_operations_info()
+        static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+        OPERATIONS.get_or_init(typed_operations_info).clone()
     }
 
     /// Handle introspect method.

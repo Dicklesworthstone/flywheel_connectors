@@ -449,6 +449,16 @@ impl CodaClient {
         url: &str,
         body: &serde_json::Value,
     ) -> CodaResult<T> {
+        // br-kxd3e: READ THE REQUEST'S OWN SIGNAL, the same shape supabase
+        // uses. Coda's row endpoint inserts by default, but becomes an UPSERT
+        // when the body carries non-empty `keyColumns` — Coda then resolves on
+        // those columns server-side, so a replay converges instead of adding
+        // duplicate rows. Deriving it from the body keeps this correct as
+        // operations change, rather than freezing a per-call-site guess.
+        let replay_safe = body
+            .get("keyColumns")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|columns| !columns.is_empty());
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let url = url.to_string();
@@ -473,10 +483,13 @@ impl CodaClient {
                         Ok(v) => AttemptOutcome::Success(v),
                         Err(e) => AttemptOutcome::Terminal(CodaError::Json(e)),
                     },
-                    Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: e.retry_after(),
-                        error: e,
-                    },
+                    Err(e) if e.is_retryable() => {
+                        // 429 stays retryable — refused WITHOUT performing the
+                        // work. A 5xx means the request arrived.
+                        let replayable = replay_safe || matches!(e, CodaError::RateLimited { .. });
+                        let retry_after = e.retry_after();
+                        AttemptOutcome::retryable_if_replayable(e, retry_after, replayable)
+                    }
                     Err(e) => AttemptOutcome::Terminal(e),
                 }
             }

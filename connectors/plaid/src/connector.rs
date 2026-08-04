@@ -1667,7 +1667,8 @@ mod tests {
             .await
             .unwrap();
 
-        let token = generate_valid_token(&signing_key, connector.instance_id(), "plaid.accounts_get");
+        let token =
+            generate_valid_token(&signing_key, connector.instance_id(), "plaid.accounts_get");
         let result = connector
             .handle_invoke(json!({
                 "operation": "plaid.accounts_get",
@@ -1699,7 +1700,11 @@ mod tests {
             .await
             .unwrap();
 
-        let token = generate_valid_token(&signing_key, connector.instance_id(), "plaid.transactions_get");
+        let token = generate_valid_token(
+            &signing_key,
+            connector.instance_id(),
+            "plaid.transactions_get",
+        );
         let result = connector
             .handle_invoke(json!({
                 "operation": "plaid.transactions_get",

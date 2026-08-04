@@ -23,6 +23,7 @@ workspace = true
 fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-sdk = { path = "../../crates/fcp-sdk" }
 
 anyhow.workspace = true
@@ -40,6 +41,5 @@ hex.workspace = true
 chrono.workspace = true
 ciborium.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
-fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }
 toml.workspace = true

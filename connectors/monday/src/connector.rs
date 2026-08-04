@@ -1,6 +1,7 @@
 //! FCP Monday.com Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
@@ -843,7 +844,10 @@ fn operation_info_from_manifest(id: String, operation: &OperationSection) -> Ope
 
 /// Build the operations info for introspection (JSON format, used by simulate).
 fn operations_info() -> serde_json::Value {
-    serde_json::to_value(typed_operations_info()).unwrap_or_default()
+    static OPERATIONS: OnceLock<serde_json::Value> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| serde_json::to_value(typed_operations_info()).unwrap_or_default())
+        .clone()
 }
 
 #[cfg(test)]

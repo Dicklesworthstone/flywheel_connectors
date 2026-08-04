@@ -11,7 +11,12 @@ use thiserror::Error;
 pub type TelegramResult<T> = Result<T, TelegramError>;
 
 /// Telegram API errors.
-#[derive(Debug, Error)]
+///
+/// `Debug` is hand-written (not derived) so the `Http` variant never prints
+/// the raw `reqwest::Error`, whose `url` field would otherwise leak the bot
+/// token embedded in every Telegram API path. Both `Display` and `Debug`
+/// route the HTTP error through [`redact_telegram_bot_token_segments`].
+#[derive(Error)]
 pub enum TelegramError {
     #[error("HTTP error: {}", redacted_http_error(.0))]
     Http(#[from] reqwest::Error),
@@ -37,6 +42,37 @@ pub enum TelegramError {
         sent_message_ids: Vec<i64>,
         source: Box<TelegramError>,
     },
+}
+
+impl std::fmt::Debug for TelegramError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => f
+                .debug_tuple("Http")
+                .field(&redacted_http_error(error))
+                .finish(),
+            Self::Api { code, description } => f
+                .debug_struct("Api")
+                .field("code", code)
+                .field("description", description)
+                .finish(),
+            Self::InvalidChatId(value) => f.debug_tuple("InvalidChatId").field(value).finish(),
+            Self::InvalidFilePath(value) => f.debug_tuple("InvalidFilePath").field(value).finish(),
+            Self::InvalidRequest(value) => f.debug_tuple("InvalidRequest").field(value).finish(),
+            Self::PartialSend {
+                sent_chunks,
+                failed_chunk_index,
+                sent_message_ids,
+                source,
+            } => f
+                .debug_struct("PartialSend")
+                .field("sent_chunks", sent_chunks)
+                .field("failed_chunk_index", failed_chunk_index)
+                .field("sent_message_ids", sent_message_ids)
+                .field("source", source)
+                .finish(),
+        }
+    }
 }
 
 impl TelegramError {
@@ -127,7 +163,18 @@ impl TelegramError {
 }
 
 fn redacted_http_error(error: &reqwest::Error) -> String {
-    redact_telegram_bot_token_segments(&error.to_string())
+    // reqwest's `Display` omits the source chain, which hides the actual
+    // failure class (connection refused vs reset vs resource exhaustion).
+    // Walk the chain and append each cause; the token redaction below
+    // covers the joined text.
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    redact_telegram_bot_token_segments(&message)
 }
 
 fn redact_telegram_bot_token_segments(message: &str) -> String {
@@ -216,6 +263,30 @@ mod tests {
         let telegram_error = TelegramError::Http(error);
         let display = telegram_error.to_string();
         assert!(!display.contains(BOT_TOKEN));
+
+        // The derived Debug would print the inner reqwest::Error's `url`
+        // field verbatim (token included); the hand-written Debug must redact,
+        // both directly and when nested inside another variant.
+        let debug = format!("{telegram_error:?}");
+        assert!(
+            !debug.contains(BOT_TOKEN),
+            "Debug leaked bot token: {debug}"
+        );
+        let nested_debug = format!(
+            "{:?}",
+            TelegramError::PartialSend {
+                sent_chunks: 1,
+                failed_chunk_index: 1,
+                sent_message_ids: vec![1],
+                source: Box::new(TelegramError::InvalidRequest(format!(
+                    "wrapping {telegram_error:?}"
+                ))),
+            }
+        );
+        assert!(
+            !nested_debug.contains(BOT_TOKEN),
+            "nested Debug leaked bot token: {nested_debug}"
+        );
 
         let fcp_error = telegram_error.to_fcp_error();
         match fcp_error {

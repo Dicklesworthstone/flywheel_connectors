@@ -1,6 +1,7 @@
 //! Golden artifact snapshots for fcp-registry wire formats.
 
 use fcp_cbor::SchemaId;
+use fcp_manifest::AttestationType;
 use fcp_prelude::{
     EpochId, NodeId, NodeSignature, ObjectHeader, ObjectId, Provenance, RevocationHead,
     RevocationObject, RevocationScope, SignatureSet, ZoneId,
@@ -115,6 +116,10 @@ fn registry_golden_supply_chain_verification_config() {
         require_transparency: true,
         require_tuf: true,
         require_sigstore: true,
+        require_attestation_types: vec![AttestationType::InToto],
+        min_slsa_level: Some(3),
+        trusted_builders: vec!["github-actions".to_string()],
+        require_attestation_expiry: true,
     };
 
     insta::assert_snapshot!("supply_chain_verification_config", pretty_json(&config));

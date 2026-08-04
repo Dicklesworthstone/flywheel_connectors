@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -670,13 +671,18 @@ fn ordered_manifest_operations() -> Vec<(String, fcp_manifest::OperationSection)
 }
 
 fn introspect_operations() -> Vec<Value> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| {
-            let operation_info = operation_info_from_manifest(id, &operation);
-            introspect_operation_from_manifest(operation_info, &operation)
+    static OPERATIONS: OnceLock<Vec<Value>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| {
+                    let operation_info = operation_info_from_manifest(id, &operation);
+                    introspect_operation_from_manifest(operation_info, &operation)
+                })
+                .collect()
         })
-        .collect()
+        .clone()
 }
 
 fn operation_order(operation_id: &str) -> usize {

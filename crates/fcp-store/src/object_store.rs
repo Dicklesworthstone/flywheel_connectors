@@ -347,6 +347,20 @@ pub trait ObjectStore: Send + Sync {
 
     /// Get storage quota in bytes.
     async fn storage_quota(&self) -> u64;
+
+    /// Whether a content-id [`ObjectIdVerifier`] is installed on this store.
+    ///
+    /// Stores reachable from untrusted write paths (peer-supplied mesh
+    /// objects) must have a verifier installed so `put` enforces
+    /// `object_id == derive_id(header, body, zone_key)`; without one, a
+    /// hostile peer can bind attacker-controlled bytes to a legitimately
+    /// requested object id (cache poisoning). `MeshNode` uses this to
+    /// surface verifier-less live-network ingestion loudly (bead
+    /// mesh-node-content-id-verifier-wiring-h3xmd). Defaults to `false`
+    /// for wrapper/test stores that do not manage a verifier.
+    fn has_object_id_verifier(&self) -> bool {
+        false
+    }
 }
 
 /// Configuration for in-memory object store.
@@ -448,6 +462,10 @@ impl MemoryObjectStore {
 
 #[async_trait]
 impl ObjectStore for MemoryObjectStore {
+    fn has_object_id_verifier(&self) -> bool {
+        self.verifier.is_some()
+    }
+
     async fn put(&self, object: StoredObject) -> Result<(), ObjectStoreError> {
         // Defense-in-depth: reject objects whose header cannot be
         // canonically encoded or whose total size exceeds

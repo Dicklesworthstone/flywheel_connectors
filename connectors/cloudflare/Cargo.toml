@@ -19,7 +19,7 @@ chrono.workspace = true
 fcp-core.workspace = true
 fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-prelude.workspace = true
-fcp-sdk.workspace = true
+fcp-sdk = { workspace = true, features = ["connector-http"] }
 fcp-async-core.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }

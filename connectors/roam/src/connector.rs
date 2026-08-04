@@ -1,6 +1,7 @@
 //! FCP `Roam Research` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
@@ -856,9 +857,15 @@ fn typed_operations_info() -> FcpResult<Vec<OperationInfo>> {
 
 /// Build the operations info for introspection (JSON format for simulate).
 fn operations_info() -> Value {
-    Value::Array(
-        introspect_operations().expect("embedded Roam manifest should validate for introspection"),
-    )
+    static OPERATIONS: OnceLock<Value> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            Value::Array(
+                introspect_operations()
+                    .expect("embedded Roam manifest should validate for introspection"),
+            )
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> FcpResult<Vec<(String, fcp_manifest::OperationSection)>> {

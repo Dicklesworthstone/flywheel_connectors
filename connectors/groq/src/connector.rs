@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -581,7 +582,13 @@ impl FcpConnector for GroqConnector {
 }
 
 fn operations_info() -> Vec<OperationInfo> {
-    groq_operations_info().expect("embedded Groq manifest should validate for introspection")
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            groq_operations_info()
+                .expect("embedded Groq manifest should validate for introspection")
+        })
+        .clone()
 }
 
 fn groq_operations_info() -> FcpResult<Vec<OperationInfo>> {

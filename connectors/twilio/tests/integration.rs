@@ -928,6 +928,63 @@ async fn error_401_maps_to_unauthorized() {
     );
 }
 
+/// A 5xx on `POST /Messages.json` is NOT retried.
+///
+/// A 5xx means Twilio received the request, and Twilio has no idempotency key
+/// for the Messages API — so replaying it sends and bills a second SMS. With
+/// `max_retries = 3` one invoke could send four messages. `expect(1)` is the
+/// assertion: the mock server panics on drop if a second request arrives.
+/// See br-kxd3e.
+#[fcp_async_core::runtime::test]
+async fn server_error_on_message_send_is_not_retried() {
+    let _ctx = AsyncTestContext::for_scenario("twilio.retry.post_5xx_terminal");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex("/Accounts/.*/Messages\\.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let base = format!("{}/2010-04-01/Accounts/ACtest", mock_server.uri());
+    let client = TwilioClient::new("ACtest", "token")
+        .unwrap()
+        .with_base_url(&base)
+        .with_retry_config(3);
+
+    client
+        .send_message("+15550002", "+15550001", "hello", None, None)
+        .await
+        .expect_err("a 503 on a message send must surface, not silently resend");
+}
+
+/// The same 5xx on a GET IS still retried — the fix must not disable retries
+/// for requests that are safe to replay.
+#[fcp_async_core::runtime::test]
+async fn server_error_on_read_is_still_retried() {
+    let _ctx = AsyncTestContext::for_scenario("twilio.retry.get_5xx_retried");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/Accounts/.*/Messages/.*\\.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let base = format!("{}/2010-04-01/Accounts/ACtest", mock_server.uri());
+    let client = TwilioClient::new("ACtest", "token")
+        .unwrap()
+        .with_base_url(&base)
+        .with_retry_config(1);
+
+    client
+        .get_message("SMtest001")
+        .await
+        .expect_err("still fails after exhausting retries");
+}
+
 /// 404 Not Found maps to `FcpError::ResourceNotFound`.
 #[fcp_async_core::runtime::test]
 async fn error_404_maps_to_not_found() {

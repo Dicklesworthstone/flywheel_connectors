@@ -2,12 +2,55 @@
 
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use reqwest::{Client, RequestBuilder, Url};
 use serde_json::json;
 use std::time::Duration;
 use tracing::{debug, warn};
+use uuid::Uuid;
+
+/// LINE's request-deduplication header.
+///
+/// LINE stores the key for 24h and answers a repeat with 409 instead of
+/// sending the message again. The value must be a UUID — LINE rejects any
+/// other shape — so this cannot carry an `fcp2:`-prefixed key the way
+/// Stripe's `Idempotency-Key` does.
+const LINE_RETRY_KEY_HEADER: &str = "X-Line-Retry-Key";
+
+/// Why replaying a LINE messaging POST cannot deliver the message twice.
+///
+/// Retrying a send after a 5xx or a timeout is only acceptable with one of
+/// these in hand: both failures can be reported after LINE already delivered
+/// the message (br-kxd3e).
+#[derive(Debug, Clone)]
+enum MessageReplaySafety {
+    /// LINE deduplicates on [`LINE_RETRY_KEY_HEADER`]. Supported by the push,
+    /// multicast, narrowcast, and broadcast endpoints.
+    RetryKey(String),
+    /// The reply endpoint takes no retry key and needs none: a reply token is
+    /// single-use, so LINE rejects a second send with the same token rather
+    /// than delivering a duplicate.
+    SingleUseReplyToken,
+}
+
+impl MessageReplaySafety {
+    /// Mint a fresh dedup key for one logical send.
+    fn retry_key() -> Self {
+        Self::RetryKey(Uuid::new_v4().to_string())
+    }
+
+    /// The header value to attach, if this endpoint takes one.
+    fn retry_key_header(&self) -> Option<String> {
+        match self {
+            Self::RetryKey(key) => Some(key.clone()),
+            Self::SingleUseReplyToken => None,
+        }
+    }
+}
 
 fn truncate_error_body(body: String) -> String {
     if body.len() > 500 {
@@ -116,7 +159,8 @@ impl LineClient {
     ) -> LineResult<SentMessageResponse> {
         let url = self.build_url(&["v2", "bot", "message", "push"])?;
         let body = json!({ "to": to, "messages": messages });
-        self.post_message(runtime, url, &body).await
+        self.post_message(runtime, url, &body, MessageReplaySafety::retry_key())
+            .await
     }
 
     /// Reply to a message using a reply token.
@@ -128,7 +172,13 @@ impl LineClient {
     ) -> LineResult<SentMessageResponse> {
         let url = self.build_url(&["v2", "bot", "message", "reply"])?;
         let body = json!({ "replyToken": reply_token, "messages": messages });
-        self.post_message(runtime, url, &body).await
+        self.post_message(
+            runtime,
+            url,
+            &body,
+            MessageReplaySafety::SingleUseReplyToken,
+        )
+        .await
     }
 
     /// Multicast a message to multiple users.
@@ -140,15 +190,22 @@ impl LineClient {
     ) -> LineResult<SentMessageResponse> {
         let url = self.build_url(&["v2", "bot", "message", "multicast"])?;
         let body = json!({ "to": to, "messages": messages });
-        self.post_message(runtime, url, &body).await
+        self.post_message(runtime, url, &body, MessageReplaySafety::retry_key())
+            .await
     }
 
     /// Common POST for messaging endpoints with retry.
+    ///
+    /// `replay_safety` states WHY replaying this request cannot deliver the
+    /// message twice — see [`MessageReplaySafety`]. Every caller must supply
+    /// one, so a messaging endpoint added later cannot inherit a retry loop
+    /// without its author deciding the question (br-kxd3e).
     async fn post_message(
         &self,
         runtime: &ConnectorRuntime,
         url: Url,
         body: &serde_json::Value,
+        replay_safety: MessageReplaySafety,
     ) -> LineResult<SentMessageResponse> {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -156,20 +213,28 @@ impl LineClient {
         let body_clone = body.clone();
         let client = self.client.clone();
         let token = self.channel_access_token.clone();
+        // Resolved ONCE, outside the retry closure, so every attempt of this
+        // call presents the same key. A per-attempt key would be worse than
+        // none: it would look like protection while providing exactly zero.
+        let retry_key = replay_safety.retry_key_header();
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
             let client = client.clone();
             let token = token.clone();
             let body = body_clone.clone();
+            let retry_key = retry_key.clone();
             async move {
                 debug!(attempt, "Sending LINE message");
-                let request = if token.is_empty() {
+                let mut request = if token.is_empty() {
                     client.post(url.clone())
                 } else {
                     client.post(url.clone()).bearer_auth(&token)
                 }
                 .json(&body);
+                if let Some(key) = retry_key.as_deref() {
+                    request = request.header(LINE_RETRY_KEY_HEADER, key);
+                }
 
                 let resp = match request.send().await {
                     Ok(r) => r,
@@ -182,6 +247,15 @@ impl LineClient {
                 };
 
                 let status = resp.status().as_u16();
+                // With a retry key attached, 409 is LINE reporting that it
+                // already accepted an identical request and did NOT send the
+                // message again. That is a success for the caller: surfacing an
+                // error here would invite an invoke-level retry, which mints a
+                // FRESH key and would genuinely duplicate the message.
+                if status == 409 && retry_key.is_some() {
+                    debug!("LINE deduplicated a retried message via X-Line-Retry-Key");
+                    return AttemptOutcome::Success(SentMessageResponse::default());
+                }
                 if status == 429 {
                     let retry_after = resp
                         .headers()
@@ -312,10 +386,16 @@ impl LineClient {
                 let resp = match request.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: LineError::Http(e),
-                            retry_after: None,
-                        };
+                        // br-kxd3e: unlike the messaging endpoints, LINE offers
+                        // no dedup key for rich-menu creation, so a replay that
+                        // reached LINE creates a SECOND menu. Only a
+                        // connect-phase failure proves it did not.
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            LineError::Http(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -332,7 +412,10 @@ impl LineClient {
                         status,
                         message: text,
                     };
-                    if !matches!(decision, RetryDecision::Terminal) {
+                    // A 429 was refused WITHOUT creating anything, so it stays
+                    // retryable. Every other retryable class here (5xx) means
+                    // LINE received the request and may have created the menu.
+                    if status == 429 && !matches!(decision, RetryDecision::Terminal) {
                         return AttemptOutcome::Retryable {
                             error: err,
                             retry_after: None,

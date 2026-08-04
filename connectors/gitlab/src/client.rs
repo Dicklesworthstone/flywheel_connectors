@@ -25,8 +25,24 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// GitLab project IDs can be numeric (`12345`) or namespace paths (`group/subgroup/project`).
 /// When used in a URL like `/projects/{id}/issues`, the slashes must be encoded to
 /// `group%2Fsubgroup%2Fproject` so they aren't interpreted as path separators.
-fn encode_path_segment(value: &str) -> String {
-    utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
+///
+/// Because slashes are encoded, the only residual traversal vector is a bare
+/// `.`/`..` segment that the server would normalize to a sibling endpoint (e.g.
+/// `list_issues("..")` → `/projects/../issues` → `/issues`, silently widening
+/// scope to every project the token can see). GitLab paths never legitimately
+/// contain consecutive dots, so such values are rejected outright.
+fn encode_path_segment(value: &str) -> GitLabResult<String> {
+    if value.is_empty() {
+        return Err(GitLabError::InvalidInput(
+            "path segment must not be empty".into(),
+        ));
+    }
+    if value == "." || value.contains("..") {
+        return Err(GitLabError::InvalidInput(
+            "path segment must not contain traversal sequences".into(),
+        ));
+    }
+    Ok(utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string())
 }
 
 use crate::{
@@ -216,7 +232,7 @@ impl GitLabClient {
 
     /// List issues in a project.
     pub async fn list_issues(&self, project_id: &str) -> GitLabResult<serde_json::Value> {
-        let encoded = encode_path_segment(project_id);
+        let encoded = encode_path_segment(project_id)?;
         self.get(&format!("/projects/{encoded}/issues")).await
     }
 
@@ -226,7 +242,7 @@ impl GitLabClient {
         project_id: &str,
         body: &serde_json::Value,
     ) -> GitLabResult<serde_json::Value> {
-        let encoded = encode_path_segment(project_id);
+        let encoded = encode_path_segment(project_id)?;
         self.post(&format!("/projects/{encoded}/issues"), body)
             .await
     }
@@ -235,7 +251,7 @@ impl GitLabClient {
 
     /// List merge requests.
     pub async fn list_merge_requests(&self, project_id: &str) -> GitLabResult<serde_json::Value> {
-        let encoded = encode_path_segment(project_id);
+        let encoded = encode_path_segment(project_id)?;
         self.get(&format!("/projects/{encoded}/merge_requests"))
             .await
     }
@@ -244,7 +260,7 @@ impl GitLabClient {
 
     /// List pipelines.
     pub async fn list_pipelines(&self, project_id: &str) -> GitLabResult<serde_json::Value> {
-        let encoded = encode_path_segment(project_id);
+        let encoded = encode_path_segment(project_id)?;
         self.get(&format!("/projects/{encoded}/pipelines")).await
     }
 }
@@ -409,30 +425,45 @@ mod tests {
     // ── encode_path_segment tests ───────────────────────────────
     #[test]
     fn encode_path_segment_numeric_id_unchanged() {
-        assert_eq!(encode_path_segment("12345"), "12345");
+        assert_eq!(encode_path_segment("12345").unwrap(), "12345");
     }
 
     #[test]
     fn encode_path_segment_encodes_slashes() {
         assert_eq!(
-            encode_path_segment("group/subgroup/project"),
+            encode_path_segment("group/subgroup/project").unwrap(),
             "group%2Fsubgroup%2Fproject"
         );
     }
 
     #[test]
     fn encode_path_segment_encodes_spaces() {
-        assert_eq!(encode_path_segment("my project"), "my%20project");
+        assert_eq!(encode_path_segment("my project").unwrap(), "my%20project");
     }
 
     #[test]
     fn encode_path_segment_preserves_hyphens_underscores() {
-        assert_eq!(encode_path_segment("my-project_v2"), "my-project_v2");
+        assert_eq!(
+            encode_path_segment("my-project_v2").unwrap(),
+            "my-project_v2"
+        );
     }
 
     #[test]
     fn encode_path_segment_encodes_special_chars() {
-        assert_eq!(encode_path_segment("a?b#c"), "a%3Fb%23c");
+        assert_eq!(encode_path_segment("a?b#c").unwrap(), "a%3Fb%23c");
+    }
+
+    #[test]
+    fn encode_path_segment_rejects_traversal() {
+        // A bare `..`/`.` project id would normalize to a sibling endpoint
+        // (`/projects/../issues` → `/issues`), widening the authorization scope.
+        for evil in ["..", ".", "../..", "a..b", ""] {
+            assert!(
+                matches!(encode_path_segment(evil), Err(GitLabError::InvalidInput(_))),
+                "path segment {evil:?} must be rejected"
+            );
+        }
     }
 
     #[test]

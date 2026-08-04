@@ -26,9 +26,14 @@ pub enum RecoveryPhraseError {
 
 /// A BIP39 recovery phrase for deriving the owner keypair.
 ///
-/// This struct zeroizes the entropy on drop for security.
+/// All secret material is zeroized on drop: the redundant `entropy` copy is
+/// wiped by this type's `Drop`, and the authoritative `mnemonic` (which holds
+/// the 24-word secret as `[u16; 24]`) is wiped because `bip39` is built with
+/// its `zeroize` feature so `Mnemonic` derives `ZeroizeOnDrop`. The
+/// compile-time assertion in this module's tests fails the build if that
+/// feature is ever dropped.
 pub struct RecoveryPhrase {
-    /// The underlying BIP39 mnemonic.
+    /// The underlying BIP39 mnemonic. `ZeroizeOnDrop` via the `zeroize` feature.
     mnemonic: Mnemonic,
 
     /// Cached entropy bytes (zeroized on drop).
@@ -37,6 +42,9 @@ pub struct RecoveryPhrase {
 
 impl Drop for RecoveryPhrase {
     fn drop(&mut self) {
+        // Wipe the redundant entropy copy. The `mnemonic` field is wiped
+        // separately by `Mnemonic`'s own `ZeroizeOnDrop` when this struct's
+        // fields drop after this body runs.
         self.entropy.zeroize();
     }
 }
@@ -240,6 +248,17 @@ impl std::fmt::Debug for OwnerKeypair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the recovery-phrase zeroization contract: if the
+    /// `bip39` `zeroize` feature is ever dropped from Cargo.toml, `Mnemonic`
+    /// loses its `ZeroizeOnDrop` impl and this fails to compile — surfacing the
+    /// silent secret-retention regression at build time rather than in a core
+    /// dump. `Mnemonic` holds the authoritative 24-word owner secret.
+    #[test]
+    fn mnemonic_is_zeroize_on_drop() {
+        const fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Mnemonic>();
+    }
 
     #[test]
     fn test_generate_recovery_phrase() {

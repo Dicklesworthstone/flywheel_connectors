@@ -425,7 +425,12 @@ async fn terraform_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["terraform.apply"]);
     // Token grants "terraform.apply" but invoke targets "terraform.state_list" -> denial
-    let token = build_token(&signing_key, "terraform.apply", &["terraform.apply"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "terraform.apply",
+        &["terraform.apply"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "terraform.state_list",
         json!({ "working_dir": "/infra/test-ws" }),
@@ -516,7 +521,12 @@ async fn terraform_allow_valid_token_connector_suite_passes() {
     let mut connector = TerraformConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["terraform.state"]);
-    let token = build_token(&signing_key, "terraform.state", &["terraform.state_list"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "terraform.state",
+        &["terraform.state_list"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "terraform.state_list",
         json!({ "working_dir": "/infra/test-ws" }),

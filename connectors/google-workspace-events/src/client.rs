@@ -22,6 +22,33 @@ pub const DEFAULT_EVENTS_BASE_URL: &str = "https://workspaceevents.googleapis.co
 /// Default Google Cloud Pub/Sub API base URL.
 pub const DEFAULT_PUBSUB_BASE_URL: &str = "https://pubsub.googleapis.com/v1";
 
+/// Validate a subscription resource name before interpolating it into a request
+/// path or method selector (`{base}/{name}`, `{base}/{name}:reactivate`, …).
+///
+/// Valid names are multi-segment resources (`subscriptions/{id}`,
+/// `projects/{p}/subscriptions/{s}`), so structural `/` is allowed, but a
+/// literal `?` or `#` would inject a query string / fragment against the
+/// allowlisted Google host (and collide with the `?validateOnly=true` the
+/// delete path appends), while `..` / encoded slashes would traverse to a
+/// sibling endpoint. Mirrors the resource-name guard used by google-chat.
+fn validate_resource_name<'a>(name: &'a str, field: &str) -> WorkspaceEventsResult<&'a str> {
+    let lower = name.to_ascii_lowercase();
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.contains("..")
+        || name.contains('?')
+        || name.contains('#')
+        || name.contains('\\')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(WorkspaceEventsError::InvalidInput {
+            message: format!("{field} contains invalid characters: {name:?}"),
+        });
+    }
+    Ok(name)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum MissingResourceKind {
     WorkspaceSubscription,
@@ -149,6 +176,7 @@ impl WorkspaceEventsClient {
         &self,
         subscription_name: &str,
     ) -> WorkspaceEventsResult<WorkspaceSubscription> {
+        let subscription_name = validate_resource_name(subscription_name, "subscription_name")?;
         let url = format!("{}/{}", self.events_base_url, subscription_name);
         self.get_json(&url, MissingResourceKind::WorkspaceSubscription)
             .await
@@ -207,6 +235,7 @@ impl WorkspaceEventsClient {
         subscription_name: &str,
         ttl: Option<&str>,
     ) -> WorkspaceEventsResult<LongRunningOperation> {
+        let subscription_name = validate_resource_name(subscription_name, "subscription_name")?;
         let url = format!("{}/{subscription_name}:reactivate", self.events_base_url);
         let body = if let Some(ttl) = ttl {
             serde_json::json!({ "ttl": ttl })
@@ -224,6 +253,7 @@ impl WorkspaceEventsClient {
         subscription_name: &str,
         validate_only: bool,
     ) -> WorkspaceEventsResult<LongRunningOperation> {
+        let subscription_name = validate_resource_name(subscription_name, "subscription_name")?;
         let url = if validate_only {
             format!(
                 "{}/{subscription_name}?validateOnly=true",
@@ -243,6 +273,8 @@ impl WorkspaceEventsClient {
         pubsub_subscription: &str,
         max_messages: u32,
     ) -> WorkspaceEventsResult<PullResponse> {
+        let pubsub_subscription =
+            validate_resource_name(pubsub_subscription, "pubsub_subscription")?;
         let url = format!("{}/{pubsub_subscription}:pull", self.pubsub_base_url);
         let body = serde_json::json!({
             "maxMessages": max_messages
@@ -258,6 +290,8 @@ impl WorkspaceEventsClient {
         pubsub_subscription: &str,
         ack_ids: &[String],
     ) -> WorkspaceEventsResult<serde_json::Value> {
+        let pubsub_subscription =
+            validate_resource_name(pubsub_subscription, "pubsub_subscription")?;
         let url = format!("{}/{pubsub_subscription}:acknowledge", self.pubsub_base_url);
         let body = serde_json::json!({
             "ackIds": ack_ids
@@ -407,6 +441,25 @@ fn map_api_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_resource_name_accepts_multi_segment_names() {
+        assert!(validate_resource_name("subscriptions/sub-1", "subscription_name").is_ok());
+        assert!(
+            validate_resource_name("projects/demo/subscriptions/x", "pubsub_subscription").is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_resource_name_rejects_injection() {
+        assert!(validate_resource_name("", "subscription_name").is_err());
+        assert!(validate_resource_name("/subscriptions/x", "subscription_name").is_err());
+        assert!(validate_resource_name("subscriptions/x?validateOnly=false", "n").is_err());
+        assert!(validate_resource_name("subscriptions/x#frag", "n").is_err());
+        assert!(validate_resource_name("subscriptions/../v1/other", "n").is_err());
+        assert!(validate_resource_name("subscriptions\\x", "n").is_err());
+        assert!(validate_resource_name("subscriptions/x%2f..", "n").is_err());
+    }
 
     #[test]
     fn auth_redacted_label_credential_ref() {

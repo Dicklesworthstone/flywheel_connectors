@@ -51,6 +51,23 @@ impl fmt::Debug for EvernoteAuth {
     }
 }
 
+/// Sanitize a path segment to prevent path traversal.
+fn sanitize_path_segment(segment: &str) -> EvernoteResult<&str> {
+    if segment.trim().is_empty()
+        || segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains("..")
+        || segment.contains('\0')
+        || segment.contains('?')
+        || segment.contains('#')
+    {
+        return Err(EvernoteError::InvalidInput(
+            "Invalid path segment: contains illegal characters".into(),
+        ));
+    }
+    Ok(segment)
+}
+
 /// `Evernote` API client.
 pub struct EvernoteClient {
     client: Client,
@@ -203,11 +220,13 @@ impl EvernoteClient {
 
     /// List notes in a notebook.
     pub async fn list_notes(&self, notebook_id: &str) -> EvernoteResult<serde_json::Value> {
+        let notebook_id = sanitize_path_segment(notebook_id)?;
         self.get(&format!("/notebooks/{notebook_id}/notes")).await
     }
 
     /// Get a single note.
     pub async fn get_note(&self, note_id: &str) -> EvernoteResult<serde_json::Value> {
+        let note_id = sanitize_path_segment(note_id)?;
         self.get(&format!("/notes/{note_id}")).await
     }
 
@@ -218,6 +237,7 @@ impl EvernoteClient {
 
     /// Delete a note.
     pub async fn delete_note(&self, note_id: &str) -> EvernoteResult<serde_json::Value> {
+        let note_id = sanitize_path_segment(note_id)?;
         self.delete(&format!("/notes/{note_id}")).await
     }
 }
@@ -232,6 +252,24 @@ mod tests {
         let dbg = format!("{auth:?}");
         assert!(!dbg.contains("secret-token"));
         assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn sanitize_path_segment_valid() {
+        assert!(sanitize_path_segment("abc123").is_ok());
+        assert!(sanitize_path_segment("note-guid-456").is_ok());
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal() {
+        assert!(sanitize_path_segment("../etc/passwd").is_err());
+        assert!(sanitize_path_segment("foo/bar").is_err());
+        assert!(sanitize_path_segment("foo\\bar").is_err());
+        assert!(sanitize_path_segment("").is_err());
+        assert!(sanitize_path_segment("   ").is_err());
+        assert!(sanitize_path_segment("foo\0bar").is_err());
+        assert!(sanitize_path_segment("foo?bar=1").is_err());
+        assert!(sanitize_path_segment("foo#frag").is_err());
     }
 
     #[test]

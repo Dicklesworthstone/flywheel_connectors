@@ -3770,16 +3770,31 @@ mod tests {
                 while !thread_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Accepted sockets inherit O_NONBLOCK from the
+                            // nonblocking listener on BSD/macOS; force
+                            // blocking mode so request reads don't spuriously
+                            // fail with WouldBlock and silently drop the
+                            // connection.
+                            let _ = stream.set_nonblocking(false);
                             handle_test_telegram_request(
                                 &mut stream,
                                 &thread_routes,
                                 &thread_requests,
+                                &thread_stop,
                             );
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(StdDuration::from_millis(5));
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            // Transient accept failures (EMFILE/ENFILE under
+                            // fd pressure, ECONNABORTED, EINTR) must not
+                            // permanently kill the server thread — a dead
+                            // listener turns every later request in the test
+                            // into a connection refusal. Back off briefly and
+                            // keep serving until the test drops the server.
+                            thread::sleep(StdDuration::from_millis(5));
+                        }
                     }
                 }
             });
@@ -3824,6 +3839,7 @@ mod tests {
         stream: &mut TcpStream,
         routes: &Arc<Mutex<VecDeque<TestTelegramRoute>>>,
         requests: &Arc<Mutex<Vec<TestTelegramRequest>>>,
+        stop: &Arc<AtomicBool>,
     ) {
         let Some((method, path, raw_body)) = read_loopback_http_request(stream) else {
             return;
@@ -3865,6 +3881,18 @@ mod tests {
                 }
             })
         } else if method == "POST" && path == token_path("getUpdates") {
+            // Emulate Telegram long-poll pacing. The connector polls with
+            // poll_interval 0 (correct against the real blocking API), so an
+            // instant empty response here turns every test's polling task into
+            // a hot connect/close loop that exhausts loopback connection
+            // resources and flakes unrelated `configure` getMe calls (rh594).
+            // Hold the empty response briefly, bailing out early on shutdown.
+            for _ in 0..10 {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(StdDuration::from_millis(5));
+            }
             serde_json::json!({ "ok": true, "result": [] })
         } else {
             serde_json::json!({
@@ -4006,7 +4034,12 @@ mod tests {
                                 behavior,
                             );
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            // Transient accept failures (EMFILE/EINTR) must
+                            // not permanently kill the server; back off and
+                            // keep serving until shutdown.
+                            thread::sleep(StdDuration::from_millis(5));
+                        }
                     }
                 }
             });
@@ -4180,7 +4213,11 @@ mod tests {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 512];
         loop {
-            let read = stream.read(&mut chunk).ok()?;
+            let read = match stream.read(&mut chunk) {
+                Ok(read) => read,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            };
             if read == 0 {
                 break;
             }

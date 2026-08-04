@@ -4,13 +4,20 @@ use std::time::Duration;
 
 use fcp_async_core::AsyncError;
 use fcp_prelude::FcpError;
+use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorErrorMapping;
 
 pub type DingTalkResult<T> = Result<T, DingTalkError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DingTalkError {
-    #[error("HTTP transport error: {0}")]
+    // The media-upload endpoint carries `access_token` in the request query
+    // string, and `reqwest::Error`'s `Display` appends the full request URL
+    // (query included, unredacted). Interpolating the reqwest error here (`{0}`)
+    // would leak the live access token into any surfaced/logged message, so
+    // Display carries no URL; the redaction-safe detail is built in
+    // `to_fcp_error`.
+    #[error("HTTP transport error")]
     Http(#[from] reqwest::Error),
 
     #[error("JSON parse error: {0}")]
@@ -68,13 +75,27 @@ impl DingTalkError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
-            Self::Http(error) => FcpError::External {
-                service: "dingtalk".into(),
-                message: error.to_string(),
-                status_code: error.status().map(|s| s.as_u16()),
-                retryable: self.is_retryable(),
-                retry_after: self.retry_after(),
-            },
+            Self::Http(error) => {
+                // `error.to_string()` would append the raw request URL, whose
+                // query string carries `access_token`. Surface a redaction-safe
+                // URL (query dropped) instead.
+                let message = error.url().map_or_else(
+                    || "HTTP transport error".to_string(),
+                    |url| {
+                        format!(
+                            "HTTP transport error for url ({})",
+                            redact_url(url.as_str())
+                        )
+                    },
+                );
+                FcpError::External {
+                    service: "dingtalk".into(),
+                    message,
+                    status_code: error.status().map(|s| s.as_u16()),
+                    retryable: self.is_retryable(),
+                    retry_after: self.retry_after(),
+                }
+            }
             Self::Json(error) => FcpError::Internal {
                 message: format!("JSON parse error: {error}"),
             },
@@ -255,5 +276,51 @@ mod tests {
             message: "gateway timeout".into(),
         };
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_transport_error_never_leaks_access_token() {
+        const SECRET: &str = "dingtalk-access-token-DEADBEEF-super-secret";
+        // Bind then immediately drop a loopback socket so the port refuses
+        // connections deterministically (no accept-loop thread, no flakiness).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener local addr").port();
+        drop(listener);
+
+        // `upload_media` sends POST /media/upload?access_token=<SECRET>&type=…;
+        // a connect failure yields a `reqwest::Error` carrying that URL. The
+        // access token in the query string must never survive into any surfaced
+        // message. The assertion is a negative, so it holds for any transport
+        // error variant the environment yields.
+        let url = format!("http://127.0.0.1:{port}/media/upload?access_token={SECRET}&type=image");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .expect("client should build");
+        let outcome = fcp_async_core::runtime::block_on_sync(async move {
+            client.post(&url).send().await.map_err(DingTalkError::from)
+        })
+        .expect("runtime should drive the future to completion");
+        let error = outcome.expect_err("connection to a closed loopback port must fail");
+        assert!(
+            matches!(error, DingTalkError::Http(_)),
+            "expected transport error, got {error:?}"
+        );
+
+        let display = error.to_string();
+        assert!(
+            !display.contains(SECRET) && !display.contains("access_token"),
+            "Display leaked the access_token query: {display}"
+        );
+
+        match error.to_fcp_error() {
+            FcpError::External { message, .. } => {
+                assert!(
+                    !message.contains(SECRET) && !message.contains("access_token"),
+                    "FcpError message leaked the access_token query: {message}"
+                );
+            }
+            other => panic!("expected External FcpError, got {other:?}"),
+        }
     }
 }

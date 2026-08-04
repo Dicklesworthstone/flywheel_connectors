@@ -423,7 +423,12 @@ async fn redis_default_deny_compliance_suite_passes() {
     let mut connector = RedisConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["redis.read"]);
-    let token = build_token(&signing_key, "redis.read", &["redis.get"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "redis.read",
+        &["redis.get"],
+        connector.instance_id.as_str(),
+    );
     // Token grants redis.read for redis.get, but we invoke redis.set
     // which requires redis.write -- should be denied.
     let invoke = invoke_request(
@@ -471,7 +476,12 @@ async fn redis_happy_path_connector_suite_passes() {
     let mut connector = RedisConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["redis.read"]);
-    let token = build_token(&signing_key, "redis.read", &["redis.get"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "redis.read",
+        &["redis.get"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request("redis.get", json!({ "key": "user:1234:name" }), token);
 
     let suite = ConnectorSuite {

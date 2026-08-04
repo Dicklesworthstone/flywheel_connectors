@@ -249,6 +249,7 @@ impl GoogleAiClient {
         model: &str,
         body: &serde_json::Value,
     ) -> GoogleAiResult<GenerateContentResponse> {
+        validate_model(model)?;
         let resource = normalize_generation_resource(model);
         let url = self.url(&format!("{resource}:generateContent"));
         let data = self.post_json(&url, body).await;
@@ -265,6 +266,7 @@ impl GoogleAiClient {
         model: &str,
         body: &serde_json::Value,
     ) -> GoogleAiResult<Vec<GenerateContentResponse>> {
+        validate_model(model)?;
         let resource = normalize_generation_resource(model);
         let url = self.url(&format!("{resource}:streamGenerateContent"));
         // The streaming endpoint returns an array of response chunks when
@@ -297,7 +299,9 @@ impl GoogleAiClient {
         model: &str,
         body: &serde_json::Value,
     ) -> GoogleAiResult<EmbedContentResponse> {
-        let url = self.url(&format!("models/{model}:embedContent"));
+        validate_model(model)?;
+        let resource = normalize_model_resource(model);
+        let url = self.url(&format!("{resource}:embedContent"));
         let data = self.post_json(&url, body).await;
         self.record_request(data.is_ok());
         let data = data?;
@@ -310,7 +314,9 @@ impl GoogleAiClient {
         model: &str,
         body: &serde_json::Value,
     ) -> GoogleAiResult<BatchEmbedContentsResponse> {
-        let url = self.url(&format!("models/{model}:batchEmbedContents"));
+        validate_model(model)?;
+        let resource = normalize_model_resource(model);
+        let url = self.url(&format!("{resource}:batchEmbedContents"));
         let data = self.post_json(&url, body).await;
         self.record_request(data.is_ok());
         let data = data?;
@@ -325,6 +331,7 @@ impl GoogleAiClient {
         model: &str,
         body: &serde_json::Value,
     ) -> GoogleAiResult<CountTokensResponse> {
+        validate_model(model)?;
         let resource = normalize_generation_resource(model);
         let url = self.url(&format!("{resource}:countTokens"));
         let data = self.post_json(&url, body).await;
@@ -357,6 +364,7 @@ impl GoogleAiClient {
 
     /// Get a specific model.
     pub async fn get_model(&self, model: &str) -> GoogleAiResult<ModelInfo> {
+        validate_model(model)?;
         let url = self.url(&normalize_model_resource(model));
         let data = self.get(&url).await;
         self.record_request(data.is_ok());
@@ -626,6 +634,46 @@ fn append_query_param(mut url: String, name: &str, value: &str) -> String {
     url
 }
 
+/// Validate a user-supplied model id before it is interpolated into a request URL.
+///
+/// Accepts a bare model id (`gemini-2.0-flash`) or one carrying a single
+/// recognized resource prefix (`models/…`, `tunedModels/…`). Rejects path
+/// traversal and any character that could alter the URL path, the `:method`
+/// selector, or the query string. `Url::parse` normalizes `..` segments, so
+/// without this guard a crafted `model` could reach a sibling endpoint under
+/// the same allowlisted host or smuggle query parameters.
+fn validate_model(model: &str) -> GoogleAiResult<()> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err(GoogleAiError::InvalidConfig(
+            "model must not be empty".into(),
+        ));
+    }
+    // Strip at most one recognized resource prefix; the remaining id must be a
+    // single path segment.
+    let segment = trimmed
+        .strip_prefix("models/")
+        .or_else(|| trimmed.strip_prefix("tunedModels/"))
+        .unwrap_or(trimmed);
+    let lower = segment.to_ascii_lowercase();
+    if segment.is_empty()
+        || segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains("..")
+        || segment.contains(':')
+        || segment.contains('?')
+        || segment.contains('#')
+        || segment.chars().any(|c| c.is_whitespace() || c.is_control())
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(GoogleAiError::InvalidConfig(
+            "model contains characters that are not allowed in a model id".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_generation_resource(model: &str) -> String {
     let trimmed = model.trim().trim_start_matches('/');
     if trimmed.starts_with("models/") || trimmed.starts_with("tunedModels/") {
@@ -664,6 +712,43 @@ fn is_google_api_version_segment(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_model_accepts_bare_and_prefixed_ids() {
+        assert!(validate_model("gemini-2.0-flash").is_ok());
+        assert!(validate_model("text-embedding-004").is_ok());
+        assert!(validate_model("gemini-1.5-pro").is_ok());
+        assert!(validate_model("models/gemini-2.0-flash").is_ok());
+        assert!(validate_model("tunedModels/my-tuned-model").is_ok());
+        assert!(validate_model("  gemini-2.0-flash  ").is_ok());
+    }
+
+    #[test]
+    fn validate_model_rejects_empty() {
+        assert!(validate_model("").is_err());
+        assert!(validate_model("   ").is_err());
+        assert!(validate_model("models/").is_err());
+    }
+
+    #[test]
+    fn validate_model_rejects_path_traversal() {
+        assert!(validate_model("../../v1beta/models").is_err());
+        assert!(validate_model("models/../tunedModels/x").is_err());
+        assert!(validate_model("a/b").is_err());
+        assert!(validate_model("a\\b").is_err());
+        assert!(validate_model("foo%2fbar").is_err());
+        assert!(validate_model("foo%5Cbar").is_err());
+    }
+
+    #[test]
+    fn validate_model_rejects_structure_breaking_chars() {
+        // A `:` would alter the `:method` selector; `?`/`#` would inject a
+        // query string or fragment.
+        assert!(validate_model("gemini:deleteModel").is_err());
+        assert!(validate_model("gemini?key=evil").is_err());
+        assert!(validate_model("gemini#frag").is_err());
+        assert!(validate_model("gemini flash").is_err());
+    }
 
     #[test]
     fn test_error_is_retryable() {

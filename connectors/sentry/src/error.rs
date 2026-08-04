@@ -58,6 +58,22 @@ impl SentryError {
         }
     }
 
+    /// Whether replaying the request that produced this error cannot duplicate
+    /// a side effect (br-kxd3e).
+    ///
+    /// Distinct from `is_retryable`: a rate-limited request was refused
+    /// WITHOUT being performed, so it stays safe to replay; a 5xx means the
+    /// service received it and may already have applied it.
+    #[must_use]
+    pub fn replay_is_safe(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::Api { status_code, .. } => *status_code == 429,
+            Self::Http(e) => !fcp_sdk::migration::transport_error_reached_service(e),
+            _ => false,
+        }
+    }
+
     /// Get the suggested retry delay.
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {

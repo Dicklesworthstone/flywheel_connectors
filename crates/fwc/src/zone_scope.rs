@@ -220,6 +220,8 @@ impl ZoneScopedTool {
 pub enum ViolationReason {
     /// Connector not authorized in this zone.
     ConnectorNotInZone,
+    /// Connector not allowed by the capability token.
+    ConnectorDenied,
     /// Operation explicitly denied.
     OperationDenied,
     /// Token expired.
@@ -234,6 +236,7 @@ impl fmt::Display for ViolationReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConnectorNotInZone => f.write_str("connector not authorized in zone"),
+            Self::ConnectorDenied => f.write_str("connector not allowed by capability token"),
             Self::OperationDenied => f.write_str("operation explicitly denied"),
             Self::TokenExpired => f.write_str("capability token expired"),
             Self::NoToken => f.write_str("no capability token provided"),
@@ -434,7 +437,7 @@ pub fn validate_tool_call(
         return Err(ZoneViolation::new(
             tool_name,
             zone.clone(),
-            ViolationReason::ConnectorNotInZone,
+            ViolationReason::ConnectorDenied,
         ));
     }
 
@@ -1681,6 +1684,13 @@ mod tests {
         let token = sample_token(zone_work()).with_connector("github"); // Only github allowed
         let result = validate_tool_call(&reg, "slack.send_message", &zone_work(), Some(&token));
         assert!(result.is_err());
+        assert_eq!(result.unwrap_err().reason, ViolationReason::ConnectorDenied);
+    }
+
+    #[test]
+    fn connector_denied_serializes_snake_case() {
+        let json = serde_json::to_value(ViolationReason::ConnectorDenied).unwrap();
+        assert_eq!(json, "connector_denied");
     }
 
     #[test]
@@ -2096,13 +2106,11 @@ mod tests {
     fn validate_connector_restricted_by_token() {
         let reg = sample_registry();
         let token = sample_token(zone_work()).with_connector("slack");
-        // Only slack allowed, github should fail
+        // Only slack allowed, github should fail with the token-denial reason
+        // (not ConnectorNotInZone — the connector IS in the zone).
         let result = validate_tool_call(&reg, "github.create_issue", &zone_work(), Some(&token));
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().reason,
-            ViolationReason::ConnectorNotInZone
-        );
+        assert_eq!(result.unwrap_err().reason, ViolationReason::ConnectorDenied);
     }
 
     // ── filter_tools_for_zone additional ─────────────────────────

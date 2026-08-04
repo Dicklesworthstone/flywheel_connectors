@@ -198,6 +198,7 @@
 
 use std::time::Duration;
 
+use fcp_async_core::http::HttpClientError;
 use fcp_async_core::{AsyncError, ExecutionContext};
 #[cfg(feature = "connector-http")]
 use fcp_manifest::{
@@ -488,7 +489,28 @@ pub const fn is_http_status_retryable(status: u16) -> bool {
 pub enum AttemptOutcome<T, E> {
     /// Operation succeeded.
     Success(T),
-    /// Operation failed but may be retried.
+    /// Operation failed and is SAFE TO REPLAY.
+    ///
+    /// "Retryable" is a claim about **side effects**, not just about whether
+    /// the error looks transient. Returning this asserts one of:
+    /// - the request provably never reached the service (a connect error), or
+    /// - the operation is idempotent, or
+    /// - the request carries an idempotency key the provider honours.
+    ///
+    /// It is NOT enough that the status code is in the 5xx family or that the
+    /// transport reported a timeout. A 5xx means the service *received* the
+    /// request, and `reqwest::Error::is_timeout()` covers the total-request
+    /// timeout, which fires after the body was fully sent — so for a
+    /// non-idempotent operation either one may mean the work already
+    /// happened. Replaying it then performs the side effect again.
+    ///
+    /// The host's receipt/idempotency-key deduplication does NOT cover this:
+    /// it deduplicates repeated *invokes*, while this retry happens inside the
+    /// connector process, below that boundary. The host sees one invoke and
+    /// writes one receipt while the provider saw N requests.
+    ///
+    /// Use [`AttemptOutcome::retryable_if_replayable`] when the safety of a
+    /// replay depends on whether the request was transmitted.
     Retryable {
         /// The error from this attempt.
         error: E,
@@ -497,6 +519,92 @@ pub enum AttemptOutcome<T, E> {
     },
     /// Operation failed terminally (no retry).
     Terminal(E),
+}
+
+impl<T, E> AttemptOutcome<T, E> {
+    /// Classify a transient failure for an operation whose replay safety
+    /// depends on whether the request was actually transmitted.
+    ///
+    /// `replayable` must be `true` only when replaying the request cannot
+    /// duplicate a side effect — because the request never left the client,
+    /// because the operation is idempotent, or because it carries an
+    /// idempotency key. When it is `false` the failure is reported as
+    /// [`AttemptOutcome::Terminal`]: giving the caller one honest error beats
+    /// silently performing the side effect up to `max_retries` more times.
+    ///
+    /// See [`transport_error_reached_service`] for classifying a
+    /// `reqwest::Error` on that axis, or
+    /// [`http_client_error_reached_service`] for the asupersync
+    /// `HttpClientError`.
+    pub const fn retryable_if_replayable(
+        error: E,
+        retry_after: Option<Duration>,
+        replayable: bool,
+    ) -> Self {
+        if replayable {
+            Self::Retryable { error, retry_after }
+        } else {
+            Self::Terminal(error)
+        }
+    }
+}
+
+/// Whether a `reqwest` transport error leaves it POSSIBLE that the service
+/// received and acted on the request.
+///
+/// Only a connect-phase failure proves the request never left the client. A
+/// timeout, a body/decode error, or a response-phase failure can all occur
+/// after the request was fully written, so for a non-idempotent operation they
+/// must be treated as "may already have executed".
+///
+/// Conservative by construction: an unrecognised error class returns `true`
+/// (assume it reached the service) so a new upstream variant fails closed.
+#[cfg(feature = "connector-http")]
+#[must_use]
+pub fn transport_error_reached_service(error: &reqwest::Error) -> bool {
+    !(error.is_connect() || error.is_builder())
+}
+
+/// Whether an asupersync [`HttpClientError`] leaves it POSSIBLE that the
+/// service received and acted on the request.
+///
+/// The asupersync counterpart of [`transport_error_reached_service`], for
+/// connectors built on `fcp_async_core::http` rather than `reqwest`. Unlike the
+/// `reqwest` helper this needs no feature gate: `fcp-async-core` is an
+/// unconditional dependency of this crate.
+///
+/// Returns `false` only for the variants that are raised while the connection
+/// is still being established, which proves no request bytes were written:
+/// URL parsing, DNS, TCP connect, the TLS handshake, proxy negotiation
+/// (SOCKS5 and HTTP `CONNECT`), and pool exhaustion.
+///
+/// Everything else returns `true`. In particular:
+/// - `Io` may be a mid-body write failure *or* a response-read failure that
+///   happens after the body was fully sent. The two are the same variant, so
+///   the ambiguous case decides it.
+/// - `HttpError` and `TooManyRedirects` are response-phase: the service
+///   answered, so it necessarily received the request.
+/// - `Cancelled` can be observed at any point, including after transmission.
+///
+/// Conservative by construction: the classification is an allowlist of
+/// pre-transmission variants, so an error class added upstream returns `true`
+/// (assume it reached the service) and fails closed without a compile break.
+/// Asupersync after 0.3.4 adds `DeadlineExceeded` — the total-request
+/// deadline, which fires after the request may have been fully transmitted —
+/// and this helper already classifies it correctly.
+#[must_use]
+pub const fn http_client_error_reached_service(error: &HttpClientError) -> bool {
+    !matches!(
+        error,
+        HttpClientError::InvalidUrl(_)
+            | HttpClientError::DnsError(_)
+            | HttpClientError::ConnectError(_)
+            | HttpClientError::TlsError(_)
+            | HttpClientError::ConnectTunnelRefused { .. }
+            | HttpClientError::InvalidConnectInput(_)
+            | HttpClientError::ProxyError(_)
+            | HttpClientError::PoolExhausted { .. }
+    )
 }
 
 /// Generic retry executor using `ExecutionContext` for deadline-aware backoff.
@@ -510,6 +618,13 @@ pub enum AttemptOutcome<T, E> {
 /// let ctx = runtime.request_context();
 /// let policy = RetryPolicy::new().with_max_attempts(Some(3));
 ///
+/// // `replayable` is the whole safety question: a POST that creates a
+/// // resource must NOT be replayed once the request has left the client,
+/// // because a 5xx or a timeout can both be reported after the service
+/// // already did the work. Set it to `true` unconditionally only for an
+/// // operation that is idempotent or that carries an idempotency key.
+/// let create_is_replayable = false;
+///
 /// let result = RetryLoop::execute(&ctx, &policy, |attempt| async move {
 ///     match client.post(url).send().await {
 ///         Ok(resp) if resp.status().is_success() => AttemptOutcome::Success(resp),
@@ -517,12 +632,22 @@ pub enum AttemptOutcome<T, E> {
 ///             error: MyError::RateLimited,
 ///             retry_after: Some(Duration::from_secs(30)),
 ///         },
+///         // A 5xx means the service RECEIVED the request.
+///         Ok(resp) if resp.status().is_server_error() => {
+///             AttemptOutcome::retryable_if_replayable(
+///                 MyError::Api(resp.status()),
+///                 None,
+///                 create_is_replayable,
+///             )
+///         }
 ///         Ok(resp) => AttemptOutcome::Terminal(MyError::Api(resp.status())),
-///         Err(e) if e.is_timeout() => AttemptOutcome::Retryable {
-///             error: MyError::Http(e),
-///             retry_after: None,
-///         },
-///         Err(e) => AttemptOutcome::Terminal(MyError::Http(e)),
+///         // Only a connect-phase failure proves the request never left the
+///         // client; `is_timeout()` covers the TOTAL request timeout, which
+///         // fires after the body was fully sent.
+///         Err(e) => {
+///             let replayable = create_is_replayable || !transport_error_reached_service(&e);
+///             AttemptOutcome::retryable_if_replayable(MyError::Http(e), None, replayable)
+///         }
 ///     }
 /// }).await;
 /// ```
@@ -601,17 +726,23 @@ impl RetryLoop {
                         return Err(error);
                     };
 
+                    // `redacted_summary()`, never `%error`: a connector error
+                    // that forwards a `reqwest::Error` renders the full URL,
+                    // and providers that authenticate via `?key=…` would leak
+                    // the credential into this line on every retry.
                     warn!(
                         attempt,
                         delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                        error = %error,
+                        error = %error.redacted_summary(),
                         "retrying after transient error"
                     );
 
                     // Sleep under context (respects deadline + cancellation)
                     if let Err(async_err) = ctx.sleep(delay).await {
-                        // Context expired or cancelled during sleep
-                        return Err(E::from_async_error(async_err));
+                        return match async_err {
+                            AsyncError::Timeout { .. } => Err(error),
+                            other => Err(E::from_async_error(other)),
+                        };
                     }
 
                     let Some(next_attempt) = attempt.checked_add(1) else {
@@ -692,6 +823,83 @@ pub fn classify_http_status(status: u16, retry_after: Option<Duration>) -> Retry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Replay safety (br-kxd3e) ─────────────────────────────────
+
+    /// `Retryable` is a claim about SIDE EFFECTS, not about how transient the
+    /// error looks. When a replay could duplicate one, the honest outcome is a
+    /// single terminal error rather than up to `max_retries` more executions.
+    #[test]
+    fn retryable_if_replayable_downgrades_an_unsafe_replay_to_terminal() {
+        let unsafe_replay: AttemptOutcome<(), &str> =
+            AttemptOutcome::retryable_if_replayable("boom", Some(Duration::from_secs(1)), false);
+        assert!(
+            matches!(unsafe_replay, AttemptOutcome::Terminal("boom")),
+            "a non-replayable failure must not be retried"
+        );
+
+        let safe_replay: AttemptOutcome<(), &str> =
+            AttemptOutcome::retryable_if_replayable("boom", Some(Duration::from_secs(1)), true);
+        assert!(matches!(
+            safe_replay,
+            AttemptOutcome::Retryable {
+                error: "boom",
+                retry_after: Some(_)
+            }
+        ));
+    }
+
+    /// Only the connection-establishment failures prove no request bytes were
+    /// written. These are the variants a non-idempotent operation may replay.
+    #[test]
+    fn http_client_error_pre_transmission_variants_did_not_reach_the_service() {
+        let pre_transmission = [
+            HttpClientError::InvalidUrl("not a url".to_string()),
+            HttpClientError::DnsError(std::io::Error::other("nxdomain")),
+            HttpClientError::ConnectError(std::io::Error::other("refused")),
+            HttpClientError::TlsError("handshake failed".to_string()),
+            HttpClientError::ConnectTunnelRefused {
+                status: 403,
+                reason: "Forbidden".to_string(),
+            },
+            HttpClientError::InvalidConnectInput("bad authority".to_string()),
+            HttpClientError::ProxyError("SOCKS5 auth rejected".to_string()),
+            HttpClientError::PoolExhausted {
+                host: "api.example.com".to_string(),
+                port: 443,
+            },
+        ];
+
+        for error in &pre_transmission {
+            assert!(
+                !http_client_error_reached_service(error),
+                "{error:?} is raised while connecting, so no request bytes were written"
+            );
+        }
+    }
+
+    /// Everything else may be observed after the body was fully sent, so a
+    /// non-idempotent operation must treat it as "may already have executed".
+    #[test]
+    fn http_client_error_post_transmission_variants_may_have_reached_the_service() {
+        let may_have_reached = [
+            // A mid-body write failure and a response-read failure are the
+            // same variant; only the latter proves transmission, so both must
+            // fail closed.
+            HttpClientError::Io(std::io::Error::other("connection reset")),
+            // Redirects imply the service answered at least once.
+            HttpClientError::TooManyRedirects { count: 11, max: 10 },
+            // Cancellation can land at any point, including post-send.
+            HttpClientError::Cancelled,
+        ];
+
+        for error in &may_have_reached {
+            assert!(
+                http_client_error_reached_service(error),
+                "{error:?} can occur after transmission and must fail closed"
+            );
+        }
+    }
 
     #[cfg(feature = "connector-http")]
     fn br_b0qqv_host_egress_context(
@@ -993,6 +1201,31 @@ mod tests {
             assert!(result.is_err());
         })
         .expect("runtime should execute max-attempts retry test");
+    }
+
+    #[test]
+    fn retry_loop_preserves_retryable_error_when_deadline_expires_during_backoff() {
+        fcp_async_core::runtime::block_on_sync(async {
+            let ctx = ExecutionContext::request_scoped(Duration::from_millis(5));
+            let policy = RetryPolicy::new()
+                .with_max_attempts(Some(3))
+                .with_jitter_enabled(false);
+
+            let result: Result<&str, TestError> =
+                RetryLoop::execute(&ctx, &policy, |_attempt| async {
+                    AttemptOutcome::Retryable {
+                        error: TestError::Transient("service overloaded".into()),
+                        retry_after: Some(Duration::from_millis(50)),
+                    }
+                })
+                .await;
+
+            match result.unwrap_err() {
+                TestError::Transient(message) => assert_eq!(message, "service overloaded"),
+                other => panic!("expected original retryable error, got {other:?}"),
+            }
+        })
+        .expect("runtime should preserve retryable error on backoff deadline expiry");
     }
 
     #[test]
@@ -1660,18 +1893,6 @@ mod tests {
         .expect("runtime should execute success-on-last test");
     }
 
-    // asupersync-uwp88: 0.3.2 reactor floors timer wakes at ~250ms AND a
-    // `timeout` under a deadline budget blocks ~the full budget. This test needs
-    // 5 successive retries whose backoff runs `ctx.sleep`, i.e.
-    // `timeout(remaining_10s_budget, sleep(delay))`; under the defect the first
-    // backoff blocks the entire 10s budget and the loop returns `Timeout` before
-    // reaching attempt 5, so it never observes the success. The pathology scales
-    // with the request budget, not the delay, so retiming cannot recover the
-    // intent (unlimited-attempt loop eventually succeeds). Ignored until
-    // asupersync 0.3.3 lands. Note: `retry_loop_unlimited_attempts_stop_at_u32_max`
-    // still covers the unlimited-attempt ceiling via a deadline-free background
-    // context with 0ms backoff.
-    #[ignore = "asupersync-uwp88: 0.3.2 reactor floors timer wakes at 250ms"]
     #[test]
     fn retry_loop_unlimited_attempts_succeeds() {
         fcp_async_core::runtime::block_on_sync(async {

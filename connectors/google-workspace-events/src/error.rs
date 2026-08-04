@@ -41,6 +41,11 @@ pub enum WorkspaceEventsError {
     /// Event payload could not be decoded.
     #[error("Invalid Pub/Sub event payload: {message}")]
     InvalidEventPayload { message: String },
+
+    /// Caller-supplied input rejected before any request was sent
+    /// (e.g. a subscription resource name carrying injection characters).
+    #[error("Invalid input: {message}")]
+    InvalidInput { message: String },
 }
 
 impl WorkspaceEventsError {
@@ -114,6 +119,10 @@ impl WorkspaceEventsError {
             Self::InvalidEventPayload { message } => FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid event payload: {message}"),
+            },
+            Self::InvalidInput { message } => FcpError::InvalidRequest {
+                code: 1004,
+                message: message.clone(),
             },
         }
     }

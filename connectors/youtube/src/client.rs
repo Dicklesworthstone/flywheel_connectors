@@ -523,7 +523,7 @@ impl YouTubeClient {
         });
 
         let response = self
-            .execute_with_retry("POST", &url, Some(&body), GoogleResponseMode::Json)
+            .execute_with_retry("POST", &url, Some(&body), GoogleResponseMode::Json, false)
             .await?;
 
         // Parse the video resource from the response.
@@ -592,14 +592,14 @@ impl YouTubeClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> YouTubeResult<T> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Json)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
 
     async fn get_text(&self, url: &str) -> YouTubeResult<String> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Binary)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Binary, true)
             .await?;
         match response.body {
             GoogleResponseBody::Binary(bytes) => {
@@ -619,17 +619,24 @@ impl YouTubeClient {
         body: &serde_json::Value,
     ) -> YouTubeResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json)
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
             .await?;
         decode_json_response(response)
     }
 
+    /// Execute with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). It is a parameter rather than a function of
+    /// `http_method` because Google models several state changes — and some
+    /// pure reads — as POSTs, so the verb alone decides nothing.
     async fn execute_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
+        replay_safe: bool,
     ) -> YouTubeResult<GoogleExecuteResponse> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -643,10 +650,14 @@ impl YouTubeClient {
                 .await
             {
                 Ok(response) => AttemptOutcome::Success(response),
-                Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                    retry_after: e.retry_after(),
-                    error: e,
-                },
+                Err(e) if e.is_retryable() => {
+                    // A rate limit was refused WITHOUT performing the work, so
+                    // it stays retryable; a 5xx means Google received the
+                    // request and may already have done it.
+                    let replayable = replay_safe || e.replay_is_safe();
+                    let retry_after = e.retry_after();
+                    AttemptOutcome::retryable_if_replayable(e, retry_after, replayable)
+                }
                 Err(e) => AttemptOutcome::Terminal(e),
             }
         })
@@ -661,7 +672,9 @@ impl YouTubeClient {
         response_mode: GoogleResponseMode,
     ) -> YouTubeResult<GoogleExecuteResponse> {
         let parsed_url = Url::parse(raw_url).map_err(|error| YouTubeError::Api {
-            message: format!("invalid request url `{raw_url}`: {error}"),
+            // `raw_url` carries `&key=<API_KEY>`; every other diagnostic path
+            // redacts it, so this parse-failure branch must too.
+            message: format!("invalid request url `{}`: {error}", redact_key(raw_url)),
             status_code: None,
         })?;
 

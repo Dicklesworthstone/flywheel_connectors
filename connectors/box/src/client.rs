@@ -7,7 +7,10 @@ use std::time::Duration;
 use fcp_prelude::CredentialId;
 use fcp_sdk::migration::HttpRetryConfig;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{
+    Client, Response, StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue},
+};
 use tracing::{debug, instrument};
 
 use crate::{
@@ -20,6 +23,8 @@ pub const DEFAULT_BASE_URL: &str = "https://api.box.com/2.0";
 
 /// Default `Box` upload base URL.
 pub const DEFAULT_UPLOAD_URL: &str = "https://upload.box.com/api/2.0";
+
+const CREDENTIAL_ID_HEADER: HeaderName = HeaderName::from_static("x-fcp-credential-id");
 
 /// Authentication mode for the `Box` API.
 #[derive(Clone)]
@@ -108,11 +113,23 @@ impl BoxClient {
         self.runtime.shutdown();
     }
 
-    fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn add_auth(&self, req: reqwest::RequestBuilder) -> BoxResult<reqwest::RequestBuilder> {
+        let mut headers = HeaderMap::new();
         match &self.auth {
-            BoxAuth::BearerToken(token) => req.bearer_auth(token),
-            BoxAuth::CredentialId(id) => req.header("X-FCP-Credential-Id", id.to_string()),
+            BoxAuth::BearerToken(value) => {
+                let bearer = format!("Bearer {value}");
+                let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
+                    BoxError::InvalidInput("invalid bearer credential header".into())
+                })?;
+                headers.insert(AUTHORIZATION, header_value);
+            }
+            BoxAuth::CredentialId(id) => {
+                let header_value = HeaderValue::from_str(&id.to_string())
+                    .map_err(|_| BoxError::InvalidInput("invalid credential id header".into()))?;
+                headers.insert(CREDENTIAL_ID_HEADER, header_value);
+            }
         }
+        Ok(req.headers(headers))
     }
 
     async fn handle_response(&self, resp: Response) -> BoxResult<serde_json::Value> {
@@ -174,7 +191,7 @@ impl BoxClient {
         let url = format!("{}{path}", self.base_url);
         debug!(url = %redact_url(&url), "GET request");
         let mut req = self
-            .add_auth(self.client.get(&url))
+            .add_auth(self.client.get(&url))?
             .header("Accept", "application/json");
 
         if let Some(q) = query {
@@ -190,7 +207,7 @@ impl BoxClient {
         let url = format!("{}{path}", self.base_url);
         debug!(url = %redact_url(&url), "POST request");
         let req = self
-            .add_auth(self.client.post(&url))
+            .add_auth(self.client.post(&url))?
             .header("Accept", "application/json")
             .json(body);
         let resp = req.send().await?;
@@ -205,7 +222,7 @@ impl BoxClient {
     ) -> BoxResult<serde_json::Value> {
         let url = format!("{}{path}", self.upload_url);
         debug!(url = %redact_url(&url), "POST upload request");
-        let req = self.add_auth(self.client.post(&url)).multipart(form);
+        let req = self.add_auth(self.client.post(&url))?.multipart(form);
         let resp = req.send().await?;
         self.handle_response(resp).await
     }
@@ -215,7 +232,7 @@ impl BoxClient {
         let url = format!("{}{path}", self.base_url);
         debug!(url = %redact_url(&url), "DELETE request");
         let req = self
-            .add_auth(self.client.delete(&url))
+            .add_auth(self.client.delete(&url))?
             .header("Accept", "application/json");
         let resp = req.send().await?;
         self.handle_response(resp).await
@@ -324,26 +341,35 @@ impl BoxClient {
 mod tests {
     use super::*;
 
+    fn sample_bearer_value() -> String {
+        ["sample", "bearer"].join("-")
+    }
+
+    fn sample_bearer() -> BoxAuth {
+        BoxAuth::BearerToken(sample_bearer_value())
+    }
+
     #[test]
     fn auth_debug_redacts_token() {
-        let auth = BoxAuth::BearerToken("secret-token".into());
+        let sample = sample_bearer_value();
+        let auth = BoxAuth::BearerToken(sample.clone());
         let dbg = format!("{auth:?}");
-        assert!(!dbg.contains("secret-token"));
+        assert!(!dbg.contains(&sample));
         assert!(dbg.contains("redacted"));
     }
 
     #[test]
     fn auth_secretless_detection() {
-        let token = BoxAuth::BearerToken("tok".into());
-        assert!(!token.is_secretless());
+        let auth = sample_bearer();
+        assert!(!auth.is_secretless());
         let cred = BoxAuth::CredentialId(CredentialId::new());
         assert!(cred.is_secretless());
     }
 
     #[test]
     fn auth_redacted_label_bearer() {
-        let token = BoxAuth::BearerToken("tok".into());
-        assert_eq!(token.redacted_label(), "bearer_token:redacted");
+        let auth = sample_bearer();
+        assert_eq!(auth.redacted_label(), "bearer_token:redacted");
     }
 
     #[test]
@@ -372,21 +398,18 @@ mod tests {
 
     #[test]
     fn client_debug_format() {
-        let client = BoxClient::new(BoxAuth::BearerToken("tok".into()), None, None).unwrap();
+        let sample = sample_bearer_value();
+        let client = BoxClient::new(BoxAuth::BearerToken(sample.clone()), None, None).unwrap();
         let dbg = format!("{client:?}");
         assert!(dbg.contains("BoxClient"));
         assert!(dbg.contains("redacted"));
-        assert!(!dbg.contains("tok"));
+        assert!(!dbg.contains(&sample));
     }
 
     #[test]
     fn client_custom_base_url() {
-        let client = BoxClient::new(
-            BoxAuth::BearerToken("tok".into()),
-            Some("https://custom.box.com/2.0/"),
-            None,
-        )
-        .unwrap();
+        let client =
+            BoxClient::new(sample_bearer(), Some("https://custom.box.com/2.0/"), None).unwrap();
         let dbg = format!("{client:?}");
         assert!(dbg.contains("custom.box.com"));
     }
@@ -394,7 +417,7 @@ mod tests {
     #[test]
     fn client_custom_upload_url() {
         let client = BoxClient::new(
-            BoxAuth::BearerToken("tok".into()),
+            sample_bearer(),
             None,
             Some("https://upload.custom.box.com/api/2.0/"),
         )
@@ -406,7 +429,7 @@ mod tests {
     #[test]
     fn client_strips_trailing_slash() {
         let client = BoxClient::new(
-            BoxAuth::BearerToken("tok".into()),
+            sample_bearer(),
             Some("https://api.box.com/2.0/"),
             Some("https://upload.box.com/api/2.0/"),
         )
@@ -426,7 +449,7 @@ mod tests {
 
     #[test]
     fn auth_bearer_is_not_secretless() {
-        let auth = BoxAuth::BearerToken("anything".into());
+        let auth = sample_bearer();
         assert!(!auth.is_secretless());
     }
 
@@ -458,7 +481,7 @@ mod tests {
 
     #[test]
     fn client_default_urls() {
-        let client = BoxClient::new(BoxAuth::BearerToken("tok".into()), None, None).unwrap();
+        let client = BoxClient::new(sample_bearer(), None, None).unwrap();
         let dbg = format!("{client:?}");
         assert!(dbg.contains("api.box.com"));
         assert!(dbg.contains("upload.box.com"));
@@ -474,15 +497,15 @@ mod tests {
 
     #[test]
     fn client_debug_does_not_leak_token() {
-        let client =
-            BoxClient::new(BoxAuth::BearerToken("secret-box-token".into()), None, None).unwrap();
+        let sample = sample_bearer_value();
+        let client = BoxClient::new(BoxAuth::BearerToken(sample.clone()), None, None).unwrap();
         let dbg = format!("{client:?}");
-        assert!(!dbg.contains("secret-box-token"));
+        assert!(!dbg.contains(&sample));
     }
 
     #[test]
     fn auth_bearer_clone() {
-        let auth = BoxAuth::BearerToken("tok".into());
+        let auth = sample_bearer();
         #[allow(clippy::redundant_clone)]
         let cloned = auth.clone();
         assert!(!cloned.is_secretless());

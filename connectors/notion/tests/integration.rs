@@ -1458,3 +1458,112 @@ async fn search_redacts_created_by_last_edited_by_property_types() {
         "Dave"
     );
 }
+
+// ============================================================================
+// Replay safety on retry (br-kxd3e)
+// ============================================================================
+//
+// Notion is the connector where BOTH directions of the "verb decides nothing"
+// trap appear in one client:
+//
+//   - `/search` and `/databases/{id}/query` are POSTs that only READ, so
+//     refusing their retries would be a pure availability loss.
+//   - `PATCH /blocks/{id}/children` APPENDS, so it is a PATCH that is NOT
+//     idempotent — replaying it adds the blocks a second time.
+//
+// The three tests below pin one case each.
+
+fn retrying_client(mock_server: &MockServer) -> NotionClient {
+    NotionClient::new("test-token")
+        .unwrap()
+        .with_api_url(&format!("{}/v1", mock_server.uri()))
+        .with_retry_config(3)
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_page_is_not_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/pages"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let result = retrying_client(&mock_server)
+        .create_page(json!({ "parent": { "page_id": "p" } }))
+        .await;
+    assert!(result.is_err());
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Notion received the create — retrying makes a SECOND page"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn append_blocks_is_not_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/blocks/block-1/children"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&mock_server)
+        .await;
+
+    let result = retrying_client(&mock_server)
+        .append_blocks("block-1", json!([{ "type": "paragraph" }]))
+        .await;
+    assert!(result.is_err());
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "this PATCH APPENDS rather than setting state, so it is not idempotent \
+         despite the verb — a retry adds the blocks twice"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn search_is_still_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/search"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "results": [],
+            "has_more": false,
+            "next_cursor": null
+        })))
+        .mount(&mock_server)
+        .await;
+
+    retrying_client(&mock_server)
+        .search(Some("q"), None)
+        .await
+        .expect("search only reads, so the retry must be preserved");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "Notion models search as a POST but it only reads — refusing this \
+         retry would cost availability for no safety gain"
+    );
+}

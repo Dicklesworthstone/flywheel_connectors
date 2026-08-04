@@ -1,6 +1,7 @@
 //! FCP `Intercom` Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, OperationSection};
@@ -689,8 +690,13 @@ fn typed_operations_info() -> Vec<OperationInfo> {
 }
 
 fn operations_info() -> serde_json::Value {
-    serde_json::to_value(typed_operations_info())
-        .expect("manifest-derived Intercom operations should serialize")
+    static OPERATIONS: OnceLock<serde_json::Value> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            serde_json::to_value(typed_operations_info())
+                .expect("manifest-derived Intercom operations should serialize")
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {

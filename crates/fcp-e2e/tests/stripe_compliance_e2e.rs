@@ -319,7 +319,12 @@ async fn stripe_default_deny_compliance_suite_passes() {
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["stripe.payment"]);
     // Token grants "stripe.payment" but invoke targets "stripe.get_customer" -> denial
-    let token = build_token(&signing_key, "stripe.payment", &["stripe.payment"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "stripe.payment",
+        &["stripe.payment"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "stripe.get_customer",
         json!({ "customer_id": "cus_abc123" }),
@@ -374,7 +379,12 @@ async fn stripe_allow_valid_token_connector_suite_passes() {
     let mut connector = StripeConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["stripe.read"]);
-    let token = build_token(&signing_key, "stripe.read", &["stripe.get_customer"], connector.connector.instance_id());
+    let token = build_token(
+        &signing_key,
+        "stripe.read",
+        &["stripe.get_customer"],
+        connector.connector.instance_id(),
+    );
     let invoke = invoke_request(
         "stripe.get_customer",
         json!({ "customer_id": "cus_e2e_test_123" }),

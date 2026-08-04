@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use fcp_sdk::ConnectorErrorMapping;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
@@ -93,6 +95,29 @@ impl TelegramClient {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
+        // Telegram's Bot API has no idempotency key, so a replayed `sendMessage`
+        // posts a second message to the chat. The HTTP verb is NOT a usable
+        // proxy here: `getUpdates` is a POST but a long-poll read, and several
+        // `set*` endpoints are POSTs that are idempotent by content. So this is
+        // an explicit allowlist of the endpoints whose replay cannot duplicate
+        // anything.
+        //
+        // FAILS CLOSED on purpose: an endpoint added later and not listed here
+        // is treated as creating something, which costs a retry rather than
+        // risking a duplicate message. See br-kxd3e.
+        let replay_safe = matches!(
+            endpoint,
+            // Reads.
+            "getMe" | "getUpdates" | "getWebhookInfo"
+            // Idempotent by content — repeating them re-asserts the same state.
+            | "setWebhook" | "deleteWebhook" | "setMessageReaction"
+            // Ephemeral and self-expiring; repeating is invisible.
+            | "sendChatAction"
+            // Answering the same callback query twice is refused by Telegram,
+            // not duplicated.
+            | "answerCallbackQuery"
+        );
+
         RetryLoop::execute(&ctx, &policy, |_attempt| {
             let url = &url;
             let ctx = ctx.clone();
@@ -151,13 +176,16 @@ impl TelegramClient {
                                 }
 
                                 if status.is_server_error() {
-                                    return AttemptOutcome::Retryable {
-                                        error: TelegramError::Api {
+                                    // A 5xx means Telegram RECEIVED the request;
+                                    // the message may already have been posted.
+                                    return AttemptOutcome::retryable_if_replayable(
+                                        TelegramError::Api {
                                             code: i32::from(status.as_u16()),
                                             description: format!("Server error: {status}"),
                                         },
-                                        retry_after: None,
-                                    };
+                                        None,
+                                        replay_safe,
+                                    );
                                 }
 
                                 // Parse the Telegram response wrapper
@@ -196,11 +224,18 @@ impl TelegramClient {
                                     AttemptOutcome::Terminal(err)
                                 }
                             }
+                            // `is_timeout()` covers the TOTAL request timeout,
+                            // which fires after the body was fully sent — only
+                            // a connect-phase failure proves the request never
+                            // left the client.
                             Err(e) if e.is_timeout() || e.is_connect() => {
-                                AttemptOutcome::Retryable {
-                                    retry_after: None,
-                                    error: TelegramError::Http(e),
-                                }
+                                let replayable =
+                                    replay_safe || !transport_error_reached_service(&e);
+                                AttemptOutcome::retryable_if_replayable(
+                                    TelegramError::Http(e),
+                                    None,
+                                    replayable,
+                                )
                             }
                             Err(e) => AttemptOutcome::Terminal(TelegramError::Http(e)),
                         }

@@ -16,7 +16,10 @@ use fcp_prelude::{
     FcpError, HandshakeRequest, IdempotencyClass, InvokeRequest, InvokeStatus, OperationId,
     RequestId, RiskLevel, SafetyTier, SubscribeRequest, ZoneId,
 };
+use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig, migration::HttpRetryConfig};
 use fcp_square::SquareConnector;
+use fcp_square::client::SquareClient;
+use fcp_square::types::{CreateOrderRequest, OrderInput};
 use fcp_testkit::readiness_helpers::{
     assert_doctor_response_valid, assert_self_check_not_ready, assert_self_check_ready,
 };
@@ -514,4 +517,96 @@ async fn webhook_ingress_is_explicitly_rejected_for_square_rest_slice() {
         }))
         .unwrap()
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Retry replay-safety (br-kxd3e)
+// ─────────────────────────────────────────────────────────────────────
+
+fn retry_client(base_url: &str, max_retries: u32) -> (ConnectorRuntime, SquareClient) {
+    let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+    let client = SquareClient::new(
+        base_url,
+        "sq-test-token",
+        HttpRetryConfig {
+            max_retries,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+    )
+    .expect("square client");
+    (runtime, client)
+}
+
+fn order_request(idempotency_key: Option<&str>) -> CreateOrderRequest {
+    CreateOrderRequest {
+        order: OrderInput {
+            location_id: "L1".into(),
+            line_items: Vec::new(),
+        },
+        idempotency_key: idempotency_key.map(str::to_string),
+    }
+}
+
+/// A 5xx on `POST /orders` is NOT retried when the body carries no
+/// `idempotency_key`.
+///
+/// A 5xx means Square received the request; without a key it has nothing to
+/// deduplicate on, so a replay creates a second order. `expect(1)` is the
+/// assertion — the mock panics on drop if a second request arrives.
+#[fcp_async_core::runtime::test]
+async fn create_order_without_idempotency_key_is_not_retried_on_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/orders"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (runtime, client) = retry_client(&mock_server.uri(), 3);
+    client
+        .create_order(&runtime, &order_request(None))
+        .await
+        .expect_err("a 503 must surface rather than silently create a second order");
+}
+
+/// The SAME 5xx IS retried once the body carries an `idempotency_key` — Square
+/// can then deduplicate, so the replay is safe. This is what keeps the fix from
+/// being a blanket loss of resilience.
+#[fcp_async_core::runtime::test]
+async fn create_order_with_idempotency_key_is_retried_on_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/orders"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let (runtime, client) = retry_client(&mock_server.uri(), 1);
+    client
+        .create_order(&runtime, &order_request(Some("caller-key-1")))
+        .await
+        .expect_err("still fails after exhausting retries");
+}
+
+/// `POST /orders/search` is a query, and must keep retrying despite having no
+/// idempotency key — a read path must not lose resilience to this fix.
+#[fcp_async_core::runtime::test]
+async fn order_search_is_still_retried_on_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/orders/search"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let (runtime, client) = retry_client(&mock_server.uri(), 1);
+    client
+        .list_orders(&runtime, &["L1".to_string()], None)
+        .await
+        .expect_err("still fails after exhausting retries");
 }

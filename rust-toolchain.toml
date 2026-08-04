@@ -1,3 +1,8 @@
 [toolchain]
-channel = "nightly"
+# Pinned to the dated nightly matching the workspace's current bare-nightly
+# build (rustc 1.98.0-nightly 61d7280f3 2026-06-06) so clippy/rustfmt behavior
+# does not drift underneath agents and CI (flywheel_connectors-61py7). Bump
+# deliberately: verify clippy --workspace -D warnings and cargo fmt --check
+# stay green, and confirm rch workers can install the new pin, before landing.
+channel = "nightly-2026-06-07"
 components = ["rustfmt", "clippy"]

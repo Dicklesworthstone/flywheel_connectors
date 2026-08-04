@@ -424,7 +424,12 @@ async fn mongodb_default_deny_compliance_suite_passes() {
     let mut connector = MongoDbConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["mongodb.read"]);
-    let token = build_token(&signing_key, "mongodb.read", &["mongodb.find"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "mongodb.read",
+        &["mongodb.find"],
+        connector.instance_id.as_str(),
+    );
     // Token grants mongodb.read for mongodb.find, but we invoke mongodb.insert_one
     // which requires mongodb.write -- should be denied.
     let invoke = invoke_request(
@@ -476,7 +481,12 @@ async fn mongodb_happy_path_connector_suite_passes() {
     let mut connector = MongoDbConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["mongodb.read"]);
-    let token = build_token(&signing_key, "mongodb.read", &["mongodb.find"], connector.instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        "mongodb.read",
+        &["mongodb.find"],
+        connector.instance_id.as_str(),
+    );
     let invoke = invoke_request(
         "mongodb.find",
         json!({ "database": "testdb", "collection": "users" }),

@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::{Client, Response, StatusCode};
@@ -106,6 +108,34 @@ fn validate_numeric_id<'a>(id: &'a str, field: &str) -> TwitterResult<&'a str> {
         )));
     }
     Ok(trimmed)
+}
+
+/// Validate a Twitter username before interpolating it into a request path.
+///
+/// Usernames are interpolated into `/2/users/by/username/{username}` with no
+/// path encoding; `reqwest` normalizes `..` while building the request, so an
+/// unvalidated username could traverse to a sibling endpoint under the
+/// allowlisted host or inject extra path segments. Twitter handles are
+/// `[A-Za-z0-9_]` (an optional leading `@` is accepted and stripped), so that
+/// charset both matches the real API contract and rejects every injection
+/// vector. Returns the bare handle (without `@`).
+fn validate_username<'a>(username: &'a str, field: &str) -> TwitterResult<&'a str> {
+    let trimmed = username.trim();
+    let handle = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    if handle.is_empty() {
+        return Err(TwitterError::InvalidInput(format!(
+            "{field} must not be empty"
+        )));
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(TwitterError::InvalidInput(format!(
+            "{field} must be a Twitter username (letters, digits, underscore), got: {handle}"
+        )));
+    }
+    Ok(handle)
 }
 
 /// Twitter REST API client.
@@ -244,7 +274,8 @@ impl TwitterApiClient {
     /// Make an authenticated GET request using OAuth 1.0a.
     #[instrument(skip(self))]
     pub async fn get<T: DeserializeOwned>(&self, endpoint: &str) -> TwitterResult<T> {
-        self.request_oauth("GET", endpoint, None::<&()>, &[]).await
+        self.request_oauth("GET", endpoint, None::<&()>, &[], true)
+            .await
     }
 
     /// Make an authenticated GET request with query parameters.
@@ -254,24 +285,47 @@ impl TwitterApiClient {
         endpoint: &str,
         params: &[(String, String)],
     ) -> TwitterResult<T> {
-        self.request_oauth("GET", endpoint, None::<&()>, params)
+        self.request_oauth("GET", endpoint, None::<&()>, params, true)
             .await
     }
 
     /// Make an authenticated POST request using OAuth 1.0a.
+    ///
+    /// br-kxd3e: treated as NOT replay-safe. X has no idempotency key, and a
+    /// 5xx or a timeout can both be reported after the tweet or DM was already
+    /// created, so replaying posts it twice. This is the fail-closed default —
+    /// a POST added later gets it without its author having to know. The
+    /// endpoints that merely set an already-set flag use
+    /// [`Self::post_replay_safe`].
     #[instrument(skip(self, body))]
     pub async fn post<T: DeserializeOwned, B: serde::Serialize>(
         &self,
         endpoint: &str,
         body: &B,
     ) -> TwitterResult<T> {
-        self.request_oauth("POST", endpoint, Some(body), &[]).await
+        self.request_oauth("POST", endpoint, Some(body), &[], false)
+            .await
+    }
+
+    /// Make an authenticated POST whose replay cannot duplicate a side effect.
+    ///
+    /// For endpoints that are idempotent in effect — retweeting or liking a
+    /// post that is already retweeted or liked leaves exactly one of each.
+    #[instrument(skip(self, body))]
+    pub async fn post_replay_safe<T: DeserializeOwned, B: serde::Serialize>(
+        &self,
+        endpoint: &str,
+        body: &B,
+    ) -> TwitterResult<T> {
+        self.request_oauth("POST", endpoint, Some(body), &[], true)
+            .await
     }
 
     /// Make an authenticated DELETE request using OAuth 1.0a.
     #[instrument(skip(self))]
     pub async fn delete<T: DeserializeOwned>(&self, endpoint: &str) -> TwitterResult<T> {
-        self.request_oauth("DELETE", endpoint, None::<&()>, &[])
+        // DELETE is idempotent per HTTP semantics.
+        self.request_oauth("DELETE", endpoint, None::<&()>, &[], true)
             .await
     }
 
@@ -280,14 +334,16 @@ impl TwitterApiClient {
     pub async fn get_app_only<T: DeserializeOwned>(&self, endpoint: &str) -> TwitterResult<T> {
         // In secretless mode, egress proxy injects auth — use OAuth path without signing
         if self.oauth_signer.is_none() {
-            return self.request_oauth("GET", endpoint, None::<&()>, &[]).await;
+            return self
+                .request_oauth("GET", endpoint, None::<&()>, &[], true)
+                .await;
         }
 
         let bearer = self.bearer_token.as_ref().ok_or_else(|| {
             TwitterError::Config("Bearer token required for app-only auth".into())
         })?;
 
-        self.request_bearer("GET", endpoint, None::<&()>, bearer)
+        self.request_bearer("GET", endpoint, None::<&()>, bearer, true)
             .await
     }
 
@@ -297,6 +353,7 @@ impl TwitterApiClient {
         endpoint: &str,
         body: Option<&B>,
         params: &[(String, String)],
+        replay_safe: bool,
     ) -> TwitterResult<T> {
         let url = format!("{}{}", self.base_url, endpoint);
 
@@ -366,29 +423,44 @@ impl TwitterApiClient {
                         // retry_after at a higher level rather than burning
                         // through the request deadline with repeated 429s.
                         Err(e @ TwitterError::RateLimited { .. }) => AttemptOutcome::Terminal(e),
-                        Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: e.retry_after(),
-                            error: e,
-                        },
+                        // br-kxd3e: the remaining retryable class is 5xx, which
+                        // means X received the request and may have acted on it.
+                        Err(e) if e.is_retryable() => {
+                            let retry_after = e.retry_after();
+                            AttemptOutcome::retryable_if_replayable(e, retry_after, replay_safe)
+                        }
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        retry_after: None,
-                        error: TwitterError::Http(e),
-                    },
-                    Err(e) => AttemptOutcome::Terminal(TwitterError::Http(e)),
+                    // br-kxd3e: `is_timeout()` is the TOTAL request timeout,
+                    // which fires after the body was fully written — it is not
+                    // proof the request never arrived. Only a connect-phase
+                    // failure is.
+                    Err(e) => {
+                        let replayable = replay_safe || !transport_error_reached_service(&e);
+                        AttemptOutcome::retryable_if_replayable(
+                            TwitterError::Http(e),
+                            None,
+                            replayable,
+                        )
+                    }
                 }
             }
         })
         .await
     }
 
+    /// Bearer-auth variant of [`Self::request_oauth`].
+    ///
+    /// `replay_safe` carries the same meaning: whether repeating this request
+    /// can duplicate a side effect (br-kxd3e). Every caller must state it, so a
+    /// non-idempotent bearer POST added later cannot inherit the retry loop.
     async fn request_bearer<T: DeserializeOwned, B: serde::Serialize>(
         &self,
         method: &str,
         endpoint: &str,
         body: Option<&B>,
         bearer: &str,
+        replay_safe: bool,
     ) -> TwitterResult<T> {
         let url = format!("{}{}", self.base_url, endpoint);
         let bearer_header = format!("Bearer {bearer}");
@@ -425,17 +497,23 @@ impl TwitterApiClient {
                     Ok(response) => match self.handle_response(response).await {
                         Ok(data) => AttemptOutcome::Success(data),
                         Err(e @ TwitterError::RateLimited { .. }) => AttemptOutcome::Terminal(e),
-                        Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: e.retry_after(),
-                            error: e,
-                        },
+                        Err(e) if e.is_retryable() => {
+                            let retry_after = e.retry_after();
+                            AttemptOutcome::retryable_if_replayable(e, retry_after, replay_safe)
+                        }
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        retry_after: None,
-                        error: TwitterError::Http(e),
-                    },
-                    Err(e) => AttemptOutcome::Terminal(TwitterError::Http(e)),
+                    // Same br-kxd3e correction as request_oauth: `is_timeout()`
+                    // is the total request timeout and is not proof the request
+                    // never arrived.
+                    Err(e) => {
+                        let replayable = replay_safe || !transport_error_reached_service(&e);
+                        AttemptOutcome::retryable_if_replayable(
+                            TwitterError::Http(e),
+                            None,
+                            replayable,
+                        )
+                    }
                 }
             }
         })
@@ -535,6 +613,7 @@ impl TwitterApiClient {
         &self,
         username: &str,
     ) -> TwitterResult<TwitterResponse<User>> {
+        let username = validate_username(username, "username")?;
         let params = vec![(
             "user.fields".to_string(),
             "id,name,username,description,profile_image_url,verified,created_at,public_metrics"
@@ -751,7 +830,9 @@ impl TwitterApiClient {
         let body = RetweetBody {
             tweet_id: tweet_id.to_string(),
         };
-        self.post(&format!("/2/users/{user_id}/retweets"), &body)
+        // Set membership: retweeting an already-retweeted post leaves one
+        // retweet, so replaying cannot duplicate a side effect.
+        self.post_replay_safe(&format!("/2/users/{user_id}/retweets"), &body)
             .await
     }
 
@@ -778,7 +859,9 @@ impl TwitterApiClient {
         let body = LikeBody {
             tweet_id: tweet_id.to_string(),
         };
-        self.post(&format!("/2/users/{user_id}/likes"), &body).await
+        // Set membership, same as retweet.
+        self.post_replay_safe(&format!("/2/users/{user_id}/likes"), &body)
+            .await
     }
 
     /// Remove a like.
@@ -867,7 +950,13 @@ impl TwitterApiClient {
         // In secretless mode, egress proxy injects auth
         if self.oauth_signer.is_none() {
             return self
-                .request_oauth("GET", "/2/tweets/search/stream/rules", None::<&()>, &[])
+                .request_oauth(
+                    "GET",
+                    "/2/tweets/search/stream/rules",
+                    None::<&()>,
+                    &[],
+                    true,
+                )
                 .await;
         }
 
@@ -876,8 +965,14 @@ impl TwitterApiClient {
             .as_ref()
             .ok_or_else(|| TwitterError::Config("Bearer token required for stream rules".into()))?;
 
-        self.request_bearer("GET", "/2/tweets/search/stream/rules", None::<&()>, bearer)
-            .await
+        self.request_bearer(
+            "GET",
+            "/2/tweets/search/stream/rules",
+            None::<&()>,
+            bearer,
+            true,
+        )
+        .await
     }
 
     /// Add stream rules.
@@ -895,7 +990,13 @@ impl TwitterApiClient {
         // In secretless mode, egress proxy injects auth
         if self.oauth_signer.is_none() {
             return self
-                .request_oauth("POST", "/2/tweets/search/stream/rules", Some(&body), &[])
+                .request_oauth(
+                    "POST",
+                    "/2/tweets/search/stream/rules",
+                    Some(&body),
+                    &[],
+                    true,
+                )
                 .await;
         }
 
@@ -904,8 +1005,14 @@ impl TwitterApiClient {
             .as_ref()
             .ok_or_else(|| TwitterError::Config("Bearer token required for stream rules".into()))?;
 
-        self.request_bearer("POST", "/2/tweets/search/stream/rules", Some(&body), bearer)
-            .await
+        self.request_bearer(
+            "POST",
+            "/2/tweets/search/stream/rules",
+            Some(&body),
+            bearer,
+            true,
+        )
+        .await
     }
 
     /// Delete stream rules by ID.
@@ -930,7 +1037,13 @@ impl TwitterApiClient {
         // In secretless mode, egress proxy injects auth
         if self.oauth_signer.is_none() {
             return self
-                .request_oauth("POST", "/2/tweets/search/stream/rules", Some(&body), &[])
+                .request_oauth(
+                    "POST",
+                    "/2/tweets/search/stream/rules",
+                    Some(&body),
+                    &[],
+                    true,
+                )
                 .await;
         }
 
@@ -939,8 +1052,14 @@ impl TwitterApiClient {
             .as_ref()
             .ok_or_else(|| TwitterError::Config("Bearer token required for stream rules".into()))?;
 
-        self.request_bearer("POST", "/2/tweets/search/stream/rules", Some(&body), bearer)
-            .await
+        self.request_bearer(
+            "POST",
+            "/2/tweets/search/stream/rules",
+            Some(&body),
+            bearer,
+            true,
+        )
+        .await
     }
 }
 
@@ -1039,6 +1158,48 @@ mod tests {
 
         let err = client.get_user("../admin").await.unwrap_err();
         assert!(matches!(err, TwitterError::InvalidInput(_)));
+    }
+
+    // ── validate_username tests ────────────────────────────────────
+
+    #[test]
+    fn validate_username_accepts_handles() {
+        assert_eq!(validate_username("jack", "username").unwrap(), "jack");
+        assert_eq!(
+            validate_username("Test_User_99", "username").unwrap(),
+            "Test_User_99"
+        );
+        assert_eq!(
+            validate_username("  spaced  ", "username").unwrap(),
+            "spaced"
+        );
+    }
+
+    #[test]
+    fn validate_username_strips_leading_at() {
+        assert_eq!(validate_username("@jack", "username").unwrap(), "jack");
+        assert_eq!(validate_username("  @jack ", "username").unwrap(), "jack");
+    }
+
+    #[test]
+    fn validate_username_rejects_empty() {
+        assert!(matches!(
+            validate_username("", "username").unwrap_err(),
+            TwitterError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            validate_username("@", "username").unwrap_err(),
+            TwitterError::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn validate_username_rejects_path_and_query_injection() {
+        assert!(validate_username("foo/../../admin", "username").is_err());
+        assert!(validate_username("foo/bar", "username").is_err());
+        assert!(validate_username("foo?x=1", "username").is_err());
+        assert!(validate_username("foo bar", "username").is_err());
+        assert!(validate_username("foo%2Fbar", "username").is_err());
     }
 
     #[fcp_async_core::runtime::test]

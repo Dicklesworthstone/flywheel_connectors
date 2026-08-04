@@ -626,7 +626,7 @@ async fn webhook_receiver_happy_path_connector_suite_passes() {
                 &signing_key,
                 "webhook.endpoints.read",
                 &["webhook.endpoints.list"],
-        connector.instance_id.as_str(),
+                connector.instance_id.as_str(),
             ),
         ))
         .await

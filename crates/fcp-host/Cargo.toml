@@ -1,6 +1,6 @@
 [package]
 name = "fcp-host"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "FCP Host - Node Gateway/Orchestrator for the Flywheel Connector Protocol"
 license = "Apache-2.0"
@@ -71,7 +71,7 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 rustls-pemfile = "2.2.0"
 rustls-platform-verifier = "0.6.2"
 tower = { version = "0.5.3", features = ["util"] }
-fcp-sandbox = { version = "0.1.0", path = "../fcp-sandbox" }
+fcp-sandbox = { version = "0.2.0", path = "../fcp-sandbox" }
 url.workspace = true
 x509-parser = "0.18.1"
 

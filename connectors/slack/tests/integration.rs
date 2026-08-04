@@ -688,9 +688,12 @@ async fn accept_test_websocket(mut stream: TcpStream) -> TestServerWebSocket {
 }
 
 async fn send_json_frame(ws: &mut TestServerWebSocket, value: serde_json::Value, context: &str) {
-    ws.send(&fcp_async_core::compatibility_cx(), ServerWsMessage::text(value.to_string()))
-        .await
-        .expect(context);
+    ws.send(
+        &fcp_async_core::compatibility_cx(),
+        ServerWsMessage::text(value.to_string()),
+    )
+    .await
+    .expect(context);
 }
 
 async fn recv_text_frame(
@@ -706,7 +709,9 @@ async fn recv_text_frame(
 }
 
 async fn close_test_websocket(ws: &mut TestServerWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 // ============================================================================
@@ -2486,6 +2491,97 @@ async fn error_not_authed_maps_to_unauthorized() {
     assert!(
         matches!(fcp_err, fcp_core::FcpError::Unauthorized { .. }),
         "Expected Unauthorized, got: {fcp_err:?}"
+    );
+}
+
+// ── Replay safety on transport failure (br-kxd3e) ────────────────────
+//
+// A response that never arrives before the per-request timeout is the exact
+// failure the bead is about: the body was fully written, so Slack may already
+// have done the work, but the client only sees "timed out". Retrying that on a
+// mutating method is what produced duplicate messages.
+//
+// These two tests are a matched pair — the same induced failure, the same
+// retry budget, different Slack methods. Asserting only that the call errors
+// would pass with the bug present, so what is pinned is the REQUEST COUNT.
+
+/// Timeout comfortably shorter than the mocked response delay.
+const REPLAY_TEST_REQUEST_TIMEOUT: StdDuration = StdDuration::from_millis(150);
+/// Long enough that the client always gives up first.
+const REPLAY_TEST_RESPONSE_DELAY: StdDuration = StdDuration::from_secs(3);
+
+#[fcp_async_core::runtime::test]
+async fn post_message_is_not_replayed_after_a_timeout() {
+    let _ctx = AsyncTestContext::for_scenario("slack.replay_safety.post_message");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(REPLAY_TEST_RESPONSE_DELAY)
+                .set_body_json(json!({ "ok": true })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = SlackClient::new("valid-token")
+        .unwrap()
+        .with_base_url(mock_server.uri())
+        .with_request_timeout(REPLAY_TEST_REQUEST_TIMEOUT)
+        // One retry available — the point is that it is not taken.
+        .with_retry_config(1, 10, 50);
+
+    let result = client.post_message("C01234567", "hello", None).await;
+    assert!(result.is_err(), "the request should time out");
+
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    assert_eq!(
+        received.len(),
+        1,
+        "chat.postMessage must NOT be replayed after a timeout: Slack may have \
+         already posted the message, so a retry duplicates it in the channel"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn update_message_is_still_replayed_after_a_timeout() {
+    let _ctx = AsyncTestContext::for_scenario("slack.replay_safety.update_message");
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat.update"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(REPLAY_TEST_RESPONSE_DELAY)
+                .set_body_json(json!({ "ok": true })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = SlackClient::new("valid-token")
+        .unwrap()
+        .with_base_url(mock_server.uri())
+        .with_request_timeout(REPLAY_TEST_REQUEST_TIMEOUT)
+        .with_retry_config(1, 10, 50);
+
+    let result = client
+        .update_message("C01234567", "1234567890.123456", "edited", None)
+        .await;
+    assert!(result.is_err(), "the request should time out");
+
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    assert_eq!(
+        received.len(),
+        2,
+        "chat.update names the exact target state, so replaying it converges \
+         on the same message — the retry must be preserved"
     );
 }
 

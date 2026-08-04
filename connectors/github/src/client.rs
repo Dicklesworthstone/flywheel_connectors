@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
@@ -394,21 +396,30 @@ impl GitHubClient {
                             Ok(b) => b,
                             Err(e) => return AttemptOutcome::Terminal(GitHubError::Http(e)),
                         };
+                        // `workflow_dispatch` CREATES a workflow run and takes
+                        // no idempotency key. A 5xx means GitHub received the
+                        // request — an edge 502 returned after the origin
+                        // already accepted the dispatch would, on replay,
+                        // produce a second run from one invoke.
                         let err = parse_error_response(status, &bytes, retry_after_secs);
                         if err.is_retryable() {
-                            AttemptOutcome::Retryable {
-                                retry_after: err.retry_after(),
-                                error: err,
-                            }
+                            let retry_after = err.retry_after();
+                            AttemptOutcome::retryable_if_replayable(err, retry_after, false)
                         } else {
                             AttemptOutcome::Terminal(err)
                         }
                     }
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        error: GitHubError::Http(e),
-                        retry_after: None,
-                    },
-                    Err(e) => AttemptOutcome::Terminal(GitHubError::Http(e)),
+                    // Only a connect-phase failure proves the dispatch never
+                    // left the client; a timeout can fire after the body was
+                    // fully sent.
+                    Err(e) => {
+                        let replayable = !transport_error_reached_service(&e);
+                        AttemptOutcome::retryable_if_replayable(
+                            GitHubError::Http(e),
+                            None,
+                            replayable,
+                        )
+                    }
                 }
             }
         })
@@ -514,19 +525,28 @@ impl GitHubClient {
                     .send()
                     .await
                 {
+                    // POST is not idempotent and GitHub's REST API takes no
+                    // idempotency key, so a failure that the service may
+                    // already have acted on must NOT be replayed — a 5xx means
+                    // the request was received, and a total-request timeout
+                    // fires after the body was sent. Retrying either one can
+                    // create the resource N times from one invoke.
                     Ok(response) => match self.handle_response(response).await {
                         Ok(data) => AttemptOutcome::Success(data),
-                        Err(e) if e.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: e.retry_after(),
-                            error: e,
-                        },
+                        Err(e) if e.is_retryable() => {
+                            let retry_after = e.retry_after();
+                            AttemptOutcome::retryable_if_replayable(e, retry_after, false)
+                        }
                         Err(e) => AttemptOutcome::Terminal(e),
                     },
-                    Err(e) if e.is_timeout() || e.is_connect() => AttemptOutcome::Retryable {
-                        error: GitHubError::Http(e),
-                        retry_after: None,
-                    },
-                    Err(e) => AttemptOutcome::Terminal(GitHubError::Http(e)),
+                    Err(e) => {
+                        let replayable = !transport_error_reached_service(&e);
+                        AttemptOutcome::retryable_if_replayable(
+                            GitHubError::Http(e),
+                            None,
+                            replayable,
+                        )
+                    }
                 }
             }
         })

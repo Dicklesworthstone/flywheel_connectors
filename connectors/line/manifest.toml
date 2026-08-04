@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:c6b5845751767bdc612f1900ceb6297e4be0b559784ba524646412ccdcc58b18"
+interface_hash = "blake3-256:fcp.interface.v2:fcd3a138d8ac30cb9635167954af73eef1268bdbf5b36a3b2d9cc3e6972b00e8"
 
 [connector]
 id = "fcp.line"
@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "One-channel LINE Messaging API connector for outbound messages, profile or group lookups, rich-menu metadata management, and health verification"
 archetypes = ["operational"]
 format = "native"
+status = "proven"
 
 [connector.state]
 model = "stateless"
@@ -24,8 +25,8 @@ migration_hint = "One channel access token plus retry and timeout settings are i
 # - One connector instance is bound to one LINE Messaging API channel.
 # - Authentication is one injected bearer channel access token.
 # - Webhook receipt, signature verification, token issuance, and token rotation are out of scope.
-# - `base_url` may point at localhost or 127.0.0.1 for test harnesses; production traffic is
-#   expected to target `https://api.line.me`.
+# - Production traffic targets `https://api.line.me`; localhost mock servers are verifier
+#   harness-only and are denied by the graduated operation network policy.
 
 [zones]
 home = "z:private"
@@ -34,7 +35,12 @@ allowed_targets = ["z:private"]
 
 [capabilities]
 required = ["network.dns", "network.egress", "network.tls.sni"]
-optional = []
+optional = [
+    "line.messages.write",
+    "line.profile.read",
+    "line.menu.read",
+    "line.menu.write",
+]
 forbidden = ["system.exec", "system.privileged", "network.listen"]
 
 [provides.operations."line.messages.push"]
@@ -83,16 +89,16 @@ examples = []
 related = ["line.messages.reply", "line.messages.multicast"]
 
 [provides.operations."line.messages.push".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -146,16 +152,16 @@ examples = []
 related = ["line.messages.push"]
 
 [provides.operations."line.messages.reply".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -212,16 +218,16 @@ examples = []
 related = ["line.messages.push"]
 
 [provides.operations."line.messages.multicast".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -267,16 +273,16 @@ examples = []
 related = ["line.group.profile", "line.health"]
 
 [provides.operations."line.profile.get".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -319,16 +325,16 @@ examples = []
 related = ["line.group.members"]
 
 [provides.operations."line.group.profile".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -378,16 +384,16 @@ examples = []
 related = ["line.group.profile"]
 
 [provides.operations."line.group.members".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -419,16 +425,16 @@ examples = []
 related = ["line.rich_menu.create", "line.rich_menu.delete"]
 
 [provides.operations."line.rich_menu.list".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -489,16 +495,16 @@ examples = []
 related = ["line.rich_menu.list", "line.rich_menu.delete"]
 
 [provides.operations."line.rich_menu.create".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -538,16 +544,16 @@ examples = []
 related = ["line.rich_menu.list", "line.rich_menu.create"]
 
 [provides.operations."line.rich_menu.delete".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
@@ -581,16 +587,16 @@ examples = []
 related = ["line.profile.get"]
 
 [provides.operations."line.health".network_constraints]
-host_allow = ["api.line.me", "localhost", "127.0.0.1"]
-port_allow = [443, 80]
+host_allow = ["api.line.me"]
+port_allow = [443]
 ip_allow = []
 cidr_deny = []
 require_sni = true
 spki_pins = []
-deny_localhost = false
-deny_private_ranges = false
+deny_localhost = true
+deny_private_ranges = true
 deny_tailnet_ranges = true
-deny_ip_literals = false
+deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0

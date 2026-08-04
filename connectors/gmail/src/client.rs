@@ -243,7 +243,9 @@ impl GmailClient {
             "addLabelIds": add_labels,
             "removeLabelIds": remove_labels,
         });
-        self.post_json(&url, &body).await
+        // Replay-safe: the body names the labels to add and remove, so
+        // applying it twice converges on the same label set.
+        self.post_json_replay_safe(&url, &body).await
     }
 
     /// Trash a message.
@@ -251,7 +253,9 @@ impl GmailClient {
     pub async fn trash_message(&self, message_id: &str) -> GmailResult<GmailMessage> {
         let message_id = sanitize_path_segment(message_id, "message_id")?;
         let url = format!("{}/users/me/messages/{message_id}/trash", self.base_url);
-        self.post_json(&url, &serde_json::json!({})).await
+        // Replay-safe: trashing an already-trashed message is a no-op.
+        self.post_json_replay_safe(&url, &serde_json::json!({}))
+            .await
     }
 
     // ── Thread operations ────────────────────────────────────────
@@ -304,7 +308,7 @@ impl GmailClient {
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> GmailResult<T> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Json)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
@@ -331,23 +335,54 @@ impl GmailClient {
         self.get(&url).await
     }
 
+    /// POST with retry.
+    ///
+    /// br-kxd3e: fail-closed. Gmail has no idempotency key, and a replay of
+    /// `messages/send` or `drafts/send` puts a SECOND email in someone's
+    /// inbox — the harm is external and irreversible. A POST added later gets
+    /// this default without its author having to know. The Gmail POSTs that
+    /// merely set state use [`Self::post_json_replay_safe`].
     async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> GmailResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json)
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
             .await?;
         decode_json_response(response)
     }
 
+    /// POST whose replay cannot duplicate a side effect.
+    ///
+    /// Gmail models several state changes as POSTs (`modify`, `trash`). Those
+    /// name a target state rather than appending, so applying them twice
+    /// converges and refusing their retries would cost availability for
+    /// nothing.
+    async fn post_json_replay_safe<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> GmailResult<T> {
+        let response = self
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, true)
+            .await?;
+        decode_json_response(response)
+    }
+
+    /// Execute with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). It is a parameter rather than a function of
+    /// `http_method` because Google models several state changes and even some
+    /// reads as POSTs, so the verb alone decides nothing.
     async fn execute_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
+        replay_safe: bool,
     ) -> GmailResult<GoogleExecuteResponse> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
@@ -362,10 +397,14 @@ impl GmailClient {
                 .await
             {
                 Ok(response) => AttemptOutcome::Success(response),
-                Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                    retry_after: error.retry_after(),
-                    error,
-                },
+                Err(error) if error.is_retryable() => {
+                    // A rate limit was refused WITHOUT sending anything, so it
+                    // stays retryable; a 5xx or a timeout means Gmail received
+                    // the request and may already have sent the mail.
+                    let replayable = replay_safe || error.replay_is_safe();
+                    let retry_after = error.retry_after();
+                    AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                }
                 Err(error) => AttemptOutcome::Terminal(error),
             }
         })

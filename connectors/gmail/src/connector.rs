@@ -1978,10 +1978,26 @@ fn op_info(
     }
 }
 
+/// Reject a header field value that would break out of its RFC 2822 header
+/// line. A `\r`, `\n`, or NUL in `to`/`subject` lets a caller inject extra
+/// headers (e.g. a hidden `Bcc:`) or a forged message body, so such values
+/// are refused before the message is assembled.
+fn validate_header_field(field: &str, value: &str) -> FcpResult<()> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: format!("Field `{field}` must not contain CR, LF, or NUL characters"),
+        });
+    }
+    Ok(())
+}
+
 fn build_raw_message_from_fields(input: &serde_json::Value) -> FcpResult<String> {
     let to = require_str(input, "to")?;
     let subject = require_str(input, "subject")?;
     let body = require_str(input, "body")?;
+    validate_header_field("to", to)?;
+    validate_header_field("subject", subject)?;
     let normalized_body = body
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -2824,6 +2840,44 @@ mod tests {
         assert!(message.contains("To: recipient@example.com"));
         assert!(message.contains("Subject: Test Subject"));
         assert!(message.ends_with("\r\n\r\nHello,\r\nworld!"));
+    }
+
+    #[test]
+    fn build_raw_message_rejects_header_injection_via_to() {
+        let err = build_raw_message_from_fields(&json!({
+            "to": "victim@example.com\r\nBcc: attacker@evil.com",
+            "subject": "Hi",
+            "body": "ok"
+        }))
+        .unwrap_err();
+        assert!(matches!(err, FcpError::InvalidRequest { code: 1003, .. }));
+    }
+
+    #[test]
+    fn build_raw_message_rejects_header_injection_via_subject() {
+        let err = build_raw_message_from_fields(&json!({
+            "to": "victim@example.com",
+            "subject": "Hi\nInjected: header",
+            "body": "ok"
+        }))
+        .unwrap_err();
+        assert!(matches!(err, FcpError::InvalidRequest { code: 1003, .. }));
+    }
+
+    #[test]
+    fn build_raw_message_allows_multiline_body() {
+        // CRLF in the body is legitimate and must still be accepted.
+        let raw = build_raw_message_from_fields(&json!({
+            "to": "recipient@example.com",
+            "subject": "Test Subject",
+            "body": "line1\r\nline2\nline3"
+        }))
+        .unwrap();
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .unwrap();
+        let message = String::from_utf8(decoded).unwrap();
+        assert!(message.ends_with("\r\n\r\nline1\r\nline2\r\nline3"));
     }
 
     // ── determine_effective_start_history_id ────────────────────────

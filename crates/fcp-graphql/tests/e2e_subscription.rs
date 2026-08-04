@@ -119,20 +119,28 @@ fn expect_text(message: Message, context: &str) -> String {
 }
 
 async fn recv_text(ws: &mut TestServerWebSocket, context: &str) -> String {
-    let maybe_message = ws.recv(&fcp_async_core::compatibility_cx()).await.expect(context);
+    let maybe_message = ws
+        .recv(&fcp_async_core::compatibility_cx())
+        .await
+        .expect(context);
     assert!(maybe_message.is_some(), "{context} missing");
     let message = maybe_message.unwrap_or_else(|| Message::text(String::new()));
     expect_text(message, context)
 }
 
 async fn send_json(ws: &mut TestServerWebSocket, value: serde_json::Value, context: &str) {
-    ws.send(&fcp_async_core::compatibility_cx(), Message::text(value.to_string()))
-        .await
-        .expect(context);
+    ws.send(
+        &fcp_async_core::compatibility_cx(),
+        Message::text(value.to_string()),
+    )
+    .await
+    .expect(context);
 }
 
 async fn close_websocket(ws: &mut TestServerWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 #[fcp_async_core::runtime::test]

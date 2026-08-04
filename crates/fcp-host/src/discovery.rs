@@ -1342,7 +1342,18 @@ impl DiscoveryCache {
             return cached;
         }
 
-        let _refresh_guard = self.refresh_lock.lock().await;
+        // The refresh lock provides single-flight refresh to avoid a thundering
+        // herd of concurrent registry loads. Two cases must skip it:
+        //  - `ttl == 0` disables caching, so the fast-path check above always
+        //    misses; holding one mutex across `registry.list().await` would then
+        //    serialize *every* concurrent discovery call through a single lock.
+        //  - a poisoned lock (a prior loader panicked while holding it) must not
+        //    brick discovery forever — degrade to an unsynchronized refresh.
+        let _refresh_guard = if self.ttl.is_zero() {
+            None
+        } else {
+            self.refresh_lock.lock_poison_tolerant().await
+        };
         let registry_version = registry.version();
         if let Some(cached) = self.cached_result(registry_version).await {
             return cached;
@@ -1846,6 +1857,139 @@ mod tests {
         }
     }
 
+    /// Registry whose first `list()` panics while the refresh lock is held —
+    /// simulating a loader panic that poisons the single-flight lock — then
+    /// succeeds on every subsequent call.
+    struct PanicOnceRegistry {
+        connectors: Vec<ConnectorSummary>,
+        list_calls: Arc<AtomicUsize>,
+    }
+
+    impl PanicOnceRegistry {
+        fn new(connectors: Vec<ConnectorSummary>, list_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                connectors,
+                list_calls,
+            }
+        }
+
+        fn find(&self, id: &ConnectorId) -> Option<ConnectorSummary> {
+            self.connectors.iter().find(|c| &c.id == id).cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectorRegistry for PanicOnceRegistry {
+        async fn list(&self) -> Vec<ConnectorSummary> {
+            let prior = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                prior > 0,
+                "PanicOnceRegistry: simulated loader panic on first list()"
+            );
+            self.connectors.clone()
+        }
+
+        async fn get(&self, id: &ConnectorId) -> Option<ConnectorSummary> {
+            self.find(id)
+        }
+
+        async fn get_introspection(&self, id: &ConnectorId) -> Option<Introspection> {
+            self.find(id).map(|_| Introspection {
+                operations: vec![],
+                events: vec![],
+                resource_types: vec![],
+                auth_caps: None,
+                event_caps: None,
+            })
+        }
+
+        async fn get_archetype(&self, _id: &ConnectorId) -> Option<ConnectorArchetype> {
+            None
+        }
+
+        async fn get_rate_limits(&self, _id: &ConnectorId) -> Option<RateLimitDeclarations> {
+            None
+        }
+
+        async fn self_check(&self, id: &ConnectorId) -> Option<SelfCheckReport> {
+            self.find(id).map(|_| SelfCheckReport::ok())
+        }
+
+        fn version(&self) -> u64 {
+            1
+        }
+    }
+
+    /// Registry that records the peak number of `list()` calls executing
+    /// concurrently, so a test can prove refreshes are (or are not) serialized.
+    struct ConcurrencyProbeRegistry {
+        connectors: Vec<ConnectorSummary>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl ConcurrencyProbeRegistry {
+        fn new(
+            connectors: Vec<ConnectorSummary>,
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                connectors,
+                active,
+                peak,
+                delay,
+            }
+        }
+
+        fn find(&self, id: &ConnectorId) -> Option<ConnectorSummary> {
+            self.connectors.iter().find(|c| &c.id == id).cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectorRegistry for ConcurrencyProbeRegistry {
+        async fn list(&self) -> Vec<ConnectorSummary> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            time::sleep(self.delay).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.connectors.clone()
+        }
+
+        async fn get(&self, id: &ConnectorId) -> Option<ConnectorSummary> {
+            self.find(id)
+        }
+
+        async fn get_introspection(&self, id: &ConnectorId) -> Option<Introspection> {
+            self.find(id).map(|_| Introspection {
+                operations: vec![],
+                events: vec![],
+                resource_types: vec![],
+                auth_caps: None,
+                event_caps: None,
+            })
+        }
+
+        async fn get_archetype(&self, _id: &ConnectorId) -> Option<ConnectorArchetype> {
+            None
+        }
+
+        async fn get_rate_limits(&self, _id: &ConnectorId) -> Option<RateLimitDeclarations> {
+            None
+        }
+
+        async fn self_check(&self, id: &ConnectorId) -> Option<SelfCheckReport> {
+            self.find(id).map(|_| SelfCheckReport::ok())
+        }
+
+        fn version(&self) -> u64 {
+            1
+        }
+    }
+
     struct MutableRegistry {
         connectors: RwLock<Vec<ConnectorSummary>>,
         list_calls: Arc<AtomicUsize>,
@@ -2119,6 +2263,99 @@ mod tests {
         assert!(!first.cache_hit);
         assert!(!second.cache_hit);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn discovery_ttl_zero_does_not_serialize_concurrent_refreshes() {
+        // With caching disabled (ttl == 0) the fast-path check always misses, so
+        // holding the single-flight refresh lock across `registry.list().await`
+        // would serialize *every* concurrent discovery call. The ttl == 0 bypass
+        // must let concurrent refreshes run in parallel.
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let summary = make_summary(
+            "ttl-zero",
+            "test",
+            "v1",
+            vec!["test"],
+            SafetyTier::Safe,
+            ConnectorHealth::healthy(),
+        );
+        let registry = Arc::new(ConcurrencyProbeRegistry::new(
+            vec![summary.clone()],
+            Arc::clone(&active),
+            Arc::clone(&peak),
+            Duration::from_millis(25),
+        ));
+        let cache = Arc::new(DiscoveryCache::new(Duration::from_millis(0)));
+
+        let mut handles = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let registry = Arc::clone(&registry);
+            handles.push(task::spawn(async move {
+                cache.get_or_refresh(Arc::as_ref(&registry)).await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.expect("refresh task should complete");
+            assert!(!result.cache_hit);
+            assert_eq!(result.connectors.len(), 1);
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "ttl == 0 must not serialize concurrent refreshes through the single-flight lock"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn discovery_recovers_after_loader_panic_poisons_refresh_lock() {
+        // A loader panic while the refresh lock is held poisons that lock. The
+        // cache must degrade to an unsynchronized refresh rather than propagating
+        // the poison panic on every subsequent call (permanent discovery outage).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let summary = make_summary(
+            "poison",
+            "test",
+            "v1",
+            vec!["test"],
+            SafetyTier::Safe,
+            ConnectorHealth::healthy(),
+        );
+        let registry = Arc::new(PanicOnceRegistry::new(
+            vec![summary.clone()],
+            Arc::clone(&calls),
+        ));
+        #[allow(clippy::duration_suboptimal_units)]
+        let cache = Arc::new(DiscoveryCache::new(Duration::from_secs(60)));
+
+        // First refresh panics inside the loader (while holding the refresh lock),
+        // poisoning it. `task::spawn` catches the unwind and reports it as an err.
+        let first = {
+            let cache = Arc::clone(&cache);
+            let registry = Arc::clone(&registry);
+            task::spawn(async move { cache.get_or_refresh(Arc::as_ref(&registry)).await }).await
+        };
+        assert!(
+            first.is_err(),
+            "first refresh should panic inside the loader and poison the refresh lock"
+        );
+
+        // The refresh lock is now poisoned; discovery must still recover.
+        let recovered = cache.get_or_refresh(Arc::as_ref(&registry)).await;
+        assert!(!recovered.cache_hit);
+        assert_eq!(recovered.connectors.len(), 1);
+        assert_eq!(
+            recovered.connectors.first().map(|connector| &connector.id),
+            Some(&summary.id)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "loader is called once (panics) then once more (succeeds)"
+        );
     }
 
     #[fcp_async_core::runtime::test]

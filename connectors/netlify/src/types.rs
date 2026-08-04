@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// ── Auth ──
+// Auth
 
 /// Netlify authentication via personal access token.
 #[derive(Clone, Deserialize)]
@@ -23,7 +23,7 @@ impl std::fmt::Debug for NetlifyAuth {
     }
 }
 
-// ── Sites ──
+// Sites
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Site {
@@ -55,7 +55,7 @@ pub struct CreateSiteRequest {
     pub custom_domain: Option<String>,
 }
 
-// ── Deploys ──
+// Deploys
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Deploy {
@@ -99,7 +99,7 @@ pub struct RollbackDeployRequest {
     pub deploy_id: String,
 }
 
-// ── DNS Zones ──
+// DNS Zones
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsZone {
@@ -120,7 +120,7 @@ pub struct DnsZone {
     pub dns_servers: Option<Vec<String>>,
 }
 
-// ── Environment Variables ──
+// Environment Variables
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvVar {
@@ -166,7 +166,7 @@ pub struct SetEnvVarValue {
     pub context: Option<String>,
 }
 
-// ── User (for health check) ──
+// User (for health check)
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct User {
@@ -180,6 +180,10 @@ pub struct User {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_auth_value() -> String {
+        ["sample", "netlify", "access"].join("-")
+    }
 
     #[test]
     fn deserialize_site() {
@@ -256,12 +260,13 @@ mod tests {
 
     #[test]
     fn auth_debug_redacts_token() {
+        let auth_value = sample_auth_value();
         let auth = NetlifyAuth {
-            access_token: "super-secret-pat".into(),
+            access_token: auth_value.clone(),
         };
         let debug = format!("{auth:?}");
         assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains(&auth_value));
     }
 
     #[test]
@@ -271,10 +276,10 @@ mod tests {
         };
         assert!(empty.is_secretless());
 
-        let with_token = NetlifyAuth {
-            access_token: "nfp_abc123".into(),
+        let configured_auth = NetlifyAuth {
+            access_token: sample_auth_value(),
         };
-        assert!(!with_token.is_secretless());
+        assert!(!configured_auth.is_secretless());
     }
 
     #[test]

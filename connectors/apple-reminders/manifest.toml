@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:7e5b729ae1c12e92a1a5b23dcd79f608f6a29a86dab35bb54abc0cd1a30fe9ff"
+interface_hash = "blake3-256:fcp.interface.v2:e8964d7b0a349020cb296fadf90ecbadabefdc11ad3ae207b818d24eb0e9edb1"
 
 [connector]
 id = "fcp.apple-reminders"
@@ -70,6 +70,7 @@ related = ["apple_reminders.list_lists", "apple_reminders.list_reminders"]
 
 [provides.operations."apple_reminders.health".input_schema]
 type = "object"
+properties = {}
 
 [provides.operations."apple_reminders.health".output_schema]
 type = "object"
@@ -120,6 +121,7 @@ related = ["apple_reminders.list_reminders", "apple_reminders.create_reminder"]
 
 [provides.operations."apple_reminders.list_lists".input_schema]
 type = "object"
+properties = {}
 
 [provides.operations."apple_reminders.list_lists".output_schema]
 type = "object"

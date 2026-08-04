@@ -23,8 +23,9 @@ workspace = true
 fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
-fcp-sdk = { path = "../../crates/fcp-sdk" }
+fcp-sdk = { path = "../../crates/fcp-sdk", features = ["connector-http"] }
 fcp-google-discovery = { path = "../../crates/fcp-google-discovery" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -42,6 +43,5 @@ ciborium.workspace = true
 wiremock.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
 fcp-e2e = { path = "../../crates/fcp-e2e" }
-fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }
 chrono.workspace = true

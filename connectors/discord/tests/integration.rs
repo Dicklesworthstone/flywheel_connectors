@@ -361,7 +361,9 @@ async fn send_gateway_json(
 }
 
 async fn close_test_gateway_websocket(ws: &mut TestGatewayWebSocket) {
-    let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+    let _ = ws
+        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+        .await;
 }
 
 fn gateway_hello(interval_ms: u64) -> serde_json::Value {
@@ -3197,6 +3199,11 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
             "api_url": mock_server.uri(),
             "gateway_url": gateway_url,
             "intents": ALL_REQUIRED_INTENTS,
+            // br-x13q4: the IDENTIFY limiter is process-global, so without this
+            // the second gateway test in the binary waits out the real 5 s
+            // window and blows its own 3 s timeout. `cfg(test)` does not reach
+            // integration tests, so the window has to be set here explicitly.
+            "gateway_identify_window_ms": 5,
             "inbound_policy": {
                 "require_mention_in_guilds": true,
                 "allowed_guilds": ["100"],
@@ -3219,10 +3226,7 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
     let mut saw_ready = false;
     let mut saw_authorized = false;
     for _ in 0..2 {
-        // Generous wait: under heavy parallel load plus the asupersync-uwp88
-        // ~250ms timer-wake floor the 3s budget intermittently expired even
-        // though the event always arrives (passes in isolation).
-        let event = fcp_async_core::time::timeout(StdDuration::from_secs(10), event_rx.recv())
+        let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
             .await
             .expect("timeout waiting for Discord gateway event")
             .expect("broadcast receive")
@@ -3254,9 +3258,7 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
         "authorized Discord message should be emitted"
     );
 
-    // 600ms negative window: comfortably above the asupersync-uwp88 ~250ms
-    // wake floor so a stray event would actually be observed.
-    let extra = fcp_async_core::time::timeout(StdDuration::from_millis(600), event_rx.recv()).await;
+    let extra = fcp_async_core::time::timeout(StdDuration::from_millis(200), event_rx.recv()).await;
     assert!(
         extra.is_err(),
         "only READY and the authorized message should be emitted"
@@ -3438,6 +3440,9 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
             "api_url": fake_server.url(),
             "gateway_url": gateway_url,
             "intents": ALL_REQUIRED_INTENTS,
+            // br-x13q4: see the sibling gateway test — the IDENTIFY limiter is
+            // process-global and `cfg(test)` does not reach integration tests.
+            "gateway_identify_window_ms": 5,
             "retry": {
                 "max_attempts": 0,
                 "initial_delay_ms": 10,
@@ -3467,10 +3472,7 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
     let mut guild_session_key = None;
     let mut dm_session_key = None;
     for _ in 0..3 {
-        // Generous wait: under heavy parallel load plus the asupersync-uwp88
-        // ~250ms timer-wake floor the 3s budget intermittently expired even
-        // though the event always arrives (passes in isolation).
-        let event = fcp_async_core::time::timeout(StdDuration::from_secs(10), event_rx.recv())
+        let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
             .await
             .expect("timeout waiting for Discord gateway event")
             .expect("broadcast receive")

@@ -1,5 +1,8 @@
 # Azure Speech Connector
 
+> **Status**: PROVEN
+> **Verification script**: `scripts/e2e/azure_speech_connector_verification.sh`
+
 This connector implements the core Azure Speech REST surface for FCP:
 
 - regional token exchange through `issueToken`
@@ -53,6 +56,33 @@ Current docs rechecked for this slice:
 - <https://learn.microsoft.com/en-us/rest/api/speechtotext/models?view=rest-speechtotext-2025-10-15>
 - <https://learn.microsoft.com/en-us/rest/api/speechtotext/endpoints?view=rest-speechtotext-2025-10-15>
 
+## Operation Inventory
+
+| Operation | Endpoint shape | Capability | SafetyTier | RiskLevel | Idempotency | Notes |
+|-----------|----------------|------------|------------|-----------|-------------|-------|
+| `azure.speech.voices.list` | `GET /cognitiveservices/voices/list` | `azure.speech.voices` | `safe` | `low` | `strict` | Discover configured-region voices before synthesis. |
+| `azure.speech.tts.synthesize` | `POST /cognitiveservices/v1` | `azure.speech.tts` | `safe` | `medium` | `none` | Synthesize one SSML/text payload to provider audio output. |
+| `azure.speech.stt.transcribe_fast` | `POST /speechtotext/transcriptions:transcribe?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `strict` | Fast transcription for bounded audio input. |
+| `azure.speech.stt.batch.submit` | `POST /speechtotext/transcriptions:submit?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `none` | Submit a batch transcription using storage or custom-speech references. |
+| `azure.speech.stt.batch.get` | `GET /speechtotext/transcriptions/{id}?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | Read batch transcription status and redacted provider links. |
+| `azure.speech.stt.batch.files` | `GET /speechtotext/transcriptions/{id}/files?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | List batch output files with SAS/provider URLs redacted. |
+| `azure.speech.stt.custom.projects.create` | `POST /speechtotext/custom/projects?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `none` | Create a Custom Speech project container. |
+| `azure.speech.stt.custom.projects.list` | `GET /speechtotext/custom/projects?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | List Custom Speech projects with bounded pagination. |
+| `azure.speech.stt.custom.projects.get` | `GET /speechtotext/custom/projects/{id}?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | Inspect one Custom Speech project by ID or normalized provider URL. |
+| `azure.speech.stt.custom.projects.delete` | `DELETE /speechtotext/custom/projects/{id}?api-version=2025-10-15` | `azure.speech.stt` | `dangerous` | `high` | `none` | Delete a project only after interactive approval. |
+| `azure.speech.stt.custom.datasets.create` | `POST /speechtotext/custom/datasets?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `none` | Register a Custom Speech dataset from provider-accessible storage. |
+| `azure.speech.stt.custom.datasets.list` | `GET /speechtotext/custom/datasets?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | List Custom Speech datasets. |
+| `azure.speech.stt.custom.datasets.get` | `GET /speechtotext/custom/datasets/{id}?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | Inspect one dataset by ID or normalized provider URL. |
+| `azure.speech.stt.custom.datasets.delete` | `DELETE /speechtotext/custom/datasets/{id}?api-version=2025-10-15` | `azure.speech.stt` | `dangerous` | `high` | `none` | Delete a dataset only after interactive approval. |
+| `azure.speech.stt.custom.models.create` | `POST /speechtotext/custom/models?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `none` | Train or register a Custom Speech model from project/dataset references. |
+| `azure.speech.stt.custom.models.list` | `GET /speechtotext/custom/models?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | List Custom Speech models. |
+| `azure.speech.stt.custom.models.get` | `GET /speechtotext/custom/models/{id}?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | Inspect one model by ID or normalized provider URL. |
+| `azure.speech.stt.custom.models.delete` | `DELETE /speechtotext/custom/models/{id}?api-version=2025-10-15` | `azure.speech.stt` | `dangerous` | `high` | `none` | Delete a model only after interactive approval. |
+| `azure.speech.stt.custom.endpoints.create` | `POST /speechtotext/custom/endpoints?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `medium` | `none` | Deploy a Custom Speech endpoint for a model reference. |
+| `azure.speech.stt.custom.endpoints.list` | `GET /speechtotext/custom/endpoints?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | List Custom Speech endpoints. |
+| `azure.speech.stt.custom.endpoints.get` | `GET /speechtotext/custom/endpoints/{id}?api-version=2025-10-15` | `azure.speech.stt` | `safe` | `low` | `strict` | Inspect one endpoint by ID or normalized provider URL. |
+| `azure.speech.stt.custom.endpoints.delete` | `DELETE /speechtotext/custom/endpoints/{id}?api-version=2025-10-15` | `azure.speech.stt` | `dangerous` | `high` | `none` | Delete an endpoint only after interactive approval. |
+
 ## Realtime WebSocket Status
 
 `flywheel_connectors-4kw5f.2.9.6.1.2` rechecked current Microsoft Learn docs on 2026-05-08. Azure Speech TTS text streaming is documented through Speech SDK `TextStream` on the WebSocket v2 endpoint, and realtime STT is documented through Speech SDK `SpeechRecognizer`/`AudioConfig` stream APIs. Microsoft does not publish the direct WebSocket frame protocol needed for a standalone Rust connector.
@@ -74,3 +104,25 @@ Current docs:
 The closeout proof lane is `scripts/e2e/azure_speech_connector_verification.sh`. It runs the no-live-credential loopback matrix through the production connector boundary and emits redacted JSONL records for token issue, voices.list, TTS synth, STT fast transcription, batch submit/get/files, custom project create/list/get/delete, custom dataset/model/endpoint create/get/delete, host-brokered managed-identity token handoff, connector-local IMDS policy skips, provider error redaction, rate-limit retry, timeout, malformed input, unsupported format, oversized audio, capability-token zone and instance denial, harness cancellation, streaming blocker disposition, shutdown cleanup, and optional live-smoke skip/pass state.
 
 The JSONL contract records command line, git revision, connector id, operation id, capability, zone, instance id, fixture/live mode, region and endpoint class, auth mode, token source class, API version, resource/model/project id hashes, voice/language/model labels, content type, audio byte counts, transcript length only, stream chunk count, HTTP status, retry/backoff decision, FCP error mapping, latency, result, audit receipt id, cleanup result, and skip reason. It deliberately rejects keys, bearer tokens, raw tenant/resource IDs, raw custom speech resource IDs, SAS URLs, SSML/text content, transcripts, raw audio bytes, provider bodies, local absolute paths, and PII.
+
+## Operator Guidance
+
+Prerequisites:
+
+- For the default verifier path, no Azure credentials are required; it uses loopback fixtures and proves the connector boundary without live egress.
+- Optional live smoke requires `AZURE_SPEECH_LIVE=1`, `AZURE_SPEECH_KEY`, and `AZURE_SPEECH_REGION`; run that only against a disposable Azure Speech resource.
+- Production keyless use requires the host to broker Microsoft Entra or managed-identity tokens and pass `entra_access_token` or `credential_id`; the connector does not contact IMDS directly.
+
+Common remediation:
+
+- `host_token_broker_required` means connector-local IMDS/MSAL acquisition was correctly refused; configure the host token broker instead of broadening connector network policy.
+- `InvalidRequest` on audio or SSML inputs should be debugged from shape fields only; do not paste raw transcripts, SSML, audio bytes, SAS URLs, subscription keys, or bearer tokens into shared logs.
+- `UpstreamTimeout` and `429_retry_after_ms_then_success` are covered by the verifier; retry with the same redaction rules before treating the provider as unavailable.
+- `blocked_official_sdk_only_protocol` on realtime streaming is expected until Microsoft publishes a standalone wire protocol or the project accepts an SDK-backed design.
+
+Rerun commands:
+
+- `RUN_ID=$(date -u +%Y%m%dT%H%M%SZ) OUT_ROOT=.codex-targets/azure-speech-verification/$RUN_ID RCH_QUEUE_WHEN_BUSY=1 bash scripts/e2e/azure_speech_connector_verification.sh`
+- `RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- env CARGO_TARGET_DIR=/Volumes/USB_NVME/cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo run -q -p fwc -- manifest fix connectors/azure-speech/manifest.toml --check --json`
+- `scripts/graduation/run_gauntlet.sh --jsonl .codex-targets/azure-speech-verification/$RUN_ID/evidence/azure_speech_gauntlet_after_operator_guidance.jsonl connectors/azure-speech`
+- `RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- env CARGO_TARGET_DIR=/Volumes/USB_NVME/cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p fcp-conformance --test graduation_gauntlet_conformance all_proven_connectors_pass_gauntlet -- --nocapture`

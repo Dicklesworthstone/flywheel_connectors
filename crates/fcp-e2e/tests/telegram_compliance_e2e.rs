@@ -572,7 +572,12 @@ async fn telegram_send_message_returns_message_id() {
 
     // Build valid token and invoke (capability class is `telegram.send`,
     // see test 2's comment for the C3.4 / br-8n0rm.6 rationale).
-    let token = build_token(&signing_key, "telegram.send", &["telegram.send_message"], connector.instance_id().as_str());
+    let token = build_token(
+        &signing_key,
+        "telegram.send",
+        &["telegram.send_message"],
+        connector.instance_id().as_str(),
+    );
     let result = connector
         .handle_invoke(json!({
             "operation": "telegram.send_message",

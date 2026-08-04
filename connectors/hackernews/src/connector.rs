@@ -1,5 +1,6 @@
 //! Hacker News connector implementation.
 
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -525,10 +526,15 @@ fn hackernews_resource_types() -> Vec<ResourceTypeInfo> {
 
 /// Build the typed operations catalog from the embedded manifest.
 pub fn operations_info() -> Vec<OperationInfo> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
-        .collect()
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {

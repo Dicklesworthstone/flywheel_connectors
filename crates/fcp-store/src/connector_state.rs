@@ -149,6 +149,13 @@ pub enum ConnectorStateStoreError {
     /// The canonical state chain loops back to an already visited object.
     #[error("connector state chain contains a cycle at {0}")]
     ChainCycle(ObjectId),
+
+    /// A state object was signed by a writer key outside the trusted set.
+    #[error("connector state writer key {writer_public_key} is not in the trusted writer set")]
+    UntrustedWriterKey {
+        /// Hex-encoded writer public key embedded in the rejected object.
+        writer_public_key: String,
+    },
 }
 
 type Result<T> = std::result::Result<T, ConnectorStateStoreError>;
@@ -220,6 +227,7 @@ pub struct FcpStoreConnectorStateStore {
     root_write_retry_policy: BackoffPolicy,
     change_bus: Arc<ConnectorStateChangeBus>,
     root_cache: Arc<RwLock<Option<CachedConnectorStateRoot>>>,
+    trusted_writer_keys: Option<Arc<HashSet<[u8; 32]>>>,
 }
 
 impl FcpStoreConnectorStateStore {
@@ -251,7 +259,29 @@ impl FcpStoreConnectorStateStore {
             root_write_retry_policy: BackoffPolicy::new(0, Duration::ZERO, Duration::ZERO, 1.0),
             change_bus,
             root_cache: Arc::new(RwLock::new(None)),
+            trusted_writer_keys: None,
         }
+    }
+
+    /// Pin the writer public keys trusted on the canonical read path.
+    ///
+    /// The append boundary already binds each incoming state object's
+    /// `writer_public_key` to a verified [`ConnectorStateWriteAuthorization`],
+    /// but stored objects are otherwise verified only against their own
+    /// embedded writer key. The keyed content-id blocks non-members, yet a
+    /// zone member holding the shared [`ObjectIdKey`] could plant a
+    /// self-signed chain for this connector and have it selected canonical.
+    /// With a pin configured, every state object loaded on the read path must
+    /// carry a writer key from this set; anything else fails closed with
+    /// [`ConnectorStateStoreError::UntrustedWriterKey`]. Append authorizations
+    /// whose writer key is outside the pin are refused at write time.
+    #[must_use]
+    pub fn with_trusted_writer_keys<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = [u8; 32]>,
+    {
+        self.trusted_writer_keys = Some(Arc::new(keys.into_iter().collect()));
+        self
     }
 
     /// Scope the store to one connector instance.
@@ -394,6 +424,15 @@ impl FcpStoreConnectorStateStore {
             return Ok(Some((object_id, root)));
         }
 
+        // Sample the change generation *before* scanning. A concurrent writer
+        // bumps the generation only after the new root object is durably
+        // stored (append_object_inner: store_root_with_retry then
+        // publish_change(RootUpdated)). Caching under this pre-scan value means
+        // any root update that races our scan advances the generation past it,
+        // so the next read misses the cache and rescans rather than serving
+        // this now-stale result as fresh.
+        let generation = self.change_bus.generation();
+
         let mut best: Option<(ObjectId, ConnectorStateRoot, Option<u64>)> = None;
 
         for object_id in self.object_store.list_zone(&self.zone_id).await {
@@ -426,7 +465,7 @@ impl FcpStoreConnectorStateStore {
 
         let root = best.map(|(object_id, root, _head_seq)| (object_id, root));
         if let Some((object_id, root)) = &root {
-            self.cache_root(*object_id, root.clone());
+            self.cache_root(generation, *object_id, root.clone());
         }
         Ok(root)
     }
@@ -440,9 +479,9 @@ impl FcpStoreConnectorStateStore {
             .map(|cached| (cached.object_id, cached.root.clone()))
     }
 
-    fn cache_root(&self, object_id: ObjectId, root: ConnectorStateRoot) {
+    fn cache_root(&self, generation: u64, object_id: ObjectId, root: ConnectorStateRoot) {
         *self.root_cache.write() = Some(CachedConnectorStateRoot {
-            generation: self.change_bus.generation(),
+            generation,
             object_id,
             root,
         });
@@ -822,9 +861,21 @@ impl FcpStoreConnectorStateStore {
     }
 
     async fn compact_inner(&self, before_seq: u64) -> Result<usize> {
+        // The current head is still referenced by the root, so relaxing its
+        // retention would let a retention-only GC strand the live chain
+        // (`read_root`/`current_head` would then fail with `MissingHead`).
+        // Honor the documented "non-head chain entries" contract and never
+        // touch the head, even when `before_seq` exceeds the head sequence.
+        let head_object_id = match self.read_root().await? {
+            Some((_root_id, root)) => root.head,
+            None => return Ok(0),
+        };
         let states = self.read_chain(None, usize::MAX).await?;
         let mut updated = 0;
         for (object_id, state) in states {
+            if head_object_id.as_ref() == Some(&object_id) {
+                continue;
+            }
             if state.seq < before_seq {
                 self.object_store
                     .set_retention(&object_id, RetentionClass::Ephemeral)
@@ -1209,7 +1260,24 @@ impl FcpStoreConnectorStateStore {
                 computed,
             });
         }
+        self.ensure_trusted_writer(state)?;
         Self::verify_state_signature(state)?;
+        Ok(())
+    }
+
+    /// Enforce the read-path writer pin, when one is configured.
+    ///
+    /// Without a pin this is a no-op: the object is then only bound to its own
+    /// embedded writer key by [`Self::verify_state_signature`], which keyed
+    /// content-ids protect from non-members but not from zone insiders.
+    fn ensure_trusted_writer(&self, state: &ConnectorStateObject) -> Result<()> {
+        if let Some(trusted) = &self.trusted_writer_keys
+            && !trusted.contains(&state.writer_public_key)
+        {
+            return Err(ConnectorStateStoreError::UntrustedWriterKey {
+                writer_public_key: writer_key_hex(&state.writer_public_key),
+            });
+        }
         Ok(())
     }
 
@@ -1362,6 +1430,17 @@ impl FcpStoreConnectorStateStore {
                 ),
             });
         }
+        if let Some(trusted) = &self.trusted_writer_keys
+            && !trusted.contains(&authorization.writer_public_key())
+        {
+            return Err(ConnectorStateError::AuthorizationDenied {
+                connector_id: connector_id.clone(),
+                reason: format!(
+                    "authorization writer key {} is not in the store's trusted writer set",
+                    writer_key_hex(&authorization.writer_public_key())
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -1500,6 +1579,7 @@ impl FcpStoreConnectorStateStore {
             | ConnectorStateStoreError::SequenceMismatch { .. }
             | ConnectorStateStoreError::SequenceOverflow(_)
             | ConnectorStateStoreError::ChainCycle(_)
+            | ConnectorStateStoreError::UntrustedWriterKey { .. }
             | ConnectorStateStoreError::Serialization(_) => ConnectorStateError::MalformedState {
                 connector_id: self.connector_id.clone(),
                 reason: err.to_string(),
@@ -1696,6 +1776,14 @@ fn shared_change_bus(
 
 fn headers_match(left: &ObjectHeader, right: &ObjectHeader) -> Result<bool> {
     Ok(fcp_cbor::to_canonical_cbor(left)? == fcp_cbor::to_canonical_cbor(right)?)
+}
+
+fn writer_key_hex(key: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    key.iter().fold(String::with_capacity(64), |mut out, byte| {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out
+    })
 }
 
 #[cfg(test)]
@@ -2200,6 +2288,100 @@ mod tests {
         assert!(matches!(
             err,
             ConnectorStateStoreError::InvalidStateSignature(_)
+        ));
+    }
+
+    #[test]
+    fn pinned_read_accepts_trusted_writer_chain() {
+        let object_store = store();
+        let state_store = test_store(object_store)
+            .with_trusted_writer_keys([test_state_signing_key().verifying_key().to_bytes()]);
+
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&state_store, state(1, Some(head0), lease_id(2)));
+
+        let root = run_async(state_store.read_root()).unwrap().unwrap().1;
+        assert_eq!(root.head, Some(head1));
+        let chain = run_async(state_store.read_chain(None, 10)).unwrap();
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn pinned_read_rejects_state_from_untrusted_writer() {
+        let object_store = store();
+        let unpinned = test_store(object_store.clone());
+        let (legit_head, _) = append_ok(&unpinned, state(0, None, lease_id(1)));
+
+        // A zone insider holding the shared object-id key plants a
+        // self-signed higher-seq chain: valid schema, valid content-id,
+        // valid self-signature, but a foreign writer key.
+        let insider_key = Ed25519SigningKey::from_bytes(&[0x77; 32]).unwrap();
+        let forged = signed_state(5, None, lease_id(9), &insider_key);
+        let stored = unpinned
+            .stored_object(&forged.header, &forged, RetentionClass::Pinned)
+            .unwrap();
+        let forged_head = stored.object_id;
+        run_async(object_store.put(stored)).unwrap();
+        run_async(unpinned.store_root(root_with_head(Some(forged_head), 1_700_000_500))).unwrap();
+
+        // Without a pin the forged chain outranks the legitimate head — this
+        // is the nr4cq insider gap the pin exists to close.
+        let unpinned_root = run_async(unpinned.read_root()).unwrap().unwrap().1;
+        assert_eq!(unpinned_root.head, Some(forged_head));
+        assert_ne!(unpinned_root.head, Some(legit_head));
+
+        // With the pin, reads fail closed on the untrusted writer key.
+        let pinned = test_store(object_store)
+            .with_trusted_writer_keys([test_state_signing_key().verifying_key().to_bytes()]);
+        let err = run_async(pinned.read_root()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorStateStoreError::UntrustedWriterKey { .. }
+        ));
+        let err = run_async(pinned.read_chain(None, 10)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorStateStoreError::UntrustedWriterKey { .. }
+        ));
+    }
+
+    #[test]
+    fn trait_append_rejects_authorization_writer_outside_pin() {
+        let object_store = store();
+        let (authorization, signing_key) = write_authorization_with_key();
+
+        // Pin includes the authorization writer: append commits.
+        let matching = test_store(object_store.clone())
+            .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()]);
+        let outcome = run_async(
+            <FcpStoreConnectorStateStore as ConnectorStateStore>::append_object(
+                &matching,
+                &connector_id(),
+                &authorization,
+                signed_state(0, None, lease_id(1), &signing_key),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectorStateAppendOutcome::Committed { .. }
+        ));
+
+        // Pin excludes the authorization writer: append is refused before any
+        // object is validated or stored.
+        let excluding = test_store(object_store).with_trusted_writer_keys([[0xEE_u8; 32]]);
+        let err = run_async(
+            <FcpStoreConnectorStateStore as ConnectorStateStore>::append_object(
+                &excluding,
+                &connector_id(),
+                &authorization,
+                signed_state(1, None, lease_id(2), &signing_key),
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorStateError::AuthorizationDenied { .. }
         ));
     }
 
@@ -2719,6 +2901,33 @@ mod tests {
         let new_meta = run_async(object_store.get_storage_meta(&head1)).unwrap();
         assert_eq!(old_meta.retention, RetentionClass::Ephemeral);
         assert_eq!(new_meta.retention, RetentionClass::Pinned);
+    }
+
+    #[test]
+    fn compact_never_marks_head_even_when_before_seq_exceeds_head() {
+        // Per the documented contract, compact only relaxes retention on
+        // non-head chain entries. A `before_seq` past the head sequence must
+        // still leave the head Pinned, or a retention-only GC could delete the
+        // live head and strand the root (MissingHead).
+        let object_store = store();
+        let state_store = test_store(object_store.clone());
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&state_store, state(1, Some(head0), lease_id(2)));
+
+        let count = run_async(state_store.compact(u64::MAX)).unwrap();
+
+        // Only the non-head predecessor is relaxed; the head is preserved.
+        assert_eq!(count, 1);
+        let old_meta = run_async(object_store.get_storage_meta(&head0)).unwrap();
+        let head_meta = run_async(object_store.get_storage_meta(&head1)).unwrap();
+        assert_eq!(old_meta.retention, RetentionClass::Ephemeral);
+        assert_eq!(
+            head_meta.retention,
+            RetentionClass::Pinned,
+            "head must remain Pinned even when before_seq exceeds its sequence"
+        );
+        // The chain is still fully resolvable through the preserved head.
+        assert!(run_async(state_store.read_root()).unwrap().is_some());
     }
 
     #[test]

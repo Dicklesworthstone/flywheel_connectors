@@ -1568,18 +1568,26 @@ impl TruthPrecedencePolicy {
     }
 
     /// Create a zone-specific policy with custom precedence.
+    ///
+    /// The operational model version is inferred from the precedence head:
+    /// a mesh-first precedence is a V2 policy, anything else is V1.
     #[must_use]
     pub fn for_zone(
         zone_id: impl Into<String>,
         precedence: Vec<KnowledgeState>,
         minimum_acceptable: KnowledgeState,
     ) -> Self {
+        let model_version = if precedence.first() == Some(&KnowledgeState::MeshBacked) {
+            OperationalModelVersion::V2MeshNative
+        } else {
+            OperationalModelVersion::V1HostFirst
+        };
         Self {
             zone_id: Some(zone_id.into()),
             precedence,
             minimum_acceptable,
             allow_fallback: true,
-            model_version: OperationalModelVersion::V1HostFirst,
+            model_version,
         }
     }
 
@@ -1611,8 +1619,10 @@ impl TruthPrecedencePolicy {
         let state_rank = self.precedence.iter().position(|s| *s == state);
         match (state_rank, min_rank) {
             (Some(sr), Some(mr)) => sr <= mr,
-            // If the state isn't in the precedence at all, check if it's
-            // Degraded or FallbackDerived — those are always below minimum.
+            // Any state absent from the precedence list (e.g. Degraded or
+            // FallbackDerived, which never appear there) is below minimum.
+            // A minimum_acceptable absent from the list fails closed: nothing
+            // is acceptable under a misconfigured policy.
             _ => false,
         }
     }

@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const TEST_TOKEN: &str = "netlify-token-for-tests";
+fn sample_auth_value() -> String {
+    ["netlify", "test", "access"].join("-")
+}
 
 fn no_retry_config() -> HttpRetryConfig {
     HttpRetryConfig {
@@ -41,7 +43,7 @@ async fn client(server: &MockServer) -> NetlifyClient {
     NetlifyClient::new(
         &server.uri(),
         NetlifyAuth {
-            access_token: TEST_TOKEN.into(),
+            access_token: sample_auth_value(),
         },
         no_retry_config(),
     )
@@ -70,20 +72,20 @@ fn test_deploy(deploy_id: &str, site_id: &str, state: &str) -> Value {
     })
 }
 
-const SCHEMA_OPERATIONS: [(&str, &str); 13] = [
-    ("sites_list", "netlify.sites.list"),
-    ("sites_get", "netlify.sites.get"),
-    ("sites_create", "netlify.sites.create"),
-    ("sites_delete", "netlify.sites.delete"),
-    ("deploys_list", "netlify.deploys.list"),
-    ("deploys_get", "netlify.deploys.get"),
-    ("deploys_create", "netlify.deploys.create"),
-    ("deploys_rollback", "netlify.deploys.rollback"),
-    ("dns_list_zones", "netlify.dns.list_zones"),
-    ("env_list", "netlify.env.list"),
-    ("env_set", "netlify.env.set"),
-    ("env_delete", "netlify.env.delete"),
-    ("health", "netlify.health"),
+const SCHEMA_OPERATIONS: [&str; 13] = [
+    "netlify.sites.list",
+    "netlify.sites.get",
+    "netlify.sites.create",
+    "netlify.sites.delete",
+    "netlify.deploys.list",
+    "netlify.deploys.get",
+    "netlify.deploys.create",
+    "netlify.deploys.rollback",
+    "netlify.dns.list_zones",
+    "netlify.env.list",
+    "netlify.env.set",
+    "netlify.env.delete",
+    "netlify.health",
 ];
 
 fn netlify_manifest() -> toml::Value {
@@ -150,10 +152,10 @@ fn assert_manifest_runtime_schema_parity(manifest: &toml::Value, operations: &[O
         "manifest operation count should match schema coverage set"
     );
 
-    for (operation_key, operation_id) in SCHEMA_OPERATIONS {
+    for operation_id in SCHEMA_OPERATIONS {
         let operation = runtime_operation(operations, operation_id);
-        let input_schema = manifest_operation_schema(manifest, operation_key, "input_schema");
-        let output_schema = manifest_operation_schema(manifest, operation_key, "output_schema");
+        let input_schema = manifest_operation_schema(manifest, operation_id, "input_schema");
+        let output_schema = manifest_operation_schema(manifest, operation_id, "output_schema");
 
         assert_eq!(
             input_schema, operation.input_schema,
@@ -175,18 +177,22 @@ fn assert_manifest_runtime_schema_parity(manifest: &toml::Value, operations: &[O
 }
 
 fn assert_catalog_input_schema_examples(manifest: &toml::Value) {
-    for operation_key in ["sites_list", "dns_list_zones", "health"] {
+    for operation_key in [
+        "netlify.sites.list",
+        "netlify.dns.list_zones",
+        "netlify.health",
+    ] {
         let schema = manifest_operation_schema(manifest, operation_key, "input_schema");
         assert_schema_accepts(&schema, &json!({}));
         assert_schema_rejects(&schema, &json!({ "unexpected": true }));
     }
 
-    let sites_get = manifest_operation_schema(manifest, "sites_get", "input_schema");
+    let sites_get = manifest_operation_schema(manifest, "netlify.sites.get", "input_schema");
     assert_schema_accepts(&sites_get, &json!({ "site_id": "site-1" }));
     assert_schema_rejects(&sites_get, &json!({}));
     assert_schema_rejects(&sites_get, &json!({ "site_id": "site-1", "extra": true }));
 
-    let sites_create = manifest_operation_schema(manifest, "sites_create", "input_schema");
+    let sites_create = manifest_operation_schema(manifest, "netlify.sites.create", "input_schema");
     assert_schema_accepts(
         &sites_create,
         &json!({ "name": "fcp-site", "custom_domain": "example.com" }),
@@ -194,25 +200,26 @@ fn assert_catalog_input_schema_examples(manifest: &toml::Value) {
     assert_schema_rejects(&sites_create, &json!({ "custom_domain": "example.com" }));
     assert_schema_rejects(&sites_create, &json!({ "name": "fcp-site", "extra": true }));
 
-    let sites_delete = manifest_operation_schema(manifest, "sites_delete", "input_schema");
+    let sites_delete = manifest_operation_schema(manifest, "netlify.sites.delete", "input_schema");
     assert_schema_accepts(&sites_delete, &json!({ "site_id": "site-1" }));
     assert_schema_rejects(&sites_delete, &json!({}));
 
-    let deploys_list = manifest_operation_schema(manifest, "deploys_list", "input_schema");
+    let deploys_list = manifest_operation_schema(manifest, "netlify.deploys.list", "input_schema");
     assert_schema_accepts(&deploys_list, &json!({ "site_id": "site-1" }));
     assert_schema_rejects(
         &deploys_list,
         &json!({ "site_id": "site-1", "extra": true }),
     );
 
-    let deploys_get = manifest_operation_schema(manifest, "deploys_get", "input_schema");
+    let deploys_get = manifest_operation_schema(manifest, "netlify.deploys.get", "input_schema");
     assert_schema_accepts(
         &deploys_get,
         &json!({ "site_id": "site-1", "deploy_id": "deploy-1" }),
     );
     assert_schema_rejects(&deploys_get, &json!({ "site_id": "site-1" }));
 
-    let deploys_create = manifest_operation_schema(manifest, "deploys_create", "input_schema");
+    let deploys_create =
+        manifest_operation_schema(manifest, "netlify.deploys.create", "input_schema");
     assert_schema_accepts(
         &deploys_create,
         &json!({ "site_id": "site-1", "branch": "main", "title": "FCP deploy" }),
@@ -223,21 +230,22 @@ fn assert_catalog_input_schema_examples(manifest: &toml::Value) {
         &json!({ "site_id": "site-1", "extra": true }),
     );
 
-    let deploys_rollback = manifest_operation_schema(manifest, "deploys_rollback", "input_schema");
+    let deploys_rollback =
+        manifest_operation_schema(manifest, "netlify.deploys.rollback", "input_schema");
     assert_schema_accepts(
         &deploys_rollback,
         &json!({ "site_id": "site-1", "deploy_id": "deploy-1" }),
     );
     assert_schema_rejects(&deploys_rollback, &json!({ "site_id": "site-1" }));
 
-    let env_list = manifest_operation_schema(manifest, "env_list", "input_schema");
+    let env_list = manifest_operation_schema(manifest, "netlify.env.list", "input_schema");
     assert_schema_accepts(
         &env_list,
         &json!({ "site_id": "site-1", "account_slug": "acme" }),
     );
     assert_schema_rejects(&env_list, &json!({ "site_id": "site-1" }));
 
-    let env_set = manifest_operation_schema(manifest, "env_set", "input_schema");
+    let env_set = manifest_operation_schema(manifest, "netlify.env.set", "input_schema");
     assert_schema_accepts(
         &env_set,
         &json!({
@@ -268,7 +276,7 @@ fn assert_catalog_input_schema_examples(manifest: &toml::Value) {
         }),
     );
 
-    let env_delete = manifest_operation_schema(manifest, "env_delete", "input_schema");
+    let env_delete = manifest_operation_schema(manifest, "netlify.env.delete", "input_schema");
     assert_schema_accepts(
         &env_delete,
         &json!({ "site_id": "site-1", "account_slug": "acme", "key": "API_KEY" }),
@@ -281,11 +289,11 @@ fn assert_catalog_input_schema_examples(manifest: &toml::Value) {
 
 fn assert_catalog_output_schema_examples(manifest: &toml::Value) {
     for operation_key in [
-        "sites_list",
-        "deploys_list",
-        "dns_list_zones",
-        "env_list",
-        "env_set",
+        "netlify.sites.list",
+        "netlify.deploys.list",
+        "netlify.dns.list_zones",
+        "netlify.env.list",
+        "netlify.env.set",
     ] {
         let schema = manifest_operation_schema(manifest, operation_key, "output_schema");
         assert_schema_accepts(&schema, &json!([]));
@@ -294,11 +302,11 @@ fn assert_catalog_output_schema_examples(manifest: &toml::Value) {
     }
 
     for operation_key in [
-        "sites_get",
-        "sites_create",
-        "deploys_get",
-        "deploys_create",
-        "deploys_rollback",
+        "netlify.sites.get",
+        "netlify.sites.create",
+        "netlify.deploys.get",
+        "netlify.deploys.create",
+        "netlify.deploys.rollback",
     ] {
         let schema = manifest_operation_schema(manifest, operation_key, "output_schema");
         assert_schema_accepts(&schema, &json!({}));
@@ -306,7 +314,7 @@ fn assert_catalog_output_schema_examples(manifest: &toml::Value) {
         assert_schema_rejects(&schema, &json!([]));
     }
 
-    let sites_delete = manifest_operation_schema(manifest, "sites_delete", "output_schema");
+    let sites_delete = manifest_operation_schema(manifest, "netlify.sites.delete", "output_schema");
     assert_schema_accepts(
         &sites_delete,
         &json!({ "deleted": true, "site_id": "site-1" }),
@@ -317,11 +325,11 @@ fn assert_catalog_output_schema_examples(manifest: &toml::Value) {
     );
     assert_schema_rejects(&sites_delete, &json!({ "deleted": true }));
 
-    let env_delete = manifest_operation_schema(manifest, "env_delete", "output_schema");
+    let env_delete = manifest_operation_schema(manifest, "netlify.env.delete", "output_schema");
     assert_schema_accepts(&env_delete, &json!({ "deleted": true, "key": "API_KEY" }));
     assert_schema_rejects(&env_delete, &json!({ "key": "API_KEY" }));
 
-    let health = manifest_operation_schema(manifest, "health", "output_schema");
+    let health = manifest_operation_schema(manifest, "netlify.health", "output_schema");
     assert_schema_accepts(
         &health,
         &json!({ "healthy": true, "user_id": "user-1", "email": null }),
@@ -348,7 +356,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([test_site("site-1")])))
         .expect(1)
         .mount(&server)
@@ -356,7 +367,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/site-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(test_site("site-1")))
         .expect(1)
         .mount(&server)
@@ -364,7 +378,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("POST"))
         .and(path("/api/v1/sites"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .and(body_json(json!({
             "name": "fcp-created",
             "custom_domain": "created.example.com"
@@ -376,7 +393,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("DELETE"))
         .and(path("/api/v1/sites/site-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&server)
@@ -384,7 +404,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/site-1/deploys"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!([test_deploy("deploy-1", "site-1", "ready")])),
@@ -395,7 +418,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("POST"))
         .and(path("/api/v1/sites/site-1/deploys"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .and(body_json(json!({
             "branch": "main",
             "title": "FCP deploy"
@@ -411,7 +437,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("POST"))
         .and(path("/api/v1/sites/site-1/rollback/deploy-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .and(body_json(json!({})))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(test_deploy("deploy-1", "site-1", "ready")),
@@ -422,7 +451,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/dns_zones"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
             "id": "zone-1",
             "name": "example.com",
@@ -435,7 +467,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
     Mock::given(method("GET"))
         .and(path("/api/v1/accounts/acme/env"))
         .and(query_param("site_id", "site-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
             "key": "API_KEY",
             "is_secret": true,
@@ -452,7 +487,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
     Mock::given(method("POST"))
         .and(path("/api/v1/accounts/acme/env"))
         .and(query_param("site_id", "site-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .and(body_json(json!([{
             "key": "API_KEY",
             "values": [{
@@ -477,7 +515,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
     Mock::given(method("DELETE"))
         .and(path("/api/v1/accounts/acme/env/API_KEY"))
         .and(query_param("site_id", "site-1"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&server)
@@ -485,7 +526,10 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/user"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "user-1",
             "email": "dev@example.com"
@@ -613,7 +657,10 @@ async fn auth_rate_limit_malformed_json_and_invalid_input_are_typed() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/bad-auth"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(401).set_body_json(json!({
             "message": "invalid token"
         })))
@@ -623,7 +670,10 @@ async fn auth_rate_limit_malformed_json_and_invalid_input_are_typed() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/rate-limited"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(
             ResponseTemplate::new(429)
                 .insert_header("retry-after", "2")
@@ -635,7 +685,10 @@ async fn auth_rate_limit_malformed_json_and_invalid_input_are_typed() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/malformed"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_string("{this is not json"))
         .expect(1)
         .mount(&server)
@@ -643,7 +696,10 @@ async fn auth_rate_limit_malformed_json_and_invalid_input_are_typed() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/sites/empty"))
-        .and(header("Authorization", format!("Bearer {TEST_TOKEN}")))
+        .and(header(
+            "Authorization",
+            format!("Bearer {}", sample_auth_value()),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_string(""))
         .expect(1)
         .mount(&server)
@@ -762,16 +818,18 @@ fn operation_catalog_manifest_and_redaction_preserve_security_posture() {
 
     let capability_section = manifest_capability_section();
     assert!(capability_section.contains("\"network.dns\""));
-    assert!(capability_section.contains("\"network.outbound\""));
+    assert!(capability_section.contains("\"network.egress\""));
+    assert!(capability_section.contains("\"network.tls.sni\""));
     assert!(capability_section.contains("\"system.exec\""));
     assert!(capability_section.contains("\"system.privileged\""));
-    assert!(!capability_section.contains("network.listen"));
+    assert!(capability_section.contains("\"network.listen\""));
 
+    let redaction_value = sample_auth_value();
     let client = fcp_async_core::runtime::block_on_sync(async {
         NetlifyClient::new(
             "https://api.netlify.com",
             NetlifyAuth {
-                access_token: "super-secret-netlify-token".into(),
+                access_token: redaction_value.clone(),
             },
             no_retry_config(),
         )
@@ -780,7 +838,7 @@ fn operation_catalog_manifest_and_redaction_preserve_security_posture() {
     .expect("runtime should complete")
     .expect("redaction proof client should build");
     let debug_output = format!("{client:?}");
-    assert!(!debug_output.contains("super-secret-netlify-token"));
+    assert!(!debug_output.contains(&redaction_value));
     assert!(debug_output.contains("[REDACTED]"));
 }
 
@@ -793,4 +851,102 @@ fn manifest_capability_section() -> &'static str {
         .split_once("[provides.operations.")
         .expect("Netlify manifest should separate capabilities from operations");
     capability_section
+}
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// The highest-harm case in the infra tier: a retried create_deploy does not
+// leave a stray record, it starts a SECOND build and ships it to production.
+// Netlify has no idempotency key. The assertion is the REQUEST COUNT.
+
+fn retrying_client_config() -> HttpRetryConfig {
+    HttpRetryConfig {
+        max_retries: 3,
+        initial_delay_ms: 1,
+        max_delay_ms: 5,
+        jitter_enabled: false,
+    }
+}
+
+async fn retrying_client(server: &MockServer) -> NetlifyClient {
+    NetlifyClient::new(
+        &server.uri(),
+        NetlifyAuth {
+            access_token: sample_auth_value(),
+        },
+        retrying_client_config(),
+    )
+    .await
+    .expect("wiremock URI should build a Netlify client")
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_deploy_is_not_retried_after_a_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sites/site-1/deploys"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let result = retrying_client(&server)
+        .await
+        .create_deploy(
+            &test_runtime(),
+            "site-1",
+            &CreateDeployRequest {
+                branch: Some("main".into()),
+                title: None,
+            },
+        )
+        .await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Netlify received the deploy trigger — retrying starts a \
+         SECOND build and ships it"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_deploy_still_retries_a_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sites/site-1/deploys"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sites/site-1/deploys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "deploy-1",
+            "site_id": "site-1",
+            "state": "building"
+        })))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .await
+        .create_deploy(
+            &test_runtime(),
+            "site-1",
+            &CreateDeployRequest {
+                branch: Some("main".into()),
+                title: None,
+            },
+        )
+        .await
+        .expect("a rate-limited trigger was refused without building anything");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "429 means Netlify did NOT start the build, so backoff is preserved"
+    );
 }

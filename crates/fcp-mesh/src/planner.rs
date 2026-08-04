@@ -1165,20 +1165,31 @@ impl ExecutionPlanner {
             .map(|(rank, cost)| (cost.node_id.as_str(), rank))
             .collect();
 
-        candidates.sort_by(|left, right| {
-            if !(left.eligible && right.eligible) {
-                return left.cmp(right);
+        // A candidate participates in cost-rank ordering only when it is both
+        // eligible and present in the cost explanation. Comparing eligible pairs
+        // by cost rank while comparing any pair involving an ineligible node by
+        // natural score order mixes two different orderings over overlapping
+        // subsets, which is not a total order (it can produce comparison cycles)
+        // and makes `slice::sort_by` panic on current Rust. Compute a per-node
+        // group once and compare uniformly: cost-ranked nodes sort ahead of the
+        // rest (by rank), everything else falls back to the natural order. The
+        // ineligible nodes are discarded by `plan()` immediately after this
+        // sort, so this only fixes the ordering they impose *during* the sort;
+        // the eligible nodes' relative order is unchanged.
+        let cost_rank = |node: &CandidateNode| -> Option<usize> {
+            if node.eligible {
+                cost_rank_by_node.get(node.node_id.as_str()).copied()
+            } else {
+                None
             }
-
-            match (
-                cost_rank_by_node.get(left.node_id.as_str()),
-                cost_rank_by_node.get(right.node_id.as_str()),
-            ) {
-                (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => left.cmp(right),
+        };
+        candidates.sort_by(|left, right| match (cost_rank(left), cost_rank(right)) {
+            (Some(left_rank), Some(right_rank)) => {
+                left_rank.cmp(&right_rank).then_with(|| left.cmp(right))
             }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => left.cmp(right),
         });
     }
 

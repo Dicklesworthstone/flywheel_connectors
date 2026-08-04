@@ -10,10 +10,20 @@ fn external_callers_cannot_forge_supply_chain_success_results() {
     fs::write(
         crate_dir.path().join("Cargo.toml"),
         format!(
+            // `[workspace]` opts this throwaway crate OUT of any enclosing
+            // workspace. Without it, a tempdir that resolves under the project
+            // tree (which is what happens on an rch worker, where the checkout
+            // and the temp root share a filesystem root) makes cargo refuse
+            // with "current package believes it's in a workspace when it's
+            // not" — a DIFFERENT compile error than the private-field one this
+            // test asserts on, so the test failed remotely while passing
+            // locally (br-g2b1r).
             r#"[package]
 name = "fcp-registry-forge-check"
 version = "0.0.0"
 edition = "2024"
+
+[workspace]
 
 [dependencies]
 fcp-registry = {{ path = "{}" }}

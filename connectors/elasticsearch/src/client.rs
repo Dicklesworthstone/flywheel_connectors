@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use fcp_prelude::CredentialId;
 use fcp_prelude::log_redaction::redact_url;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, Response, StatusCode};
 use tracing::{debug, instrument};
@@ -200,11 +202,18 @@ impl ElasticsearchClient {
         }
     }
 
+    /// Issue a request with retry.
+    ///
+    /// `replay_safe` states whether repeating this request can duplicate a
+    /// side effect (br-kxd3e). It cannot be derived from `http_method` here,
+    /// because Elasticsearch uses POST for BOTH `_search` (a pure read) and
+    /// `_doc` without an id (which mints a new document id server-side).
     async fn request_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
+        replay_safe: bool,
     ) -> ElasticsearchResult<serde_json::Value> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
@@ -225,22 +234,22 @@ impl ElasticsearchClient {
             match req.send().await {
                 Ok(resp) => match self.handle_response(resp).await {
                     Ok(val) => AttemptOutcome::Success(val),
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        // 429 stays retryable — Elasticsearch rejected the
+                        // request WITHOUT indexing. A 5xx did reach it.
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 },
                 Err(err) => {
-                    let err = ElasticsearchError::Http(err);
-                    if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    }
+                    let replayable = replay_safe || !transport_error_reached_service(&err);
+                    AttemptOutcome::retryable_if_replayable(
+                        ElasticsearchError::Http(err),
+                        None,
+                        replayable,
+                    )
                 }
             }
         })
@@ -250,21 +259,48 @@ impl ElasticsearchClient {
     #[instrument(skip(self), fields(url))]
     async fn get(&self, path: &str) -> ElasticsearchResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("GET", &url, None).await
+        self.request_with_retry("GET", &url, None, true).await
     }
 
     #[instrument(skip(self, body), fields(url))]
+    /// POST with retry.
+    ///
+    /// br-kxd3e: fail-closed, because `_doc` without an id mints a new
+    /// document id server-side and a replay indexes the document TWICE.
+    /// `_search` uses [`Self::post_replay_safe`].
     async fn post(
         &self,
         path: &str,
         body: &serde_json::Value,
     ) -> ElasticsearchResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("POST", &url, Some(body)).await
+        self.request_with_retry("POST", &url, Some(body), false)
+            .await
+    }
+
+    /// POST whose replay cannot duplicate a side effect.
+    ///
+    /// Elasticsearch models search as a POST because the query travels in the
+    /// body; it indexes nothing.
+    async fn post_replay_safe(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> ElasticsearchResult<serde_json::Value> {
+        let url = format!("{}{path}", self.base_url);
+        self.request_with_retry("POST", &url, Some(body), true)
+            .await
     }
 
     #[instrument(skip(self, body), fields(url))]
+    /// POST an ndjson body (the `_bulk` API).
+    ///
+    /// br-kxd3e: NOT replay-safe. A bulk body whose actions omit document ids
+    /// indexes new documents, so a replay indexes them a second time. Bulk
+    /// actions that DO carry ids would be idempotent, but the body is opaque
+    /// here, so this fails closed.
     async fn post_ndjson(&self, path: &str, body: &str) -> ElasticsearchResult<serde_json::Value> {
+        let replay_safe = false;
         let url_owned = format!("{}{path}", self.base_url);
         let url: &str = &url_owned;
         let ctx = self.runtime.request_context();
@@ -288,22 +324,22 @@ impl ElasticsearchClient {
             match req.send().await {
                 Ok(resp) => match self.handle_response(resp).await {
                     Ok(val) => AttemptOutcome::Success(val),
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        // 429 stays retryable — Elasticsearch rejected the
+                        // request WITHOUT indexing. A 5xx did reach it.
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 },
                 Err(err) => {
-                    let err = ElasticsearchError::Http(err);
-                    if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    }
+                    let replayable = replay_safe || !transport_error_reached_service(&err);
+                    AttemptOutcome::retryable_if_replayable(
+                        ElasticsearchError::Http(err),
+                        None,
+                        replayable,
+                    )
                 }
             }
         })
@@ -317,13 +353,15 @@ impl ElasticsearchClient {
         body: &serde_json::Value,
     ) -> ElasticsearchResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("PUT", &url, Some(body)).await
+        // PUT indexes at a caller-chosen id, so a replay overwrites rather
+        // than duplicating.
+        self.request_with_retry("PUT", &url, Some(body), true).await
     }
 
     #[instrument(skip(self), fields(url))]
     async fn delete(&self, path: &str) -> ElasticsearchResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("DELETE", &url, None).await
+        self.request_with_retry("DELETE", &url, None, true).await
     }
 
     // -- Search --
@@ -351,7 +389,8 @@ impl ElasticsearchClient {
         if let Some(s) = sort {
             body["sort"] = s.clone();
         }
-        self.post(&format!("/{index}/_search"), &body).await
+        self.post_replay_safe(&format!("/{index}/_search"), &body)
+            .await
     }
 
     /// Get a document by ID.

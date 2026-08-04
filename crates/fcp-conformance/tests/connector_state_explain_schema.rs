@@ -51,6 +51,146 @@ fn github_explain_payload(zone: Option<&str>, explicit_host: Option<&str>) -> Va
     connector_state_explain_payload(connector, &request)
 }
 
+fn availability(availability: &str, command: &str, authoritative: bool) -> Value {
+    json!({
+        "availability": availability,
+        "command": command,
+        "authoritative": authoritative,
+        "explanation": "fixture availability",
+        "recoverable": availability != "live-runtime",
+        "next_actions": ["inspect fixture provenance"]
+    })
+}
+
+fn host_backed_payload() -> Value {
+    json!({
+        "status": "ok",
+        "command": "connector",
+        "subcommand": "state explain",
+        "schema_version": CONNECTOR_STATE_EXPLAIN_SCHEMA_VERSION,
+        "_truth_source": "host",
+        "source": "host-admin-api",
+        "host_payload_source": "host-canonical-state",
+        "host_registry_version": 1,
+        "message": "Explained connector state storage for `github` from live fcp-host canonical fcp-store state.",
+        "connector": {
+            "requested_selector": "github",
+            "slug": "github",
+            "canonical_id": "fcp.github:enterprise:v1",
+            "name": "GitHub Connector",
+            "version": "1.0.0"
+        },
+        "connector_id": "fcp.github:enterprise:v1",
+        "state_root": {
+            "path": "/srv/fcp/state",
+            "source": "host"
+        },
+        "canonical_storage": "mesh",
+        "last_canonical_seq": 7,
+        "mesh_replica_count": 3,
+        "canonical_state": {
+            "root_present": true,
+            "connector_id": "fcp.github:enterprise:v1",
+            "zone_id": "z:work",
+            "instance_id": null,
+            "model": "singleton_writer",
+            "root_object_id": "1111111111111111111111111111111111111111111111111111111111111111",
+            "head_object_id": "2222222222222222222222222222222222222222222222222222222222222222",
+            "state_schema_version": 1,
+            "status_source": "fcp-store"
+        },
+        "local_cache_path": "/srv/fcp/state/fcp.github_enterprise_v1/cache",
+        "local_cache_present": true,
+        "local_cache_marker_present": true,
+        "cache_marker": {
+            "filename": ".fcp-cache-only",
+            "path": "/srv/fcp/state/fcp.github_enterprise_v1/cache/.fcp-cache-only",
+            "present": true,
+            "status": "present"
+        },
+        "zone": {
+            "requested": "z:work",
+            "local_cache_path": "/srv/fcp/state/fcp.github_enterprise_v1/cache/z_work",
+            "local_cache_marker_present": true,
+            "cache_marker_status": "present"
+        },
+        "live_host": {
+            "requested": true,
+            "endpoint_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "queried",
+            "route_available": true,
+            "route": "/rpc/admin/connectors/{connector_id}/state/explain"
+        },
+        "telemetry": {
+            "cache_hit_counter": "fcp_connector_state_cache_hits_total",
+            "fall_through_counter": "fcp_connector_state_fall_through_total",
+            "fall_through_event": "fcp.connector_state.fall_through"
+        },
+        "warnings": [],
+        "availability": availability("live-runtime", "connector", true)
+    })
+}
+
+fn connector_resolution_error_payload() -> Value {
+    json!({
+        "status": "error",
+        "command": "connector",
+        "schema_version": "fcp.fwc.truth-source.v1",
+        "_truth_source": "offline",
+        "error": {
+            "type": "connector-not-found",
+            "message": "`missing` did not match any connector in the workspace catalog.",
+            "recoverable": true,
+            "selector": "missing",
+            "did_you_mean": [],
+            "examples": ["fwc list"],
+            "next_actions": [
+                "Use `fwc list` or `fwc search <term>` to narrow the connector first."
+            ]
+        }
+    })
+}
+
+fn truth_source_unavailable_payload() -> Value {
+    json!({
+        "status": "error",
+        "command": "connector",
+        "subcommand": "state explain",
+        "schema_version": "fcp.fwc.truth-source.v1",
+        "_truth_source": "host",
+        "error": {
+            "type": "truth-source-unavailable",
+            "required": "mesh",
+            "actual": "host",
+            "message": "`fwc connector state explain` resolved from `host` truth, which does not satisfy `--require-source mesh`.",
+            "recoverable": true
+        },
+        "next_actions": ["Retry after the required live truth source is reachable."],
+        "availability": availability("unavailable", "connector", false)
+    })
+}
+
+fn truth_resolver_internal_error_payload() -> Value {
+    json!({
+        "status": "error",
+        "command": "connector",
+        "subcommand": "state explain",
+        "schema_version": "fcp.fwc.truth-source.v1",
+        "_truth_source": "unavailable",
+        "error": {
+            "type": "truth-resolver-internal-error",
+            "message": "`fwc connector state explain` could not classify live truth because the resolver failed internally.",
+            "recoverable": false,
+            "redacted_cause": "resolver panicked after redaction",
+            "log_event": "fcp.truth_resolver.internal_error",
+            "correlation_id": "00000000-0000-4000-8000-000000000000",
+            "bead_reference": "flywheel_connectors-hr0rr.2.5"
+        },
+        "next_actions": ["Inspect logs for `fcp.truth_resolver.internal_error`."],
+        "availability": availability("unavailable", "connector", false)
+    })
+}
+
 fn assert_valid(instance: &Value) {
     let validator = validator();
     let errors = validator
@@ -106,6 +246,48 @@ fn connector_state_explain_schema_validates_host_requested_payload() {
 }
 
 #[test]
+fn connector_state_explain_schema_validates_host_backed_payload() {
+    let payload = host_backed_payload();
+
+    assert_valid(&payload);
+    assert_eq!(payload["_truth_source"], "host");
+    assert_eq!(payload["source"], "host-admin-api");
+    assert_eq!(payload["host_payload_source"], "host-canonical-state");
+    assert_eq!(payload["canonical_state"]["status_source"], "fcp-store");
+    assert_eq!(payload["live_host"]["state"], "queried");
+}
+
+#[test]
+fn connector_state_explain_schema_validates_connector_resolution_error() {
+    let payload = connector_resolution_error_payload();
+
+    assert_valid(&payload);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["error"]["type"], "connector-not-found");
+}
+
+#[test]
+fn connector_state_explain_schema_validates_truth_source_unavailable() {
+    let payload = truth_source_unavailable_payload();
+
+    assert_valid(&payload);
+    assert_eq!(payload["error"]["required"], "mesh");
+    assert_eq!(payload["error"]["actual"], "host");
+}
+
+#[test]
+fn connector_state_explain_schema_validates_truth_resolver_internal_error() {
+    let payload = truth_resolver_internal_error_payload();
+
+    assert_valid(&payload);
+    assert_eq!(payload["_truth_source"], "unavailable");
+    assert_eq!(
+        payload["error"]["log_event"],
+        "fcp.truth_resolver.internal_error"
+    );
+}
+
+#[test]
 fn connector_state_explain_schema_rejects_missing_schema_version() {
     let mut payload = github_explain_payload(Some("z:work"), None);
     payload
@@ -149,6 +331,46 @@ fn connector_state_explain_schema_rejects_unknown_canonical_storage() {
     payload["canonical_storage"] = json!("maybe");
 
     assert_invalid(&payload, "canonical storage is a closed enum");
+}
+
+#[test]
+fn connector_state_explain_schema_rejects_host_payload_without_canonical_state() {
+    let mut payload = host_backed_payload();
+    payload
+        .as_object_mut()
+        .expect("payload must be an object")
+        .remove("canonical_state");
+
+    assert_invalid(
+        &payload,
+        "host-backed payload must carry canonical state evidence",
+    );
+}
+
+#[test]
+fn connector_state_explain_schema_rejects_offline_payload_with_host_only_fields() {
+    let mut payload = github_explain_payload(Some("z:work"), None);
+    payload["telemetry"] = json!({
+        "cache_hit_counter": "fcp_connector_state_cache_hits_total",
+        "fall_through_counter": "fcp_connector_state_fall_through_total",
+        "fall_through_event": "fcp.connector_state.fall_through"
+    });
+
+    assert_invalid(&payload, "offline payload cannot claim host telemetry");
+}
+
+#[test]
+fn connector_state_explain_schema_rejects_incomplete_resolver_internal_error() {
+    let mut payload = truth_resolver_internal_error_payload();
+    payload["error"]
+        .as_object_mut()
+        .expect("error must be an object")
+        .remove("redacted_cause");
+
+    assert_invalid(
+        &payload,
+        "resolver internal errors must carry redacted cause",
+    );
 }
 
 #[test]

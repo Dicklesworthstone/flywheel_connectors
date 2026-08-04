@@ -50,6 +50,37 @@ fn validate_sql_identifier<'a>(value: &'a str, field: &str) -> SnowflakeResult<&
     Ok(value)
 }
 
+/// Validate a Snowflake account identifier before it is interpolated into the
+/// request host (`https://{account}.snowflakecomputing.com`).
+///
+/// Account identifiers are either `orgname-account_name` or a legacy account
+/// locator optionally suffixed with region/cloud segments
+/// (`xy12345.us-east-1.aws`), so only ASCII alphanumerics plus `-`, `_`, and
+/// `.` are legitimate. Anything else (`/`, `\`, `@`, `:`, `?`, `#`, `%`,
+/// whitespace) could terminate or escape the intended host — e.g. `evil.com/`
+/// parses to host `evil.com` — redirecting the bearer-token-carrying request to
+/// an attacker-controlled server.
+fn validate_account_identifier(value: &str) -> SnowflakeResult<()> {
+    if value.is_empty() {
+        return Err(SnowflakeError::InvalidInput(
+            "account_identifier must not be empty".into(),
+        ));
+    }
+    for ch in value.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.' {
+            return Err(SnowflakeError::InvalidInput(format!(
+                "account_identifier contains invalid character '{ch}'"
+            )));
+        }
+    }
+    if value.starts_with('.') || value.ends_with('.') || value.contains("..") {
+        return Err(SnowflakeError::InvalidInput(
+            "account_identifier has invalid dot placement".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `Snowflake` authentication credentials.
 #[derive(Clone)]
 pub struct SnowflakeAuth {
@@ -111,12 +142,14 @@ impl SnowflakeClient {
             .user_agent("fcp-snowflake/0.1.0 (FCP connector)")
             .build()?;
 
-        let url = match base_url {
-            Some(u) => u.trim_end_matches('/').to_string(),
-            None => format!(
+        let url = if let Some(u) = base_url {
+            u.trim_end_matches('/').to_string()
+        } else {
+            validate_account_identifier(&auth.account_identifier)?;
+            format!(
                 "https://{}.snowflakecomputing.com/api/v2",
                 auth.account_identifier
-            ),
+            )
         };
 
         Ok(Self {
@@ -385,6 +418,47 @@ mod tests {
             client.base_url,
             "https://myaccount.snowflakecomputing.com/api/v2"
         );
+    }
+
+    #[test]
+    fn client_new_rejects_host_injecting_account_identifier() {
+        // A crafted account identifier must not be able to break out of the
+        // `{account}.snowflakecomputing.com` host and redirect the
+        // access-token-carrying request to an attacker-controlled server.
+        for evil in [
+            "evil.com/",
+            "evil.com\\",
+            "acct@evil.com",
+            "acct:8080",
+            "acct?x=1",
+            "acct#frag",
+            "acct%2f..",
+            "..",
+            "acct with space",
+            "",
+        ] {
+            let auth = SnowflakeAuth {
+                access_token: "TOKEN".into(),
+                account_identifier: evil.into(),
+            };
+            let result = SnowflakeClient::new(auth, None, None, None, None);
+            assert!(
+                matches!(result, Err(SnowflakeError::InvalidInput(_))),
+                "account_identifier {evil:?} must be rejected"
+            );
+        }
+
+        // Legitimate identifier shapes (org-account and legacy locator) accepted.
+        for ok in ["myorg-myaccount", "xy12345.us-east-1.aws", "ACC_1"] {
+            let auth = SnowflakeAuth {
+                access_token: "TOKEN".into(),
+                account_identifier: ok.into(),
+            };
+            assert!(
+                SnowflakeClient::new(auth, None, None, None, None).is_ok(),
+                "account_identifier {ok:?} must be accepted"
+            );
+        }
     }
 
     #[test]

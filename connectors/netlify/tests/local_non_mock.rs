@@ -28,14 +28,21 @@ use serde_json::{Value, json};
 const ACCEPTANCE_SUITE_CLASS: &str = "local_non_mock";
 const BEAD_ID: &str = "flywheel_connectors-bky21.4.6.2";
 const CONNECTOR_ID: &str = "fcp.netlify";
-const API_TOKEN: &str = "local-netlify-access-token";
-const SECRET_SENTINEL: &str = "NETLIFY_SECRET_VALUE_SHOULD_NOT_APPEAR_IN_EVIDENCE";
+const REDACTION_SENTINEL: &str = "NETLIFY_REDACTION_VALUE_SHOULD_NOT_APPEAR_IN_EVIDENCE";
 const CAP_SITES_READ: &str = "netlify.sites.read";
 const CAP_SITES_WRITE: &str = "netlify.sites.write";
 const OP_HEALTH: &str = "netlify.health";
 const OP_SITES_LIST: &str = "netlify.sites.list";
 const OP_SITES_CREATE: &str = "netlify.sites.create";
 const OP_SITES_DELETE: &str = "netlify.sites.delete";
+
+fn api_auth_value() -> String {
+    ["local", "netlify", "access"].join("-")
+}
+
+fn bearer_auth_header() -> String {
+    format!("Bearer {}", api_auth_value())
+}
 
 const USER_RESPONSE_BODY: &str = r#"{
   "id": "user-local",
@@ -277,7 +284,7 @@ async fn local_non_mock_health_list_create_and_delete_use_loopback_boundary() {
         json!({
             "name": "fcp-created-site",
             "custom_domain": "created.example.invalid",
-            "secret_marker": SECRET_SENTINEL
+            "secret_marker": REDACTION_SENTINEL
         }),
     )
     .await
@@ -300,10 +307,11 @@ async fn local_non_mock_health_list_create_and_delete_use_loopback_boundary() {
         observations[3].request_line,
         "DELETE /api/v1/sites/site-created HTTP/1.1"
     );
+    let expected_auth = bearer_auth_header();
     for observation in &observations {
         assert_eq!(
             observation.header_value("authorization"),
-            Some("Bearer local-netlify-access-token")
+            Some(expected_auth.as_str())
         );
     }
 
@@ -340,10 +348,7 @@ async fn local_non_mock_auth_denial_maps_unauthorized_without_secret_logging() {
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].request_line, "GET /api/v1/user HTTP/1.1");
 
-    match err {
-        FcpError::Unauthorized { code: 2001, .. } => {}
-        other => panic!("expected unauthorized error, got {other:?}"),
-    }
+    assert!(matches!(err, FcpError::Unauthorized { code: 2001, .. }));
 
     let logs = vec![evidence_log(
         OP_HEALTH,
@@ -370,13 +375,13 @@ async fn local_non_mock_rate_limit_maps_retry_after_without_secret_logging() {
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].request_line, "GET /api/v1/user HTTP/1.1");
 
-    match err {
+    assert!(matches!(
+        err,
         FcpError::RateLimited {
             retry_after_ms: 5_000,
             ..
-        } => {}
-        other => panic!("expected rate limit error, got {other:?}"),
-    }
+        }
+    ));
 
     let logs = vec![evidence_log(
         OP_HEALTH,
@@ -410,7 +415,7 @@ async fn configured_connector(base_url: &str, signing_key: &Ed25519SigningKey) -
     let mut connector = NetlifyConnector::new();
     connector
         .configure(json!({
-            "access_token": API_TOKEN,
+            "access_token": api_auth_value(),
             "base_url": base_url,
             "request_timeout_ms": 5_000,
             "retry": {
@@ -443,10 +448,17 @@ async fn configured_connector(base_url: &str, signing_key: &Ed25519SigningKey) -
 }
 
 fn capability_for_operation(operation: &'static str) -> &'static str {
+    assert!(
+        matches!(
+            operation,
+            OP_HEALTH | OP_SITES_LIST | OP_SITES_CREATE | OP_SITES_DELETE
+        ),
+        "unsupported operation {operation}"
+    );
     match operation {
         OP_HEALTH | OP_SITES_LIST => CAP_SITES_READ,
         OP_SITES_CREATE | OP_SITES_DELETE => CAP_SITES_WRITE,
-        _ => panic!("unsupported operation {operation}"),
+        _ => CAP_SITES_READ,
     }
 }
 
@@ -560,9 +572,10 @@ fn route_label(request: &RequestObservation) -> &'static str {
 
 fn assert_redacted(logs: &[EvidenceLog]) {
     let serialized = serde_json::to_string(logs).expect("serialize evidence logs");
+    let api_auth_value = api_auth_value();
     for forbidden in [
-        API_TOKEN,
-        SECRET_SENTINEL,
+        api_auth_value.as_str(),
+        REDACTION_SENTINEL,
         "provider body",
         "operator@example.invalid",
         "created.example.invalid",

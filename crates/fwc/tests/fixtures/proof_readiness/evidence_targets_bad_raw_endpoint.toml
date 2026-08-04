@@ -1,0 +1,16 @@
+schema_version = "fcp.fwc.proof-readiness-targets.v1"
+
+[[targets]]
+target_id = "bad_endpoint"
+title = "Bad endpoint target"
+blocked_beads = ["flywheel_connectors-qeg89.1"]
+artifact_schema = "fcp.fixture-proof.v1"
+artifact_root = "artifacts/proof/fixture"
+artifact_globs = ["artifacts/proof/fixture/*.json"]
+freshness_days = 7
+machine_classes = ["fixture"]
+host_roles = ["10.0.0.12"]
+required_artifact_fields = ["schema_version", "git_sha"]
+command_template = "curl https://private.example.invalid/proof"
+redaction_policy = ["no_raw_hostnames", "no_private_ips", "no_tokens"]
+evidence_notes = ["This fixture intentionally contains raw endpoint material."]

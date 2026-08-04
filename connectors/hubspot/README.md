@@ -73,12 +73,12 @@ Important runtime truths the contract preserves:
 - `handle_shutdown` shuts down the client runtime, clears config/client state, and resets configured and handshaken flags.
 - `invoke` only checks the connector ready state and operation ID. It does not require or verify an FCP capability token in this checkout.
 - `simulate` only checks whether an operation ID is known. It does not check configured state, handshake state, approval policy, or capability tokens.
+- Runtime operation metadata is derived from the strict manifest, including schemas, capabilities, risk, safety, idempotency, approval, AI hints, and rate-limit metadata.
 
 ## Drift Visible In This Checkout
 
 This README documents runtime truth and keeps current drift visible:
 
-- Runtime operation metadata sets `requires_approval = None` for every operation, while the manifest marks CRM writes and deletes as `policy` or `interactive`.
 - Runtime does not verify bound capability tokens for either `invoke` or `simulate`; capability families are advertised but not mechanically enforced at this connector boundary.
 - Runtime uses legacy HubSpot CRM v3/v4 paths such as `/crm/v3/objects/contacts`, `/crm/v3/objects/deals/search`, and `/crm/v4/objects/.../associations/...`. Current HubSpot docs also expose newer date-versioned API paths for some CRM operations.
 - Runtime `hubspot.contacts.delete` sends `DELETE /crm/v3/objects/contacts/{contact_id}` and returns `{ "deleted": true }`; HubSpot documentation treats this as archiving a contact record.
@@ -90,7 +90,7 @@ This README documents runtime truth and keeps current drift visible:
 - `configure` returns `{}` and does not surface the provisioning-readiness payload that `self_check` calculates.
 - `doctor` does not include base URL policy or auth-mode diagnostics, while `self_check` does.
 
-A follow-up parity bead should add capability-token verification, align runtime approval metadata with the manifest, decide whether to move to HubSpot's latest date-versioned CRM paths, clarify delete/archive wording in API results, either implement real webhook receiving or rename the event operation as polling, reconcile `analytics.report` with current HubSpot reporting APIs, and route direct HTTP requests through the shared retry policy.
+A follow-up parity bead should add capability-token verification, decide whether to move to HubSpot's latest date-versioned CRM paths, clarify delete/archive wording in API results, either implement real webhook receiving or rename the event operation as polling, reconcile `analytics.report` with current HubSpot reporting APIs, and route direct HTTP requests through the shared retry policy.
 
 ## First-Slice Scope
 
@@ -101,7 +101,7 @@ The current HubSpot README slice documents the existing runtime surface:
 - local path/query sanitization and base URL policy behavior
 - local provisioning recipe, doctor, health, self-check, simulate, introspect, invoke, and shutdown surfaces
 - provider error mapping and rate-limit response handling
-- runtime/manifest drift around approval, capability-token verification, CRM API versioning, analytics/reporting, and event streaming
+- remaining runtime drift around capability-token verification, CRM API versioning, analytics/reporting, and event streaming
 - mock-only WireMock integration tests
 
 ## Auth And Zone Boundary

@@ -89,6 +89,9 @@ fn push_if(names: &mut Vec<&'static str>, enabled: bool, name: &'static str) {
     }
 }
 
+// Only const-eligible on targets where every arch-specific detector compiles
+// to an empty stub; the x86 path uses runtime CPUID feature detection.
+#[allow(clippy::missing_const_for_fn)]
 fn detect_without_logging() -> HwFeatureSet {
     let mut features = HwFeatureSet::all_false();
     detect_x86(&mut features);

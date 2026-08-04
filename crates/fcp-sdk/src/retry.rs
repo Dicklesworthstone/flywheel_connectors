@@ -176,7 +176,41 @@ impl RetryPolicy {
         let factor = jitter_factor.clamp(0.0, 1.0).mul_add(0.5, 0.5);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let jittered = (base as f64 * factor) as u64;
-        jittered
+        // Preserve `compute_backoff_ms`'s ≥1ms guarantee: the jitter factor
+        // bottoms out at 0.5, and `(1 * 0.5) as u64 == 0`, so a policy with a
+        // 1ms effective backoff would otherwise retry with no delay at all —
+        // exactly the tight busy-wait loop that floor exists to prevent.
+        if self.base_backoff_ms > 0 {
+            jittered.max(1)
+        } else {
+            jittered
+        }
+    }
+
+    /// Clamp a server-supplied `Retry-After` hint into this policy's bounds.
+    ///
+    /// `Retry-After` is attacker-controlled. `max_backoff_ms` is the policy's
+    /// documented ceiling, so a hint must not be able to override it — an
+    /// unclamped hint let one response header park a connector for as long as
+    /// the upstream asked (bounded in practice only by the request deadline,
+    /// and not at all on a deadline-less background context). The floor
+    /// matters too: `Retry-After: 0` from a service that just asked to be
+    /// backed off would otherwise produce a zero-delay retry burst for the
+    /// whole attempt budget.
+    const fn clamp_retry_after_ms(&self, hint_ms: u64) -> u64 {
+        let floor = if self.base_backoff_ms > 0 { 1 } else { 0 };
+        let ceiling = if self.max_backoff_ms > floor {
+            self.max_backoff_ms
+        } else {
+            floor
+        };
+        if hint_ms < floor {
+            floor
+        } else if hint_ms > ceiling {
+            ceiling
+        } else {
+            hint_ms
+        }
     }
 
     /// Translate a retry decision into a delay, applying Retry-After hints.
@@ -206,16 +240,15 @@ impl RetryPolicy {
         match decision {
             RetryDecision::Terminal => None,
             RetryDecision::Immediate => Some(Duration::from_millis(0)),
-            RetryDecision::After(delay) => Some(delay),
+            RetryDecision::After(delay) => Some(Duration::from_millis(
+                self.clamp_retry_after_ms(duration_to_ms(delay)),
+            )),
             RetryDecision::Backoff => {
                 let jitter = pseudo_random_jitter(attempt);
                 let mut delay_ms = self.compute_backoff_with_jitter_ms(attempt, jitter);
 
                 if let Some(hint) = retry_after_hint {
-                    let hint_ms = duration_to_ms(hint);
-                    if hint_ms > delay_ms {
-                        delay_ms = hint_ms;
-                    }
+                    delay_ms = delay_ms.max(self.clamp_retry_after_ms(duration_to_ms(hint)));
                 }
 
                 Some(Duration::from_millis(delay_ms))
@@ -558,9 +591,72 @@ mod tests {
         let p = RetryPolicy::new()
             .with_base_backoff_ms(1_000)
             .with_jitter_enabled(false);
-        let hint = Duration::from_secs(120);
+        // Under the policy ceiling (default max_backoff_ms = 60s), the hint wins.
+        let hint = Duration::from_secs(30);
         let delay = p.next_delay(0, RetryDecision::Backoff, Some(hint)).unwrap();
         assert_eq!(delay, hint);
+    }
+
+    /// `Retry-After` is attacker-controlled, so it may raise the delay but must
+    /// never escape `max_backoff_ms` — the policy's documented ceiling. An
+    /// unclamped hint let one response header park a connector for as long as
+    /// the upstream asked.
+    #[test]
+    fn next_delay_clamps_hostile_retry_after_to_max_backoff() {
+        let p = RetryPolicy::new()
+            .with_base_backoff_ms(1_000)
+            .with_jitter_enabled(false);
+        let ceiling = Duration::from_millis(p.max_backoff_ms);
+
+        // Via the Backoff path (hint passed alongside).
+        let delay = p
+            .next_delay(
+                0,
+                RetryDecision::Backoff,
+                Some(Duration::from_secs(31_536_000)),
+            )
+            .unwrap();
+        assert_eq!(delay, ceiling);
+
+        // Via the explicit After path, which previously returned the hint verbatim.
+        let delay = p
+            .next_delay(
+                0,
+                RetryDecision::After(Duration::from_secs(31_536_000)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(delay, ceiling);
+    }
+
+    /// `Retry-After: 0` from a service that just asked to be backed off must not
+    /// turn into a zero-delay retry burst for the whole attempt budget.
+    #[test]
+    fn next_delay_floors_zero_retry_after() {
+        let p = RetryPolicy::new()
+            .with_base_backoff_ms(1_000)
+            .with_jitter_enabled(false);
+        let delay = p
+            .next_delay(0, RetryDecision::After(Duration::ZERO), None)
+            .unwrap();
+        assert!(delay >= Duration::from_millis(1), "got {delay:?}");
+    }
+
+    /// The jitter factor bottoms out at 0.5 and truncates, so a 1ms effective
+    /// backoff produced a 0ms delay — the tight busy-wait loop
+    /// `compute_backoff_ms`'s floor exists to prevent.
+    #[test]
+    fn jittered_backoff_preserves_the_one_millisecond_floor() {
+        let p = RetryPolicy::new()
+            .with_base_backoff_ms(1)
+            .with_max_backoff_ms(1)
+            .with_jitter_enabled(true);
+        for attempt in 0..8 {
+            assert!(
+                p.compute_backoff_with_jitter_ms(attempt, 0.0) >= 1,
+                "attempt {attempt} produced a zero delay"
+            );
+        }
     }
 
     #[test]

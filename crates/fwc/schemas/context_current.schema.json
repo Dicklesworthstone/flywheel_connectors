@@ -2,25 +2,257 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "fcp://schemas/fwc/context-current/truth-source-envelope/v1",
   "title": "FWC context current truth-source envelope v1",
-  "description": "Top-level provenance envelope for `fwc context current --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "command", "subcommand", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "context" },
-    "subcommand": { "const": "current" },
-    "schema_version": { "const": "fcp.fwc.truth-source.v1" },
-    "_truth_source": {
+  "description": "Stable JSON output schema for `fwc context current --json`, including truth-source metadata.",
+  "oneOf": [
+    { "$ref": "#/$defs/current_success" },
+    { "$ref": "#/$defs/truth_source_unavailable" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
+  ],
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_non_empty_string": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
+    "truth_source": {
       "type": "string",
       "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
     },
-    "error": {
+    "truth_requirement": {
+      "type": "string",
+      "enum": ["mesh", "mesh-or-host", "any-live"]
+    },
+    "schema_version": {
+      "const": "fcp.fwc.truth-source.v1"
+    },
+    "next_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "availability_tag": {
+      "type": "string",
+      "enum": [
+        "live-runtime",
+        "offline-artifact",
+        "unsupported",
+        "planned",
+        "unavailable",
+        "denied",
+        "unknown"
+      ]
+    },
+    "context_availability": {
       "type": "object",
-      "additionalProperties": true,
-      "required": ["type"],
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "availability": { "$ref": "#/$defs/availability_tag" },
+        "command": { "const": "context" },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "context_error_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
+      "properties": {
+        "availability": { "$ref": "#/$defs/availability_tag" },
+        "command": {
+          "type": "string",
+          "enum": ["context", "context current"]
+        },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        }
+      }
+    },
+    "config_overrides": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "active_context": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "endpoint",
+            "default_zone",
+            "node_identity",
+            "config_overrides"
+          ],
+          "properties": {
+            "name": { "$ref": "#/$defs/non_empty_string" },
+            "endpoint": { "$ref": "#/$defs/non_empty_string" },
+            "default_zone": { "$ref": "#/$defs/nullable_non_empty_string" },
+            "node_identity": { "$ref": "#/$defs/nullable_non_empty_string" },
+            "config_overrides": { "$ref": "#/$defs/config_overrides" }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "context_error_identity": {
+      "oneOf": [
+        {
+          "required": ["command", "subcommand"],
+          "properties": {
+            "command": { "const": "context" },
+            "subcommand": { "const": "current" }
+          }
+        },
+        {
+          "required": ["command"],
+          "properties": {
+            "command": { "const": "context current" }
+          },
+          "not": { "required": ["subcommand"] }
+        }
+      ]
+    },
+    "current_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "config_path",
+        "current_context",
+        "context",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "context" },
+        "subcommand": { "const": "current" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "config_path": { "$ref": "#/$defs/non_empty_string" },
+        "current_context": { "$ref": "#/$defs/non_empty_string" },
+        "context": { "$ref": "#/$defs/active_context" },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/context_availability" }
+      }
+    },
+    "truth_source_unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [{ "$ref": "#/$defs/context_error_identity" }],
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": {
+          "type": "string",
+          "enum": ["context", "context current"]
+        },
+        "subcommand": { "const": "current" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": { "$ref": "#/$defs/truth_requirement" },
+            "actual": { "$ref": "#/$defs/truth_source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/context_error_availability" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [{ "$ref": "#/$defs/context_error_identity" }],
+      "required": [
+        "status",
+        "command",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": {
+          "type": "string",
+          "enum": ["context", "context current"]
+        },
+        "subcommand": { "const": "current" },
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/next_actions" },
+        "availability": { "$ref": "#/$defs/context_error_availability" }
       }
     }
   }

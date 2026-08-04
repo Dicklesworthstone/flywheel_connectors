@@ -23,7 +23,8 @@ workspace = true
 fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
-fcp-sdk = { path = "../../crates/fcp-sdk" }
+# `connector-http` gates `transport_error_reached_service` (see client.rs).
+fcp-sdk = { path = "../../crates/fcp-sdk", features = ["connector-http"] }
 fcp-voice-call = { path = "../../crates/fcp-voice-call" }
 
 anyhow.workspace = true

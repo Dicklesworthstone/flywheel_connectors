@@ -21,6 +21,7 @@ workspace = true
 
 [dependencies]
 fcp-core = { path = "../../crates/fcp-core" }
+fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-sdk = { path = "../../crates/fcp-sdk" }
@@ -42,5 +43,4 @@ wiremock.workspace = true
 hex.workspace = true
 sha2.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
-fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }

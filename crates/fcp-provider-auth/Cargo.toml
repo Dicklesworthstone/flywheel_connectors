@@ -19,6 +19,7 @@ fcp-async-core = { path = "../fcp-async-core" }
 hex.workspace = true
 hmac.workspace = true
 parking_lot.workspace = true
+percent-encoding.workspace = true
 rand.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

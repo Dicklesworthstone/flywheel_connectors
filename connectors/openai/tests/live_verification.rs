@@ -128,7 +128,8 @@ async fn live_chat_completions() {
 
     let mut connector = OpenAIConnector::new();
     let signing_key = setup_live_connector(&mut connector, &api_key).await;
-    let capability = generate_read_token(&signing_key, connector.instance_id(), "openai.simple_chat");
+    let capability =
+        generate_read_token(&signing_key, connector.instance_id(), "openai.simple_chat");
 
     let result = connector
         .handle_invoke(json!({
@@ -193,7 +194,8 @@ async fn live_error_mapping_invalid_key() {
         .await
         .expect("handshake should succeed");
 
-    let capability = generate_read_token(&signing_key, connector.instance_id(), "openai.simple_chat");
+    let capability =
+        generate_read_token(&signing_key, connector.instance_id(), "openai.simple_chat");
 
     let err = connector
         .handle_invoke(json!({

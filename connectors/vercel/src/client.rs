@@ -7,7 +7,9 @@ mod projects;
 
 use std::time::Duration;
 
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
@@ -207,6 +209,13 @@ impl VercelClient {
         .await
     }
 
+    /// Issue a request with retry.
+    ///
+    /// br-kxd3e: replay safety is derived from the verb — GET reads, PUT/PATCH
+    /// set named fields, DELETE converges, and only POST creates. Vercel has
+    /// no idempotency key, so a replayed POST can trigger a SECOND deployment.
+    /// (The POST helper currently has no callers; the gate is here so the
+    /// first one added inherits the safe behaviour.)
     async fn request_json<R>(
         &self,
         method: Method,
@@ -219,6 +228,7 @@ impl VercelClient {
     {
         let url = self.endpoint_url(endpoint);
         let query = self.scope_query(extra_query);
+        let replay_safe = method != Method::POST;
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -240,19 +250,26 @@ impl VercelClient {
                 match builder.send().await {
                     Ok(response) => match self.handle_response(response).await {
                         Ok(parsed) => AttemptOutcome::Success(parsed),
-                        Err(error) if error.is_retryable() => AttemptOutcome::Retryable {
-                            retry_after: error.retry_after(),
-                            error,
-                        },
+                        Err(error) if error.is_retryable() => {
+                            // 429 stays retryable — refused WITHOUT deploying.
+                            let replayable =
+                                replay_safe || matches!(error, VercelError::RateLimited { .. });
+                            let retry_after = error.retry_after();
+                            AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                        }
                         Err(error) => AttemptOutcome::Terminal(error),
                     },
-                    Err(error) if error.is_timeout() || error.is_connect() => {
-                        AttemptOutcome::Retryable {
-                            error: VercelError::Http(error),
-                            retry_after: None,
-                        }
+                    // `is_timeout()` is the TOTAL request timeout and fires
+                    // after the body was written; only a connect-phase failure
+                    // proves the request never arrived.
+                    Err(error) => {
+                        let replayable = replay_safe || !transport_error_reached_service(&error);
+                        AttemptOutcome::retryable_if_replayable(
+                            VercelError::Http(error),
+                            None,
+                            replayable,
+                        )
                     }
-                    Err(error) => AttemptOutcome::Terminal(VercelError::Http(error)),
                 }
             }
         })

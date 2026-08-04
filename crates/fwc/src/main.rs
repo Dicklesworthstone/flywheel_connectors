@@ -228,6 +228,9 @@ mod policy_cmd;
 #[allow(dead_code)] // Prerequisite onboarding, repair, and drift detection.
 mod prerequisite;
 mod proof_cmd;
+mod proof_readiness;
+#[allow(dead_code)]
+mod proof_request;
 #[allow(dead_code, clippy::cast_precision_loss)]
 mod rate_forecast;
 #[allow(dead_code)]
@@ -2750,6 +2753,10 @@ struct ServeMcpArgs {
     #[arg(long)]
     zone: Option<String>,
 
+    /// Maximum risk level to include (low, medium, high, critical).
+    #[arg(long)]
+    risk_max: Option<String>,
+
     /// Optional principal identity forwarded on each live tool call.
     #[arg(long)]
     principal: Option<String>,
@@ -3399,7 +3406,10 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
         catalog.connectors.clone()
     };
 
-    let config = serve_mcp_config(args.connector.as_ref().and(connectors.first()));
+    let config = serve_mcp_config(
+        args.connector.as_ref().and(connectors.first()),
+        args.risk_max.as_deref(),
+    );
 
     let mut tools = Vec::new();
     for connector in &connectors {
@@ -3439,10 +3449,14 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
 
 fn serve_mcp_config(
     selected_connector: Option<&HostConnectorRecord>,
+    risk_max: Option<&str>,
 ) -> serve_mcp::McpServerConfig {
     let mut config = serve_mcp::McpServerConfig::new();
     if let Some(connector) = selected_connector {
         config = config.with_connector_filter(connector.slug.clone());
+    }
+    if let Some(risk_max) = risk_max {
+        config = config.with_risk_max(risk_max);
     }
     config
 }
@@ -7840,12 +7854,14 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
     let resolved_host = resolve_host_config(host)?;
     if args.offline {
         if resolved_host.is_some() {
-            return Ok(conflicting_catalog_mode_dispatch("list"));
+            let mut outcome = conflicting_catalog_mode_dispatch("list");
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            return Ok(outcome);
         }
     } else if let Some(host) = resolved_host {
         return list_dispatch_host(args, &host.endpoint);
     } else {
-        return Ok(missing_host_dispatch(
+        let mut outcome = missing_host_dispatch(
             "list",
             json!({
                 "filters": {
@@ -7859,7 +7875,9 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 "fwc list --host <endpoint>".to_owned(),
                 "fwc list --offline".to_owned(),
             ],
-        ));
+        );
+        inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+        return Ok(outcome);
     }
 
     if let Some(outcome) =
@@ -8078,6 +8096,7 @@ fn zones_dispatch(args: &ZonesArgs) -> Result<DispatchOutcome> {
     }
 
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -9403,6 +9422,7 @@ fn mesh_lease_ladder_dispatch(
         ],
     });
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -10718,6 +10738,7 @@ fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
     });
     payload["warnings"] = json!(warnings);
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -10769,6 +10790,7 @@ fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
     });
     payload["warnings"] = json!(warnings);
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -10831,6 +10853,7 @@ fn mesh_use_dispatch(args: &MeshUseArgs) -> Result<DispatchOutcome> {
         ]);
     }
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -10883,6 +10906,7 @@ fn mesh_target_dispatch(args: &MeshTargetArgs) -> Result<DispatchOutcome> {
             ],
         });
         envelope.inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
@@ -10963,6 +10987,7 @@ fn mesh_target_dispatch(args: &MeshTargetArgs) -> Result<DispatchOutcome> {
             ],
         });
         envelope.inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
@@ -11007,6 +11032,7 @@ fn mesh_target_dispatch(args: &MeshTargetArgs) -> Result<DispatchOutcome> {
             ],
         });
         envelope.inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
         Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
@@ -15490,6 +15516,7 @@ fn telemetry_otlp_readiness_dispatch(args: &TelemetryOtlpReadinessArgs) -> Dispa
         "next_actions": telemetry_readiness_next_actions(status),
     });
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     DispatchOutcome { payload, exit_code }
 }
 
@@ -15541,6 +15568,7 @@ fn telemetry_config_error_dispatch(
         ],
     });
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -18132,6 +18160,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-get answers are authoritative for the current node's config snapshot. Sanitized snapshots are degraded for replay because inline secrets are intentionally withheld.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             envelope.inject_into(&mut payload);
             Ok(DispatchOutcome {
                 payload,
@@ -18267,6 +18296,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-set answers are authoritative for the current node's applied connector config mutation and record the exact mutation target for automation.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             envelope.inject_into(&mut payload);
             Ok(DispatchOutcome {
                 payload,
@@ -18395,6 +18425,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-unset answers are authoritative for the current node's applied connector config mutation and record the exact mutation target for automation.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             envelope.inject_into(&mut payload);
             Ok(DispatchOutcome {
                 payload,
@@ -18518,6 +18549,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-import answers are authoritative for the current node's applied connector config mutation and record the imported document target for automation.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             envelope.inject_into(&mut payload);
             Ok(DispatchOutcome {
                 payload,
@@ -18622,6 +18654,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-export answers are authoritative for the current node's config snapshot. Sanitized exports are degraded for replay because inline secrets are intentionally withheld.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             envelope.inject_into(&mut payload);
             Ok(DispatchOutcome {
                 payload,
@@ -18778,6 +18811,7 @@ fn config_dispatch(args: &ConfigArgs, explicit_host: Option<&str>) -> Result<Dis
                 "Live config-doctor answers are authoritative for the current node's config snapshot and validation preview. Sanitized snapshots and failed validations are explicitly marked as degraded.",
                 evidence_handles,
             );
+            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
             if exit_code.is_success() {
                 envelope.inject_into(&mut payload);
             }
@@ -18909,6 +18943,7 @@ fn config_non_replayable_live_config_dispatch(
         "Live config mutation previews remain authoritative for the current node even when sanitized snapshots make partial mutation unsafe. The rejected mutation target is recorded explicitly for automation.",
         evidence_handles,
     );
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -18972,6 +19007,7 @@ fn config_live_validation_dispatch(
         "Live config mutation previews are authoritative for the current node even when the candidate is rejected. Validation evidence and the rejected mutation target are recorded explicitly for automation.",
         evidence_handles,
     );
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -19027,6 +19063,7 @@ fn config_redacted_placeholder_import_dispatch(
         "Live config-import preflight remains authoritative for the current node even when sanitized placeholder values make the requested import unsafe. The rejected import target is recorded explicitly for automation.",
         evidence_handles,
     );
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -19744,14 +19781,17 @@ fn install_dispatch(args: &InstallArgs, explicit_host: Option<&str>) -> Result<D
     }
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "install");
-    let mut payload = serde_json::to_value(build_install_activation_operator_contract(
+    let contract = build_install_activation_operator_contract(
         &host.endpoint,
         &artifact,
         &candidate,
         applied,
         post_install_status.as_ref(),
         (!warnings.is_empty()).then_some(warnings),
-    ))?;
+    );
+    let truth_source = contract.resolution.operator_knowledge_state();
+    let mut payload = serde_json::to_value(contract)?;
+    inject_truth_source_metadata(&mut payload, truth_source);
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
@@ -19947,6 +19987,7 @@ fn update_dispatch(args: &UpdateArgs, explicit_host: Option<&str>) -> Result<Dis
         "Live update answers are authoritative for the current node's inventory preview or mutation result. They do not by themselves prove mesh-wide placement or post-update runtime convergence.",
         evidence_handles,
     );
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
@@ -21425,6 +21466,7 @@ fn export_tools_dispatch_host(args: &ExportToolsArgs, host: &str) -> Result<Disp
             catalog::ToolAvailability::Live,
             tool_provenance.clone(),
         );
+        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
         envelope.inject_into(&mut payload);
         return Ok(DispatchOutcome {
             payload,
@@ -21458,6 +21500,7 @@ fn export_tools_dispatch_host(args: &ExportToolsArgs, host: &str) -> Result<Disp
         catalog::ToolAvailability::Live,
         tool_provenance,
     );
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
@@ -23411,6 +23454,7 @@ fn invoke_dispatch_host(
             ),
             format!("fwc template {} {}", connector.slug, operation.name),
         ]);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Validation,
@@ -23481,6 +23525,7 @@ fn invoke_dispatch_host(
             CommandEnvelope::new(CommandAvailability::Denied, command)
         };
         envelope.inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
         return Ok(DispatchOutcome {
             payload,
             exit_code: if preflight.allowed {
@@ -23526,6 +23571,7 @@ fn invoke_dispatch_host(
             ),
         ]);
         CommandEnvelope::new(CommandAvailability::Denied, command).inject_into(&mut payload);
+        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::PolicyDenied,
@@ -23601,6 +23647,7 @@ fn invoke_dispatch_host(
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "invoke");
     envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     Ok(DispatchOutcome {
         payload,
         exit_code: match response.status {
@@ -23762,6 +23809,7 @@ fn invoke_dispatch_without_host(command: &str, args: &InvokeArgs) -> Result<Disp
         "recoverable": true,
     });
 
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome { payload, exit_code })
 }
 
@@ -23813,6 +23861,7 @@ fn host_invoke_input_error_dispatch(
         payload["error"]["details"] = details;
     }
 
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -23872,6 +23921,7 @@ fn invoke_input_error_dispatch(
         payload["error"]["details"] = details;
     }
 
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     DispatchOutcome {
         payload,
         exit_code: CliExitCode::Validation,
@@ -26073,6 +26123,7 @@ fn capabilities_dispatch(
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "capabilities");
     let mut payload = payload;
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     envelope.inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
@@ -31741,6 +31792,7 @@ mod tests {
             .join()
             .map_err(|_| "mock host should complete".to_owned())?;
         assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
+        assert_eq!(payload["schema_version"], "1.2.0");
         assert_eq!(payload["overall_status"], "skip");
         assert_eq!(
             payload["live_telemetry"]["reason_code"],
@@ -31789,6 +31841,7 @@ max_state_replication_staleness_secs = 120
         ]);
 
         assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
+        assert_eq!(payload["schema_version"], "1.2.0");
         assert_eq!(payload["targets"]["min_connectors"], 5);
         assert_eq!(payload["targets"]["replica_count"], 4);
         assert_eq!(payload["targets"]["state_staleness_seconds"], 120);
@@ -31816,6 +31869,7 @@ max_state_replication_staleness_secs = 120
         assert_eq!(payload["subcommand"], "cutover-gates");
         assert_eq!(payload["error"]["type"], "invalid-cutover-gates-config");
         assert_eq!(payload["error"]["recoverable"], true);
+        assert!(payload.get("schema_version").is_none());
     }
 
     fn temp_auth_store() -> (TempDir, super::CredentialStore) {
@@ -32162,6 +32216,7 @@ max_state_replication_staleness_secs = 120
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["error"]["type"], "invalid-host-endpoint");
+        assert!(payload.get("schema_version").is_none());
         assert!(
             payload["error"]["message"]
                 .as_str()
@@ -34084,6 +34139,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "execution");
         assert_eq!(payload["input_authoring"]["primary_source"], "binding-set");
         assert_eq!(payload["input_authoring"]["binding_count"], 3);
@@ -34113,6 +34170,8 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["status"], "error");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "invalid-input-payload");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], false);
         assert_eq!(payload["input_authoring"]["validation"]["error_count"], 3);
@@ -34145,6 +34204,8 @@ deny_ptrace = true
         ]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "conflicting-input-sources");
         assert_eq!(payload["error"]["recoverable"], true);
     }
@@ -34648,6 +34709,7 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "auth"]);
 
         assert_eq!(exit_code, CliExitCode::Parse.into());
+        assert!(payload.get("schema_version").is_none());
         assert_eq!(payload["error"]["type"], "missing-auth-subcommand");
         assert_eq!(payload["error"]["examples"][0], "fwc auth list");
     }
@@ -34657,6 +34719,7 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "auth", "rotate"]);
 
         assert_eq!(exit_code, CliExitCode::UnknownCommand.into());
+        assert!(payload.get("schema_version").is_none());
         // Error type may be "auth-subcommand" or "unknown-command" depending on dispatch path.
         let error_type = payload["error"]["type"].as_str().unwrap_or("");
         assert!(
@@ -34961,6 +35024,7 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["error"]["type"], "missing-host-endpoint");
+        assert!(payload.get("schema_version").is_none());
     }
 
     #[test]
@@ -35000,11 +35064,12 @@ deny_ptrace = true
             "--offline",
             "--format",
             "mcp",
-            "tlon",
+            "zalouser",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["error"]["type"], "hidden-connector-requires-opt-in");
+        assert!(payload.get("schema_version").is_none());
     }
 
     #[test]
@@ -35017,10 +35082,12 @@ deny_ptrace = true
             "--include-hidden",
             "--format",
             "mcp",
-            "tlon",
+            "zalouser",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert!(
             payload["tools"]
                 .as_array()
@@ -35099,6 +35166,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["connector_count"], 1);
         assert_eq!(payload["tool_count"], 2);
         assert_eq!(payload["tools"][0]["name"], "github.create_issue");
@@ -36064,6 +36133,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "telemetry");
         assert_eq!(payload["subcommand"], "otlp-readiness");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         let expected_status = if cfg!(feature = "otlp") {
             "ready"
         } else {
@@ -36093,6 +36164,8 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "telemetry");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["status"], "fail");
         assert_eq!(payload["readiness"]["status"], "fail");
         assert!(
@@ -36132,6 +36205,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
     }
 
     #[test]
@@ -36151,6 +36226,7 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["error"]["type"], "missing-capability-token");
+        assert!(payload.get("schema_version").is_none());
     }
 
     #[test]
@@ -37143,6 +37219,10 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "budget");
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(
+            payload["schema_version"],
+            HostBudgetReportResponse::SCHEMA_VERSION
+        );
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -37173,6 +37253,10 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "budget");
+        assert_eq!(
+            payload["schema_version"],
+            HostBudgetReportResponse::SCHEMA_VERSION
+        );
         assert_eq!(payload["filter"]["zone"], "z:work");
         assert_evidence_handle(&payload, "budget-report");
         assert_evidence_handle(&payload, "budget-zone-filter");
@@ -37233,6 +37317,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "install");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "mesh");
         assert_eq!(payload["source"], "host-admin-api");
         assert_install_contract(
             &payload,
@@ -37343,6 +37429,8 @@ deny_ptrace = true
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "fallback-derived");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -37431,6 +37519,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "install");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "fallback-derived");
         assert_eq!(payload["source"], "host-admin-api");
         assert_install_contract(
             &payload,
@@ -37563,6 +37653,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "update");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["mode"], "dry-run");
         assert_install_contract(
             &payload,
@@ -37657,6 +37749,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "update");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["mode"], "apply");
         assert_install_contract(
             &payload,
@@ -37701,6 +37795,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "get");
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["config"]["profile"], "work");
         assert_eq!(payload["replayable"], true);
         assert_eq!(payload["snapshot"]["active_revision_id"], 41);
@@ -37733,6 +37829,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "export");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["replayable"], false);
         assert!(
             payload["message"]
@@ -37786,6 +37884,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "set");
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -37839,6 +37939,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "unset");
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -37880,6 +37982,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "set");
         assert_eq!(payload["error"]["type"], "non-replayable-live-config");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -37932,6 +38036,8 @@ deny_ptrace = true
         assert_eq!(payload["subcommand"], "doctor");
         assert_eq!(payload["source"], "host-admin-api");
         assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["validation"]["valid"], true);
     }
 
@@ -37976,6 +38082,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "import");
         assert_eq!(payload["error"]["type"], "redacted-placeholder-import");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -38047,6 +38155,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "import");
         assert_eq!(payload["error"]["type"], "config-validation-failed");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -38113,6 +38223,8 @@ deny_ptrace = true
         assert_eq!(payload["command"], "config");
         assert_eq!(payload["subcommand"], "import");
         assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_install_contract(
             &payload,
             "host-admin-api",
@@ -38181,6 +38293,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "capabilities");
         assert_eq!(payload["subcommand"], "report");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["availability"]["availability"], "offline-artifact");
         assert_eq!(payload["availability"]["command"], "capabilities");
         assert_eq!(payload["availability"]["authoritative"], false);
@@ -38245,6 +38359,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "capabilities");
         assert_eq!(payload["subcommand"], "suggest");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["recommendations"][0]["suggestion"], "review_risky");
         assert_eq!(
             payload["recommendations"][0]["key"]["capability_id"],
@@ -38959,6 +39075,8 @@ deny_ptrace = true
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], "1.0.0");
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["canonical_storage"], "mesh");
         assert_eq!(payload["local_cache_present"], true);
         assert_eq!(payload["local_cache_marker_present"], true);
@@ -39046,12 +39164,13 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "connector");
         assert_eq!(payload["subcommand"], "state explain");
+        assert_eq!(payload["schema_version"], "1.0.0");
         assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
         assert_eq!(payload["host_payload_source"], "host-cache-markers");
         assert_eq!(
             payload["message"],
-            "Explained connector state storage for `github` from live fcp-host evidence."
+            "Explained connector state storage for `github` from live fcp-host cache-marker evidence."
         );
         assert_eq!(
             payload["connector"]["canonical_id"],
@@ -39181,6 +39300,8 @@ deny_ptrace = true
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], "1.0.0");
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
         assert_eq!(payload["host_payload_source"], "host-canonical-state");
         assert_eq!(payload["last_canonical_seq"], 7);
@@ -39577,6 +39698,7 @@ deny_ptrace = true
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "lease ladder");
         assert_eq!(payload["schema_version"], "1.0.0");
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["source"], "offline-mesh-context");
         assert_eq!(payload["connector_count"], 2);
         assert_eq!(payload["eligible_node_count"], 3);
@@ -39626,6 +39748,8 @@ deny_ptrace = true
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], "1.0.0");
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["connector_count"], 1);
         let connector = payload["connectors"]
             .as_array()
@@ -39648,6 +39772,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "status");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["current_context"], "local");
         assert_eq!(payload["context"]["persistence_scope"], "host-context");
         assert!(payload["active_session"].is_null());
@@ -39689,6 +39815,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "status"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(
             payload["target_state"]["active_default_node"],
             "stale-laptop"
@@ -39730,6 +39858,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "use", "desktop"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["target_state"]["active_default_node"], "desktop");
         assert_eq!(payload["target_state"]["active_default_node_stale"], false);
         let (_, reloaded) = super::load_context_config().expect("context config should load");
@@ -39749,6 +39879,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "use", "laptop-work"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(
             payload["target_state"]["active_default_node"],
             "laptop-work"
@@ -39795,6 +39927,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["inventory_source"], "persisted-targets");
         assert_eq!(payload["node_count"], 2);
         let nodes = payload["nodes"]
@@ -39841,6 +39975,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["connector_filter"], "github");
         assert_eq!(payload["node_count"], 1);
         assert_eq!(payload["nodes"][0]["node"], "desktop");
@@ -39861,6 +39997,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["node_count"], 1);
         assert_eq!(payload["nodes"][0]["node"], "laptop");
         let warnings = payload["warnings"]
@@ -39880,6 +40018,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["node_count"], 0);
         let warnings = payload["warnings"]
             .as_array()
@@ -39906,6 +40046,8 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "availability");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["source"], "workspace-manifests");
         assert_discovery_provenance(&payload, "workspace_manifest", false, "offline-artifact");
         assert_eq!(payload["connector"]["slug"], "github");
@@ -40212,6 +40354,7 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "availability");
+        assert!(payload.get("schema_version").is_none());
         assert_eq!(payload["error"]["type"], "unsupported-live-zone-filter");
     }
 
@@ -40244,6 +40387,8 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["subcommand"], "repair-hints");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "degraded");
         assert_eq!(payload["inventory"]["observed_state"], "missing");
         assert_eq!(payload["availability_fact"]["state"], "unavailable");
         assert_evidence_handle(&payload, "mesh-live-availability");
@@ -40285,6 +40430,8 @@ deny_ptrace = true
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "degraded");
         assert_eq!(payload["availability_fact"]["state"], "degraded");
         assert_eq!(payload["inventory"]["observed_state"], "degraded");
         assert_live_truth_resolution(
@@ -40317,6 +40464,8 @@ deny_ptrace = true
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["zone_source"], "context-default");
         assert_eq!(payload["effective_target"]["node"], "desktop");
         assert_eq!(payload["effective_target"]["zone"], "z:work");
@@ -40348,6 +40497,8 @@ deny_ptrace = true
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["zone_source"], "explicit");
         assert_eq!(payload["effective_target"]["zone"], "z:private");
         let (_, reloaded) = super::load_context_config().expect("context config should load");
@@ -40382,6 +40533,8 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "target", "github"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["effective_target"]["node"], "desktop");
         assert_eq!(payload["effective_target"]["source"], "connector-target");
     }
@@ -40410,6 +40563,8 @@ deny_ptrace = true
             execute_json(&["fwc", "--json", "mesh", "target", "github", "--clear"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert!(payload["effective_target"].is_null());
         let (_, reloaded) = super::load_context_config().expect("context config should load");
         assert!(
@@ -40427,6 +40582,7 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "target", "github"]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert!(payload.get("schema_version").is_none());
         assert_eq!(payload["error"]["type"], "mesh-target-not-found");
         assert_eq!(payload["connector"], "github");
     }
@@ -40456,6 +40612,8 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "zones");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["source"], "workspace-manifests");
         assert_eq!(payload["mode"], "offline-artifact");
         assert!(
@@ -40482,6 +40640,8 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "zones");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["zone"]["zone_id"], "z:work");
         assert_eq!(payload["policy"]["policy_type"], "standard");
         assert_eq!(payload["policy"]["source"], "inferred-from-zone-id");
@@ -40501,6 +40661,7 @@ deny_ptrace = true
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "zones");
+        assert!(payload.get("schema_version").is_none());
         assert_eq!(payload["error"]["type"], "missing-zone-selector");
     }
 
@@ -40510,6 +40671,8 @@ deny_ptrace = true
             execute_json(&["fwc", "--json", "zones", "z:totally-empty-test-zone"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["zone"]["zone_id"], "z:totally-empty-test-zone");
         assert_eq!(payload["zone"]["connector_count"], 0);
         assert_eq!(payload["zone"]["tool_count"], 0);
@@ -43663,7 +43826,8 @@ depends_on = ["missing"]
                 .expect("mock introspection response should deserialize");
         let tools = try_host_mcp_tool_definitions(connector, &introspection)
             .expect("live MCP tool definitions should build");
-        let state = serve_mcp::state_from_tools(tools, super::serve_mcp_config(Some(connector)));
+        let state =
+            serve_mcp::state_from_tools(tools, super::serve_mcp_config(Some(connector), None));
         let response = serve_mcp::handle_request(
             &state,
             &serve_mcp::JsonRpcRequest {
@@ -43680,6 +43844,16 @@ depends_on = ["missing"]
         assert_eq!(state.config.connector_filter.as_deref(), Some("github"));
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "github.create_issue");
+    }
+
+    #[test]
+    fn serve_mcp_config_applies_risk_max() {
+        let config = super::serve_mcp_config(None, Some("medium"));
+        assert_eq!(config.risk_max.as_deref(), Some("medium"));
+        assert!(config.connector_filter.is_none());
+
+        let config = super::serve_mcp_config(None, None);
+        assert!(config.risk_max.is_none());
     }
 
     #[test]
@@ -44037,6 +44211,8 @@ depends_on = ["missing"]
 
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "invoke");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["connector"]["slug"], "github");
         assert_eq!(payload["operation"]["requested_selector"], "issues.create");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], true);
@@ -44086,6 +44262,8 @@ depends_on = ["missing"]
         ]);
 
         let preview = &payload["input_authoring"]["payload_preview"];
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(preview["shape"], "object");
         assert!(preview["field_count"].as_u64().unwrap() >= 3);
         assert!(preview["bytes"].as_u64().unwrap() > 0);
@@ -44108,6 +44286,8 @@ depends_on = ["missing"]
         ]);
 
         let op = &payload["operation"];
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert!(op["capability"].as_str().is_some_and(|c| !c.is_empty()));
         assert!(op["risk_level"].as_str().is_some_and(|r| !r.is_empty()));
         assert!(op["safety_tier"].as_str().is_some_and(|s| !s.is_empty()));
@@ -44127,6 +44307,8 @@ depends_on = ["missing"]
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["status"], "error");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "invalid-input-payload");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], false);
         assert!(
@@ -44154,6 +44336,8 @@ depends_on = ["missing"]
         // Without a host, simulate dispatches through the same offline path as invoke
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "simulate");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "missing-host-endpoint");
     }
 
@@ -44171,6 +44355,8 @@ depends_on = ["missing"]
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["command"], "simulate");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "invalid-input-payload");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], false);
     }
@@ -44204,6 +44390,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::PolicyDenied.into());
         assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["error"]["type"], "policy-denied");
         assert_eq!(payload["error"]["recoverable"], true);
@@ -44237,6 +44425,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::PolicyDenied.into());
         assert_eq!(payload["status"], "denied");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["command"], "simulate");
     }
@@ -44268,6 +44458,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["preflight"]["allowed"], true);
@@ -44354,6 +44546,8 @@ depends_on = ["missing"]
             execute_json(&["fwc", "--json", "invoke", "github", "issues.create"]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "missing-input-source");
         assert_eq!(payload["error"]["recoverable"], true);
     }
@@ -44655,6 +44849,8 @@ depends_on = ["missing"]
 
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "invoke");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["input_authoring"]["primary_source"], "file");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], true);
         assert_eq!(payload["error"]["type"], "missing-host-endpoint");
@@ -44708,6 +44904,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "execution");
         assert_eq!(payload["response"]["result"]["number"], 99);
     }
@@ -44725,6 +44923,8 @@ depends_on = ["missing"]
         ]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "unreadable-input-file");
     }
 
@@ -45024,6 +45224,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "execution");
         assert_eq!(payload["source"], "host-admin-api");
         assert_eq!(payload["response"]["result"]["number"], 77);
@@ -45548,6 +45750,8 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["status"], "error");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["phase"], "input-authoring");
         assert_eq!(payload["error"]["type"], "invalid-input-payload");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], false);
@@ -45903,7 +46107,7 @@ depends_on = ["missing"]
             ])),
             4,
         );
-        let (exit_code, _) = execute_json(&[
+        let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
@@ -45919,6 +46123,10 @@ depends_on = ["missing"]
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["phase"], "execution");
+        assert_eq!(payload["input_authoring"]["validation"]["valid"], true);
+        assert_eq!(payload["response"]["result"]["number"], 7);
 
         // Now query history and verify there is at least one entry for github.
         let (history_exit, history_payload) = execute_json(&[
@@ -50530,9 +50738,18 @@ require_attestation_types = ["in-toto"]"#,
             .to_owned();
 
         // Resolve the task so it becomes ready for execution.
-        let (_resolve_exit, _resolve_payload) = execute_json(&[
+        let (resolve_exit, resolve_payload) = execute_json(&[
             "fwc", "--json", "task", "resolve", &task_id, "--until", "ready",
         ]);
+        assert_eq!(resolve_exit, CliExitCode::Success.into());
+        assert_eq!(resolve_payload["command"], "task");
+        assert_eq!(resolve_payload["subcommand"], "resolve");
+        assert!(
+            resolve_payload["task"]["capsule_status"]
+                .as_str()
+                .is_some_and(|status| !status.is_empty()),
+            "task resolve output should include capsule_status"
+        );
 
         // List tasks and find the one we created.
         let (list_exit, list_payload) = execute_json(&["fwc", "--json", "task", "list"]);
@@ -51498,6 +51715,7 @@ require_attestation_types = ["in-toto"]"#,
             execute_json(&["fwc", "--json", "auth", "bootstrap", "nonexistent-xyz"]);
 
         assert_eq!(exit_code, CliExitCode::UnknownCommand.into());
+        assert!(payload.get("schema_version").is_none());
         let error_type = payload["error"]["type"].as_str().unwrap_or("");
         assert!(
             error_type.contains("auth") || error_type.contains("unknown"),
@@ -51788,6 +52006,8 @@ require_attestation_types = ["in-toto"]"#,
         // `pipe` without required positional args (source, target) should error
         let (pipe_exit, pipe_payload) = execute_json(&["fwc", "--json", "pipe"]);
         assert_ne!(pipe_exit, CliExitCode::Success.into());
+        assert_eq!(pipe_payload["status"], "error");
+        assert!(pipe_payload["error"]["type"].as_str().is_some());
         // The error should reference "pipe", not "pipeline"
         let pipe_text = serde_json::to_string(&pipe_payload).unwrap_or_default();
         // The raw error or command field should distinguish the two
@@ -51799,6 +52019,8 @@ require_attestation_types = ["in-toto"]"#,
         // `pipeline` without required subcommand should also error
         let (pipeline_exit, pipeline_payload) = execute_json(&["fwc", "--json", "pipeline"]);
         assert_ne!(pipeline_exit, CliExitCode::Success.into());
+        assert_eq!(pipeline_payload["status"], "error");
+        assert!(pipeline_payload["error"]["type"].as_str().is_some());
         let pipeline_text = serde_json::to_string(&pipeline_payload).unwrap_or_default();
         assert!(
             pipeline_text.contains("pipeline"),

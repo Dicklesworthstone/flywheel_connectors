@@ -3,24 +3,293 @@
   "$id": "fcp://schemas/fwc/mesh-explain-availability/truth-source-envelope/v1",
   "title": "FWC mesh explain-availability truth-source envelope v1",
   "description": "Top-level provenance envelope for `fwc mesh explain-availability --json`.",
-  "type": "object",
-  "additionalProperties": true,
-  "required": ["status", "command", "subcommand", "schema_version", "_truth_source"],
-  "properties": {
-    "status": { "type": "string", "minLength": 1 },
-    "command": { "const": "mesh" },
-    "subcommand": { "const": "explain-availability" },
-    "schema_version": { "const": "fcp.fwc.truth-source.v1" },
-    "_truth_source": {
+  "oneOf": [
+    { "$ref": "#/$defs/mesh_explain_availability_success" },
+    { "$ref": "#/$defs/truth_source_unavailable_error" },
+    { "$ref": "#/$defs/truth_resolver_internal_error" }
+  ],
+  "$defs": {
+    "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
-    "error": {
+    "truth_requirement": {
+      "type": "string",
+      "enum": ["mesh", "mesh-or-host", "any-live"]
+    },
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullable_string": {
+      "anyOf": [
+        { "$ref": "#/$defs/non_empty_string" },
+        { "type": "null" }
+      ]
+    },
+    "string_array": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "availability_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "command",
+        "authoritative",
+        "explanation",
+        "recoverable",
+        "next_actions"
+      ],
+      "properties": {
+        "availability": { "$ref": "#/$defs/non_empty_string" },
+        "command": { "const": "mesh" },
+        "authoritative": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" },
+        "recoverable": { "type": "boolean" },
+        "next_actions": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_selector", "slug", "canonical_id", "name", "version"],
+      "properties": {
+        "requested_selector": { "$ref": "#/$defs/non_empty_string" },
+        "slug": { "$ref": "#/$defs/non_empty_string" },
+        "canonical_id": { "$ref": "#/$defs/non_empty_string" },
+        "name": { "$ref": "#/$defs/non_empty_string" },
+        "version": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "availability_fact": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["type"],
+      "required": ["state", "silent_fallback"],
       "properties": {
-        "type": { "type": "string", "minLength": 1 }
+        "state": { "$ref": "#/$defs/non_empty_string" },
+        "silent_fallback": { "type": "boolean" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "source_selection": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "state",
+        "selection_mode",
+        "silent_fallback",
+        "provenance_recorded",
+        "source_kind",
+        "source_uri"
+      ],
+      "properties": {
+        "state": { "$ref": "#/$defs/non_empty_string" },
+        "selection_mode": { "$ref": "#/$defs/non_empty_string" },
+        "silent_fallback": { "type": "boolean" },
+        "provenance_recorded": { "type": "boolean" },
+        "source_kind": { "$ref": "#/$defs/nullable_string" },
+        "source_uri": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "offline_readiness": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["state", "explanation"],
+      "properties": {
+        "state": { "$ref": "#/$defs/non_empty_string" },
+        "explanation": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "knowledge_state",
+        "resolver_branch",
+        "authoritative_scope",
+        "mesh_backed",
+        "degraded",
+        "fallback_derived",
+        "reason"
+      ],
+      "properties": {
+        "knowledge_state": { "$ref": "#/$defs/non_empty_string" },
+        "resolver_branch": { "$ref": "#/$defs/non_empty_string" },
+        "authoritative_scope": { "$ref": "#/$defs/non_empty_string" },
+        "mesh_backed": { "type": "boolean" },
+        "degraded": { "type": "boolean" },
+        "fallback_derived": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "evidence_handle": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/non_empty_string" }
+      }
+    },
+    "evidence_handles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evidence_handle" }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["command", "source", "availability", "authoritative"],
+      "properties": {
+        "command": { "const": "mesh" },
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "availability": { "$ref": "#/$defs/non_empty_string" },
+        "authoritative": { "type": "boolean" },
+        "caveat": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["source", "authoritative"],
+      "properties": {
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "authoritative": { "type": "boolean" }
+      }
+    },
+    "mesh_explain_availability_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "source",
+        "mode",
+        "message",
+        "connector",
+        "availability_fact",
+        "source_selection",
+        "offline_readiness",
+        "repair_hints",
+        "resolution",
+        "evidence_handles",
+        "next_actions",
+        "provenance",
+        "explanation",
+        "schema_version",
+        "_truth_source",
+        "availability"
+      ],
+      "properties": {
+        "status": { "const": "ok" },
+        "command": { "const": "mesh" },
+        "subcommand": { "const": "explain-availability" },
+        "source": {
+          "enum": ["host-admin-api", "workspace-manifests"]
+        },
+        "mode": { "$ref": "#/$defs/non_empty_string" },
+        "message": { "$ref": "#/$defs/non_empty_string" },
+        "connector": { "$ref": "#/$defs/connector" },
+        "inventory": { "$ref": "#/$defs/inventory" },
+        "availability_fact": { "$ref": "#/$defs/availability_fact" },
+        "source_selection": { "$ref": "#/$defs/source_selection" },
+        "offline_readiness": { "$ref": "#/$defs/offline_readiness" },
+        "repair_hints": { "$ref": "#/$defs/string_array" },
+        "resolution": { "$ref": "#/$defs/resolution" },
+        "evidence_handles": { "$ref": "#/$defs/evidence_handles" },
+        "next_actions": { "$ref": "#/$defs/string_array" },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "explanation": { "$ref": "#/$defs/string_array" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "availability": { "$ref": "#/$defs/availability_envelope" }
+      }
+    },
+    "truth_source_unavailable_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "mesh" },
+        "subcommand": { "const": "explain-availability" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "required", "actual", "message", "recoverable"],
+          "properties": {
+            "type": { "const": "truth-source-unavailable" },
+            "required": { "$ref": "#/$defs/truth_requirement" },
+            "actual": { "$ref": "#/$defs/truth_source" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "type": "boolean" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "truth_resolver_internal_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "command",
+        "subcommand",
+        "schema_version",
+        "_truth_source",
+        "error",
+        "next_actions"
+      ],
+      "properties": {
+        "status": { "const": "error" },
+        "command": { "const": "mesh" },
+        "subcommand": { "const": "explain-availability" },
+        "schema_version": { "const": "fcp.fwc.truth-source.v1" },
+        "_truth_source": { "const": "unavailable" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "message",
+            "recoverable",
+            "redacted_cause",
+            "log_event",
+            "correlation_id",
+            "bead_reference"
+          ],
+          "properties": {
+            "type": { "const": "truth-resolver-internal-error" },
+            "message": { "$ref": "#/$defs/non_empty_string" },
+            "recoverable": { "const": false },
+            "redacted_cause": { "$ref": "#/$defs/non_empty_string" },
+            "log_event": { "const": "fcp.truth_resolver.internal_error" },
+            "correlation_id": { "$ref": "#/$defs/non_empty_string" },
+            "bead_reference": { "const": "flywheel_connectors-hr0rr.2.5" }
+          }
+        },
+        "next_actions": { "$ref": "#/$defs/string_array" }
       }
     }
   }

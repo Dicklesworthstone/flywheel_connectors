@@ -183,12 +183,20 @@ impl GrafanaClient {
         }
     }
 
+    /// Issue a request with retry.
+    ///
+    /// br-kxd3e: replay safety is derived from the verb, which is sound here
+    /// because this client uses each one for its standard meaning — GET reads,
+    /// PUT/PATCH set named fields to named values, DELETE converges, and only
+    /// POST creates. A replay of a POST after a 5xx creates a second object or
+    /// double-counts an ingested event.
     async fn request_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
     ) -> GrafanaResult<serde_json::Value> {
+        let replay_safe = http_method != "POST";
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -207,22 +215,18 @@ impl GrafanaClient {
             match req.send().await {
                 Ok(resp) => match self.handle_response(resp).await {
                     Ok(val) => AttemptOutcome::Success(val),
-                    Err(err) if err.is_retryable() => AttemptOutcome::Retryable {
-                        retry_after: err.retry_after(),
-                        error: err,
-                    },
+                    Err(err) if err.is_retryable() => {
+                        let replayable = replay_safe || err.replay_is_safe();
+                        let retry_after = err.retry_after();
+                        AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
+                    }
                     Err(err) => AttemptOutcome::Terminal(err),
                 },
                 Err(err) => {
                     let err = GrafanaError::Http(err);
-                    if err.is_retryable() {
-                        AttemptOutcome::Retryable {
-                            retry_after: err.retry_after(),
-                            error: err,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    }
+                    let replayable = replay_safe || err.replay_is_safe();
+                    let retry_after = err.retry_after();
+                    AttemptOutcome::retryable_if_replayable(err, retry_after, replayable)
                 }
             }
         })

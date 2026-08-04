@@ -336,8 +336,8 @@ impl PlaidClient {
                                 .headers()
                                 .get("retry-after")
                                 .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .map_or(60_000, |s| s * 1000);
+                                .and_then(parse_retry_after_ms)
+                                .unwrap_or(60_000);
 
                             let err = PlaidError::RateLimit {
                                 retry_after_ms: retry_after,
@@ -435,10 +435,62 @@ fn normalize_base_url(base_url: &str) -> PlaidResult<String> {
     Ok(trimmed.trim_end_matches('/').to_string())
 }
 
+/// Parse an RFC 7231 `Retry-After` header value into milliseconds.
+///
+/// Accepts both the delta-seconds form (`"120"`) and the HTTP-date form
+/// (`"Wed, 21 Oct 2026 07:28:00 GMT"`); a date in the past yields 0.
+fn parse_retry_after_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let wait = retry_at
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(chrono::Utc::now());
+    if wait <= chrono::Duration::zero() {
+        Some(0)
+    } else {
+        Some(u64::try_from(wait.num_milliseconds()).unwrap_or(u64::MAX))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
+
+    #[test]
+    fn parse_retry_after_ms_seconds() {
+        assert_eq!(parse_retry_after_ms("120"), Some(120_000));
+        assert_eq!(parse_retry_after_ms(" 1 "), Some(1_000));
+        assert_eq!(
+            parse_retry_after_ms(&u64::MAX.to_string()),
+            Some(u64::MAX.saturating_mul(1000))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_ms_http_date_in_past_is_zero() {
+        assert_eq!(
+            parse_retry_after_ms("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_ms_http_date_in_future_is_positive() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let value = future.to_rfc2822();
+        let ms = parse_retry_after_ms(&value).unwrap();
+        assert!(ms > 80_000 && ms <= 91_000, "got {ms}");
+    }
+
+    #[test]
+    fn parse_retry_after_ms_garbage_is_none() {
+        assert_eq!(parse_retry_after_ms("soon"), None);
+        assert_eq!(parse_retry_after_ms(""), None);
+    }
     use std::net::{TcpListener, TcpStream};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};

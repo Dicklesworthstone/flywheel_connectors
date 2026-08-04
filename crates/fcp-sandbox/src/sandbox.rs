@@ -260,6 +260,28 @@ impl CompiledPolicy {
         self
     }
 
+    /// Whether the manifest declared explicit filesystem path restrictions.
+    ///
+    /// `state_dir` is always merged into `writable_paths` regardless of what
+    /// the manifest asked for, so it is excluded here — the signal is whether
+    /// the connector author listed `fs_readonly_paths` or additional
+    /// `fs_writable_paths`, i.e. expressed an intent to be confined to a
+    /// specific set of paths.
+    ///
+    /// The Linux native sandbox uses this to fail closed rather than silently
+    /// run a connector unconfined when no path-confinement mechanism
+    /// (Landlock, or mount-namespace bind mounts) will actually enforce the
+    /// declared restrictions (bead sandbox-linux-no-default-fs-confinement).
+    #[must_use]
+    pub fn declares_fs_path_restrictions(&self) -> bool {
+        if !self.readonly_paths.is_empty() {
+            return true;
+        }
+        self.writable_paths
+            .iter()
+            .any(|path| self.state_dir.as_ref() != Some(path))
+    }
+
     /// Return the normalized Windows `AppContainer` capabilities implied by this policy.
     pub fn windows_appcontainer_capabilities(&self) -> Result<Vec<String>, SandboxError> {
         let mut capabilities = normalize_windows_appcontainer_capabilities(
@@ -2777,6 +2799,40 @@ mod tests {
         };
         let policy = policy.with_platform_flags(flags);
         assert!(policy.platform_flags.linux_use_landlock);
+    }
+
+    #[test]
+    fn declares_fs_path_restrictions_detects_manifest_intent() {
+        // Manifest lists readonly paths -> declares restrictions.
+        let section = test_sandbox_section();
+        let state_dir = Some(PathBuf::from("/var/lib/fcp/connectors/test"));
+        let policy = CompiledPolicy::from_manifest(&section, state_dir.clone()).unwrap();
+        assert!(
+            policy.declares_fs_path_restrictions(),
+            "readonly paths declared in the manifest must count as confinement intent"
+        );
+
+        // Only the auto-added state_dir is writable, nothing else declared ->
+        // no confinement intent (must not newly fail closed).
+        let mut bare = test_sandbox_section();
+        bare.fs_readonly_paths.clear();
+        bare.fs_writable_paths.clear();
+        let bare_policy = CompiledPolicy::from_manifest(&bare, state_dir).unwrap();
+        assert!(
+            !bare_policy.declares_fs_path_restrictions(),
+            "a policy whose only writable path is the auto-added state_dir declares no restrictions"
+        );
+
+        // Manifest-declared writable path beyond state_dir -> confinement intent.
+        let mut writable = test_sandbox_section();
+        writable.fs_readonly_paths.clear();
+        writable.fs_writable_paths = vec!["/srv/data".into()];
+        let writable_policy = CompiledPolicy::from_manifest(
+            &writable,
+            Some(PathBuf::from("/var/lib/fcp/connectors/test")),
+        )
+        .unwrap();
+        assert!(writable_policy.declares_fs_path_restrictions());
     }
 
     #[test]

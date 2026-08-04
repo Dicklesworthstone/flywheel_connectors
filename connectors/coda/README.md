@@ -1,10 +1,13 @@
 # Coda Connector V3 Contract
 
-> **Status**: implemented first-slice contract
+> **Status**: PROVEN runtime contract documented with remote Coda verifier proof
 > **Bead**: `flywheel_connectors-j05nu.5.3.1`
 > **Unblocks**: `flywheel_connectors-j05nu.5.3.2`
 > **Primary upstream**: https://coda.io/developers/apis/v1
 > **Verification script**: `scripts/e2e/coda_connector_verification.sh`
+> **Proof bundle**: `/Users/jemanuel/projects/flywheel_connectors/.codex-targets/coda-verification/20260607T113953Z/evidence/summary.json` (`sha256:451acca5f8300bf9aec6f3d96b8128b45f2d406335da728fac8e18855883f37c`, `overall_status=failed` only because the manifest lane was run before the capability/interface-hash refresh; `cargo_check`, `format_check`, `health_guidance`, `doctor_guidance`, `self_check`, `retryable_self_check`, `pagination_evidence`, `dangerous_delete_evidence`, `compliance`, `integration_suite`, `crate_suite`, and `clippy` all passed remotely)
+> **Supplemental manifest proof**: `/Users/jemanuel/projects/flywheel_connectors/.codex-targets/coda-verification/20260607T1506Z/logs/manifest_check_after_promotion.log` (`sha256:7a643c25e4bf14580e57c6ea102c97816d220611f162473b46295931b8f004d6`, `rch` job `29871232832767237` on `vmi1149989`, `changed=false`, exit 0)
+> **Supplemental gauntlet proof**: `/Users/jemanuel/projects/flywheel_connectors/.codex-targets/coda-verification/20260607T1506Z/evidence/coda_gauntlet_after_promotion.jsonl` (`sha256:5ba860e94073969e8d5a530e779bf74d2474de01b510b0382cb18dd13eb91794`, all 12 checks passed)
 
 ## Purpose
 
@@ -162,12 +165,12 @@ The follow-on closeout bead for this connector is `flywheel_connectors-j05nu.5.3
 
 - Replayable verification bundle: `scripts/e2e/coda_connector_verification.sh`
 - Artifact root: `artifacts/e2e/coda_connector/<timestamp>`
-- Manifest verification command: `RCH_FORCE_REMOTE=1 rch exec -- cargo run -q -p fwc -- manifest fix connectors/coda/manifest.toml --check --json`
+- Manifest verification command: `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo run -q -p fwc -- manifest fix connectors/coda/manifest.toml --check --json`
 - Focused cargo checks:
-  - `RCH_FORCE_REMOTE=1 rch exec -- cargo check -p fcp-coda --all-targets`
-  - `RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda --test integration -- --nocapture`
-  - `RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda -- --nocapture`
-  - `RCH_FORCE_REMOTE=1 rch exec -- cargo clippy -p fcp-coda --all-targets -- -D warnings`
+  - `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo check -p fcp-coda --all-targets`
+  - `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda --test integration -- --nocapture`
+  - `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda -- --nocapture`
+  - `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo clippy -p fcp-coda --all-targets -- -D warnings`
 
 Operator guidance for verification:
 
@@ -234,9 +237,9 @@ Common remediation:
 
 Rerun commands:
 - `scripts/e2e/coda_connector_verification.sh`
-- `RCH_FORCE_REMOTE=1 rch exec -- cargo run -q -p fwc -- manifest fix connectors/coda/manifest.toml --check --json`
+- `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo run -q -p fwc -- manifest fix connectors/coda/manifest.toml --check --json`
 - `cargo fmt --manifest-path connectors/coda/Cargo.toml --check`
-- `RCH_FORCE_REMOTE=1 rch exec -- cargo check -p fcp-coda --all-targets`
-- `RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda --test integration -- --nocapture`
-- `RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda`
-- `RCH_FORCE_REMOTE=1 rch exec -- cargo clippy -p fcp-coda --all-targets -- -D warnings`
+- `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo check -p fcp-coda --all-targets`
+- `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda --test integration -- --nocapture`
+- `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo test -p fcp-coda`
+- `RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo clippy -p fcp-coda --all-targets -- -D warnings`

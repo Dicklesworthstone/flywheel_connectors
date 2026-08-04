@@ -1,6 +1,7 @@
 //! FCP Semantic Scholar Connector implementation.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
@@ -808,10 +809,15 @@ fn is_local_test_host(host: &str) -> bool {
 
 /// Build the typed operations catalog from the embedded manifest.
 fn operations_info() -> Vec<OperationInfo> {
-    ordered_manifest_operations()
-        .into_iter()
-        .map(|(id, operation)| operation_info_from_manifest(id, &operation))
-        .collect()
+    static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
+    OPERATIONS
+        .get_or_init(|| {
+            ordered_manifest_operations()
+                .into_iter()
+                .map(|(id, operation)| operation_info_from_manifest(id, &operation))
+                .collect()
+        })
+        .clone()
 }
 
 fn ordered_manifest_operations() -> Vec<(String, OperationSection)> {

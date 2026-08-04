@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use tracing::instrument;
@@ -21,6 +23,35 @@ use crate::{
 
 /// Default Figma API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.figma.com/v1";
+
+/// Validate a caller-supplied id before it is interpolated into a request path.
+///
+/// Figma resource ids (team/project/file/comment/webhook) are opaque tokens but
+/// arrive as connector input. The request helpers build the URL with a plain
+/// `format!("{base}/{path}")`, and `reqwest` normalizes `..` segments while
+/// building the request, so an unsanitized id could traverse to a sibling
+/// endpoint under `api.figma.com` or inject extra path segments. Rejecting
+/// slashes, `..`, and their percent-encoded forms closes that vector.
+fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> FigmaResult<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(FigmaError::InvalidInput {
+            message: format!("{field} must not be empty"),
+        });
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(FigmaError::InvalidInput {
+            message: format!("{field} contains path traversal characters"),
+        });
+    }
+    Ok(trimmed)
+}
 
 /// Authentication mode for the Figma client.
 #[derive(Clone)]
@@ -186,6 +217,7 @@ impl FigmaClient {
     /// List projects within a team.
     #[instrument(skip(self))]
     pub async fn list_team_projects(&self, team_id: &str) -> FigmaResult<TeamProjectsResponse> {
+        let team_id = sanitize_path_segment(team_id, "team_id")?;
         self.get_with_params::<TeamProjectsResponse>(&format!("teams/{team_id}/projects"), &[])
             .await
     }
@@ -193,6 +225,7 @@ impl FigmaClient {
     /// List files within a project.
     #[instrument(skip(self))]
     pub async fn list_project_files(&self, project_id: &str) -> FigmaResult<ProjectFilesResponse> {
+        let project_id = sanitize_path_segment(project_id, "project_id")?;
         self.get_with_params::<ProjectFilesResponse>(&format!("projects/{project_id}/files"), &[])
             .await
     }
@@ -223,6 +256,7 @@ impl FigmaClient {
             params.push(("plugin_data", plugin_data.to_string()));
         }
 
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params(&format!("files/{file_key}"), &params)
             .await
     }
@@ -240,6 +274,7 @@ impl FigmaClient {
             params.push(("depth", depth.to_string()));
         }
 
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params(&format!("files/{file_key}/nodes"), &params)
             .await
     }
@@ -247,6 +282,7 @@ impl FigmaClient {
     /// Get all components in a file.
     #[instrument(skip(self))]
     pub async fn get_file_components(&self, file_key: &str) -> FigmaResult<ComponentsResponse> {
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params::<ComponentsResponse>(&format!("files/{file_key}/components"), &[])
             .await
     }
@@ -254,6 +290,7 @@ impl FigmaClient {
     /// Get all styles in a file.
     #[instrument(skip(self))]
     pub async fn get_file_styles(&self, file_key: &str) -> FigmaResult<StylesResponse> {
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params::<StylesResponse>(&format!("files/{file_key}/styles"), &[])
             .await
     }
@@ -286,6 +323,7 @@ impl FigmaClient {
             params.push(("use_absolute_bounds", v.to_string()));
         }
 
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params(&format!("images/{file_key}"), &params)
             .await
     }
@@ -295,6 +333,7 @@ impl FigmaClient {
     /// List version history for a file.
     #[instrument(skip(self))]
     pub async fn list_file_versions(&self, file_key: &str) -> FigmaResult<VersionsResponse> {
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params::<VersionsResponse>(&format!("files/{file_key}/versions"), &[])
             .await
     }
@@ -313,6 +352,7 @@ impl FigmaClient {
             params.push(("as_md", "true".to_string()));
         }
 
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.get_with_params(&format!("files/{file_key}/comments"), &params)
             .await
     }
@@ -332,6 +372,7 @@ impl FigmaClient {
             client_meta,
         };
 
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
         self.post_json(&format!("files/{file_key}/comments"), &body)
             .await
     }
@@ -339,6 +380,8 @@ impl FigmaClient {
     /// Delete a comment from a file.
     #[instrument(skip(self))]
     pub async fn delete_comment(&self, file_key: &str, comment_id: &str) -> FigmaResult<()> {
+        let file_key = sanitize_path_segment(file_key, "file_key")?;
+        let comment_id = sanitize_path_segment(comment_id, "comment_id")?;
         self.delete(&format!("files/{file_key}/comments/{comment_id}"))
             .await
     }
@@ -348,7 +391,10 @@ impl FigmaClient {
     /// List webhooks for a team.
     #[instrument(skip(self))]
     pub async fn list_webhooks(&self, team_id: &str) -> FigmaResult<WebhooksListResponse> {
-        // Webhooks use v2 API
+        // Webhooks use v2 API. The `../v2/` prefix is a deliberate version switch
+        // relative to the v1 base; only the id is caller-controlled, so sanitize
+        // it (not the literal prefix) to keep the version hop intact.
+        let team_id = sanitize_path_segment(team_id, "team_id")?;
         let path = format!("../v2/webhooks/{team_id}");
         self.get_with_params(&path, &[]).await
     }
@@ -378,6 +424,8 @@ impl FigmaClient {
     /// Delete a webhook.
     #[instrument(skip(self))]
     pub async fn delete_webhook(&self, webhook_id: &str) -> FigmaResult<()> {
+        // `../v2/` is a deliberate version switch; only the id is caller-controlled.
+        let webhook_id = sanitize_path_segment(webhook_id, "webhook_id")?;
         self.delete(&format!("../v2/webhooks/{webhook_id}")).await
     }
 
@@ -505,6 +553,13 @@ impl FigmaClient {
         }
     }
 
+    /// Execute one POST attempt.
+    ///
+    /// br-kxd3e: NOT replay-safe. Both callers CREATE — a file comment and a
+    /// webhook — and Figma offers no idempotency key, so a replay posts a
+    /// second comment or registers a second webhook. Only the rate-limit arm
+    /// (refused WITHOUT creating) and a connect-phase transport failure retry.
+    /// A converging POST added later needs its own path.
     async fn execute_post_once<T: serde::de::DeserializeOwned>(
         req: RequestBuilder,
         _path: &str,
@@ -532,14 +587,9 @@ impl FigmaClient {
                         status: status.as_u16(),
                         message: body_text,
                     };
-                    return if status.is_server_error() {
-                        AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        }
-                    } else {
-                        AttemptOutcome::Terminal(err)
-                    };
+                    // A 5xx means Figma received the request and may already
+                    // have created the comment or webhook.
+                    return AttemptOutcome::Terminal(err);
                 }
 
                 match resp.json::<T>().await {
@@ -548,15 +598,10 @@ impl FigmaClient {
                 }
             }
             Err(e) => {
-                let err: FigmaError = e.into();
-                if err.is_retryable() {
-                    AttemptOutcome::Retryable {
-                        retry_after: None,
-                        error: err,
-                    }
-                } else {
-                    AttemptOutcome::Terminal(err)
-                }
+                // Only a connect-phase failure proves the request never
+                // reached Figma.
+                let replayable = !transport_error_reached_service(&e);
+                AttemptOutcome::retryable_if_replayable(e.into(), None, replayable)
             }
         }
     }
@@ -633,5 +678,45 @@ impl FigmaClient {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_path_segment_accepts_opaque_ids() {
+        assert_eq!(
+            sanitize_path_segment("abc123DEF456", "file_key").unwrap(),
+            "abc123DEF456"
+        );
+        assert_eq!(sanitize_path_segment("12345", "team_id").unwrap(), "12345");
+        assert_eq!(
+            sanitize_path_segment("  67890 ", "project_id").unwrap(),
+            "67890"
+        );
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_empty() {
+        assert!(sanitize_path_segment("   ", "file_key").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_segment_rejects_traversal() {
+        assert!(sanitize_path_segment("abc/../admin", "file_key").is_err());
+        assert!(sanitize_path_segment("..", "team_id").is_err());
+        assert!(sanitize_path_segment("a/b", "file_key").is_err());
+        assert!(sanitize_path_segment("a\\b", "webhook_id").is_err());
+        assert!(sanitize_path_segment("a%2Fb", "comment_id").is_err());
+        assert!(sanitize_path_segment("a%5Cb", "comment_id").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_segment_blocks_v2_version_escape() {
+        // A file_key like "../v2/webhooks" must not let a v1 file operation hop
+        // to the v2 webhook surface.
+        assert!(sanitize_path_segment("../v2/webhooks", "file_key").is_err());
     }
 }

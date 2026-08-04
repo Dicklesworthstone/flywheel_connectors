@@ -3829,10 +3829,7 @@ mod openai_e2e_tests {
             // the canonical OpenAI host.
             assert_eq!(
                 host_allow,
-                vec![
-                    "api.openai.com".to_string(),
-                    "api.deepseek.com".to_string(),
-                ]
+                vec!["api.openai.com".to_string(), "api.deepseek.com".to_string(),]
             );
             assert!(host_allowed("api.openai.com", &host_allow));
             assert!(host_allowed("api.deepseek.com", &host_allow));

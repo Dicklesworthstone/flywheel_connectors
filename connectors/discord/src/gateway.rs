@@ -60,10 +60,13 @@ const GATEWAY_EVENT_BUFFER_CAPACITY: usize = 256;
 pub const DISCORD_GATEWAY_STATE_FILE: &str = "discord_gateway_state.json";
 const GATEWAY_SEND_LIMIT: usize = 120;
 const GATEWAY_SEND_WINDOW: Duration = Duration::from_secs(60);
-#[cfg(not(test))]
-const GATEWAY_IDENTIFY_WINDOW: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const GATEWAY_IDENTIFY_WINDOW: Duration = Duration::from_millis(5);
+// br-x13q4: the identify spacing used to be a `#[cfg(test)]` constant —
+// 5 s normally, 5 ms under test. That gate does NOT reach integration tests,
+// which link the library built without `cfg(test)`, so the loopback gateway
+// tests were silently serialized behind the real 5 s window while asserting
+// against a 3 s timeout. Exactly one of any two of them failed per run,
+// depending on which identified second. The window now comes from config so
+// tests set it explicitly and cannot be surprised by it again.
 
 async fn connect_gateway_websocket(url: &str) -> DiscordResult<WsConnection> {
     WsClient::new(url)
@@ -152,30 +155,28 @@ struct GatewaySendLimiterStatus {
 #[derive(Debug)]
 struct GatewayIdentifyLimiter {
     next_allowed_at_by_key: StdMutex<BTreeMap<u32, Instant>>,
-    window: Duration,
 }
 
 impl GatewayIdentifyLimiter {
-    const fn new(window: Duration) -> Self {
+    const fn new() -> Self {
         Self {
             next_allowed_at_by_key: StdMutex::new(BTreeMap::new()),
-            window,
         }
     }
 
     async fn wait(&self, config: &DiscordConfig) {
-        let (shard_id, max_concurrency) = identify_limiter_params(config);
-        self.wait_for(shard_id, max_concurrency).await;
+        let (shard_id, max_concurrency, window) = identify_limiter_params(config);
+        self.wait_for(shard_id, max_concurrency, window).await;
     }
 
-    async fn wait_for(&self, shard_id: u32, max_concurrency: u32) {
-        let wait = self.reserve_wait(shard_id, max_concurrency);
+    async fn wait_for(&self, shard_id: u32, max_concurrency: u32, window: Duration) {
+        let wait = self.reserve_wait(shard_id, max_concurrency, window);
         if !wait.is_zero() {
             fcp_async_core::time::sleep(wait).await;
         }
     }
 
-    fn reserve_wait(&self, shard_id: u32, max_concurrency: u32) -> Duration {
+    fn reserve_wait(&self, shard_id: u32, max_concurrency: u32, window: Duration) -> Duration {
         let key = shard_id % max_concurrency.max(1);
         let now = Instant::now();
         let mut next_allowed_at_by_key = self
@@ -184,19 +185,23 @@ impl GatewayIdentifyLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next_allowed_at = next_allowed_at_by_key.get(&key).copied().unwrap_or(now);
         let wait = next_allowed_at.saturating_duration_since(now);
-        next_allowed_at_by_key.insert(key, now.max(next_allowed_at) + self.window);
+        next_allowed_at_by_key.insert(key, now.max(next_allowed_at) + window);
         wait
     }
 }
 
-fn identify_limiter_params(config: &DiscordConfig) -> (u32, u32) {
+fn identify_limiter_params(config: &DiscordConfig) -> (u32, u32, Duration) {
     let shard_id = config.shard.as_ref().map_or(0, |shard| shard.shard_id);
-    (shard_id, config.gateway_identify_max_concurrency.max(1))
+    (
+        shard_id,
+        config.gateway_identify_max_concurrency.max(1),
+        Duration::from_millis(config.gateway_identify_window_ms),
+    )
 }
 
 fn shared_gateway_identify_limiter() -> &'static GatewayIdentifyLimiter {
     static LIMITER: OnceLock<GatewayIdentifyLimiter> = OnceLock::new();
-    LIMITER.get_or_init(|| GatewayIdentifyLimiter::new(GATEWAY_IDENTIFY_WINDOW))
+    LIMITER.get_or_init(GatewayIdentifyLimiter::new)
 }
 
 async fn send_gateway_payload(
@@ -289,11 +294,15 @@ mod tests {
     }
 
     async fn send_message(ws: &mut TestServerWebSocket, message: ServerWsMessage, context: &str) {
-        ws.send(&fcp_async_core::compatibility_cx(), message).await.expect(context);
+        ws.send(&fcp_async_core::compatibility_cx(), message)
+            .await
+            .expect(context);
     }
 
     async fn close_test_websocket(ws: &mut TestServerWebSocket) {
-        let _ = ws.close(&fcp_async_core::compatibility_cx(), CloseReason::normal()).await;
+        let _ = ws
+            .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
+            .await;
     }
 
     fn parse_payload(msg: ServerWsMessage) -> GatewayPayload {
@@ -400,11 +409,12 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn gateway_identify_limiter_spaces_same_bucket() {
-        let limiter = GatewayIdentifyLimiter::new(Duration::from_millis(5));
-        limiter.wait_for(0, 1).await;
+        let limiter = GatewayIdentifyLimiter::new();
+        let window = Duration::from_millis(5);
+        limiter.wait_for(0, 1, window).await;
 
         let started = Instant::now();
-        limiter.wait_for(0, 1).await;
+        limiter.wait_for(0, 1, window).await;
         assert!(
             started.elapsed() >= Duration::from_millis(4),
             "same identify bucket should be spaced by the configured window"
@@ -413,11 +423,12 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn gateway_identify_limiter_allows_distinct_buckets() {
-        let limiter = GatewayIdentifyLimiter::new(Duration::from_millis(50));
-        limiter.wait_for(0, 2).await;
+        let limiter = GatewayIdentifyLimiter::new();
+        let window = Duration::from_millis(50);
+        limiter.wait_for(0, 2, window).await;
 
         let started = Instant::now();
-        limiter.wait_for(1, 2).await;
+        limiter.wait_for(1, 2, window).await;
         assert!(
             started.elapsed() < Duration::from_millis(10),
             "different identify buckets should not block each other"
@@ -434,12 +445,23 @@ mod tests {
 
         assert_eq!(
             identify_limiter_params(&config),
-            (7, 1),
+            (7, 1, Duration::from_millis(5_000)),
             "shard_count is not Discord gateway max_concurrency; default must serialize IDENTIFY"
         );
 
         config.gateway_identify_max_concurrency = 4;
-        assert_eq!(identify_limiter_params(&config), (7, 4));
+        assert_eq!(
+            identify_limiter_params(&config),
+            (7, 4, Duration::from_millis(5_000))
+        );
+
+        // br-x13q4: the window is configuration, so a caller (notably an
+        // integration test, which `cfg(test)` never reached) can shorten it.
+        config.gateway_identify_window_ms = 5;
+        assert_eq!(
+            identify_limiter_params(&config),
+            (7, 4, Duration::from_millis(5))
+        );
     }
 
     #[test]
@@ -1448,10 +1470,12 @@ async fn run_gateway_loop_inner(
             t: None,
         };
 
-        let (shard_id, max_concurrency) = identify_limiter_params(&config);
+        let (shard_id, max_concurrency, identify_window) = identify_limiter_params(&config);
         debug!(
             shard_id,
-            max_concurrency, "Waiting for Discord gateway identify limiter"
+            max_concurrency,
+            identify_window_ms = identify_window.as_millis() as u64,
+            "Waiting for Discord gateway identify limiter"
         );
         shared_gateway_identify_limiter().wait(&config).await;
         send_gateway_payload(

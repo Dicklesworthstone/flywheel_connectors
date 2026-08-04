@@ -326,14 +326,32 @@ fn skip_comment(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
+/// Skip to the end of a block string, honouring the one escape the GraphQL
+/// spec defines inside one: `\"""` is an escaped triple-quote, not a
+/// terminator.
+///
+/// Treating `\"""` as a terminator desynchronised the tokenizer from the
+/// document a real GraphQL server parses: the string closed early, the *real*
+/// closing `"""` then opened a second block string with no terminator, and
+/// this function swallowed the entire remainder of the query. Every guard
+/// downstream — `max_depth`, `max_aliases`, `max_root_fields`, and the
+/// `GraphqlIntrospectionPolicy::Deny` security policy — then saw an empty
+/// token stream and passed a query the server would happily execute. A single
+/// argument value of `"""a\"""b"""` was enough to disable all of them.
 fn skip_block_string(bytes: &[u8], mut index: usize) -> usize {
     while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            // Consume the backslash and whatever it escapes so an escaped
+            // `"""` cannot be mistaken for the closing delimiter.
+            index += 2;
+            continue;
+        }
         if bytes.get(index..index + 3) == Some(b"\"\"\"") {
             return index + 3;
         }
         index += 1;
     }
-    index
+    bytes.len()
 }
 
 fn skip_string(bytes: &[u8], mut index: usize) -> usize {
@@ -566,6 +584,49 @@ mod tests {
             Err(GraphqlLimitExceeded::IntrospectionDisabled {
                 field_name: "__schema".to_string(),
             })
+        );
+    }
+
+    /// An escaped triple-quote inside a block string used to desynchronise the
+    /// tokenizer from the document a real GraphQL server parses: the string
+    /// closed early, the real closing `"""` opened an unterminated one, and
+    /// `skip_block_string` swallowed the whole remainder of the query. Every
+    /// guard then ran against an empty token stream and passed.
+    #[test]
+    fn query_limits_see_through_escaped_triple_quote_in_block_string() {
+        let limits = GraphqlQueryLimits::default()
+            .with_introspection_policy(GraphqlIntrospectionPolicy::Deny);
+
+        // Control: an ordinary block string does not hide the introspection.
+        assert_eq!(
+            limits.validate(r#"query { f(note: """ab""") { __schema { types { name } } } }"#),
+            Err(GraphqlLimitExceeded::IntrospectionDisabled {
+                field_name: "__schema".to_string(),
+            })
+        );
+
+        // The escaped `\"""` must be consumed as string content, not as the
+        // terminator, so the introspection after it is still seen.
+        assert_eq!(
+            limits.validate(r#"query { f(note: """a\"""b""") { __schema { types { name } } } }"#),
+            Err(GraphqlLimitExceeded::IntrospectionDisabled {
+                field_name: "__schema".to_string(),
+            })
+        );
+
+        // The depth guard must survive the same trick.
+        let depth_limits = GraphqlQueryLimits::new(4096, 2, 64, 64);
+        assert!(matches!(
+            depth_limits
+                .validate(r#"query { f(note: """a\"""b""") { p { q { r { s { t } } } } } }"#),
+            Err(GraphqlLimitExceeded::DepthExceeded { .. })
+        ));
+
+        // A trailing backslash must not run the scan past the end of input.
+        assert!(
+            GraphqlQueryLimits::default()
+                .validate(r#"query { f(note: """unterminated\"#)
+                .is_ok()
         );
     }
 

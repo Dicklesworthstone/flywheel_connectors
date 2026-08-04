@@ -79,12 +79,45 @@ pub fn init_logging(config: &TelemetryConfig) -> Result<(), TelemetryError> {
     Ok(())
 }
 
+/// Diagnostics go to STDERR, leaving stdout free as a data channel.
+///
+/// `fmt::layer()` writes to stdout by default, which is the wrong stream for logs
+/// and was the wrong stream here: MEASURED on the `fcp-host` binary, 16 structured
+/// log lines arrived on stdout and 0 on stderr. That silently defeated every
+/// consumer that reads diagnostics off stderr — `host_connector_integration`
+/// spawns the host with `.stdout(Stdio::null())` and `.stderr(Stdio::piped())`, so
+/// 12 tests timed out waiting for events that were being discarded (br-050la).
+///
+/// The convention is the repository's own, stated in README.md: "Stdout is
+/// data-only. Every diagnostic (progress, warnings, retry notices, lint output)
+/// goes to stderr." Keeping logs on stdout also means any binary later run as a
+/// subprocess with a protocol on its stdout would have that channel corrupted by
+/// its own logging — the exact hazard the convention exists to prevent.
+///
+/// This has never been otherwise: `git log -S with_writer` on this file is empty,
+/// so the stdout default was inherited rather than chosen.
 fn json_logging_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
     fmt::layer()
+        .with_writer(std::io::stderr)
         .json()
+        // Event fields at the TOP level, not nested under `"fields"`.
+        //
+        // `.json()` alone nests every custom field, so a line reads
+        // `{"level":..,"fields":{"message":..,"event":"invoke_request"},..}`. Every
+        // consumer in this repo reads them flat — README documents the per-event
+        // schema as `timestamp`, `level`, `target`, `trace_id`/`span_id`,
+        // `connector_id`, `audit_seq`, `message` plus event-specific fields, all as
+        // peers — and `host_connector_integration`'s log matcher looks up
+        // `entry["event"]` directly.
+        //
+        // Nesting is why 12 of those tests timed out even once the stream was
+        // fixed: MEASURED, every event they waited for WAS emitted, so the events
+        // were never missing — they were one level deeper than anything reading
+        // them looked (br-050la).
+        .flatten_event(true)
         .with_current_span(true)
         .with_span_list(true)
         .with_file(true)
@@ -94,11 +127,13 @@ where
         .with_span_events(FmtSpan::CLOSE)
 }
 
+/// Same stderr discipline as [`json_logging_layer`]; see its comment.
 fn pretty_logging_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
     fmt::layer()
+        .with_writer(std::io::stderr)
         .with_ansi(true)
         .with_file(true)
         .with_line_number(true)

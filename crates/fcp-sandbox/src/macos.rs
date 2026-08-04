@@ -211,79 +211,67 @@ impl MacOsSandbox {
     }
 
     /// Apply resource limits using setrlimit.
-    fn apply_rlimits(policy: &CompiledPolicy) {
-        // Enforce both heap/data growth and total address-space growth. RLIMIT_DATA
-        // alone does not cover mmap-backed allocations, so guests could otherwise
-        // bypass the memory budget via repeated anonymous mappings.
-        let memory_limit = libc::rlimit {
-            rlim_cur: policy.memory_limit_bytes,
-            rlim_max: policy.memory_limit_bytes,
-        };
-        // SAFETY: `memory_limit` is a fully initialized `libc::rlimit`, and
-        // `setrlimit` only reads that struct for the current process.
-        unsafe {
-            if libc::setrlimit(libc::RLIMIT_DATA, &memory_limit) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "Failed to set memory limit"
-                );
-            }
-            if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "Failed to set address-space limit"
-                );
-            }
+    ///
+    /// Enforcement is split by what the macOS kernel actually supports
+    /// (verified empirically on Darwin 25 / Apple Silicon under bead
+    /// sandbox-macos-setrlimit-fail-open-1o7fy):
+    ///
+    /// - `RLIMIT_CPU` and `RLIMIT_CORE` apply reliably, so their failures
+    ///   propagate (fail closed), mirroring the Linux sandbox.
+    /// - `RLIMIT_NOFILE` raises can exceed `kern.maxfilesperproc` on
+    ///   constrained hosts, so it stays best-effort with a warning.
+    /// - `RLIMIT_DATA` / `RLIMIT_AS` return `EINVAL` for every value on
+    ///   modern macOS — the kernel does not implement lowering them — so the
+    ///   memory budget cannot be enforced via setrlimit at all. The attempt
+    ///   is kept for older kernels that honored `RLIMIT_DATA`, but a failure
+    ///   is a documented platform limitation logged loudly rather than a
+    ///   fail-closed error: failing closed here would refuse every native
+    ///   connector on current macOS. Connectors that require an enforced
+    ///   memory ceiling must run under the WASI runtime (see the
+    ///   `FilterStrength` guidance in `sandbox.rs`); the native macOS
+    ///   sandbox is defense-in-depth.
+    fn apply_rlimits(policy: &CompiledPolicy) -> Result<(), SandboxError> {
+        // Best-effort memory budget: RLIMIT_DATA alone does not cover
+        // mmap-backed allocations, so both are attempted, but see above —
+        // modern Darwin rejects both with EINVAL.
+        let mem_data = set_rlimit(
+            libc::RLIMIT_DATA,
+            policy.memory_limit_bytes,
+            policy.memory_limit_bytes,
+        );
+        let mem_as = set_rlimit(
+            libc::RLIMIT_AS,
+            policy.memory_limit_bytes,
+            policy.memory_limit_bytes,
+        );
+        if let Err(error) = mem_data.and(mem_as) {
+            warn!(
+                error = %error,
+                memory_mb = policy.memory_limit_bytes / (1024 * 1024),
+                "macOS cannot enforce the memory budget via setrlimit \
+                 (RLIMIT_DATA/RLIMIT_AS are unsupported on modern Darwin); \
+                 the native sandbox runs WITHOUT a memory cap — use the WASI \
+                 runtime for connectors that require an enforced memory limit"
+            );
         }
 
-        // CPU time limit
+        // CPU time limit (soft = timeout, hard = timeout + 5s grace).
+        // Reliable on macOS: fail closed like Linux.
         let cpu_seconds = policy.wall_clock_timeout.as_secs();
-        let cpu_limit = libc::rlimit {
-            rlim_cur: cpu_seconds,
-            rlim_max: cpu_seconds + 5,
-        };
-        // SAFETY: `cpu_limit` is a valid `libc::rlimit`, and `setrlimit`
-        // updates only the current process resource limits.
-        unsafe {
-            if libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "Failed to set CPU limit"
-                );
-            }
+        set_rlimit(libc::RLIMIT_CPU, cpu_seconds, cpu_seconds + 5)?;
+
+        // File descriptor limit: best-effort, the hard-limit raise can hit
+        // kern.maxfilesperproc on constrained hosts.
+        if let Err(error) = set_rlimit(libc::RLIMIT_NOFILE, 1024, 4096) {
+            warn!(
+                error = %error,
+                "Failed to set file descriptor limit"
+            );
         }
 
-        // File descriptor limit
-        let fd_limit = libc::rlimit {
-            rlim_cur: 1024,
-            rlim_max: 4096,
-        };
-        // SAFETY: `fd_limit` is initialized locally and passed by shared
-        // reference for the kernel to read while updating this process limit.
-        unsafe {
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &fd_limit) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "Failed to set file descriptor limit"
-                );
-            }
-        }
-
-        // Disable core dumps
-        let core_limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `core_limit` is a valid `libc::rlimit`, and `setrlimit`
-        // reads it synchronously to disable core dumps for this process.
-        unsafe {
-            if libc::setrlimit(libc::RLIMIT_CORE, &core_limit) != 0 {
-                warn!(
-                    error = %std::io::Error::last_os_error(),
-                    "Failed to disable core dumps"
-                );
-            }
-        }
+        // Disable core dumps. Lowering to zero is always permitted, so an
+        // error here is unexpected: fail closed.
+        set_rlimit(libc::RLIMIT_CORE, 0, 0)?;
 
         // NOTE: RLIMIT_NPROC is NOT set on macOS even when deny_exec is true.
         // On macOS (like Linux NPTL), RLIMIT_NPROC counts threads as processes.
@@ -292,7 +280,29 @@ impl MacOsSandbox {
         // profile's `(deny process-exec)` directive.
 
         info!("Applied resource limits via setrlimit");
+        Ok(())
     }
+}
+
+/// Set one resource limit, mirroring the Linux sandbox helper.
+fn set_rlimit(resource: libc::c_int, soft: u64, hard: u64) -> Result<(), SandboxError> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+
+    // SAFETY: `limit` is a fully initialized `libc::rlimit`, and `setrlimit`
+    // only reads that struct while updating the current process limits.
+    unsafe {
+        if libc::setrlimit(resource, &limit) != 0 {
+            return Err(SandboxError::SyscallFailed(format!(
+                "setrlimit({resource}) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 impl Sandbox for MacOsSandbox {
@@ -307,8 +317,9 @@ impl Sandbox for MacOsSandbox {
             "Applying macOS sandbox"
         );
 
-        // Step 1: Apply resource limits
-        Self::apply_rlimits(policy);
+        // Step 1: Apply resource limits (fails closed on the limits macOS
+        // reliably supports; see `apply_rlimits`).
+        Self::apply_rlimits(policy)?;
 
         // Step 2: Generate and apply sandbox profile
         let profile = Self::generate_profile(policy);
@@ -559,6 +570,39 @@ mod tests {
         let sandbox = MacOsSandbox::new();
         assert!(sandbox.is_available());
         assert_eq!(sandbox.platform_name(), "macos");
+    }
+
+    /// The limits `apply_rlimits` fails closed on must actually be settable,
+    /// or every native macOS connector would be refused (bead
+    /// sandbox-macos-setrlimit-fail-open-1o7fy). Core-dump disable and a
+    /// generous CPU ceiling are safe to apply to the test process.
+    #[test]
+    fn fail_closed_rlimits_are_settable_on_macos() {
+        set_rlimit(libc::RLIMIT_CORE, 0, 0).expect("RLIMIT_CORE lowering must succeed");
+        // 10^7 seconds (~115 days) — far above any test runtime, so this
+        // cannot affect the harness while proving the CPU path works.
+        set_rlimit(libc::RLIMIT_CPU, 10_000_000, 10_000_005)
+            .expect("RLIMIT_CPU must be settable on macOS");
+    }
+
+    /// Tripwire for the documented platform limitation: modern Darwin on
+    /// Apple Silicon rejects `RLIMIT_DATA`/`RLIMIT_AS` with `EINVAL` for every
+    /// value, which is why `apply_rlimits` treats the memory budget as
+    /// best-effort instead of fail-closed. If this test ever fails, the
+    /// kernel has started honoring memory rlimits — revisit the fail-open
+    /// memory design and promote `DATA`/`AS` to fail-closed.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn memory_rlimits_remain_unsupported_on_apple_silicon() {
+        let mem = 128 * 1024 * 1024;
+        assert!(
+            set_rlimit(libc::RLIMIT_DATA, mem, mem).is_err(),
+            "RLIMIT_DATA unexpectedly succeeded — revisit bead 1o7fy fail-open memory design"
+        );
+        assert!(
+            set_rlimit(libc::RLIMIT_AS, mem, mem).is_err(),
+            "RLIMIT_AS unexpectedly succeeded — revisit bead 1o7fy fail-open memory design"
+        );
     }
 
     #[test]

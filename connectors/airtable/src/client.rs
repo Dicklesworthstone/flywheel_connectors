@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, Response, StatusCode, Url, header, redirect::Policy};
 use tracing::instrument;
@@ -662,7 +664,7 @@ impl AirtableClient {
 
         RetryLoop::execute(&ctx, &policy, |_attempt| {
             let req = self.apply_auth(self.client.get(url));
-            async move { Self::execute_once(req).await }
+            async move { Self::execute_once(req, true).await }
         })
         .await
     }
@@ -692,7 +694,7 @@ impl AirtableClient {
 
         RetryLoop::execute(&ctx, &policy, |_attempt| {
             let req = self.apply_auth(self.client.get(&url));
-            async move { Self::execute_once(req).await }
+            async move { Self::execute_once(req, false).await }
         })
         .await
     }
@@ -762,7 +764,7 @@ impl AirtableClient {
 
         RetryLoop::execute(&ctx, &policy, |_attempt| {
             let req = self.apply_auth(self.client.delete(url));
-            async move { Self::execute_once(req).await }
+            async move { Self::execute_once(req, true).await }
         })
         .await
     }
@@ -773,6 +775,12 @@ impl AirtableClient {
         path: &str,
         body: &serde_json::Value,
     ) -> AirtableResult<T> {
+        // br-kxd3e: PATCH and PUT address records by id and set fields to
+        // values, so they converge; only POST creates records, and a replay
+        // creates a SECOND set. Note this client already treats every
+        // non-success status as terminal, so the transport arm in
+        // `execute_once` is the only place a replay could happen.
+        let replay_safe = method != reqwest::Method::POST;
         let url = format!("{}{path}", self.base_url);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
@@ -782,13 +790,14 @@ impl AirtableClient {
             let req = self
                 .apply_auth(self.client.request(method.clone(), &url))
                 .json(body);
-            async move { Self::execute_once(req).await }
+            async move { Self::execute_once(req, replay_safe).await }
         })
         .await
     }
 
     async fn execute_once<T: serde::de::DeserializeOwned>(
         req: reqwest::RequestBuilder,
+        replay_safe: bool,
     ) -> AttemptOutcome<T, AirtableError> {
         match req.send().await {
             Ok(resp) => {
@@ -814,15 +823,10 @@ impl AirtableClient {
                 }
             }
             Err(e) => {
-                let err: AirtableError = e.into();
-                if err.is_retryable() {
-                    AttemptOutcome::Retryable {
-                        retry_after: None,
-                        error: err,
-                    }
-                } else {
-                    AttemptOutcome::Terminal(err)
-                }
+                // Only a connect-phase failure proves the create never reached
+                // Airtable.
+                let replayable = replay_safe || !transport_error_reached_service(&e);
+                AttemptOutcome::retryable_if_replayable(e.into(), None, replayable)
             }
         }
     }

@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:3212739e38cdad82f6c67da7d528e0a8ae4cc5fa4cd06c3fc4f85bf7b37bb373"
+interface_hash = "blake3-256:fcp.interface.v2:cd03549985da67e28955bec8320cbf1eae5ea9fb1f0ef6eca6bff996c1b0bb4e"
 
 [connector]
 id = "fcp.google-people"
@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "FCP connector for Google People/Contacts with explicit field-mask and approval semantics"
 archetypes = ["operational"]
 format = "wasi"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"
@@ -28,7 +29,15 @@ forbidden = ["z:public"]
 
 [capabilities]
 required = ["network.dns", "network.egress", "network.tls.sni", "storage.state"]
-optional = []
+optional = [
+    "people.contact_groups.read",
+    "people.contacts.delete",
+    "people.contacts.read",
+    "people.contacts.write",
+    "people.directory.read",
+    "people.other_contacts.read",
+    "people.profile.read",
+]
 forbidden = ["system.exec", "network.listen"]
 
 # -- Sandbox -----------------------------------------------------------

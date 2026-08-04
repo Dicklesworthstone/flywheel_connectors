@@ -599,6 +599,32 @@ impl TokenStore {
             if stored.tokens.refresh_token() != expected_refresh_token {
                 return Ok(false);
             }
+
+            // `tokens` was built by `OAuthTokens::from_response`, which
+            // collapses an omitted `expires_in` to `None` and an omitted
+            // `scope` to `[]`. A blind assignment would therefore
+            // (a) clobber the previous expiry to never-expiring — silently
+            //     stopping the refresh loop — when the provider omits
+            //     `expires_in` on refresh, and
+            // (b) drop the granted scope AND defeat the scope-narrowing
+            //     guard below on the next refresh.
+            // Preserve those fields when the refresh response omitted them,
+            // and reject a refresh that WIDENS granted scopes (a compromised
+            // token endpoint returning e.g. `read` -> `read write admin`).
+            // This mirrors `OAuthTokens::update_from_response`, which the
+            // `get_or_refresh` path does not route through.
+            let mut tokens = tokens;
+            if tokens.expires_at.is_none() {
+                tokens.expires_at = stored.tokens.expires_at;
+            }
+            if tokens.scopes.is_empty() {
+                tokens.scopes.clone_from(&stored.tokens.scopes);
+            } else if !refreshed_scopes_are_subset(&stored.tokens.scopes, &tokens.scopes) {
+                return Err(OAuthError::InvalidTokenResponse(
+                    "refresh response expanded granted scopes".into(),
+                ));
+            }
+
             stored.tokens = tokens;
             Ok(true)
         } else {
@@ -2405,6 +2431,128 @@ mod tests {
         let stored = store.get("k").unwrap();
         assert_eq!(stored.access_token(), "leader_at");
         assert_eq!(stored.refresh_token(), Some("new_rt"));
+    }
+
+    #[test]
+    fn test_update_after_refresh_preserves_expiry_when_omitted() {
+        // A refresh response that omits `expires_in` must NOT clear the
+        // prior expiry to never-expiring (which would silently stop the
+        // refresh loop). from_response builds the new tokens with
+        // expires_at=None; update_after_refresh must preserve the stored
+        // expiry.
+        let store = TokenStore::new();
+        store.store(
+            "k",
+            valid_tokens(TokenResponse {
+                access_token: "at".into(),
+                token_type: "Bearer".into(),
+                expires_in: Some(0), // at expiry
+                refresh_token: Some("rt".into()),
+                scope: Some("read".into()),
+                id_token: None,
+            }),
+        );
+        assert!(store.get("k").unwrap().is_expired());
+
+        let refreshed = valid_tokens(TokenResponse {
+            access_token: "at2".into(),
+            token_type: "Bearer".into(),
+            expires_in: None, // OMITTED
+            refresh_token: Some("rt".into()),
+            scope: Some("read".into()),
+            id_token: None,
+        });
+        assert!(
+            store
+                .update_after_refresh("k", Some("rt"), refreshed)
+                .unwrap()
+        );
+
+        let stored = store.get("k").unwrap();
+        assert_eq!(stored.access_token(), "at2");
+        assert!(
+            stored.is_expired(),
+            "omitted expires_in must preserve the prior expiry, not clear it to never-expiring"
+        );
+    }
+
+    #[test]
+    fn test_update_after_refresh_preserves_scopes_when_omitted() {
+        let store = TokenStore::new();
+        store.store(
+            "k",
+            valid_tokens(TokenResponse {
+                access_token: "at".into(),
+                token_type: "Bearer".into(),
+                expires_in: Some(3600),
+                refresh_token: Some("rt".into()),
+                scope: Some("read write".into()),
+                id_token: None,
+            }),
+        );
+
+        let refreshed = valid_tokens(TokenResponse {
+            access_token: "at2".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(3600),
+            refresh_token: Some("rt".into()),
+            scope: None, // OMITTED
+            id_token: None,
+        });
+        assert!(
+            store
+                .update_after_refresh("k", Some("rt"), refreshed)
+                .unwrap()
+        );
+
+        assert_eq!(
+            store.get("k").unwrap().scopes().to_vec(),
+            vec!["read".to_string(), "write".to_string()],
+            "omitted scope must preserve the originally granted scopes"
+        );
+    }
+
+    #[test]
+    fn test_update_after_refresh_rejects_scope_expansion() {
+        // A refresh must never WIDEN granted scopes (a compromised token
+        // endpoint returning read -> read write admin), and must leave the
+        // stored credential unchanged when it tries.
+        let store = TokenStore::new();
+        store.store(
+            "k",
+            valid_tokens(TokenResponse {
+                access_token: "at".into(),
+                token_type: "Bearer".into(),
+                expires_in: Some(3600),
+                refresh_token: Some("rt".into()),
+                scope: Some("read".into()),
+                id_token: None,
+            }),
+        );
+
+        let widened = valid_tokens(TokenResponse {
+            access_token: "at2".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(3600),
+            refresh_token: Some("rt".into()),
+            scope: Some("read write admin".into()),
+            id_token: None,
+        });
+        let err = store
+            .update_after_refresh("k", Some("rt"), widened)
+            .unwrap_err();
+        assert!(
+            matches!(err, OAuthError::InvalidTokenResponse(_)),
+            "a refresh that widens scopes must be rejected, got {err:?}"
+        );
+
+        let stored = store.get("k").unwrap();
+        assert_eq!(
+            stored.access_token(),
+            "at",
+            "rejected refresh must not mutate the stored token"
+        );
+        assert_eq!(stored.scopes().to_vec(), vec!["read".to_string()]);
     }
 
     #[test]

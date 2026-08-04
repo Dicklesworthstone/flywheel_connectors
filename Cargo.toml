@@ -250,7 +250,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -400,9 +400,13 @@ fwc = { path = "crates/fwc" }
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# The connector protocol loop awaits every JSON-RPC handler uniformly
+# (configure/handshake/health/...), so handlers keep `async fn` signatures
+# even when a given handler body has no await points.
+unused_async_trait_impl = "allow"
 
 [profile.release]
 opt-level = "z"

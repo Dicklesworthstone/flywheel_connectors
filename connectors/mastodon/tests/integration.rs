@@ -962,3 +962,101 @@ fn debug_output_redacts_mastodon_secrets() {
     assert!(!debug_client.contains("super-secret-mastodon-token"));
     assert!(debug_client.contains("[REDACTED]"));
 }
+
+// ── Replay safety on retry (br-kxd3e) ────────────────────────────────
+//
+// A 5xx or a timeout can both be reported after Mastodon already created the
+// status, so a bare retry posts the toot twice. Mastodon deduplicates on
+// `Idempotency-Key` for POST /statuses, which makes the retry genuinely safe
+// rather than merely refused.
+//
+// These pin the DISTINCTION: asserting only "the call succeeds" would pass
+// with a per-attempt key, which provides exactly zero protection.
+
+fn retrying_client(server: &MockServer) -> MastodonClient {
+    MastodonClient::new(
+        &server.uri(),
+        TEST_TOKEN,
+        HttpRetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            jitter_enabled: false,
+        },
+    )
+    .expect("wiremock URI should build a Mastodon client")
+}
+
+fn idempotency_keys_of(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("idempotency-key")
+                .map(|v| v.to_str().expect("header is ASCII").to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn status_body() -> Value {
+    status("109", "<p>hello</p>")
+}
+
+#[fcp_async_core::runtime::test]
+async fn post_status_presents_one_stable_idempotency_key_across_attempts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/statuses"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_body()))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .post_status(&test_runtime(), "hello", None, None, false, None)
+        .await
+        .expect("the retry should succeed");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2, "the 503 should have been retried");
+
+    let keys = idempotency_keys_of(&requests);
+    assert!(
+        !keys[0].is_empty(),
+        "POST /statuses must carry Idempotency-Key so the retry cannot post twice"
+    );
+    assert_eq!(
+        keys[0], keys[1],
+        "both attempts must present the SAME key — a per-attempt key would let \
+         Mastodon treat the retry as a new status and publish it twice"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn favourite_sends_no_idempotency_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/statuses/109/favourite"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_body()))
+        .mount(&server)
+        .await;
+
+    retrying_client(&server)
+        .favourite_status(&test_runtime(), "109")
+        .await
+        .expect("favourite should succeed");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        idempotency_keys_of(&requests)[0],
+        "",
+        "Mastodon honours Idempotency-Key only on POST /statuses; favourite is \
+         safe because the flag is already set on a replay"
+    );
+}

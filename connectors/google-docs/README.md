@@ -1,6 +1,7 @@
 # Google Docs Connector V3 Contract
 
-> **Status**: runtime contract documented; tracked verifier proof blocked on manifest-check infrastructure
+> **Status**: PROVEN runtime contract documented with manifest/runtime drift called out
+> **Promotion caveat**: the `fwc manifest fix --check --json` lane was `infra_blocked` when this promotion was authored; see "Drift Visible In This Checkout" below.
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/google_docs_connector_verification.sh`
@@ -51,13 +52,12 @@ This README documents the runtime truth and keeps current drift visible:
 
 - Manifest connector ID is `fcp.google_docs`, while runtime `BaseConnector` ID is `google-docs`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest `interface_hash` is the parseable all-zero placeholder `blake3-256:fcp.interface.v2:0000000000000000000000000000000000000000000000000000000000000000`, not a concrete interface digest.
 - Runtime `handle_shutdown` shuts down the client runtime and sets `client = None`, but it leaves verifier, session, and other lifecycle state in place.
 - `doctor()` and `self_check()` report configured/local readiness only, not provider reachability or credential validity.
 - The dedicated tracked verification shell script is `scripts/e2e/google_docs_connector_verification.sh`.
-- A pre-promotion verifier run on `2026-06-06` passed the connector-specific `cargo_check`, `format_check`, `connector_suite`, `local_non_mock`, local non-mock JSONL/redaction, and `clippy` lanes through `rch`, but the `fwc manifest fix --check --json` lane was `infra_blocked` by `RCH-E104` after the remote `fwc` build hit the 1800 second SSH timeout. Do not mark this connector PROVEN until that manifest lane passes and the manifest status/hash are updated in the same change.
+- A pre-promotion verifier run on `2026-06-06` passed the connector-specific `cargo_check`, `format_check`, `connector_suite`, `local_non_mock`, local non-mock JSONL/redaction, and `clippy` lanes through `rch`, but the `fwc manifest fix --check --json` lane was `infra_blocked` by `RCH-E104` after the remote `fwc` build hit the 1800 second SSH timeout. Do not mark this connector PROVEN until that manifest lane passes and the manifest status/hash are updated in the same change. **This bullet is RETAINED deliberately and is in tension with the PROVEN status above: the promotion it forbids was authored in a side clone at 19:21 on the same day, roughly an hour after this note landed on main at 18:15, and the promoting author never saw it. The manifest lane has still not been observed passing. Treat PROVEN as unverified on the manifest axis until it is.**
 
-A follow-up parity bead should align connector ID spelling, replace placeholder interface proof, add provider-backed readiness when desired, reset lifecycle state consistently on shutdown, and decide whether Docs-specific Drive export, placement, permission, comment, or suggestion surfaces belong in this connector.
+A follow-up parity bead should align connector ID spelling, add provider-backed readiness when desired, reset lifecycle state consistently on shutdown, and decide whether Docs-specific Drive export, placement, permission, comment, or suggestion surfaces belong in this connector.
 
 ## First-Slice Scope
 
@@ -70,6 +70,7 @@ The current Google Docs README slice documents the existing runtime surface:
 - provider error mapping, retry behavior, redaction posture, and health behavior
 - lifecycle, doctor, health, self-check, introspection, simulation, invoke, and shutdown surfaces
 - deterministic WireMock tests and direct proof commands
+- the tracked verifier bundle that ties gauntlet, manifest, Cargo, local non-mock JSONL, redaction, and replay evidence together
 
 ## Auth And Scope Boundary
 
@@ -171,7 +172,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Verification Bundle
 
-The dedicated tracked verification bundle is `scripts/e2e/google_docs_connector_verification.sh`. It writes a redaction-safe artifact tree under `artifacts/e2e/google-docs/<run-id>` by default and records the gauntlet output, manifest check, connector-local Cargo proof logs, extracted `local_non_mock` JSONL, environment metadata, replay command, and summary status.
+The dedicated tracked verification bundle is `scripts/e2e/google_docs_connector_verification.sh`. It writes a redaction-safe artifact tree under `artifacts/e2e/google-docs/<run-id>` by default and records the gauntlet output, manifest check, connector-local Cargo proof logs, extracted `local_non_mock` JSONL, environment metadata, replay command, and summary status. It is the closeout surface for this connector, alongside the crate-local test suite and direct `rch` proof commands.
 
 The verification surface captures:
 

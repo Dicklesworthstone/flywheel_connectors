@@ -1,6 +1,6 @@
 # Box Connector V3 Contract
 
-> **Status**: manifest/runtime contract documented
+> **Status**: PROVEN runtime contract documented; runtime operation metadata derives from manifest
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -38,6 +38,8 @@ Important runtime truths the contract preserves:
 - File and folder identifiers reject empty values, path traversal, slash, backslash, `..`, `%2f`, and `%5c`.
 - Upload is a simplified multipart request that sends JSON attributes plus text content from the optional `content` field.
 - Upstream 401, 403, 404, 409, 429, and other provider failures are mapped into FCP auth, permission, not-found, conflict, rate-limit, or external errors.
+- Runtime introspection derives operation descriptions, schemas, capability, risk, safety, idempotency, approval mode, and AI hints from `manifest.toml`.
+- Runtime introspection exposes manifest approval intent for `box.files.upload` and `box.files.delete`, but `invoke` and `simulate` do not verify approval tokens.
 
 ## First-Slice Scope
 
@@ -99,7 +101,7 @@ The current Box README slice documents the existing runtime surface:
 |-----------|----------------|------------|------------|-----------|-------------|-----------|
 | `box.files.get` | `GET /files/{file_id}` | `box.files.read` | `Safe` | `Low` | `Strict` | Read-only file metadata lookup. |
 | `box.files.upload` | `POST upload:/files/content` | `box.files.write` | `Risky` | `Medium` | `None` | Creates provider-visible file content in a folder. |
-| `box.files.delete` | `DELETE /files/{file_id}` | `box.files.write` | `Dangerous` | `High` | `Strict` | Destructive file deletion; manifest marks it for interactive approval. |
+| `box.files.delete` | `DELETE /files/{file_id}` | `box.files.write` | `Dangerous` | `High` | `None` | Destructive file deletion; manifest marks it for interactive approval. |
 | `box.folders.list` | `GET /folders/{folder_id}/items` | `box.folders.read` | `Safe` | `Low` | `Strict` | Read-only folder item inventory. |
 | `box.sharing.list` | `GET /files/{file_id}/collaborations` | `box.sharing.read` | `Safe` | `Low` | `Strict` | Read-only collaboration listing for a file. |
 
@@ -130,7 +132,7 @@ These are excluded on purpose:
 - auth mode, base URL, upload URL, credential-injection state, request counters, and error counters
 - self-check degradation for unconfigured and credential-id configurations
 - simulation denial for unsupported operation IDs
-- five operation descriptors with capability, risk, safety tier, idempotency, schemas, and AI hints
+- five operation descriptors with manifest-derived capability, risk, safety tier, idempotency, approval mode, schemas, and AI hints
 
 The deterministic integration evidence is anchored on connector-local tests covering:
 
@@ -157,7 +159,7 @@ There is no dedicated tracked `scripts/e2e/box_connector_verification.sh` bundle
 
 The verification surface captures:
 
-- manifest/runtime operation agreement
+- manifest-derived runtime operation metadata with explicit approval-mode parity
 - deterministic WireMock coverage for all five operations
 - auth, URL policy, input validation, provider error, lifecycle, and introspection tests
 - formatting, check, and clippy proof through `rch`

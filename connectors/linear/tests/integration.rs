@@ -959,3 +959,84 @@ async fn unknown_operation_rejected() {
 
     assert!(result.is_err());
 }
+
+// ============================================================================
+// Replay safety on retry (br-kxd3e)
+// ============================================================================
+//
+// Linear speaks GraphQL: every query AND every mutation is the same
+// `POST /graphql` request. The HTTP verb therefore carries no information
+// about whether a replay is safe, which makes this the clearest case in the
+// sweep for gating on the OPERATION rather than on the transport.
+//
+// These two tests are a matched pair — identical mock, identical retry
+// budget, different GraphQL document — so what they pin is exactly that
+// distinction. A gate written at the helper level would make both behave the
+// same and one of these would fail.
+
+fn replay_test_client(mock_server: &MockServer) -> LinearClient {
+    LinearClient::new("test-key")
+        .unwrap()
+        .with_api_url(&format!("{}/graphql", mock_server.uri()))
+        .with_retry_config(3)
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_issue_mutation_is_not_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let result = replay_test_client(&mock_server)
+        .create_issue("Test issue", "team-1", None)
+        .await;
+    assert!(result.is_err());
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 503 means Linear received the issueCreate mutation — retrying files \
+         a SECOND issue"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn list_teams_query_is_still_retried_after_a_5xx() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "teams": { "nodes": [] } }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    replay_test_client(&mock_server)
+        .list_teams()
+        .await
+        .expect("a read-only query must keep its retry");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the SAME endpoint and the SAME 503 — only the GraphQL document \
+         differs, which is why the gate has to live at the operation"
+    );
+}
