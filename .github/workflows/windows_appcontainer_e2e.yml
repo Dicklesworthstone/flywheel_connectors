@@ -39,7 +39,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Checkout toon_rust path dependency
         shell: bash
@@ -100,7 +100,7 @@ jobs:
         run: bash scripts/e2e/windows_appcontainer_process_launch_verification.sh
 
       - name: Upload Windows AppContainer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: success()
         with:
           name: windows-appcontainer-${{ github.run_id }}
@@ -108,7 +108,7 @@ jobs:
           retention-days: 7
 
       - name: Upload failed Windows AppContainer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: windows-appcontainer-failed-${{ github.run_id }}
