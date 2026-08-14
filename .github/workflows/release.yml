@@ -75,11 +75,6 @@ jobs:
             archive_ext: zip
     steps:
       - uses: actions/checkout@v7
-      - name: Checkout external dependencies
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git "$GITHUB_WORKSPACE/../asupersync"
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git "$GITHUB_WORKSPACE/../toon_rust"
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -160,11 +155,6 @@ jobs:
             suffix: windows-arm64
     steps:
       - uses: actions/checkout@v7
-      - name: Checkout external dependencies
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git "$GITHUB_WORKSPACE/../asupersync"
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git "$GITHUB_WORKSPACE/../toon_rust"
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -333,11 +323,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v7
-      - name: Checkout external dependencies
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git "$GITHUB_WORKSPACE/../asupersync"
-          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git "$GITHUB_WORKSPACE/../toon_rust"
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |

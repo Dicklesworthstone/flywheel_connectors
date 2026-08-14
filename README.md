@@ -1657,21 +1657,14 @@ Owner policy can enforce:
 - **Rust nightly (2024 edition)** — see [`rust-toolchain.toml`](rust-toolchain.toml).
 - **Cargo**.
 - **Tailscale** — for mesh features.
-- **Sibling repositories** — this workspace depends on two external repos via relative `path = "../../../<sibling>"` entries. Clone them as siblings:
+- **crates.io dependencies** — external runtime crates such as [`asupersync`](https://crates.io/crates/asupersync) (native async runtime) and [`tru`](https://crates.io/crates/tru) (the TOON serializer, imported under the `toon` alias in `fwc`) are pinned to exact versions and fetched from crates.io. A fresh clone builds with no sibling checkouts and no special directory layout.
 
-  ```bash
-  # Expected layout
-  #   parent/
-  #   ├── asupersync/          ← native async runtime (required)
-  #   ├── toon_rust/           ← TOON serializer library (required)
-  #   └── flywheel_connectors/ ← this repo
+  To hack on one of those crates locally, add a temporary [`[patch.crates-io]`](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html) section to the workspace `Cargo.toml` pointing at your checkout (do not commit it):
 
-  git clone https://github.com/Dicklesworthstone/asupersync.git
-  git clone https://github.com/Dicklesworthstone/toon_rust.git
-  git clone https://github.com/Dicklesworthstone/flywheel_connectors.git
+  ```toml
+  [patch.crates-io]
+  tru = { path = "../toon_rust" }
   ```
-
-  If either sibling is missing, `cargo build` fails at dependency resolution with `failed to get <name> as a dependency` followed by a `failed to read .../Cargo.toml` cause pointing at the missing sibling. The error cites package names — a missing `toon_rust` checkout will be reported against package `tru` (the underlying crate name), not the `toon` alias.
 
 ### Building
 
@@ -2146,7 +2139,7 @@ zones[2]:
 
 Token-efficiency is a first-class concern when an LLM consumes every command output: TOON typically saves 30–60% of tokens versus JSON on `fwc list`, `fwc show`, and `fwc ops` payloads, which adds up when an agent runs hundreds of discovery commands per session.
 
-Every command supports `--json` for full-fidelity structured output and `--format table|csv|tsv|markdown` for human consumption. The TOON serializer lives in the sibling [`toon_rust`](https://github.com/Dicklesworthstone/toon_rust) repository.
+Every command supports `--json` for full-fidelity structured output and `--format table|csv|tsv|markdown` for human consumption. The TOON serializer is the [`tru`](https://crates.io/crates/tru) crate, developed in the [`toon_rust`](https://github.com/Dicklesworthstone/toon_rust) repository.
 
 ---
 
