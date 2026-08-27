@@ -5,7 +5,8 @@
 //! and deterministic, with structured JSON logging.
 
 #![forbid(unsafe_code)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+// Lint groups come from [workspace.lints.clippy]; duplicating them here would
+// override that table and defeat its allow entries.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::cast_possible_truncation)] // duration_ms fits in u64
 #![allow(clippy::too_many_arguments)] // test harness functions need many parameters

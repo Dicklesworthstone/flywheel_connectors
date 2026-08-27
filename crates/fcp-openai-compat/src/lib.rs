@@ -7,7 +7,8 @@
 //! provider policy and an `fcp_async_core::http::HttpClient`.
 
 #![forbid(unsafe_code)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+// Lint groups come from [workspace.lints.clippy]; duplicating them here would
+// override that table and defeat its allow entries.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]

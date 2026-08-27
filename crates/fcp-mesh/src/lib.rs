@@ -11,7 +11,8 @@
 //! - [`transport`] - Transport path ranking + deterministic multipath selection
 
 #![forbid(unsafe_code)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+// Lint groups come from [workspace.lints.clippy]; duplicating them here would
+// override that table and defeat its allow entries.
 #![allow(clippy::module_name_repetitions)]
 // Allow patterns common in mesh/gossip code
 #![allow(clippy::cast_possible_truncation)]

@@ -21,6 +21,11 @@ supply-chain-live = []
 # fails to compile unless the consumer explicitly opts in.
 test-mocks = []
 
+[lints]
+# Inherit [workspace.lints.clippy]; without this the crate silently opts out of the
+# workspace lint policy, allow entries included.
+workspace = true
+
 [dependencies]
 axum = { version = "0.8", features = ["json"] }
 bytes = { workspace = true }

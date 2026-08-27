@@ -8,6 +8,11 @@ repository.workspace = true
 
 description = "Typed GraphQL client infrastructure for FCP connectors"
 
+[lints]
+# Inherit [workspace.lints.clippy]; without this the crate silently opted out of
+# the workspace lint policy, allows included.
+workspace = true
+
 [dependencies]
 fcp-async-core = { workspace = true }
 fcp-core = { workspace = true }

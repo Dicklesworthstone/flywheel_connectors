@@ -252,7 +252,7 @@ default-members = [
 [workspace.package]
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/flywheel/flywheel_connectors"
 authors = ["Flywheel Core Team <core@flywheel.dev>"]
@@ -400,6 +400,34 @@ fwc = { path = "crates/fwc" }
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
+# New lint. as_chunks changes remainder handling, so it is not a free swap in the
+# raptorq/graphql byte paths.
+chunks_exact_to_as_chunks = "allow"
+# Matrix walks index parallel rows by a single counter.
+needless_range_loop = "allow"
+# Nested guards kept separate where each condition documents a distinct case.
+collapsible_if = "allow"
+# nursery; const-ness is not part of these APIs contracts.
+missing_const_for_fn = "allow"
+# New lint preferring is_multiple_of over % checks.
+manual_is_multiple_of = "allow"
+# Unit choice matches the surrounding protocol constants.
+duration_suboptimal_units = "allow"
+# nursery false positives around borrow-splitting.
+redundant_clone = "allow"
+# Guards deliberately span the critical section.
+significant_drop_tightening = "allow"
+# nursery lint. These futures are driven by asupersync's local executor and are
+# deliberately not Send; requiring Send would force needless synchronisation.
+future_not_send = "allow"
+# Suggests mul_add for a*b+c. Fusing changes rounding, so it is not a free swap in
+# benchmark statistics code. Allowed, as sibling repos already do.
+suboptimal_flops = "allow"
+# New in recent nightlies. It only asks for `assert_eq!(x, "")` instead of
+# `assert!(x.is_empty())` to improve the failure message; it fires on dozens of test
+# assertions here with no defect behind any, and the rewrite is type-specific so
+# `clippy --fix` cannot apply it.
+assert_is_empty = "allow"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }

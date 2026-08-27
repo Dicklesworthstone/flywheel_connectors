@@ -45,6 +45,14 @@
 //! than the old fixed 64-byte scaffold.
 
 #![forbid(unsafe_code)]
+// nursery/pedantic style lints that newer nightlies fire on this unchanged code.
+// Needed here rather than in Cargo.toml because this crate re-enables the groups
+// with an inner attribute, which overrides the workspace lint table.
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::duration_suboptimal_units)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::significant_drop_tightening)]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};

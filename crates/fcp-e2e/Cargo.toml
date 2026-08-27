@@ -201,6 +201,11 @@ postgresql = ["dep:fcp-postgresql"]
 whisper = ["dep:fcp-whisper"]
 line = ["dep:fcp-line"]
 
+[lints]
+# Inherit [workspace.lints.clippy]; without this the crate silently opts out of the
+# workspace lint policy, allow entries included.
+workspace = true
+
 [dependencies]
 fcp-core = { workspace = true }
 fcp-prelude = { workspace = true }

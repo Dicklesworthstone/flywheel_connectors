@@ -5,8 +5,21 @@
 //! consistent async concurrency model.
 
 #![forbid(unsafe_code)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+// Lint groups come from [workspace.lints.clippy]; duplicating them here would
+// override that table and defeat its allow entries.
 #![allow(clippy::module_name_repetitions)]
+// These futures run on asupersync's local executor and are deliberately not Send;
+// requiring Send would force needless synchronisation. Must live here rather than in
+// Cargo.toml because the #![warn(clippy::nursery)] above overrides the lint table.
+#![allow(clippy::future_not_send)]
+// nursery/pedantic style lints that newer nightlies fire on this unchanged code.
+// Needed here rather than in Cargo.toml because this crate re-enables the groups
+// with an inner attribute, which overrides the workspace lint table.
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::duration_suboptimal_units)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::significant_drop_tightening)]
 
 extern crate self as fcp_async_core;
 

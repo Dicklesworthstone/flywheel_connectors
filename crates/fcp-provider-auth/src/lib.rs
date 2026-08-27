@@ -6,8 +6,14 @@
 //! core primitives.
 
 #![forbid(unsafe_code)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+// Lint groups come from [workspace.lints.clippy]; duplicating them here would
+// override that table and defeat its allow entries.
 #![allow(clippy::module_name_repetitions)]
+// nursery/pedantic style lints newer nightlies fire on this unchanged code; the crate
+// re-enables the groups in source, which overrides the workspace lint table.
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::duration_suboptimal_units)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;

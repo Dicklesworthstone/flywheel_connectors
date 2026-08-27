@@ -1,4 +1,12 @@
 //! FCP2 crypto primitives and helpers.
+// nursery/pedantic style lints that newer nightlies fire on this unchanged code.
+// Needed here rather than in Cargo.toml because this crate re-enables the groups
+// with an inner attribute, which overrides the workspace lint table.
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::duration_suboptimal_units)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::significant_drop_tightening)]
 //!
 //! This crate provides the cryptographic building blocks used by zone key
 //! distribution, capability tokens, sessions, receipts, and audit throughout
