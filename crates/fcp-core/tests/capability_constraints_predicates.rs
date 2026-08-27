@@ -50,12 +50,12 @@ fn default_is_empty_constraint_set() {
          (capability.rs:1472 documents 'empty == deny all')"
     );
     // And every field is its zero value.
-    assert!(c.resource_allow.is_empty());
-    assert!(c.resource_deny.is_empty());
+    assert_eq!(c.resource_allow, [] as [std::string::String; 0]);
+    assert_eq!(c.resource_deny, [] as [std::string::String; 0]);
     assert!(c.max_calls.is_none());
     assert!(c.max_bytes.is_none());
     assert!(c.idempotency_key.is_none());
-    assert!(c.credential_allow.is_empty());
+    assert_eq!(c.credential_allow, [] as [fcp_core::CredentialId; 0]);
 }
 
 #[test]

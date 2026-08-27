@@ -669,7 +669,7 @@ mod tests {
         let encoded = frame.encode();
         let decoded = FcpcFrame::decode(&encoded).expect("decode ok");
         let opened = decoded.open(dir, &K_CTX).expect("open ok");
-        assert!(opened.is_empty());
+        assert_eq!(opened, [] as [u8; 0]);
     }
 
     #[test]
@@ -1284,7 +1284,7 @@ mod tests {
         // Decode with exact limit
         let decoded = FcpcFrame::decode_with_limit(&bytes, 0).expect("empty payload, limit 0 ok");
         let opened = decoded.open(dir, &K_CTX).expect("open ok");
-        assert!(opened.is_empty());
+        assert_eq!(opened, [] as [u8; 0]);
     }
 
     #[test]

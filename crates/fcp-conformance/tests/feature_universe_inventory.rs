@@ -2626,7 +2626,7 @@ fn command_attribute_parser_does_not_confuse_alias_with_visible_alias() {
         command_attribute_string_values(attr, "visible_aliases"),
         vec!["handoff".to_owned(), "ready".to_owned()]
     );
-    assert!(command_attribute_string_values(attr, "alias").is_empty());
+    assert_eq!(command_attribute_string_values(attr, "alias"), [] as [std::string::String; 0]);
 }
 
 #[test]

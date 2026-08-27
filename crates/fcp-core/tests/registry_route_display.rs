@@ -232,7 +232,7 @@ fn sbom_dependency_default_depends_on_recovers_from_missing_field() {
     let bare = json!({ "component_id": "x" });
     let dep: SbomDependency = serde_json::from_value(bare).unwrap();
     assert_eq!(dep.component_id, "x");
-    assert!(dep.depends_on.is_empty());
+    assert_eq!(dep.depends_on, [] as [std::string::String; 0]);
 }
 
 #[test]

@@ -307,7 +307,7 @@ fn object_placement_policy_cbor_roundtrip_preserves_all_fields() {
     assert_eq!(back.target_coverage_bps, policy.target_coverage_bps);
     assert_eq!(back.min_source_diversity, policy.min_source_diversity);
     assert_eq!(back.preferred_devices.len(), 1);
-    assert!(back.excluded_devices.is_empty());
+    assert_eq!(back.excluded_devices, [] as [fcp_core::DeviceSelector; 0]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -342,8 +342,8 @@ fn object_placement_policy_preferred_excluded_default_to_empty_vec() {
         "target_coverage_bps": 100
     }"#;
     let policy: ObjectPlacementPolicy = serde_json::from_str(json).expect("deserialize");
-    assert!(policy.preferred_devices.is_empty());
-    assert!(policy.excluded_devices.is_empty());
+    assert_eq!(policy.preferred_devices, [] as [fcp_core::DeviceSelector; 0]);
+    assert_eq!(policy.excluded_devices, [] as [fcp_core::DeviceSelector; 0]);
     assert_eq!(policy.min_source_diversity, 0);
 }
 

@@ -551,7 +551,7 @@ fn streaming_thread_info_survives_sdk_to_client_flow() {
     let ack = EventAck::new("telegram.message.new", vec![emitted.seq]);
     let ack_result = mgr.handle_ack(&ack);
     assert_eq!(ack_result.acked, vec![emitted.seq]);
-    assert!(ack_result.missing.is_empty());
+    assert_eq!(ack_result.missing, [] as [u64; 0]);
 }
 
 #[test]
@@ -577,11 +577,11 @@ fn streaming_ack_clears_pending() {
     let ack = EventAck::new("t", vec![e1.seq]);
     let result = mgr.handle_ack(&ack);
     assert_eq!(result.acked, vec![e1.seq]);
-    assert!(result.missing.is_empty());
+    assert_eq!(result.missing, [] as [u64; 0]);
 
     // Ack e1 again → it's missing now
     let result2 = mgr.handle_ack(&ack);
-    assert!(result2.acked.is_empty());
+    assert_eq!(result2.acked, [] as [u64; 0]);
     assert_eq!(result2.missing, vec![e1.seq]);
 }
 
@@ -595,7 +595,7 @@ fn streaming_nack_redelivers_events() {
     let result = mgr.handle_nack(&nack);
     assert_eq!(result.redeliver.len(), 1);
     assert_eq!(result.redeliver[0].seq, e1.seq);
-    assert!(result.missing.is_empty());
+    assert_eq!(result.missing, [] as [u64; 0]);
 }
 
 #[test]
@@ -979,7 +979,7 @@ fn supervisor_config_zero_base_backoff_fails_validation() {
         ..SupervisorConfig::default()
     };
     let errors = config.validate().unwrap_err();
-    assert!(!errors.is_empty());
+    assert_ne!(errors, [] as [std::string::String; 0]);
 }
 
 #[test]

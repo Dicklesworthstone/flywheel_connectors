@@ -558,7 +558,7 @@ impl ObjectStore for MemoryObjectStore {
         drop(zone_index);
 
         self.used_bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_sub(size))
             })
             .ok();

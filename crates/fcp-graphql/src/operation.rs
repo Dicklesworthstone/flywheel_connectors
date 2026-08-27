@@ -319,7 +319,7 @@ fn tokenize_query(query: &str) -> Vec<GraphqlToken<'_>> {
     tokens
 }
 
-fn skip_comment(bytes: &[u8], mut index: usize) -> usize {
+const fn skip_comment(bytes: &[u8], mut index: usize) -> usize {
     while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
         index += 1;
     }
@@ -354,7 +354,7 @@ fn skip_block_string(bytes: &[u8], mut index: usize) -> usize {
     bytes.len()
 }
 
-fn skip_string(bytes: &[u8], mut index: usize) -> usize {
+const fn skip_string(bytes: &[u8], mut index: usize) -> usize {
     let mut escaped = false;
     while index < bytes.len() {
         let byte = bytes[index];

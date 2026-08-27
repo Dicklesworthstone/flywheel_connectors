@@ -78,7 +78,7 @@ fn test_invalid_approver_emits_audit_with_reject_marker() {
         provenance.confidentiality_label,
         ConfidentialityLevel::Private
     );
-    assert!(provenance.label_adjustments.is_empty());
+    assert_eq!(provenance.label_adjustments, [] as [fcp_core::LabelAdjustment; 0]);
 }
 
 #[test]

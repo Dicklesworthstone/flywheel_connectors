@@ -304,8 +304,8 @@ fn test_empty_paths() {
     };
 
     let policy = CompiledPolicy::from_manifest(&manifest, None).unwrap();
-    assert!(policy.readonly_paths.is_empty());
-    assert!(policy.writable_paths.is_empty());
+    assert_eq!(policy.readonly_paths, [] as [std::path::PathBuf; 0]);
+    assert_eq!(policy.writable_paths, [] as [std::path::PathBuf; 0]);
 }
 
 // ============================================================================

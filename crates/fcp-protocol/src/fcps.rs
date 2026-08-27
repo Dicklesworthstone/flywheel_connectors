@@ -3369,7 +3369,7 @@ mod tests {
         ];
         for reason in reasons {
             let dbg = format!("{reason:?}");
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 
@@ -3749,7 +3749,7 @@ mod tests {
         ];
         for err in &variants {
             let dbg = format!("{err:?}");
-            assert!(!dbg.is_empty());
+            assert_ne!(dbg, "");
         }
     }
 

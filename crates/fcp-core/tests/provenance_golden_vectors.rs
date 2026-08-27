@@ -947,7 +947,7 @@ fn test_current_zone_updated_on_zone_crossing() {
     let now_ms = 1_704_067_200_000u64;
     let mut record = ProvenanceRecord::new(ZoneId::private());
     assert_eq!(record.current_zone, ZoneId::private());
-    assert!(record.zone_crossings.is_empty());
+    assert_eq!(record.zone_crossings, [] as [fcp_core::ZoneCrossing; 0]);
 
     // Cross to work zone (approved crossing)
     record.record_zone_crossing(ZoneId::work(), true, None, now_ms);

@@ -502,7 +502,7 @@ mod tests {
         let sealed = hpke_seal(&recipient_public_key, b"", &aad).unwrap();
         let opened = hpke_open(&recipient_secret_key, &sealed, &aad).unwrap();
 
-        assert!(opened.is_empty());
+        assert_eq!(opened, [] as [u8; 0]);
     }
 
     #[test]

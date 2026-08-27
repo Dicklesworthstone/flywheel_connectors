@@ -834,7 +834,7 @@ fn test_session_id_debug() {
     let session = SessionId::new();
     let debug = format!("{session:?}");
     // SessionId should have a debug representation
-    assert!(!debug.is_empty());
+    assert_ne!(debug, "");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

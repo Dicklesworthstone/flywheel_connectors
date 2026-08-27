@@ -55,7 +55,7 @@ fn connector_bundle_cbor_roundtrip_preserves_fields_and_display() -> TestResult 
     let mut encoded = Vec::new();
     ciborium::into_writer(&bundle, &mut encoded)?;
 
-    assert!(!encoded.is_empty());
+    assert_ne!(encoded, [] as [u8; 0]);
 
     let decoded: ConnectorBundle = ciborium::from_reader(encoded.as_slice())?;
     assert_eq!(decoded, bundle);

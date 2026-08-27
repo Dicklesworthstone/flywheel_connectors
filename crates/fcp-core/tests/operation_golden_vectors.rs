@@ -572,7 +572,7 @@ mod lease_fencing_tests {
 
         // Signable bytes should include the zero
         let bytes = intent.signable_bytes();
-        assert!(!bytes.is_empty());
+        assert_ne!(bytes, [] as [u8; 0]);
     }
 
     #[test]
@@ -785,7 +785,7 @@ mod fault_injection_tests {
         // Verify display works for all
         for status in &statuses {
             let s = status.to_string();
-            assert!(!s.is_empty());
+            assert_ne!(s, "");
         }
 
         // Verify serde roundtrip for all
@@ -1160,8 +1160,8 @@ mod edge_cases {
 
         let restored: OperationReceipt =
             ciborium::from_reader(&cbor[..]).expect("should deserialize");
-        assert!(restored.outcome_object_ids.is_empty());
-        assert!(restored.resource_object_ids.is_empty());
+        assert_eq!(restored.outcome_object_ids, [] as [fcp_core::ObjectId; 0]);
+        assert_eq!(restored.resource_object_ids, [] as [fcp_core::ObjectId; 0]);
     }
 
     #[test]

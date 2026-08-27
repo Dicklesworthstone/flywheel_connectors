@@ -1234,7 +1234,7 @@ mod tests {
         let nack = EventNack::new("t", vec![e1.seq, e2.seq], "retry");
         let result = manager.handle_nack(&nack);
         assert_eq!(result.redeliver.len(), 2);
-        assert!(result.missing.is_empty());
+        assert_eq!(result.missing, [] as [u64; 0]);
     }
 
     #[test]
@@ -1251,7 +1251,7 @@ mod tests {
         let mut manager = EventStreamManager::new(caps(true, true, 3));
         let ack = EventAck::new("nonexistent", vec![0, 1]).with_cursors(vec![]);
         let result = manager.handle_ack(&ack);
-        assert!(result.acked.is_empty());
+        assert_eq!(result.acked, [] as [u64; 0]);
         assert_eq!(result.missing, vec![0, 1]);
     }
 
@@ -1729,7 +1729,7 @@ mod tests {
 
         // Second ack of same seq should be missing
         let r2 = manager.handle_ack(&ack);
-        assert!(r2.acked.is_empty());
+        assert_eq!(r2.acked, [] as [u64; 0]);
         assert_eq!(r2.missing, vec![e.seq]);
     }
 
@@ -2615,7 +2615,7 @@ mod tests {
             },
         ];
         for err in &errors {
-            assert!(!err.to_string().is_empty());
+            assert_ne!(err.to_string(), "");
         }
     }
 
@@ -2625,8 +2625,8 @@ mod tests {
         manager.emit("t", sample_event_data());
         let ack = EventAck::new("t", vec![]).with_cursors(vec![]);
         let result = manager.handle_ack(&ack);
-        assert!(result.acked.is_empty());
-        assert!(result.missing.is_empty());
+        assert_eq!(result.acked, [] as [u64; 0]);
+        assert_eq!(result.missing, [] as [u64; 0]);
     }
 
     #[test]
@@ -2636,7 +2636,7 @@ mod tests {
         let nack = EventNack::new("t", vec![], "retry");
         let result = manager.handle_nack(&nack);
         assert!(result.redeliver.is_empty());
-        assert!(result.missing.is_empty());
+        assert_eq!(result.missing, [] as [u64; 0]);
     }
 
     #[test]
@@ -2697,7 +2697,7 @@ mod tests {
             capability_token: None,
         };
         let outcome = manager.handle_subscribe(&req).unwrap();
-        assert!(outcome.response.result.confirmed_topics.is_empty());
+        assert_eq!(outcome.response.result.confirmed_topics, [] as [std::string::String; 0]);
         assert!(outcome.replay_events.is_empty());
     }
 }

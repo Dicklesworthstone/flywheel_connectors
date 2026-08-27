@@ -630,7 +630,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ciphertext.is_empty());
+        assert_eq!(ciphertext, [] as [u8; 0]);
 
         let decrypted = decrypt_symbol(
             &zone_key,
@@ -641,7 +641,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(decrypted.is_empty());
+        assert_eq!(decrypted, [] as [u8; 0]);
     }
 
     #[test]
@@ -950,7 +950,7 @@ mod tests {
 
         let (ciphertext, auth_tag) =
             encrypt_symbol(&zone_key, ZoneKeyAlgorithm::XChaCha20Poly1305, &ctx, b"").unwrap();
-        assert!(ciphertext.is_empty());
+        assert_eq!(ciphertext, [] as [u8; 0]);
 
         let decrypted = decrypt_symbol(
             &zone_key,
@@ -960,7 +960,7 @@ mod tests {
             &auth_tag,
         )
         .unwrap();
-        assert!(decrypted.is_empty());
+        assert_eq!(decrypted, [] as [u8; 0]);
     }
 
     #[test]

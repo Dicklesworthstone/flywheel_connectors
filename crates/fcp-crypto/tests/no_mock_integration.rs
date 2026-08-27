@@ -596,7 +596,7 @@ fn aead_empty_plaintext_roundtrip() {
     let ct = chacha20_encrypt(&key, &nonce, &[], b"empty-body").unwrap();
     assert_eq!(ct.len(), AEAD_TAG_SIZE); // only auth tag
     let pt = chacha20_decrypt(&key, &nonce, &ct, b"empty-body").unwrap();
-    assert!(pt.is_empty());
+    assert_eq!(pt, [] as [u8; 0]);
 }
 
 // ============================================================================
@@ -736,10 +736,10 @@ fn crypto_error_display_variants() {
     assert!(format!("{err}").contains("32"));
 
     let err = CryptoError::AeadEncryptFailed;
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
 
     let err = CryptoError::TokenExpired;
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
 }
 
 // ============================================================================

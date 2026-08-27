@@ -871,7 +871,7 @@ mod tests {
             "fcp.test.contract:utility:1.0.0",
         ));
 
-        assert!(!description.diagnostics.testkit_entry_points.is_empty());
+        assert_ne!(description.diagnostics.testkit_entry_points, [] as [std::string::String; 0]);
         assert_eq!(description.diagnostics.reason_codes, Vec::<String>::new());
         assert!(
             description

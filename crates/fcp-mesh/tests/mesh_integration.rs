@@ -650,7 +650,7 @@ mod meshnode {
             .await
             .expect("symbol request should succeed");
 
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
         assert!(response.symbol_esis.len() <= 2);
     }
 
@@ -1816,7 +1816,7 @@ mod meshnode {
             .await
             .expect("authenticated session should allow request");
 
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
 
         emit_test_pass(
             TEST_NAME,
@@ -1903,7 +1903,7 @@ mod meshnode {
             .handle_symbol_request(request, &peer, true, 1_200)
             .await
             .expect("symbol request succeeds");
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
 
         let snapshot = node.trace_snapshot().expect("trace capture enabled");
         let has_session = snapshot
@@ -1992,8 +1992,8 @@ mod meshnode {
             .expect("parse json trace");
         let cbor_trace = CapturedTrace::from_cbor(&cbor_bytes).expect("parse cbor trace");
 
-        assert!(!json_trace.events.is_empty());
-        assert!(!cbor_trace.events.is_empty());
+        assert_ne!(json_trace.events, [] as [fcp_telemetry::trace_capture::TraceEvent; 0]);
+        assert_ne!(cbor_trace.events, [] as [fcp_telemetry::trace_capture::TraceEvent; 0]);
         assert_eq!(json_trace.events.len(), cbor_trace.events.len());
         assert!(
             json_trace.redacted,
@@ -2109,7 +2109,7 @@ mod meshnode {
             .handle_symbol_request(allowed_request, &peer, false, 10_200)
             .await
             .expect("authenticated session should allow larger request");
-        assert!(!allowed.symbol_esis.is_empty());
+        assert_ne!(allowed.symbol_esis, [] as [u32; 0]);
 
         let receiver_store = node_b.symbol_store().clone();
         if let Err(SymbolStoreError::ObjectNotFound(_)) =
@@ -3262,7 +3262,7 @@ mod routing {
         let planner = ExecutionPlanner::new();
 
         let before = planner.plan(&PlannerInput::new(initial_nodes.clone(), 1000), &context);
-        assert!(!before.is_empty());
+        assert_ne!(before, [] as [fcp_mesh::CandidateNode; 0]);
         assert_eq!(before[0].node_id.as_str(), "node-primary");
 
         let after_nodes: Vec<NodeInfo> = initial_nodes
@@ -3270,7 +3270,7 @@ mod routing {
             .filter(|node| node.profile.node_id.as_str() != "node-primary")
             .collect();
         let after = planner.plan(&PlannerInput::new(after_nodes, 2000), &context);
-        assert!(!after.is_empty());
+        assert_ne!(after, [] as [fcp_mesh::CandidateNode; 0]);
         assert_eq!(after[0].node_id.as_str(), "node-backup");
 
         emit_test_pass(
@@ -3338,7 +3338,7 @@ mod routing {
         let candidates = planner.plan(&input, &context);
 
         // node-high should be first, node-low may be excluded due to memory requirement
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
         assert_eq!(candidates[0].node_id.as_str(), "node-high");
 
         emit_test_pass(
@@ -4581,8 +4581,8 @@ mod gossip_integration {
         );
         let response = gossip.handle_request(&request);
 
-        assert!(response.have_objects.is_empty());
-        assert!(response.have_symbols.is_empty());
+        assert_eq!(response.have_objects, [] as [fcp_prelude::ObjectId; 0]);
+        assert_eq!(response.have_symbols, [] as [(fcp_prelude::ObjectId, u32); 0]);
 
         emit_test_pass(
             TEST_NAME,
@@ -4799,7 +4799,7 @@ mod gossip_integration {
         )
         .unwrap_or(u64::MAX);
 
-        assert!(!summary.iblt.is_empty());
+        assert_ne!(summary.iblt, [] as [u8; 0]);
         assert!(summary.iblt.len() <= max_iblt_bytes);
 
         let created_log = find_tracing_event(&capture, "summary_created");
@@ -5386,7 +5386,7 @@ mod integration_scenarios {
         let planner = ExecutionPlanner::new();
         let candidates = planner.plan(&input, &context);
 
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 
         // Record usage after successful routing
         admission.record_bytes(&peer, 1024, now_ms);
@@ -5440,7 +5440,7 @@ mod integration_scenarios {
             &PlannerInput::new(nodes, now_ms),
             &PlannerContext::new(connector_id.clone()),
         );
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 
         emit_test_pass(
             TEST_NAME,
@@ -5502,7 +5502,7 @@ mod integration_scenarios {
         let candidates = planner.plan(&input, &context);
 
         // Node with data should be preferred
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
         assert_eq!(candidates[0].node_id.as_str(), "node-with-data");
 
         emit_test_pass(
@@ -5761,7 +5761,7 @@ mod real_component_integration {
             .handle_symbol_request(request.clone(), &peer, false, 1001)
             .await
             .expect("authenticated session should allow request");
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
 
         let allow_receipt = make_decision_receipt(
             &zone_id,
@@ -5863,7 +5863,7 @@ mod real_component_integration {
                 .await
             {
                 Ok(response) => {
-                    assert!(!response.symbol_esis.is_empty());
+                    assert_ne!(response.symbol_esis, [] as [u32; 0]);
                     allowed_count += 1;
                     // Record bytes against admission budget so it accumulates
                     node.admission_mut().record_bytes(
@@ -6489,7 +6489,7 @@ mod real_component_integration {
             .handle_symbol_request(request, &peer, true, 1000)
             .await
             .expect("first request should succeed");
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
 
         // Phase 2: Peer reports decode complete
         let header = ObjectHeader {
@@ -6826,7 +6826,7 @@ mod real_component_integration {
         let context = PlannerContext::new(connector_id).with_preferred_symbols(vec![target_symbol]);
         let candidates = node.plan_execution(&context, 1000);
 
-        assert!(!candidates.is_empty());
+        assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
         assert_eq!(candidates[0].node_id.as_str(), "peer-powerful");
 
         emit_test_pass(
@@ -6883,7 +6883,7 @@ mod real_component_integration {
             .handle_symbol_request(request, &peer, true, 1000)
             .await
             .expect("first request should succeed");
-        assert!(!response.symbol_esis.is_empty());
+        assert_ne!(response.symbol_esis, [] as [u32; 0]);
 
         // Phase 2: SymbolAck Complete — signals object is fully decoded
         let signing_key = fcp_crypto::Ed25519SigningKey::generate();

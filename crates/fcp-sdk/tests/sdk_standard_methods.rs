@@ -292,7 +292,7 @@ fn test_subscribe_method_signature_correct() {
 
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert!(!response.result.confirmed_topics.is_empty());
+        assert_ne!(response.result.confirmed_topics, [] as [std::string::String; 0]);
         assert_eq!(connector.subscribe_count(), 1);
     });
 }
@@ -613,7 +613,7 @@ fn test_simulate_response_allowed() {
     assert!(response.would_succeed);
     assert!(response.failure_reason.is_none());
     assert!(response.denial_code.is_none());
-    assert!(response.missing_capabilities.is_empty());
+    assert_eq!(response.missing_capabilities, [] as [std::string::String; 0]);
 }
 
 #[test]

@@ -580,7 +580,7 @@ mod tests {
             placement: None,
         };
         let obj = ControlPlaneObject::new(header, vec![]);
-        assert!(obj.body.is_empty());
+        assert_eq!(obj.body, [] as [u8; 0]);
         assert_eq!(obj.retention(), ControlPlaneRetention::Ephemeral);
     }
 

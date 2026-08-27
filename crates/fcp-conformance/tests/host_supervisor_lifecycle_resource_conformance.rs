@@ -339,7 +339,7 @@ fn violations_empty_when_within_limits() {
         process_count: 10, // ≤ 64
         file_size_bytes: 0,
     };
-    assert!(usage.violations(&limits).is_empty());
+    assert_eq!(usage.violations(&limits), [] as [fcp_host::ResourceViolation; 0]);
     assert!(usage.within_limits(&limits));
 }
 

@@ -60,7 +60,7 @@ fn cross_zone_sequence_does_not_match_outside_window() {
         entry("b", "capability.invoke", "z:public", 2, 10_001),
     ];
 
-    assert!(pattern.find_matches(&entries).is_empty());
+    assert_eq!(pattern.find_matches(&entries), [] as [fcp_audit::PatternMatch; 0]);
 }
 
 #[test]

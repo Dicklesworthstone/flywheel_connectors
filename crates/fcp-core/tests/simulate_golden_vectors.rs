@@ -286,7 +286,7 @@ mod response_validation {
         assert!(resp.would_succeed);
         assert!(resp.failure_reason.is_none());
         assert!(resp.denial_code.is_none());
-        assert!(resp.missing_capabilities.is_empty());
+        assert_eq!(resp.missing_capabilities, [] as [std::string::String; 0]);
         assert!(resp.estimated_cost.is_none());
         assert!(resp.availability.is_none());
     }
@@ -1131,11 +1131,11 @@ mod missing_capabilities {
     #[test]
     fn missing_capabilities_empty_list() {
         let resp = SimulateResponse::allowed(RequestId::new("req_empty"));
-        assert!(resp.missing_capabilities.is_empty());
+        assert_eq!(resp.missing_capabilities, [] as [std::string::String; 0]);
 
         let json_str = serde_json::to_string(&resp).unwrap();
         let parsed: SimulateResponse = serde_json::from_str(&json_str).unwrap();
-        assert!(parsed.missing_capabilities.is_empty());
+        assert_eq!(parsed.missing_capabilities, [] as [std::string::String; 0]);
     }
 
     #[test]

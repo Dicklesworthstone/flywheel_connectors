@@ -240,7 +240,7 @@ fn handshake_request_minimal_capabilities_default_to_empty_list() {
         "nonce": zeros
     });
     let back: HandshakeRequest = serde_json::from_value(bare).unwrap();
-    assert!(back.capabilities_requested.is_empty());
+    assert_eq!(back.capabilities_requested, [] as [fcp_core::CapabilityId; 0]);
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn transport_caps_default_state_is_empty_list_and_none_frame_size() {
     // Decode-side: default fills both.
     let bare = json!({});
     let back: TransportCaps = serde_json::from_value(bare).unwrap();
-    assert!(back.compression.is_empty());
+    assert_eq!(back.compression, [] as [std::string::String; 0]);
     assert!(back.max_frame_size.is_none());
 }
 

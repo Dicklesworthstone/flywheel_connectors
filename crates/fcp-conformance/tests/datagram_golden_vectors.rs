@@ -245,5 +245,5 @@ fn datagram_exactly_header_accepted() {
     // 40 bytes (exactly the header) must decode successfully with empty frame
     let input = vec![0u8; 40];
     let decoded = FcpsDatagram::decode(&input, 1200).expect("header-only datagram must decode");
-    assert!(decoded.frame_bytes.is_empty());
+    assert_eq!(decoded.frame_bytes, [] as [u8; 0]);
 }

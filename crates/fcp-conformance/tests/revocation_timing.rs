@@ -345,7 +345,7 @@ fn scenario_priority_push_fanout_collapses_within_interval() {
         PriorityGossipPolicy::DirectPush,
         1_050,
     );
-    assert!(collapsed.selected_peers.is_empty());
+    assert_eq!(collapsed.selected_peers, [] as [fcp_prelude::TailscaleNodeId; 0]);
     assert_eq!(collapsed.next_allowed_at_ms, Some(1_100));
 }
 

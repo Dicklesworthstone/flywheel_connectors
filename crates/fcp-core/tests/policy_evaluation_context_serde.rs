@@ -153,7 +153,7 @@ fn omitted_optional_fields_use_documented_defaults() {
     assert!(!parsed.execution_approval_required);
     assert_eq!(parsed.safety_tier, SafetyTier::Safe);
     assert!(parsed.sanitizer_receipts.is_empty());
-    assert!(parsed.related_object_ids.is_empty());
+    assert_eq!(parsed.related_object_ids, [] as [fcp_core::ObjectId; 0]);
     assert!(parsed.request_object_id.is_none());
     assert!(parsed.request_input_hash.is_none());
     assert!(parsed.principal.is_none());

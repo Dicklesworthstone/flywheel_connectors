@@ -83,7 +83,7 @@ fn connector_attestation_cbor_roundtrip_preserves_display_fields() -> TestResult
     let mut encoded = Vec::new();
     ciborium::into_writer(&attestation, &mut encoded)?;
 
-    assert!(!encoded.is_empty());
+    assert_ne!(encoded, [] as [u8; 0]);
 
     let decoded: SupplyChainAttestation = ciborium::from_reader(encoded.as_slice())?;
     assert_eq!(decoded, attestation);

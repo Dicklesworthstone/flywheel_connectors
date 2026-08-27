@@ -1028,7 +1028,7 @@ mod golden_vectors {
 
         // Hash should be stable
         let expected_prefix = hex::encode(&hash.as_bytes()[..8]);
-        assert!(!expected_prefix.is_empty());
+        assert_ne!(expected_prefix, "");
     }
 
     #[test]
@@ -1249,7 +1249,7 @@ mod grant_verification {
             .expect("should be present");
 
         if let ciborium::Value::Array(arr) = grants_val {
-            assert!(!arr.is_empty());
+            assert_ne!(arr.as_slice(), []);
             // First element should be text, not bytes
             assert!(matches!(&arr[0], ciborium::Value::Text(_)));
         } else {

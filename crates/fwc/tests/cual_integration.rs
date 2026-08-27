@@ -566,7 +566,7 @@ fn assert_operator_truth_fixture_has_core_evidence_contract(fixture: &OperatorTr
 fn assert_operator_truth_fixture_contract(payload: &Value, fixture: &OperatorTruthFixture) {
     assert_eq!(payload["command"], fixture.command);
     assert_eq!(payload["source"], fixture.source);
-    assert!(!fixture.notes.trim().is_empty());
+    assert_ne!(fixture.notes.trim(), "");
 
     if let Some(availability) = fixture.availability.as_deref() {
         assert_eq!(payload["availability"]["availability"], availability);
@@ -4796,8 +4796,8 @@ fn operator_truth_fixture_matrix_freezes_core_answer_classes() {
     );
 
     for fixture in &matrix.fixtures {
-        assert!(!fixture.command.trim().is_empty());
-        assert!(!fixture.source.trim().is_empty());
+        assert_ne!(fixture.command.trim(), "");
+        assert_ne!(fixture.source.trim(), "");
         assert!(
             fixture
                 .availability
@@ -4810,7 +4810,7 @@ fn operator_truth_fixture_matrix_freezes_core_answer_classes() {
             "fixture {} must freeze either availability or status",
             fixture.id
         );
-        assert!(!fixture.notes.trim().is_empty());
+        assert_ne!(fixture.notes.trim(), "");
         assert_operator_truth_fixture_has_core_evidence_contract(fixture);
     }
 

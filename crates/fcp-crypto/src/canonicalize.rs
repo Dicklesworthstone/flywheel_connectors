@@ -448,7 +448,7 @@ mod tests {
     fn sort_signatures_empty() {
         let ids: Vec<&[u8]> = vec![];
         let sorted = sort_signatures_by_node_id(&ids);
-        assert!(sorted.is_empty());
+        assert_eq!(sorted, [] as [usize; 0]);
     }
 
     #[test]
@@ -593,7 +593,7 @@ mod tests {
     fn deterministic_cbor_string() {
         let s = "hello world";
         let cbor = to_deterministic_cbor(&s).unwrap();
-        assert!(!cbor.is_empty());
+        assert_ne!(cbor, [] as [u8; 0]);
     }
 
     #[test]
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn deterministic_cbor_integer() {
         let cbor = to_deterministic_cbor(&42u64).unwrap();
-        assert!(!cbor.is_empty());
+        assert_ne!(cbor, [] as [u8; 0]);
         let cbor2 = to_deterministic_cbor(&42u64).unwrap();
         assert_eq!(cbor, cbor2);
     }
@@ -649,14 +649,14 @@ mod tests {
     fn deterministic_cbor_option_none() {
         let val: Option<u32> = None;
         let cbor = to_deterministic_cbor(&val).unwrap();
-        assert!(!cbor.is_empty());
+        assert_ne!(cbor, [] as [u8; 0]);
     }
 
     #[test]
     fn deterministic_cbor_option_some() {
         let val: Option<u32> = Some(42);
         let cbor = to_deterministic_cbor(&val).unwrap();
-        assert!(!cbor.is_empty());
+        assert_ne!(cbor, [] as [u8; 0]);
     }
 
     // ---- Schema hash with long input ----

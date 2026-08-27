@@ -686,7 +686,7 @@ fn envelope_empty_plaintext() {
     let decrypted = envelope
         .decrypt(&zone_key, ZoneKeyAlgorithm::ChaCha20Poly1305, zone_key_id)
         .unwrap();
-    assert!(decrypted.is_empty());
+    assert_eq!(decrypted, [] as [u8; 0]);
 }
 
 #[test]
@@ -980,7 +980,7 @@ fn encode_error_display() {
 #[test]
 fn decode_error_display() {
     let err = DecodeError::Timeout;
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
 
     let err = DecodeError::InsufficientSymbols {
         received: 3,
@@ -999,7 +999,7 @@ fn decode_error_display() {
 #[test]
 fn chunk_error_display() {
     let err = ChunkError::HashMismatch;
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
 
     let err = ChunkError::MissingChunks {
         expected: 5,
@@ -1158,7 +1158,7 @@ fn envelope_preserves_metadata_after_encrypt() {
     assert_eq!(envelope.sender_instance_id, 0x4242);
     assert_eq!(envelope.frame_seq, 55);
     // Ciphertext should be non-empty
-    assert!(!envelope.data.is_empty());
+    assert_ne!(envelope.data, [] as [u8; 0]);
     // Auth tag should be non-zero
     assert_ne!(envelope.auth_tag, [0u8; 16]);
 }

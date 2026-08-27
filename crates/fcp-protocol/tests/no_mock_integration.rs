@@ -551,8 +551,8 @@ fn suite_id_invalid() {
 
 #[test]
 fn suite_as_str() {
-    assert!(!SessionCryptoSuite::Suite1.as_str().is_empty());
-    assert!(!SessionCryptoSuite::Suite2.as_str().is_empty());
+    assert_ne!(SessionCryptoSuite::Suite1.as_str(), "");
+    assert_ne!(SessionCryptoSuite::Suite2.as_str(), "");
     assert_ne!(
         SessionCryptoSuite::Suite1.as_str(),
         SessionCryptoSuite::Suite2.as_str()
@@ -1303,13 +1303,13 @@ fn fcps_datagram_encode_decode() {
 #[test]
 fn frame_error_display() {
     let err = fcp_protocol::FrameError::TooShort { len: 10, min: 114 };
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }
 
 #[test]
 fn session_error_display() {
     let err = fcp_protocol::SessionError::NoMutualSuite;
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }
 
 #[test]
@@ -1321,7 +1321,7 @@ fn fcpc_error_display() {
 #[test]
 fn symbol_envelope_error_display() {
     let err = fcp_protocol::SymbolEnvelopeError::DecryptFailed;
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }
 
 // ── build_symbol_aad ──

@@ -386,7 +386,7 @@ mod state_schema_tests {
         let json_str = serde_json::to_string(&crdt_type).unwrap();
 
         // Should serialize to a recognizable string
-        assert!(!json_str.is_empty());
+        assert_ne!(json_str, "");
 
         // Should deserialize back
         let deserialized: ConnectorCrdtType = serde_json::from_str(&json_str).unwrap();
@@ -1322,7 +1322,7 @@ mod health_schema_tests {
 
         for state in states {
             let json_str = serde_json::to_string(&state).unwrap();
-            assert!(!json_str.is_empty());
+            assert_ne!(json_str, "");
         }
     }
 }

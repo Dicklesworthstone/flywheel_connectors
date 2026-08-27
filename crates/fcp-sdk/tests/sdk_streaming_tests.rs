@@ -168,7 +168,7 @@ fn test_pending_ack_tracking() {
     let result = manager.handle_ack(&ack);
 
     assert_eq!(result.acked, vec![e1.seq]);
-    assert!(result.missing.is_empty());
+    assert_eq!(result.missing, [] as [u64; 0]);
     assert_eq!(manager.pending_acks("events.pending"), 2);
 
     // Ack remaining
@@ -190,7 +190,7 @@ fn test_ack_unknown_seq() {
     let ack = EventAck::new("events.ack", vec![999]).with_cursors(vec!["999".to_string()]);
     let result = manager.handle_ack(&ack);
 
-    assert!(result.acked.is_empty());
+    assert_eq!(result.acked, [] as [u64; 0]);
     assert_eq!(result.missing, vec![999]);
 }
 
@@ -202,7 +202,7 @@ fn test_ack_unknown_topic() {
     let ack = EventAck::new("events.nonexistent", vec![0]).with_cursors(vec!["0".to_string()]);
     let result = manager.handle_ack(&ack);
 
-    assert!(result.acked.is_empty());
+    assert_eq!(result.acked, [] as [u64; 0]);
     assert_eq!(result.missing, vec![0]);
 }
 
@@ -223,7 +223,7 @@ fn test_nack_redelivery() {
 
     assert_eq!(result.redeliver.len(), 1);
     assert_eq!(result.redeliver[0].seq, e1.seq);
-    assert!(result.missing.is_empty());
+    assert_eq!(result.missing, [] as [u64; 0]);
 }
 
 #[test]

@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(ciphertext.len(), AEAD_TAG_SIZE); // Tag only
 
         let decrypted = chacha20_decrypt(&key, &nonce, &ciphertext, b"aad").unwrap();
-        assert!(decrypted.is_empty());
+        assert_eq!(decrypted, [] as [u8; 0]);
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
         let ct = xchacha20_encrypt(&key, &nonce, b"", b"aad").unwrap();
         assert_eq!(ct.len(), AEAD_TAG_SIZE);
         let pt = xchacha20_decrypt(&key, &nonce, &ct, b"aad").unwrap();
-        assert!(pt.is_empty());
+        assert_eq!(pt, [] as [u8; 0]);
     }
 
     #[test]

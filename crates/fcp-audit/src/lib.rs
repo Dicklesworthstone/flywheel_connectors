@@ -3380,7 +3380,7 @@ mod tests {
         let (entries, head) = signed_chain_and_head(&signing_key);
         // head.signatures intentionally left empty even though
         // signature_count = 1. This is the canonical tamper payload.
-        assert!(head.signatures.is_empty());
+        assert_eq!(head.signatures, [] as [HeadSignature; 0]);
         assert_eq!(head.signature_count, 1);
 
         let resolver =
@@ -3905,7 +3905,7 @@ mod tests {
         // count, has_quorum returns false on decoded legacy heads.
         let legacy_json = r#"{"zone_id":"z:work","head_entry":"e","head_seq":0,"coverage":1.0,"epoch_id":"ep","signature_count":3}"#;
         let legacy: ChainHead = serde_json::from_str(legacy_json).unwrap();
-        assert!(legacy.signatures.is_empty());
+        assert_eq!(legacy.signatures, [] as [HeadSignature; 0]);
         assert!(!legacy.has_quorum());
         assert!(!legacy.signature_count_consistent());
     }
@@ -5400,7 +5400,7 @@ mod tests {
         assert!(entry.connector_id.is_none());
         assert!(entry.operation_id.is_none());
         assert!(entry.metadata.is_empty());
-        assert!(entry.correlation_id.is_empty());
+        assert_eq!(entry.correlation_id, "");
     }
 
     #[test]
@@ -5511,7 +5511,7 @@ mod tests {
             .occurred_at(0)
             .build()
             .unwrap();
-        assert!(entry.correlation_id.is_empty());
+        assert_eq!(entry.correlation_id, "");
     }
 
     #[test]
@@ -6041,7 +6041,7 @@ mod tests {
         ];
         for err in variants {
             let debug = format!("{err:?}");
-            assert!(!debug.is_empty());
+            assert_ne!(debug, "");
         }
     }
 
@@ -6193,7 +6193,7 @@ mod tests {
         ];
         assert_eq!(variants.len(), 8);
         for v in &variants {
-            assert!(!v.to_string().is_empty());
+            assert_ne!(v.to_string(), "");
         }
     }
 
@@ -6742,8 +6742,8 @@ mod tests {
             .occurred_at(0)
             .build()
             .unwrap();
-        assert!(entry.id.is_empty());
-        assert!(entry.event_type.is_empty());
+        assert_eq!(entry.id, "");
+        assert_eq!(entry.event_type, "");
     }
 
     #[test]

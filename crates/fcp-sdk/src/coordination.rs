@@ -1983,7 +1983,7 @@ mod tests {
         assert!(config.enabled());
         assert_eq!(config.ttl(), DEFAULT_THREAD_OWNERSHIP_TTL);
         assert!(config.fail_open());
-        assert!(config.allowlist_channels().is_empty());
+        assert_eq!(config.allowlist_channels(), []);
         assert_eq!(config.backend(), ChatCoordinationBackend::AgentMail);
         assert_eq!(config.dm_mode(), DmMode::TreatAsThread);
         assert!(config.channel_is_allowed(&ChannelId::new("C123")));

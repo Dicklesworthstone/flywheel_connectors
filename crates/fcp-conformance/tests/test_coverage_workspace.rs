@@ -113,9 +113,7 @@ fn is_untracked_path(root: &Path, relative_path: &str) -> bool {
     if !output.status.success() {
         return false;
     }
-    String::from_utf8(output.stdout)
-        .ok()
-        .is_some_and(|stdout| stdout.lines().any(|line| line.starts_with("?? ")))
+    String::from_utf8(output.stdout).is_ok_and(|stdout| stdout.lines().any(|line| line.starts_with("?? ")))
 }
 
 fn expected_missing_tests_dirs() -> BTreeSet<String> {

@@ -199,7 +199,7 @@ fn check_result_minimal_construction_with_required_fields() {
     assert_eq!(parsed.status, CheckStatus::Ok);
     assert_eq!(parsed.severity, CheckSeverity::Info);
     assert_eq!(parsed.message, "passed");
-    assert!(parsed.repair_hints.is_empty());
+    assert_eq!(parsed.repair_hints, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn check_result_default_when_optionals_absent_in_json() {
         serde_json::from_str(&json_str).expect("deserialize minimal CheckResult");
     assert!(parsed.connector_id.is_none());
     assert!(parsed.code.is_none());
-    assert!(parsed.repair_hints.is_empty());
+    assert_eq!(parsed.repair_hints, [] as [std::string::String; 0]);
 }
 
 #[test]

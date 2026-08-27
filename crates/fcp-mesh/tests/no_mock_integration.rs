@@ -690,7 +690,7 @@ fn transport_multipath_zero_fanout() {
     )];
     let policy = ZoneTransportPolicy::default();
     let selected = TransportSelector::select_multipath(&paths, &policy, &test_object_id(1), 0, 0);
-    assert!(selected.is_empty());
+    assert_eq!(selected, [] as [fcp_mesh::TransportPath; 0]);
 }
 
 #[test]
@@ -1208,7 +1208,7 @@ fn planner_singleton_writer_lease() {
     let context = PlannerContext::new(connector_id).with_singleton_writer();
     let planner = ExecutionPlanner::new();
     let candidates = planner.plan(&input, &context);
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
     assert_eq!(candidates[0].node_id.as_str(), "holder");
 }
 
@@ -1219,7 +1219,7 @@ fn planner_empty_nodes_returns_empty() {
     let context = PlannerContext::new(connector_id);
     let planner = ExecutionPlanner::new();
     let candidates = planner.plan(&input, &context);
-    assert!(candidates.is_empty());
+    assert_eq!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 }
 
 #[test]
@@ -1382,7 +1382,7 @@ fn degraded_encoder_decoder_roundtrip() {
             &test_ts_node("mesh-test-sender"),
         )
         .expect("encode should succeed");
-    assert!(!frames.is_empty());
+    assert_ne!(frames, [] as [fcp_protocol::FcpsFrame; 0]);
 
     let mut decoder = DegradedModeDecoder::new(config);
     let zone = test_zone();
@@ -1438,7 +1438,7 @@ fn degraded_encoder_small_payload() {
     let frames = encoder
         .encode_authenticated(&envelope, 0, &zone_key, algorithm, &source_id)
         .unwrap();
-    assert!(!frames.is_empty());
+    assert_ne!(frames, [] as [fcp_protocol::FcpsFrame; 0]);
 
     let mut decoder = DegradedModeDecoder::new(config);
     let zone = test_zone();
@@ -1483,7 +1483,7 @@ fn degraded_encoder_signed_roundtrip() {
             &pq_signing_key,
         )
         .expect("encode_signed should succeed");
-    assert!(!signed_frames.is_empty());
+    assert_ne!(signed_frames, [] as [fcp_crypto::SignedEnvelope<fcp_protocol::SignedFcpsFramePayload>; 0]);
 
     let mut decoder = DegradedModeDecoder::new(config);
     let zone = test_zone();
@@ -1645,13 +1645,13 @@ fn degraded_transport_error_display() {
     assert!(msg.contains("10"));
 
     let err2 = DegradedTransportError::RetentionViolation;
-    assert!(!err2.to_string().is_empty());
+    assert_ne!(err2.to_string(), "");
 
     let err3 = DegradedTransportError::MissingControlPlaneFlag;
-    assert!(!err3.to_string().is_empty());
+    assert_ne!(err3.to_string(), "");
 
     let err4 = DegradedTransportError::ObjectIdMismatch;
-    assert!(!err4.to_string().is_empty());
+    assert_ne!(err4.to_string(), "");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1746,7 +1746,7 @@ fn handler_list_epochs_unknown_zone() {
     let handler = InMemoryControlPlaneHandler::new();
     let unknown = ZoneId::owner();
     let epochs = handler.list_epochs(&unknown, None);
-    assert!(epochs.is_empty());
+    assert_eq!(epochs, [] as [u64; 0]);
 }
 
 #[test]
@@ -1943,7 +1943,7 @@ fn trace_replay_report_no_capturing_node() {
     let json = serde_json::to_string(&report).unwrap();
     let parsed: TraceReplayReport = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.source_capturing_node, None);
-    assert!(parsed.diffs.is_empty());
+    assert_eq!(parsed.diffs, [] as [fcp_mesh::TraceReplayDiff; 0]);
 }
 
 #[test]
@@ -1971,7 +1971,7 @@ fn trace_replay_error_parse_display() {
 #[test]
 fn trace_replay_error_capture_unavailable() {
     let err = TraceReplayError::TraceCaptureUnavailable;
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 }
 
 #[test]
@@ -2153,7 +2153,7 @@ fn mesh_node_plan_execution() {
 
     let ctx = PlannerContext::new(test_connector_id("fcp.test"));
     let candidates = node.plan_execution(&ctx, 1000);
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 }
 
 #[test]
@@ -2161,7 +2161,7 @@ fn mesh_node_plan_execution_no_candidates() {
     let node = create_test_node("empty-planner");
     let ctx = PlannerContext::new(test_connector_id("fcp.missing"));
     let candidates = node.plan_execution(&ctx, 1000);
-    assert!(candidates.is_empty());
+    assert_eq!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 }
 
 #[test]
@@ -2181,7 +2181,7 @@ fn mesh_node_control_plane_encode_decode() {
     let frames = node
         .encode_control_plane(&envelope, 1, &zone_key, algorithm)
         .expect("encode");
-    assert!(!frames.is_empty());
+    assert_ne!(frames, [] as [fcp_protocol::FcpsFrame; 0]);
 
     let peer = NodeId::new("cp-node");
     let mut result = None;
@@ -2550,7 +2550,7 @@ fn cross_admission_gossip_planning_workflow() {
 
     let context = PlannerContext::new(test_connector_id("data-sync"));
     let candidates = node.plan_execution(&context, 3000);
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
 }
 
 #[test]
@@ -2622,7 +2622,7 @@ fn cross_degraded_encode_to_handler_store() {
     let frames = encoder
         .encode_authenticated(&envelope, 10, &zone_key, algorithm, &source_id)
         .unwrap();
-    assert!(!frames.is_empty());
+    assert_ne!(frames, [] as [fcp_protocol::FcpsFrame; 0]);
 
     let mut decoder = DegradedModeDecoder::new(test_raptorq_config());
     let mut recovered = None;
@@ -2937,7 +2937,7 @@ fn mesh_node_announce_then_plan_data_locality() {
     let context =
         PlannerContext::new(test_connector_id("compute")).with_required_symbols(vec![obj]);
     let candidates = node.plan_execution(&context, 3000);
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates, [] as [fcp_mesh::CandidateNode; 0]);
     assert!(candidates.iter().any(|c| c.node_id.as_str() == "data-node"));
 }
 

@@ -424,7 +424,7 @@ fn select_multipath_returns_empty_when_no_eligible_paths() {
     )];
     let oid = test_object_id();
     let selected = TransportSelector::select_multipath(&paths, &policy, &oid, 0, 5);
-    assert!(selected.is_empty());
+    assert_eq!(selected, [] as [fcp_mesh::TransportPath; 0]);
 }
 
 #[test]

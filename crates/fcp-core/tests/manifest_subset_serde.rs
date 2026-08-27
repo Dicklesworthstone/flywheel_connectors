@@ -51,7 +51,7 @@ fn manifest_subset_cbor_shape_and_roundtrip_are_pinned() -> TestResult {
     let subset = sample_manifest_subset();
     let mut encoded = Vec::new();
     ciborium::into_writer(&subset, &mut encoded)?;
-    assert!(!encoded.is_empty());
+    assert_ne!(encoded, [] as [u8; 0]);
 
     let value: CborValue = ciborium::from_reader(encoded.as_slice())?;
     let CborValue::Map(entries) = value else {

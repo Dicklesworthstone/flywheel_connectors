@@ -293,7 +293,7 @@ mod binding_rules {
         let corr_id = CorrelationId::new();
         // CorrelationId wraps a UUID and implements Display
         let id_string = corr_id.to_string();
-        assert!(!id_string.is_empty());
+        assert_ne!(id_string, "");
     }
 }
 

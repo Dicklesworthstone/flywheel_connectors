@@ -101,7 +101,7 @@ fn provisioning_recipe_cbor_roundtrip_preserves_recipe() -> TestResult {
     let mut encoded = Vec::new();
     ciborium::ser::into_writer(&recipe, &mut encoded)?;
 
-    assert!(!encoded.is_empty());
+    assert_ne!(encoded, [] as [u8; 0]);
 
     let decoded = ciborium::de::from_reader::<ProvisioningRecipe, _>(encoded.as_slice())?;
     assert_recipe_eq(&recipe, &decoded)?;

@@ -51,7 +51,7 @@ fn batch_operation_defaults_dependencies_and_omits_absent_zone() {
     }))
     .expect("operation parse");
 
-    assert!(op.depends_on.is_empty());
+    assert_eq!(op.depends_on, [] as [std::string::String; 0]);
     assert!(op.zone.is_none());
     assert_eq!(op.scheduler, BatchScheduleHint::default());
 

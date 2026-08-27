@@ -1697,7 +1697,7 @@ mod tests {
             let decoded =
                 FcpsDatagram::decode(&bytes, DEFAULT_MAX_DATAGRAM_BYTES).expect("decode ok");
             assert_eq!(decoded.session_id, session_id);
-            assert!(decoded.frame_bytes.is_empty());
+            assert_eq!(decoded.frame_bytes, [] as [u8; 0]);
         });
     }
 

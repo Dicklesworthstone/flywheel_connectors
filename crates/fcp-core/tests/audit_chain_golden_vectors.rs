@@ -980,7 +980,7 @@ fn test_decision_receipt_without_explanation() {
 
     assert!(receipt.explanation.is_none());
     // Reason code alone should be sufficient for programmatic handling
-    assert!(!receipt.reason_code.is_empty());
+    assert_ne!(receipt.reason_code, "");
 
     log = log.verify().pass();
     log.log();

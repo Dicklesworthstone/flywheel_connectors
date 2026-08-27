@@ -2829,7 +2829,7 @@ fn matches_any(patterns: &[PolicyPattern], value: &str) -> bool {
 }
 
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) fn pattern_matches(pattern: &str, value: &str) -> bool {
+pub(crate) const fn pattern_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
 

@@ -351,7 +351,7 @@ fn empty_builder_allowlist_omitted_from_wire_form() {
 
     // Round-trip recovers an empty Vec via serde(default).
     let back: SupplyChainAttestation = serde_json::from_value(value).unwrap();
-    assert!(back.builder_allowlist.is_empty());
+    assert_eq!(back.builder_allowlist, [] as [std::string::String; 0]);
 }
 
 #[test]

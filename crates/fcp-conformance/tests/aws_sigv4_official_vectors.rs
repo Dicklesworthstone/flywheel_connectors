@@ -269,7 +269,7 @@ fn request_parser_matches_a_hand_checked_case() {
         parsed.headers.get("host").map(String::as_str),
         Some("example.amazonaws.com")
     );
-    assert!(parsed.body.is_empty());
+    assert_eq!(parsed.body, [] as [u8; 0]);
 
     let ctx = parse_context(&std::fs::read_to_string(dir.join("context.json")).unwrap());
     assert_eq!(ctx.access_key_id, "AKIDEXAMPLE");

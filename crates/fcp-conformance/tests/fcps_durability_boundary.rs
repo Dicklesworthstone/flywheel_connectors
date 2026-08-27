@@ -356,7 +356,7 @@ fn stored_symbols_produce_valid_fcps_frame_headers() {
     assert_eq!(decoded.symbol_size, config.symbol_size);
 
     // Symbols exist and are non-empty
-    assert!(!symbols.is_empty());
+    assert_ne!(symbols, [] as [(u32, std::vec::Vec<u8>); 0]);
     assert!(symbols.len() >= source_k as usize);
 }
 

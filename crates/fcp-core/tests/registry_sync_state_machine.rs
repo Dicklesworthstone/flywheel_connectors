@@ -202,7 +202,7 @@ fn self_transitions_are_always_denied() {
 fn successful_transition_updates_state_and_appends_history() {
     let mut r = fresh_record();
     assert_eq!(r.state, LifecycleState::Pending);
-    assert!(r.transitions.is_empty());
+    assert_eq!(r.transitions, [] as [fcp_core::LifecycleTransition; 0]);
     let original_state_changed_at = r.state_changed_at;
 
     r.transition(
@@ -351,7 +351,7 @@ fn lifecycle_record_serde_roundtrip_preserves_full_transition_history() {
 fn fresh_record_starts_in_pending_with_default_health_and_canary_policy() {
     let r = fresh_record();
     assert_eq!(r.state, LifecycleState::Pending);
-    assert!(r.transitions.is_empty());
+    assert_eq!(r.transitions, [] as [fcp_core::LifecycleTransition; 0]);
     assert!(r.previous_version.is_none());
     // Sanity: defaults match LifecycleRecord::new() contract.
     let _: &HealthMetrics = &r.health;

@@ -34,7 +34,7 @@ fn empty_ring_reports_zero_state() {
     assert_eq!(r.capacity(), 16);
     assert_eq!(r.total_written(), 0);
     assert!(!r.has_overflow());
-    assert!(r.contents().is_empty());
+    assert_eq!(r.contents(), [] as [u8; 0]);
 }
 
 #[test]

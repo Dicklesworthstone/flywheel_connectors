@@ -161,7 +161,7 @@ fn intent_signable_bytes_are_deterministic_across_calls() {
     let c = intent.signable_bytes();
     assert_eq!(a, b);
     assert_eq!(b, c);
-    assert!(!a.is_empty());
+    assert_ne!(a, [] as [u8; 0]);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn receipt_signable_bytes_are_deterministic_across_calls() {
     let a = receipt.signable_bytes();
     let b = receipt.signable_bytes();
     assert_eq!(a, b);
-    assert!(!a.is_empty());
+    assert_ne!(a, [] as [u8; 0]);
 }
 
 #[test]

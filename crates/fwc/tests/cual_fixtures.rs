@@ -451,9 +451,9 @@ fn catalog_covers_every_fixture_file() {
     assert_eq!(catalog_paths, fixture_files);
     assert_eq!(catalog_paths.len(), catalog.fixtures.len());
     for entry in &catalog.fixtures {
-        assert!(!entry.kind.trim().is_empty());
-        assert!(!entry.purpose.trim().is_empty());
-        assert!(!entry.validation.trim().is_empty());
+        assert_ne!(entry.kind.trim(), "");
+        assert_ne!(entry.purpose.trim(), "");
+        assert_ne!(entry.validation.trim(), "");
     }
 }
 
@@ -513,7 +513,7 @@ fn introspection_fixtures_deserialize_with_expected_cardinality() {
     for response in [&github, &slack, &minimal, &large] {
         assert_eq!(response.connector.tool_count as usize, response.tools.len());
         for tool in &response.tools {
-            assert!(!tool.description.trim().is_empty());
+            assert_ne!(tool.description.trim(), "");
             assert!(tool.input_schema.is_object());
             assert!(tool.output_schema.is_object() || tool.output_schema.is_array());
         }
@@ -690,14 +690,14 @@ fn golden_output_snapshots_are_non_empty_and_dispatchable() {
             content.lines().count() >= 4,
             "{relative} should have multiple lines"
         );
-        assert!(!content.trim().is_empty());
+        assert_ne!(content.trim(), "");
     }
 
     let invocations: Vec<DispatchInvocationFixture> = load_json("golden/dispatch_invocations.json");
     assert_eq!(invocations.len(), 3);
     for invocation in invocations {
-        assert!(!invocation.name.trim().is_empty());
-        assert!(!invocation.argv.is_empty());
+        assert_ne!(invocation.name.trim(), "");
+        assert_ne!(invocation.argv, [] as [std::string::String; 0]);
         assert_eq!(invocation.argv[0], "fwc");
     }
 }
@@ -783,12 +783,12 @@ fn host_integration_fixture_matrix_covers_required_archetypes_and_modes() {
 fn host_integration_fixture_matrix_entries_are_semantically_complete() {
     let catalog = load_host_integration_fixture_catalog();
     for fixture in &catalog.fixtures {
-        assert!(!fixture.id.trim().is_empty());
+        assert_ne!(fixture.id.trim(), "");
         assert!(fixture.connector_id.starts_with("fcp."));
-        assert!(!fixture.display_name.trim().is_empty());
-        assert!(!fixture.risk_level.trim().is_empty());
-        assert!(!fixture.safety_tier.trim().is_empty());
-        assert!(!fixture.operation_family.trim().is_empty());
+        assert_ne!(fixture.display_name.trim(), "");
+        assert_ne!(fixture.risk_level.trim(), "");
+        assert_ne!(fixture.safety_tier.trim(), "");
+        assert_ne!(fixture.operation_family.trim(), "");
         assert!(fixture.tool_count > 0);
         assert!(
             !fixture.provenance_markers.is_empty(),

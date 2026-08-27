@@ -342,7 +342,7 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     }
 }
 
-fn nearest_rank(sorted: &[f64], per_mille: usize) -> f64 {
+const fn nearest_rank(sorted: &[f64], per_mille: usize) -> f64 {
     let len = sorted.len();
     let mut index = (len * per_mille).div_ceil(1_000).saturating_sub(1);
     if index >= len {

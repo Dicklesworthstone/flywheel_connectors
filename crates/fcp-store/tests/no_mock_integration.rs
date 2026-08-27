@@ -1852,7 +1852,7 @@ fn access_tracker_prioritized_objects() {
 #[test]
 fn object_store_error_display() {
     let err = ObjectStoreError::NotFound(test_object_id(1));
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 
     let err = ObjectStoreError::QuotaExceeded { used: 100, max: 50 };
     let msg = err.to_string();
@@ -1862,7 +1862,7 @@ fn object_store_error_display() {
 #[test]
 fn quarantine_error_display() {
     let err = QuarantineError::NotFound(test_object_id(1));
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 
     let err = QuarantineError::PromotionDenied {
         reason: "test".to_string(),

@@ -331,7 +331,7 @@ fn test_intent_required_fields_present() {
     assert!(!intent.request_object_id.as_bytes().iter().all(|&b| b == 0));
     assert_ne!(intent.capability_token_jti, Uuid::nil());
     assert!(intent.planned_at > 0);
-    assert!(!intent.planned_by.as_str().is_empty());
+    assert_ne!(intent.planned_by.as_str(), "");
 
     // Optional fields for Strict idempotency
     assert!(intent.idempotency_key.is_some());
@@ -362,7 +362,7 @@ fn test_receipt_required_fields_present() {
     // Verify required fields
     assert!(!receipt.request_object_id.as_bytes().iter().all(|&b| b == 0));
     assert!(receipt.executed_at > 0);
-    assert!(!receipt.executed_by.as_str().is_empty());
+    assert_ne!(receipt.executed_by.as_str(), "");
 
     // Verify outcome tracking
     assert_eq!(receipt.outcome_object_ids.len(), 2);

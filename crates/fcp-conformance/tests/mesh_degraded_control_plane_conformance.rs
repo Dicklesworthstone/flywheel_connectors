@@ -158,7 +158,7 @@ fn handler_starts_empty() {
     let h = InMemoryControlPlaneHandler::new();
     assert_eq!(h.count(), 0);
     assert!(h.get(&fake_object_id(b"missing")).is_none());
-    assert!(h.list_epochs(&ZoneId::work(), None).is_empty());
+    assert_eq!(h.list_epochs(&ZoneId::work(), None), [] as [u64; 0]);
 }
 
 #[test]

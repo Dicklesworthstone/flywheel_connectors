@@ -334,7 +334,7 @@ fn authority_view_serde_handles_no_active_holder() {
     let parsed: AuthorityView = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed.active_holder, None);
     assert_eq!(parsed.active_fencing_token, None);
-    assert!(parsed.failover_order.is_empty());
+    assert_eq!(parsed.failover_order, [] as [fcp_prelude::TailscaleNodeId; 0]);
 }
 
 #[test]

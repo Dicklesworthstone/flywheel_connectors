@@ -183,7 +183,7 @@ fn json_roundtrip_preserves_deny_minimal() {
     assert!(!back.is_allow());
     assert_eq!(back.decision, Decision::Deny);
     assert_eq!(back.reason_code, "zone_policy.principal_denied");
-    assert!(back.evidence.is_empty());
+    assert_eq!(back.evidence, [] as [fcp_core::ObjectId; 0]);
     assert!(back.explanation.is_none());
 }
 
@@ -208,7 +208,7 @@ fn cbor_roundtrip_preserves_deny_minimal() {
     let back: DecisionReceipt = ciborium::de::from_reader(&bytes[..]).unwrap();
 
     assert!(back.is_deny());
-    assert!(back.evidence.is_empty());
+    assert_eq!(back.evidence, [] as [fcp_core::ObjectId; 0]);
     assert!(back.explanation.is_none());
 }
 

@@ -184,7 +184,7 @@ fn validate_returns_empty_for_legal_config() {
         max_concurrent_calls: 5,
         rate_limit_per_minute: 30,
     };
-    assert!(c.validate().is_empty());
+    assert_eq!(c.validate(), [] as [std::string::String; 0]);
     assert!(c.is_valid());
 }
 

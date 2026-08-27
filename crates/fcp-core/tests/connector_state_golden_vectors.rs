@@ -782,7 +782,7 @@ mod fencing_tests {
 
         for error in &errors {
             let display = error.to_string();
-            assert!(!display.is_empty());
+            assert_ne!(display, "");
         }
     }
 
@@ -1079,7 +1079,7 @@ mod snapshot_tests {
         assert_eq!(snapshot.covers_seq, 100);
 
         // State can be recovered without replaying states 0-100
-        assert!(!snapshot.state_cbor.is_empty());
+        assert_ne!(snapshot.state_cbor, [] as [u8; 0]);
     }
 
     #[test]
@@ -1157,7 +1157,7 @@ mod crdt_delta_tests {
         let delta = create_test_delta();
 
         // Delta tracks which node applied it (for CRDT attribution)
-        assert!(!delta.applied_by.as_str().is_empty());
+        assert_ne!(delta.applied_by.as_str(), "");
         assert!(delta.applied_at > 0);
     }
 
@@ -1442,7 +1442,7 @@ mod edge_cases {
         let restored: ConnectorStateObject =
             ciborium::from_reader(&cbor[..]).expect("should deserialize");
 
-        assert!(restored.state_cbor.is_empty());
+        assert_eq!(restored.state_cbor, [] as [u8; 0]);
     }
 
     #[test]
@@ -1536,6 +1536,6 @@ mod edge_cases {
         let restored: ConnectorStateDelta =
             ciborium::from_reader(&cbor[..]).expect("should deserialize");
 
-        assert!(restored.delta_cbor.is_empty());
+        assert_eq!(restored.delta_cbor, [] as [u8; 0]);
     }
 }

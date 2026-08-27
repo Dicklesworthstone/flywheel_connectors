@@ -450,7 +450,7 @@ fn forensics_jsonl_invalid_json_line() {
     match result {
         Err(ForensicsValidationError::InvalidJsonLine { line, message }) => {
             assert_eq!(line, 1);
-            assert!(!message.is_empty());
+            assert_ne!(message, "");
         }
         other => panic!("expected InvalidJsonLine, got {other:?}"),
     }
@@ -594,17 +594,17 @@ fn forensics_validation_error_equality() {
 
 #[test]
 fn schema_constants_are_non_empty() {
-    assert!(!schemas::FZPF_V01_SCHEMA.is_empty());
-    assert!(!schemas::E2E_LOG_V1_SCHEMA.is_empty());
-    assert!(!schemas::E2E_LOG_V2_SCHEMA.is_empty());
-    assert!(!schemas::POLICY_BUNDLE_V1_SCHEMA.is_empty());
-    assert!(!schemas::RELEASE_MANIFEST_V1_SCHEMA.is_empty());
-    assert!(!schemas::ROLLOUT_POLICY_V1_SCHEMA.is_empty());
-    assert!(!schemas::TRACE_V1_SCHEMA.is_empty());
-    assert!(!schemas::CAPABILITY_USAGE_V1_SCHEMA.is_empty());
-    assert!(!schemas::SUPPLY_CHAIN_ATTESTATION_V1_SCHEMA.is_empty());
-    assert!(!schemas::SBOM_V1_SCHEMA.is_empty());
-    assert!(!schemas::ASUPERSYNC_FORENSICS_V1_SCHEMA.is_empty());
+    assert_ne!(schemas::FZPF_V01_SCHEMA, "");
+    assert_ne!(schemas::E2E_LOG_V1_SCHEMA, "");
+    assert_ne!(schemas::E2E_LOG_V2_SCHEMA, "");
+    assert_ne!(schemas::POLICY_BUNDLE_V1_SCHEMA, "");
+    assert_ne!(schemas::RELEASE_MANIFEST_V1_SCHEMA, "");
+    assert_ne!(schemas::ROLLOUT_POLICY_V1_SCHEMA, "");
+    assert_ne!(schemas::TRACE_V1_SCHEMA, "");
+    assert_ne!(schemas::CAPABILITY_USAGE_V1_SCHEMA, "");
+    assert_ne!(schemas::SUPPLY_CHAIN_ATTESTATION_V1_SCHEMA, "");
+    assert_ne!(schemas::SBOM_V1_SCHEMA, "");
+    assert_ne!(schemas::ASUPERSYNC_FORENSICS_V1_SCHEMA, "");
 }
 
 #[test]
@@ -912,7 +912,7 @@ fn schema_validation_error_from_invalid_json() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     let display = format!("{err}");
-    assert!(!display.is_empty());
+    assert_ne!(display, "");
 }
 
 #[test]

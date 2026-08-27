@@ -937,7 +937,7 @@ fn noop_sandbox_is_available() {
 fn noop_sandbox_platform_name() {
     let sandbox = NoOpSandbox;
     let name = sandbox.platform_name();
-    assert!(!name.is_empty());
+    assert_ne!(name, "");
 }
 
 #[test]
@@ -990,7 +990,7 @@ fn create_sandbox_returns_platform_sandbox() {
     let sandbox = create_sandbox().unwrap();
     assert!(sandbox.is_available());
     let name = sandbox.platform_name();
-    assert!(!name.is_empty());
+    assert_ne!(name, "");
 }
 
 // ============================================================================
@@ -1002,8 +1002,8 @@ fn wasi_config_default() {
     let config = WasiConfig::default();
     assert!(config.memory_limit_bytes > 0);
     assert!(!config.deterministic_mode);
-    assert!(config.readonly_paths.is_empty());
-    assert!(config.writable_paths.is_empty());
+    assert_eq!(config.readonly_paths, [] as [std::path::PathBuf; 0]);
+    assert_eq!(config.writable_paths, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -1015,7 +1015,7 @@ fn wasi_config_from_policy() {
 
     assert_eq!(config.memory_limit_bytes, 256 * 1024 * 1024);
     assert!(config.block_direct_network);
-    assert!(!config.readonly_paths.is_empty());
+    assert_ne!(config.readonly_paths, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -1621,7 +1621,7 @@ fn sandbox_error_display() {
 
     let err = SandboxError::Timeout;
     let msg = format!("{err}");
-    assert!(!msg.is_empty());
+    assert_ne!(msg, "");
 
     let err = SandboxError::InvalidConfig("bad config".to_string());
     assert!(format!("{err}").contains("bad config"));
@@ -1641,15 +1641,15 @@ fn wasi_error_display() {
 
     let err = WasiError::Timeout;
     let msg = format!("{err}");
-    assert!(!msg.is_empty());
+    assert_ne!(msg, "");
 
     let err = WasiError::ClockAccessDenied;
     let msg = format!("{err}");
-    assert!(!msg.is_empty());
+    assert_ne!(msg, "");
 
     let err = WasiError::EntropyAccessDenied;
     let msg = format!("{err}");
-    assert!(!msg.is_empty());
+    assert_ne!(msg, "");
 }
 
 // ============================================================================

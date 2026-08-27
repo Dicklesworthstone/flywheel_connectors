@@ -804,7 +804,7 @@ mod tests {
         let result = validate_json_schema(&schema, &bad_value);
         match result {
             Err(SchemaValidationError::ValidationFailed { errors, .. }) => {
-                assert!(!errors.is_empty());
+                assert_ne!(errors, [] as [std::string::String; 0]);
             }
             other => panic!("expected ValidationFailed, got {other:?}"),
         }

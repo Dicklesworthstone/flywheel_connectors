@@ -359,5 +359,5 @@ fn error_is_std_error() {
     let _: &dyn std::error::Error = &e;
     // Smoke check — also pin that Debug is non-empty.
     let dbg = format!("{e:?}");
-    assert!(!dbg.is_empty());
+    assert_ne!(dbg, "");
 }

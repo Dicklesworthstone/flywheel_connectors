@@ -1776,7 +1776,7 @@ mod transport_limits_tests {
         let minimal = vec![0u8; FCPS_DATAGRAM_HEADER_LEN];
         let result = FcpsDatagram::decode(&minimal, DEFAULT_MAX_DATAGRAM_BYTES);
         assert!(result.is_ok());
-        assert!(result.unwrap().frame_bytes.is_empty());
+        assert_eq!(result.unwrap().frame_bytes, [] as [u8; 0]);
 
         log = log.pass();
         log.log();

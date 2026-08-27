@@ -1126,7 +1126,7 @@ fn golden_vector_file_valid_checkpoint_proposal() {
 
         // Validate proposal structure
         assert!(proposal.proposed_seq > 0 || proposal.prev_checkpoint_id.is_none());
-        assert!(!proposal.triggers.is_empty());
+        assert_ne!(proposal.triggers, [] as [fcp_core::CheckpointTrigger; 0]);
     } else {
         // Create the golden vector
         let proposal = create_test_proposal(test_zone(), 42, Some(test_object_id("prev-chk-41")));

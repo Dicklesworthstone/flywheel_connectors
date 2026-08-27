@@ -5520,7 +5520,7 @@ deny_ptrace = true
     fn poll_result_empty_constructor() {
         let result: PollResult<i32> = PollResult::empty();
         match result {
-            PollResult::Success(items) => assert!(items.is_empty()),
+            PollResult::Success(items) => assert_eq!(items, [] as [i32; 0]),
             _ => panic!("expected empty Success"),
         }
     }

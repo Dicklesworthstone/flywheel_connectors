@@ -288,8 +288,8 @@ fn mesh_node_error_debug_is_non_empty_for_every_variant() {
     ];
     for e in cases {
         let dbg = format!("{e:?}");
-        assert!(!dbg.is_empty());
+        assert_ne!(dbg, "");
         let display = format!("{e}");
-        assert!(!display.is_empty());
+        assert_ne!(display, "");
     }
 }

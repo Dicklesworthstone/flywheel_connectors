@@ -855,7 +855,7 @@ mod tests {
         let bundle = parse_replay_bundle(&jsonl).expect("jsonl parses");
 
         assert_eq!(bundle.audit_entries, vec![invocation]);
-        assert!(bundle.capability_tokens.is_empty());
-        assert!(bundle.receipts.is_empty());
+        assert_eq!(bundle.capability_tokens, [] as [serde_json::Value; 0]);
+        assert_eq!(bundle.receipts, [] as [DecisionReceipt; 0]);
     }
 }

@@ -13,8 +13,8 @@ fn test_healthy_fixture_scores_800_plus() {
     assert_eq!(report.fixture_name, "healthy_env");
     assert_eq!(report.status, SelfTestStatus::Ok);
     assert!(report.score >= 800, "score was {}", report.score);
-    assert!(report.remediation_messages.is_empty());
-    assert!(report.executed_commands.is_empty());
+    assert_eq!(report.remediation_messages, [] as [std::string::String; 0]);
+    assert_eq!(report.executed_commands, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn test_broken_fixture_scores_within_degradation_curve() {
 fn test_doctor_never_restarts_agent_mail() {
     let report = run_self_test(Path::new(BROKEN_ENV)).expect("broken fixture should run");
 
-    assert!(report.executed_commands.is_empty());
+    assert_eq!(report.executed_commands, [] as [std::string::String; 0]);
     let agent_mail = report
         .checks
         .iter()
@@ -71,7 +71,7 @@ fn test_doctor_warns_but_does_not_repair_beads_wal() {
         Some("br doctor --repair (operator-gated)")
     );
     assert!(!beads_wal.auto_repair);
-    assert!(report.executed_commands.is_empty());
+    assert_eq!(report.executed_commands, [] as [std::string::String; 0]);
 }
 
 #[test]

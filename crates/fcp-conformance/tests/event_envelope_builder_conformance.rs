@@ -64,7 +64,7 @@ fn schema_namespace_matches_streaming_subsystem() {
 fn new_initializes_seq_to_zero_and_cursor_empty() {
     let env = EventEnvelope::new("topic", test_event_data());
     assert_eq!(env.seq, 0);
-    assert!(env.cursor.is_empty());
+    assert_eq!(env.cursor, "");
     assert!(!env.requires_ack);
     assert!(env.stream_key.is_none());
     assert!(env.ordering.is_none());

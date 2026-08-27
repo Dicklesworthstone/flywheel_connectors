@@ -839,7 +839,7 @@ pub mod channel {
     use super::{AsyncError, Instrumentation, NoopInstrumentation};
 
     fn decrement_depth(depth: &AtomicUsize) {
-        let _ = depth.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let _ = depth.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_sub(1)
         });
     }
@@ -5939,19 +5939,19 @@ mod tests {
     #[test]
     fn async_error_cancelled_display() {
         let e = AsyncError::Cancelled;
-        assert!(!e.to_string().is_empty());
+        assert_ne!(e.to_string(), "");
     }
 
     #[test]
     fn async_error_channel_full_display() {
         let e = AsyncError::ChannelFull;
-        assert!(!e.to_string().is_empty());
+        assert_ne!(e.to_string(), "");
     }
 
     #[test]
     fn async_error_channel_closed_display() {
         let e = AsyncError::ChannelClosed;
-        assert!(!e.to_string().is_empty());
+        assert_ne!(e.to_string(), "");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -6308,7 +6308,7 @@ mod tests {
         // AcquireError has private fields, so test via Debug/Display/Clone/Eq
         // which are auto-derived. We verify the Display text is correct.
         let text = "semaphore closed or cancelled";
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
     }
 
     // ─── sync::TryAcquireError ──────────────────────────────────────────
@@ -7056,7 +7056,7 @@ mod tests {
             },
         ];
         for v in &variants {
-            assert!(!format!("{v:?}").is_empty());
+            assert_ne!(format!("{v:?}"), "");
         }
     }
 

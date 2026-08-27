@@ -865,29 +865,28 @@ fn main() {
                         result.schemas_checked
                     );
                     std::process::exit(0);
-                } else {
-                    eprintln!("✗ Verification failed:");
-                    if !result.schemas_missing.is_empty() {
-                        eprintln!("  Missing schemas: {:?}", result.schemas_missing);
-                    }
-                    if !result.schemas_extra.is_empty() {
-                        eprintln!("  Extra schemas: {:?}", result.schemas_extra);
-                    }
-                    for diff in &result.diffs {
-                        eprintln!(
-                            "  {}.{}: expected {} != actual {}",
-                            diff.schema,
-                            diff.field,
-                            &diff.expected[..diff.expected.len().min(32)],
-                            &diff.actual[..diff.actual.len().min(32)]
-                        );
-                    }
-                    eprintln!("\nTo update baseline, run:");
-                    eprintln!(
-                        "  cargo run -p fcp-conformance --bin fcp-vecgen -- --out tests/vectors/serialization"
-                    );
-                    std::process::exit(1);
                 }
+                eprintln!("✗ Verification failed:");
+                if !result.schemas_missing.is_empty() {
+                    eprintln!("  Missing schemas: {:?}", result.schemas_missing);
+                }
+                if !result.schemas_extra.is_empty() {
+                    eprintln!("  Extra schemas: {:?}", result.schemas_extra);
+                }
+                for diff in &result.diffs {
+                    eprintln!(
+                        "  {}.{}: expected {} != actual {}",
+                        diff.schema,
+                        diff.field,
+                        &diff.expected[..diff.expected.len().min(32)],
+                        &diff.actual[..diff.actual.len().min(32)]
+                    );
+                }
+                eprintln!("\nTo update baseline, run:");
+                eprintln!(
+                    "  cargo run -p fcp-conformance --bin fcp-vecgen -- --out tests/vectors/serialization"
+                );
+                std::process::exit(1);
             }
             Err(e) => {
                 eprintln!("Error during verification: {e}");

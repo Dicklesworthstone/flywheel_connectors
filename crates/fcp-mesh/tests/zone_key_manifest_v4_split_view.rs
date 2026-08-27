@@ -68,7 +68,7 @@ fn empty_v4_manifest() -> ZoneKeyManifest {
 #[test]
 fn split_view_validate_passes_on_empty_manifest() {
     let m = empty_v4_manifest();
-    assert!(m.split_view_recipients().is_empty());
+    assert_eq!(m.split_view_recipients(), [] as [fcp_core::TailscaleNodeId; 0]);
     m.validate_no_recipient_split_view()
         .expect("empty manifest is safe");
 }
@@ -90,7 +90,7 @@ fn split_view_validate_passes_on_v4_only_recipient() {
     let mut m = empty_v4_manifest();
     m.add_xwing_wrap(alice, 1_700_000_000, sealed);
 
-    assert!(m.split_view_recipients().is_empty());
+    assert_eq!(m.split_view_recipients(), [] as [fcp_core::TailscaleNodeId; 0]);
     m.validate_no_recipient_split_view()
         .expect("V4-only recipient is safe");
 }
@@ -250,7 +250,7 @@ fn split_view_validate_passes_on_two_independent_recipients() {
     m.wrapped_keys = vec![alice_v3];
     m.add_xwing_wrap(bob, 1_700_000_001, bob_v4);
 
-    assert!(m.split_view_recipients().is_empty());
+    assert_eq!(m.split_view_recipients(), [] as [fcp_core::TailscaleNodeId; 0]);
     m.validate_no_recipient_split_view()
         .expect("disjoint recipients are safe");
 }
