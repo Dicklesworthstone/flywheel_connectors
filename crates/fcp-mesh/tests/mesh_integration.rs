@@ -1992,8 +1992,14 @@ mod meshnode {
             .expect("parse json trace");
         let cbor_trace = CapturedTrace::from_cbor(&cbor_bytes).expect("parse cbor trace");
 
-        assert_ne!(json_trace.events, [] as [fcp_telemetry::trace_capture::TraceEvent; 0]);
-        assert_ne!(cbor_trace.events, [] as [fcp_telemetry::trace_capture::TraceEvent; 0]);
+        assert_ne!(
+            json_trace.events,
+            [] as [fcp_telemetry::trace_capture::TraceEvent; 0]
+        );
+        assert_ne!(
+            cbor_trace.events,
+            [] as [fcp_telemetry::trace_capture::TraceEvent; 0]
+        );
         assert_eq!(json_trace.events.len(), cbor_trace.events.len());
         assert!(
             json_trace.redacted,
@@ -4582,7 +4588,10 @@ mod gossip_integration {
         let response = gossip.handle_request(&request);
 
         assert_eq!(response.have_objects, [] as [fcp_prelude::ObjectId; 0]);
-        assert_eq!(response.have_symbols, [] as [(fcp_prelude::ObjectId, u32); 0]);
+        assert_eq!(
+            response.have_symbols,
+            [] as [(fcp_prelude::ObjectId, u32); 0]
+        );
 
         emit_test_pass(
             TEST_NAME,

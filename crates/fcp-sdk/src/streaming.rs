@@ -2697,7 +2697,10 @@ mod tests {
             capability_token: None,
         };
         let outcome = manager.handle_subscribe(&req).unwrap();
-        assert_eq!(outcome.response.result.confirmed_topics, [] as [std::string::String; 0]);
+        assert_eq!(
+            outcome.response.result.confirmed_topics,
+            [] as [std::string::String; 0]
+        );
         assert!(outcome.replay_events.is_empty());
     }
 }

@@ -3900,9 +3900,18 @@ fn simulated_network_applies_latency() {
     network.send(0, msg);
 
     // At t=0, message not ready
-    assert_eq!(network.drain_ready(0), [] as [fcp_conformance::harness::NetworkMessage; 0]);
-    assert_eq!(network.drain_ready(50), [] as [fcp_conformance::harness::NetworkMessage; 0]);
-    assert_eq!(network.drain_ready(99), [] as [fcp_conformance::harness::NetworkMessage; 0]);
+    assert_eq!(
+        network.drain_ready(0),
+        [] as [fcp_conformance::harness::NetworkMessage; 0]
+    );
+    assert_eq!(
+        network.drain_ready(50),
+        [] as [fcp_conformance::harness::NetworkMessage; 0]
+    );
+    assert_eq!(
+        network.drain_ready(99),
+        [] as [fcp_conformance::harness::NetworkMessage; 0]
+    );
 
     // At t=100, message ready
     let ready = network.drain_ready(100);

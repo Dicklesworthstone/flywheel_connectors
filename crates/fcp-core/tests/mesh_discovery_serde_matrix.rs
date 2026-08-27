@@ -240,7 +240,10 @@ fn handshake_request_minimal_capabilities_default_to_empty_list() {
         "nonce": zeros
     });
     let back: HandshakeRequest = serde_json::from_value(bare).unwrap();
-    assert_eq!(back.capabilities_requested, [] as [fcp_core::CapabilityId; 0]);
+    assert_eq!(
+        back.capabilities_requested,
+        [] as [fcp_core::CapabilityId; 0]
+    );
 }
 
 #[test]

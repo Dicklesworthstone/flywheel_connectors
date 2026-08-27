@@ -89,7 +89,10 @@ fn test_reports_missing_pq_machine_classes_without_artifacts() {
     let target = &report.targets[0];
     assert_eq!(target.target_id, "pq_signing_csd");
     assert_eq!(target.status, ProofReadinessStatus::MissingPrerequisites);
-    assert_eq!(target.satisfied_artifacts, [] as [fwc::proof_readiness::SatisfiedArtifact; 0]);
+    assert_eq!(
+        target.satisfied_artifacts,
+        [] as [fwc::proof_readiness::SatisfiedArtifact; 0]
+    );
     assert!(target.missing.iter().any(|item| {
         item.kind == MissingPrerequisiteKind::Artifact
             && item.id == "artifacts/perf/pq_signing/csd-*.json"
@@ -121,7 +124,10 @@ fn test_reports_contabo_satisfied_when_valid_statpack_exists() {
     assert_eq!(report.status, ProofReadinessStatus::Ready);
     let target = &report.targets[0];
     assert_eq!(target.status, ProofReadinessStatus::Ready);
-    assert_eq!(target.missing, [] as [fwc::proof_readiness::MissingPrerequisite; 0]);
+    assert_eq!(
+        target.missing,
+        [] as [fwc::proof_readiness::MissingPrerequisite; 0]
+    );
     assert_eq!(target.satisfied_artifacts.len(), 1);
     assert_eq!(
         target.satisfied_artifacts[0].machine_class.as_deref(),
@@ -197,7 +203,10 @@ fn test_rejects_stale_or_wrong_schema_artifact() {
     );
     let target = &report.targets[0];
     assert_eq!(target.status, ProofReadinessStatus::MissingPrerequisites);
-    assert_eq!(target.satisfied_artifacts, [] as [fwc::proof_readiness::SatisfiedArtifact; 0]);
+    assert_eq!(
+        target.satisfied_artifacts,
+        [] as [fwc::proof_readiness::SatisfiedArtifact; 0]
+    );
     assert!(
         target
             .missing
@@ -236,7 +245,10 @@ fn test_committed_filename_date_marks_stale_proof_despite_fresh_mtime() {
     let report = build_report_for_at(temp.path(), "pq_signing_csd", SystemTime::now());
     let target = &report.targets[0];
     assert_eq!(target.status, ProofReadinessStatus::MissingPrerequisites);
-    assert_eq!(target.satisfied_artifacts, [] as [fwc::proof_readiness::SatisfiedArtifact; 0]);
+    assert_eq!(
+        target.satisfied_artifacts,
+        [] as [fwc::proof_readiness::SatisfiedArtifact; 0]
+    );
     assert!(
         target
             .missing
@@ -395,7 +407,10 @@ fn test_future_timestamped_artifact_is_not_fresh() {
     );
     let target = &report.targets[0];
     assert_eq!(target.status, ProofReadinessStatus::MissingPrerequisites);
-    assert_eq!(target.satisfied_artifacts, [] as [fwc::proof_readiness::SatisfiedArtifact; 0]);
+    assert_eq!(
+        target.satisfied_artifacts,
+        [] as [fwc::proof_readiness::SatisfiedArtifact; 0]
+    );
     assert!(
         target
             .missing

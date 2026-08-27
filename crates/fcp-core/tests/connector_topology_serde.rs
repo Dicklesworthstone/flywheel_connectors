@@ -342,7 +342,10 @@ fn object_placement_policy_preferred_excluded_default_to_empty_vec() {
         "target_coverage_bps": 100
     }"#;
     let policy: ObjectPlacementPolicy = serde_json::from_str(json).expect("deserialize");
-    assert_eq!(policy.preferred_devices, [] as [fcp_core::DeviceSelector; 0]);
+    assert_eq!(
+        policy.preferred_devices,
+        [] as [fcp_core::DeviceSelector; 0]
+    );
     assert_eq!(policy.excluded_devices, [] as [fcp_core::DeviceSelector; 0]);
     assert_eq!(policy.min_source_diversity, 0);
 }

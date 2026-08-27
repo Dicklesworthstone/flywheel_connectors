@@ -1202,7 +1202,10 @@ fn parses_all_valid_archetypes() {
         let with_hash = toml.replace(PLACEHOLDER_HASH, &hash.to_string());
         let parsed = ConnectorManifest::parse_str(&with_hash)
             .unwrap_or_else(|_| panic!("archetype {archetype} should be valid"));
-        assert_ne!(parsed.connector.archetypes, [] as [fcp_manifest::ConnectorArchetype; 0]);
+        assert_ne!(
+            parsed.connector.archetypes,
+            [] as [fcp_manifest::ConnectorArchetype; 0]
+        );
     }
 }
 
@@ -5018,7 +5021,10 @@ fn zalouser_planned_only_manifest_forbids_exec_until_helper_policy_exists() {
 
     assert_eq!(parsed.connector.id.as_str(), "fcp.zalouser");
     assert_eq!(parsed.connector.status.to_string(), "quarantined");
-    assert_eq!(parsed.capabilities.required, [] as [fcp_core::CapabilityId; 0]);
+    assert_eq!(
+        parsed.capabilities.required,
+        [] as [fcp_core::CapabilityId; 0]
+    );
     assert!(
         parsed
             .capabilities

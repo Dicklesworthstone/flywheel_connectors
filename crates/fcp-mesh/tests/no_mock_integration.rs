@@ -1483,7 +1483,10 @@ fn degraded_encoder_signed_roundtrip() {
             &pq_signing_key,
         )
         .expect("encode_signed should succeed");
-    assert_ne!(signed_frames, [] as [fcp_crypto::SignedEnvelope<fcp_protocol::SignedFcpsFramePayload>; 0]);
+    assert_ne!(
+        signed_frames,
+        [] as [fcp_crypto::SignedEnvelope<fcp_protocol::SignedFcpsFramePayload>; 0]
+    );
 
     let mut decoder = DegradedModeDecoder::new(config);
     let zone = test_zone();
