@@ -379,8 +379,9 @@ use crate::render::{
     ExtractRender, OutputFormat, RenderOptions, TemplateRender, render_with_options, token_stats,
 };
 use crate::truth::{
-    KnowledgeState, RequiredTruthSource, ResolutionError, SourceOutcome,
-    TRUTH_SOURCE_SCHEMA_VERSION, TruthSourceUnavailable,
+    KnowledgeState, LiveTruthResolver, QueryResult, RequiredTruthSource, ResolutionError,
+    ResolutionStrategy, ResolverConfig, SourceOutcome, TRUTH_SOURCE_SCHEMA_VERSION,
+    TruthSourceUnavailable,
 };
 
 const ABOUT: &str =
@@ -7852,40 +7853,104 @@ fn examples_dispatch_host(args: &ExampleArgs, host: &str) -> Result<DispatchOutc
 
 fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome> {
     let resolved_host = resolve_host_config(host)?;
-    if args.offline {
-        if resolved_host.is_some() {
-            let mut outcome = conflicting_catalog_mode_dispatch("list");
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-            return Ok(outcome);
-        }
-    } else if let Some(host) = resolved_host {
-        return list_dispatch_host(args, &host.endpoint);
-    } else {
-        let mut outcome = missing_host_dispatch(
-            "list",
-            json!({
-                "filters": {
-                    "zone": args.zone.clone(),
-                    "category": args.category.clone(),
-                    "include_hidden": args.include_hidden,
-                    "require_source": args.require_source.map(RequiredTruthSource::label),
-                },
-            }),
-            vec![
-                "fwc list --host <endpoint>".to_owned(),
-                "fwc list --offline".to_owned(),
-            ],
-        );
+    if args.offline && resolved_host.is_some() {
+        let mut outcome = conflicting_catalog_mode_dispatch("list");
         inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
         return Ok(outcome);
     }
 
-    if let Some(outcome) =
-        enforce_required_truth_source("list", args.require_source, KnowledgeState::Offline)
-    {
-        return Ok(outcome);
-    }
+    // A.5: route the source ladder through `LiveTruthResolver` instead of
+    // hand-picking the host/offline branch, so the answer carries the
+    // resolver's decision trace and `--require-source` enforcement happens at
+    // one chokepoint for every read-only command.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
+    // The truthfulness contract forbids silent downgrade: offline artifacts
+    // are only a source when the operator asked for `--offline`, and a
+    // configured-but-failed host propagates its transport error unchanged.
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match list_dispatch_host(args, &host.endpoint) {
+                Ok(outcome) if outcome.exit_code == CliExitCode::Success => {
+                    QueryResult::Complete(outcome.payload)
+                }
+                Ok(outcome) => QueryResult::Error(format!(
+                    "host list returned exit code {:?}",
+                    outcome.exit_code
+                )),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline => match list_offline_payload(args) {
+            Ok(payload) => QueryResult::Complete(payload),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                offline_error = Some(error);
+                QueryResult::Unavailable(detail)
+            }
+        },
+        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
+        // list cache; Degraded/FallbackDerived are resolver-assigned outcomes,
+        // never queryable sources.
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "list",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(DispatchOutcome {
+                payload: resolved.value,
+                exit_code: CliExitCode::Success,
+            })
+        }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            drop(resolution_error);
+            let mut outcome = missing_host_dispatch(
+                "list",
+                json!({
+                    "filters": {
+                        "zone": args.zone.clone(),
+                        "category": args.category.clone(),
+                        "include_hidden": args.include_hidden,
+                        "require_source": args.require_source.map(RequiredTruthSource::label),
+                    },
+                }),
+                vec![
+                    "fwc list --host <endpoint>".to_owned(),
+                    "fwc list --offline".to_owned(),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
+
+fn list_offline_payload(args: &ListArgs) -> Result<Value> {
     let catalog = DiscoveryCatalog::load()?;
     let visible_connectors = catalog.list(
         args.zone.as_deref(),
@@ -7952,10 +8017,7 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
     attach_metadata_cache_evidence(&mut payload, &cache_key, false);
     inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    Ok(payload)
 }
 
 #[derive(Debug, Serialize)]

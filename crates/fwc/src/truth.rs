@@ -769,6 +769,26 @@ pub struct ResolverConfig {
     pub node_local_max_age: Duration,
     /// Timeout for individual source queries.
     pub source_timeout: Duration,
+    /// Whether resolution may attempt mesh-backed sources at all.
+    ///
+    /// This is the A.5 `mesh_backed` feature flag: when `false`, the
+    /// mesh-backed rung is removed from every strategy's source order, so a
+    /// host-first deployment never spends a query on a mesh that is not
+    /// provisioned. Callers turn it on once the host reports at least
+    /// [`fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE`] healthy mesh peers
+    /// (see [`mesh_backed_from_healthy_peers`]), or when the operator sets
+    /// `FWC_MESH_BACKED` explicitly (see [`ResolverConfig::from_environment`]).
+    #[serde(default)]
+    pub mesh_backed_enabled: bool,
+}
+
+/// Decide whether the mesh-backed rung is enabled from a healthy mesh peer
+/// count, per the A.6 single-host fallback contract: mesh-backed resolution
+/// activates only when the healthy peer count meets
+/// [`fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE`].
+#[must_use]
+pub fn mesh_backed_from_healthy_peers(healthy_peers: u32) -> bool {
+    healthy_peers >= fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE
 }
 
 impl Default for ResolverConfig {
@@ -779,6 +799,43 @@ impl Default for ResolverConfig {
             host_max_age: Duration::from_secs(30),  // 30 seconds
             node_local_max_age: Duration::from_secs(60), // 1 minute
             source_timeout: Duration::from_secs(5),
+            // Mesh-backed stays opt-in until the host reports healthy mesh
+            // peers (A.6) or the operator overrides via `FWC_MESH_BACKED`.
+            mesh_backed_enabled: false,
+        }
+    }
+}
+
+impl ResolverConfig {
+    /// Enable or disable the mesh-backed rung of the source ladder.
+    #[must_use]
+    pub fn with_mesh_backed(mut self, enabled: bool) -> Self {
+        self.mesh_backed_enabled = enabled;
+        self
+    }
+
+    /// Build a configuration honoring the `FWC_MESH_BACKED` operator override.
+    ///
+    /// Accepted truthy values: `1`, `true`, `on`. Falsy: `0`, `false`, `off`.
+    /// Anything else is ignored (the safe default stays off). The override is
+    /// explicit in both directions so an operator can force mesh-backed
+    /// attempts during cutover rehearsal or force them off during an incident.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        let mut config = Self::default();
+        if let Ok(raw) = std::env::var("FWC_MESH_BACKED") {
+            config.apply_mesh_backed_override(&raw);
+        }
+        config
+    }
+
+    /// Apply one `FWC_MESH_BACKED` override value. Unrecognized values are
+    /// ignored so a typo never silently flips the truth ladder.
+    fn apply_mesh_backed_override(&mut self, raw: &str) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => self.mesh_backed_enabled = true,
+            "0" | "false" | "off" => self.mesh_backed_enabled = false,
+            _ => {}
         }
     }
 }
@@ -824,6 +881,24 @@ impl LiveTruthResolver {
         Self { config }
     }
 
+    /// Effective source order for a strategy under this resolver's config.
+    ///
+    /// When `mesh_backed_enabled` is false the mesh-backed rung is removed
+    /// rather than attempted-and-failed, so per-source timeouts never gate a
+    /// host-first deployment and the decision trace does not claim a mesh
+    /// attempt that never happened.
+    fn effective_sources(&self, strategy: ResolutionStrategy) -> Vec<KnowledgeState> {
+        let sources = strategy.source_order();
+        if self.config.mesh_backed_enabled {
+            sources
+        } else {
+            sources
+                .into_iter()
+                .filter(|source| *source != KnowledgeState::MeshBacked)
+                .collect()
+        }
+    }
+
     /// Create a resolver with default configuration.
     #[must_use]
     pub fn with_defaults() -> Self {
@@ -850,7 +925,7 @@ impl LiveTruthResolver {
         F: FnMut(KnowledgeState) -> Option<T>,
     {
         let start = Instant::now();
-        let sources = strategy.source_order();
+        let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
 
         for source in &sources {
@@ -911,7 +986,7 @@ impl LiveTruthResolver {
         F: FnMut(KnowledgeState) -> QueryResult<T>,
     {
         let start = Instant::now();
-        let sources = strategy.source_order();
+        let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
         let mut best_partial: Option<(T, KnowledgeState, Duration)> = None;
 
@@ -1765,6 +1840,12 @@ impl LiveTruthResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Resolver with the mesh-backed rung explicitly enabled, for tests that
+    /// exercise mesh-first ladders. Production default is mesh-disabled until
+    /// the host reports healthy mesh peers (A.6) or `FWC_MESH_BACKED` is set.
+    fn mesh_enabled_resolver() -> LiveTruthResolver {
+        LiveTruthResolver::new(ResolverConfig::default().with_mesh_backed(true))
+    }
 
     // ── KnowledgeState ────────────────────────────────────────────────
 
@@ -2072,7 +2153,7 @@ mod tests {
 
     #[test]
     fn resolve_sync_falls_back_to_offline() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result = resolver.resolve_sync(ResolutionStrategy::PreferHost, |source| {
             if source == KnowledgeState::Offline {
                 Some("cached-manifest")
@@ -2091,7 +2172,7 @@ mod tests {
 
     #[test]
     fn resolve_sync_mesh_backed_preferred_in_best_available() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| match source {
                 KnowledgeState::MeshBacked => Some("mesh-state"),
@@ -2108,8 +2189,72 @@ mod tests {
     }
 
     #[test]
-    fn resolve_sync_all_fail_returns_error() {
+    fn mesh_backed_rung_filtered_by_default() {
         let resolver = LiveTruthResolver::with_defaults();
+        let result = resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| {
+            if source == KnowledgeState::HostBacked {
+                Some("host-state")
+            } else {
+                None
+            }
+        });
+
+        let resolution = result.unwrap();
+        assert_eq!(resolution.knowledge_state, KnowledgeState::HostBacked);
+        assert!(
+            resolution
+                .trace
+                .attempts
+                .iter()
+                .all(|attempt| attempt.source != KnowledgeState::MeshBacked),
+            "mesh rung must not be attempted while the mesh_backed flag is off"
+        );
+    }
+
+    #[test]
+    fn mesh_backed_rung_present_when_enabled() {
+        let resolver = mesh_enabled_resolver();
+        let result = resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| {
+            if source == KnowledgeState::MeshBacked {
+                Some("mesh-state")
+            } else {
+                None
+            }
+        });
+
+        let resolution = result.unwrap();
+        assert_eq!(resolution.knowledge_state, KnowledgeState::MeshBacked);
+        assert_eq!(resolution.trace.attempts.len(), 1);
+    }
+
+    #[test]
+    fn mesh_backed_peer_threshold_matches_a6_floor() {
+        assert!(!mesh_backed_from_healthy_peers(0));
+        assert!(mesh_backed_from_healthy_peers(
+            fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE
+        ));
+        assert!(!mesh_backed_from_healthy_peers(
+            fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE - 1
+        ));
+    }
+
+    #[test]
+    fn mesh_backed_override_parsing_is_explicit_both_directions() {
+        let mut config = ResolverConfig::default();
+        assert!(!config.mesh_backed_enabled);
+        config.apply_mesh_backed_override("1");
+        assert!(config.mesh_backed_enabled);
+        config.apply_mesh_backed_override("off");
+        assert!(!config.mesh_backed_enabled);
+        config.apply_mesh_backed_override("garbage");
+        assert!(!config.mesh_backed_enabled);
+        config.apply_mesh_backed_override(" TRUE ");
+        assert!(config.mesh_backed_enabled);
+    }
+
+    #[test]
+    fn resolve_sync_all_fail_returns_error() {
+        let resolver = mesh_enabled_resolver();
         let result: Result<TruthResolution<String>, _> =
             resolver.resolve_sync(ResolutionStrategy::PreferHost, |_| None);
 
@@ -2140,7 +2285,7 @@ mod tests {
 
     #[test]
     fn resolve_sync_decision_trace_records_all_attempts() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result = resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| {
             if source == KnowledgeState::NodeLocal {
                 Some("local-cache")
@@ -2379,7 +2524,7 @@ mod tests {
 
     #[test]
     fn scenario_refusal_when_nothing_available() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result: Result<TruthResolution<String>, _> = resolver
             .resolve_with_partials(ResolutionStrategy::PreferHost, |_| {
                 QueryResult::Unavailable("not configured".into())
@@ -2412,7 +2557,7 @@ mod tests {
     fn scenario_explain_resolver_decision() {
         // Simulates the `fwc explain` use case: resolver must explain
         // exactly why it chose the answer it did.
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| match source {
                 KnowledgeState::MeshBacked | KnowledgeState::HostBacked => None,
