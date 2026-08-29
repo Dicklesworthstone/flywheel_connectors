@@ -13,7 +13,10 @@ use fcp_sdk::migration::{
 };
 
 use crate::error::{CloudflareError, CloudflareResult};
-use crate::types::*;
+use crate::types::{
+    CloudflareAuth, CloudflareResponse, CreateDnsRecord, DnsRecord, PagesDeployment, PagesProject,
+    UpdateDnsRecord, VerifyToken, Worker, WorkerScript, Zone,
+};
 
 const MAX_RETRY_AFTER_SECS: u64 = 300;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
@@ -72,16 +75,23 @@ pub struct CloudflareClient {
 impl std::fmt::Debug for CloudflareClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudflareClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
             .field("account_id", &self.account_id)
+            .field("retry_config", &self.retry_config)
             .field("timeout", &self.timeout)
             .finish()
     }
 }
 
 impl CloudflareClient {
-    pub async fn new(
+    /// Create a Cloudflare API client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError::Http`] if the HTTP client cannot be built.
+    pub fn new(
         base_url: &str,
         auth: CloudflareAuth,
         account_id: &str,
@@ -103,16 +113,23 @@ impl CloudflareClient {
         })
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.auth.is_secretless()
     }
 
     // ── Health check ──
 
+    /// Verify the configured token as a health check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on transport failure or a non-2xx response.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> CloudflareResult<VerifyToken> {
         let url = format!("{}/user/tokens/verify", self.base_url);
         let ctx = runtime.request_context();
@@ -133,6 +150,11 @@ impl CloudflareClient {
 
     // ── Zones ──
 
+    /// List zones for the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on transport failure or a non-2xx response.
     pub async fn list_zones(&self, runtime: &ConnectorRuntime) -> CloudflareResult<Vec<Zone>> {
         let url = format!("{}/zones", self.base_url);
         self.get_list(runtime, &url).await
@@ -140,6 +162,12 @@ impl CloudflareClient {
 
     // ── DNS ──
 
+    /// List DNS records for a zone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn list_dns_records(
         &self,
         runtime: &ConnectorRuntime,
@@ -150,6 +178,12 @@ impl CloudflareClient {
         self.get_list(runtime, &url).await
     }
 
+    /// Create a DNS record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_dns_record(
         &self,
         runtime: &ConnectorRuntime,
@@ -166,6 +200,12 @@ impl CloudflareClient {
         .await
     }
 
+    /// Update a DNS record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn update_dns_record(
         &self,
         runtime: &ConnectorRuntime,
@@ -184,6 +224,12 @@ impl CloudflareClient {
         .await
     }
 
+    /// Delete a DNS record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn delete_dns_record(
         &self,
         runtime: &ConnectorRuntime,
@@ -198,6 +244,11 @@ impl CloudflareClient {
 
     // ── Workers ──
 
+    /// List Workers scripts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on transport failure or a non-2xx response.
     pub async fn list_workers(&self, runtime: &ConnectorRuntime) -> CloudflareResult<Vec<Worker>> {
         let url = format!(
             "{}/accounts/{}/workers/scripts",
@@ -206,6 +257,12 @@ impl CloudflareClient {
         self.get_list(runtime, &url).await
     }
 
+    /// Fetch a Worker script.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_worker(
         &self,
         runtime: &ConnectorRuntime,
@@ -219,6 +276,12 @@ impl CloudflareClient {
         self.get_single(runtime, &url).await
     }
 
+    /// Deploy a Worker script.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn deploy_worker(
         &self,
         runtime: &ConnectorRuntime,
@@ -250,6 +313,12 @@ impl CloudflareClient {
         .await
     }
 
+    /// Delete a Worker script.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn delete_worker(
         &self,
         runtime: &ConnectorRuntime,
@@ -265,6 +334,12 @@ impl CloudflareClient {
 
     // ── Pages ──
 
+    /// List Pages projects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn list_pages_projects(
         &self,
         runtime: &ConnectorRuntime,
@@ -276,6 +351,12 @@ impl CloudflareClient {
         self.get_list(runtime, &url).await
     }
 
+    /// Create a Pages deployment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_pages_deployment(
         &self,
         runtime: &ConnectorRuntime,
@@ -293,6 +374,12 @@ impl CloudflareClient {
 
     // ── KV ──
 
+    /// Read a key from a KV namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn kv_get(
         &self,
         runtime: &ConnectorRuntime,
@@ -308,7 +395,7 @@ impl CloudflareClient {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
-        let key_log = key.to_string();
+        let key_log = key.to_owned();
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
             let client = self.client.clone();
@@ -339,6 +426,12 @@ impl CloudflareClient {
         .await
     }
 
+    /// Write a key to a KV namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn kv_put(
         &self,
         runtime: &ConnectorRuntime,
@@ -354,8 +447,8 @@ impl CloudflareClient {
         );
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
-        let val = value.to_string();
-        let key_log = key.to_string();
+        let val = value.to_owned();
+        let key_log = key.to_owned();
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
@@ -372,6 +465,12 @@ impl CloudflareClient {
         .await
     }
 
+    /// Delete a key from a KV namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CloudflareError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn kv_delete(
         &self,
         runtime: &ConnectorRuntime,
@@ -783,19 +882,15 @@ mod tests {
 
     #[test]
     fn client_debug_redacts_auth() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4",
-                CloudflareAuth::ApiToken {
-                    api_token: "secret-token".into(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4",
+            CloudflareAuth::ApiToken {
+                api_token: "secret-token".into(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
         .unwrap();
 
         let debug = format!("{rt:?}");
@@ -805,54 +900,42 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4",
-                CloudflareAuth::ApiToken {
-                    api_token: String::new(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4",
+            CloudflareAuth::ApiToken {
+                api_token: String::new(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4",
-                CloudflareAuth::ApiToken {
-                    api_token: "token".into(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4",
+            CloudflareAuth::ApiToken {
+                api_token: "token".into(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4/",
-                CloudflareAuth::ApiToken {
-                    api_token: "t".into(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4/",
+            CloudflareAuth::ApiToken {
+                api_token: "t".into(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
         .unwrap();
         assert!(!rt.base_url().ends_with('/'));
     }
@@ -882,39 +965,31 @@ mod tests {
 
     #[test]
     fn api_key_auth_secretless() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4",
-                CloudflareAuth::ApiKey {
-                    api_key: String::new(),
-                    email: "user@example.com".into(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4",
+            CloudflareAuth::ApiKey {
+                api_key: String::new(),
+                email: "user@example.com".into(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
         .unwrap();
         assert!(rt.is_secretless());
     }
 
     #[test]
     fn client_uses_configured_timeout() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            CloudflareClient::new(
-                "https://api.cloudflare.com/client/v4",
-                CloudflareAuth::ApiToken {
-                    api_token: "token".into(),
-                },
-                "acc123",
-                HttpRetryConfig::default(),
-                Duration::from_millis(1_234),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = CloudflareClient::new(
+            "https://api.cloudflare.com/client/v4",
+            CloudflareAuth::ApiToken {
+                api_token: "token".into(),
+            },
+            "acc123",
+            HttpRetryConfig::default(),
+            Duration::from_millis(1_234),
+        )
         .unwrap();
         assert_eq!(rt.timeout, Duration::from_millis(1_234));
     }

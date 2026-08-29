@@ -163,11 +163,13 @@ impl CloudflareConfig {
 
         ProvisioningReadiness {
             auth_mode: self.auth.auth_mode(),
-            uses_legacy_global_key: self.auth.is_legacy_global_key(),
-            secret_material_configured: !self.auth.is_secretless(),
-            requires_credential_injection: self.auth.is_secretless(),
-            account_id_configured: !self.account_id.trim().is_empty(),
-            network_ok,
+            flags: ReadinessFlags {
+                uses_legacy_global_key: self.auth.is_legacy_global_key(),
+                secret_material_configured: !self.auth.is_secretless(),
+                requires_credential_injection: self.auth.is_secretless(),
+                account_id_configured: !self.account_id.trim().is_empty(),
+                network_ok,
+            },
             network_message,
             base_url: self.base_url.clone(),
             allowed_hosts: CLOUDFLARE_ALLOWED_HOSTS.to_vec(),
@@ -179,15 +181,21 @@ impl CloudflareConfig {
 #[derive(Debug, Clone, Serialize)]
 struct ProvisioningReadiness {
     auth_mode: &'static str,
+    flags: ReadinessFlags,
+    network_message: String,
+    base_url: String,
+    allowed_hosts: Vec<&'static str>,
+    account_scope_hint: &'static str,
+}
+
+/// Boolean readiness flags bundled for the provisioning report.
+#[derive(Debug, Clone, Serialize)]
+struct ReadinessFlags {
     uses_legacy_global_key: bool,
     secret_material_configured: bool,
     requires_credential_injection: bool,
     account_id_configured: bool,
     network_ok: bool,
-    network_message: String,
-    base_url: String,
-    allowed_hosts: Vec<&'static str>,
-    account_scope_hint: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -291,8 +299,7 @@ fn base_url_policy(base_url: &str) -> (bool, String) {
     }
     if !CLOUDFLARE_ALLOWED_HOSTS.contains(&host) {
         problems.push(format!(
-            "host must be one of {:?}, got {host}",
-            CLOUDFLARE_ALLOWED_HOSTS
+            "host must be one of {CLOUDFLARE_ALLOWED_HOSTS:?}, got {host}"
         ));
     }
     if !parsed.path().starts_with("/client/v4") {
@@ -433,14 +440,14 @@ impl CloudflareConnector {
         if let Some(readiness) = &provisioning {
             checks.push(DoctorCheck {
                 name: "network_constraints".into(),
-                passed: readiness.network_ok,
+                passed: readiness.flags.network_ok,
                 message: Some(readiness.network_message.clone()),
                 critical: true,
             });
             checks.push(DoctorCheck {
                 name: "account_id".into(),
-                passed: readiness.account_id_configured,
-                message: Some(if readiness.account_id_configured {
+                passed: readiness.flags.account_id_configured,
+                message: Some(if readiness.flags.account_id_configured {
                     "Cloudflare account_id configured".into()
                 } else {
                     "account_id missing; Workers, Pages, and KV cannot resolve account-scoped endpoints".into()
@@ -455,8 +462,8 @@ impl CloudflareConnector {
             });
             checks.push(DoctorCheck {
                 name: "secret_material".into(),
-                passed: readiness.secret_material_configured,
-                message: Some(if readiness.secret_material_configured {
+                passed: readiness.flags.secret_material_configured,
+                message: Some(if readiness.flags.secret_material_configured {
                     "Credential material configured directly".into()
                 } else {
                     "Secret material omitted; host or egress proxy must inject headers at runtime"
@@ -466,8 +473,8 @@ impl CloudflareConnector {
             });
             checks.push(DoctorCheck {
                 name: "recommended_auth".into(),
-                passed: !readiness.uses_legacy_global_key,
-                message: Some(if readiness.uses_legacy_global_key {
+                passed: !readiness.flags.uses_legacy_global_key,
+                message: Some(if readiness.flags.uses_legacy_global_key {
                     "Global API key is legacy and broad; prefer scoped API tokens for operator verification".into()
                 } else {
                     "Scoped API token mode configured".into()
@@ -489,7 +496,7 @@ impl CloudflareConnector {
 
     fn attach_self_check_details(
         mut report: SelfCheckReport,
-        provisioning: Option<ProvisioningReadiness>,
+        provisioning: Option<&ProvisioningReadiness>,
     ) -> SelfCheckReport {
         report.details = Some(json!({
             "provisioning": provisioning,
@@ -520,16 +527,15 @@ impl CloudflareConnector {
     }
 
     fn optional_bool(input: &serde_json::Value, key: &str) -> FcpResult<Option<bool>> {
-        match input.get(key) {
-            None => Ok(None),
-            Some(value) => value
+        input.get(key).map_or(Ok(None), |value| {
+            value
                 .as_bool()
                 .map(Some)
                 .ok_or_else(|| FcpError::InvalidRequest {
                     code: 1005,
                     message: format!("Field '{key}' must be a boolean"),
-                }),
-        }
+                })
+        })
     }
 
     fn optional_u32(input: &serde_json::Value, key: &str) -> FcpResult<Option<u32>> {
@@ -680,7 +686,6 @@ impl FcpConnector for CloudflareConnector {
             cf.retry.clone(),
             timeout,
         )
-        .await
         .map_err(|e| FcpError::Internal {
             message: format!("Client init: {e}"),
         })?;
@@ -695,11 +700,10 @@ impl FcpConnector for CloudflareConnector {
             auth_label = self
                 .config
                 .as_ref()
-                .map(|cfg| cfg.auth.redacted_label())
-                .unwrap_or("unknown"),
-            network_ok = provisioning.network_ok,
-            requires_credential_injection = provisioning.requires_credential_injection,
-            uses_legacy_global_key = provisioning.uses_legacy_global_key,
+                .map_or("unknown", |cfg| cfg.auth.redacted_label()),
+            network_ok = provisioning.flags.network_ok,
+            requires_credential_injection = provisioning.flags.requires_credential_injection,
+            uses_legacy_global_key = provisioning.flags.uses_legacy_global_key,
             base_url = %provisioning.base_url,
             "Configured Cloudflare connector"
         );
@@ -744,10 +748,10 @@ impl FcpConnector for CloudflareConnector {
             .as_ref()
             .map(CloudflareConfig::provisioning_readiness);
         let mut snap = match &provisioning {
-            Some(readiness) if !readiness.network_ok => {
+            Some(readiness) if !readiness.flags.network_ok => {
                 HealthSnapshot::error("network constraints invalid")
             }
-            Some(readiness) if readiness.requires_credential_injection => {
+            Some(readiness) if readiness.flags.requires_credential_injection => {
                 HealthSnapshot::degraded("credential injection required")
             }
             Some(_) => HealthSnapshot::ready(),
@@ -774,13 +778,13 @@ impl FcpConnector for CloudflareConnector {
         };
         let provisioning = config.provisioning_readiness();
 
-        if !provisioning.network_ok {
+        if !provisioning.flags.network_ok {
             return Ok(Self::attach_self_check_details(
                 SelfCheckReport::failed(
                     "network_constraints_invalid",
                     provisioning.network_message.clone(),
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         }
 
@@ -790,7 +794,7 @@ impl FcpConnector for CloudflareConnector {
                     "client_missing",
                     "Cloudflare HTTP client not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
         let Some(runtime) = &self.runtime else {
@@ -799,17 +803,17 @@ impl FcpConnector for CloudflareConnector {
                     "runtime_missing",
                     "ConnectorRuntime not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
 
-        if provisioning.requires_credential_injection {
+        if provisioning.flags.requires_credential_injection {
             return Ok(Self::attach_self_check_details(
                 SelfCheckReport::degraded(
                     "credential_injection_required",
                     "Credential material is intentionally omitted; inject Authorization or X-Auth-* headers at runtime before re-running self_check",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         }
 
@@ -827,7 +831,7 @@ impl FcpConnector for CloudflareConnector {
             }
             Err(error) => SelfCheckReport::failed("self_check_failed", error.to_string()),
         };
-        let report = Self::attach_self_check_details(report, Some(provisioning));
+        let report = Self::attach_self_check_details(report, Some(&provisioning));
         info!(
             event = "cloudflare.provisioning.self_check",
             status = ?report.status,
@@ -1207,7 +1211,6 @@ mod tests {
 
     fn capability_for_operation(op: &'static str) -> &'static str {
         match op {
-            OP_ZONES_LIST | OP_HEALTH => CAP_ZONES_READ,
             OP_DNS_LIST => CAP_DNS_READ,
             OP_DNS_CREATE | OP_DNS_UPDATE | OP_DNS_DELETE => CAP_DNS_WRITE,
             OP_WORKERS_LIST | OP_WORKERS_GET => CAP_WORKERS_READ,
@@ -1333,7 +1336,7 @@ mod tests {
                 "base_url":" https://api.cloudflare.com/client/v4 "
             }))
             .await
-            .map(|_| c)
+            .map(|()| c)
         })
         .unwrap()
         .unwrap();
@@ -1361,7 +1364,7 @@ mod tests {
                 "base_url":" https://api.cloudflare.com/client/v4 "
             }))
             .await
-            .map(|_| c)
+            .map(|()| c)
         })
         .unwrap()
         .unwrap();
