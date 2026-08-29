@@ -11,7 +11,10 @@ use fcp_sdk::migration::{
 };
 
 use crate::error::{NetlifyError, NetlifyResult};
-use crate::types::*;
+use crate::types::{
+    CreateDeployRequest, CreateSiteRequest, Deploy, DnsZone, EnvVar, NetlifyAuth, SetEnvVarRequest,
+    Site, User,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> NetlifyResult<&'a str> {
@@ -63,14 +66,21 @@ pub struct NetlifyClient {
 impl std::fmt::Debug for NetlifyClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetlifyClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
+            .field("retry_config", &self.retry_config)
             .finish()
     }
 }
 
 impl NetlifyClient {
-    pub async fn new(
+    /// Create a Netlify API client for the given base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError::Http`] if the HTTP client cannot be built.
+    pub fn new(
         base_url: &str,
         auth: NetlifyAuth,
         retry_config: HttpRetryConfig,
@@ -88,16 +98,23 @@ impl NetlifyClient {
         })
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.auth.is_secretless()
     }
 
     // Health check
 
+    /// Fetch the authenticated user as a lightweight health check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on transport failure or a non-2xx response.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> NetlifyResult<User> {
         let url = format!("{}/api/v1/user", self.base_url);
         self.get_single(runtime, &url).await
@@ -105,17 +122,34 @@ impl NetlifyClient {
 
     // Sites
 
+    /// List sites visible to the configured token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on transport failure or a non-2xx response.
     pub async fn list_sites(&self, runtime: &ConnectorRuntime) -> NetlifyResult<Vec<Site>> {
         let url = format!("{}/api/v1/sites", self.base_url);
         self.get_list(runtime, &url).await
     }
 
+    /// Fetch a single site by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_site(&self, runtime: &ConnectorRuntime, site_id: &str) -> NetlifyResult<Site> {
         let site_id = sanitize_path_segment(site_id, "site_id")?;
         let url = format!("{}/api/v1/sites/{site_id}", self.base_url);
         self.get_single(runtime, &url).await
     }
 
+    /// Create a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_site(
         &self,
         runtime: &ConnectorRuntime,
@@ -127,6 +161,12 @@ impl NetlifyClient {
         self.post_json(runtime, &url, &body, false).await
     }
 
+    /// Delete a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn delete_site(
         &self,
         runtime: &ConnectorRuntime,
@@ -139,6 +179,12 @@ impl NetlifyClient {
 
     // Deploys
 
+    /// List deploys for a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn list_deploys(
         &self,
         runtime: &ConnectorRuntime,
@@ -149,6 +195,12 @@ impl NetlifyClient {
         self.get_list(runtime, &url).await
     }
 
+    /// Fetch a single deploy by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_deploy(
         &self,
         runtime: &ConnectorRuntime,
@@ -164,6 +216,12 @@ impl NetlifyClient {
         self.get_single(runtime, &url).await
     }
 
+    /// Create a deploy for a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_deploy(
         &self,
         runtime: &ConnectorRuntime,
@@ -177,6 +235,12 @@ impl NetlifyClient {
         self.post_json(runtime, &url, &body, false).await
     }
 
+    /// Roll back a deploy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn rollback_deploy(
         &self,
         runtime: &ConnectorRuntime,
@@ -195,6 +259,11 @@ impl NetlifyClient {
 
     // DNS
 
+    /// List DNS zones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on transport failure or a non-2xx response.
     pub async fn list_dns_zones(&self, runtime: &ConnectorRuntime) -> NetlifyResult<Vec<DnsZone>> {
         let url = format!("{}/api/v1/dns_zones", self.base_url);
         self.get_list(runtime, &url).await
@@ -202,6 +271,12 @@ impl NetlifyClient {
 
     // Environment Variables
 
+    /// List environment variables for a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn list_env_vars(
         &self,
         runtime: &ConnectorRuntime,
@@ -217,6 +292,12 @@ impl NetlifyClient {
         self.get_list(runtime, &url).await
     }
 
+    /// Set an environment variable on a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn set_env_var(
         &self,
         runtime: &ConnectorRuntime,
@@ -235,6 +316,12 @@ impl NetlifyClient {
         self.post_json_list(runtime, &url, &body, true).await
     }
 
+    /// Delete an environment variable from a site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetlifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn delete_env_var(
         &self,
         runtime: &ConnectorRuntime,
@@ -422,7 +509,10 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: NetlifyError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
@@ -514,7 +604,10 @@ async fn handle_list_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: NetlifyError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
@@ -563,17 +656,13 @@ mod tests {
     #[test]
     fn client_debug_redacts_auth() {
         let auth_value = sample_auth_value();
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            NetlifyClient::new(
-                "https://api.netlify.com",
-                NetlifyAuth {
-                    access_token: auth_value.clone(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = NetlifyClient::new(
+            "https://api.netlify.com",
+            NetlifyAuth {
+                access_token: auth_value.clone(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
 
         let debug = format!("{rt:?}");
@@ -583,31 +672,23 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            NetlifyClient::new(
-                "https://api.netlify.com",
-                NetlifyAuth {
-                    access_token: String::new(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = NetlifyClient::new(
+            "https://api.netlify.com",
+            NetlifyAuth {
+                access_token: String::new(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            NetlifyClient::new(
-                "https://api.netlify.com",
-                NetlifyAuth {
-                    access_token: sample_auth_value(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = NetlifyClient::new(
+            "https://api.netlify.com",
+            NetlifyAuth {
+                access_token: sample_auth_value(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
@@ -639,17 +720,13 @@ mod tests {
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            NetlifyClient::new(
-                "https://api.netlify.com/",
-                NetlifyAuth {
-                    access_token: sample_auth_value(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = NetlifyClient::new(
+            "https://api.netlify.com/",
+            NetlifyAuth {
+                access_token: sample_auth_value(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt.base_url().ends_with('/'));
     }

@@ -39,7 +39,7 @@ fn test_runtime() -> ConnectorRuntime {
     )
 }
 
-async fn client(server: &MockServer) -> NetlifyClient {
+fn client(server: &MockServer) -> NetlifyClient {
     NetlifyClient::new(
         &server.uri(),
         NetlifyAuth {
@@ -47,7 +47,6 @@ async fn client(server: &MockServer) -> NetlifyClient {
         },
         no_retry_config(),
     )
-    .await
     .expect("wiremock URI should build a Netlify client")
 }
 
@@ -134,12 +133,8 @@ fn assert_schema_accepts(schema: &Value, payload: &Value) {
 
 fn assert_schema_rejects(schema: &Value, payload: &Value) {
     let validator = jsonschema::validator_for(schema).expect("schema should compile");
-    let errors = validator
-        .iter_errors(payload)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
     assert!(
-        !errors.is_empty(),
+        validator.iter_errors(payload).next().is_some(),
         "schema should reject payload {payload:#}"
     );
 }
@@ -538,7 +533,7 @@ async fn site_deploy_dns_env_and_health_success_paths_use_netlify_contracts() {
         .mount(&server)
         .await;
 
-    let client = client(&server).await;
+    let client = client(&server);
 
     let sites = client
         .list_sites(&runtime)
@@ -705,7 +700,7 @@ async fn auth_rate_limit_malformed_json_and_invalid_input_are_typed() {
         .mount(&server)
         .await;
 
-    let client = client(&server).await;
+    let client = client(&server);
 
     let unauthorized = client
         .get_site(&runtime, "bad-auth")
@@ -825,17 +820,13 @@ fn operation_catalog_manifest_and_redaction_preserve_security_posture() {
     assert!(capability_section.contains("\"network.listen\""));
 
     let redaction_value = sample_auth_value();
-    let client = fcp_async_core::runtime::block_on_sync(async {
-        NetlifyClient::new(
-            "https://api.netlify.com",
-            NetlifyAuth {
-                access_token: redaction_value.clone(),
-            },
-            no_retry_config(),
-        )
-        .await
-    })
-    .expect("runtime should complete")
+    let client = NetlifyClient::new(
+        "https://api.netlify.com",
+        NetlifyAuth {
+            access_token: redaction_value.clone(),
+        },
+        no_retry_config(),
+    )
     .expect("redaction proof client should build");
     let debug_output = format!("{client:?}");
     assert!(!debug_output.contains(&redaction_value));
@@ -868,7 +859,7 @@ fn retrying_client_config() -> HttpRetryConfig {
     }
 }
 
-async fn retrying_client(server: &MockServer) -> NetlifyClient {
+fn retrying_client(server: &MockServer) -> NetlifyClient {
     NetlifyClient::new(
         &server.uri(),
         NetlifyAuth {
@@ -876,7 +867,6 @@ async fn retrying_client(server: &MockServer) -> NetlifyClient {
         },
         retrying_client_config(),
     )
-    .await
     .expect("wiremock URI should build a Netlify client")
 }
 
@@ -890,7 +880,6 @@ async fn create_deploy_is_not_retried_after_a_5xx() {
         .await;
 
     let result = retrying_client(&server)
-        .await
         .create_deploy(
             &test_runtime(),
             "site-1",
@@ -931,7 +920,6 @@ async fn create_deploy_still_retries_a_429() {
         .await;
 
     retrying_client(&server)
-        .await
         .create_deploy(
             &test_runtime(),
             "site-1",

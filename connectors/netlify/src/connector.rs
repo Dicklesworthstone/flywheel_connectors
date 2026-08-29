@@ -92,6 +92,9 @@ impl std::fmt::Debug for NetlifyConfig {
         f.debug_struct("NetlifyConfig")
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("account_slug", &self.account_slug)
             .finish()
     }
 }
@@ -214,8 +217,7 @@ fn base_url_policy(base_url: &str) -> (bool, String) {
     }
     if !NETLIFY_ALLOWED_HOSTS.contains(&host) {
         problems.push(format!(
-            "host must be one of {:?}, got {host}",
-            NETLIFY_ALLOWED_HOSTS
+            "host must be one of {NETLIFY_ALLOWED_HOSTS:?}, got {host}"
         ));
     }
 
@@ -416,7 +418,6 @@ impl FcpConnector for NetlifyConnector {
                 .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms)),
         ));
         let client = NetlifyClient::new(&cfg.base_url, cfg.auth.clone(), cfg.retry.clone())
-            .await
             .map_err(|e| FcpError::Internal {
                 message: format!("Client init: {e}"),
             })?;
@@ -749,9 +750,12 @@ impl NetlifyConnector {
                 let context = req
                     .input
                     .get("context")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .map(String::from);
-                let netlify_secret_flag = req.input.get("is_secret").and_then(|v| v.as_bool());
+                let netlify_secret_flag = req
+                    .input
+                    .get("is_secret")
+                    .and_then(serde_json::Value::as_bool);
                 let set_req = vec![SetEnvVarRequest {
                     key: key.into(),
                     values: vec![SetEnvVarValue {
@@ -830,7 +834,7 @@ mod tests {
     fn operations_have_unique_ids() {
         let ops = operations_info();
         let mut ids: Vec<_> = ops.iter().map(|o| o.id.as_str()).collect();
-        ids.sort();
+        ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 13);
     }

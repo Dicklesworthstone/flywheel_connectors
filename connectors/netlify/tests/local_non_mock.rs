@@ -456,7 +456,6 @@ fn capability_for_operation(operation: &'static str) -> &'static str {
         "unsupported operation {operation}"
     );
     match operation {
-        OP_HEALTH | OP_SITES_LIST => CAP_SITES_READ,
         OP_SITES_CREATE | OP_SITES_DELETE => CAP_SITES_WRITE,
         _ => CAP_SITES_READ,
     }
