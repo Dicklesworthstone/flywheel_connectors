@@ -58,7 +58,9 @@ fn log_event(scenario_id: &str, phase: &str, outcome: &str, detail: Option<&str>
 /// is the byte index modulo 251 (a prime) which avoids accidental
 /// runs of zeros that could mask alignment bugs.
 fn make_payload(size: usize) -> Vec<u8> {
-    (0..size).map(|i| u8::try_from(i % 251).unwrap_or(u8::MAX)).collect()
+    (0..size)
+        .map(|i| u8::try_from(i % 251).unwrap_or(u8::MAX))
+        .collect()
 }
 
 /// Test config: smaller-than-default symbols so a 1MB payload yields
@@ -338,8 +340,8 @@ fn symbol_first_e2e_three_node_split_lose_one_reconstruct_from_two() {
             break;
         }
     }
-    let decoded =
-        maybe_decoded.expect("two-of-three reconstruction MUST succeed (symbol fungibility property)");
+    let decoded = maybe_decoded
+        .expect("two-of-three reconstruction MUST succeed (symbol fungibility property)");
     assert_eq!(decoded, payload, "reconstructed bytes must equal source");
     log_event(scenario, "decode_two_of_three", "passed", None);
 }
@@ -415,7 +417,9 @@ fn symbol_first_e2e_symbol_fungibility_repair_only_decode() {
     let all_symbols = encoder.encode_all();
 
     // Filter to only repair symbols (ESI >= K' >= K).
-    let k_prime = u32::try_from(all_symbols.len()).unwrap_or(u32::MAX).saturating_sub(encoder.repair_symbols());
+    let k_prime = u32::try_from(all_symbols.len())
+        .unwrap_or(u32::MAX)
+        .saturating_sub(encoder.repair_symbols());
     let repair_only: Vec<(u32, Vec<u8>)> = all_symbols
         .into_iter()
         .filter(|(esi, _)| *esi >= k_prime)

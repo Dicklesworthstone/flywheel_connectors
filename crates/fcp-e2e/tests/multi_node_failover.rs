@@ -9,7 +9,7 @@ use fcp_testkit::local_mesh::{LocalChaosMode, LocalMeshHarness, LocalMeshHarness
 use fcp_testkit::redacted_replay_bundle::{
     verify_in_memory_replay_bundle, verify_written_replay_bundle,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn deterministic_local_mesh_failover_smoke_covers_all_a4_chaos_modes()
@@ -162,7 +162,10 @@ fn generate_multi_node_failover_golden_matrix() -> Result<(), Box<dyn std::error
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&document)?))?;
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&document)?),
+    )?;
     Ok(())
 }
 

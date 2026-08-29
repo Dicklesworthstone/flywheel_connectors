@@ -11275,6 +11275,32 @@ fn mesh_known_nodes(state: &MeshTargetState, default_zone: Option<&str>) -> Vec<
         .collect()
 }
 
+fn context_current_node_local_payload() -> Result<Value> {
+    let (path, config) = load_context_config()?;
+    let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "context");
+    let mut payload = json!({
+        "status": "ok",
+        "command": "context",
+        "subcommand": "current",
+        "config_path": path.display().to_string(),
+        "current_context": &config.current_context,
+        "context": config.contexts.get(&config.current_context).map_or(Value::Null, |context| json!({
+            "name": &config.current_context,
+            "endpoint": &context.endpoint,
+            "default_zone": &context.default_zone,
+            "node_identity": context.node_identity.as_ref().map(|path| path.display().to_string()),
+            "config_overrides": &context.config_overrides,
+        })),
+        "next_actions": [
+            "fwc context list".to_owned(),
+            "fwc list".to_owned(),
+        ],
+    });
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::NodeLocal);
+    Ok(payload)
+}
+
 #[allow(clippy::too_many_lines)]
 fn context_dispatch(args: &ContextArgs) -> Result<DispatchOutcome> {
     match &args.command {
@@ -11325,40 +11351,53 @@ fn context_dispatch(args: &ContextArgs) -> Result<DispatchOutcome> {
             })
         }
         ContextCommand::Current(args) => {
-            if let Some(outcome) = enforce_required_truth_source(
-                "context current",
-                args.require_source,
-                KnowledgeState::NodeLocal,
-            ) {
-                return Ok(outcome);
-            }
+            // A.5: route the source ladder through `LiveTruthResolver` instead
+            // of hand-picking the node-local branch, so the answer carries the
+            // resolver's decision trace and `--require-source` enforcement
+            // happens at one chokepoint for every read-only command.
+            //
+            // `context current` only has a node-local source (the on-disk
+            // context config); every other rung is not configured.
+            let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+            let mut node_local_error: Option<anyhow::Error> = None;
+            let resolution = resolver.resolve_with_partials(
+                ResolutionStrategy::NodeLocalOnly,
+                |source| match source {
+                    KnowledgeState::NodeLocal => match context_current_node_local_payload() {
+                        Ok(payload) => QueryResult::Complete(payload),
+                        Err(error) => {
+                            let detail = format!("{error:#}");
+                            node_local_error = Some(error);
+                            QueryResult::Unavailable(detail)
+                        }
+                    },
+                    _ => QueryResult::NotConfigured,
+                },
+            );
 
-            let (path, config) = load_context_config()?;
-            let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "context");
-            let mut payload = json!({
-                "status": "ok",
-                "command": "context",
-                "subcommand": "current",
-                "config_path": path.display().to_string(),
-                "current_context": &config.current_context,
-                "context": config.contexts.get(&config.current_context).map_or(Value::Null, |context| json!({
-                    "name": &config.current_context,
-                    "endpoint": &context.endpoint,
-                    "default_zone": &context.default_zone,
-                    "node_identity": context.node_identity.as_ref().map(|path| path.display().to_string()),
-                    "config_overrides": &context.config_overrides,
-                })),
-                "next_actions": [
-                    "fwc context list".to_owned(),
-                    "fwc list".to_owned(),
-                ],
-            });
-            envelope.inject_into(&mut payload);
-            inject_truth_source_metadata(&mut payload, KnowledgeState::NodeLocal);
-            Ok(DispatchOutcome {
-                payload,
-                exit_code: CliExitCode::Success,
-            })
+            match resolution {
+                Ok(resolved) => {
+                    if let Some(outcome) = enforce_required_truth_source(
+                        "context current",
+                        args.require_source,
+                        resolved.knowledge_state,
+                    ) {
+                        return Ok(outcome);
+                    }
+                    Ok(DispatchOutcome {
+                        payload: resolved.value,
+                        exit_code: CliExitCode::Success,
+                    })
+                }
+                Err(resolution_error) => {
+                    // A failed node-local config load propagates its error
+                    // unchanged, matching the pre-resolver `?` surface.
+                    if let Some(error) = node_local_error {
+                        return Err(error);
+                    }
+                    Err(resolution_error.into())
+                }
+            }
         }
         ContextCommand::Use(args) => {
             let (path, mut config) = load_context_config()?;
@@ -12647,58 +12686,121 @@ fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome
 
 fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutcome> {
     let resolved_host = resolve_host_config(host)?;
-    if args.offline {
-        if resolved_host.is_some() {
-            let mut outcome = conflicting_catalog_mode_dispatch("search");
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-            return Ok(outcome);
-        }
-    } else if let Some(host) = resolved_host {
-        if let Some(outcome) =
-            enforce_required_truth_source("search", args.require_source, KnowledgeState::HostBacked)
-        {
-            return Ok(outcome);
-        }
-        return search_dispatch_host(args, &host.endpoint);
-    } else {
-        if let Some(outcome) =
-            enforce_required_truth_source("search", args.require_source, KnowledgeState::Offline)
-        {
-            return Ok(outcome);
-        }
-
-        let mut outcome = missing_host_dispatch(
-            "search",
-            json!({
-                "query": &args.query,
-                "filters": {
-                    "zone": args.zone,
-                    "connector": args.connector,
-                    "capability": args.capability,
-                    "risk": args.risk,
-                    "safety": args.safety,
-                    "archetype": args.archetype,
-                    "category": args.category,
-                    "idempotent": args.idempotent,
-                    "include_hidden": args.include_hidden,
-                },
-                "require_source": args.require_source.map(RequiredTruthSource::label),
-            }),
-            vec![
-                "fwc search <query> --host <endpoint>".to_owned(),
-                "fwc search <query> --offline".to_owned(),
-            ],
-        );
+    if args.offline && resolved_host.is_some() {
+        let mut outcome = conflicting_catalog_mode_dispatch("search");
         inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
         return Ok(outcome);
     }
 
-    if let Some(outcome) =
-        enforce_required_truth_source("search", args.require_source, KnowledgeState::Offline)
-    {
-        return Ok(outcome);
-    }
+    // A.5: route the source ladder through `LiveTruthResolver` instead of
+    // hand-picking the host/offline branch, so the answer carries the
+    // resolver's decision trace and `--require-source` enforcement happens at
+    // one chokepoint for every read-only command.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
+    // The truthfulness contract forbids silent downgrade: offline artifacts
+    // are only a source when the operator asked for `--offline`, and a
+    // configured-but-failed host propagates its transport error unchanged.
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match search_dispatch_host(args, &host.endpoint) {
+                Ok(outcome) if outcome.exit_code == CliExitCode::Success => {
+                    QueryResult::Complete(outcome.payload)
+                }
+                Ok(outcome) => QueryResult::Error(format!(
+                    "host search returned exit code {:?}",
+                    outcome.exit_code
+                )),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline => match search_offline_payload(args) {
+            Ok(payload) => QueryResult::Complete(payload),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                offline_error = Some(error);
+                QueryResult::Unavailable(detail)
+            }
+        },
+        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
+        // search cache; Degraded/FallbackDerived are resolver-assigned
+        // outcomes, never queryable sources.
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "search",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(DispatchOutcome {
+                payload: resolved.value,
+                exit_code: CliExitCode::Success,
+            })
+        }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            drop(resolution_error);
+            // Preserve the pre-resolver no-source surface: a `--require-source`
+            // floor the offline artifact cannot satisfy refuses before the
+            // missing-host payload is emitted.
+            if let Some(outcome) = enforce_required_truth_source(
+                "search",
+                args.require_source,
+                KnowledgeState::Offline,
+            ) {
+                return Ok(outcome);
+            }
+            let mut outcome = missing_host_dispatch(
+                "search",
+                json!({
+                    "query": &args.query,
+                    "filters": {
+                        "zone": args.zone,
+                        "connector": args.connector,
+                        "capability": args.capability,
+                        "risk": args.risk,
+                        "safety": args.safety,
+                        "archetype": args.archetype,
+                        "category": args.category,
+                        "idempotent": args.idempotent,
+                        "include_hidden": args.include_hidden,
+                    },
+                    "require_source": args.require_source.map(RequiredTruthSource::label),
+                }),
+                vec![
+                    "fwc search <query> --host <endpoint>".to_owned(),
+                    "fwc search <query> --offline".to_owned(),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
+
+fn search_offline_payload(args: &SearchArgs) -> Result<Value> {
     let catalog = DiscoveryCatalog::load_for_connector_filter(args.connector.as_deref())?;
 
     let filters = search::SearchFilters {
@@ -12799,55 +12901,118 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
     attach_metadata_cache_evidence(&mut payload, &cache_key, false);
     envelope.inject_into(&mut payload);
     inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    Ok(payload)
 }
 
 fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome> {
     let resolved_host = resolve_host_config(host)?;
-    if args.offline {
-        if resolved_host.is_some() {
-            let mut outcome = conflicting_catalog_mode_dispatch("show");
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-            return Ok(outcome);
-        }
-    } else if let Some(host) = resolved_host {
-        if let Some(outcome) =
-            enforce_required_truth_source("show", args.require_source, KnowledgeState::HostBacked)
-        {
-            return Ok(outcome);
-        }
-        return show_dispatch_host(args, &host.endpoint);
-    } else {
-        if let Some(outcome) =
-            enforce_required_truth_source("show", args.require_source, KnowledgeState::Offline)
-        {
-            return Ok(outcome);
-        }
-
-        let mut outcome = missing_host_dispatch(
-            "show",
-            json!({
-                "connector": &args.connector,
-                "require_source": args.require_source.map(RequiredTruthSource::label),
-            }),
-            vec![
-                format!("fwc show {} --host <endpoint>", args.connector),
-                format!("fwc show {} --offline", args.connector),
-            ],
-        );
+    if args.offline && resolved_host.is_some() {
+        let mut outcome = conflicting_catalog_mode_dispatch("show");
         inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
         return Ok(outcome);
     }
 
-    if let Some(outcome) =
-        enforce_required_truth_source("show", args.require_source, KnowledgeState::Offline)
-    {
-        return Ok(outcome);
-    }
+    // A.5: route the source ladder through `LiveTruthResolver` instead of
+    // hand-picking the host/offline branch, so the answer carries the
+    // resolver's decision trace and `--require-source` enforcement happens at
+    // one chokepoint for every read-only command.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
+    // The truthfulness contract forbids silent downgrade: offline artifacts
+    // are only a source when the operator asked for `--offline`, and a
+    // configured-but-failed host propagates its transport error unchanged.
+    // Connector-resolution refusals surface from the builders as non-success
+    // outcomes: the queried source did answer, so they resolve as `Complete`
+    // and their exit code is reattached to the final dispatch unchanged.
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let mut outcome_exit_code: Option<CliExitCode> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match show_dispatch_host(args, &host.endpoint) {
+                Ok(outcome) => {
+                    if outcome.exit_code != CliExitCode::Success {
+                        outcome_exit_code = Some(outcome.exit_code);
+                    }
+                    QueryResult::Complete(outcome.payload)
+                }
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline => match show_offline_payload(args) {
+            Ok(outcome) => {
+                if outcome.exit_code != CliExitCode::Success {
+                    outcome_exit_code = Some(outcome.exit_code);
+                }
+                QueryResult::Complete(outcome.payload)
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                offline_error = Some(error);
+                QueryResult::Unavailable(detail)
+            }
+        },
+        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
+        // show cache; Degraded/FallbackDerived are resolver-assigned outcomes,
+        // never queryable sources.
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "show",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(DispatchOutcome {
+                payload: resolved.value,
+                exit_code: outcome_exit_code.unwrap_or(CliExitCode::Success),
+            })
+        }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            drop(resolution_error);
+            if let Some(outcome) =
+                enforce_required_truth_source("show", args.require_source, KnowledgeState::Offline)
+            {
+                return Ok(outcome);
+            }
+            let mut outcome = missing_host_dispatch(
+                "show",
+                json!({
+                    "connector": &args.connector,
+                    "require_source": args.require_source.map(RequiredTruthSource::label),
+                }),
+                vec![
+                    format!("fwc show {} --host <endpoint>", args.connector),
+                    format!("fwc show {} --offline", args.connector),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
+
+fn show_offline_payload(args: &ShowArgs) -> Result<DispatchOutcome> {
     // Try the exact-slug fast path first, but fall back to the full catalog so
     // aliases and unique prefixes keep resolving exactly as before.
     let catalog = {
@@ -13031,55 +13196,113 @@ fn ops_dispatch(args: &OpsArgs, host: Option<&str>) -> Result<DispatchOutcome> {
 #[allow(clippy::too_many_lines)]
 fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutcome> {
     let resolved_host = resolve_host_config(host)?;
-    if args.offline {
-        if resolved_host.is_some() {
-            let mut outcome = conflicting_catalog_mode_dispatch("schema");
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-            return Ok(outcome);
-        }
-    } else if let Some(host) = resolved_host {
-        if let Some(outcome) =
-            enforce_required_truth_source("schema", args.require_source, KnowledgeState::HostBacked)
-        {
-            return Ok(outcome);
-        }
-        return schema_dispatch_host(args, &host.endpoint);
-    } else {
-        if let Some(outcome) =
-            enforce_required_truth_source("schema", args.require_source, KnowledgeState::Offline)
-        {
-            return Ok(outcome);
-        }
-
-        let mut outcome = missing_host_dispatch(
-            "schema",
-            json!({
-                "connector": &args.connector,
-                "operation": args.operation,
-                "field": args.field,
-                "required_only": args.required_only,
-                "examples": args.examples,
-                "scaffold": args.scaffold,
-                "require_source": args.require_source.map(RequiredTruthSource::label),
-            }),
-            vec![
-                format!(
-                    "fwc schema {} <operation> --host <endpoint>",
-                    args.connector
-                ),
-                format!("fwc schema {} <operation> --offline", args.connector),
-            ],
-        );
+    if args.offline && resolved_host.is_some() {
+        let mut outcome = conflicting_catalog_mode_dispatch("schema");
         inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
         return Ok(outcome);
     }
 
-    if let Some(outcome) =
-        enforce_required_truth_source("schema", args.require_source, KnowledgeState::Offline)
-    {
-        return Ok(outcome);
-    }
+    // A.5: route the source ladder through `LiveTruthResolver` instead of
+    // hand-picking the host/offline branch, so the answer carries the
+    // resolver's decision trace and `--require-source` enforcement happens at
+    // one chokepoint for every read-only command.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
+    // The truthfulness contract forbids silent downgrade: offline artifacts
+    // are only a source when the operator asked for `--offline`, and a
+    // configured-but-failed host propagates its transport error unchanged.
+    // Selector-resolution refusals (connector/operation not found) are
+    // complete source answers whose non-success exit codes must survive, so
+    // the ladder carries whole `DispatchOutcome`s rather than bare payloads.
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match schema_dispatch_host(args, &host.endpoint) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline => match schema_offline_payload(args) {
+            Ok(outcome) => QueryResult::Complete(outcome),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                offline_error = Some(error);
+                QueryResult::Unavailable(detail)
+            }
+        },
+        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
+        // schema cache; Degraded/FallbackDerived are resolver-assigned
+        // outcomes, never queryable sources.
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "schema",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(resolved.value)
+        }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            drop(resolution_error);
+            // No source could answer: reproduce the pre-resolver refusal
+            // surface byte-for-byte (`--require-source` check first, then the
+            // missing-host payload).
+            if let Some(outcome) = enforce_required_truth_source(
+                "schema",
+                args.require_source,
+                KnowledgeState::Offline,
+            ) {
+                return Ok(outcome);
+            }
+            let mut outcome = missing_host_dispatch(
+                "schema",
+                json!({
+                    "connector": &args.connector,
+                    "operation": args.operation,
+                    "field": args.field,
+                    "required_only": args.required_only,
+                    "examples": args.examples,
+                    "scaffold": args.scaffold,
+                    "require_source": args.require_source.map(RequiredTruthSource::label),
+                }),
+                vec![
+                    format!(
+                        "fwc schema {} <operation> --host <endpoint>",
+                        args.connector
+                    ),
+                    format!("fwc schema {} <operation> --offline", args.connector),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn schema_offline_payload(args: &SchemaArgs) -> Result<DispatchOutcome> {
     // Try the exact-slug fast path first, but fall back to the full catalog so
     // aliases and unique prefixes keep resolving exactly as before.
     let catalog = {
@@ -23587,7 +23810,7 @@ fn invoke_dispatch_host(
             CommandEnvelope::new(CommandAvailability::Denied, command)
         };
         envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+        inject_simulated_truth_source_metadata(&mut payload);
         return Ok(DispatchOutcome {
             payload,
             exit_code: if preflight.allowed {
@@ -24725,6 +24948,24 @@ fn inject_truth_source_metadata(payload: &mut Value, source: KnowledgeState) {
     }
 }
 
+/// A.5 simulate marker: a simulated answer is a real host policy evaluation
+/// but must be non-authoritative for downstream consumers, so it carries
+/// `_truth_source: "simulated"` instead of `host`. The string is pinned by the
+/// conformance envelope schema (TRUTH_SOURCES in fwc_command_schemas.rs). A
+/// typed `KnowledgeState::Simulated` variant is deliberately deferred: the
+/// resolver ladder never resolves INTO simulated (it is a dispatch-time
+/// marker, not an evidence class), and simulate takes no `--require-source`
+/// floor, so no typed floor interaction exists to enforce.
+fn inject_simulated_truth_source_metadata(payload: &mut Value) {
+    inject_truth_source_metadata(payload, KnowledgeState::HostBacked);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "_truth_source".to_owned(),
+            Value::String("simulated".to_owned()),
+        );
+    }
+}
+
 fn truth_source_unavailable_dispatch(
     command: &str,
     error: TruthSourceUnavailable,
@@ -25173,12 +25414,54 @@ fn cancel_dispatch(args: &CancelArgs, explicit_host: Option<&str>) -> Result<Dis
 
 #[allow(clippy::option_if_let_else)]
 fn history_dispatch(args: &HistoryArgs) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("history", args.require_source, KnowledgeState::Offline)
-    {
-        return Ok(outcome);
-    }
+    // A.5: route the source ladder through `LiveTruthResolver` instead of
+    // hand-picking the offline store branch, so the answer carries the
+    // resolver's decision trace and `--require-source` enforcement happens at
+    // one chokepoint for every read-only command.
+    //
+    // `history` only has an offline artifact source (the local CLI history
+    // store); every other rung is not configured.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(
+        ResolutionStrategy::NodeLocalOnly,
+        |source| match source {
+            KnowledgeState::Offline => match history_offline_payload(args) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            _ => QueryResult::NotConfigured,
+        },
+    );
 
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "history",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(resolved.value)
+        }
+        Err(resolution_error) => {
+            // A failed history store propagates its error unchanged, matching
+            // the pre-resolver `?` surface.
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+#[allow(clippy::option_if_let_else)]
+fn history_offline_payload(args: &HistoryArgs) -> Result<DispatchOutcome> {
     let store = cli_history_store()?;
 
     // Single entry lookup.

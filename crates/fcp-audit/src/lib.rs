@@ -589,7 +589,7 @@ impl AuditEntry {
 
     /// Verify the entry's signature using a **pre-computed** canonical
     /// id for the signing transcript, avoiding the redundant
-    /// canonicalize+hash work that [`verify_signature`] performs.
+    /// canonicalize+hash work that [`Self::verify_signature`] performs.
     ///
     /// Used by batch verification (see [`verify_chain_with_signers`])
     /// that already holds the canonical id for each entry; paired with
@@ -597,7 +597,7 @@ impl AuditEntry {
     /// serialization cost of a signed-chain check (br-atd32).
     ///
     /// # Errors
-    /// Same as [`verify_signature`]: [`AuditError::SignerMissing`] when
+    /// Same as [`Self::verify_signature`]: [`AuditError::SignerMissing`] when
     /// `issuer_kid` or `signature` is absent;
     /// [`AuditError::SignatureInvalid`] when the signer/key do not
     /// match or the signature does not verify against the canonical

@@ -27,6 +27,9 @@
 const README: &str = include_str!("../../../README.md");
 const FCP3_TRANSITION_SCORECARD: &str = include_str!("../../../docs/FCP3_Transition_Scorecard.md");
 const FWC_MAIN: &str = include_str!("../src/main.rs");
+const FWC_TRUTH: &str = include_str!("../src/truth.rs");
+const FWC_COMMAND_SCHEMAS: &str =
+    include_str!("../../fcp-conformance/tests/fwc_command_schemas.rs");
 const SECRET_FETCH: &str = include_str!("../../fcp-crypto/src/secret_fetch.rs");
 const SECRETLESS_CONNECTOR_E2E: &str =
     include_str!("../../fcp-e2e/tests/secretless_connector_e2e.rs");
@@ -218,5 +221,47 @@ fn fwc_invoke_fn_signature_is_unchanged() {
         "br-lvz4t: HostClient::invoke signature has changed. If this is intentional \
          (e.g. mesh-native cutover), update both the README status row and this test in \
          the same PR so the README ↔ production-path drift defence stays meaningful."
+    );
+}
+
+/// A.5 (`flywheel_connectors-hr0rr.2.5`) coordinated update path: when the
+/// A-series cutover beads are closed AND the four scorecard gates report
+/// green, graduating the README Mesh-Native label must be a single-file,
+/// test-visible act — this test file is that file. The assertions below pin
+/// the A.5 operator-surface wiring that makes a one-file graduation honest:
+/// every read-only answer is truth-classified, the resolver gate decides
+/// when mesh-backed answers may be served, and simulate is explicitly
+/// non-authoritative. If any of these disappear, graduating the label would
+/// require new code, and this test must keep failing until that code exists.
+#[test]
+fn readme_mesh_native_graduation_requires_only_this_file() {
+    // 1. Read-only commands route through LiveTruthResolver so every operator
+    //    answer carries a resolver decision trace, not a post-hoc stamp.
+    assert!(
+        FWC_MAIN.contains("resolve_with_partials"),
+        "A.5 graduation path: read-only fwc commands must route through \
+         LiveTruthResolver::resolve_with_partials before the Mesh-Native label can move"
+    );
+    // 2. The mesh-backed rung is gated on healthy mesh peers (A.6) so the
+    //    label cannot graduate while no mesh is provisioned.
+    assert!(
+        FWC_TRUTH.contains("mesh_backed_enabled")
+            && FWC_TRUTH.contains("MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE"),
+        "A.5 graduation path: the resolver's mesh_backed gate (default off until \
+         MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE is met) must stay wired"
+    );
+    // 3. The conformance suite pins `_truth_source` on every read-only command
+    //    envelope, so the graduated label's evidence surface is machine-checked.
+    assert!(
+        FWC_COMMAND_SCHEMAS.contains("_truth_source") && FWC_COMMAND_SCHEMAS.contains("simulated"),
+        "A.5 graduation path: the command-schema conformance suite must keep pinning \
+         _truth_source (including the non-authoritative `simulated` marker) for every \
+         read-only command"
+    );
+    // 4. simulate is marked non-authoritative end-to-end.
+    assert!(
+        FWC_MAIN.contains("inject_simulated_truth_source_metadata"),
+        "A.5 graduation path: `fwc simulate` must keep stamping `_truth_source: \"simulated\"` \
+         so non-authoritative answers are never mistaken for runtime truth"
     );
 }

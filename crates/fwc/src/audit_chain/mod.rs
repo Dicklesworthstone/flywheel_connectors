@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 use crate::capability_replay::parse_since_seconds;
-use crate::truth::{KnowledgeState, RequiredTruthSource, TRUTH_SOURCE_SCHEMA_VERSION};
+use crate::truth::{KnowledgeState, LiveTruthResolver, QueryResult, RequiredTruthSource, ResolutionStrategy, ResolverConfig, TRUTH_SOURCE_SCHEMA_VERSION};
 use types::{AuditEventOutput, AuditFilter, AuditTailError};
 
 pub(crate) const AUDIT_CHAIN_STATUS_SCHEMA_VERSION: &str = "fcp.fwc.audit_chain_status.v1";
@@ -473,6 +473,9 @@ struct AuditVerifyReport {
 }
 
 fn run_verify(args: &VerifyArgs) -> Result<()> {
+    // Verify is an offline-only artifact operation, so the resolved truth
+    // source is statically `Offline`; enforce `--require-source` up front
+    // exactly as before (exit 2 precedes any artifact read).
     enforce_audit_required_truth_source(
         "audit verify",
         args.require_source,
@@ -480,19 +483,49 @@ fn run_verify(args: &VerifyArgs) -> Result<()> {
         args.json,
     );
 
+    // A.5: route the source ladder through `LiveTruthResolver` so the answer
+    // carries the resolver's decision trace; the ladder is the offline rung
+    // alone and artifact input failures propagate unchanged.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution =
+        resolver.resolve_with_partials(ResolutionStrategy::OfflineOnly, |source| match source {
+            KnowledgeState::Offline => match build_verify_report(args) {
+                Ok(report) => QueryResult::Complete(report),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            _ => QueryResult::NotConfigured,
+        });
+
+    match resolution {
+        Ok(resolved) => output_verify_report(&resolved.value, args.json),
+        Err(resolution_error) => {
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+fn build_verify_report(args: &VerifyArgs) -> Result<AuditVerifyReport> {
     let events_input = read_input(&args.events)?;
-    let head_input = if let Some(ref path) = args.head {
+    let head_input = if let Some(path) = &args.head {
         Some(read_input(path)?)
     } else {
         None
     };
-    let report = build_verify_report_from_inputs(
+    build_verify_report_from_inputs(
         &events_input,
         head_input.as_deref(),
         args.zone.as_deref(),
         &args.issuer_keys,
-    )?;
-    output_verify_report(&report, args.json)
+    )
 }
 
 fn run_explain(args: &ExplainArgs) -> Result<()> {
@@ -827,16 +860,93 @@ fn run_chain_status(args: &ChainStatusArgs, explicit_host: Option<&str>) -> Resu
         .now_unix_secs
         .unwrap_or_else(|| u64::try_from(Utc::now().timestamp()).unwrap_or_default());
     let host = resolve_audit_chain_status_host(explicit_host);
-    let (report, truth_source) =
-        build_chain_status_report_with_source(args, now_unix_secs, host.as_deref())?;
-    enforce_audit_required_truth_source(
-        "audit chain status",
-        args.require_source,
-        truth_source,
-        args.json,
-    );
 
-    output_chain_status_report(&report, truth_source, args.json)
+    // A.5: route the host/artifact source ladder through `LiveTruthResolver`
+    // so the answer carries the resolver's decision trace and
+    // `--require-source` enforcement happens at one chokepoint. Source
+    // eligibility is unchanged: the host is only queried when configured and
+    // no `--head` artifact was supplied.
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = resolver.config().default_strategy;
+
+    // A configured-but-unreachable host downgrades to the signed-head
+    // artifact source with a warning rather than failing the command;
+    // artifact read/parse failures propagate unchanged.
+    let mut host_error: Option<String> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => {
+            if args.head.is_none()
+                && let Some(host) = &host
+            {
+                match AuditHostClient::new(host).and_then(|client| {
+                    client.chain_status(args.zone.as_deref(), args.max_age_seconds, now_unix_secs)
+                }) {
+                    Ok(response) => {
+                        QueryResult::Complete((response.into_report(), KnowledgeState::HostBacked))
+                    }
+                    Err(error) => {
+                        let detail = error.to_string();
+                        host_error = Some(detail.clone());
+                        QueryResult::Unavailable(detail)
+                    }
+                }
+            } else {
+                QueryResult::NotConfigured
+            }
+        }
+        KnowledgeState::Offline => {
+            match chain_status_offline_report(args, now_unix_secs, host_error.as_deref()) {
+                Ok(report) => QueryResult::Complete((report, KnowledgeState::Offline)),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            }
+        }
+        // Mesh-backed has no audit client yet (A.5 gate); node-local has no
+        // audit-chain cache; Degraded/FallbackDerived are resolver-assigned
+        // outcomes, never queryable sources.
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            let (report, truth_source) = resolved.value;
+            enforce_audit_required_truth_source(
+                "audit chain status",
+                args.require_source,
+                truth_source,
+                args.json,
+            );
+            output_chain_status_report(&report, truth_source, args.json)
+        }
+        Err(resolution_error) => {
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+/// Build the offline chain-status report: the signed-head artifact report,
+/// or the missing-telemetry report carrying the host-failure warning when a
+/// configured host was unreachable (the historical downgrade surface).
+fn chain_status_offline_report(
+    args: &ChainStatusArgs,
+    now_unix_secs: u64,
+    host_error: Option<&str>,
+) -> Result<AuditChainStatusReport> {
+    if let Some(error) = host_error {
+        let mut report = missing_chain_status_report(args);
+        report
+            .warnings
+            .push(format!("host admin API audit-chain status query failed: {error}"));
+        return Ok(report);
+    }
+    build_artifact_chain_status_report(args, now_unix_secs)
 }
 
 pub(crate) fn build_chain_status_report(

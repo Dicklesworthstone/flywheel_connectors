@@ -27,13 +27,13 @@ use fcp_evidence::{
 };
 use fcp_mesh::{DeviceProfile, GossipMessage, MeshNode, MeshNodeConfig, ObjectAdmissionClass};
 use fcp_prelude::{
-    CapabilityId, ConnectorId, Decision, DecisionReasonCode, DecisionReceiptPolicy, EpochId, NodeId as CoreNodeId,
-    NodeSignature, ObjectHeader, ObjectId, ObjectIdKey, OperationId, POLICY_BUNDLE_SIGNED_FIELDS,
-    PolicyBundle, PolicyBundleObject, PolicyBundlePolicyRef, PolicyBundleResolved,
-    PolicyBundleSignature, PolicyDecisionInput, PolicyEngine, PolicyPattern, PrincipalId,
-    Provenance, ProvenanceRecord, RetentionClass, RevocationObject, RevocationRegistry,
-    RevocationScope, SafetyTier, StorageMeta, StoredObject, TailscaleNodeId, TransportMode, ZoneId,
-    ZonePolicyObject, ZoneTransportPolicy, compute_policy_bundle_hash,
+    CapabilityId, ConnectorId, Decision, DecisionReasonCode, DecisionReceiptPolicy, EpochId,
+    NodeId as CoreNodeId, NodeSignature, ObjectHeader, ObjectId, ObjectIdKey, OperationId,
+    POLICY_BUNDLE_SIGNED_FIELDS, PolicyBundle, PolicyBundleObject, PolicyBundlePolicyRef,
+    PolicyBundleResolved, PolicyBundleSignature, PolicyDecisionInput, PolicyEngine, PolicyPattern,
+    PrincipalId, Provenance, ProvenanceRecord, RetentionClass, RevocationObject,
+    RevocationRegistry, RevocationScope, SafetyTier, StorageMeta, StoredObject, TailscaleNodeId,
+    TransportMode, ZoneId, ZonePolicyObject, ZoneTransportPolicy, compute_policy_bundle_hash,
 };
 use fcp_store::{
     KeyedObjectIdVerifier, MemoryObjectStore, MemoryObjectStoreConfig, MemorySymbolStore,

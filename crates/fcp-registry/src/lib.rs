@@ -3126,7 +3126,12 @@ impl LocalRegistryCatalog {
         let entries = self.sorted_version_entries(connector_id)?;
         let latest_version = entries.first()?.0.clone();
         let (_, records) = entries.first()?;
-        Some(Self::version_descriptor(connector_id, latest_version.as_str(), records, true))
+        Some(Self::version_descriptor(
+            connector_id,
+            latest_version.as_str(),
+            records,
+            true,
+        ))
     }
 
     #[must_use]

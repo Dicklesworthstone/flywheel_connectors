@@ -559,11 +559,10 @@ fn persist_session_transcript_artifact(
         ));
     }
 
-    let artifact_path = bundle_dir
-        .map_or_else(
-            || source_path.to_path_buf(),
-            |dir| dir.join("session_transcript.json"),
-        );
+    let artifact_path = bundle_dir.map_or_else(
+        || source_path.to_path_buf(),
+        |dir| dir.join("session_transcript.json"),
+    );
     if bundle_dir.is_some() {
         write_text_file(&artifact_path, &payload)?;
     }
@@ -771,9 +770,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let bundle_dir = args.bundle_dir.as_deref();
         let output_path = default_output_path(args.output.as_deref(), bundle_dir, "logs.jsonl");
-        let stable_output_path =
-            default_output_path(args.stable_output.as_deref(), bundle_dir, "logs.stable.jsonl");
-        let report_json_path = default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
+        let stable_output_path = default_output_path(
+            args.stable_output.as_deref(),
+            bundle_dir,
+            "logs.stable.jsonl",
+        );
+        let report_json_path =
+            default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
         let summary_output_path =
             default_output_path(args.summary_output.as_deref(), bundle_dir, "summary.txt");
         let scan_report_path = args
@@ -953,9 +956,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let bundle_dir = args.bundle_dir.as_deref();
         let output_path = default_output_path(args.output.as_deref(), bundle_dir, "logs.jsonl");
-        let stable_output_path =
-            default_output_path(args.stable_output.as_deref(), bundle_dir, "logs.stable.jsonl");
-        let report_json_path = default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
+        let stable_output_path = default_output_path(
+            args.stable_output.as_deref(),
+            bundle_dir,
+            "logs.stable.jsonl",
+        );
+        let report_json_path =
+            default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
         let summary_output_path =
             default_output_path(args.summary_output.as_deref(), bundle_dir, "summary.txt");
 
@@ -1084,16 +1091,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = bundle_dir.as_ref() {
         std::fs::create_dir_all(dir)?;
     }
-    let output_path = default_output_path(args.output.as_deref(), bundle_dir.as_deref(), "logs.jsonl");
+    let output_path =
+        default_output_path(args.output.as_deref(), bundle_dir.as_deref(), "logs.jsonl");
     let stable_output_path = default_output_path(
         args.stable_output.as_deref(),
         bundle_dir.as_deref(),
         "logs.stable.jsonl",
     );
-    let report_json_path =
-        default_output_path(args.report_json.as_deref(), bundle_dir.as_deref(), "report.json");
-    let summary_output_path =
-        default_output_path(args.summary_output.as_deref(), bundle_dir.as_deref(), "summary.txt");
+    let report_json_path = default_output_path(
+        args.report_json.as_deref(),
+        bundle_dir.as_deref(),
+        "report.json",
+    );
+    let summary_output_path = default_output_path(
+        args.summary_output.as_deref(),
+        bundle_dir.as_deref(),
+        "summary.txt",
+    );
 
     let arg_refs: Vec<&str> = args.connector_args.iter().map(String::as_str).collect();
     let mut runner = ConnectorProcessRunner::spawn(&connector_cmd, &arg_refs, &[]).await?;

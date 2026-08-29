@@ -199,12 +199,10 @@ impl CredentialLeaseClient for RegistryBackedCredentialLeaseClient {
         _cx: &fcp_async_core::Cx,
         request: CredentialLeaseRequest,
     ) -> Result<SdkCredentialLease, CredentialLeaseClientError> {
-        let request_id = request
-            .operation
-            .as_deref()
-            .map_or_else(|| "req-boundary-unspecified".to_owned(), |operation| {
-                format!("req-boundary-{operation}")
-            });
+        let request_id = request.operation.as_deref().map_or_else(
+            || "req-boundary-unspecified".to_owned(),
+            |operation| format!("req-boundary-{operation}"),
+        );
         let provider = request.provider.as_deref().unwrap_or("groq");
         if provider != self.key.provider.as_str() {
             self.push_event(
@@ -393,8 +391,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
         }),
     ));
 
-    let (distribution, mut lease_records) =
-        run_parallel_round_robin_requests(registry, &key);
+    let (distribution, mut lease_records) = run_parallel_round_robin_requests(registry, &key);
     records.append(&mut lease_records);
 
     assert_eq!(
