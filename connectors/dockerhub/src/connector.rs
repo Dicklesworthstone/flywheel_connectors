@@ -66,6 +66,8 @@ impl std::fmt::Debug for DockerHubConfig {
         f.debug_struct("DockerHubConfig")
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
             .field("namespace", &self.namespace)
             .finish()
     }
@@ -191,8 +193,7 @@ fn base_url_policy(base_url: &str) -> (bool, String) {
     }
     if !DOCKERHUB_ALLOWED_HOSTS.contains(&host) {
         problems.push(format!(
-            "host must be one of {:?}, got {host}",
-            DOCKERHUB_ALLOWED_HOSTS
+            "host must be one of {DOCKERHUB_ALLOWED_HOSTS:?}, got {host}"
         ));
     }
 
@@ -540,10 +541,9 @@ impl FcpConnector for DockerHubConnector {
                 .with_request_timeout(Duration::from_millis(cfg.request_timeout_ms)),
         );
         let mut client = DockerHubClient::new(&cfg.base_url, cfg.auth.clone(), cfg.retry.clone())
-            .await
             .map_err(|e| FcpError::Internal {
-                message: format!("Client init: {e}"),
-            })?;
+            message: format!("Client init: {e}"),
+        })?;
 
         // If credentials-based auth, attempt login to get JWT
         if matches!(cfg.auth, DockerHubAuth::Credentials { .. }) && !cfg.auth.is_secretless() {
@@ -806,9 +806,12 @@ impl DockerHubConnector {
                     description: req
                         .input
                         .get("description")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
-                    is_private: req.input.get("is_private").and_then(|v| v.as_bool()),
+                    is_private: req
+                        .input
+                        .get("is_private")
+                        .and_then(serde_json::Value::as_bool),
                     full_description: req
                         .input
                         .get("full_description")
@@ -994,7 +997,7 @@ mod tests {
     fn operations_have_unique_ids() {
         let ops = operations_info();
         let mut ids: Vec<_> = ops.iter().map(|o| o.id.as_str()).collect();
-        ids.sort();
+        ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 9);
     }

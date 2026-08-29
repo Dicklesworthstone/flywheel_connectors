@@ -202,7 +202,7 @@ mod tests {
             "description": "Official Nginx image",
             "is_private": false,
             "star_count": 1000,
-            "pull_count": 5000000
+            "pull_count": 5_000_000
         });
         let repo: Repository = serde_json::from_value(json).unwrap();
         assert_eq!(repo.name, "nginx");

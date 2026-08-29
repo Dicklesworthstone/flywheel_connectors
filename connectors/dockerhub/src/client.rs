@@ -11,7 +11,10 @@ use fcp_sdk::migration::{
 };
 
 use crate::error::{DockerHubError, DockerHubResult};
-use crate::types::*;
+use crate::types::{
+    CreateRepositoryRequest, DockerHubAuth, LoginRequest, LoginResponse, Organization,
+    PaginatedResponse, Repository, Tag, User,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> DockerHubResult<&'a str> {
@@ -47,15 +50,22 @@ pub struct DockerHubClient {
 impl std::fmt::Debug for DockerHubClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DockerHubClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
             .field("has_session_auth", &self.session_auth_value.is_some())
+            .field("retry_config", &self.retry_config)
             .finish()
     }
 }
 
 impl DockerHubClient {
-    pub async fn new(
+    /// Create a client for the given Docker Hub base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError::Http`] if the HTTP client cannot be built.
+    pub fn new(
         base_url: &str,
         auth: DockerHubAuth,
         retry_config: HttpRetryConfig,
@@ -74,10 +84,12 @@ impl DockerHubClient {
         })
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.auth.is_secretless()
     }
@@ -88,12 +100,18 @@ impl DockerHubClient {
                 Some(access_token.as_str())
             }
             DockerHubAuth::Credentials { .. } => self.session_auth_value.as_deref(),
-            _ => None,
+            DockerHubAuth::Token { .. } => None,
         }
     }
 
     // ── Login (for credentials-based auth) ──
 
+    /// Log in with username/password credentials and store the session token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on transport failure or a non-success login
+    /// response.
     pub async fn login(&mut self, runtime: &ConnectorRuntime) -> DockerHubResult<()> {
         if let DockerHubAuth::Credentials { username, password } = &self.auth {
             let url = format!("{}/v2/users/login", self.base_url);
@@ -130,6 +148,11 @@ impl DockerHubClient {
 
     // ── Health check ──
 
+    /// Fetch the authenticated user as a lightweight health check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on transport failure or a non-2xx response.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> DockerHubResult<User> {
         let url = format!("{}/v2/user", self.base_url);
         self.get_single(runtime, &url).await
@@ -137,6 +160,12 @@ impl DockerHubClient {
 
     // ── Repositories ──
 
+    /// List repositories in a namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid namespace input, transport
+    /// failure, or a non-2xx response.
     pub async fn list_repos(
         &self,
         runtime: &ConnectorRuntime,
@@ -147,6 +176,12 @@ impl DockerHubClient {
         self.get_paginated(runtime, &url).await
     }
 
+    /// Fetch a single repository by namespace and name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid path segments, transport
+    /// failure, or a non-2xx response.
     pub async fn get_repo(
         &self,
         runtime: &ConnectorRuntime,
@@ -159,6 +194,12 @@ impl DockerHubClient {
         self.get_single(runtime, &url).await
     }
 
+    /// Create a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid namespace input, transport
+    /// failure, or a non-2xx response.
     pub async fn create_repo(
         &self,
         runtime: &ConnectorRuntime,
@@ -170,6 +211,12 @@ impl DockerHubClient {
         self.post_json(runtime, &url, &body).await
     }
 
+    /// Delete a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid path segments, transport
+    /// failure, or a non-2xx response.
     pub async fn delete_repo(
         &self,
         runtime: &ConnectorRuntime,
@@ -184,6 +231,12 @@ impl DockerHubClient {
 
     // ── Tags ──
 
+    /// List tags of a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid path segments, transport
+    /// failure, or a non-2xx response.
     pub async fn list_tags(
         &self,
         runtime: &ConnectorRuntime,
@@ -196,6 +249,12 @@ impl DockerHubClient {
         self.get_paginated(runtime, &url).await
     }
 
+    /// Fetch a single tag of a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid path segments, transport
+    /// failure, or a non-2xx response.
     pub async fn get_tag(
         &self,
         runtime: &ConnectorRuntime,
@@ -213,6 +272,12 @@ impl DockerHubClient {
         self.get_single(runtime, &url).await
     }
 
+    /// Delete a tag from a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on invalid path segments, transport
+    /// failure, or a non-2xx response.
     pub async fn delete_tag(
         &self,
         runtime: &ConnectorRuntime,
@@ -232,6 +297,11 @@ impl DockerHubClient {
 
     // ── Organizations ──
 
+    /// List organizations the authenticated user belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerHubError`] on transport failure or a non-2xx response.
     pub async fn list_orgs(
         &self,
         runtime: &ConnectorRuntime,
@@ -635,17 +705,13 @@ mod tests {
 
     #[test]
     fn client_debug_redacts_auth() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com",
-                DockerHubAuth::Token {
-                    access_token: "redaction-fixture-value".into(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = DockerHubClient::new(
+            "https://hub.docker.com",
+            DockerHubAuth::Token {
+                access_token: "redaction-fixture-value".into(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
 
         let debug = format!("{rt:?}");
@@ -655,65 +721,49 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com",
-                DockerHubAuth::Token {
-                    access_token: String::new(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = DockerHubClient::new(
+            "https://hub.docker.com",
+            DockerHubAuth::Token {
+                access_token: String::new(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com",
-                DockerHubAuth::Token {
-                    access_token: "token".into(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = DockerHubClient::new(
+            "https://hub.docker.com",
+            DockerHubAuth::Token {
+                access_token: "token".into(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com/",
-                DockerHubAuth::Token {
-                    access_token: "t".into(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = DockerHubClient::new(
+            "https://hub.docker.com/",
+            DockerHubAuth::Token {
+                access_token: "t".into(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt.base_url().ends_with('/'));
     }
 
     #[test]
     fn bearer_token_from_access_token() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com",
-                DockerHubAuth::Token {
-                    access_token: "my-pat".into(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = DockerHubClient::new(
+            "https://hub.docker.com",
+            DockerHubAuth::Token {
+                access_token: "my-pat".into(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert_eq!(rt.bearer_token(), Some("my-pat"));
     }
@@ -743,17 +793,13 @@ mod tests {
 
     #[test]
     fn bearer_token_none_when_empty() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            DockerHubClient::new(
-                "https://hub.docker.com",
-                DockerHubAuth::Token {
-                    access_token: String::new(),
-                },
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = DockerHubClient::new(
+            "https://hub.docker.com",
+            DockerHubAuth::Token {
+                access_token: String::new(),
+            },
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(rt.bearer_token().is_none());
     }

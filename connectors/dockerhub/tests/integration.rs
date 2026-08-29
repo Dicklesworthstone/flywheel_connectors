@@ -116,7 +116,7 @@ fn assert_schema_rejects(schema: &Value, payload: &Value) {
     );
 }
 
-async fn client(server: &MockServer) -> DockerHubClient {
+fn client(server: &MockServer) -> DockerHubClient {
     DockerHubClient::new(
         &server.uri(),
         DockerHubAuth::Token {
@@ -124,7 +124,6 @@ async fn client(server: &MockServer) -> DockerHubClient {
         },
         no_retry_config(),
     )
-    .await
     .expect("wiremock URI should build a Docker Hub client")
 }
 
@@ -244,7 +243,7 @@ async fn repository_tag_org_and_create_success_paths_use_dockerhub_contracts() {
         .mount(&server)
         .await;
 
-    let client = client(&server).await;
+    let client = client(&server);
 
     let repos = client
         .list_repos(&runtime, "acme")
@@ -324,7 +323,7 @@ async fn destructive_delete_requests_use_expected_delete_shapes() {
         .mount(&server)
         .await;
 
-    let client = client(&server).await;
+    let client = client(&server);
 
     let repo_delete = client
         .delete_repo(&runtime, "acme", "widget")
@@ -393,7 +392,7 @@ async fn auth_missing_resource_rate_limit_and_malformed_json_are_typed() {
         .mount(&server)
         .await;
 
-    let client = client(&server).await;
+    let client = client(&server);
 
     let unauthorized = client.health_check(&runtime).await.unwrap_err();
     assert!(matches!(unauthorized, DockerHubError::Unauthorized(_)));
@@ -447,7 +446,7 @@ async fn cancelled_runtime_short_circuits_before_network_io() {
     let runtime = test_runtime();
     runtime.shutdown();
 
-    let client = client(&server).await;
+    let client = client(&server);
     let err = client
         .get_repo(&runtime, "acme", "widget")
         .await
@@ -645,7 +644,6 @@ async fn debug_output_redacts_dockerhub_secrets() {
         },
         no_retry_config(),
     )
-    .await
     .expect("client should build");
     let debug_client = format!("{client:?}");
     assert!(!debug_client.contains("super-secret-client-token"));
