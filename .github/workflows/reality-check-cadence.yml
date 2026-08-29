@@ -31,6 +31,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
       - name: Test cadence helper
         run: cargo test -p br-tools --test scheduled_reality_check_filing
 
@@ -97,6 +102,10 @@ jobs:
             echo "::warning title=br sync failed::Cadence bead was created locally, but br sync failed in this runner"
           fi
 
+      - name: Annotate silent-failure risk
+        if: failure()
+        run: |
+          echo "::error title=Reality-check cadence run failed::The monthly cadence job failed before or during bead proposal/filing. A monthly reality-check artifact may be silently skipped; check docs/reality/ and backfill manually. Tracked in flywheel_connectors-jqx5k."
       - uses: actions/upload-artifact@v7
         if: always()
         with:

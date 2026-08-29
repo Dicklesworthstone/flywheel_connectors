@@ -62,23 +62,23 @@ Status legend:
 | **Tamper-Evident Audit + HLC** | `PROVEN` | Hash-linked audit chain with monotonic sequence numbers, quorum-signed checkpoints, Hybrid Logical Clocks, Hierarchical Version Vectors for revocation freshness, and an OTLP parity exporter. | `crates/fcp-audit/src/hlc.rs`, `crates/fcp-mesh/src/revocation/hier_vv.rs`, `crates/fcp-conformance/tests/{hlc_hiervv_conformance,audit_otlp_hlc_contract}.rs` |
 | **Revocation** | `PROVEN` | First-class revocation objects, exact-membership lookup (no XOR filter in the revocation path), `RevocationSeal` for check-use atomicity, priority gossip push, zone-wide freshness SLA. | `crates/fcp-core/src/revocation.rs`, `crates/fcp-conformance/tests/revocation_timing.rs`, `crates/fcp-e2e/tests/revocation_cascade_e2e.rs` |
 | **Egress Proxy** | `PROVEN` | Connector network access routed through manifest-aware guardrails with CIDR deny defaults and denial audit evidence. | `crates/fcp-sandbox/src/egress.rs`, `crates/fcp-e2e/tests/egress_proxy_e2e.rs` |
-| **Secretless Connectors** | `PROVEN` | Egress proxy injects credentials per request through `SecretFetchHook`; connector binaries pass `credential_id` references rather than raw bearer material. | `crates/fcp-crypto/src/secret_fetch.rs`, `crates/fcp-e2e/tests/secretless_{github,slack,gmail}_e2e.rs` |
+| **Secretless Connectors** | `PROVEN` | Egress proxy injects credentials per request through `SecretFetchHook`; connector binaries pass `credential_id` references rather than raw bearer material. PROVEN covers the GitHub, Slack, and Gmail connector families; it does not claim every connector has migrated. | `crates/fcp-crypto/src/secret_fetch.rs`, `crates/fcp-e2e/tests/secretless_{github,slack,gmail}_e2e.rs` |
 | **Multi-Method Provider Auth** | `PROVEN` | `fcp-provider-auth` consolidates API key, AWS SigV4 request signing, JWT refresh, OAuth device-code, authorization-code with PKCE, refresh-token, and setup-token; `AuthProfile` flows through the credential pool layer. | `crates/fcp-provider-auth/`, host/fwc profile-admin and OAuth login surfaces |
 | **Credential Pooling** | `PROVEN` | Multi-credential per-provider pools with priority, strategy, exhaustion-cooldown, active-lease tracking, LRU, sticky restick, max-use, and a redaction-safe connector-boundary E2E. | `crates/fcp-host/src/credentials.rs`, `crates/fcp-e2e/tests/credential_pool_e2e.rs`, host admin API routes, audit log |
 | **Multi-Host Singleton Writers (HRW)** | `PROVEN` | Quorum-signed durable leases gossip across nodes; rendezvous hashing picks the holder deterministically; binary launch/flush/invoke fencing prevents split-writer windows; multi-node failover replay harness lands as closeout. | `crates/fcp-core/src/lease.rs`, `crates/fcp-mesh/src/{authority,coordinator,planner}.rs`, multi-node failover replay harness |
 | **Threshold Owner Key** | `PROVEN` | FROST ceremony and signing support exist in `fcp-bootstrap`; not yet the universal operational default. | `crates/fcp-bootstrap/src/ceremony.rs`, `crates/fcp-e2e/tests/threshold_owner_key_e2e.rs` |
 | **Threshold Secrets (Shamir)** | `PROVEN` | Shamir secret sharing for device-distributed recovery so raw secret material never lives on one machine. | `crates/fcp-core/src/secret.rs`, `crates/fcp-e2e/tests/threshold_secrets_e2e.rs` |
 | **Supply Chain Attestations** | `PROVEN` | Registry-side attestation schemas, TUF/cosign verification adapters, host gate proof. Release-distribution proof remains outside this repo. | `crates/fcp-registry/src/lib.rs`, `crates/fcp-e2e/tests/supply_chain_attestation_e2e.rs` |
-| **Offline Access** | `PROVEN` | `ObjectPlacementPolicy`, repair controllers, cache-while-offline, queued writes, drain-on-restore. | `crates/fcp-store/src/offline.rs`, `crates/fcp-e2e/tests/{offline_access,offline_repair}_e2e.rs` |
+| **Offline Access** | `PROVEN` | `ObjectPlacementPolicy` (`fcp-core`), repair controllers (`fcp-store/src/repair.rs`), cache-while-offline (`fcp-store/src/offline.rs`); queued writes and drain-on-restore are proven through the connector-side E2E harness pattern. | `crates/fcp-store/src/offline.rs`, `crates/fcp-e2e/tests/{offline_access,offline_repair}_e2e.rs` |
 | **Mesh-Stored Policy Objects** | `PROVEN` | Zone definitions and policy bundles exist as owner-signed objects with mesh gossip, verification, evaluation, and revocation proof. | `crates/fcp-core/src/policy.rs`, `crates/fcp-e2e/tests/mesh_policy_object_e2e.rs` |
 | **Symbol-First Protocol** | `PROVEN` | RaptorQ object-symbol framing, reconstruction, repair machinery, multipath aggregation, offline resilience. | `crates/fcp-raptorq/`, `crates/fcp-e2e/tests/symbol_first_protocol_e2e.rs`, golden vectors |
 | **Browser Real-CDP Control Plane** | `PROVEN` | Rust-owned CDP control-worker, supervised target/session manager, cookie ownership boundary, native launcher/proxy worker, direct-CDP routing, real-browser operation-matrix closeout — mirrors OpenClaw semantics. | `connectors/browser/`, host browser CDP manager proof |
 | **Voice-Call Multi-Provider Parity** | `PROVEN` | Shared `CallAuthToken`, `SessionStore`, replay-cache crate (`fcp-voice-call`); Twilio, Telnyx, Plivo all flow through the same architectural shape with no-live-credential loopback evidence. | `crates/fcp-voice-call/`, `connectors/{twilio,telnyx,plivo}/`, `scripts/e2e/voice_call_multi_provider_verification.sh` |
 | **Manifest Operations Conformance** | `PROVEN` | Every connector with declared operations exposes them via typed `[provides.operations.*]` in `manifest.toml`; runtime const drift is caught by a conformance scanner. | `crates/fcp-conformance/tests/manifest_operations_*.rs` |
 | **Computation Migration** | `PROVEN` | Migrate-and-resume reference proof: CRIU-format checkpoint handoff, lease transfer, replay, byte-equivalent completion. | `crates/fcp-kernel/src/computation_migration.rs`, `crates/fcp-e2e/tests/computation_migration_reference.rs` |
-| **Mesh-Native Architecture** | `STEADY-STATE TARGET` | Gossip, IBLT, XOR filters, masked IBLT anti-entropy, and LiveTruthResolver are built and tested. The production `fwc → fcp-host → connector subprocess` invoke path remains host-first today. Pinned by `crates/fwc/tests/readme_status_pinning.rs`. | `crates/fcp-mesh/`, `crates/fwc/src/truth.rs` |
+| **Mesh-Native Architecture** | `STEADY-STATE TARGET (NOT YET OPERATIONAL)` | Gossip, IBLT, XOR filters, masked IBLT anti-entropy, and LiveTruthResolver are built and tested. The production `fwc → fcp-host → connector subprocess` invoke path remains host-first today. Pinned by `crates/fwc/tests/readme_status_pinning.rs`. | `crates/fcp-mesh/`, `crates/fwc/src/truth.rs` |
 
-> **Audit status:** all status labels reconciled as of 2026-05-16. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report.
+> **Audit status:** all status labels reconciled as of 2026-05-16 (see the Q3 report for the current reconciliation). The Mesh-Native downgrade rationale is tracked in `br-lvz4t`. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report and [`docs/quarterly/2026-Q3-claims-vs-reality.md`](docs/quarterly/2026-Q3-claims-vs-reality.md) for the current quarter.
 
 ---
 
@@ -261,7 +261,7 @@ This is the intended steady-state architecture: every device is a peer in a pers
 
 ### Cryptographic Key Hierarchy
 
-FCP uses a structured key hierarchy to prevent cross-purpose key reuse. The hybrid classical + post-quantum stack lives in `fcp-crypto` (classical) and `fcp-crypto-pq` (X-Wing KEM, ML-DSA-65).
+FCP uses a structured key hierarchy to prevent cross-purpose key reuse. The hybrid classical + post-quantum stack lives in `fcp-crypto` (classical primitives plus the production X-Wing KEM and ML-DSA-65 implementations) and `fcp-crypto-pq` (lattice-trapdoor delegation research surface).
 
 ```
 Owner Key (Ed25519, threshold via FROST)
@@ -758,6 +758,8 @@ Every `invoke` request flows through a deterministic 14-stage pipeline in `crate
 
 A returned `OperationReceipt` walks back up the pipeline, releasing the credential lease, recording the receipt for idempotency, and closing the OTLP span.
 
+The table above is the conceptual pipeline. The fourteen checks implemented in `crates/fcp-host/src/enforcement.rs` are named `canonical_decode`, `zone_membership`, `capability_verify`, `revocation_cascade`, `deployment_tier`, `holder_proof`, `checkpoint_freshness`, `revocation_freshness`, `taint_approval`, `policy_ceiling`, `capability_constraints`, `connector_manifest`, `budget`, and `rate_limit` (registered in order via `fcp_prelude::EnforcementCheckOrder` and pinned by `host_enforcement_pipeline_outcome_conformance.rs`). The remaining conceptual stages live in the surrounding modules: COSE signature verification, CWT temporal bounds, and the typestate ladder execute inside `fcp-core`'s `CapabilityVerifier`; the HRW lease check runs in the host's lease enforcement path (`crates/fcp-host/src/bin/fcp-host.rs`); credential-pool leasing is `crates/fcp-host/src/credentials.rs`; the audit+HLC append is `invoke_audit.rs`; sandbox setup is `fcp-sandbox`; and dispatch is the supervisor. The count (14) and the short-circuit structured-denial semantics are enforced identically by both views.
+
 ### Admission Control
 
 Nodes enforce per-peer resource budgets:
@@ -800,18 +802,18 @@ The OTLP exporter re-emits audit events as OpenTelemetry traces, metrics, and lo
 
 ## Post-Quantum Cryptography
 
-Production-grade PQ infrastructure lives in `fcp-crypto-pq`:
+Production-grade PQ infrastructure lives in `fcp-crypto` (X-Wing KEM, ML-DSA-65 signatures, V4 zone-key envelopes and their constant-time/length-invariant/zeroize machinery); the lattice-trapdoor delegation research surface lives separately in `fcp-crypto-pq`:
 
 | Primitive | Algorithm | Use |
 |-----------|-----------|-----|
-| **KEM** | X-Wing (RustCrypto draft-06) | Hybrid HPKE-X25519 + X-Wing wrap of zone keys in `ZoneKeyManifest V4` |
-| **Signature** | ML-DSA-65 (FIPS 204) | Post-quantum signing path alongside Ed25519 |
-| **AEAD profile** | `Fcp4Aad` | Wire format for `XWingSealedBox` |
-| **Lattice delegation** | Trapdoor delegation chain | Lean formal soundness theorem; throughput bench vs Ed25519 and ML-DSA-65 |
+| **KEM** | X-Wing (RustCrypto draft-06, `crates/fcp-crypto/src/xwing.rs`) | Hybrid HPKE-X25519 + X-Wing wrap of zone keys in `ZoneKeyManifest V4` |
+| **Signature** | ML-DSA-65 (FIPS 204, `crates/fcp-crypto/src/ml_dsa.rs`) | Post-quantum signing path alongside Ed25519 |
+| **AEAD profile** | `Fcp4Aad` (`crates/fcp-crypto/src/xwing.rs`) | Wire format for `XWingSealedBox` |
+| **Lattice delegation** | Trapdoor delegation chain (`crates/fcp-crypto-pq/`) | Lean structural soundness theorem; throughput bench vs Ed25519 and ML-DSA-65 |
 
 Properties:
 - IETF KAT regression harness for X-Wing.
-- Pinned KAT vectors for ML-DSA-65; randomized signing via `getrandom`.
+- Internal regression KAT pinned for ML-DSA-65 (vendoring the published NIST FIPS 204 vectors is tracked in `kyopb.1.1.3.1`); randomized signing via `getrandom`.
 - `ZoneKeyManifest V4` supports mixed V3 + V4 wrap lists, per-recipient KEM discriminator, and a safe `migrated_to_v4` promotion path.
 - Hybrid verifier dispatches through both HPKE-X25519 and X-Wing.
 - Constant-time `PartialEq` on all PQ secret types via `subtle::ConstantTimeEq`.
@@ -822,7 +824,7 @@ Properties:
 
 ## Connectors
 
-The workspace ships 177 connector crates — 176 production connectors plus one adversarial conformance test crate (`connectors/_adversarial/`). All 176 production crates ship a `manifest.toml` and tests. The connector surface is broad but not perfectly uniform: 156 currently implement the formal `ConnectorErrorMapping` trait, 158 currently follow the full `src/client.rs` + `src/connector.rs` + `src/types.rs` layout, and 160 currently publish explicit `OperationInfo` structs. A workspace conformance guard fails CI if a mature connector lacks a `tests/` directory.
+The workspace ships 177 connector crates — 176 production connectors plus one adversarial conformance test crate (`connectors/_adversarial/`). All 176 production crates ship a `manifest.toml` and tests. The connector surface is broad but not perfectly uniform: 156 currently implement the formal `ConnectorErrorMapping` trait, 158 currently follow the full `src/client.rs` + `src/connector.rs` + `src/types.rs` layout, and 176 currently publish explicit `OperationInfo` structs. A workspace conformance guard fails CI if a mature connector lacks a `tests/` directory.
 
 ### Tier 1: Critical Infrastructure
 
@@ -866,7 +868,7 @@ The workspace ships 177 connector crates — 176 production connectors plus one 
 | **Home & Local** | Sonos, Hue, Home Assistant |
 | **Other** | MCP Bridge, Salesforce, Box, Dropbox, Microsoft 365 |
 
-The authoritative inventory is the `connectors/` directory or manifest-backed `fwc list --offline`, not a handwritten static table. A few connectors are explicitly non-live today (`tlon` ships as `status = "incubating"`; `zalouser` ships as `status = "quarantined"`; `huggingface` describes itself as incubating in its connector description but does not declare a `status` field). Inventory presence does not mean end-to-end proof.
+The authoritative inventory is the `connectors/` directory or manifest-backed `fwc list --offline`, not a handwritten static table. A few connectors are explicitly non-live today (`zalouser` ships as `status = "quarantined"`; `tlon` and `huggingface` declare `status = "proven"` in their manifests, although `huggingface` still reports a code-level `surface_status` of incubating in its connector introspection). Inventory presence does not mean end-to-end proof.
 
 ### Google Workspace Platform
 
@@ -883,7 +885,7 @@ The `fcp-voice-call` crate provides shared `CallAuthToken`, `SessionStore`, and 
 
 ### OpenAI-Compatible Shared Client
 
-The `fcp-openai-compat` crate centralizes the OpenAI-compatible HTTP facade used by Groq, Cerebras, GLM (Zhipu), Moonshot, Fireworks, Together, OpenRouter, and others. Each provider routes through the unified `/v1/chat/completions` shape with reasoning-content preservation and trace redaction.
+The `fcp-openai-compat` crate centralizes the OpenAI-compatible HTTP facade used by Groq, Cerebras, DeepSeek, Fireworks, GLM (Zhipu), LM Studio, Microsoft Foundry, Moonshot, NVIDIA NIM, Ollama, Qwen, Together, Voyage, and xAI. Each provider routes through the unified `/v1/chat/completions` shape with reasoning-content preservation and trace redaction.
 
 ### Browser Real-CDP Control Plane
 
@@ -1030,7 +1032,7 @@ When a `fwc` run fails, the shortest trustworthy debugging loop:
 
 ### Intent Compiler
 
-`fwc plan`, `fwc explain`, and `fwc do` are not placeholder UX. The local intent compiler (`crates/fwc/src/intent.rs`) is ~5.9k lines with 258 inline tests and compiles natural-language goals into concrete `fwc` primitives plus workflow-truth metadata, ambiguity reporting, missing-information prompts, and suggested next actions. Resolution is strongest for the current curated connector profile set (~two dozen connectors with explicit aliases and domain keywords); connectors outside that set still participate through generic alias/keyword matching plus the manifest-backed operation index. `fwc do` is safe by default — it materializes the compiled workflow in simulation mode unless you explicitly pass `--approve`.
+`fwc plan`, `fwc explain`, and `fwc do` are not placeholder UX. The local intent compiler (`crates/fwc/src/intent.rs`) is ~6.3k lines with 267 inline tests and compiles natural-language goals into concrete `fwc` primitives plus workflow-truth metadata, ambiguity reporting, missing-information prompts, and suggested next actions. Resolution is strongest for the current curated connector profile set (~two dozen connectors with explicit aliases and domain keywords); connectors outside that set still participate through generic alias/keyword matching plus the manifest-backed operation index. `fwc do` is safe by default — it materializes the compiled workflow in simulation mode unless you explicitly pass `--approve`.
 
 ### Output Formats
 
@@ -1117,9 +1119,9 @@ fwc export-tools --offline --format openai --risk-max medium --output tools.json
 
 | Crate | Purpose |
 |-------|---------|
-| `fcp-crypto` | Ed25519, X25519, HPKE, COSE/CWT, ChaCha20-Poly1305 AEAD, BLAKE3, Shamir |
-| `fcp-crypto-pq` | X-Wing KEM, ML-DSA-65, hybrid HPKE-X25519 + X-Wing, lattice delegation, Lean soundness theorem |
-| `fcp-crypto-hw` | Hardware token support (PKCS#11), hardware-backed signing, HSM bridging |
+| `fcp-crypto` | Ed25519, X25519, HPKE, COSE/CWT, ChaCha20-Poly1305 AEAD, BLAKE3, Shamir, plus production PQ primitives: X-Wing KEM, ML-DSA-65, V4 zone-key envelopes |
+| `fcp-crypto-pq` | Lattice-trapdoor delegation (deterministic fixture route), Lean structural soundness theorem, Ed25519/ML-DSA-65/lattice throughput bench |
+| `fcp-crypto-hw` | CPU feature detection (CPUID) and SIMD dispatch for BLAKE3 and ChaCha20-Poly1305 AEAD |
 | `fcp-cbor` | Deterministic CBOR (RFC 8949 §4.2 canonical encoding), schema hashing |
 
 ### Mesh / Data Plane
@@ -1372,7 +1374,7 @@ The workspace has a very large crate-local and end-to-end test surface (60,000+ 
 | **Mesh scenarios** | `crates/fcp-conformance/tests/integration_scenarios.rs` | Network partition recovery, gossip convergence, multi-node failover |
 | **Benchmarks** | `crates/fcp-bench/`, `crates/fwc/benches/`, `crates/fcp-core/benches/` | Search, schema, pipeline, PCS, repair, HLC, OTLP, lattice |
 | **Fuzz** | `fuzz/` | 100+ targets across CBOR / crypto / protocol / webhook / oauth / streaming / mesh / host |
-| **Chaos** | `crates/fcp-chaos/`, `chaos-results/` | Chaos-engineered failures with deferred chaos plans |
+| **Chaos** | `crates/fcp-chaos/`, `scenarios/` | Chaos-engineered failures with deferred chaos plans (results land in the runtime-generated, gitignored `chaos-results/`) |
 | **Golden vectors** | embedded `insta` snapshots throughout | Canonical CBOR, manifest hashes, protocol frames, signing transcripts |
 
 Key testing patterns:
@@ -1792,7 +1794,7 @@ Honest about what FCP does not do yet:
 - **Production deployment is still single-active-host** — the honest operating model is one active `fcp-host` with staged standby peers. Connector admin state remains node-local and automatic multi-node failover is not yet a production guarantee.
 - **Mesh-native cutover is incomplete** — gossip, IBLT, XOR filters, masked-IBLT anti-entropy, and the LiveTruthResolver are built and tested, but mesh-backed truth is not the default highest-confidence source in production yet.
 - **No GUI** — `fwc` is CLI-only. The `serve-mcp` command exposes connectors as MCP tools for AI agent consumption, but there is no web dashboard.
-- **Connector maturity varies** — all 176 production connectors compile and pass tests, but depth of operation coverage ranges from comprehensive (GitHub, Gmail) to minimal. A few connectors are explicitly non-live (`tlon` ships as `status = "incubating"`; `zalouser` ships as `status = "quarantined"`; `huggingface` describes itself as incubating in its connector description but does not declare a `status` field).
+- **Connector maturity varies** — all 176 production connectors compile and pass tests, but depth of operation coverage ranges from comprehensive (GitHub, Gmail) to minimal. A few connectors are explicitly non-live (`zalouser` ships as `status = "quarantined"`; `tlon` and `huggingface` declare `status = "proven"` in their manifests, although `huggingface` still reports a code-level `surface_status` of incubating in its connector introspection).
 - **Windows sandbox is Tier 2** — `fcp-sandbox` implements seccomp + Landlock on Linux and basic WASI isolation; macOS uses seatbelt. Windows sandbox support is not yet hardened.
 - **No automatic connector updates** — `fwc install` and `fwc update` exist, but automatic background updates with rollback are not yet implemented.
 - **Multi-node connector-state replication is designed, not operational** — `ConnectorStateRoot` and externalized state objects are specified, but the production host stores state locally.
@@ -1842,7 +1844,7 @@ Use the scaffold generator: `fwc new fcp.myservice --archetype request-response`
 The egress proxy denies the request. Network constraints are declared per-operation in the manifest (`allowed_hosts`, `allowed_ports`, `require_tls`). The sandbox enforces CIDR deny defaults (localhost, private ranges, tailnet) and SNI verification. The denial is logged as an audit event.
 
 **Q: Is FCP post-quantum-secure today?**
-The infrastructure is there: `fcp-crypto-pq` ships X-Wing KEM (hybrid HPKE + post-quantum) and ML-DSA-65 signatures with IETF KAT vectors. `ZoneKeyManifest V4` supports mixed V3 + V4 wrap lists. Whether a given deployment is operationally PQ-secure depends on whether you have promoted your manifests to V4 and rotated zone keys. The default is hybrid: classical X25519 alongside X-Wing.
+The infrastructure is there: `fcp-crypto` ships X-Wing KEM (hybrid HPKE + post-quantum) with IETF KAT vectors and ML-DSA-65 signatures with an internal regression KAT. `ZoneKeyManifest V4` supports mixed V3 + V4 wrap lists. Whether a given deployment is operationally PQ-secure depends on whether you have promoted your manifests to V4 and rotated zone keys. The default is hybrid: classical X25519 alongside X-Wing.
 
 **Q: How does `fwc do` avoid disasters?**
 `fwc do` materializes the compiled workflow in simulation mode by default. Side-effecting execution requires an explicit `--approve` flag. Operations with `risk_level = "high"` or `risk_level = "dangerous"` additionally require an `ApprovalToken` and may require a quorum signature.
@@ -2043,13 +2045,16 @@ X-Wing is a recent (RFC-draft) KEM that combines X25519 ECDH with the ML-KEM-768
 
 ### ML-DSA-65 (FIPS 204) Signatures
 
-ML-DSA-65 (formerly CRYSTALS-Dilithium-3) is NIST's standard post-quantum signature scheme. Public keys are ~1.9 KB; signatures are ~3.3 KB. The randomized signing path uses `getrandom`; KAT vectors from FIPS 204 are pinned. Where Ed25519 would have shipped one signature, hybrid deployments ship `Ed25519 ‖ ML-DSA-65` and verify both, so the post-quantum signature still holds even if the classical primitive falls.
+ML-DSA-65 (formerly CRYSTALS-Dilithium-3) is NIST's standard post-quantum signature scheme. Public keys are ~1.9 KB; signatures are ~3.3 KB. The randomized signing path uses `getrandom`; an internal regression KAT is pinned (vendoring the published NIST FIPS 204 vectors is tracked in `kyopb.1.1.3.1`). Where Ed25519 would have shipped one signature, hybrid deployments ship `Ed25519 ‖ ML-DSA-65` and verify both, so the post-quantum signature still holds even if the classical primitive falls.
 
-`fcp-crypto-pq` ships:
+The PQ envelope types in `fcp-crypto` ship:
 - Constant-time `PartialEq` on every secret-bearing PQ type via `subtle::ConstantTimeEq`.
 - Length-invariant `Deserialize` on every transparent byte envelope (proptest fuzz asserts wrong-length sequences reject; closes a P1 caught during the swarm session).
 - `zeroize::ZeroizeOnDrop` on private-key material.
-- A Lean formal soundness theorem for the lattice-trapdoor delegation chain.
+
+`fcp-crypto-pq` (lattice delegation) additionally ships:
+- Constant-time `PartialEq` on its secret-bearing types, behaviorally pinned by tests.
+- A Lean structural soundness theorem for the lattice-trapdoor delegation chain; the SIS hardness reduction is an explicitly unmechanized assumption boundary (`lean/Fcp/Invariants/LatticeDelegation.lean`).
 - A Criterion throughput bench comparing Ed25519, ML-DSA-65, and lattice delegation.
 
 ### Token Bucket with Phase-Preserving Refill
@@ -2297,10 +2302,9 @@ The development model also imposes discipline most human-only projects don't bot
 
 `connectors/_adversarial/` is a deliberately hostile connector binary used as a conformance fixture. It probes:
 
-- **Manifest violations** — declares capabilities it shouldn't have, requests forbidden zones, claims `singleton_writer` without backing semantics, ships malformed operation schemas.
-- **Sandbox escape attempts** — tries to write outside the FS allowlist, spawn subprocesses with `deny_exec=true`, open raw sockets, dial denied CIDR ranges.
-- **Token forgery attempts** — invents capability tokens, tampers with claims, replays tokens past `exp`.
-- **Audit chain tampering** — emits receipts with stale HLC, replays old receipts, fabricates forged signatures.
+- **Hostile response shapes** — ten `AdversarialScenario` variants exercising malformed and hostile provider responses through the connector protocol surface.
+- **Boundary declarations** — an impossible egress target (`adversarial.invalid` with 1 ms timeouts), forbidden capabilities (`network.*`, `system.exec`), and a strict sandbox profile (16 MiB / 5% CPU / 1 s wall clock, `deny_exec`, `deny_ptrace`), proving the sandbox and network guardrails hold at the manifest boundary.
+- **Production-mode refusal** — the fixture fails closed when invoked outside the conformance harness.
 
 The host MUST refuse to start, isolate, or interact with this connector at the appropriate boundary for each probe. Conformance tests under `crates/fcp-conformance/tests/` use the adversarial connector as the "what should fail" half of their assertions.
 
@@ -2433,7 +2437,7 @@ Caller (fwc)                  fcp-host                   Connector              
 
 Three properties of the cancellation machinery are worth pointing at:
 
-- **Bounded propagation latency.** The host's `cancellation.rs` module (`crates/fcp-host/src/cancellation.rs`) gives each `CancellationToken` a deadline. If a connector does not acknowledge cancellation within the deadline, the supervisor force-terminates the subprocess. The default deadline is configurable per-archetype: 1 s for request-response, 10 s for streaming (to allow graceful WebSocket close).
+- **Bounded propagation latency.** The host's `cancellation.rs` module (`crates/fcp-host/src/cancellation.rs`) tracks cancellation per operation owner, records outcomes (`Cancelled`, `Pending`, `TooLate`) with 24-hour checkpoints, and emits audit events for every transition. The backstop for an unresponsive connector is the supervisor's graceful-shutdown machinery (`ShutdownCoordinator` in `supervisor.rs`), which escalates to a force-kill when the graceful shutdown timeout expires; a connector subprocess also self-terminates on parent-pid drop or supervisor heartbeat loss. Per-archetype cancellation *deadlines* with supervisor force-terminate on deadline expiry are designed but not yet implemented — that work is tracked in `flywheel_connectors-861lx`.
 - **Idempotency on retry.** A cancelled operation produces a receipt with `outcome = cancelled` and `external_effect` flags (`sent: yes/no`, `ack: yes/no/unknown`). Retries can decide whether to re-issue based on the recorded external effect rather than guessing. For `Strict` idempotency operations, the cancelled `OperationIntent` blocks naive retries until explicitly released by the caller.
 - **No orphaned external side effects on host crash.** If `fcp-host` itself crashes mid-invoke, the connector subprocess detects parent-pid drop (or supervisor heartbeat loss) and self-terminates. The receipt for the cancelled operation lands in the audit chain only if the connector successfully wrote it to its local state cache before exit; otherwise it remains a half-completed gap that the post-restart consistency check surfaces explicitly.
 
@@ -3028,8 +3032,8 @@ Coverage-guided fuzzing via `cargo fuzz`. 100+ targets across CBOR parsing, cryp
 ### 6. Metamorphic Tests
 For systems with the oracle problem (where the "correct output" is unknown but input-output relationships are predictable). Examples in `fcp-crypto`: HPKE cross-ciphertext swap (swapping two ciphertexts must produce two corrupt decryptions, not one good + one bad), Ed25519 context-sign (signing the same message with different contexts must produce different signatures). In `fcp-raptorq`: random-loss invariants, duplicate-symbol invariants. In `fcp-protocol`: encode → decode → re-encode must produce byte-equal output (round-trip stability).
 
-### 7. Chaos Engineering (`crates/fcp-chaos/`, `chaos-results/`)
-Deliberately-injected faults: network partitions, clock skew, message drop, message reorder, byzantine peer behavior, slow-loris attacks, disk-full conditions, OOM, supervisor restart loops. Deferred chaos plans recorded under `chaos-results/`; results feed back into hardening for fail-closed sites and admission control tuning.
+### 7. Chaos Engineering (`crates/fcp-chaos/`, `scenarios/`)
+Deliberately-injected faults: network partitions, clock skew, message drop, message reorder, byzantine peer behavior, slow-loris attacks, disk-full conditions, OOM, supervisor restart loops. Deferred chaos plans are recorded under `chaos-results/`, which is generated at runtime and intentionally not committed (`.gitignore`); results feed back into hardening for fail-closed sites and admission control tuning.
 
 The conformance + ratchet + chaos combination produces a property the project relies on: **once a security property holds, it stays holding**. The 2026-05-02 swarm session's 5/5 REVIEW MODE catch rate on same-day P1 findings is a direct consequence — the ratchet conformance tests catch regressions that human review would miss in a 168-bead session.
 
@@ -3072,8 +3076,8 @@ Every concept has exactly one home crate. When the rule is violated, the violati
 | Mesh framing + transport | `fcp-protocol` + `fcp-mesh` | FCPC/FCPS encoding and the gossip/admission/lease layer. |
 | Object durability | `fcp-store` + `fcp-raptorq` | Symbol storage, repair, GC, fountain coding. |
 | Identity and ACLs | `fcp-tailscale` | Mesh identity, peer discovery, ACL/tag mapping. |
-| Hardware-crypto adapters | `fcp-crypto-hw` | PKCS#11, hardware tokens, HSM bridges; keeps `fcp-crypto` free of OS-specific deps. |
-| Post-quantum primitives | `fcp-crypto-pq` | X-Wing KEM, ML-DSA-65, lattice delegation; isolated so `fcp-crypto` remains a pure classical-crypto crate. |
+| Hardware-crypto adapters | `fcp-bootstrap` | PKCS#11 adapter (cryptoki), hardware-token PIN, recovery phrases; keeps `fcp-crypto` free of OS-specific deps. |
+| Post-quantum primitives | `fcp-crypto` | X-Wing KEM and ML-DSA-65 live alongside the classical suite, sharing the envelope/constant-time/zeroize machinery. Lattice-trapdoor delegation is isolated in `fcp-crypto-pq` as a research surface pending `kyopb.1.3.1.1`. |
 | Provider-specific auth | `fcp-provider-auth` | API key + SigV4 + OAuth flows + token refresh, consumed by every connector that needs more than a bare bearer token. |
 | OpenAI-compatible client | `fcp-openai-compat` | Shared by every provider that speaks OpenAI's `/v1/chat/completions` shape. |
 | Voice-call primitives | `fcp-voice-call` | `CallAuthToken`, `SessionStore`, replay cache shared across Twilio/Telnyx/Plivo. |
@@ -3168,7 +3172,7 @@ Sensitive zones can require hardware-backed key residency. `PostureAttestation` 
 | **TPM 2.0** | Linux, Windows | Node signing/encryption/issuance keys generated and sealed inside the TPM; private material cannot be exported |
 | **Apple Secure Enclave** | macOS, iOS | Keys live in the Secure Enclave; software cannot extract them |
 | **Android Keystore** | Android | Keys are bound to an Android KeyMint (the platform HAL) hardware-backed key alias with attestation chain |
-| **PKCS#11 hardware token** | Cross-platform | YubiKey, Nitrokey, SoftHSM2; `fcp-crypto-hw` carries the adapter |
+| **PKCS#11 hardware token** | Cross-platform | YubiKey, Nitrokey, SoftHSM2; `fcp-bootstrap` carries the adapter |
 
 A zone's `ZonePolicy` can declare `require_posture = ["tpm2", "secure-enclave"]` to enforce that only nodes with one of the named hardware modalities can decrypt that zone's keys. The host refuses to register a node into such a zone without a valid posture attestation. PKCS#11 PIN handling uses constant-time comparison (`subtle::ConstantTimeEq`) and zeroizes the PIN buffer on drop (`zeroize::ZeroizeOnDrop`) — surfaced as a fix during the Gemini Lane 4 (Bootstrap) audit.
 
@@ -3598,7 +3602,7 @@ The mapping has two consequences:
 
 ### Transport Priority
 
-The `fcp-tailscale` crate consumes `tailscale status --json` (or the Tailscale LocalAPI when available) to determine the best path to each peer. The priority order:
+The `fcp-tailscale` crate consumes the Tailscale LocalAPI (`/localapi/v0/status`) to determine the best path to each peer. Path selection and priority live in `fcp-mesh/src/transport.rs`; the priority order:
 
 ```
 Priority 1: Tailscale Direct (peers on the same LAN, NAT-free)
@@ -3607,7 +3611,7 @@ Priority 3: Tailscale DERP   (encrypted relay through Tailscale's DERP servers)
 Priority 4: Tailscale Funnel (public TLS endpoint, for low-trust zones only)
 ```
 
-Zones configure transport policy via `ZoneTransportPolicy` to control DERP/Funnel availability. By default, `z:owner` and `z:private` traffic refuses to use Funnel (so personal data never flows through public-internet endpoints), while `z:public` may use any path.
+Zones configure transport policy via `ZoneTransportPolicy` (`crates/fcp-core/src/policy.rs`) to control DERP/Funnel availability. By default, `z:owner` and `z:private` traffic refuses to use Funnel (so personal data never flows through public-internet endpoints), while `z:public` may use any path.
 
 ### Why Not Build a Mesh Layer From Scratch
 
@@ -3643,7 +3647,7 @@ The `fcp-async-core` crate wraps Asupersync and provides a thin quarantine bridg
 What's left of Tokio in the workspace is intentionally tracked in `docs/FCP3_Retirement_Kill_List.md` with explicit removal triggers:
 
 - The Tokio compat bridge in `fcp-async-core` is removed when `wiremock` ships an asupersync-native counterpart or when test infrastructure migrates to a different HTTP mock.
-- `fwc/src/serve_mcp.rs` retains one `tokio::io` import, quarantined until `fcp-async-core::io` gains `AsyncWrite` and `lines()` support.
+- The `fwc/src/serve_mcp.rs` Tokio seam is **retired**: the file now uses `fcp_async_core::io::{AsyncBufRead, AsyncWrite, …}` and contains zero Tokio imports.
 
 The forward-only ratchet ensures these surfaces shrink over time. The asupersync-tokio guard test fails if new Tokio imports appear in production paths.
 
@@ -3793,15 +3797,16 @@ Bare invocations (`fwc list`) produce TOON-formatted human-readable output. Robo
 | Exit | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Operation failed (generic) |
-| 2 | Invalid arguments / usage error |
-| 3 | Connector or host not available |
-| 4 | Capability denied / authentication failure |
-| 5 | Rate limited |
-| 6 | Validation failure (schema mismatch, manifest invalid) |
-| 7 | Refused (truthful-runtime resolution declined to fabricate an answer) |
+| 1 | Operation failed (generic internal error) |
+| 2 | Invalid arguments / usage error (parse) |
+| 3 | Unknown command |
+| 4 | Ambiguous correction (the command resolved to more than one candidate; guidance is printed) |
+| 5 | Validation failure (schema mismatch, manifest invalid) |
+| 6 | Policy denied (capability denied / authentication or policy refusal) |
+| 7 | Connector/service error (the operation failed inside the connector or upstream service, e.g. rate limited) |
+| 8 | Transport error / refused (the host endpoint was missing, unreachable, or unhealthy, and truthful-runtime resolution declined to fabricate an answer) |
 
-A 7 is distinct from a 1: it signals "the command's truth source was unreachable and I refused to make something up" — which an agent should retry (with `--offline` or by waiting for the host to come back) rather than treating as a general failure.
+An 8 is distinct from a 1: it signals "the command's truth source was unreachable and I refused to make something up" — which an agent should retry (with `--offline` or by waiting for the host to come back) rather than treating as a general failure.
 
 ### Stdout vs Stderr Discipline
 
