@@ -30709,15 +30709,40 @@ fn parse_failure_dispatch(args: &[String], error: &clap::Error) -> DispatchOutco
                     "fwc task resolve <task-id> --until ready".to_owned(),
                 ],
             ),
-            Some(token) => unknown_subcommand_dispatch(
-                "unknown-command",
-                "fwc",
-                args,
-                &normalized_args,
-                Some(token),
-                catalog::COMMANDS,
-                vec!["fwc guide".to_owned(), "fwc list".to_owned()],
-            ),
+            Some(token) => {
+                if matches!(error.kind(), ErrorKind::UnknownArgument)
+                    && catalog::COMMANDS.contains(&token)
+                {
+                    structured_error(
+                        "unknown-argument",
+                        parser_summary(error),
+                        CliExitCode::Parse,
+                        true,
+                        args,
+                        &normalized_args,
+                        ErrorDetails {
+                            did_you_mean: Vec::new(),
+                            examples: vec![format!("fwc {token} --help")],
+                            next_actions: vec![
+                                format!(
+                                    "Run `fwc {token} --help` to inspect the flags `{token}` accepts."
+                                ),
+                                "Remove the unsupported flag and retry.".to_owned(),
+                            ],
+                        },
+                    )
+                } else {
+                    unknown_subcommand_dispatch(
+                        "unknown-command",
+                        "fwc",
+                        args,
+                        &normalized_args,
+                        Some(token),
+                        catalog::COMMANDS,
+                        vec!["fwc guide".to_owned(), "fwc list".to_owned()],
+                    )
+                }
+            }
             None => structured_error(
                 "parse-error",
                 parser_summary(error),
@@ -30877,7 +30902,10 @@ fn unknown_subcommand_dispatch(
     examples: Vec<String>,
 ) -> DispatchOutcome {
     let unknown = token.unwrap_or("<unknown>").to_owned();
-    let suggestions = suggest_values(&unknown, candidates);
+    let suggestions = suggest_values(&unknown, candidates)
+        .into_iter()
+        .filter(|suggestion| *suggestion != unknown)
+        .collect::<Vec<_>>();
     let next_actions = if scope == "config" {
         vec![
             "Use `fwc config schema <connector>` to inspect configuration requirements.".to_owned(),
@@ -33983,6 +34011,50 @@ deny_ptrace = true
             normalized.corrections[0].to,
             "task create 'create a GitHub issue titled '\\''FWC: add workflow macros'\\'''"
         );
+    }
+
+    #[test]
+    fn execute_unknown_flag_on_valid_command_is_unknown_argument() {
+        let args = vec![
+            "fwc".to_owned(),
+            "--json".to_owned(),
+            "plan".to_owned(),
+            "search my Gmail for invoices".to_owned(),
+            "--offline".to_owned(),
+        ];
+        let outcome = execute(&args).expect("execution should not fail internally");
+        let payload: Value =
+            serde_json::from_str(&outcome.text).expect("json output should parse cleanly");
+
+        assert_eq!(outcome.exit_code, CliExitCode::Parse.into());
+        assert_eq!(payload["error"]["type"], "unknown-argument");
+        assert_eq!(payload["error"]["recoverable"], true);
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("--offline"),
+            "error message should name the offending flag, got: {message}"
+        );
+        let suggestions = payload["error"]["did_you_mean"].as_array().cloned().unwrap_or_default();
+        assert!(
+            suggestions.iter().all(|entry| entry != "Did you mean `plan`?"),
+            "did_you_mean must never suggest the command the user already typed: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn execute_unknown_flag_on_doctor_is_unknown_argument() {
+        let args = vec![
+            "fwc".to_owned(),
+            "--json".to_owned(),
+            "doctor".to_owned(),
+            "--offline".to_owned(),
+        ];
+        let outcome = execute(&args).expect("execution should not fail internally");
+        let payload: Value =
+            serde_json::from_str(&outcome.text).expect("json output should parse cleanly");
+
+        assert_eq!(outcome.exit_code, CliExitCode::Parse.into());
+        assert_eq!(payload["error"]["type"], "unknown-argument");
     }
 
     #[test]
