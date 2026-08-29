@@ -148,8 +148,11 @@ directly.
 `fwc simulate` is not the same thing as a read-only truth-source answer. It
 uses the invoke-style dry-run path and history can record entries with
 `status: "simulated"`, but that status means no live connector mutation was
-performed. It is not currently a top-level `_truth_source: "simulated"` JSON
-contract.
+performed. Since hr0rr.2.5, simulate output carries the top-level
+`_truth_source: "simulated"` JSON marker so downstream consumers can treat it
+as non-authoritative; the marker is dispatch-time metadata, not an evidence
+class in the resolver ladder (see
+docs/architecture/truth_resolver_simulate.md).
 
 For safety-sensitive workflows:
 
