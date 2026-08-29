@@ -23,18 +23,30 @@ established by MOR/C2.5. Each quarter:
 | Truthful Runtime Resolution | | | | | |
 | Zone Isolation | | | | | |
 | Capability Tokens (CWT/COSE) | | | | | |
-| Tamper-Evident Audit | | | | | |
+| Capability Token Typestate | | | | | |
+| Post-Quantum Zone Keys | | | | | |
+| Tamper-Evident Audit + HLC | | | | | |
 | Revocation | | | | | |
 | Egress Proxy | | | | | |
 | Secretless Connectors | | | | | |
+| Multi-Method Provider Auth | | | | | |
+| Credential Pooling | | | | | |
+| Multi-Host Singleton Writers (HRW) | | | | | |
 | Threshold Owner Key | | | | | |
-| Threshold Secrets | | | | | |
+| Threshold Secrets (Shamir) | | | | | |
 | Supply Chain Attestations | | | | | |
 | Offline Access | | | | | |
 | Mesh-Stored Policy Objects | | | | | |
 | Symbol-First Protocol | | | | | |
-| Mesh-Native Architecture | | | | | |
+| Browser Real-CDP Control Plane | | | | | |
+| Voice-Call Multi-Provider Parity | | | | | |
+| Manifest Operations Conformance | | | | | |
 | Computation Migration | | | | | |
+| Mesh-Native Architecture | | | | | |
+
+(The row set mirrors the 24-row authoritative ledger in
+`docs/architecture/master_reachability.md`. Keep the two in sync; the
+`master_reachability_ledger` conformance test fails CI when they diverge.)
 
 ## Overclaims Found
 

@@ -78,7 +78,7 @@ Status legend:
 | **Computation Migration** | `PROVEN` | Migrate-and-resume reference proof: CRIU-format checkpoint handoff, lease transfer, replay, byte-equivalent completion. | `crates/fcp-kernel/src/computation_migration.rs`, `crates/fcp-e2e/tests/computation_migration_reference.rs` |
 | **Mesh-Native Architecture** | `STEADY-STATE TARGET (NOT YET OPERATIONAL)` | Gossip, IBLT, XOR filters, masked IBLT anti-entropy, and LiveTruthResolver are built and tested. The production `fwc → fcp-host → connector subprocess` invoke path remains host-first today. Pinned by `crates/fwc/tests/readme_status_pinning.rs`. | `crates/fcp-mesh/`, `crates/fwc/src/truth.rs` |
 
-> **Audit status:** all status labels reconciled as of 2026-05-16 (see the Q3 report for the current reconciliation). The Mesh-Native downgrade rationale is tracked in `br-lvz4t`. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report and [`docs/quarterly/2026-Q3-claims-vs-reality.md`](docs/quarterly/2026-Q3-claims-vs-reality.md) for the current quarter.
+> **Audit status**: all status labels reconciled as of 2026-05-16 (see the Q3 report for the current reconciliation). The Mesh-Native downgrade rationale is tracked in `br-lvz4t`. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report and [`docs/quarterly/2026-Q3-claims-vs-reality.md`](docs/quarterly/2026-Q3-claims-vs-reality.md) for the current quarter.
 
 ---
 
@@ -2616,7 +2616,7 @@ COSE_Sign1 = [
 | `grants` | `Vec<ciborium::Value>` | Granted capabilities (opaque CBOR here to break the `fcp-core` dep cycle; verifier decodes into `CapabilityGrant`) |
 | `constraints` | `Option<ciborium::Value>` | Resource / call constraints (opaque CBOR; verifier decodes into `CapabilityConstraints`) |
 
-The signature is verified *before* claims are parsed. The verifier calls `reject_unexpected_schema_version` early so an unsupported `schema_version` produces a clear error rather than a confusing field-level decode failure downstream. The legacy `OPERATIONS` claim is rejected by the verifier after epic `8n0rm.6`. Revocation is checked via `token_id` for one-shot tokens, the `kid` for issuance-key revocation, the `issuing_node` for node-attestation revocation, and the `zone_id` for zone-key rotation.
+The signature is verified *before* claims are parsed. The verifier calls `AuthClaims::check_schema_version` early so an unsupported `schema_version` produces a clear error rather than a confusing field-level decode failure downstream. The legacy `OPERATIONS` claim is rejected by the verifier after epic `8n0rm.6`. Revocation is checked via `token_id` for one-shot tokens, the `kid` for issuance-key revocation, the `issuing_node` for node-attestation revocation, and the `zone_id` for zone-key rotation.
 
 The two opaque-CBOR fields (`grants`, `constraints`) exist that way deliberately: `fcp-auth-schema` is a leaf crate so the verifier doesn't depend on it transitively, and re-decoding into the typed `CapabilityGrant` / `CapabilityConstraints` is owned by `fcp-core`. This also lets a peer with an older schema decode the surface envelope even if it can't interpret the inner grant shape.
 

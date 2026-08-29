@@ -56,12 +56,14 @@ tla-check:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/cutover" -config "$(TLA_CUTOVER_CFG)" "$(TLA_CUTOVER_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/cutover.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/cutover" -config "$(TLA_CUTOVER_CFG)" "$(TLA_CUTOVER_SPEC)" > "$(TLA_ARTIFACT_DIR)/cutover.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/cutover.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/cutover.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["Safety","Liveness","Recoverability"],"verdict":"green","duration_s":%s}\n' "$(TLA_CUTOVER_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/cutover.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["Safety","Liveness","Recoverability"],"verdict":"red","duration_s":%s}\n' "$(TLA_CUTOVER_SPEC)" "$$duration"; \
 		exit 1; \
@@ -99,12 +101,14 @@ tla-check-capability-lifecycle:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/capability_lifecycle" -config "$(TLA_CAPABILITY_LIFECYCLE_CFG)" "$(TLA_CAPABILITY_LIFECYCLE_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/capability_lifecycle.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/capability_lifecycle" -config "$(TLA_CAPABILITY_LIFECYCLE_CFG)" "$(TLA_CAPABILITY_LIFECYCLE_SPEC)" > "$(TLA_ARTIFACT_DIR)/capability_lifecycle.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/capability_lifecycle.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/capability_lifecycle.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["RevokeBeforeUse","NoDoubleSpend","RevocationPropagationSLO"],"verdict":"green","duration_s":%s}\n' "$(TLA_CAPABILITY_LIFECYCLE_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/capability_lifecycle.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["RevokeBeforeUse","NoDoubleSpend","RevocationPropagationSLO"],"verdict":"red","duration_s":%s}\n' "$(TLA_CAPABILITY_LIFECYCLE_SPEC)" "$$duration"; \
 		exit 1; \
@@ -142,12 +146,14 @@ tla-check-audit-liveness:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/audit_liveness" -config "$(TLA_AUDIT_LIVENESS_CFG)" "$(TLA_AUDIT_LIVENESS_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/audit_liveness.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/audit_liveness" -config "$(TLA_AUDIT_LIVENESS_CFG)" "$(TLA_AUDIT_LIVENESS_SPEC)" > "$(TLA_ARTIFACT_DIR)/audit_liveness.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/audit_liveness.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/audit_liveness.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["Safety","Liveness","Recoverability"],"verdict":"green","duration_s":%s}\n' "$(TLA_AUDIT_LIVENESS_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/audit_liveness.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["Safety","Liveness","Recoverability"],"verdict":"red","duration_s":%s}\n' "$(TLA_AUDIT_LIVENESS_SPEC)" "$$duration"; \
 		exit 1; \
@@ -185,12 +191,14 @@ tla-check-agent-mail-ordering:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/agent_mail_ordering" -config "$(TLA_AGENT_MAIL_ORDERING_CFG)" "$(TLA_AGENT_MAIL_ORDERING_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/agent_mail_ordering.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/agent_mail_ordering" -config "$(TLA_AGENT_MAIL_ORDERING_CFG)" "$(TLA_AGENT_MAIL_ORDERING_SPEC)" > "$(TLA_ARTIFACT_DIR)/agent_mail_ordering.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/agent_mail_ordering.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/agent_mail_ordering.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["Safety","CausalDelivery","Liveness"],"verdict":"green","duration_s":%s}\n' "$(TLA_AGENT_MAIL_ORDERING_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/agent_mail_ordering.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["Safety","CausalDelivery","Liveness"],"verdict":"red","duration_s":%s}\n' "$(TLA_AGENT_MAIL_ORDERING_SPEC)" "$$duration"; \
 		exit 1; \
@@ -228,12 +236,14 @@ tla-check-mesh-admission:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/mesh_admission" -config "$(TLA_MESH_ADMISSION_CFG)" "$(TLA_MESH_ADMISSION_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/mesh_admission.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/mesh_admission" -config "$(TLA_MESH_ADMISSION_CFG)" "$(TLA_MESH_ADMISSION_SPEC)" > "$(TLA_ARTIFACT_DIR)/mesh_admission.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/mesh_admission.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/mesh_admission.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["Safety","SafetyQuorum","Liveness","Recoverability"],"verdict":"green","duration_s":%s}\n' "$(TLA_MESH_ADMISSION_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/mesh_admission.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["Safety","SafetyQuorum","Liveness","Recoverability"],"verdict":"red","duration_s":%s}\n' "$(TLA_MESH_ADMISSION_SPEC)" "$$duration"; \
 		exit 1; \
@@ -271,12 +281,14 @@ tla-check-frost-dkg:
 		exit 127; \
 	fi; \
 	start=$$(date +%s); \
-	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/frost_dkg" -config "$(TLA_FROST_DKG_CFG)" "$(TLA_FROST_DKG_SPEC)" | tee "$(TLA_ARTIFACT_DIR)/frost_dkg.log"; then \
+	if java -cp "$(TLA2TOOLS_JAR)" tlc2.TLC -deadlock -metadir "$(TLA_STATE_DIR)/frost_dkg" -config "$(TLA_FROST_DKG_CFG)" "$(TLA_FROST_DKG_SPEC)" > "$(TLA_ARTIFACT_DIR)/frost_dkg.log" 2>&1; then \
+		cat "$(TLA_ARTIFACT_DIR)/frost_dkg.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		states=$$(sed -n 's/^\([0-9][0-9]*\) states generated.*/\1/p' "$(TLA_ARTIFACT_DIR)/frost_dkg.log" | tail -n 1); \
 		states=$${states:-unknown}; \
 		printf 'INFO {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"%s","invariants_checked":["Safety","SafetyNoKeyAfterAbort","SafetyFaultyImpliesAbort","Liveness","Recoverability"],"verdict":"green","duration_s":%s}\n' "$(TLA_FROST_DKG_SPEC)" "$$states" "$$duration"; \
 	else \
+		cat "$(TLA_ARTIFACT_DIR)/frost_dkg.log"; \
 		duration=$$(( $$(date +%s) - start )); \
 		printf 'ERROR {"span":"fcp.formal.tla_check","spec":"%s","depth":20,"states_explored":"unknown","invariants_checked":["Safety","SafetyNoKeyAfterAbort","SafetyFaultyImpliesAbort","Liveness","Recoverability"],"verdict":"red","duration_s":%s}\n' "$(TLA_FROST_DKG_SPEC)" "$$duration"; \
 		exit 1; \

@@ -127,6 +127,8 @@ tmp_target_*/
 
 # Build/test artifacts directory
 artifacts/
+# Downloaded tool binaries (tla2tools.jar etc.; CI downloads its own copies)
+tools/
 
 # Agent worktree and target directories
 .claude/worktrees/

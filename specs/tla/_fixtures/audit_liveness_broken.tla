@@ -40,7 +40,9 @@ AppendEntry ==
         /\ pending_appends_since_replicate' = pending_appends_since_replicate + 1
 
 Replicate ==
-    /\ \E src \in Replicas, dst \in Replicas, seq \in held[src] :
+    /\ \E src \in Replicas :
+        \E dst \in Replicas :
+            \E seq \in held[src] :
         /\ src # dst
         /\ seq \notin held[dst]
         /\ held' = [held EXCEPT ![dst] = held[dst] \cup {seq}]

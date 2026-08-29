@@ -57,7 +57,9 @@ AppendEntry ==
 \* replica that doesn't yet hold it. This models the gossip / drain
 \* path described in fcp-store's offline replica synchronization.
 Replicate ==
-    /\ \E src \in Replicas, dst \in Replicas, seq \in held[src] :
+    /\ \E src \in Replicas :
+        \E dst \in Replicas :
+            \E seq \in held[src] :
         /\ src # dst
         /\ seq \notin held[dst]
         /\ held' = [held EXCEPT ![dst] = held[dst] \cup {seq}]

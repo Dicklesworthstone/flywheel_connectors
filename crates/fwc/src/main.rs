@@ -34034,9 +34034,14 @@ deny_ptrace = true
             message.contains("--offline"),
             "error message should name the offending flag, got: {message}"
         );
-        let suggestions = payload["error"]["did_you_mean"].as_array().cloned().unwrap_or_default();
+        let suggestions = payload["error"]["did_you_mean"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            suggestions.iter().all(|entry| entry != "Did you mean `plan`?"),
+            suggestions
+                .iter()
+                .all(|entry| entry != "Did you mean `plan`?"),
             "did_you_mean must never suggest the command the user already typed: {suggestions:?}"
         );
     }
