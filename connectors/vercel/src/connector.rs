@@ -79,6 +79,7 @@ impl std::fmt::Debug for VercelConfig {
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
             .field("scope", &self.scope)
+            .field("retry", &self.retry)
             .field("request_timeout_ms", &self.request_timeout_ms)
             .finish()
     }
@@ -516,7 +517,7 @@ fn op(
     }
 }
 
-fn operations_info() -> Vec<OperationInfo> {
+fn health_and_deployments_operations() -> Vec<OperationInfo> {
     vec![
         op(
             OP_HEALTH,
@@ -605,6 +606,11 @@ fn operations_info() -> Vec<OperationInfo> {
             "Remove a deployment that should no longer be accessible",
             Some(ApprovalMode::Interactive),
         ),
+    ]
+}
+
+fn projects_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_PROJECTS_LIST,
             "List projects",
@@ -689,6 +695,11 @@ fn operations_info() -> Vec<OperationInfo> {
             "Permanently remove a project and its deployment surface",
             Some(ApprovalMode::Interactive),
         ),
+    ]
+}
+
+fn domains_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_DOMAINS_LIST,
             "List project domains",
@@ -755,6 +766,11 @@ fn operations_info() -> Vec<OperationInfo> {
             "Detach a custom domain from a project",
             Some(ApprovalMode::Interactive),
         ),
+    ]
+}
+
+fn env_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_ENV_LIST,
             "List project environment variables",
@@ -810,6 +826,14 @@ fn operations_info() -> Vec<OperationInfo> {
             Some(ApprovalMode::Interactive),
         ),
     ]
+}
+
+fn operations_info() -> Vec<OperationInfo> {
+    let mut ops = health_and_deployments_operations();
+    ops.extend(projects_operations());
+    ops.extend(domains_operations());
+    ops.extend(env_operations());
+    ops
 }
 
 #[derive(Debug, Deserialize)]

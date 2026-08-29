@@ -6,6 +6,12 @@ use crate::{
 use super::{VercelClient, sanitize_path_segment};
 
 impl VercelClient {
+    /// List environment variables for a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VercelError`](crate::error::VercelError) on invalid input,
+    /// transport failure, or a non-2xx response.
     pub async fn list_env_vars(
         &self,
         project_id_or_name: &str,
@@ -15,6 +21,12 @@ impl VercelClient {
             .await
     }
 
+    /// Create environment variables for a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VercelError`](crate::error::VercelError) on invalid input,
+    /// transport failure, or a non-2xx response.
     pub async fn create_env_vars(
         &self,
         project_id_or_name: &str,
@@ -29,6 +41,12 @@ impl VercelClient {
         .await
     }
 
+    /// Delete an environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VercelError`](crate::error::VercelError) on invalid input,
+    /// transport failure, or a non-2xx response.
     pub async fn delete_env_var(
         &self,
         project_id_or_name: &str,

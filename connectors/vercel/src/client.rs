@@ -63,6 +63,12 @@ impl std::fmt::Debug for VercelClient {
 }
 
 impl VercelClient {
+    /// Create a Vercel API client for the given auth and team scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VercelError::Http`](crate::error::VercelError::Http) if the
+    /// HTTP client cannot be built.
     pub fn new(
         auth: VercelAuth,
         scope: TeamScope,
@@ -112,6 +118,12 @@ impl VercelClient {
         self.auth.is_secretless()
     }
 
+    /// Run a lightweight health check against the Vercel API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VercelError`](crate::error::VercelError) on transport failure
+    /// or a non-2xx response.
     pub async fn health_check(&self) -> VercelResult<()> {
         let _ = self.list_projects(Some(1)).await?;
         Ok(())
