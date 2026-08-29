@@ -12,7 +12,10 @@ use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 
 use crate::error::{PayPalError, PayPalResult};
-use crate::types::*;
+use crate::types::{
+    Capture, CreateInvoice, CreateOrder, Invoice, InvoiceSendResponse, InvoicesListResponse,
+    PayPalOrder, Refund, RefundRequest, TokenResponse, TransactionSearchResponse,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> PayPalResult<&'a str> {
@@ -45,7 +48,7 @@ fn sanitize_query_param<'a>(value: &'a str, field: &str) -> PayPalResult<&'a str
     Ok(value)
 }
 
-/// PayPal API client with OAuth2 token management and retry support.
+/// `PayPal` API client with `OAuth2` token management and retry support.
 const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -81,15 +84,26 @@ pub struct PayPalClient {
 impl std::fmt::Debug for PayPalClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PayPalClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("client_id", &"[REDACTED]")
             .field("client_secret", &"[REDACTED]")
+            .field("retry_config", &self.retry_config)
+            .field(
+                "access_token_cached",
+                &self.access_token.read().ok().map(|guard| guard.is_some()),
+            )
             .finish()
     }
 }
 
 impl PayPalClient {
-    pub async fn new(
+    /// Create a `PayPal` API client for the given base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError::Http`] if the HTTP client cannot be built.
+    pub fn new(
         base_url: &str,
         client_id: String,
         client_secret: String,
@@ -119,7 +133,7 @@ impl PayPalClient {
         self.client_id.trim().is_empty() || self.client_secret.trim().is_empty()
     }
 
-    /// Obtain or refresh OAuth2 access token via client_credentials grant.
+    /// Obtain or refresh `OAuth2` access token via `client_credentials` grant.
     async fn ensure_token(&self, runtime: &ConnectorRuntime) -> PayPalResult<String> {
         let now = Instant::now();
         {
@@ -218,6 +232,11 @@ impl PayPalClient {
 
     // ── Health check ──
 
+    /// Verify credentials by obtaining an `OAuth2` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on transport failure or a non-2xx response.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> PayPalResult<bool> {
         let url = format!("{}/v2/checkout/orders?limit=1", self.base_url);
         let mut force_refresh = false;
@@ -294,6 +313,12 @@ impl PayPalClient {
 
     // ── Orders ──
 
+    /// Create an order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_order(
         &self,
         runtime: &ConnectorRuntime,
@@ -310,6 +335,12 @@ impl PayPalClient {
         .await
     }
 
+    /// Fetch an order by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_order(
         &self,
         runtime: &ConnectorRuntime,
@@ -320,6 +351,12 @@ impl PayPalClient {
         self.get_json(runtime, &url).await
     }
 
+    /// Capture an approved order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn capture_order(
         &self,
         runtime: &ConnectorRuntime,
@@ -334,6 +371,11 @@ impl PayPalClient {
 
     // ── Payments ──
 
+    /// List payments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on transport failure or a non-2xx response.
     pub async fn list_payments(
         &self,
         runtime: &ConnectorRuntime,
@@ -349,6 +391,12 @@ impl PayPalClient {
         self.get_json(runtime, &url).await
     }
 
+    /// Fetch a capture by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_capture(
         &self,
         runtime: &ConnectorRuntime,
@@ -359,6 +407,12 @@ impl PayPalClient {
         self.get_json(runtime, &url).await
     }
 
+    /// Refund a capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn refund_capture(
         &self,
         runtime: &ConnectorRuntime,
@@ -379,6 +433,12 @@ impl PayPalClient {
 
     // ── Invoices ──
 
+    /// Create an invoice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_invoice(
         &self,
         runtime: &ConnectorRuntime,
@@ -395,6 +455,11 @@ impl PayPalClient {
         .await
     }
 
+    /// List invoices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on transport failure or a non-2xx response.
     pub async fn list_invoices(
         &self,
         runtime: &ConnectorRuntime,
@@ -406,6 +471,12 @@ impl PayPalClient {
         self.get_json(runtime, &url).await
     }
 
+    /// Send an invoice to its recipients.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayPalError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn send_invoice(
         &self,
         runtime: &ConnectorRuntime,
@@ -459,10 +530,10 @@ impl PayPalClient {
                             .map(Duration::from_secs);
                         return AttemptOutcome::Retryable {
                             error: PayPalError::RateLimited {
-                                retry_after_ms: retry_after
-                                    .unwrap_or(Duration::from_secs(5))
-                                    .as_millis()
-                                    as u64,
+                                retry_after_ms: u64::try_from(
+                                    retry_after.unwrap_or(Duration::from_secs(5)).as_millis(),
+                                )
+                                .unwrap_or(u64::MAX),
                             },
                             retry_after,
                         };
@@ -609,7 +680,7 @@ impl PayPalClient {
 /// Returns the caller's key when there is one, otherwise a fresh id. Callers
 /// MUST invoke this outside their retry loop so every attempt of the same call
 /// presents the same value — that identity is the entire mechanism by which
-/// PayPal deduplicates a replayed order, capture, refund, or invoice send.
+/// `PayPal` deduplicates a replayed order, capture, refund, or invoice send.
 fn resolve_request_id(idempotency_key: Option<&str>) -> String {
     idempotency_key.map_or_else(
         || format!("fcp2-retry-{}", uuid::Uuid::new_v4()),
@@ -642,7 +713,10 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: PayPalError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(5)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(5)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
@@ -706,7 +780,7 @@ mod tests {
         )
     }
 
-    async fn test_client(base_url: &str) -> PayPalClient {
+    fn test_client(base_url: &str) -> PayPalClient {
         PayPalClient::new(
             base_url,
             "client".into(),
@@ -714,7 +788,6 @@ mod tests {
             5_000,
             HttpRetryConfig::default(),
         )
-        .await
         .unwrap()
     }
 
@@ -890,7 +963,6 @@ mod tests {
             TestHttpBody::Empty => (String::new(), false),
         };
         let reason = match response.status {
-            200 => "OK",
             204 => "No Content",
             401 => "Unauthorized",
             404 => "Not Found",
@@ -913,17 +985,13 @@ mod tests {
 
     #[test]
     fn client_debug_redacts() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            PayPalClient::new(
-                "https://api-m.sandbox.paypal.com",
-                "client_id_123".into(),
-                "secret_456".into(),
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = PayPalClient::new(
+            "https://api-m.sandbox.paypal.com",
+            "client_id_123".into(),
+            "secret_456".into(),
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         let debug = format!("{rt:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -933,48 +1001,36 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            PayPalClient::new(
-                "https://api-m.sandbox.paypal.com",
-                String::new(),
-                "secret".into(),
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = PayPalClient::new(
+            "https://api-m.sandbox.paypal.com",
+            String::new(),
+            "secret".into(),
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            PayPalClient::new(
-                "https://api-m.sandbox.paypal.com",
-                "id".into(),
-                "secret".into(),
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = PayPalClient::new(
+            "https://api-m.sandbox.paypal.com",
+            "id".into(),
+            "secret".into(),
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            PayPalClient::new(
-                "https://api-m.sandbox.paypal.com/",
-                "id".into(),
-                "secret".into(),
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = PayPalClient::new(
+            "https://api-m.sandbox.paypal.com/",
+            "id".into(),
+            "secret".into(),
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt.base_url().ends_with('/'));
     }
@@ -1015,17 +1071,13 @@ mod tests {
 
     #[test]
     fn clear_token_works() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            PayPalClient::new(
-                "https://api-m.sandbox.paypal.com",
-                "id".into(),
-                "secret".into(),
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = PayPalClient::new(
+            "https://api-m.sandbox.paypal.com",
+            "id".into(),
+            "secret".into(),
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         set_cached_token(
             &rt,
@@ -1061,11 +1113,15 @@ mod tests {
             .with_required_header("authorization", "Bearer fresh-token"),
         ]);
 
-        let client = test_client(server.uri()).await;
+        let client = test_client(server.uri());
         set_cached_token(
             &client,
             "expired-token",
-            Some(Instant::now() - Duration::from_secs(1)),
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("test clock should be at least one second after program start"),
+            ),
         );
 
         assert!(client.health_check(&test_runtime()).await.unwrap());
@@ -1107,7 +1163,7 @@ mod tests {
             .with_required_header("authorization", "Bearer fresh-token"),
         ]);
 
-        let client = test_client(server.uri()).await;
+        let client = test_client(server.uri());
         set_cached_token(
             &client,
             "stale-token",
@@ -1129,7 +1185,7 @@ mod tests {
                 .with_required_header("authorization", "Bearer cached-token"),
         ]);
 
-        let client = test_client(server.uri()).await;
+        let client = test_client(server.uri());
         set_cached_token(
             &client,
             "cached-token",
@@ -1150,7 +1206,7 @@ mod tests {
                 .with_required_header("authorization", "Bearer cached-token"),
         ]);
 
-        let client = test_client(server.uri()).await;
+        let client = test_client(server.uri());
         set_cached_token(
             &client,
             "cached-token",

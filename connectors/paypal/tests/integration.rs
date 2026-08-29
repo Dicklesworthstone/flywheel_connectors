@@ -65,7 +65,7 @@ fn test_runtime() -> ConnectorRuntime {
     )
 }
 
-async fn paypal_client(server: &MockServer) -> PayPalClient {
+fn paypal_client(server: &MockServer) -> PayPalClient {
     PayPalClient::new(
         &server.uri(),
         CLIENT_ID.into(),
@@ -73,7 +73,6 @@ async fn paypal_client(server: &MockServer) -> PayPalClient {
         500,
         no_retry_config(),
     )
-    .await
     .expect("wiremock URI should build a PayPal client")
 }
 
@@ -305,7 +304,7 @@ async fn orders_payments_refunds_invoices_and_health_use_paypal_contracts() {
         .await;
 
     let runtime = test_runtime();
-    let client = paypal_client(&server).await;
+    let client = paypal_client(&server);
 
     let created = client
         .create_order(
@@ -497,7 +496,7 @@ async fn auth_rate_limit_not_found_malformed_json_and_invalid_input_are_typed() 
         .mount(&server)
         .await;
 
-    let client = paypal_client(&server).await;
+    let client = paypal_client(&server);
 
     let unauthorized = client
         .get_capture(&runtime, "unauthorized")
@@ -574,7 +573,6 @@ async fn reqwest_timeout_bounds_slow_paypal_responses() {
         50,
         no_retry_config(),
     )
-    .await
     .expect("wiremock URI should build a PayPal client");
 
     let error = client
@@ -765,17 +763,13 @@ fn debug_output_redacts_paypal_credentials_and_tokens() {
     assert!(!debug_config.contains("merchant-client-id"));
     assert!(!debug_config.contains("merchant-client-secret"));
 
-    let client = fcp_async_core::runtime::block_on_sync(async {
-        PayPalClient::new(
-            "https://api-m.sandbox.paypal.com",
-            "client-id-for-debug".into(),
-            "client-secret-for-debug".into(),
-            500,
-            no_retry_config(),
-        )
-        .await
-    })
-    .expect("runtime should complete")
+    let client = PayPalClient::new(
+        "https://api-m.sandbox.paypal.com",
+        "client-id-for-debug".into(),
+        "client-secret-for-debug".into(),
+        500,
+        no_retry_config(),
+    )
     .expect("redaction proof client should build");
     let debug_client = format!("{client:?}");
     assert!(debug_client.contains("[REDACTED]"));

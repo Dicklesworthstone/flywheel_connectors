@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Auth ──
 
-/// PayPal OAuth2 client_credentials authentication.
+/// `PayPal` `OAuth2` `client_credentials` authentication.
 #[derive(Clone, Deserialize)]
 pub struct PayPalAuth {
     pub client_id: String,
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn auth_secretless_empty_id() {
         let auth = PayPalAuth {
-            client_id: "".into(),
+            client_id: String::new(),
             client_secret: "secret".into(),
         };
         assert!(auth.is_secretless());

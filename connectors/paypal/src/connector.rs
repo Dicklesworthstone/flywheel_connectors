@@ -1,4 +1,4 @@
-//! PayPal connector implementation.
+//! `PayPal` connector implementation.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -87,6 +87,8 @@ impl std::fmt::Debug for PayPalConfig {
             .field("client_secret", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("sandbox", &self.sandbox)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
             .finish()
     }
 }
@@ -268,7 +270,7 @@ fn contract_details(config: Option<&PayPalConfig>) -> serde_json::Value {
 fn with_self_check_details(
     mut report: SelfCheckReport,
     config: Option<&PayPalConfig>,
-    probe: serde_json::Value,
+    probe: &serde_json::Value,
 ) -> SelfCheckReport {
     report.details = Some(json!({
         "contract": contract_details(config),
@@ -679,7 +681,6 @@ impl FcpConnector for PayPalConnector {
             cfg.request_timeout_ms,
             cfg.retry.clone(),
         )
-        .await
         .map_err(|e| FcpError::Internal {
             message: format!("Client init: {e}"),
         })?;
@@ -734,7 +735,7 @@ impl FcpConnector for PayPalConnector {
         snap.details = Some(json!({
             "configured": self.config.is_some(),
             "handshaken": self.base.handshaken.load(Ordering::Acquire),
-            "sandbox": self.config.as_ref().map(|c| c.sandbox).unwrap_or(false),
+            "sandbox": self.config.as_ref().is_some_and(|c| c.sandbox),
             "base_url": self.config.as_ref().map(|c| c.base_url.clone()),
             "manifest_hash": Self::manifest_hash(),
             "contract": contract_details(self.config.as_ref()),
@@ -747,7 +748,7 @@ impl FcpConnector for PayPalConnector {
             return Ok(with_self_check_details(
                 SelfCheckReport::degraded("not_configured", "Connector is not configured"),
                 None,
-                json!({
+                &json!({
                     "ready": false,
                     "reason": "configure one PayPal client_id/client_secret pair and environment before running self_check",
                 }),
@@ -761,7 +762,7 @@ impl FcpConnector for PayPalConnector {
                     "PayPal HTTP client not initialized; re-run configure",
                 ),
                 Some(config),
-                json!({
+                &json!({
                     "ready": false,
                     "reason": "client_missing",
                 }),
@@ -774,7 +775,7 @@ impl FcpConnector for PayPalConnector {
                     "ConnectorRuntime not initialized; re-run configure",
                 ),
                 Some(config),
-                json!({
+                &json!({
                     "ready": false,
                     "reason": "runtime_missing",
                 }),
@@ -787,7 +788,7 @@ impl FcpConnector for PayPalConnector {
                 Ok(with_self_check_details(
                     SelfCheckReport::ok(),
                     Some(config),
-                    json!({
+                    &json!({
                         "healthy": true,
                         "base_url": client.base_url(),
                         "environment": if config.sandbox { "sandbox" } else { "production" },
@@ -797,7 +798,7 @@ impl FcpConnector for PayPalConnector {
             Ok(false) => Ok(with_self_check_details(
                 SelfCheckReport::degraded("api_degraded", "PayPal API returned server error"),
                 Some(config),
-                json!({
+                &json!({
                     "healthy": false,
                     "base_url": client.base_url(),
                     "environment": if config.sandbox { "sandbox" } else { "production" },
@@ -806,7 +807,7 @@ impl FcpConnector for PayPalConnector {
             Err(error) if error.is_retryable() => Ok(with_self_check_details(
                 SelfCheckReport::degraded("self_check_retryable", error.to_string()),
                 Some(config),
-                json!({
+                &json!({
                     "healthy": false,
                     "base_url": client.base_url(),
                     "environment": if config.sandbox { "sandbox" } else { "production" },
@@ -816,7 +817,7 @@ impl FcpConnector for PayPalConnector {
             Err(error) => Ok(with_self_check_details(
                 SelfCheckReport::failed("self_check_failed", error.to_string()),
                 Some(config),
-                json!({
+                &json!({
                     "healthy": false,
                     "base_url": client.base_url(),
                     "environment": if config.sandbox { "sandbox" } else { "production" },
@@ -1111,7 +1112,7 @@ impl PayPalConnector {
                     .health_check(runtime)
                     .await
                     .map_err(|e| e.to_fcp_error())?;
-                json!({"healthy": healthy, "sandbox": self.config.as_ref().map(|c| c.sandbox).unwrap_or(false)})
+                json!({"healthy": healthy, "sandbox": self.config.as_ref().is_some_and(|c| c.sandbox)})
             }
             _ => {
                 return Err(FcpError::InvalidRequest {
@@ -1331,7 +1332,6 @@ mod tests {
             TestHttpBody::Empty => (String::new(), false),
         };
         let reason = match response.status {
-            200 => "OK",
             204 => "No Content",
             _ => "OK",
         };
@@ -1774,7 +1774,6 @@ mod tests {
                     30_000,
                     HttpRetryConfig::default(),
                 )
-                .await
                 .unwrap(),
             );
             let sent = connector

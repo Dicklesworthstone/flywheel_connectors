@@ -226,7 +226,7 @@ fn test_runtime() -> ConnectorRuntime {
     )
 }
 
-async fn local_client(base_url: &str) -> PayPalClient {
+fn local_client(base_url: &str) -> PayPalClient {
     PayPalClient::new(
         base_url,
         CLIENT_ID.to_owned(),
@@ -234,7 +234,6 @@ async fn local_client(base_url: &str) -> PayPalClient {
         5_000,
         no_retry_config(),
     )
-    .await
     .expect("raw loopback PayPal client should build")
 }
 
@@ -472,7 +471,7 @@ async fn local_non_mock_paypal_rest_boundary_and_redaction() {
     ]);
 
     let runtime = test_runtime();
-    let client = local_client(loopback.base_url()).await;
+    let client = local_client(loopback.base_url());
 
     let traversal = client
         .get_order(&runtime, "../admin")
