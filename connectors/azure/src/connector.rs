@@ -82,6 +82,7 @@ impl std::fmt::Debug for AzureConfig {
         f.debug_struct("AzureConfig")
             .field("management_url", &self.management_url)
             .field("auth", &self.auth)
+            .field("retry", &self.retry)
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("api_versions", &self.api_versions)
             .finish()
@@ -373,7 +374,7 @@ impl AzureConnector {
     fn attach_self_check_details(
         &self,
         mut report: SelfCheckReport,
-        provisioning: Option<ProvisioningReadiness>,
+        provisioning: Option<&ProvisioningReadiness>,
     ) -> SelfCheckReport {
         report.details = Some(json!({
             "configured": self.config.is_some(),
@@ -700,7 +701,7 @@ fn op(
     }
 }
 
-fn operations_info() -> Vec<OperationInfo> {
+fn management_operations() -> Vec<OperationInfo> {
     vec![
         op(
             OP_LIST_SUBSCRIPTIONS,
@@ -792,6 +793,11 @@ fn operations_info() -> Vec<OperationInfo> {
             &[OP_LIST_RESOURCE_GROUPS],
             None,
         ),
+    ]
+}
+
+fn blob_list_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_BLOB_LIST_CONTAINERS,
             "List blob storage containers",
@@ -860,6 +866,11 @@ fn operations_info() -> Vec<OperationInfo> {
             &[OP_BLOB_LIST_CONTAINERS, OP_BLOB_GET, OP_BLOB_DELETE],
             None,
         ),
+    ]
+}
+
+fn blob_get_put_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_BLOB_GET,
             "Download a blob",
@@ -931,40 +942,48 @@ fn operations_info() -> Vec<OperationInfo> {
             &[OP_BLOB_GET, OP_BLOB_DELETE],
             None,
         ),
-        op(
-            OP_BLOB_DELETE,
-            "Delete a blob",
-            "Delete a blob from Azure Storage.",
-            CAP_STORAGE_WRITE,
-            RiskLevel::Medium,
-            SafetyTier::Risky,
-            IdempotencyClass::BestEffort,
-            json!({
-                "type": "object",
-                "required": ["storage_account", "container", "blob_name"],
-                "properties": {
-                    "storage_account": string_schema("Azure Storage account name."),
-                    "container": string_schema("Blob container name."),
-                    "blob_name": string_schema("Blob name."),
-                    "blob_base_url": string_schema("Optional override for the blob endpoint root, for example https://account.blob.core.windows.net."),
+    ]
+}
+
+fn blob_delete_operation() -> Vec<OperationInfo> {
+    vec![op(
+        OP_BLOB_DELETE,
+        "Delete a blob",
+        "Delete a blob from Azure Storage.",
+        CAP_STORAGE_WRITE,
+        RiskLevel::Medium,
+        SafetyTier::Risky,
+        IdempotencyClass::BestEffort,
+        json!({
+            "type": "object",
+            "required": ["storage_account", "container", "blob_name"],
+            "properties": {
+                "storage_account": string_schema("Azure Storage account name."),
+                "container": string_schema("Blob container name."),
+                "blob_name": string_schema("Blob name."),
+                "blob_base_url": string_schema("Optional override for the blob endpoint root, for example https://account.blob.core.windows.net."),
+            },
+        }),
+        json!({
+            "type": "object",
+            "required": ["deleted"],
+            "properties": {
+                "deleted": {
+                    "type": "boolean",
+                    "description": "Whether Azure Storage accepted the blob delete.",
                 },
-            }),
-            json!({
-                "type": "object",
-                "required": ["deleted"],
-                "properties": {
-                    "deleted": {
-                        "type": "boolean",
-                        "description": "Whether Azure Storage accepted the blob delete.",
-                    },
-                    "blob_name": nullable_string_schema("Blob name echoed back by the connector."),
-                },
-            }),
-            "Delete a blob from an Azure storage container",
-            &["Assuming delete is a dry-run operation; it removes the target blob."],
-            &[OP_BLOB_LIST_BLOBS],
-            None,
-        ),
+                "blob_name": nullable_string_schema("Blob name echoed back by the connector."),
+            },
+        }),
+        "Delete a blob from an Azure storage container",
+        &["Assuming delete is a dry-run operation; it removes the target blob."],
+        &[OP_BLOB_LIST_BLOBS],
+        None,
+    )]
+}
+
+fn keyvault_operations() -> Vec<OperationInfo> {
+    vec![
         op(
             OP_KEYVAULT_LIST_SECRETS,
             "List Key Vault secrets",
@@ -1054,6 +1073,15 @@ fn operations_info() -> Vec<OperationInfo> {
             Some(ApprovalMode::Interactive),
         ),
     ]
+}
+
+fn operations_info() -> Vec<OperationInfo> {
+    let mut ops = management_operations();
+    ops.extend(blob_list_operations());
+    ops.extend(blob_get_put_operations());
+    ops.extend(blob_delete_operation());
+    ops.extend(keyvault_operations());
+    ops
 }
 
 impl AzureConnector {
@@ -1261,9 +1289,12 @@ impl AzureConnector {
                 let content_type = req
                     .input
                     .get("content_type")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
-                let enabled = req.input.get("enabled").and_then(|v| v.as_bool());
+                let enabled = req
+                    .input
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool);
 
                 let set_req = SetSecretRequest {
                     value: value.into(),
@@ -1427,7 +1458,7 @@ impl FcpConnector for AzureConnector {
         let Some(client) = &self.client else {
             return Ok(self.attach_self_check_details(
                 SelfCheckReport::degraded("not_configured", "Connector is not configured"),
-                provisioning,
+                provisioning.as_ref(),
             ));
         };
 
@@ -1437,19 +1468,21 @@ impl FcpConnector for AzureConnector {
                     "credential_injection_required",
                     "Configured with credential_id; egress proxy injection is required for health checks",
                 ),
-                provisioning,
+                provisioning.as_ref(),
             ));
         }
 
         match client.health_check().await {
-            Ok(()) => Ok(self.attach_self_check_details(SelfCheckReport::ok(), provisioning)),
+            Ok(()) => {
+                Ok(self.attach_self_check_details(SelfCheckReport::ok(), provisioning.as_ref()))
+            }
             Err(error) if error.is_retryable() => Ok(self.attach_self_check_details(
                 SelfCheckReport::degraded("self_check_retryable", error.to_string()),
-                provisioning,
+                provisioning.as_ref(),
             )),
             Err(error) => Ok(self.attach_self_check_details(
                 SelfCheckReport::failed("self_check_failed", error.to_string()),
-                provisioning,
+                provisioning.as_ref(),
             )),
         }
     }

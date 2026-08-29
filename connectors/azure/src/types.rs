@@ -379,7 +379,7 @@ mod tests {
             "value": [
                 {
                     "id": "https://myvault.vault.azure.net/secrets/my-secret",
-                    "attributes": { "enabled": true, "created": 1700000000 }
+                    "attributes": { "enabled": true, "created": 1_700_000_000 }
                 }
             ]
         });
