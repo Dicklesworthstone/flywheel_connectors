@@ -142,7 +142,6 @@ written.
 `hashes.json` contains:
 
 - `final_state_hash`
-- `expected_hash_for_seed`
 - `per_node_state_hashes` with one `{node_id_hash, state_hash}` record per
   final node snapshot
 - `receipt_hash`
@@ -166,9 +165,31 @@ it against another run. The helper decodes `manifest.json`, `events.jsonl`,
 `hashes.json`, `invariants.json`, and every per-node CBOR snapshot, then fails
 if any artifact contains raw harness node labels or credential-like markers
 (`authorization`, `bearer`, `cookie`, `password`, `secret`, `token`), empty
-node hashes, non-64-hex hash fields, missing transition events, a mismatch
-between `final_state_hash` and `expected_hash_for_seed`, a non-green invariant
+node hashes, non-64-hex hash fields, missing transition events, a non-green invariant
 summary, or a node/timeline/hash count mismatch.
+
+## Golden Matrix
+
+The smoke test pins every scenario's `final_state_hash` against a checked-in
+golden matrix at
+`crates/fcp-e2e/golden/multi_node_failover/matrix.json`
+(schema `fcp.multi-node-failover-matrix/v1`, one `seed_<n>_<chaos_mode>` entry
+per scenario). The matrix proves the harness is deterministic across commits:
+any code change that alters failover behavior changes at least one hash and
+fails the test.
+
+Regenerate only after confirming the new behavior is intentional and the
+forward/reverse traversal check still passes:
+
+```bash
+cargo test -p fcp-e2e --no-default-features --test multi_node_failover -- \
+  --ignored generate_multi_node_failover_golden_matrix
+```
+
+The generator runs the full 100-seed x 3-mode matrix twice (forward and
+reverse) and refuses to write goldens if the two traversals disagree, so a
+non-deterministic harness can never produce a green-looking matrix. Review the
+resulting diff: every changed line is a scenario whose failover behavior moved.
 
 ## Host Handoff Replay
 
@@ -226,10 +247,13 @@ strings fail the preflight instead of leaving a partial replay on disk.
    and `state_at_end.cbor` for the same node directory. Decode them with
    `CanonicalSerializer::deserialize::<LocalNodeSnapshot>` and the
    `fcp.testkit:LocalNodeSnapshot@1.0.0` schema.
-5. Compare `hashes.json` against a rerun with the same seed and mode.
-   `expected_hash_for_seed` must match `final_state_hash`, and the
+5. Compare `hashes.json` against the checked-in golden matrix
+   (`crates/fcp-e2e/golden/multi_node_failover/matrix.json`). The smoke test
+   asserts every scenario's `final_state_hash` equals its golden entry; the
    `per_node_state_hashes` array identifies which final node snapshot diverged
-   first when the whole-state hash changes.
+   first when the whole-state hash changes. If the drift is an intentional
+   behavior change, regenerate the matrix (see "Golden Matrix" below) and
+   review the diff before committing.
 6. Inspect `invariants.json` when the final state hash is stable but failover
    acceptance still fails. Non-zero orphan counts or invalid signatures identify
    whether the issue is active-holder liveness, connector-state reachability, or
@@ -278,8 +302,7 @@ convention for future host-backed replay artifacts so operators can compare
 timelines without leaking deployment identifiers. Every replay hash field must
 be lowercase 64-hex, including event node hashes, handoff target hashes,
 snapshot node hashes, per-node state hashes, active-holder hashes,
-`final_state_hash`, `expected_hash_for_seed`, `receipt_hash`, and
-`transition_hash`.
+`final_state_hash`, `receipt_hash`, and `transition_hash`.
 
 The ProofGraph flight-recorder adapter follows the same node-redaction rule:
 `MeshFailoverFlightRecord` rejects participating nodes, primary-before/after

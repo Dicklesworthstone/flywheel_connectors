@@ -9,7 +9,7 @@ use fcp_testkit::local_mesh::{LocalChaosMode, LocalMeshHarness, LocalMeshHarness
 use fcp_testkit::redacted_replay_bundle::{
     verify_in_memory_replay_bundle, verify_written_replay_bundle,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[test]
 fn deterministic_local_mesh_failover_smoke_covers_all_a4_chaos_modes()
@@ -33,6 +33,25 @@ fn deterministic_local_mesh_failover_smoke_covers_all_a4_chaos_modes()
         forward_matrix, reverse_matrix,
         "seed/mode final-state hashes must be independent of traversal order"
     );
+    let golden_matrix = load_golden_matrix()?;
+    assert_eq!(
+        golden_matrix.len(),
+        forward_matrix.len(),
+        "golden matrix must cover every seed/mode scenario; regenerate with `{REGEN_COMMAND}`"
+    );
+    for ((seed_index, chaos_mode), actual_hash) in &forward_matrix {
+        let key = scenario_key(*seed_index, *chaos_mode);
+        let expected_hash = golden_matrix.get(&key).ok_or_else(|| {
+            invalid_replay_artifact(format!(
+                "golden matrix is missing scenario {key}; regenerate with `{REGEN_COMMAND}`"
+            ))
+        })?;
+        assert_eq!(
+            expected_hash, actual_hash,
+            "scenario {key} final-state hash drifted from the checked-in golden matrix; \
+             if this behavior change is intentional, regenerate with `{REGEN_COMMAND}` and review the diff"
+        );
+    }
     Ok(())
 }
 
@@ -82,7 +101,6 @@ fn local_mesh_replay_bundle_writes_documented_artifacts() -> Result<(), Box<dyn 
     assert_eq!(summary.node_count, 3);
     assert_eq!(summary.snapshot_file_count, 12);
     assert_eq!(summary.final_state_hash, outcome.final_state_hash);
-    assert_eq!(summary.expected_hash_for_seed, outcome.final_state_hash);
     assert_eq!(summary.per_node_state_hash_count, 3);
     assert_eq!(summary.active_holder_hash, outcome.active_holder_hash);
     assert_eq!(summary.online_node_count, 3);
@@ -111,6 +129,40 @@ fn local_mesh_replay_bundle_refuses_unredacted_artifact_writes()
         !unsafe_dir.exists(),
         "redaction failure must happen before artifact directories are created"
     );
+    Ok(())
+}
+
+/// Regenerates `golden/multi_node_failover/matrix.json` from a doubly-run
+/// deterministic matrix. Ignored by default: run explicitly with
+/// `cargo test -p fcp-e2e --no-default-features --test multi_node_failover -- --ignored generate_multi_node_failover_golden_matrix`
+/// and review the resulting diff before committing.
+#[test]
+#[ignore = "writes the checked-in golden matrix"]
+fn generate_multi_node_failover_golden_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let scenarios = seed_mode_scenarios();
+    let forward_matrix = failover_hash_matrix(scenarios.iter().copied(), None)?;
+    let reverse_matrix = failover_hash_matrix(scenarios.iter().rev().copied(), None)?;
+    assert_eq!(
+        forward_matrix, reverse_matrix,
+        "refusing to write goldens from a non-deterministic matrix run"
+    );
+
+    let mut scenario_hashes = serde_json::Map::new();
+    for ((seed_index, chaos_mode), hash) in &forward_matrix {
+        scenario_hashes.insert(
+            scenario_key(*seed_index, *chaos_mode),
+            Value::String(hash.clone()),
+        );
+    }
+    let document = json!({
+        "schema": GOLDEN_MATRIX_SCHEMA,
+        "scenario_hashes": Value::Object(scenario_hashes),
+    });
+    let path = golden_matrix_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&document)?))?;
     Ok(())
 }
 
@@ -322,4 +374,47 @@ fn replay_artifact_dir_count(root: &Path) -> Result<usize, Box<dyn std::error::E
         }
     }
     Ok(count)
+}
+
+const GOLDEN_MATRIX_SCHEMA: &str = "fcp.multi-node-failover-matrix/v1";
+const REGEN_COMMAND: &str = "cargo test -p fcp-e2e --no-default-features --test multi_node_failover -- --ignored generate_multi_node_failover_golden_matrix";
+
+fn golden_matrix_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("golden/multi_node_failover/matrix.json")
+}
+
+fn scenario_key(seed_index: u64, chaos_mode: LocalChaosMode) -> String {
+    format!("seed_{seed_index}_{}", chaos_mode.as_str())
+}
+
+fn load_golden_matrix() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let path = golden_matrix_path();
+    let raw = fs::read_to_string(&path).map_err(|source| {
+        invalid_replay_artifact(format!(
+            "golden matrix {} is unreadable: {source}; regenerate with `{REGEN_COMMAND}`",
+            path.display()
+        ))
+    })?;
+    let document: Value = serde_json::from_str(&raw)?;
+    let schema = required_string_field(&document, "schema")?;
+    if schema != GOLDEN_MATRIX_SCHEMA {
+        return Err(invalid_replay_artifact(format!(
+            "golden matrix schema `{schema}` does not match `{GOLDEN_MATRIX_SCHEMA}`; regenerate with `{REGEN_COMMAND}`"
+        )));
+    }
+    let hashes = document
+        .get("scenario_hashes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_replay_artifact("golden matrix missing scenario_hashes object"))?;
+    let mut matrix = BTreeMap::new();
+    for (scenario, hash) in hashes {
+        let hash = hash.as_str().ok_or_else(|| {
+            invalid_replay_artifact(format!(
+                "golden matrix scenario {scenario} hash must be a string"
+            ))
+        })?;
+        assert_hash_value("golden scenario hash", hash);
+        matrix.insert(scenario.clone(), hash.to_owned());
+    }
+    Ok(matrix)
 }

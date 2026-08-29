@@ -121,7 +121,6 @@ pub struct LocalReplayManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalReplayHashes {
     pub final_state_hash: String,
-    pub expected_hash_for_seed: String,
     pub per_node_state_hashes: Vec<LocalNodeStateHash>,
     pub receipt_hash: String,
     pub transition_hash: String,
@@ -798,7 +797,7 @@ impl LocalMeshHarness {
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
         Ok(LocalReplayBundle {
             manifest: LocalReplayManifest {
-                schema_version: "1.0.0".to_string(),
+                schema_version: "1.1.0".to_string(),
                 scenario_id: scenario_id.to_string(),
                 seed_index: self.seed_index,
                 chaos_mode,
@@ -811,7 +810,6 @@ impl LocalMeshHarness {
             invariants,
             hashes: LocalReplayHashes {
                 final_state_hash: final_state_hash.to_string(),
-                expected_hash_for_seed: final_state_hash.to_string(),
                 per_node_state_hashes,
                 receipt_hash,
                 transition_hash,

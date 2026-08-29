@@ -40,7 +40,6 @@ pub struct RedactedReplayBundleSummary {
     pub timeline_count: usize,
     pub snapshot_file_count: usize,
     pub final_state_hash: String,
-    pub expected_hash_for_seed: String,
     pub per_node_state_hash_count: usize,
     pub active_holder_hash: String,
     pub online_node_count: usize,
@@ -86,13 +85,6 @@ pub enum RedactedReplayBundleError {
     EmptyTimelineNodeHash { artifact: String },
     #[error("replay snapshot `{artifact}` has an empty node_id_hash")]
     EmptySnapshotNodeHash { artifact: String },
-    #[error(
-        "final_state_hash `{final_state_hash}` did not match expected_hash_for_seed `{expected_hash_for_seed}`"
-    )]
-    ExpectedHashMismatch {
-        final_state_hash: String,
-        expected_hash_for_seed: String,
-    },
     #[error("replay bundle had {actual} per-node state hashes; expected {expected}")]
     PerNodeStateHashCountMismatch { expected: usize, actual: usize },
     #[error("per-node state hash `{artifact}` has an empty node_id_hash")]
@@ -251,7 +243,6 @@ fn ensure_replay_shape(
         timeline_count,
         snapshot_file_count,
         final_state_hash: hashes.final_state_hash.clone(),
-        expected_hash_for_seed: hashes.expected_hash_for_seed.clone(),
         per_node_state_hash_count: hashes.per_node_state_hashes.len(),
         active_holder_hash: invariants.active_holder_hash.clone(),
         online_node_count: invariants.online_node_count,
@@ -339,19 +330,8 @@ fn ensure_hashes_shape(
     expected_node_count: usize,
 ) -> Result<(), RedactedReplayBundleError> {
     ensure_hash_field(artifact, "final_state_hash", &hashes.final_state_hash)?;
-    ensure_hash_field(
-        artifact,
-        "expected_hash_for_seed",
-        &hashes.expected_hash_for_seed,
-    )?;
     ensure_hash_field(artifact, "receipt_hash", &hashes.receipt_hash)?;
     ensure_hash_field(artifact, "transition_hash", &hashes.transition_hash)?;
-    if hashes.final_state_hash != hashes.expected_hash_for_seed {
-        return Err(RedactedReplayBundleError::ExpectedHashMismatch {
-            final_state_hash: hashes.final_state_hash.clone(),
-            expected_hash_for_seed: hashes.expected_hash_for_seed.clone(),
-        });
-    }
     if hashes.per_node_state_hashes.len() != expected_node_count {
         return Err(RedactedReplayBundleError::PerNodeStateHashCountMismatch {
             expected: expected_node_count,
