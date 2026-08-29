@@ -10,7 +10,11 @@ use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 
 use crate::error::{ShopifyError, ShopifyResult};
-use crate::types::*;
+use crate::types::{
+    CreateOrder, CreateProduct, Customer, CustomerResponse, CustomersResponse, InventoryLevel,
+    InventoryLevelsResponse, Order, OrderResponse, OrdersResponse, Product, ProductResponse,
+    ProductsResponse, Shop, ShopResponse, ShopifyAuth, UpdateProduct,
+};
 
 /// Shopify Admin API client with retry support.
 pub struct ShopifyClient {
@@ -23,14 +27,21 @@ pub struct ShopifyClient {
 impl std::fmt::Debug for ShopifyClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShopifyClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("auth", &self.auth)
+            .field("retry_config", &self.retry_config)
             .finish()
     }
 }
 
 impl ShopifyClient {
-    pub async fn new(
+    /// Create a Shopify Admin API client for the given shop domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError::Http`] if the HTTP client cannot be built.
+    pub fn new(
         shop_domain: &str,
         auth: ShopifyAuth,
         api_version: &str,
@@ -55,6 +66,7 @@ impl ShopifyClient {
         })
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -65,12 +77,18 @@ impl ShopifyClient {
         self
     }
 
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.auth.is_secretless()
     }
 
     // ── Health check (shop info) ──
 
+    /// Fetch shop info as a lightweight health check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on transport failure or a non-2xx response.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> ShopifyResult<Shop> {
         let url = format!("{}/shop.json", self.base_url);
         let ctx = runtime.request_context();
@@ -107,6 +125,11 @@ impl ShopifyClient {
 
     // ── Products ──
 
+    /// List products.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on transport failure or a non-2xx response.
     pub async fn list_products(&self, runtime: &ConnectorRuntime) -> ShopifyResult<Vec<Product>> {
         let url = format!("{}/products.json?limit=50", self.base_url);
         self.get_wrapped::<ProductsResponse>(runtime, &url)
@@ -114,6 +137,12 @@ impl ShopifyClient {
             .map(|r| r.products)
     }
 
+    /// Fetch a single product by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_product(
         &self,
         runtime: &ConnectorRuntime,
@@ -125,6 +154,12 @@ impl ShopifyClient {
             .map(|r| r.product)
     }
 
+    /// Create a product.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_product(
         &self,
         runtime: &ConnectorRuntime,
@@ -138,6 +173,12 @@ impl ShopifyClient {
             .map(|r| r.product)
     }
 
+    /// Update a product.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn update_product(
         &self,
         runtime: &ConnectorRuntime,
@@ -152,6 +193,12 @@ impl ShopifyClient {
             .map(|r| r.product)
     }
 
+    /// Delete a product.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn delete_product(
         &self,
         runtime: &ConnectorRuntime,
@@ -163,6 +210,11 @@ impl ShopifyClient {
 
     // ── Orders ──
 
+    /// List orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on transport failure or a non-2xx response.
     pub async fn list_orders(&self, runtime: &ConnectorRuntime) -> ShopifyResult<Vec<Order>> {
         let url = format!("{}/orders.json?status=any&limit=50", self.base_url);
         self.get_wrapped::<OrdersResponse>(runtime, &url)
@@ -170,6 +222,12 @@ impl ShopifyClient {
             .map(|r| r.orders)
     }
 
+    /// Fetch a single order by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_order(
         &self,
         runtime: &ConnectorRuntime,
@@ -181,6 +239,12 @@ impl ShopifyClient {
             .map(|r| r.order)
     }
 
+    /// Create an order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn create_order(
         &self,
         runtime: &ConnectorRuntime,
@@ -196,6 +260,11 @@ impl ShopifyClient {
 
     // ── Customers ──
 
+    /// List customers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on transport failure or a non-2xx response.
     pub async fn list_customers(&self, runtime: &ConnectorRuntime) -> ShopifyResult<Vec<Customer>> {
         let url = format!("{}/customers.json?limit=50", self.base_url);
         self.get_wrapped::<CustomersResponse>(runtime, &url)
@@ -203,6 +272,12 @@ impl ShopifyClient {
             .map(|r| r.customers)
     }
 
+    /// Fetch a single customer by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn get_customer(
         &self,
         runtime: &ConnectorRuntime,
@@ -216,6 +291,12 @@ impl ShopifyClient {
 
     // ── Inventory ──
 
+    /// List inventory levels for an inventory item.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShopifyError`] on invalid input, transport failure, or a
+    /// non-2xx response.
     pub async fn list_inventory_levels(
         &self,
         runtime: &ConnectorRuntime,
@@ -583,19 +664,15 @@ mod tests {
 
     #[test]
     fn client_debug_redacts_token() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            ShopifyClient::new(
-                "test-store.myshopify.com",
-                ShopifyAuth::AccessToken {
-                    access_token: "shpat_secret".into(),
-                },
-                "2024-01",
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = ShopifyClient::new(
+            "test-store.myshopify.com",
+            ShopifyAuth::AccessToken {
+                access_token: "shpat_secret".into(),
+            },
+            "2024-01",
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         let debug = format!("{rt:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -604,57 +681,45 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            ShopifyClient::new(
-                "test.myshopify.com",
-                ShopifyAuth::CredentialId {
-                    credential_id: fcp_core::CredentialId::parse(
-                        "550e8400-e29b-41d4-a716-446655440000",
-                    )
-                    .unwrap(),
-                },
-                "2024-01",
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = ShopifyClient::new(
+            "test.myshopify.com",
+            ShopifyAuth::CredentialId {
+                credential_id: fcp_core::CredentialId::parse(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                )
+                .unwrap(),
+            },
+            "2024-01",
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            ShopifyClient::new(
-                "test.myshopify.com",
-                ShopifyAuth::AccessToken {
-                    access_token: "token".into(),
-                },
-                "2024-01",
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = ShopifyClient::new(
+            "test.myshopify.com",
+            ShopifyAuth::AccessToken {
+                access_token: "token".into(),
+            },
+            "2024-01",
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
 
     #[test]
     fn base_url_format() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            ShopifyClient::new(
-                "my-store.myshopify.com",
-                ShopifyAuth::AccessToken {
-                    access_token: "t".into(),
-                },
-                "2024-01",
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = ShopifyClient::new(
+            "my-store.myshopify.com",
+            ShopifyAuth::AccessToken {
+                access_token: "t".into(),
+            },
+            "2024-01",
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert_eq!(
             rt.base_url(),
@@ -664,19 +729,15 @@ mod tests {
 
     #[test]
     fn base_url_trailing_slash_trimmed() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            ShopifyClient::new(
-                "store.myshopify.com/",
-                ShopifyAuth::AccessToken {
-                    access_token: "t".into(),
-                },
-                "2024-01",
-                30_000,
-                HttpRetryConfig::default(),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = ShopifyClient::new(
+            "store.myshopify.com/",
+            ShopifyAuth::AccessToken {
+                access_token: "t".into(),
+            },
+            "2024-01",
+            30_000,
+            HttpRetryConfig::default(),
+        )
         .unwrap();
         assert!(!rt.base_url().contains("//admin"));
     }

@@ -62,7 +62,7 @@ fn test_runtime() -> ConnectorRuntime {
     )
 }
 
-async fn shopify_client(server: &MockServer, request_timeout_ms: u64) -> ShopifyClient {
+fn shopify_client(server: &MockServer, request_timeout_ms: u64) -> ShopifyClient {
     ShopifyClient::new(
         "proof.myshopify.com",
         ShopifyAuth::AccessToken {
@@ -72,7 +72,6 @@ async fn shopify_client(server: &MockServer, request_timeout_ms: u64) -> Shopify
         request_timeout_ms,
         no_retry_config(),
     )
-    .await
     .expect("client should initialize")
     .with_base_url(&format!("{}{}", server.uri(), API_PREFIX))
 }
@@ -279,7 +278,7 @@ async fn product_order_customer_inventory_and_health_use_shopify_contracts() {
         .await;
 
     let runtime = test_runtime();
-    let client = shopify_client(&server, 500).await;
+    let client = shopify_client(&server, 500);
 
     let products = client
         .list_products(&runtime)
@@ -428,7 +427,7 @@ async fn auth_rate_limit_decode_and_missing_resource_errors_are_typed() {
         .await;
 
     let runtime = test_runtime();
-    let client = shopify_client(&server, 500).await;
+    let client = shopify_client(&server, 500);
 
     let unauthorized = client
         .get_product(&runtime, 401)
@@ -495,7 +494,7 @@ async fn reqwest_timeout_bounds_slow_shopify_responses() {
         .await;
 
     let runtime = test_runtime();
-    let client = shopify_client(&server, 25).await;
+    let client = shopify_client(&server, 25);
     let error = client
         .get_product(&runtime, 123)
         .await
@@ -663,18 +662,14 @@ fn redaction_and_fcp_error_mapping_preserve_security_contract() {
     assert!(auth_debug.contains("[REDACTED]"));
     assert!(!auth_debug.contains(&sensitive_marker));
 
-    let client = fcp_async_core::runtime::block_on_sync(async {
-        ShopifyClient::new(
-            "proof.myshopify.com",
-            auth,
-            "2026-01",
-            500,
-            no_retry_config(),
-        )
-        .await
-        .expect("client should initialize")
-    })
-    .expect("runtime should complete");
+    let client = ShopifyClient::new(
+        "proof.myshopify.com",
+        auth,
+        "2026-01",
+        500,
+        no_retry_config(),
+    )
+    .expect("client should initialize");
     let client_debug = format!("{client:?}");
     assert!(client_debug.contains("[REDACTED]"));
     assert!(!client_debug.contains(&sensitive_marker));

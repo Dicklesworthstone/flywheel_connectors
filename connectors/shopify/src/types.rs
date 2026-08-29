@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn deserialize_product() {
         let json = serde_json::json!({
-            "id": 123456,
+            "id": 123_456,
             "title": "Test Product",
             "vendor": "TestVendor",
             "status": "active",
@@ -325,7 +325,7 @@ mod tests {
             }]
         });
         let product: Product = serde_json::from_value(json).unwrap();
-        assert_eq!(product.id, 123456);
+        assert_eq!(product.id, 123_456);
         assert_eq!(product.title, "Test Product");
         assert_eq!(product.variants.len(), 1);
         assert_eq!(product.variants[0].price.as_deref(), Some("29.99"));

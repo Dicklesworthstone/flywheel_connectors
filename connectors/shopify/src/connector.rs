@@ -99,6 +99,8 @@ impl std::fmt::Debug for ShopifyConfig {
             .field("shop_domain", &self.shop_domain)
             .field("auth", &self.auth)
             .field("api_version", &self.api_version)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
             .finish()
     }
 }
@@ -344,7 +346,7 @@ fn contract_details(config: Option<&ShopifyConfig>) -> serde_json::Value {
 fn with_self_check_details(
     mut report: SelfCheckReport,
     config: Option<&ShopifyConfig>,
-    probe: serde_json::Value,
+    probe: &serde_json::Value,
 ) -> SelfCheckReport {
     report.details = Some(json!({
         "contract": contract_details(config),
@@ -492,7 +494,7 @@ impl ShopifyConnector {
     fn require_u64(input: &serde_json::Value, key: &str) -> FcpResult<u64> {
         input
             .get(key)
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| FcpError::InvalidRequest {
                 code: 1005,
                 message: format!("Missing or invalid integer: {key}"),
@@ -997,7 +999,6 @@ impl FcpConnector for ShopifyConnector {
             cfg.request_timeout_ms,
             cfg.retry.clone(),
         )
-        .await
         .map_err(|e| FcpError::Internal {
             message: format!("Client init: {e}"),
         })?;
@@ -1081,7 +1082,7 @@ impl FcpConnector for ShopifyConnector {
             return Ok(with_self_check_details(
                 SelfCheckReport::degraded("not_configured", "Connector is not configured"),
                 None,
-                json!({
+                &json!({
                     "reachable": false,
                     "reason": "configure one *.myshopify.com shop domain plus exactly one auth mode (access_token or credential_id) before running self_check"
                 }),
@@ -1095,7 +1096,7 @@ impl FcpConnector for ShopifyConnector {
                     "Shopify HTTP client not initialized; re-run configure",
                 ),
                 Some(config),
-                json!({
+                &json!({
                     "reachable": false,
                     "reason": "client missing"
                 }),
@@ -1108,7 +1109,7 @@ impl FcpConnector for ShopifyConnector {
                     "ConnectorRuntime not initialized; re-run configure",
                 ),
                 Some(config),
-                json!({
+                &json!({
                     "reachable": false,
                     "reason": "runtime missing"
                 }),
@@ -1125,7 +1126,7 @@ impl FcpConnector for ShopifyConnector {
                 Ok(with_self_check_details(
                     SelfCheckReport::ok(),
                     Some(config),
-                    json!({
+                    &json!({
                         "reachable": true,
                         "shop": {
                             "id": shop.id,
@@ -1139,7 +1140,7 @@ impl FcpConnector for ShopifyConnector {
             Err(error) if error.is_retryable() => Ok(with_self_check_details(
                 SelfCheckReport::degraded("self_check_retryable", error.to_string()),
                 Some(config),
-                json!({
+                &json!({
                     "reachable": false,
                     "retryable": true,
                 }),
@@ -1147,7 +1148,7 @@ impl FcpConnector for ShopifyConnector {
             Err(error) => Ok(with_self_check_details(
                 SelfCheckReport::failed("self_check_failed", error.to_string()),
                 Some(config),
-                json!({
+                &json!({
                     "reachable": false,
                     "retryable": false,
                 }),
@@ -1439,12 +1440,15 @@ impl ShopifyConnector {
                         Ok(CreateLineItem {
                             variant_id: item
                                 .get("variant_id")
-                                .and_then(|v| v.as_u64())
+                                .and_then(serde_json::Value::as_u64)
                                 .ok_or_else(|| FcpError::InvalidRequest {
                                     code: 1005,
                                     message: "line_items[].variant_id required".into(),
                                 })?,
-                            quantity: item.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1),
+                            quantity: item
+                                .get("quantity")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(1),
                         })
                     })
                     .collect::<FcpResult<Vec<_>>>()?;
@@ -1561,7 +1565,7 @@ impl ShopifyConnector {
                     })?;
                 for item in items {
                     item.get("variant_id")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| FcpError::InvalidRequest {
                             code: 1005,
                             message: "line_items[].variant_id required".into(),
