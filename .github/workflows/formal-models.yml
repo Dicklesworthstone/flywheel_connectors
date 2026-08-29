@@ -40,7 +40,7 @@ env:
   CARGO_INCREMENTAL: 0
   TLA2TOOLS_VERSION: v1.7.4
   TLA2TOOLS_SHA1: bee4a54f3ee3d4afc347c3240ec2d9e93b075104
-  TLA2TOOLS_JAR: tools/tla2tools.jar
+  TLA2TOOLS_JAR: ${{ github.workspace }}/tools/tla2tools.jar
 
 jobs:
   cutover-tla:
