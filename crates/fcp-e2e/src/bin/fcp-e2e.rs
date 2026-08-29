@@ -104,6 +104,7 @@ fn load_session_transcript(path: &Path) -> Result<SessionTranscript, String> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // linear CLI flag match; each arm handles one flag, and splitting it would scatter argument-shape validation across helper fns
 fn parse_args() -> Result<CliArgs, String> {
     let mut args = env::args().skip(1);
     let mut parsed = CliArgs {
@@ -243,10 +244,10 @@ fn parse_args() -> Result<CliArgs, String> {
         return Ok(parsed);
     }
 
-    let mode_count = parsed.validate_log.is_some() as u8
-        + parsed.scan_log.is_some() as u8
-        + parsed.interop as u8
-        + parsed.connector_cmd.is_some() as u8;
+    let mode_count = u8::from(parsed.validate_log.is_some())
+        + u8::from(parsed.scan_log.is_some())
+        + u8::from(parsed.interop)
+        + u8::from(parsed.connector_cmd.is_some());
     if mode_count == 0 {
         return Err(
             "Missing mode: use --validate-log, --scan-log, --interop, or --connector-cmd"
@@ -364,26 +365,27 @@ fn write_scanned_text(path: Option<&Path>, payload: &str, label: &str) -> io::Re
         ));
     }
 
-    if let Some(path) = path {
-        write_text_file(path, payload)
-    } else {
-        print!("{payload}");
-        Ok(())
-    }
+    path.map_or_else(
+        || {
+            print!("{payload}");
+            Ok(())
+        },
+        |path| write_text_file(path, payload),
+    )
 }
 
-fn write_report(report: &E2eReport, output: Option<PathBuf>) -> io::Result<()> {
+fn write_report(report: &E2eReport, output: Option<&Path>) -> io::Result<()> {
     let payload = report.to_json_lines();
-    write_scanned_text(output.as_deref(), &payload, "generated JSONL log")
+    write_scanned_text(output, &payload, "generated JSONL log")
 }
 
 fn default_output_path(
-    explicit: &Option<PathBuf>,
+    explicit: Option<&Path>,
     bundle_dir: Option<&Path>,
     file_name: &str,
 ) -> Option<PathBuf> {
     explicit
-        .clone()
+        .map(Path::to_path_buf)
         .or_else(|| bundle_dir.map(|dir| dir.join(file_name)))
 }
 
@@ -406,8 +408,10 @@ fn artifact_record_from_payload(
 fn effective_run_id(session_transcript: Option<&SessionTranscript>) -> String {
     session_transcript
         .filter(|transcript| !transcript.run_id.trim().is_empty())
-        .map(|transcript| transcript.run_id.clone())
-        .unwrap_or_else(|| CorrelationId::new().to_string())
+        .map_or_else(
+            || CorrelationId::new().to_string(),
+            |transcript| transcript.run_id.clone(),
+        )
 }
 
 fn effective_scenario_id(
@@ -478,7 +482,7 @@ fn append_session_transcript_logs(
             session_phase(&entry.step),
             transcript.run_id.clone(),
             entry.outcome.to_string(),
-            entry.duration.as_millis() as u64,
+            u64::try_from(entry.duration.as_millis()).unwrap_or(u64::MAX),
             assertions,
             serde_json::json!({
                 "transport": session_transport_value(transcript),
@@ -501,7 +505,7 @@ fn append_session_transcript_logs(
         "verify",
         transcript.run_id.clone(),
         transcript.outcome.to_string(),
-        transcript.total_duration.as_millis() as u64,
+        u64::try_from(transcript.total_duration.as_millis()).unwrap_or(u64::MAX),
         assertions,
         serde_json::json!({
             "entry_count": transcript.entries.len(),
@@ -556,8 +560,10 @@ fn persist_session_transcript_artifact(
     }
 
     let artifact_path = bundle_dir
-        .map(|dir| dir.join("session_transcript.json"))
-        .unwrap_or_else(|| source_path.to_path_buf());
+        .map_or_else(
+            || source_path.to_path_buf(),
+            |dir| dir.join("session_transcript.json"),
+        );
     if bundle_dir.is_some() {
         write_text_file(&artifact_path, &payload)?;
     }
@@ -605,7 +611,7 @@ fn session_transcript_step_report(
         } else {
             "fail".to_string()
         },
-        duration_ms: transcript.total_duration.as_millis() as u64,
+        duration_ms: u64::try_from(transcript.total_duration.as_millis()).unwrap_or(u64::MAX),
         command: None,
         stdout_path: None,
         stderr_path: None,
@@ -633,8 +639,7 @@ fn exit_message_for_run_report(mode: &str, run_report: &E2eRunReport) -> Option<
             run_report
                 .failure
                 .as_ref()
-                .map(|failure| failure.reason.as_str())
-                .unwrap_or("unknown failure")
+                .map_or("unknown failure", |failure| failure.reason.as_str())
         ))
     } else {
         None
@@ -720,7 +725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_id.clone(),
             if passed { "pass" } else { "fail" },
             0,
-            AssertionsSummary::new(if passed { 1 } else { 0 }, if passed { 0 } else { 1 }),
+            AssertionsSummary::new(u32::from(passed), u32::from(!passed)),
             serde_json::json!({
                 "total_lines": source_scan.total_lines,
                 "finding_count": source_scan.findings.len(),
@@ -765,18 +770,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(1);
         }
         let bundle_dir = args.bundle_dir.as_deref();
-        let output_path = default_output_path(&args.output, bundle_dir, "logs.jsonl");
+        let output_path = default_output_path(args.output.as_deref(), bundle_dir, "logs.jsonl");
         let stable_output_path =
-            default_output_path(&args.stable_output, bundle_dir, "logs.stable.jsonl");
-        let report_json_path = default_output_path(&args.report_json, bundle_dir, "report.json");
+            default_output_path(args.stable_output.as_deref(), bundle_dir, "logs.stable.jsonl");
+        let report_json_path = default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
         let summary_output_path =
-            default_output_path(&args.summary_output, bundle_dir, "summary.txt");
+            default_output_path(args.summary_output.as_deref(), bundle_dir, "summary.txt");
         let scan_report_path = args
             .scan_report
             .clone()
             .or_else(|| bundle_dir.map(|dir| dir.join("scan-report.json")));
 
-        write_report(&log_report, output_path.clone())?;
+        write_report(&log_report, output_path.as_deref())?;
         if let Some(path) = stable_output_path.as_ref() {
             let payload = log_report.to_stable_json_lines();
             write_scanned_text(Some(path), &payload, "stable JSONL log")?;
@@ -831,7 +836,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             artifacts.push(artifact.clone());
         }
 
-        let scan_failure = if !passed {
+        let scan_failure = if passed {
+            None
+        } else {
             Some(E2eFailureSummary {
                 step_id: Some("scan-log".to_string()),
                 reason: format!(
@@ -841,8 +848,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error_code: Some("log_scan_detected_secret".to_string()),
                 stderr_excerpt: None,
             })
-        } else {
-            None
         };
         let mut step_reports = vec![E2eStepReport {
             step_id: "scan-log".to_string(),
@@ -947,14 +952,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process::exit(1);
         }
         let bundle_dir = args.bundle_dir.as_deref();
-        let output_path = default_output_path(&args.output, bundle_dir, "logs.jsonl");
+        let output_path = default_output_path(args.output.as_deref(), bundle_dir, "logs.jsonl");
         let stable_output_path =
-            default_output_path(&args.stable_output, bundle_dir, "logs.stable.jsonl");
-        let report_json_path = default_output_path(&args.report_json, bundle_dir, "report.json");
+            default_output_path(args.stable_output.as_deref(), bundle_dir, "logs.stable.jsonl");
+        let report_json_path = default_output_path(args.report_json.as_deref(), bundle_dir, "report.json");
         let summary_output_path =
-            default_output_path(&args.summary_output, bundle_dir, "summary.txt");
+            default_output_path(args.summary_output.as_deref(), bundle_dir, "summary.txt");
 
-        write_report(&report, output_path.clone())?;
+        write_report(&report, output_path.as_deref())?;
         if let Some(path) = stable_output_path.as_ref() {
             let payload = report.to_stable_json_lines();
             write_scanned_text(Some(path), &payload, "stable JSONL log")?;
@@ -991,15 +996,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             artifacts.push(artifact.clone());
         }
 
-        let interop_failure = if !interop_suite_passed {
+        let interop_failure = if interop_suite_passed {
+            None
+        } else {
             Some(E2eFailureSummary {
                 step_id: Some("interop-suite".to_string()),
                 reason: "interop suite recorded failing checks".to_string(),
                 error_code: Some("interop_suite_failed".to_string()),
                 stderr_excerpt: None,
             })
-        } else {
-            None
         };
         let mut step_reports = vec![E2eStepReport {
             step_id: "interop-suite".to_string(),
@@ -1064,13 +1069,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let connector_cmd = match args.connector_cmd {
-        Some(cmd) => cmd,
-        None => {
-            eprintln!("No connector command provided.");
-            eprintln!("{}", usage());
-            process::exit(2);
-        }
+    let Some(connector_cmd) = args.connector_cmd else {
+        eprintln!("No connector command provided.");
+        eprintln!("{}", usage());
+        process::exit(2);
     };
 
     let bundle_dir = args.bundle_dir.clone();
@@ -1082,16 +1084,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = bundle_dir.as_ref() {
         std::fs::create_dir_all(dir)?;
     }
-    let output_path = default_output_path(&args.output, bundle_dir.as_deref(), "logs.jsonl");
+    let output_path = default_output_path(args.output.as_deref(), bundle_dir.as_deref(), "logs.jsonl");
     let stable_output_path = default_output_path(
-        &args.stable_output,
+        args.stable_output.as_deref(),
         bundle_dir.as_deref(),
         "logs.stable.jsonl",
     );
     let report_json_path =
-        default_output_path(&args.report_json, bundle_dir.as_deref(), "report.json");
+        default_output_path(args.report_json.as_deref(), bundle_dir.as_deref(), "report.json");
     let summary_output_path =
-        default_output_path(&args.summary_output, bundle_dir.as_deref(), "summary.txt");
+        default_output_path(args.summary_output.as_deref(), bundle_dir.as_deref(), "summary.txt");
 
     let arg_refs: Vec<&str> = args.connector_args.iter().map(String::as_str).collect();
     let mut runner = ConnectorProcessRunner::spawn(&connector_cmd, &arg_refs, &[]).await?;
@@ -1128,7 +1130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let request_start = std::time::Instant::now();
         let response = runner.request(request).await;
-        let duration_ms = request_start.elapsed().as_millis() as u64;
+        let duration_ms = u64::try_from(request_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let stdout_lines = runner.drain_stdout_lines().await;
         let stderr_lines = runner.drain_stderr_lines().await;
         if let Some(path) = stdout_path.as_ref() {
@@ -1411,12 +1413,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         passed &= transcript.all_passed();
     }
 
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let request_assertions = AssertionsSummary::new(assertions_passed, assertions_failed);
     let session_assertions = session_transcript
         .as_ref()
-        .map(session_assertions)
-        .unwrap_or_else(|| AssertionsSummary::new(0, 0));
+        .map_or_else(|| AssertionsSummary::new(0, 0), session_assertions);
     let combined_assertions = AssertionsSummary::new(
         request_assertions
             .passed
@@ -1483,7 +1484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("log schema validation failed: {err}");
         process::exit(1);
     }
-    write_report(&report, output_path.clone())?;
+    write_report(&report, output_path.as_deref())?;
     if let Some(path) = stable_output_path.as_ref() {
         let payload = report.to_stable_json_lines();
         write_scanned_text(Some(path), &payload, "stable JSONL log")?;
@@ -1545,13 +1546,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|artifact| artifact.path.as_str()),
         ));
     }
-    let failure = if let Some(failure) = request_failure {
-        Some(failure)
-    } else if let Some(transcript) = session_transcript.as_ref().filter(|t| !t.all_passed()) {
-        Some(session_transcript_failure(transcript))
-    } else {
-        None
-    };
+    let failure = request_failure.map_or_else(
+        || {
+            session_transcript
+                .as_ref()
+                .filter(|t| !t.all_passed())
+                .map(session_transcript_failure)
+        },
+        Some,
+    );
     let mut run_report = build_run_report(
         &run_id,
         &args.module,
