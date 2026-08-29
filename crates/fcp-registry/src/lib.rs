@@ -34,8 +34,8 @@ pub use fcp_core::{
 };
 use fcp_crypto::ed25519::{Ed25519Signature, Ed25519VerifyingKey, PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 use fcp_manifest::{
-    AttestationType, Base64Bytes, ConnectorManifest, ManifestError, SignatureEntry,
-    SignaturesSection,
+    AttestationType, Base64Bytes, ConnectorManifest, ManifestError, RateLimitsSection,
+    SignatureEntry, SignaturesSection,
 };
 use fcp_prelude::{
     CapabilityId, ObjectHeader, ObjectId, ObjectIdKey, Provenance, RateLimitDeclarations,
@@ -465,8 +465,8 @@ impl SupplyChainEvidence {
     ) -> Self {
         if result.verified {
             self.sigstore_verified = true;
-            self.sigstore_identity = result.identity.clone();
-            self.sigstore_issuer = result.issuer.clone();
+            self.sigstore_identity.clone_from(&result.identity);
+            self.sigstore_issuer.clone_from(&result.issuer);
         }
         self
     }
@@ -819,6 +819,7 @@ pub trait SigstoreVerifier: Send + Sync {
 /// axis (br-g7jhf finding 1). A connector that ships no `[policy]` table at
 /// all still has to satisfy everything declared here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent operator-side requirement toggles serialized in config; grouping them into flag enums would churn the operator schema with no defect behind it
 pub struct SupplyChainVerificationConfig {
     /// Pinned TUF root for anti-rollback.
     pub tuf_pinned_root: Option<TufRootMetadata>,
@@ -971,6 +972,7 @@ impl LocalTufVerifier {
         self.verify_target_inner(pinned_root, target_path, Some(target_bytes))
     }
 
+    #[allow(clippy::too_many_lines, clippy::similar_names)] // one linear TUF role-chain pipeline (root -> timestamp -> snapshot -> targets); the per-role `<role>_bytes` bindings follow the spec's vocabulary, and splitting the chain would scatter a single cryptographic verification sequence
     fn verify_target_inner(
         &self,
         pinned_root: &TufRootMetadata,
@@ -1940,6 +1942,10 @@ impl SigstoreVerifier for MockSigstoreVerifier {
 }
 
 impl VerifiedConnectorBundle {
+    /// Build a verification report stamped with the current wall-clock time.
+    ///
+    /// # Panics
+    /// Panics if the system clock reads before the Unix epoch (year 2262 bound).
     #[must_use]
     pub fn report(&self, outcome: &str) -> RegistryVerificationReport {
         let verified_at =
@@ -1960,7 +1966,7 @@ impl VerifiedConnectorBundle {
         self.manifest
             .rate_limits
             .as_ref()
-            .map(|section| section.to_declarations())
+            .map(RateLimitsSection::to_declarations)
     }
 }
 
@@ -2140,6 +2146,9 @@ impl RegistryVerifier {
     ///
     /// # Errors
     /// Returns [`RegistryError`] if object storage fails.
+    ///
+    /// # Panics
+    /// Panics if the system clock reads before the Unix epoch (year 2262 bound).
     pub async fn mirror_bundle(
         &self,
         verified: &VerifiedConnectorBundle,
@@ -2226,13 +2235,11 @@ impl RegistryVerifier {
         // and is what makes re-mirroring genuinely idempotent at the
         // ObjectStore boundary; any other store error still propagates.
         match store.put(manifest_record).await {
-            Ok(()) => {}
-            Err(ObjectStoreError::AlreadyExists(_)) => {}
+            Ok(()) | Err(ObjectStoreError::AlreadyExists(_)) => {}
             Err(err) => return Err(err.into()),
         }
         match store.put(binary_record).await {
-            Ok(()) => {}
-            Err(ObjectStoreError::AlreadyExists(_)) => {}
+            Ok(()) | Err(ObjectStoreError::AlreadyExists(_)) => {}
             Err(err) => return Err(err.into()),
         }
 
@@ -2252,6 +2259,9 @@ impl RegistryVerifier {
     ///
     /// # Errors
     /// Returns [`RegistryError`] if symbol encoding or storage fails.
+    ///
+    /// # Panics
+    /// Panics if the system clock reads before the Unix epoch (year 2262 bound).
     #[allow(clippy::too_many_arguments)]
     pub async fn mirror_bundle_symbols(
         &self,
@@ -2404,17 +2414,17 @@ impl RegistryVerifier {
             .await;
         symbols.sort_by_key(|symbol| symbol.meta.esi);
 
-        let mut decoder =
+        let mut rq_decoder =
             RaptorQDecoder::new(store_oti_from_descriptor(descriptor.oti).to_oti(), config);
-        let mut decoded = None;
+        let mut maybe_decoded = None;
         for symbol in symbols {
-            if let Some(bytes) = decoder.add_symbol(symbol.meta.esi, symbol.data.to_vec())? {
-                decoded = Some(bytes);
+            if let Some(bytes) = rq_decoder.add_symbol(symbol.meta.esi, symbol.data.to_vec())? {
+                maybe_decoded = Some(bytes);
                 break;
             }
         }
 
-        let decoded = decoded.ok_or(RegistryError::IncompleteSymbols {
+        let decoded = maybe_decoded.ok_or(RegistryError::IncompleteSymbols {
             received,
             needed: descriptor.source_symbols,
         })?;
@@ -2526,17 +2536,19 @@ pub fn manifest_signing_bytes(manifest: &ConnectorManifest) -> Result<Vec<u8>, R
 }
 
 fn descriptor_oti_from_store(oti: ObjectTransmissionInfo) -> ConnectorBinaryTransmissionInfo {
-    let descriptor = ConnectorBinaryTransmissionInfo::new(
+    let mut descriptor = ConnectorBinaryTransmissionInfo::new(
         oti.transfer_length,
         oti.symbol_size,
         oti.source_blocks,
         oti.sub_blocks,
         oti.alignment,
     );
-    match oti.payload_hash {
-        Some(payload_hash) => descriptor.with_payload_hash(payload_hash),
-        None => descriptor,
+    // Both match arms move `descriptor`, which `Option::map_or` cannot
+    // express without a double move; a mutating if-let keeps the flow linear.
+    if let Some(payload_hash) = oti.payload_hash {
+        descriptor = descriptor.with_payload_hash(payload_hash);
     }
+    descriptor
 }
 
 fn store_oti_from_descriptor(oti: ConnectorBinaryTransmissionInfo) -> ObjectTransmissionInfo {
@@ -3094,7 +3106,7 @@ impl LocalRegistryCatalog {
         let versions = entries
             .iter()
             .map(|(version, records)| {
-                self.version_descriptor(
+                Self::version_descriptor(
                     connector_id,
                     version.as_str(),
                     records,
@@ -3114,7 +3126,7 @@ impl LocalRegistryCatalog {
         let entries = self.sorted_version_entries(connector_id)?;
         let latest_version = entries.first()?.0.clone();
         let (_, records) = entries.first()?;
-        Some(self.version_descriptor(connector_id, latest_version.as_str(), records, true))
+        Some(Self::version_descriptor(connector_id, latest_version.as_str(), records, true))
     }
 
     #[must_use]
@@ -3124,7 +3136,7 @@ impl LocalRegistryCatalog {
         let (_, records) = entries
             .into_iter()
             .find(|(candidate, _)| candidate.as_str() == version)?;
-        Some(self.version_descriptor(
+        Some(Self::version_descriptor(
             connector_id,
             version,
             records,
@@ -3178,6 +3190,7 @@ impl LocalRegistryCatalog {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // linear signed-package load pipeline: read -> parse -> context/hash checks -> path-traversal rejection -> canonicalization -> signature verify -> attestation; every step is order-dependent security enforcement, so the sequence stays in one function
     fn load_signed_package(
         package_dir: &Path,
     ) -> Result<RegistryPackageRecord, RegistryCatalogError> {
@@ -3400,7 +3413,6 @@ impl LocalRegistryCatalog {
     }
 
     fn version_descriptor(
-        &self,
         connector_id: &str,
         version: &str,
         records: &[RegistryPackageRecord],

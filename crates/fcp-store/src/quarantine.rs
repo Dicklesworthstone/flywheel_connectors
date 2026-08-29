@@ -361,7 +361,6 @@ impl QuarantineStore {
                         reason: "Object cannot be reachable from itself".into(),
                     });
                 }
-                Ok(())
             }
             PromotionReason::AuthenticatedPeerRequest {
                 peer_id,
@@ -379,7 +378,6 @@ impl QuarantineStore {
                         reason: "Invalid peer ID".into(),
                     });
                 }
-                Ok(())
             }
             PromotionReason::LocalPin { reason: pin_reason } => {
                 // Local pin must have a non-empty reason for audit trail
@@ -388,9 +386,9 @@ impl QuarantineStore {
                         reason: "Local pin requires a reason for audit trail".into(),
                     });
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Check if an object is in quarantine (unfiltered).

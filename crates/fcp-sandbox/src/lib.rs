@@ -75,7 +75,10 @@
 //! assert_eq!(result.exit_code, 0);
 //! ```
 
-// Note: unsafe code allowed via Cargo.toml lints for OS sandbox syscalls
+// unsafe_code stays allowed for this crate (OS sandbox syscalls: seccomp,
+// landlock, seatbelt, AppContainer FFI). The workspace table denies it; a
+// crate-root source attribute outranks the manifest-derived flag.
+#![allow(unsafe_code)]
 // Allow FFI-related patterns common in OS sandbox implementations
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::cast_possible_truncation)]

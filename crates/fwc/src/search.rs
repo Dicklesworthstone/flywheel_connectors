@@ -310,11 +310,11 @@ fn operation_passes_filters(operation: &DiscoveredOperation, filters: &SearchFil
             return false;
         }
     }
-    !(filters.idempotent_only
-        && !matches!(
+    !filters.idempotent_only
+        || matches!(
             operation.summary.idempotency.as_str(),
             "strict" | "best_effort"
-        ))
+        )
 }
 
 fn connector_relevance(connector: &DiscoveredConnector, tokens: &[String]) -> i64 {
