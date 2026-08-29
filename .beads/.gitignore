@@ -19,6 +19,10 @@ sync_base.jsonl
 .write.lock
 .write.lock.stale-*
 
+# `br` per-write lock files (per-process suffixed db + jsonl write locks)
+.br-db-write-*.lock
+.br-jsonl-write-*.lock
+
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 
