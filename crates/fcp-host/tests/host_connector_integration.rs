@@ -970,13 +970,12 @@ where
 {
     let headers = with_admin_auth_if_needed(&reqwest::Method::PUT, &url, None).unwrap_or_default();
     let response = client
-        .put(url)
+        .put(url.as_str())
         .headers(headers)
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
-    let body = response.json::<T>().await?;
+        .await?;
+    let (_, _, body) = read_json_response(&reqwest::Method::PUT, &url, response).await?;
     Ok(body)
 }
 
@@ -989,13 +988,8 @@ where
 {
     let headers =
         with_admin_auth_if_needed(&reqwest::Method::DELETE, &url, None).unwrap_or_default();
-    let response = client
-        .delete(url)
-        .headers(headers)
-        .send()
-        .await?
-        .error_for_status()?;
-    let body = response.json::<T>().await?;
+    let response = client.delete(url.as_str()).headers(headers).send().await?;
+    let (_, _, body) = read_json_response(&reqwest::Method::DELETE, &url, response).await?;
     Ok(body)
 }
 
@@ -1003,6 +997,34 @@ struct HttpJsonResponse<T> {
     status: reqwest::StatusCode,
     headers: HeaderMap,
     body: T,
+}
+
+/// Read a response as JSON, preserving the status line and a body excerpt in
+/// every failure.
+///
+/// br-mvl7c: `error_for_status()` and `response.json()` both discard the
+/// body, which made the rare loaded-suite host-process failures nearly
+/// impossible to diagnose.
+async fn read_json_response<T>(
+    method: &reqwest::Method,
+    url: &str,
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, HeaderMap, T), Box<dyn std::error::Error>>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body_text = response.text().await?;
+    if !status.is_success() {
+        let excerpt: String = body_text.chars().take(512).collect();
+        return Err(format!("{method} {url} failed with {status}; body excerpt: {excerpt}").into());
+    }
+    let body = serde_json::from_str::<T>(&body_text).map_err(|error| {
+        let excerpt: String = body_text.chars().take(512).collect();
+        format!("{method} {url} returned unparseable JSON: {error}; body excerpt: {excerpt}")
+    })?;
+    Ok((status, headers, body))
 }
 
 async fn http_get_json_response<T>(
@@ -1014,14 +1036,13 @@ where
     T: DeserializeOwned + Send + 'static,
 {
     let auth_headers = with_admin_auth_if_needed(&reqwest::Method::GET, &url, headers);
-    let mut request = client.get(url);
+    let mut request = client.get(url.as_str());
     if let Some(hdrs) = auth_headers {
         request = request.headers(hdrs);
     }
-    let response = request.send().await?.error_for_status()?;
-    let status = response.status();
-    let resp_headers = response.headers().clone();
-    let body = response.json::<T>().await?;
+    let response = request.send().await?;
+    let (status, resp_headers, body) =
+        read_json_response(&reqwest::Method::GET, &url, response).await?;
     Ok(HttpJsonResponse {
         status,
         headers: resp_headers,
@@ -1040,14 +1061,13 @@ where
     T: DeserializeOwned + Send + 'static,
 {
     let auth_headers = with_admin_auth_if_needed(&reqwest::Method::POST, &url, headers);
-    let mut request = client.post(url).json(&body);
+    let mut request = client.post(url.as_str()).json(&body);
     if let Some(hdrs) = auth_headers {
         request = request.headers(hdrs);
     }
-    let response = request.send().await?.error_for_status()?;
-    let status = response.status();
-    let resp_headers = response.headers().clone();
-    let body = response.json::<T>().await?;
+    let response = request.send().await?;
+    let (status, resp_headers, body) =
+        read_json_response(&reqwest::Method::POST, &url, response).await?;
     Ok(HttpJsonResponse {
         status,
         headers: resp_headers,

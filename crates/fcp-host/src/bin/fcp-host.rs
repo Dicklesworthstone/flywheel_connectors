@@ -14564,22 +14564,52 @@ mod tests {
     };
 
     fn maybe_compiled_test_connector_binary() -> Option<std::path::PathBuf> {
+        // Explicit override first: operators on rch-managed or otherwise
+        // relocated test layouts can point straight at the fixture.
+        if let Ok(path) = std::env::var("FCP_TEST_CONNECTOR_BIN") {
+            let candidate = std::path::PathBuf::from(path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
         if let Some(path) = option_env!("CARGO_BIN_EXE_fcp-test-connector") {
             return Some(std::path::PathBuf::from(path));
         }
 
         let current_exe = std::env::current_exe().expect("current test executable path");
+        let exe_name = format!("fcp-test-connector{}", std::env::consts::EXE_SUFFIX);
+
+        // Standard cargo layout: the test exe lives under
+        // <target>/<profile>/deps, so the sibling bin sits in
+        // <target>/<profile>.
         let deps_dir = current_exe
             .parent()
             .expect("test executable should have parent directory");
-        let profile_dir = deps_dir
-            .parent()
-            .expect("test executable should live under target/<profile>/deps");
-        let candidate = profile_dir.join(format!(
-            "fcp-test-connector{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        candidate.exists().then_some(candidate)
+        if let Some(profile_dir) = deps_dir.parent() {
+            let candidate = profile_dir.join(&exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        // br-lfl91: under rch artifact retrieval the test exe runs from
+        // <target>/<profile>/build/<pkg>/<hash>/out/, where the fixed
+        // parent-of-parent heuristic never reaches <target>/<profile>.
+        // Walk up to the nearest ancestor profile directory and probe there.
+        for ancestor in current_exe.ancestors() {
+            let is_profile_dir = ancestor
+                .file_name()
+                .is_some_and(|name| name == "debug" || name == "release");
+            if !is_profile_dir {
+                continue;
+            }
+            let candidate = ancestor.join(&exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 
     fn compiled_test_connector_binary() -> std::path::PathBuf {
@@ -19248,7 +19278,12 @@ deny_ptrace = true
         .0;
 
         let observed_gmail_requests = gmail_task.await.expect("Gmail server task");
-        let observed_oauth_requests = oauth.join();
+        let (observed_oauth_requests, oauth_loopback_errors) = oauth.join();
+        assert!(
+            oauth_loopback_errors.is_empty(),
+            "Gmail OAuth loopback server recorded errors: {oauth_loopback_errors:?}; \
+             observed requests: {observed_oauth_requests:?}"
+        );
         assert_eq!(response.status, 200);
         assert_eq!(
             serde_json::from_slice::<Value>(response.body.as_bytes())
@@ -27353,6 +27388,27 @@ done"#;
         serde_json::from_slice(&bytes).map_err(Box::<dyn std::error::Error + Send + Sync>::from)
     }
 
+    /// Read a response body as JSON, asserting 200 OK first and printing the
+    /// raw body when the status is anything else. Under full-suite load the
+    /// loopback-provider routes occasionally fail with a non-OK status, and
+    /// the body is the only evidence of what actually happened (br-mvl7c).
+    async fn response_body_json_ok(
+        response: axum::response::Response,
+        context: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{context}: expected 200 OK, got {status}; body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    }
+
     struct HostOAuthLoopbackExpectedRequest {
         method: &'static str,
         path: &'static str,
@@ -27362,7 +27418,7 @@ done"#;
 
     struct HostOAuthLoopbackServer {
         base_url: String,
-        handle: thread::JoinHandle<()>,
+        handle: thread::JoinHandle<Vec<String>>,
         observed: Arc<StdMutex<Vec<(String, String)>>>,
     }
 
@@ -27378,6 +27434,12 @@ done"#;
             let thread_observed = Arc::clone(&observed);
             let expected_count = expected.len();
             let handle = thread::spawn(move || {
+                // br-mvl7c: never panic inside the provider thread. A panic
+                // here used to leave the host's HTTP client hanging on a
+                // closed socket and surfaced as an opaque test-body failure
+                // far from the real cause. Record every anomaly instead and
+                // keep the exchange terminating; `join` returns the errors.
+                let mut errors: Vec<String> = Vec::new();
                 let mut expected = VecDeque::from(expected);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut served = 0usize;
@@ -27389,22 +27451,42 @@ done"#;
                             thread::sleep(Duration::from_millis(10));
                             continue;
                         }
-                        Err(error) => panic!("host OAuth loopback accept failed: {error}"),
+                        Err(error) => {
+                            errors.push(format!(
+                                "accept failed after {served}/{expected_count} served: {error}"
+                            ));
+                            break;
+                        }
                     };
                     let Some((method, path, body)) = read_host_oauth_loopback_request(&mut stream)
                     else {
+                        errors.push(format!(
+                            "connection closed or malformed before a complete request \
+                             (after {served}/{expected_count} served)"
+                        ));
                         continue;
                     };
-                    let expected = expected
-                        .pop_front()
-                        .expect("expected OAuth loopback request");
-                    assert_eq!(method, expected.method);
-                    assert_eq!(path, expected.path);
+                    let Some(expected) = expected.pop_front() else {
+                        errors.push(format!("unexpected extra request: {method} {path}"));
+                        // Close without responding: the client gets a fast
+                        // EOF instead of a hang, and the error list names it.
+                        continue;
+                    };
+                    if method != expected.method || path != expected.path {
+                        errors.push(format!(
+                            "request {}: expected {} {}, got {method} {path}",
+                            served + 1,
+                            expected.method,
+                            expected.path
+                        ));
+                    }
                     for needle in &expected.body_contains {
-                        assert!(
-                            body.contains(needle),
-                            "OAuth loopback body `{body}` missing `{needle}`"
-                        );
+                        if !body.contains(needle) {
+                            errors.push(format!(
+                                "request {} {method} {path}: body `{body}` missing `{needle}`",
+                                served + 1
+                            ));
+                        }
                     }
                     thread_observed
                         .lock()
@@ -27414,10 +27496,12 @@ done"#;
                     served += 1;
                 }
 
-                assert_eq!(
-                    served, expected_count,
-                    "host OAuth loopback served {served} request(s), expected {expected_count}"
-                );
+                if served < expected_count {
+                    errors.push(format!(
+                        "deadline expired: served {served}/{expected_count} requests in 5s"
+                    ));
+                }
+                errors
             });
 
             Self {
@@ -27427,14 +27511,24 @@ done"#;
             }
         }
 
-        fn join(self) -> Vec<(String, String)> {
-            self.handle
-                .join()
-                .expect("host OAuth loopback thread joins");
-            self.observed
+        /// Joins the provider thread, returning the observed requests plus
+        /// every anomaly recorded while serving. Assert the error list is
+        /// empty before trusting `observed`: a slow or mismatched provider
+        /// exchange now reports itself there instead of panicking the
+        /// provider thread (br-mvl7c).
+        fn join(self) -> (Vec<(String, String)>, Vec<String>) {
+            let errors = self.handle.join().unwrap_or_else(|_| {
+                vec![
+                    "host OAuth loopback thread panicked (errors should be recorded, not raised)"
+                        .to_string(),
+                ]
+            });
+            let observed = self
+                .observed
                 .lock()
                 .expect("OAuth loopback observed lock")
-                .clone()
+                .clone();
+            (observed, errors)
         }
     }
 
@@ -29146,7 +29240,8 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(upserted.status(), axum::http::StatusCode::OK);
+        let _upserted_body =
+            response_body_json_ok(upserted, "POST auth profile (oauth_device)").await?;
 
         let started = send_json_request(
             app.clone(),
@@ -29156,8 +29251,7 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(started.status(), axum::http::StatusCode::OK);
-        let started_body = response_body_json(started).await?;
+        let started_body = response_body_json_ok(started, "oauth start").await?;
         assert_eq!(started_body["method"], "oauth_device");
         assert_eq!(started_body["user_code"], "USER-123");
         let login_id = started_body["login_id"]
@@ -29173,8 +29267,7 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(polled.status(), axum::http::StatusCode::OK);
-        let polled_body = response_body_json(polled).await?;
+        let polled_body = response_body_json_ok(polled, "oauth/device/poll").await?;
         assert_eq!(polled_body["status"], "authorized");
         assert_eq!(polled_body["profile"]["method"], "oauth_device");
         let polled_text = polled_body.to_string();
@@ -29189,14 +29282,22 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(refreshed.status(), axum::http::StatusCode::OK);
-        let refreshed_body = response_body_json(refreshed).await?;
+        let refreshed_body = response_body_json_ok(refreshed, "oauth refresh").await?;
         assert_eq!(refreshed_body["outcomes"][0]["action"], "due");
         assert_eq!(refreshed_body["outcomes"][0]["outcome"], "refreshed");
         assert!(!refreshed_body.to_string().contains("access-device-456"));
 
-        let observed = oauth.join();
-        assert_eq!(observed.len(), 3);
+        let (observed, loopback_errors) = oauth.join();
+        assert!(
+            loopback_errors.is_empty(),
+            "oauth-device loopback server recorded errors: {loopback_errors:?}; \
+             observed requests: {observed:?}"
+        );
+        assert_eq!(
+            observed.len(),
+            3,
+            "expected device/token/refresh requests; observed: {observed:?}"
+        );
         Ok(())
     }
 
@@ -29249,8 +29350,8 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(upserted.status(), axum::http::StatusCode::OK);
-        let upserted_body = response_body_json(upserted).await?;
+        let upserted_body =
+            response_body_json_ok(upserted, "POST auth profile (oauth_auth_code)").await?;
         assert!(!upserted_body.to_string().contains("client-secret-123"));
 
         let started = send_json_request(
@@ -29261,8 +29362,7 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(started.status(), axum::http::StatusCode::OK);
-        let started_body = response_body_json(started).await?;
+        let started_body = response_body_json_ok(started, "oauth start").await?;
         assert_eq!(started_body["method"], "oauth_auth_code");
         let login_id = started_body["login_id"]
             .as_str()
@@ -29286,8 +29386,7 @@ done"#;
             &auth,
         )
         .await?;
-        assert_eq!(completed.status(), axum::http::StatusCode::OK);
-        let completed_body = response_body_json(completed).await?;
+        let completed_body = response_body_json_ok(completed, "oauth/auth-code/complete").await?;
         assert_eq!(completed_body["status"], "authorized");
         assert_eq!(completed_body["profile"]["method"], "oauth_auth_code");
         let completed_text = completed_body.to_string();
@@ -29296,8 +29395,17 @@ done"#;
         assert!(!completed_text.contains("access-auth-code-123"));
         assert!(!completed_text.contains("refresh-auth-code-123"));
 
-        let observed = oauth.join();
-        assert_eq!(observed.len(), 1);
+        let (observed, loopback_errors) = oauth.join();
+        assert!(
+            loopback_errors.is_empty(),
+            "oauth-auth-code loopback server recorded errors: {loopback_errors:?}; \
+             observed requests: {observed:?}"
+        );
+        assert_eq!(
+            observed.len(),
+            1,
+            "expected a single token exchange request; observed: {observed:?}"
+        );
         Ok(())
     }
 

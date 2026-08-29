@@ -2759,8 +2759,12 @@ mod tests {
         for _ in 0..THREADS {
             let tracker = Arc::clone(&tracker);
             handles.push(std::thread::spawn(move || {
-                for _ in 0..ITERS_PER_THREAD {
-                    assert!(tracker.try_consume("op", 1).is_none());
+                for iteration in 0..ITERS_PER_THREAD {
+                    assert!(
+                        tracker.try_consume("op", 1).is_none(),
+                        "try_consume rejected iteration {iteration}/{ITERS_PER_THREAD}; \
+                         checkpoint pool state may have been lost mid-storm"
+                    );
                 }
             }));
         }
@@ -2781,9 +2785,17 @@ mod tests {
                 if bytes.is_empty() {
                     continue;
                 }
-                let parsed: RateLimitCheckpointFile = serde_json::from_slice(&bytes).expect(
-                    "checkpoint file must always remain valid JSON under concurrent persist",
-                );
+                // br-mvl7c: on a torn read, the offending bytes are the only
+                // evidence — print an excerpt with the parse error.
+                let parsed: RateLimitCheckpointFile = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "checkpoint file must always remain valid JSON under concurrent \
+                             persist: parse error {error}; len={}; excerpt: {}",
+                            bytes.len(),
+                            String::from_utf8_lossy(&bytes[..bytes.len().min(256)])
+                        )
+                    });
                 assert_eq!(parsed.version, RATE_LIMIT_CHECKPOINT_VERSION);
                 let pool = parsed
                     .pools
@@ -2805,8 +2817,15 @@ mod tests {
         // Final on-disk state must also be valid and reflect every
         // accepted request (no lost writes after the storm settles).
         let final_bytes = std::fs::read(&checkpoint_path).expect("final checkpoint should exist");
-        let final_parsed: RateLimitCheckpointFile =
-            serde_json::from_slice(&final_bytes).expect("final checkpoint must be valid JSON");
+        let final_parsed: RateLimitCheckpointFile = serde_json::from_slice(&final_bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "final checkpoint must be valid JSON: parse error {error}; len={}; \
+                     excerpt: {}",
+                    final_bytes.len(),
+                    String::from_utf8_lossy(&final_bytes[..final_bytes.len().min(256)])
+                )
+            });
         let final_pool = final_parsed
             .pools
             .values()
