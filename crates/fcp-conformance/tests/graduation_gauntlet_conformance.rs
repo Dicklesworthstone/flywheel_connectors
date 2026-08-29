@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -22,50 +22,351 @@ const EXPECTED_CHECKS: [(&str, i32); 12] = [
     ("operator_guidance", 12),
 ];
 
-const BATCH2_CONNECTORS: [&str; 9] = [
-    "connectors/google-admin-reports",
-    "connectors/google-calendar",
-    "connectors/google-chat",
-    "connectors/google-docs",
-    "connectors/google-drive",
-    "connectors/google-meet",
-    "connectors/google-people",
-    "connectors/google-sheets",
-    "connectors/google-workspace-events",
-];
+/// Parse a `NAME=( "a" "b" )` string array out of a bash script.
+///
+/// The graduation scripts (`run_gauntlet.sh`, `batch4_inventory.sh`) are the
+/// source of truth for batch rosters; these tests parse them instead of
+/// pinning a copy so roster edits cannot silently drift from the assertions.
+fn parse_bash_string_array(script: &str, array_name: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut in_array = false;
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if !in_array {
+            if trimmed.starts_with(&format!("{array_name}=(")) {
+                in_array = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with(')') {
+            break;
+        }
+        let entry = trimmed.trim_matches(|c| c == '"' || c == '\'');
+        if !entry.is_empty() {
+            entries.push(entry.to_string());
+        }
+    }
+    entries
+}
 
-const BATCH3_CONNECTORS: [&str; 4] = [
-    "connectors/deepseek",
-    "connectors/google-ai",
-    "connectors/huggingface",
-    "connectors/llm-router",
-];
+/// A hardcoded batch roster, parsed out of `run_gauntlet.sh` itself.
+fn gauntlet_script_roster(array_name: &str) -> Vec<String> {
+    let script = fs::read_to_string(gauntlet_runner()).expect("run_gauntlet.sh should be readable");
+    let roster = parse_bash_string_array(&script, array_name);
+    assert!(
+        !roster.is_empty(),
+        "run_gauntlet.sh should define a non-empty {array_name} roster"
+    );
+    roster
+}
 
-const BATCH4_CONNECTORS: [&str; 23] = [
-    "connectors/amplitude",
-    "connectors/anthropic-vertex",
-    "connectors/azure-speech",
-    "connectors/circleci",
-    "connectors/coda",
-    "connectors/confluence",
-    "connectors/feishu",
-    "connectors/inworld",
-    "connectors/irc",
-    "connectors/line",
-    "connectors/microsoft-foundry",
-    "connectors/microsoft365",
-    "connectors/package-registry",
-    "connectors/paypal",
-    "connectors/plivo",
-    "connectors/posthog",
-    "connectors/qq",
-    "connectors/roam",
-    "connectors/synology-chat",
-    "connectors/telnyx",
-    "connectors/tlon",
-    "connectors/twitch",
-    "connectors/wecom",
-];
+/// The batch1-3 exclusion list (bare connector names) from `batch4_inventory.sh`.
+fn batch1_to_3_exclusion() -> BTreeSet<String> {
+    let script = fs::read_to_string(batch4_inventory_runner())
+        .expect("batch4_inventory.sh should be readable");
+    let excluded = parse_bash_string_array(&script, "BATCH1_TO_3_CONNECTORS");
+    assert!(
+        !excluded.is_empty(),
+        "batch4_inventory.sh should define a non-empty BATCH1_TO_3_CONNECTORS exclusion list"
+    );
+    excluded.into_iter().collect()
+}
+
+/// The current batch4 long-tail roster, straight from the inventory script
+/// that `run_gauntlet.sh --batch batch4` itself consumes.
+fn batch4_inventory_list() -> Vec<String> {
+    let output = Command::new("bash")
+        .current_dir(workspace_root())
+        .arg(batch4_inventory_runner())
+        .output()
+        .expect("batch4 inventory runner should list connectors");
+    assert!(
+        output.status.success(),
+        "batch4 inventory list failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Mirror of `status_line_for` in `batch4_inventory.sh`: the first
+/// `> **Status**: ...` line of the connector README, if any.
+fn readme_status_line(connector_dir: &Path) -> Option<String> {
+    let readme = fs::read_to_string(connector_dir.join("README.md")).ok()?;
+    readme
+        .lines()
+        .find_map(|line| line.strip_prefix("> **Status**: "))
+        .map(str::to_string)
+}
+
+/// Mirror of `is_batch4_status` in `batch4_inventory.sh`.
+fn is_long_tail_status(status: Option<&str>) -> bool {
+    let Some(status) = status else {
+        return true; // NO_STATUS
+    };
+    let lower = status.to_lowercase();
+    lower.contains("incubat")
+        || lower.contains("planning contract")
+        || lower.contains("retrofit contract")
+        || lower.contains("first-slice")
+}
+
+/// Mirror of `graduation_check_readme_status_match` in
+/// `scripts/graduation/checks/core.sh`: the check passes iff the README status
+/// line contains the word PROVEN and the manifest declares `status = "proven"`.
+/// Missing files pass vacuously (the ladder's manifest_present/readme_present
+/// checks fail first in that case).
+fn readme_status_match_expected_verdict(connector_dir: &Path) -> &'static str {
+    let readme_path = connector_dir.join("README.md");
+    let manifest_path = connector_dir.join("manifest.toml");
+    if !readme_path.is_file() || !manifest_path.is_file() {
+        return "pass";
+    }
+    let readme = fs::read_to_string(&readme_path).expect("connector README should be readable");
+    let manifest =
+        fs::read_to_string(&manifest_path).expect("connector manifest should be readable");
+    let readme_proven = readme.lines().any(|line| {
+        line.starts_with("> **Status**:")
+            && line
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == "PROVEN")
+    });
+    let manifest_proven = manifest.lines().any(|line| {
+        line.trim_start()
+            .replace([' ', '\t'], "")
+            .starts_with("status=\"proven\"")
+    });
+    if readme_proven && manifest_proven {
+        "pass"
+    } else {
+        "fail"
+    }
+}
+
+/// The `(passing, total)` counts from the doc's `Summary: `N/M` ...` line.
+fn parse_summary_counts(status_doc: &str) -> (usize, usize) {
+    status_doc
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("Summary: `")?;
+            let (counts, _) = rest.split_once('`')?;
+            let (passing, total) = counts.split_once('/')?;
+            Some((passing.parse().ok()?, total.parse().ok()?))
+        })
+        .expect("status doc should carry a `Summary: `N/M`` line")
+}
+
+/// Per-connector gauntlet records in emission order, derived from the JSONL.
+fn group_records_by_connector(
+    records: &[serde_json::Value],
+) -> BTreeMap<String, Vec<(String, String)>> {
+    let mut grouped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for record in records {
+        let connector = record_str(record, "connector")
+            .expect("JSONL record should carry a connector")
+            .to_string();
+        let check = record_str(record, "check")
+            .expect("JSONL record should carry a check")
+            .to_string();
+        let verdict = record_str(record, "verdict")
+            .expect("JSONL record should carry a verdict")
+            .to_string();
+        grouped.entry(connector).or_default().push((check, verdict));
+    }
+    grouped
+}
+
+/// Relationship-based assertions for a `--batch <batch> --status-md` run.
+///
+/// Rosters, counts, and PROVEN verdicts below are derived from the scripts
+/// and the live connector tree rather than pinned as literals: graduating a
+/// connector is *supposed* to change the summary numbers, and must not fail
+/// these tests. What must hold is the runner's contract: roster completeness,
+/// contiguous check prefixes with early exit on first failure,
+/// `readme_status_match` verdicts that agree with the README + manifest on
+/// disk, and summary/promotion lines whose numbers match the JSONL evidence.
+fn assert_batch_status_run(batch: &str, label: &str, roster: &[String]) {
+    let fixture_root = unique_fixture_root(&format!("{batch}-status"));
+    fs::create_dir_all(&fixture_root).expect("fixture root should be creatable");
+    let status_path = fixture_root.join(format!("{batch}_status.md"));
+    let jsonl_path = fixture_root.join(format!("{batch}_status.jsonl"));
+    let output = run_gauntlet(vec![
+        OsString::from("--jsonl"),
+        jsonl_path.as_os_str().to_os_string(),
+        OsString::from("--batch"),
+        OsString::from(batch),
+        OsString::from("--status-md"),
+        status_path.as_os_str().to_os_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{batch} status run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status_doc =
+        fs::read_to_string(&status_path).expect("batch status markdown should be written");
+    assert!(status_doc.contains(&format!("# {label} Graduation Status")));
+    assert!(status_doc.contains(&format!(
+        "scripts/graduation/run_gauntlet.sh --batch {batch}"
+    )));
+    for connector in roster {
+        assert!(
+            status_doc.contains(&format!("`{connector}`")),
+            "status doc should mention {connector}"
+        );
+    }
+
+    let jsonl = fs::read_to_string(&jsonl_path).expect("batch JSONL should be written");
+    let records = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record"))
+        .collect::<Vec<_>>();
+    let grouped = group_records_by_connector(&records);
+
+    // Roster completeness: the runner covered exactly the expected roster.
+    assert_eq!(
+        grouped.keys().cloned().collect::<BTreeSet<_>>(),
+        roster.iter().cloned().collect::<BTreeSet<_>>(),
+        "{batch} JSONL connectors should equal the roster from run_gauntlet.sh / \
+         batch4_inventory.sh"
+    );
+
+    let check_order = EXPECTED_CHECKS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+
+    let mut passing = 0_usize;
+    let mut all_blocked_at_readme_status = true;
+    for (connector, checks) in &grouped {
+        // Records form a contiguous prefix of the 12-check ladder; the runner
+        // stops at the first failure, so at most the last record may fail.
+        let prefix_len = checks.len();
+        assert!(
+            prefix_len <= check_order.len(),
+            "{connector} emitted more checks than the ladder has: {checks:?}"
+        );
+        for (index, (check, verdict)) in checks.iter().enumerate() {
+            assert_eq!(check, check_order[index], "{connector} check order drifted");
+            if index + 1 == prefix_len && prefix_len < check_order.len() {
+                assert_eq!(
+                    verdict, "fail",
+                    "{connector} stopped early without a failing check"
+                );
+            } else {
+                assert_eq!(verdict, "pass", "{connector} failed {check} but kept going");
+            }
+        }
+        let connector_passed = prefix_len == check_order.len();
+        if connector_passed {
+            passing += 1;
+        } else {
+            let (last_check, _) = checks
+                .last()
+                .expect("blocked connector should emit at least one check");
+            if last_check != "readme_status_match" {
+                all_blocked_at_readme_status = false;
+            }
+        }
+
+        // connector_path: the rostered connector directory must exist.
+        assert_eq!(
+            checks
+                .first()
+                .map(|(check, verdict)| (check.as_str(), verdict.as_str())),
+            Some(("connector_path", "pass")),
+            "{connector} should exist on disk and pass connector_path"
+        );
+
+        // readme_status_match: the verdict must agree with the README +
+        // manifest currently on disk. This replaces the old hardcoded PROVEN
+        // roster and follows graduations automatically.
+        if let Some((_, verdict)) = checks
+            .iter()
+            .find(|(check, _)| check == "readme_status_match")
+        {
+            let expected = readme_status_match_expected_verdict(&workspace_root().join(connector));
+            assert_eq!(
+                verdict, expected,
+                "{connector} readme_status_match verdict disagrees with on-disk README/manifest"
+            );
+        }
+    }
+
+    // Summary counts come from the JSONL, not from a frozen snapshot.
+    let (doc_passing, doc_total) = parse_summary_counts(&status_doc);
+    assert_eq!(
+        doc_passing, passing,
+        "{batch} summary passing count disagrees with the JSONL evidence"
+    );
+    assert_eq!(
+        doc_total,
+        roster.len(),
+        "{batch} summary total disagrees with the roster size"
+    );
+
+    // Promotion/pre-promotion guidance tracks the same numbers and branch
+    // conditions as write_batch_status_markdown (which checks
+    // `passing == total` first, then the readme_status_match-only branch,
+    // then falls through to generic remediation guidance).
+    let total = roster.len();
+    let unpromoted = total - passing;
+    if passing == total {
+        assert!(
+            status_doc.contains("Keep this artifact scoped to mechanical gauntlet status"),
+            "fully-passing {label} should emit the scoped-artifact guidance"
+        );
+    } else if all_blocked_at_readme_status {
+        if passing == 0 {
+            assert!(status_doc.contains(&format!(
+                "Pre-promotion status: `{total}/{total}` {label} connectors pass every check \
+                 before `readme_status_match`"
+            )));
+            assert!(
+                status_doc.contains("every connector is still blocked at `readme_status_match`")
+            );
+        } else {
+            assert!(status_doc.contains(&format!(
+                "Promotion status: `{passing}/{total}` {label} connectors are PROVEN; \
+                 `{unpromoted}/{total}` still pass every check before `readme_status_match`"
+            )));
+        }
+        assert!(status_doc.contains("all_proven_connectors_pass_gauntlet"));
+        assert!(
+            !status_doc
+                .contains("Add connector-local `tests/local_non_mock.rs` acceptance coverage"),
+            "promotion-progress status should not emit stale local_non_mock guidance"
+        );
+    } else {
+        assert!(
+            status_doc.contains(&format!(
+                "Do not mark any {label} connector PROVEN until its manifest, README, local \
+                 non-mock proof, sandbox/network policy, and operator guidance all pass the \
+                 gauntlet."
+            )),
+            "{label} connectors blocked before readme_status_match should emit generic \
+             remediation guidance"
+        );
+    }
+
+    // A batch with at least one fully-passing connector exercises all 12 checks.
+    if passing > 0 {
+        let emitted = records
+            .iter()
+            .filter_map(|record| record_str(record, "check"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            emitted,
+            check_order.iter().copied().collect::<BTreeSet<_>>(),
+            "{batch} should cover the full 12-check ladder"
+        );
+    }
+}
 
 #[derive(Clone, Copy)]
 struct FixtureOptions {
@@ -368,308 +669,52 @@ fn test_gauntlet_requires_actual_proven_status() {
 
 #[test]
 fn batch1_status_runner_writes_status_markdown() {
-    let fixture_root = unique_fixture_root("batch1-status");
-    fs::create_dir_all(&fixture_root).expect("fixture root should be creatable");
-    let status_path = fixture_root.join("batch1_status.md");
-    let jsonl_path = fixture_root.join("batch1_status.jsonl");
-    let output = run_gauntlet(vec![
-        OsString::from("--jsonl"),
-        jsonl_path.as_os_str().to_os_string(),
-        OsString::from("--batch"),
-        OsString::from("batch1"),
-        OsString::from("--status-md"),
-        status_path.as_os_str().to_os_string(),
-    ]);
-    assert!(
-        output.status.success(),
-        "batch1 status run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let status_doc =
-        fs::read_to_string(&status_path).expect("batch1 status markdown should be written");
-    assert!(status_doc.contains("# Batch 1 Graduation Status"));
-    assert!(status_doc.contains("scripts/graduation/run_gauntlet.sh --batch batch1"));
-    assert!(status_doc.contains("Summary: `2/7` Batch 1 connectors currently pass"));
-    assert!(status_doc.contains("Promotion status: `2/7` Batch 1 connectors are PROVEN"));
-    assert!(status_doc.contains("`5/7` still pass every check before `readme_status_match`"));
-    assert!(status_doc.contains("all_proven_connectors_pass_gauntlet"));
-    assert!(
-        !status_doc.contains("Add connector-local `tests/local_non_mock.rs` acceptance coverage"),
-        "promotion-progress status should not emit stale local_non_mock guidance"
-    );
-    for connector in [
-        "connectors/postgresql",
-        "connectors/stripe",
-        "connectors/github",
-        "connectors/gmail",
-        "connectors/telegram",
-        "connectors/slack",
-        "connectors/kubernetes",
-    ] {
-        assert!(
-            status_doc.contains(connector),
-            "status doc should mention {connector}"
-        );
-    }
-
-    let jsonl = fs::read_to_string(&jsonl_path).expect("batch1 JSONL should be written");
-    let records = jsonl
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record"))
-        .collect::<Vec<_>>();
-    // Two connectors (github, gmail) are PROVEN and run all 12 checks; the
-    // remaining five are blocked at `readme_status_match` (check 8) and stop
-    // there. Records: 2 * 12 + 5 * 8 = 64.
-    assert_eq!(records.len(), 2 * 12 + 5 * 8);
-    let proven_batch1 = BTreeSet::from(["connectors/github", "connectors/gmail"]);
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") == Some("readme_status_match"))
-            .all(|record| {
-                let connector = record_str(record, "connector").unwrap_or_default();
-                let verdict = record_str(record, "verdict");
-                if proven_batch1.contains(connector) {
-                    verdict == Some("pass")
-                } else {
-                    verdict == Some("fail")
-                }
-            }),
-        "Batch 1 readme_status_match should pass only for PROVEN connectors: {jsonl}"
-    );
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") != Some("readme_status_match"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 1 status JSONL should pass every check other than readme_status_match: {jsonl}"
-    );
-
-    let connectors = records
-        .iter()
-        .filter_map(|record| record_str(record, "connector"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        connectors,
-        BTreeSet::from([
-            "connectors/github",
-            "connectors/gmail",
-            "connectors/kubernetes",
-            "connectors/postgresql",
-            "connectors/slack",
-            "connectors/stripe",
-            "connectors/telegram",
-        ])
-    );
-
-    let checks = records
-        .iter()
-        .filter_map(|record| record_str(record, "check"))
-        .collect::<BTreeSet<_>>();
-    // The two PROVEN connectors run the full 12-check ladder, so the union of
-    // emitted checks covers all of EXPECTED_CHECKS.
-    assert_eq!(
-        checks,
-        EXPECTED_CHECKS
-            .iter()
-            .map(|(check, _)| *check)
-            .collect::<BTreeSet<_>>()
+    assert_batch_status_run(
+        "batch1",
+        "Batch 1",
+        &gauntlet_script_roster("BATCH1_CONNECTORS"),
     );
 }
 
 #[test]
 fn batch2_status_runner_writes_status_markdown() {
-    let fixture_root = unique_fixture_root("batch2-status");
-    fs::create_dir_all(&fixture_root).expect("fixture root should be creatable");
-    let status_path = fixture_root.join("batch2_status.md");
-    let jsonl_path = fixture_root.join("batch2_status.jsonl");
-    let output = run_gauntlet(vec![
-        OsString::from("--jsonl"),
-        jsonl_path.as_os_str().to_os_string(),
-        OsString::from("--batch"),
-        OsString::from("batch2"),
-        OsString::from("--status-md"),
-        status_path.as_os_str().to_os_string(),
-    ]);
-    assert!(
-        output.status.success(),
-        "batch2 status run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let status_doc =
-        fs::read_to_string(&status_path).expect("batch2 status markdown should be written");
-    assert!(status_doc.contains("# Batch 2 Graduation Status"));
-    assert!(status_doc.contains("scripts/graduation/run_gauntlet.sh --batch batch2"));
-    assert!(status_doc.contains("Summary: `2/9` Batch 2 connectors currently pass"));
-    assert!(status_doc.contains("Promotion status: `2/9` Batch 2 connectors are PROVEN"));
-    assert!(status_doc.contains("`7/9` still pass every check before `readme_status_match`"));
-    for connector in BATCH2_CONNECTORS {
-        assert!(
-            status_doc.contains(connector),
-            "status doc should mention {connector}"
-        );
-    }
-
-    let jsonl = fs::read_to_string(&jsonl_path).expect("batch2 JSONL should be written");
-    let records = jsonl
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record"))
-        .collect::<Vec<_>>();
-    // Google Calendar and Google Drive are PROVEN and run all 12 checks; the
-    // remaining seven are blocked at `readme_status_match` (check 8):
-    // 2 * 12 + 7 * 8 = 80 records.
-    assert_eq!(records.len(), 2 * 12 + 7 * 8);
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") == Some("connector_path"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 2 connector paths should exist: {jsonl}"
-    );
-    let proven_batch2 = BTreeSet::from(["connectors/google-calendar", "connectors/google-drive"]);
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") == Some("readme_status_match"))
-            .all(|record| {
-                let connector = record_str(record, "connector").unwrap_or_default();
-                let verdict = record_str(record, "verdict");
-                if proven_batch2.contains(connector) {
-                    verdict == Some("pass")
-                } else {
-                    verdict == Some("fail")
-                }
-            }),
-        "Batch 2 readme_status_match should pass only for PROVEN connectors: {jsonl}"
-    );
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") != Some("readme_status_match"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 2 should pass every check other than readme_status_match: {jsonl}"
-    );
-
-    let connectors = records
-        .iter()
-        .filter_map(|record| record_str(record, "connector"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(connectors, BTreeSet::from(BATCH2_CONNECTORS));
-
-    let checks = records
-        .iter()
-        .filter_map(|record| record_str(record, "check"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        checks,
-        EXPECTED_CHECKS
-            .iter()
-            .map(|(check, _)| *check)
-            .collect::<BTreeSet<_>>()
+    assert_batch_status_run(
+        "batch2",
+        "Batch 2",
+        &gauntlet_script_roster("BATCH2_CONNECTORS"),
     );
 }
 
 #[test]
 fn batch3_status_runner_writes_status_markdown() {
-    let fixture_root = unique_fixture_root("batch3-status");
-    fs::create_dir_all(&fixture_root).expect("fixture root should be creatable");
-    let status_path = fixture_root.join("batch3_status.md");
-    let jsonl_path = fixture_root.join("batch3_status.jsonl");
-    let output = run_gauntlet(vec![
-        OsString::from("--jsonl"),
-        jsonl_path.as_os_str().to_os_string(),
-        OsString::from("--batch"),
-        OsString::from("batch3"),
-        OsString::from("--status-md"),
-        status_path.as_os_str().to_os_string(),
-    ]);
-    assert!(
-        output.status.success(),
-        "batch3 status run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let status_doc =
-        fs::read_to_string(&status_path).expect("batch3 status markdown should be written");
-    assert!(status_doc.contains("# Batch 3 Graduation Status"));
-    assert!(status_doc.contains("scripts/graduation/run_gauntlet.sh --batch batch3"));
-    assert!(status_doc.contains("Summary: `2/4` Batch 3 connectors currently pass"));
-    assert!(status_doc.contains("Promotion status: `2/4` Batch 3 connectors are PROVEN"));
-    assert!(status_doc.contains("`2/4` still pass every check before `readme_status_match`"));
-    for connector in BATCH3_CONNECTORS {
-        assert!(
-            status_doc.contains(connector),
-            "status doc should mention {connector}"
-        );
-    }
-
-    let jsonl = fs::read_to_string(&jsonl_path).expect("batch3 JSONL should be written");
-    let records = jsonl
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record"))
-        .collect::<Vec<_>>();
-    // Two connectors (deepseek, huggingface) are PROVEN and run all 12 checks;
-    // the other two (google-ai, llm-router) stop at `readme_status_match`
-    // (check 8): 2 * 12 + 2 * 8 = 40 records.
-    assert_eq!(records.len(), 2 * 12 + 2 * 8);
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") == Some("connector_path"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 3 connector paths should exist: {jsonl}"
-    );
-    let proven_batch3 = BTreeSet::from(["connectors/deepseek", "connectors/huggingface"]);
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") == Some("readme_status_match"))
-            .all(|record| {
-                let connector = record_str(record, "connector").unwrap_or_default();
-                let verdict = record_str(record, "verdict");
-                if proven_batch3.contains(connector) {
-                    verdict == Some("pass")
-                } else {
-                    verdict == Some("fail")
-                }
-            }),
-        "Batch 3 readme_status_match should pass only for PROVEN connectors: {jsonl}"
-    );
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") != Some("readme_status_match"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 3 should pass every check other than readme_status_match: {jsonl}"
-    );
-
-    let connectors = records
-        .iter()
-        .filter_map(|record| record_str(record, "connector"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(connectors, BTreeSet::from(BATCH3_CONNECTORS));
-
-    let checks = records
-        .iter()
-        .filter_map(|record| record_str(record, "check"))
-        .collect::<BTreeSet<_>>();
-    // The two PROVEN connectors run the full 12-check ladder.
-    assert_eq!(
-        checks,
-        EXPECTED_CHECKS
-            .iter()
-            .map(|(check, _)| *check)
-            .collect::<BTreeSet<_>>()
+    assert_batch_status_run(
+        "batch3",
+        "Batch 3",
+        &gauntlet_script_roster("BATCH3_CONNECTORS"),
     );
 }
 
 #[test]
 fn batch4_inventory_scans_current_long_tail() {
+    // The exclusion list in batch4_inventory.sh must stay in sync with the
+    // batch1-3 rosters in run_gauntlet.sh, or connectors leak across batches.
+    let excluded = batch1_to_3_exclusion();
+    let gauntlet_prior = [
+        "BATCH1_CONNECTORS",
+        "BATCH2_CONNECTORS",
+        "BATCH3_CONNECTORS",
+    ]
+    .iter()
+    .flat_map(|array| gauntlet_script_roster(array))
+    .map(|path| path.trim_start_matches("connectors/").to_string())
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        excluded, gauntlet_prior,
+        "batch4_inventory.sh BATCH1_TO_3_CONNECTORS must equal the run_gauntlet.sh batch1-3 \
+         rosters"
+    );
+
+    // --count must agree with the plain list.
     let count_output = Command::new("bash")
         .current_dir(workspace_root())
         .arg(batch4_inventory_runner())
@@ -682,23 +727,44 @@ fn batch4_inventory_scans_current_long_tail() {
         String::from_utf8_lossy(&count_output.stdout),
         String::from_utf8_lossy(&count_output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&count_output.stdout).trim(), "23");
-
-    let list_output = Command::new("bash")
-        .current_dir(workspace_root())
-        .arg(batch4_inventory_runner())
-        .output()
-        .expect("batch4 inventory runner should list connectors");
-    assert!(
-        list_output.status.success(),
-        "batch4 inventory list failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&list_output.stdout),
-        String::from_utf8_lossy(&list_output.stderr)
+    let count = String::from_utf8_lossy(&count_output.stdout)
+        .trim()
+        .parse::<usize>()
+        .expect("batch4 inventory --count should print an integer");
+    let connectors = batch4_inventory_list().into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        count,
+        connectors.len(),
+        "--count must equal the number of listed connectors"
     );
-    let list_stdout = String::from_utf8_lossy(&list_output.stdout);
-    let connectors = list_stdout.lines().collect::<BTreeSet<_>>();
-    assert_eq!(connectors, BTreeSet::from(BATCH4_CONNECTORS));
 
+    // Membership must equal exactly the on-disk long tail: every listed
+    // connector is genuinely long-tail per its README status, and every
+    // non-excluded connector on disk that is NOT listed has a non-long-tail
+    // status. The second direction keeps a scanner regression (silently
+    // finding fewer files) distinguishable from real graduations.
+    let connectors_dir = workspace_root().join("connectors");
+    for entry in fs::read_dir(&connectors_dir).expect("connectors directory should be readable") {
+        let entry = entry.expect("connector directory entry should be readable");
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if excluded.contains(&name) {
+            continue;
+        }
+        let path = format!("connectors/{name}");
+        let long_tail = is_long_tail_status(readme_status_line(&entry.path()).as_deref());
+        assert_eq!(
+            connectors.contains(&path),
+            long_tail,
+            "inventory membership mismatch for {path}: listed={} long_tail={long_tail}",
+            connectors.contains(&path),
+        );
+    }
+
+    // --markdown must emit exactly one row per listed connector, carrying its
+    // path and current README status text.
     let markdown_output = Command::new("bash")
         .current_dir(workspace_root())
         .arg(batch4_inventory_runner())
@@ -712,82 +778,30 @@ fn batch4_inventory_scans_current_long_tail() {
         String::from_utf8_lossy(&markdown_output.stderr)
     );
     let markdown = String::from_utf8_lossy(&markdown_output.stdout);
-    assert!(markdown.contains("| `ai-ml` | `connectors/anthropic-vertex` | NO_STATUS |"));
-    assert!(
-        markdown.contains("| `messaging-social` | `connectors/tlon` | implemented runtime surface; incubating provider maturity |")
+    let rows = markdown
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        connectors.len(),
+        "markdown should carry one row per long-tail connector:\n{markdown}"
     );
+    for connector in &connectors {
+        let status = readme_status_line(&workspace_root().join(connector))
+            .unwrap_or_else(|| "NO_STATUS".to_string());
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("`{connector}`")) && row.contains(&status)),
+            "markdown row for {connector} should carry status {status:?}:\n{markdown}"
+        );
+    }
 }
 
 #[test]
 fn batch4_status_runner_writes_status_markdown() {
-    let fixture_root = unique_fixture_root("batch4-status");
-    fs::create_dir_all(&fixture_root).expect("fixture root should be creatable");
-    let status_path = fixture_root.join("batch4_status.md");
-    let jsonl_path = fixture_root.join("batch4_status.jsonl");
-    let output = run_gauntlet(vec![
-        OsString::from("--jsonl"),
-        jsonl_path.as_os_str().to_os_string(),
-        OsString::from("--batch"),
-        OsString::from("batch4"),
-        OsString::from("--status-md"),
-        status_path.as_os_str().to_os_string(),
-    ]);
-    assert!(
-        output.status.success(),
-        "batch4 status run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let status_doc =
-        fs::read_to_string(&status_path).expect("batch4 status markdown should be written");
-    assert!(status_doc.contains("# Batch 4 Graduation Status"));
-    assert!(status_doc.contains("scripts/graduation/run_gauntlet.sh --batch batch4"));
-    assert!(status_doc.contains("Summary: `0/23` Batch 4 connectors currently pass"));
-    assert!(status_doc.contains(
-        "Pre-promotion status: `23/23` Batch 4 connectors pass every check before \
-         `readme_status_match`"
-    ));
-    assert!(status_doc.contains("every connector is still blocked at `readme_status_match`"));
-    for connector in BATCH4_CONNECTORS {
-        assert!(
-            status_doc.contains(connector),
-            "status doc should mention {connector}"
-        );
-    }
-
-    let jsonl = fs::read_to_string(&jsonl_path).expect("batch4 JSONL should be written");
-    let records = jsonl
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record"))
-        .collect::<Vec<_>>();
-    // All 23 connectors now pass the seven pre-promotion checks and stop at
-    // `readme_status_match` (check 8): 23 * 8 = 184 records.
-    assert_eq!(records.len(), BATCH4_CONNECTORS.len() * 8);
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| {
-                record_str(record, "check") == Some("readme_status_match")
-                    && record_str(record, "verdict") == Some("fail")
-            })
-            .count(),
-        BATCH4_CONNECTORS.len(),
-        "Batch 4 should block every connector at PROVEN-status promotion: {jsonl}"
-    );
-    assert!(
-        records
-            .iter()
-            .filter(|record| record_str(record, "check") != Some("readme_status_match"))
-            .all(|record| record_str(record, "verdict") == Some("pass")),
-        "Batch 4 should pass every check before readme_status_match: {jsonl}"
-    );
-
-    let connectors = records
-        .iter()
-        .filter_map(|record| record_str(record, "connector"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(connectors, BTreeSet::from(BATCH4_CONNECTORS));
+    let roster = batch4_inventory_list();
+    assert_batch_status_run("batch4", "Batch 4", &roster);
 }
 
 #[test]
