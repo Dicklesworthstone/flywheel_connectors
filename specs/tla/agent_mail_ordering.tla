@@ -60,7 +60,8 @@ Send ==
 \* already been delivered. This is the causal-ordering guard: deliver
 \* only when all causal predecessors are already in the inbox.
 Deliver ==
-    \E r \in Recipients, msg \in buffered[r] :
+    \E r \in Recipients :
+        \E msg \in buffered[r] :
         LET s == msg[1] IN
         LET seq == msg[2] IN
         /\ Len(messages_at[r][s]) = seq - 1

@@ -80,7 +80,8 @@ Spec == Init /\ [][Next]_vars /\ SF_vars(Replicate)
 \* the absence of any Remove action, but also assert structural
 \* well-formedness as an invariant.
 NoUnknownEntryHeld ==
-    \A r \in Replicas, seq \in held[r] : seq \in 1..Len(entries)
+    \A r \in Replicas :
+        \A seq \in held[r] : seq \in 1..Len(entries)
 
 ChainOrderConsistent ==
     \A i \in DOMAIN entries : entries[i] = i

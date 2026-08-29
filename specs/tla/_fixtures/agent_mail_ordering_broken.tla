@@ -43,7 +43,8 @@ Send ==
 \* that guard; deliver can fire on any buffered message regardless of
 \* whether its predecessors arrived first.
 Deliver ==
-    \E r \in Recipients, msg \in buffered[r] :
+    \E r \in Recipients :
+        \E msg \in buffered[r] :
         LET s == msg[1] IN
         LET seq == msg[2] IN
         /\ messages_at' = [messages_at EXCEPT

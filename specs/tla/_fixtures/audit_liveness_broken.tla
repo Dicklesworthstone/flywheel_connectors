@@ -52,7 +52,8 @@ Next == AppendEntry \/ Replicate
 Spec == Init /\ [][Next]_vars /\ SF_vars(Replicate)
 
 NoUnknownEntryHeld ==
-    \A r \in Replicas, seq \in held[r] : seq \in 1..Len(entries)
+    \A r \in Replicas :
+        \A seq \in held[r] : seq \in 1..Len(entries)
 
 ChainOrderConsistent ==
     \A i \in DOMAIN entries : entries[i] = i
