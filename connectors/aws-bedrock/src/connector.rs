@@ -83,6 +83,15 @@ impl std::fmt::Debug for BedrockConfig {
         f.debug_struct("BedrockConfig")
             .field("region", &self.region)
             .field("auth", &self.auth)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("runtime_base_url", &self.runtime_base_url)
+            .field("control_base_url", &self.control_base_url)
+            .field(
+                "mantle_bearer_token",
+                &self.mantle_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("mantle_base_url", &self.mantle_base_url)
             .finish()
     }
 }
@@ -171,9 +180,11 @@ impl BedrockConfig {
             control_base_url: self.control_base_url.clone(),
             mantle_base_url: self.mantle_base_url.clone(),
             default_control_plane_would_touch_aws: self.control_base_url.is_none(),
-            aws_sigv4_supported: !self.auth.access_key_id.is_empty(),
-            mantle_bearer_supported: self.mantle_bearer_token.is_some(),
-            event_stream_decoder_supported: true,
+            supported: AuthSupport {
+                aws_sigv4: !self.auth.access_key_id.is_empty(),
+                mantle_bearer: self.mantle_bearer_token.is_some(),
+                event_stream_decoder: true,
+            },
         }
     }
 }
@@ -243,9 +254,15 @@ pub struct ProvisioningReadiness {
     control_base_url: Option<String>,
     mantle_base_url: Option<String>,
     default_control_plane_would_touch_aws: bool,
-    aws_sigv4_supported: bool,
-    mantle_bearer_supported: bool,
-    event_stream_decoder_supported: bool,
+    supported: AuthSupport,
+}
+
+/// Capability support flags for the provisioning readiness report.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AuthSupport {
+    aws_sigv4: bool,
+    mantle_bearer: bool,
+    event_stream_decoder: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -388,8 +405,8 @@ impl BedrockConnector {
         if let Some(readiness) = &provisioning {
             checks.push(DoctorCheck {
                 name: "request_signing".into(),
-                passed: readiness.aws_sigv4_supported || readiness.mantle_bearer_supported,
-                message: Some(if readiness.aws_sigv4_supported {
+                passed: readiness.supported.aws_sigv4 || readiness.supported.mantle_bearer,
+                message: Some(if readiness.supported.aws_sigv4 {
                     "SigV4 signing is active for Bedrock Runtime and control-plane calls".into()
                 } else {
                     "SigV4 signing is not configured; only Mantle bearer-token operations are available".into()
@@ -398,8 +415,8 @@ impl BedrockConnector {
             });
             checks.push(DoctorCheck {
                 name: "mantle_bearer_auth".into(),
-                passed: readiness.mantle_bearer_supported,
-                message: Some(if readiness.mantle_bearer_supported {
+                passed: readiness.supported.mantle_bearer,
+                message: Some(if readiness.supported.mantle_bearer {
                     "Bedrock Mantle bearer-token route is configured".into()
                 } else {
                     "Bedrock Mantle bearer-token route is not configured".into()
@@ -408,7 +425,7 @@ impl BedrockConnector {
             });
             checks.push(DoctorCheck {
                 name: "event_stream_decoder".into(),
-                passed: readiness.event_stream_decoder_supported,
+                passed: readiness.supported.event_stream_decoder,
                 message: Some("AWS event-stream decoder validates prelude and message CRCs".into()),
                 critical: true,
             });
@@ -429,7 +446,7 @@ impl BedrockConnector {
     fn attach_self_check_details(
         &self,
         mut report: SelfCheckReport,
-        provisioning: Option<ProvisioningReadiness>,
+        provisioning: Option<&ProvisioningReadiness>,
     ) -> SelfCheckReport {
         report.details = Some(json!({
             "configured": self.config.is_some(),
@@ -796,14 +813,12 @@ fn input_schema_for(operation_id: &str) -> Value {
         OP_CONVERSE | OP_CONVERSE_STREAM => converse_input_schema(),
         OP_INVOKE_MODEL | OP_INVOKE_MODEL_STREAM => invoke_model_input_schema(),
         OP_MODELS_LIST => list_models_input_schema(),
-        OP_HEALTH => empty_input_schema(),
         _ => empty_input_schema(),
     }
 }
 
 fn output_schema_for(operation_id: &str) -> Value {
     match operation_id {
-        OP_CONVERSE | OP_INVOKE_MODEL => provider_json_output_schema(),
         OP_CONVERSE_STREAM | OP_INVOKE_MODEL_STREAM => stream_output_schema(),
         OP_MODELS_LIST => models_list_output_schema(),
         OP_HEALTH => health_output_schema(),
@@ -930,7 +945,6 @@ impl FcpConnector for BedrockConnector {
             cfg.mantle_bearer_token.clone(), // ubs:ignore - passes caller-supplied credential to HTTP client
             cfg.mantle_base_url.clone(),
         )
-        .await
         .map_err(|error| FcpError::Internal {
             message: format!("Client init: {error}"),
         })?;
@@ -1023,7 +1037,7 @@ impl FcpConnector for BedrockConnector {
                     "client_missing",
                     "Bedrock HTTP client not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
         let Some(runtime) = &self.runtime else {
@@ -1032,7 +1046,7 @@ impl FcpConnector for BedrockConnector {
                     "runtime_missing",
                     "ConnectorRuntime not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
         if config.control_base_url.is_none() {
@@ -1041,7 +1055,7 @@ impl FcpConnector for BedrockConnector {
                     "self_check_unsupported_on_default_bedrock",
                     "self_check abstains against the default Bedrock control-plane endpoint to avoid hitting production with operator credentials; set control_base_url to a staging endpoint or local HTTP verifier",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         }
         let report = match client.health_check(runtime).await {
@@ -1055,7 +1069,7 @@ impl FcpConnector for BedrockConnector {
             }
             Err(error) => SelfCheckReport::failed("self_check_failed", error.to_string()),
         };
-        Ok(self.attach_self_check_details(report, Some(provisioning)))
+        Ok(self.attach_self_check_details(report, Some(&provisioning)))
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
@@ -1165,53 +1179,53 @@ impl BedrockConnector {
 
         let output = match operation {
             OP_CONVERSE => {
-                let input: ConverseInput =
-                    serde_json::from_value(req.input.clone()).map_err(invalid_invoke_input)?;
+                let input: ConverseInput = serde_json::from_value(req.input.clone())
+                    .map_err(|error| invalid_invoke_input(&error))?;
                 client
                     .converse(runtime, &input)
                     .await
                     .map_err(|error| error.to_fcp_error())?
             }
             OP_CONVERSE_STREAM => {
-                let input: ConverseInput =
-                    serde_json::from_value(req.input.clone()).map_err(invalid_invoke_input)?;
+                let input: ConverseInput = serde_json::from_value(req.input.clone())
+                    .map_err(|error| invalid_invoke_input(&error))?;
                 serde_json::to_value(
                     client
                         .converse_stream(runtime, &input)
                         .await
                         .map_err(|error| error.to_fcp_error())?,
                 )
-                .map_err(serialize_error)?
+                .map_err(|error| serialize_error(&error))?
             }
             OP_INVOKE_MODEL => {
-                let input: InvokeModelInput =
-                    serde_json::from_value(req.input.clone()).map_err(invalid_invoke_input)?;
+                let input: InvokeModelInput = serde_json::from_value(req.input.clone())
+                    .map_err(|error| invalid_invoke_input(&error))?;
                 client
                     .invoke_model(runtime, &input)
                     .await
                     .map_err(|error| error.to_fcp_error())?
             }
             OP_INVOKE_MODEL_STREAM => {
-                let input: InvokeModelInput =
-                    serde_json::from_value(req.input.clone()).map_err(invalid_invoke_input)?;
+                let input: InvokeModelInput = serde_json::from_value(req.input.clone())
+                    .map_err(|error| invalid_invoke_input(&error))?;
                 serde_json::to_value(
                     client
                         .invoke_model_stream(runtime, &input)
                         .await
                         .map_err(|error| error.to_fcp_error())?,
                 )
-                .map_err(serialize_error)?
+                .map_err(|error| serialize_error(&error))?
             }
             OP_MODELS_LIST => {
-                let input: ListModelsInput =
-                    serde_json::from_value(req.input.clone()).map_err(invalid_invoke_input)?;
+                let input: ListModelsInput = serde_json::from_value(req.input.clone())
+                    .map_err(|error| invalid_invoke_input(&error))?;
                 serde_json::to_value(
                     client
                         .list_models(runtime, &input)
                         .await
                         .map_err(|error| error.to_fcp_error())?,
                 )
-                .map_err(serialize_error)?
+                .map_err(|error| serialize_error(&error))?
             }
             OP_HEALTH => serde_json::to_value(
                 client
@@ -1219,7 +1233,7 @@ impl BedrockConnector {
                     .await
                     .map_err(|error| error.to_fcp_error())?,
             )
-            .map_err(serialize_error)?,
+            .map_err(|error| serialize_error(&error))?,
             _ => {
                 return Err(FcpError::InvalidRequest {
                     code: 1004,
@@ -1232,14 +1246,14 @@ impl BedrockConnector {
     }
 }
 
-fn invalid_invoke_input(error: serde_json::Error) -> FcpError {
+fn invalid_invoke_input(error: &serde_json::Error) -> FcpError {
     FcpError::InvalidRequest {
         code: 1003,
         message: format!("Invalid invoke input: {error}"),
     }
 }
 
-fn serialize_error(error: serde_json::Error) -> FcpError {
+fn serialize_error(error: &serde_json::Error) -> FcpError {
     FcpError::Internal {
         message: format!("Failed to serialize response: {error}"),
     }

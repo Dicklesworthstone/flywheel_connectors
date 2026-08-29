@@ -1,6 +1,6 @@
 //! Gated live verification for the AWS Bedrock connector.
 //!
-//! Set `AWS_BEDROCK_E2E=1` plus the AWS_BEDROCK_* credential/model variables to
+//! Set `AWS_BEDROCK_E2E=1` plus the `AWS_BEDROCK_*` credential/model variables to
 //! run this against real Bedrock endpoints. Without the gate or required
 //! variables, the test emits a redaction-safe structured skip line.
 

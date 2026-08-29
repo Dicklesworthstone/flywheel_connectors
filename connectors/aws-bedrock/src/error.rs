@@ -182,8 +182,10 @@ pub fn bedrock_error_from_status(status: u16, body: &str) -> BedrockError {
                 .and_then(|error| error.get("type"))
         })
         .and_then(serde_json::Value::as_str)
-        .map(|value| value.rsplit('#').next().unwrap_or(value).to_string())
-        .unwrap_or_else(|| format!("HTTP {status}"));
+        .map_or_else(
+            || format!("HTTP {status}"),
+            |value| value.rsplit('#').next().unwrap_or(value).to_string(),
+        );
     let message = parsed
         .as_ref()
         .and_then(|value| value.get("message"))
@@ -195,8 +197,7 @@ pub fn bedrock_error_from_status(status: u16, body: &str) -> BedrockError {
                 .and_then(|error| error.get("message"))
         })
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| body.to_string());
+        .map_or_else(|| body.to_string(), str::to_string);
 
     match status {
         401 | 403 => BedrockError::Unauthorized(message),

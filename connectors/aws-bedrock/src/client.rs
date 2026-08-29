@@ -32,14 +32,23 @@ pub struct BedrockClient {
 impl std::fmt::Debug for BedrockClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BedrockClient")
-            .field("region", &self.region)
+            .field("client", &self.client)
             .field("auth", &self.auth)
+            .field("region", &self.region)
+            .field("retry_config", &self.retry_config)
+            .field("runtime_base_url", &self.runtime_base_url)
+            .field("control_base_url", &self.control_base_url)
+            .field(
+                "mantle_bearer_token",
+                &self.mantle_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("mantle_base_url", &self.mantle_base_url)
             .finish()
     }
 }
 
 impl BedrockClient {
-    pub async fn new(
+    pub fn new(
         auth: BedrockAuth,
         region: &str,
         retry_config: HttpRetryConfig,
@@ -614,7 +623,10 @@ fn percent_encode_query(value: &str) -> String {
                 encoded.push(byte as char);
             }
             b' ' => encoded.push_str("%20"),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
+            _ => {
+                use std::fmt::Write as _;
+                write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+            }
         }
     }
     encoded
@@ -690,7 +702,7 @@ fn sign_request(
     } else {
         SignableRequest::hash_payload(payload)
     };
-    let signed = signer.sign(&SignableRequest {
+    let signed_request = signer.sign(&SignableRequest {
         method: method.to_string(),
         uri: parsed.path().to_string(),
         query_params,
@@ -700,14 +712,14 @@ fn sign_request(
 
     let mut req = with_static_request_header(
         with_static_request_header(
-            with_static_request_header(req, "Authorization", &signed.authorization),
+            with_static_request_header(req, "Authorization", &signed_request.authorization),
             "X-Amz-Date",
-            &signed.x_amz_date,
+            &signed_request.x_amz_date,
         ),
         "X-Amz-Content-Sha256",
         &payload_hash,
     );
-    if let Some(token) = &signed.x_amz_security_token {
+    if let Some(token) = &signed_request.x_amz_security_token {
         req = with_static_request_header(req, "X-Amz-Security-Token", token);
     }
     req
@@ -822,7 +834,10 @@ fn classify_error<T>(
     if status == 429 {
         return AttemptOutcome::Retryable {
             error: BedrockError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
