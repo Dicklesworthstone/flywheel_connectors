@@ -272,6 +272,14 @@ fn test_broken_spec_caught_by_tlc() {
         return;
     };
     let root = repo_root();
+    let jar = {
+        let candidate = std::path::Path::new(&jar);
+        if candidate.is_absolute() {
+            jar
+        } else {
+            root.join(candidate).display().to_string()
+        }
+    };
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time after UNIX_EPOCH")
@@ -280,16 +288,14 @@ fn test_broken_spec_caught_by_tlc() {
         "fcp-tla-capability-lifecycle-broken-{}-{now_nanos}",
         std::process::id()
     ));
-    let cfg = root
-        .join("specs/tla/capability_lifecycle.cfg")
-        .display()
-        .to_string();
-    let spec = root
-        .join("specs/tla/_fixtures/capability_lifecycle_broken.tla")
-        .display()
-        .to_string();
     let metadir = metadir.display().to_string();
+    // TLC v1.7.4 (TLC2 2.19) cannot resolve the spec through an absolute
+    // path: it then fails to read the configuration file with a misleading
+    // "File not found" ConfigFileException. Run with the repo root as the
+    // working directory and pass the cfg/spec as relative paths; the jar
+    // may stay absolute.
     let output = Command::new("java")
+        .current_dir(&root)
         .args([
             "-cp",
             jar.as_str(),
@@ -298,8 +304,8 @@ fn test_broken_spec_caught_by_tlc() {
             "-metadir",
             metadir.as_str(),
             "-config",
-            cfg.as_str(),
-            spec.as_str(),
+            "specs/tla/capability_lifecycle.cfg",
+            "specs/tla/_fixtures/capability_lifecycle_broken.tla",
         ])
         .output()
         .expect("TLC failure smoke launches java");
