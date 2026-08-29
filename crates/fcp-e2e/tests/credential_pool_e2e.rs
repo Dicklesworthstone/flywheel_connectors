@@ -92,7 +92,7 @@ impl RegistryBackedCredentialLeaseClient {
                     credential_id,
                     Some(CredentialCooldown::Until { until }),
                 )
-                .map_err(map_pool_client_error)?;
+                .map_err(|error| map_pool_client_error(&error))?;
         }
         drop(registry);
         self.push_event(
@@ -113,7 +113,7 @@ impl RegistryBackedCredentialLeaseClient {
         for credential_id in [credential_id(1), credential_id(2), credential_id(3)] {
             registry
                 .set_cooldown(&self.key, credential_id, None)
-                .map_err(map_pool_client_error)?;
+                .map_err(|error| map_pool_client_error(&error))?;
         }
         Ok(())
     }
@@ -307,7 +307,7 @@ impl CredentialLeaseClient for RegistryBackedCredentialLeaseClient {
         let mut registry = self.registry_lock()?;
         let released_id = registry
             .release(&self.key, host_token)
-            .map_err(map_pool_client_error)?;
+            .map_err(|error| map_pool_client_error(&error))?;
         if released_id != release.credential_id {
             return Err(CredentialLeaseClientError::invalid(
                 "credential lease release id mismatch",
@@ -339,7 +339,7 @@ impl CredentialLeaseClient for RegistryBackedCredentialLeaseClient {
         let mut registry = self.registry_lock()?;
         let reported_id = registry
             .report_error(&self.key, host_token, kind, retry_after, now)
-            .map_err(map_pool_client_error)?;
+            .map_err(|error| map_pool_client_error(&error))?;
         if reported_id != report.credential_id {
             return Err(CredentialLeaseClientError::invalid(
                 "credential error report id mismatch",
