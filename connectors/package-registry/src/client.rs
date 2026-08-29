@@ -46,6 +46,7 @@ pub struct PackageRegistryClient {
 impl std::fmt::Debug for PackageRegistryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PackageRegistryClient")
+            .field("client", &self.client)
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
@@ -55,6 +56,12 @@ impl std::fmt::Debug for PackageRegistryClient {
 }
 
 impl PackageRegistryClient {
+    /// Create a package-registry client for the given provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the HTTP client cannot be built or the base URL
+    /// is invalid.
     pub fn new(
         provider: RegistryProvider,
         base_url: String,
@@ -82,6 +89,12 @@ impl PackageRegistryClient {
         self.token.is_none()
     }
 
+    /// Run a lightweight health check against the configured registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on transport failure, a non-2xx response, or an
+    /// unsupported provider operation.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> Result<Value> {
         match self.provider {
             RegistryProvider::Npm => self
@@ -134,6 +147,12 @@ impl PackageRegistryClient {
         }
     }
 
+    /// Search the registry for packages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, a non-2xx
+    /// response, or if the provider does not support search.
     pub async fn search(
         &self,
         runtime: &ConnectorRuntime,
@@ -238,6 +257,12 @@ impl PackageRegistryClient {
         }
     }
 
+    /// Fetch package metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, or a non-2xx
+    /// response.
     pub async fn get_package(
         &self,
         runtime: &ConnectorRuntime,
@@ -246,120 +271,144 @@ impl PackageRegistryClient {
         let name = validate_name(name)?;
 
         match self.provider {
-            RegistryProvider::Npm => {
-                let payload = self.npm_packument(runtime, name).await?;
-                let latest = latest_npm_version(&payload);
-                let latest_payload = latest
-                    .as_ref()
-                    .and_then(|version| npm_version_payload(&payload, version))
-                    .cloned();
-
-                let owners = payload
-                    .get("maintainers")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| {
-                                str_field(item, "name").or_else(|| str_field(item, "username"))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                Ok(PackageMetadata {
-                    provider: self.provider,
-                    name: str_field(&payload, "name").unwrap_or_else(|| name.to_string()),
-                    normalized_name: name.to_string(),
-                    latest_version: latest,
-                    description: str_field(&payload, "description").or_else(|| {
-                        latest_payload
-                            .as_ref()
-                            .and_then(|item| str_field(item, "description"))
-                    }),
-                    homepage: str_field(&payload, "homepage").or_else(|| {
-                        latest_payload
-                            .as_ref()
-                            .and_then(|item| repository_or_url(item, "homepage"))
-                    }),
-                    documentation: latest_payload
-                        .as_ref()
-                        .and_then(|item| repository_or_url(item, "documentation")),
-                    repository: repository_or_url(&payload, "repository").or_else(|| {
-                        latest_payload
-                            .as_ref()
-                            .and_then(|item| repository_or_url(item, "repository"))
-                    }),
-                    license: stringish_field(&payload, "license").or_else(|| {
-                        latest_payload
-                            .as_ref()
-                            .and_then(|item| stringish_field(item, "license"))
-                    }),
-                    keywords: array_of_strings(payload.get("keywords")),
-                    owners,
-                    extra: Some(json!({
-                        "dist_tags": payload.get("dist-tags").cloned().unwrap_or(Value::Null),
-                    })),
-                })
-            }
-            RegistryProvider::Pypi => {
-                let payload = self.pypi_project(runtime, name).await?;
-                let info = payload.get("info").cloned().unwrap_or(Value::Null);
-                Ok(PackageMetadata {
-                    provider: self.provider,
-                    name: str_field(&info, "name").unwrap_or_else(|| normalize_pypi_name(name)),
-                    normalized_name: normalize_pypi_name(name),
-                    latest_version: str_field(&info, "version"),
-                    description: str_field(&info, "summary"),
-                    homepage: nested_str_field(&info, &["project_urls", "Homepage"])
-                        .or_else(|| str_field(&info, "home_page")),
-                    documentation: str_field(&info, "docs_url"),
-                    repository: nested_str_field(&info, &["project_urls", "Source"])
-                        .or_else(|| nested_str_field(&info, &["project_urls", "Repository"])),
-                    license: str_field(&info, "license"),
-                    keywords: split_keywords(str_field(&info, "keywords").as_deref()),
-                    owners: Vec::new(),
-                    extra: Some(json!({
-                        "requires_python": info.get("requires_python").cloned().unwrap_or(Value::Null),
-                        "project_urls": info.get("project_urls").cloned().unwrap_or(Value::Null),
-                    })),
-                })
-            }
-            RegistryProvider::CratesIo => {
-                let payload = self.crates_details(runtime, name).await?;
-                let krate = payload.get("crate").cloned().unwrap_or(Value::Null);
-                let owners = self.crates_owners(runtime, name).await.unwrap_or_default();
-                Ok(PackageMetadata {
-                    provider: self.provider,
-                    name: str_field(&krate, "name").unwrap_or_else(|| name.to_string()),
-                    normalized_name: name.to_string(),
-                    latest_version: str_field(&krate, "max_version"),
-                    description: str_field(&krate, "description"),
-                    homepage: str_field(&krate, "homepage"),
-                    documentation: str_field(&krate, "documentation"),
-                    repository: str_field(&krate, "repository"),
-                    license: None,
-                    keywords: payload
-                        .get("keywords")
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| str_field(item, "keyword"))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    owners,
-                    extra: Some(json!({
-                        "downloads": krate.get("downloads").cloned().unwrap_or(Value::Null),
-                        "recent_downloads": krate.get("recent_downloads").cloned().unwrap_or(Value::Null),
-                        "trustpub_only": krate.get("trustpub_only").cloned().unwrap_or(Value::Null),
-                    })),
-                })
-            }
+            RegistryProvider::Npm => self.get_package_npm(runtime, name).await,
+            RegistryProvider::Pypi => self.get_package_pypi(runtime, name).await,
+            RegistryProvider::CratesIo => self.get_package_crates_io(runtime, name).await,
         }
     }
 
+    async fn get_package_npm(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+    ) -> Result<PackageMetadata> {
+        let payload = self.npm_packument(runtime, name).await?;
+        let latest = latest_npm_version(&payload);
+        let latest_payload = latest
+            .as_ref()
+            .and_then(|version| npm_version_payload(&payload, version))
+            .cloned();
+
+        let owners = payload
+            .get("maintainers")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        str_field(item, "name").or_else(|| str_field(item, "username"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(PackageMetadata {
+            provider: self.provider,
+            name: str_field(&payload, "name").unwrap_or_else(|| name.to_string()),
+            normalized_name: name.to_string(),
+            latest_version: latest,
+            description: str_field(&payload, "description").or_else(|| {
+                latest_payload
+                    .as_ref()
+                    .and_then(|item| str_field(item, "description"))
+            }),
+            homepage: str_field(&payload, "homepage").or_else(|| {
+                latest_payload
+                    .as_ref()
+                    .and_then(|item| repository_or_url(item, "homepage"))
+            }),
+            documentation: latest_payload
+                .as_ref()
+                .and_then(|item| repository_or_url(item, "documentation")),
+            repository: repository_or_url(&payload, "repository").or_else(|| {
+                latest_payload
+                    .as_ref()
+                    .and_then(|item| repository_or_url(item, "repository"))
+            }),
+            license: stringish_field(&payload, "license").or_else(|| {
+                latest_payload
+                    .as_ref()
+                    .and_then(|item| stringish_field(item, "license"))
+            }),
+            keywords: array_of_strings(payload.get("keywords")),
+            owners,
+            extra: Some(json!({
+                "dist_tags": payload.get("dist-tags").cloned().unwrap_or(Value::Null),
+            })),
+        })
+    }
+
+    async fn get_package_pypi(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+    ) -> Result<PackageMetadata> {
+        let payload = self.pypi_project(runtime, name).await?;
+        let info = payload.get("info").cloned().unwrap_or(Value::Null);
+        Ok(PackageMetadata {
+            provider: self.provider,
+            name: str_field(&info, "name").unwrap_or_else(|| normalize_pypi_name(name)),
+            normalized_name: normalize_pypi_name(name),
+            latest_version: str_field(&info, "version"),
+            description: str_field(&info, "summary"),
+            homepage: nested_str_field(&info, &["project_urls", "Homepage"])
+                .or_else(|| str_field(&info, "home_page")),
+            documentation: str_field(&info, "docs_url"),
+            repository: nested_str_field(&info, &["project_urls", "Source"])
+                .or_else(|| nested_str_field(&info, &["project_urls", "Repository"])),
+            license: str_field(&info, "license"),
+            keywords: split_keywords(str_field(&info, "keywords").as_deref()),
+            owners: Vec::new(),
+            extra: Some(json!({
+                "requires_python": info.get("requires_python").cloned().unwrap_or(Value::Null),
+                "project_urls": info.get("project_urls").cloned().unwrap_or(Value::Null),
+            })),
+        })
+    }
+
+    async fn get_package_crates_io(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+    ) -> Result<PackageMetadata> {
+        let payload = self.crates_details(runtime, name).await?;
+        let krate = payload.get("crate").cloned().unwrap_or(Value::Null);
+        let owners = self.crates_owners(runtime, name).await.unwrap_or_default();
+        Ok(PackageMetadata {
+            provider: self.provider,
+            name: str_field(&krate, "name").unwrap_or_else(|| name.to_string()),
+            normalized_name: name.to_string(),
+            latest_version: str_field(&krate, "max_version"),
+            description: str_field(&krate, "description"),
+            homepage: str_field(&krate, "homepage"),
+            documentation: str_field(&krate, "documentation"),
+            repository: str_field(&krate, "repository"),
+            license: None,
+            keywords: payload
+                .get("keywords")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| str_field(item, "keyword"))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            owners,
+            extra: Some(json!({
+                "downloads": krate.get("downloads").cloned().unwrap_or(Value::Null),
+                "recent_downloads": krate.get("recent_downloads").cloned().unwrap_or(Value::Null),
+                "trustpub_only": krate.get("trustpub_only").cloned().unwrap_or(Value::Null),
+            })),
+        })
+    }
+
+    /// List published versions of a package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, or a non-2xx
+    /// response.
     pub async fn list_versions(
         &self,
         runtime: &ConnectorRuntime,
@@ -462,6 +511,12 @@ impl PackageRegistryClient {
         }
     }
 
+    /// Fetch the dependency list of a package version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, or a non-2xx
+    /// response.
     pub async fn get_dependencies(
         &self,
         runtime: &ConnectorRuntime,
@@ -471,119 +526,145 @@ impl PackageRegistryClient {
         let name = validate_name(name)?;
 
         match self.provider {
-            RegistryProvider::Npm => {
-                let payload = self.npm_packument(runtime, name).await?;
-                let version = resolve_npm_version(&payload, version)?;
-                let version_payload = npm_version_payload(&payload, &version).ok_or_else(|| {
-                    Error::NotFound(format!("npm version not found: {name}@{version}"))
-                })?;
-                let mut dependencies = collect_named_dependencies(
-                    version_payload.get("dependencies"),
-                    "dependency",
-                    false,
-                );
-                dependencies.extend(collect_named_dependencies(
-                    version_payload.get("peerDependencies"),
-                    "peer_dependency",
-                    false,
-                ));
-                dependencies.extend(collect_named_dependencies(
-                    version_payload.get("optionalDependencies"),
-                    "optional_dependency",
-                    true,
-                ));
-
-                Ok(DependenciesResponse {
-                    provider: self.provider,
-                    name: name.to_string(),
-                    version,
-                    dependencies,
-                })
-            }
-            RegistryProvider::Pypi => {
-                let version = version.map(ToOwned::to_owned).unwrap_or_default();
-                let payload = if version.is_empty() {
-                    self.pypi_project(runtime, name).await?
-                } else {
-                    self.pypi_release(runtime, name, &version).await?
-                };
-                let info = payload.get("info").cloned().unwrap_or(Value::Null);
-                let resolved_version = str_field(&info, "version").unwrap_or(version);
-                let dependencies = info
-                    .get("requires_dist")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(parse_pypi_requirement)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(DependenciesResponse {
-                    provider: self.provider,
-                    name: normalize_pypi_name(name),
-                    version: resolved_version,
-                    dependencies,
-                })
-            }
+            RegistryProvider::Npm => self.get_dependencies_npm(runtime, name, version).await,
+            RegistryProvider::Pypi => self.get_dependencies_pypi(runtime, name, version).await,
             RegistryProvider::CratesIo => {
-                let version = match version {
-                    Some(version) => version.to_string(),
-                    None => self
-                        .crates_details(runtime, name)
-                        .await?
-                        .get("crate")
-                        .and_then(|krate| str_field(krate, "max_version"))
-                        .ok_or_else(|| Error::NotFound(format!("crate not found: {name}")))?,
-                };
-
-                let path = format!(
-                    "/api/v1/crates/{}/{}{}",
-                    encode_segment(name)?,
-                    encode_segment(&version)?,
-                    "/dependencies"
-                );
-                let payload = self.get_json(runtime, &path, &[]).await?;
-                let dependencies = payload
-                    .get("dependencies")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .map(|item| DependencyInfo {
-                                name: str_field(item, "crate_id").unwrap_or_default(),
-                                requirement: str_field(item, "req"),
-                                kind: str_field(item, "kind"),
-                                optional: item.get("optional").and_then(Value::as_bool),
-                                target: str_field(item, "target"),
-                                features: item
-                                    .get("features")
-                                    .and_then(Value::as_array)
-                                    .map(|features| {
-                                        features
-                                            .iter()
-                                            .filter_map(Value::as_str)
-                                            .map(ToOwned::to_owned)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                raw: None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                Ok(DependenciesResponse {
-                    provider: self.provider,
-                    name: name.to_string(),
-                    version,
-                    dependencies,
-                })
+                self.get_dependencies_crates_io(runtime, name, version)
+                    .await
             }
         }
     }
 
+    async fn get_dependencies_npm(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<DependenciesResponse> {
+        let payload = self.npm_packument(runtime, name).await?;
+        let version = resolve_npm_version(&payload, version)?;
+        let version_payload = npm_version_payload(&payload, &version)
+            .ok_or_else(|| Error::NotFound(format!("npm version not found: {name}@{version}")))?;
+        let mut dependencies =
+            collect_named_dependencies(version_payload.get("dependencies"), "dependency", false);
+        dependencies.extend(collect_named_dependencies(
+            version_payload.get("peerDependencies"),
+            "peer_dependency",
+            false,
+        ));
+        dependencies.extend(collect_named_dependencies(
+            version_payload.get("optionalDependencies"),
+            "optional_dependency",
+            true,
+        ));
+
+        Ok(DependenciesResponse {
+            provider: self.provider,
+            name: name.to_string(),
+            version,
+            dependencies,
+        })
+    }
+
+    async fn get_dependencies_pypi(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<DependenciesResponse> {
+        let version = version.map(ToOwned::to_owned).unwrap_or_default();
+        let payload = if version.is_empty() {
+            self.pypi_project(runtime, name).await?
+        } else {
+            self.pypi_release(runtime, name, &version).await?
+        };
+        let info = payload.get("info").cloned().unwrap_or(Value::Null);
+        let resolved_version = str_field(&info, "version").unwrap_or(version);
+        let dependencies = info
+            .get("requires_dist")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(parse_pypi_requirement)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DependenciesResponse {
+            provider: self.provider,
+            name: normalize_pypi_name(name),
+            version: resolved_version,
+            dependencies,
+        })
+    }
+
+    async fn get_dependencies_crates_io(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<DependenciesResponse> {
+        let version = match version {
+            Some(version) => version.to_string(),
+            None => self
+                .crates_details(runtime, name)
+                .await?
+                .get("crate")
+                .and_then(|krate| str_field(krate, "max_version"))
+                .ok_or_else(|| Error::NotFound(format!("crate not found: {name}")))?,
+        };
+
+        let path = format!(
+            "/api/v1/crates/{}/{}{}",
+            encode_segment(name)?,
+            encode_segment(&version)?,
+            "/dependencies"
+        );
+        let payload = self.get_json(runtime, &path, &[]).await?;
+        let dependencies = payload
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| DependencyInfo {
+                        name: str_field(item, "crate_id").unwrap_or_default(),
+                        requirement: str_field(item, "req"),
+                        kind: str_field(item, "kind"),
+                        optional: item.get("optional").and_then(Value::as_bool),
+                        target: str_field(item, "target"),
+                        features: item
+                            .get("features")
+                            .and_then(Value::as_array)
+                            .map(|features| {
+                                features
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(ToOwned::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        raw: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(DependenciesResponse {
+            provider: self.provider,
+            name: name.to_string(),
+            version,
+            dependencies,
+        })
+    }
+
+    /// List downloadable artifacts for a package version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, or a non-2xx
+    /// response.
     pub async fn list_artifacts(
         &self,
         runtime: &ConnectorRuntime,
@@ -593,110 +674,136 @@ impl PackageRegistryClient {
         let name = validate_name(name)?;
 
         match self.provider {
-            RegistryProvider::Npm => {
-                let payload = self.npm_packument(runtime, name).await?;
-                let version = resolve_npm_version(&payload, version)?;
-                let version_payload = npm_version_payload(&payload, &version).ok_or_else(|| {
-                    Error::NotFound(format!("npm version not found: {name}@{version}"))
-                })?;
-                let dist = version_payload.get("dist").cloned().unwrap_or(Value::Null);
-                let artifact = ArtifactInfo {
-                    filename: Some(format!("{name}-{version}.tgz")),
-                    url: str_field(&dist, "tarball").unwrap_or_default(),
-                    checksum: str_field(&dist, "shasum"),
-                    integrity: str_field(&dist, "integrity"),
-                    size: u64_field(&dist, "unpackedSize"),
-                    packagetype: Some("tgz".into()),
-                    yanked: None,
-                };
-                Ok(ArtifactsResponse {
-                    provider: self.provider,
-                    name: name.to_string(),
-                    version,
-                    artifacts: vec![artifact],
-                })
-            }
-            RegistryProvider::Pypi => {
-                let version = version.map(ToOwned::to_owned).unwrap_or_default();
-                let payload = if version.is_empty() {
-                    self.pypi_project(runtime, name).await?
-                } else {
-                    self.pypi_release(runtime, name, &version).await?
-                };
-                let info = payload.get("info").cloned().unwrap_or(Value::Null);
-                let resolved_version = str_field(&info, "version").unwrap_or(version);
-                let artifacts = payload
-                    .get("urls")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .map(|item| ArtifactInfo {
-                                filename: str_field(item, "filename"),
-                                url: str_field(item, "url").unwrap_or_default(),
-                                checksum: nested_str_field(item, &["digests", "sha256"]),
-                                integrity: None,
-                                size: u64_field(item, "size"),
-                                packagetype: str_field(item, "packagetype"),
-                                yanked: item.get("yanked").and_then(Value::as_bool),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                Ok(ArtifactsResponse {
-                    provider: self.provider,
-                    name: normalize_pypi_name(name),
-                    version: resolved_version,
-                    artifacts,
-                })
-            }
+            RegistryProvider::Npm => self.list_artifacts_npm(runtime, name, version).await,
+            RegistryProvider::Pypi => self.list_artifacts_pypi(runtime, name, version).await,
             RegistryProvider::CratesIo => {
-                let payload = self.crates_details(runtime, name).await?;
-                let versions = payload
-                    .get("versions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| Error::NotFound(format!("crate versions not found: {name}")))?;
-                let selected_version = version
-                    .map(ToOwned::to_owned)
-                    .or_else(|| {
-                        payload
-                            .get("crate")
-                            .and_then(|krate| str_field(krate, "max_version"))
-                    })
-                    .ok_or_else(|| Error::NotFound(format!("crate not found: {name}")))?;
-                let version_payload = versions
-                    .iter()
-                    .find(|item| {
-                        str_field(item, "num").as_deref() == Some(selected_version.as_str())
-                    })
-                    .ok_or_else(|| {
-                        Error::NotFound(format!(
-                            "crate version not found: {name}@{selected_version}"
-                        ))
-                    })?;
-                let dl_path = str_field(version_payload, "dl_path").ok_or_else(|| {
-                    Error::NotFound(format!("download path missing: {name}@{selected_version}"))
-                })?;
-                let artifact = ArtifactInfo {
-                    filename: Some(format!("{name}-{selected_version}.crate")),
-                    url: format!("{}{}", self.base_url, dl_path),
-                    checksum: str_field(version_payload, "checksum"),
-                    integrity: None,
-                    size: u64_field(version_payload, "crate_size"),
-                    packagetype: Some("crate".into()),
-                    yanked: version_payload.get("yanked").and_then(Value::as_bool),
-                };
-                Ok(ArtifactsResponse {
-                    provider: self.provider,
-                    name: name.to_string(),
-                    version: selected_version,
-                    artifacts: vec![artifact],
-                })
+                self.list_artifacts_crates_io(runtime, name, version).await
             }
         }
     }
 
+    async fn list_artifacts_npm(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<ArtifactsResponse> {
+        let payload = self.npm_packument(runtime, name).await?;
+        let version = resolve_npm_version(&payload, version)?;
+        let version_payload = npm_version_payload(&payload, &version)
+            .ok_or_else(|| Error::NotFound(format!("npm version not found: {name}@{version}")))?;
+        let dist = version_payload.get("dist").cloned().unwrap_or(Value::Null);
+        let artifact = ArtifactInfo {
+            filename: Some(format!("{name}-{version}.tgz")),
+            url: str_field(&dist, "tarball").unwrap_or_default(),
+            checksum: str_field(&dist, "shasum"),
+            integrity: str_field(&dist, "integrity"),
+            size: u64_field(&dist, "unpackedSize"),
+            packagetype: Some("tgz".into()),
+            yanked: None,
+        };
+        Ok(ArtifactsResponse {
+            provider: self.provider,
+            name: name.to_string(),
+            version,
+            artifacts: vec![artifact],
+        })
+    }
+
+    async fn list_artifacts_pypi(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<ArtifactsResponse> {
+        let version = version.map(ToOwned::to_owned).unwrap_or_default();
+        let payload = if version.is_empty() {
+            self.pypi_project(runtime, name).await?
+        } else {
+            self.pypi_release(runtime, name, &version).await?
+        };
+        let info = payload.get("info").cloned().unwrap_or(Value::Null);
+        let resolved_version = str_field(&info, "version").unwrap_or(version);
+        let artifacts = payload
+            .get("urls")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| ArtifactInfo {
+                        filename: str_field(item, "filename"),
+                        url: str_field(item, "url").unwrap_or_default(),
+                        checksum: nested_str_field(item, &["digests", "sha256"]),
+                        integrity: None,
+                        size: u64_field(item, "size"),
+                        packagetype: str_field(item, "packagetype"),
+                        yanked: item.get("yanked").and_then(Value::as_bool),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(ArtifactsResponse {
+            provider: self.provider,
+            name: normalize_pypi_name(name),
+            version: resolved_version,
+            artifacts,
+        })
+    }
+
+    async fn list_artifacts_crates_io(
+        &self,
+        runtime: &ConnectorRuntime,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<ArtifactsResponse> {
+        let payload = self.crates_details(runtime, name).await?;
+        let versions = payload
+            .get("versions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::NotFound(format!("crate versions not found: {name}")))?;
+        let selected_version = version
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                payload
+                    .get("crate")
+                    .and_then(|krate| str_field(krate, "max_version"))
+            })
+            .ok_or_else(|| Error::NotFound(format!("crate not found: {name}")))?;
+        let version_payload = versions
+            .iter()
+            .find(|item| str_field(item, "num").as_deref() == Some(selected_version.as_str()))
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "crate version not found: {name}@{selected_version}"
+                ))
+            })?;
+        let dl_path = str_field(version_payload, "dl_path").ok_or_else(|| {
+            Error::NotFound(format!("download path missing: {name}@{selected_version}"))
+        })?;
+        let artifact = ArtifactInfo {
+            filename: Some(format!("{name}-{selected_version}.crate")),
+            url: format!("{}{}", self.base_url, dl_path),
+            checksum: str_field(version_payload, "checksum"),
+            integrity: None,
+            size: u64_field(version_payload, "crate_size"),
+            packagetype: Some("crate".into()),
+            yanked: version_payload.get("yanked").and_then(Value::as_bool),
+        };
+        Ok(ArtifactsResponse {
+            provider: self.provider,
+            name: name.to_string(),
+            version: selected_version,
+            artifacts: vec![artifact],
+        })
+    }
+
+    /// Fetch download statistics for a package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on invalid input, transport failure, a non-2xx
+    /// response, or if the provider does not support download stats.
     pub async fn get_downloads(
         &self,
         runtime: &ConnectorRuntime,
@@ -852,9 +959,10 @@ impl PackageRegistryClient {
                 if status == 429 {
                     return AttemptOutcome::Retryable {
                         error: Error::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -862,15 +970,13 @@ impl PackageRegistryClient {
 
                 if matches!(status, 401 | 403) {
                     return AttemptOutcome::Terminal(Error::Unauthorized(format!(
-                        "{} request rejected with HTTP {}",
-                        provider, status
+                        "{provider} request rejected with HTTP {status}"
                     )));
                 }
 
                 if status == 404 {
                     return AttemptOutcome::Terminal(Error::NotFound(format!(
-                        "{} resource not found at {}",
-                        provider, url
+                        "{provider} resource not found at {url}"
                     )));
                 }
 
@@ -880,7 +986,7 @@ impl PackageRegistryClient {
                 } else {
                     serde_json::from_str::<Value>(&body)
                         .ok()
-                        .and_then(extract_error_message)
+                        .and_then(|value| extract_error_message(&value))
                         .unwrap_or(body)
                 };
 
@@ -1014,7 +1120,7 @@ fn parse_pypi_requirement(raw: &str) -> DependencyInfo {
     }
 }
 
-fn extract_error_message(value: Value) -> Option<String> {
+fn extract_error_message(value: &Value) -> Option<String> {
     if let Some(message) = value.get("message").and_then(Value::as_str) {
         return Some(message.to_string());
     }

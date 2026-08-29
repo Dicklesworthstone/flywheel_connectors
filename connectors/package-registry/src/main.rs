@@ -79,73 +79,7 @@ async fn handle_message(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let result: FcpResult<serde_json::Value> = async {
-        match method {
-            "configure" => {
-                connector.configure(params).await?;
-                Ok(serde_json::json!({ "status": "configured" }))
-            }
-            "handshake" => {
-                let request: fcp_core::HandshakeRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid handshake: {error}"),
-                    })?;
-                encode(&connector.handshake(request).await?)
-            }
-            "health" => encode(&connector.health().await),
-            "doctor" => encode(&connector.doctor()),
-            "self_check" => encode(&connector.self_check().await?),
-            "introspect" => encode(&connector.introspect()),
-            "invoke" => {
-                let request: fcp_core::InvokeRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid invoke: {error}"),
-                    })?;
-                encode(&connector.invoke(request).await?)
-            }
-            "simulate" => {
-                let request: SimulateRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid simulate: {error}"),
-                    })?;
-                encode(&connector.simulate(request).await?)
-            }
-            "subscribe" => {
-                let request: SubscribeRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid subscribe: {error}"),
-                    })?;
-                encode(&connector.subscribe(request).await?)
-            }
-            "unsubscribe" => {
-                let request: UnsubscribeRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid unsubscribe: {error}"),
-                    })?;
-                connector.unsubscribe(request).await?;
-                Ok(serde_json::json!({ "status": "unsubscribed" }))
-            }
-            "shutdown" => {
-                let request: fcp_core::ShutdownRequest =
-                    serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid shutdown: {error}"),
-                    })?;
-                connector.shutdown(request).await?;
-                Ok(serde_json::json!({ "status": "shutdown_accepted" }))
-            }
-            _ => Err(FcpError::InvalidRequest {
-                code: 1002,
-                message: format!("Unknown method: {method}"),
-            }),
-        }
-    }
-    .await;
+    let result: FcpResult<serde_json::Value> = dispatch_method(connector, method, params).await;
 
     match result {
         Ok(value) => {
@@ -169,5 +103,76 @@ async fn handle_message(
             }
             response
         }
+    }
+}
+
+async fn dispatch_method(
+    connector: &mut PackageRegistryConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> FcpResult<serde_json::Value> {
+    match method {
+        "configure" => {
+            connector.configure(params).await?;
+            Ok(serde_json::json!({ "status": "configured" }))
+        }
+        "handshake" => {
+            let request: fcp_core::HandshakeRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid handshake: {error}"),
+                })?;
+            encode(&connector.handshake(request).await?)
+        }
+        "health" => encode(&connector.health().await),
+        "doctor" => encode(&connector.doctor()),
+        "self_check" => encode(&connector.self_check().await?),
+        "introspect" => encode(&connector.introspect()),
+        "invoke" => {
+            let request: fcp_core::InvokeRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid invoke: {error}"),
+                })?;
+            encode(&connector.invoke(request).await?)
+        }
+        "simulate" => {
+            let request: SimulateRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid simulate: {error}"),
+                })?;
+            encode(&connector.simulate(request).await?)
+        }
+        "subscribe" => {
+            let request: SubscribeRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid subscribe: {error}"),
+                })?;
+            encode(&connector.subscribe(request).await?)
+        }
+        "unsubscribe" => {
+            let request: UnsubscribeRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid unsubscribe: {error}"),
+                })?;
+            connector.unsubscribe(request).await?;
+            Ok(serde_json::json!({ "status": "unsubscribed" }))
+        }
+        "shutdown" => {
+            let request: fcp_core::ShutdownRequest =
+                serde_json::from_value(params).map_err(|error| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid shutdown: {error}"),
+                })?;
+            connector.shutdown(request).await?;
+            Ok(serde_json::json!({ "status": "shutdown_accepted" }))
+        }
+        _ => Err(FcpError::InvalidRequest {
+            code: 1002,
+            message: format!("Unknown method: {method}"),
+        }),
     }
 }

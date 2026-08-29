@@ -50,6 +50,7 @@ impl fmt::Display for RegistryProvider {
     }
 }
 
+#[must_use]
 pub const fn default_request_timeout_ms() -> u64 {
     30_000
 }
@@ -80,6 +81,11 @@ impl fmt::Debug for PackageRegistryConfig {
 }
 
 impl PackageRegistryConfig {
+    /// Build a config from its JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the JSON does not match the config schema.
     pub fn from_value(value: Value) -> Result<Self> {
         let mut config: Self = serde_json::from_value(value)
             .map_err(|error| Error::Config(format!("invalid package-registry config: {error}")))?;
@@ -108,6 +114,11 @@ impl PackageRegistryConfig {
         });
     }
 
+    /// Validate the normalized config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when a field holds an invalid value.
     pub fn validate(&self) -> Result<()> {
         if self.request_timeout_ms == 0 {
             return Err(Error::Config(

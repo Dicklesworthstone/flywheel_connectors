@@ -70,9 +70,15 @@ struct ProvisioningReadiness {
     anonymous_allowed: bool,
     request_timeout_ms: u64,
     retry: RetryReadiness,
-    search_supported: bool,
-    downloads_supported: bool,
-    publication_supported: bool,
+    supported: FeatureSupport,
+}
+
+/// Provider capability flags for the provisioning readiness report.
+#[derive(Debug, Clone, serde::Serialize)]
+struct FeatureSupport {
+    search: bool,
+    downloads: bool,
+    publication: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -180,9 +186,11 @@ impl PackageRegistryConnector {
                 max_delay_ms: config.retry.max_delay_ms,
                 jitter_enabled: config.retry.jitter_enabled,
             },
-            search_supported: config.provider.supports_search(),
-            downloads_supported: config.provider.supports_downloads(),
-            publication_supported: false,
+            supported: FeatureSupport {
+                search: config.provider.supports_search(),
+                downloads: config.provider.supports_downloads(),
+                publication: false,
+            },
         })
     }
 
@@ -611,7 +619,7 @@ impl PackageRegistryConnector {
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_capability = match req.operation.as_str() {
@@ -636,16 +644,30 @@ impl PackageRegistryConnector {
             &[],
         )?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Package registry client missing after configure".into(),
         })?;
-        let config = self.config.as_ref().ok_or(FcpError::Internal {
+        let config = self.config.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Package registry config missing after configure".into(),
         })?;
 
+        let output = self
+            .dispatch_operation(&req, runtime, client, config)
+            .await?;
+
+        Ok(InvokeResponse::ok(req.id, output))
+    }
+
+    async fn dispatch_operation(
+        &self,
+        req: &InvokeRequest,
+        runtime: &ConnectorRuntime,
+        client: &PackageRegistryClient,
+        config: &PackageRegistryConfig,
+    ) -> FcpResult<serde_json::Value> {
         let output = match req.operation.as_str() {
             OP_SEARCH => {
                 let query = require_str(&req.input, "query")?;
@@ -728,7 +750,7 @@ impl PackageRegistryConnector {
             message: format!("JSON serialization error: {error}"),
         })?;
 
-        Ok(InvokeResponse::ok(req.id, output))
+        Ok(output)
     }
 }
 
