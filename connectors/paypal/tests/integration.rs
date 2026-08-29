@@ -1,7 +1,7 @@
-//! Connector-local no-mock PayPal integration proof.
+//! Connector-local no-mock `PayPal` integration proof.
 //!
-//! These tests exercise the real PayPal client against a local HTTP server.
-//! No live PayPal service is called.
+//! These tests exercise the real `PayPal` client against a local HTTP server.
+//! No live `PayPal` service is called.
 
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
@@ -441,7 +441,7 @@ async fn auth_rate_limit_not_found_malformed_json_and_invalid_input_are_typed() 
         .await;
 
     let runtime = test_runtime();
-    let token_failure_client = paypal_client(&token_failure_server).await;
+    let token_failure_client = paypal_client(&token_failure_server);
     let token_error = token_failure_client
         .get_order(&runtime, "ORDER-UNAUTH")
         .await

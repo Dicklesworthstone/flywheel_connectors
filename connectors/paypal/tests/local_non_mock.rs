@@ -1,8 +1,8 @@
-//! Local no-mock acceptance coverage for the PayPal connector surface.
+//! Local no-mock acceptance coverage for the `PayPal` connector surface.
 //!
 //! The connector's production configuration intentionally rejects localhost
 //! base URLs. These tests therefore cover both sides of that boundary: the
-//! connector rejects local provider configuration, while the PayPal REST client
+//! connector rejects local provider configuration, while the `PayPal` REST client
 //! is exercised against a raw TCP loopback server with no live credentials.
 
 #![allow(
@@ -78,7 +78,7 @@ impl LoopbackPayPal {
                 .into_iter()
                 .map(|response| {
                     let (stream, _) = listener.accept().expect("accept PayPal client request");
-                    handle_request(stream, response)
+                    handle_request(stream, &response)
                 })
                 .collect()
         });
@@ -95,7 +95,7 @@ impl LoopbackPayPal {
     }
 }
 
-fn handle_request(mut stream: TcpStream, response: HttpResponse) -> RecordedRequest {
+fn handle_request(mut stream: TcpStream, response: &HttpResponse) -> RecordedRequest {
     stream
         .set_read_timeout(Some(StdDuration::from_secs(5)))
         .expect("set PayPal loopback read timeout");

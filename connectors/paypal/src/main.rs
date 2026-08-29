@@ -1,4 +1,4 @@
-//! FCP PayPal Connector - Main entrypoint.
+//! FCP `PayPal` Connector - Main entrypoint.
 
 #![forbid(unsafe_code)]
 
