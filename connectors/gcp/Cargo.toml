@@ -40,3 +40,6 @@ fcp-crypto.workspace = true
 fcp-e2e = { path = "../../crates/fcp-e2e" }
 fcp-testkit.workspace = true
 wiremock.workspace = true
+
+[lints]
+workspace = true

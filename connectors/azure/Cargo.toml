@@ -40,3 +40,6 @@ fcp-crypto.workspace = true
 fcp-testkit.workspace = true
 serde_urlencoded = "0.7"
 wiremock.workspace = true
+
+[lints]
+workspace = true

@@ -8,8 +8,8 @@ repository = "https://github.com/flywheel-ai/flywheel_connectors"
 keywords = ["fcp", "host", "gateway", "orchestrator"]
 categories = ["network-programming", "asynchronous"]
 
-[lints.rust]
-unsafe_code = "deny"
+[lints]
+workspace = true
 
 [features]
 default = []

@@ -36,3 +36,6 @@ fcp-testkit = { path = "../../crates/fcp-testkit" }
 jsonschema.workspace = true
 toml.workspace = true
 wiremock.workspace = true
+
+[lints]
+workspace = true

@@ -36,3 +36,6 @@ fcp-crypto.workspace = true
 fcp-testkit.workspace = true
 tempfile = "3.15"
 toml.workspace = true
+
+[lints]
+workspace = true

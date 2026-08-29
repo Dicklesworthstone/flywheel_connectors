@@ -37,3 +37,6 @@ fcp-crypto.workspace = true
 fcp-manifest.workspace = true
 fcp-testkit.workspace = true
 wiremock.workspace = true
+
+[lints]
+workspace = true

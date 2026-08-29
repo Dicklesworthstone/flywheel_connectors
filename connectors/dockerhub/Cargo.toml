@@ -38,3 +38,6 @@ fcp-testkit.workspace = true
 jsonschema.workspace = true
 toml.workspace = true
 wiremock.workspace = true
+
+[lints]
+workspace = true
