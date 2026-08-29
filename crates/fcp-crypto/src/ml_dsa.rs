@@ -13,8 +13,8 @@
 //! `ml-dsa` consumes `rand_core = "0.10"`'s [`TryCryptoRng`] trait, which is
 //! a generation ahead of the workspace `rand = "0.8"` family. Rather than
 //! pull a third version of `rand` into the tree we wrap [`getrandom`] in a
-//! tiny [`OsRngV10`] adapter that implements the required traits directly.
-//! Production callers do not see this — they just call [`Self::sign`].
+//! tiny `OsRngV10` adapter that implements the required traits directly.
+//! Production callers do not see this — they just call [`MlDsa65SigningKey::sign`].
 //!
 //! [`ml-dsa`]: https://docs.rs/ml-dsa
 //! [`getrandom`]: https://docs.rs/getrandom

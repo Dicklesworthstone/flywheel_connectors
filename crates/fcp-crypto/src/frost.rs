@@ -1453,8 +1453,8 @@ fn signature_shares_to_frost(
 /// would orchestrate the commit/sign/aggregate rounds over authenticated
 /// sessions.
 ///
-/// Implements [`OwnerSigner`] so callers can use it interchangeably with a
-/// single [`Ed25519SigningKey`].
+/// Implements [`crate::ed25519::OwnerSigner`] so callers can use it interchangeably with a
+/// single [`crate::ed25519::Ed25519SigningKey`].
 pub struct FrostLocalCoordinator {
     key_packages: BTreeMap<u16, FrostKeyPackage>,
     public_key_package: FrostPublicKeyPackage,

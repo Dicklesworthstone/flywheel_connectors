@@ -4,7 +4,7 @@
 //! knowledge of the corresponding secret key by signing the key's own
 //! compressed encoding under the dedicated [`BLS_POP_DST`] domain tag.
 //! Verified keys live in a [`PopRegistry`]; the aggregation and
-//! verification paths in [`super::aggregate`] refuse any signer ID that is
+//! verification paths in [`mod@super::aggregate`] refuse any signer ID that is
 //! not present, so an attacker-chosen key that never proved possession is
 //! structurally unusable.
 

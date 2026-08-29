@@ -547,6 +547,8 @@ pub struct XWingWireSize {
 
 /// Production [`XWingKem`] implementation backed by the `RustCrypto`
 /// [`x-wing`] crate (draft 06).
+///
+/// [`x-wing`]: https://docs.rs/x-wing
 #[derive(Clone, Copy, Debug, Default)]
 pub struct XWingProvider;
 

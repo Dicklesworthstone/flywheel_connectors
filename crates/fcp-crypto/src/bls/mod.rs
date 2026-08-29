@@ -26,8 +26,8 @@
 //! can only enter a [`PopRegistry`] together with a valid proof of
 //! possession**, and both aggregation and verification resolve signer IDs
 //! through the registry. A key without a verified PoP is unusable —
-//! [`aggregate`](aggregate::aggregate) and
-//! [`verify_aggregate`](aggregate::verify_aggregate) return
+//! [`aggregate::aggregate`] and
+//! [`aggregate::verify_aggregate`] return
 //! [`BlsError::PopMissing`] instead of touching the unproven key.
 //!
 //! # Relationship to the Ed25519 quorum path

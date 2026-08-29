@@ -6,7 +6,7 @@
 //! # Sync vs async
 //!
 //! [`SecretFetchHook`] is the canonical SYNC trait used by the egress hot path
-//! and by the WASI host runtime in [`fcp_sandbox`]. WASI host functions are
+//! and by the WASI host runtime in `fcp_sandbox`. WASI host functions are
 //! synchronous in the wasmtime integration we use today, so the egress trait
 //! must be sync to keep that integration working.
 //!
@@ -406,9 +406,9 @@ where
 ///
 /// The bridge holds an explicit [`tokio::runtime::Handle`] (provided by the
 /// caller) so that sync `fetch`/`rotate`/`revoke` calls can drive the inner
-/// async hook via [`Handle::block_on`]. The handle MUST belong to a runtime
+/// async hook via [`tokio::runtime::Handle::block_on`]. The handle MUST belong to a runtime
 /// that the calling thread is NOT currently running on, otherwise
-/// [`Handle::block_on`] panics. Typical pattern: a dedicated single-thread
+/// [`tokio::runtime::Handle::block_on`] panics. Typical pattern: a dedicated single-thread
 /// runtime owned by the host process for credential operations.
 ///
 /// This bridge does NOT cache results. Callers that need caching should layer

@@ -31,7 +31,7 @@
 //! - [`hkdf`] - HKDF-SHA256 key derivation
 //! - [`aead`] - ChaCha20-Poly1305 and XChaCha20-Poly1305 AEAD
 //! - [`mac`] - BLAKE3 keyed MAC for session frames
-//! - [`hpke_seal`] - HPKE (RFC 9180) for sealed boxes
+//! - [`mod@hpke_seal`] - HPKE (RFC 9180) for sealed boxes
 //! - [`cose`] - `COSE_Sign1/CWT` helpers for capability tokens
 //! - [`kid`] - Key identifier (KID) types
 //! - [`ml_dsa`] - FIPS 204 ML-DSA-65 (post-quantum signatures, owner-key V4)
