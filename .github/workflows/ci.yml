@@ -587,7 +587,9 @@ jobs:
 
       - name: Run security audit
         # RUSTSEC-2023-0071: rsa Marvin Attack — no fixed version available
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # RUSTSEC-2026-0255: sized-chunks panic-safety unsoundness — no fixed
+        # version (see .cargo/audit.toml for the full exposure analysis).
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0255
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked

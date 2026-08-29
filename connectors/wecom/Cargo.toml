@@ -32,7 +32,7 @@ base64.workspace = true
 cbc = "0.1"
 chrono.workspace = true
 reqwest = { workspace = true, features = ["json", "multipart"] }
-quick-xml = "0.39.2"
+quick-xml = "0.41"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1 = "0.10"

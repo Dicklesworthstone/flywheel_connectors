@@ -1,0 +1,26 @@
+# cargo-audit configuration
+# https://docs.rs/rustsec/latest/rustsec/
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa Marvin Attack (timing sidechannel) — no fixed
+    # version available upstream. Also passed via --ignore in CI; kept here so
+    # local `cargo audit` runs agree with the CI gate.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0255: sized-chunks 0.6.5 panic-safety unsoundness in
+    # Chunk::{clear,drop_left,drop_right}, RingBuffer::{clear,drop_left,
+    # drop_right}, InlineArray::clear (use-after-free / double-free when an
+    # element's Drop panics). No upgrade path exists:
+    #   - advisory `patched = []`; every release <= 0.7.0 is affected and the
+    #     upstream sized-chunks repo is archived (issues/PRs disabled).
+    #   - sole consumer chain: sized-chunks <- im-rc 15.1.0 (^0.6.4 pin)
+    #     <- wasm-compose 0.243.0 <- wasmtime 41.0.4 <- fcp-sandbox.
+    #   - workspace code never uses sized-chunks/im-rc directly (grep-clean).
+    # Exposure analysis: the only im-rc container instantiated by the
+    # transitive consumer is wasm-compose's
+    # `im_rc::HashMap<ResourceId, (ComponentId, ResourceId)>` (graph.rs).
+    # All stored types are Copy ID newtypes with no Drop impls, so the
+    # trigger condition (an element Drop panicking during
+    # clear/drop_left/drop_right) is unreachable from workspace call sites.
+    "RUSTSEC-2026-0255",
+]

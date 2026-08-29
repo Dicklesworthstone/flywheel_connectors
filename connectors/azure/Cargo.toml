@@ -31,7 +31,7 @@ sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
-quick-xml = { version = "0.39.2", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 [dev-dependencies]
 ciborium.workspace = true

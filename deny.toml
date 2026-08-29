@@ -16,6 +16,14 @@ notice = "warn"
 ignore = [
     # rsa crate Marvin Attack (RUSTSEC-2023-0071) — no fixed version available upstream
     "RUSTSEC-2023-0071",
+    # sized-chunks panic-safety unsoundness (RUSTSEC-2026-0255) — no upgrade
+    # path: `patched = []`, all releases <= 0.7.0 affected, upstream repo
+    # archived. Sole chain: sized-chunks <- im-rc 15.1.0 <- wasm-compose
+    # 0.243.0 <- wasmtime 41.0.4 <- fcp-sandbox. Not reachable in practice:
+    # the only im-rc container in the consumer tree is wasm-compose's
+    # HashMap of Copy ID types (no panicking element Drop), and workspace
+    # code never touches sized-chunks/im-rc directly.
+    "RUSTSEC-2026-0255",
 ]
 
 [licenses]
