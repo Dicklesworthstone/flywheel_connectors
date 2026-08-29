@@ -46,7 +46,7 @@
 //! ## Companion to existing offline coverage
 //!
 //! `crates/fcp-e2e/tests/offline_repair_e2e.rs` covers the
-//! storage-layer offline-availability + repair flow (RepairController,
+//! storage-layer offline-availability + repair flow (`RepairController`,
 //! coverage evaluation, GC). This test covers the orthogonal
 //! connector-side flow: cache-while-online, serve-while-offline,
 //! queue-write-while-offline, drain-on-restore. Together they pin
@@ -494,8 +494,7 @@ enum WriteOutcome {
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 // ── Wiremock helpers ───────────────────────────────────────────────────
@@ -511,10 +510,11 @@ async fn build_wiremock_with_user_profile() -> MockApiServer {
 }
 
 async fn build_wiremock_for_writes() -> MockApiServer {
-    let mock = MockApiServer::start().await;
-    // PUT /users/octocat returns 200 with the echoed body.
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
+
+    let mock = MockApiServer::start().await;
+    // PUT /users/octocat returns 200 with the echoed body.
     Mock::given(method("PUT"))
         .and(path("/users/octocat/name"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"updated": true})))
@@ -524,9 +524,10 @@ async fn build_wiremock_for_writes() -> MockApiServer {
 }
 
 async fn build_wiremock_returning_409_on_put() -> MockApiServer {
-    let mock = MockApiServer::start().await;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
+
+    let mock = MockApiServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/users/octocat/name"))
         .respond_with(ResponseTemplate::new(409).set_body_string("conflict"))

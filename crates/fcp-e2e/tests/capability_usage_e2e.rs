@@ -788,6 +788,7 @@ fn max_entries_caps_distinct_keys() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn full_usage_suggestion_flow_logged() {
     let mut logger = E2eLogger::new();
     let test_name = "capability_usage_e2e";

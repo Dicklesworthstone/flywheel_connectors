@@ -3,7 +3,7 @@
 //! Exercises the Google AI (Gemini) connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error + decision receipt)
 //! - Allow with valid token (happy path invoke)
-//! - Network guard allow/deny (manifest host_allow validation)
+//! - Network guard allow/deny (manifest `host_allow` validation)
 //! - Streaming backpressure (deterministic JSON-array chunk consumption)
 //!
 //! All tests are deterministic -- no real API calls.

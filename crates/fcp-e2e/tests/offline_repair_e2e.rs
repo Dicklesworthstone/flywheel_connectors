@@ -74,6 +74,7 @@ struct OfflineRepairPhaseAssertion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // persisted evidence schema; regrouping toggles into enums would churn the artifact format with no defect behind it
 struct OfflineRepairStateEvidence {
     root_id: ObjectId,
     payload_id: ObjectId,
@@ -116,6 +117,7 @@ struct OfflineRepairArtifactBundle {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // linear evidence-bundle builder; each stage writes one artifact class and splitting would scatter the emission order the test pins
 fn build_offline_repair_artifact_bundle(
     root_id: ObjectId,
     payload_id: ObjectId,
@@ -203,11 +205,7 @@ fn build_offline_repair_artifact_bundle(
                 && payload_after_reconstructable
                 && payload_after_meets_placement,
             detail: format!(
-                "reconstructable_before={} reconstructable_after={} placement_before={} placement_after={}",
-                payload_before_reconstructable,
-                payload_after_reconstructable,
-                payload_before_meets_placement,
-                payload_after_meets_placement
+                "reconstructable_before={payload_before_reconstructable} reconstructable_after={payload_after_reconstructable} placement_before={payload_before_meets_placement} placement_after={payload_after_meets_placement}"
             ),
         },
         OfflineRepairPhaseAssertion {
@@ -1996,8 +1994,7 @@ fn offline_capability_iter() {
         a.set_local_symbols(u32::from(i) * 5);
         cap.track(a);
     }
-    let collected: Vec<_> = cap.iter().collect();
-    assert_eq!(collected.len(), 3);
+    assert_eq!(cap.iter().count(), 3);
 }
 
 #[test]

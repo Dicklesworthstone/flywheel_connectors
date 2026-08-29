@@ -2,7 +2,7 @@
 //!
 //! Exercises the Telegram connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error)
-//! - Allow with valid token (happy path send_message invoke)
+//! - Allow with valid token (happy path `send_message` invoke)
 //! - Subscribe confirms requested topics (streaming protocol)
 //! - Get file with valid token (read operation)
 //!

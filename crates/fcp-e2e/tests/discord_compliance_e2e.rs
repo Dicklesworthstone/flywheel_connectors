@@ -2,8 +2,8 @@
 //!
 //! Exercises the Discord connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error)
-//! - Allow with valid token (happy path send_message invoke)
-//! - Network guard allow/deny (manifest host_allow validation)
+//! - Allow with valid token (happy path `send_message` invoke)
+//! - Network guard allow/deny (manifest `host_allow` validation)
 //! - Gateway streaming subscribe protocol (topic confirmation)
 //! - Rate limit behavior (429 response handling)
 //!

@@ -1,4 +1,4 @@
-//! Deepgram and ElevenLabs connector-boundary evidence.
+//! Deepgram and `ElevenLabs` connector-boundary evidence.
 //!
 //! This deterministic lane covers the implemented prerecorded, finite realtime,
 //! and finite streaming speech/media surfaces. It deliberately records only

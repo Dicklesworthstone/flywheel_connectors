@@ -1,6 +1,6 @@
-//! E2E OpenAI connector compliance tests.
+//! E2E `OpenAI` connector compliance tests.
 //!
-//! Exercises the OpenAI connector through the E2E compliance harness:
+//! Exercises the `OpenAI` connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error + decision receipt)
 //! - Allow with valid token (happy path invoke via mock REST API)
 //! - Network guard allow/deny (manifest `host_allow` exact-host validation)

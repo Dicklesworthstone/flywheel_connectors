@@ -27,7 +27,7 @@ use fcp_evidence::{
 };
 use fcp_mesh::{DeviceProfile, GossipMessage, MeshNode, MeshNodeConfig, ObjectAdmissionClass};
 use fcp_prelude::{
-    CapabilityId, ConnectorId, Decision, DecisionReasonCode, EpochId, NodeId as CoreNodeId,
+    CapabilityId, ConnectorId, Decision, DecisionReasonCode, DecisionReceiptPolicy, EpochId, NodeId as CoreNodeId,
     NodeSignature, ObjectHeader, ObjectId, ObjectIdKey, OperationId, POLICY_BUNDLE_SIGNED_FIELDS,
     PolicyBundle, PolicyBundleObject, PolicyBundlePolicyRef, PolicyBundleResolved,
     PolicyBundleSignature, PolicyDecisionInput, PolicyEngine, PolicyPattern, PrincipalId,
@@ -49,7 +49,7 @@ const OWNER_KEY_ID: &str = "owner-o9t0e";
 const NOW_SECS: u64 = 1_700_000_000;
 const NOW_MS: u64 = NOW_SECS * 1000;
 
-fn log_event(phase: &str, outcome: &str, details: Value) {
+fn log_event(phase: &str, outcome: &str, details: &Value) {
     let entry = json!({
         "ts": Utc::now().to_rfc3339(),
         "scenario_id": SCENARIO_ID,
@@ -65,7 +65,7 @@ fn object_id_key() -> ObjectIdKey {
     ObjectIdKey::from_bytes([0xE4; 32])
 }
 
-fn schema_header(schema_name: &str, zone: &ZoneId, refs: Vec<ObjectId>) -> ObjectHeader {
+fn schema_header(schema_name: &str, zone: &ZoneId, refs: &[ObjectId]) -> ObjectHeader {
     serde_json::from_value(json!({
         "schema": {
             "namespace": "fcp.core",
@@ -140,7 +140,7 @@ fn verify_stored_object_integrity(object: &StoredObject, object_id_key: &ObjectI
 
 fn zone_policy(zone: &ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
-        header: schema_header("ZonePolicyObject", zone, Vec::new()),
+        header: schema_header("ZonePolicyObject", zone, &[]),
         zone_id: zone.clone(),
         principal_allow: vec![PolicyPattern {
             pattern: "user:alice".to_string(),
@@ -162,7 +162,7 @@ fn zone_policy(zone: &ZoneId) -> ZonePolicyObject {
             allow_derp: false,
             allow_funnel: false,
         },
-        decision_receipts: Default::default(),
+        decision_receipts: DecisionReceiptPolicy::default(),
         usage_budget: None,
         requires_posture: None,
     }
@@ -327,7 +327,7 @@ fn policy_revocation_object(
     signable.extend_from_slice(&NOW_SECS.to_be_bytes());
 
     RevocationObject {
-        header: schema_header("RevocationObject", zone, vec![policy_object_id]),
+        header: schema_header("RevocationObject", zone, &[policy_object_id]),
         revoked: vec![policy_object_id],
         scope: RevocationScope::ZoneKey,
         reason: "mesh-stored policy object superseded by owner revocation".to_string(),
@@ -427,7 +427,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "setup",
         "started",
-        json!({"node_a": NODE_A, "node_b": NODE_B}),
+        &json!({"node_a": NODE_A, "node_b": NODE_B}),
     );
 
     let policy = zone_policy(&zone);
@@ -439,7 +439,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     let bundle = signed_policy_bundle(&zone, &policy_object, &owner_key);
     let bundle_body = bundle_bytes(&bundle);
     let bundle_object = stored_object(
-        schema_header("PolicyBundle", &zone, vec![policy_object.object_id]),
+        schema_header("PolicyBundle", &zone, &[policy_object.object_id]),
         bundle_body,
         &object_id_key,
     );
@@ -454,7 +454,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
         .await
         .expect("node A stores signed policy bundle");
     let observer_anchor = stored_object(
-        schema_header("MeshPolicyObserverAnchor", &zone, vec![]),
+        schema_header("MeshPolicyObserverAnchor", &zone, &[]),
         b"node-b-observed-policy-gossip".to_vec(),
         &object_id_key,
     );
@@ -484,7 +484,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "write_mesh_store",
         "stored",
-        json!({
+        &json!({
             "policy_object_id": policy_object.object_id.to_string(),
             "bundle_object_id": bundle_object.object_id.to_string(),
             "policy_hash": expected_policy_hash,
@@ -550,7 +550,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "gossip_propagation_and_reconciliation",
         "observed",
-        json!({
+        &json!({
             "missing_objects": reconciliation
                 .we_missing_objects
                 .iter()
@@ -603,7 +603,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "peer_transfer",
         "verified",
-        json!({"content_id_verified": true}),
+        &json!({"content_id_verified": true}),
     );
 
     let peer_policy_object = store_b
@@ -661,7 +661,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "peer_admission",
         "allowed",
-        json!({"reason": allow_decision.reason_code.as_str()}),
+        &json!({"reason": allow_decision.reason_code.as_str()}),
     );
 
     let revocation = policy_revocation_object(&zone, policy_object.object_id, &owner_key);
@@ -745,7 +745,7 @@ async fn mesh_policy_object_lifecycle_gossip_admission_revocation_and_integrity(
     log_event(
         "revocation_cascade",
         "denied_and_audited",
-        json!({
+        &json!({
             "direct_revocation": "policy_object_revoked",
             "cascade_revocation": "issuer_key_revoked",
             "admission_reason": denial.reason_code.as_str(),

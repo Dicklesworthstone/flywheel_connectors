@@ -1,7 +1,7 @@
 //! Capability-rejection roundtrip E2E (host-backed).
 //!
 //! `full_system_e2e::e2e_capability_verification` only covers one
-//! rejection path (capability_id mismatch surfaced as reason FCP-3003).
+//! rejection path (`capability_id` mismatch surfaced as reason FCP-3003).
 //! The remaining gateway-level rejection invariants live inline in
 //! `fcp-core/src/capability.rs` but had no E2E roundtrip showing each
 //! rejection class flowing through the production `CapabilityVerifier`
@@ -14,9 +14,9 @@
 //! can parse the run history without re-running tests.
 //!
 //! Property under test: each of the six rejection classes
-//! (TokenExpired, TokenNotYetValid, InvalidSignature, ZoneViolation,
+//! (`TokenExpired`, `TokenNotYetValid`, `InvalidSignature`, `ZoneViolation`,
 //! OperationNotGranted-on-capability, OperationNotGranted-on-operation)
-//! is surfaced by the production CapabilityVerifier. A regression that
+//! is surfaced by the production `CapabilityVerifier`. A regression that
 //! silently accepts a tampered token in any class fails this E2E
 //! immediately.
 

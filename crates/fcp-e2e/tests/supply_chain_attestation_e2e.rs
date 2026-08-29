@@ -53,7 +53,7 @@ struct AuditTrail {
 }
 
 impl AuditTrail {
-    fn record(&mut self, phase: &str, outcome: &str, details: Value) {
+    fn record(&mut self, phase: &str, outcome: &str, details: &Value) {
         let entry = json!({
             "ts": Utc::now().to_rfc3339(),
             "scenario_id": "supply_chain_attestation_e2e",
@@ -224,7 +224,7 @@ fn run_command(trail: &mut AuditTrail, phase: &str, command: &mut Command) {
         } else {
             "failed"
         },
-        json!({
+        &json!({
             "status": output.status.to_string(),
             "stderr": stderr.trim(),
         }),
@@ -347,6 +347,7 @@ sig = "{signature}"
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_tuf_metadata(
     metadata_dir: &Path,
     target_path: &str,
@@ -462,7 +463,7 @@ fn write_tuf_metadata(
     trail.record(
         "tuf_metadata_written",
         "passed",
-        json!({
+        &json!({
             "metadata_dir": metadata_dir.display().to_string(),
             "target_path": target_path,
             "root_hash": pinned.root_hash,
@@ -609,6 +610,7 @@ fn registry_evidence(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn supply_chain_attestation_e2e() {
     let mut trail = AuditTrail::default();
     let paths = ScenarioPaths::create();
@@ -619,7 +621,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "setup",
         "started",
-        json!({
+        &json!({
             "root": paths.root.display().to_string(),
             "cosign": cosign.display().to_string(),
         }),
@@ -645,7 +647,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "tuf_verify_target",
         "passed",
-        json!({
+        &json!({
             "root_version": tuf_result.root_version(),
             "target": tuf_result.target().map(|target| target.target_path.clone()),
         }),
@@ -665,7 +667,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "cosign_verify_blob",
         "passed",
-        json!({
+        &json!({
             "identity": sigstore_result.identity(),
             "issuer": sigstore_result.issuer(),
             "rekor_log_index": sigstore_result.rekor_log_index(),
@@ -696,7 +698,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "manifest_signed",
         "passed",
-        json!({
+        &json!({
             "connector_id": parsed_manifest.connector.id.to_string(),
             "attestation_ref": attestation_ref.to_prefixed_string(),
             "transparency_ref": transparency_ref.to_prefixed_string(),
@@ -725,7 +727,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "registry_catalog_install",
         "passed",
-        json!({
+        &json!({
             "latest": descriptor.is_latest,
             "target": descriptor.targets[0].target,
             "binary_sha256": descriptor.targets[0].binary_sha256,
@@ -765,7 +767,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "registry_verify_install",
         "passed",
-        serde_json::to_value(&report).expect("registry report json"),
+        &serde_json::to_value(&report).expect("registry report json"),
     );
 
     let unsigned_bundle = ConnectorBundle {
@@ -780,7 +782,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "registry_refuse_unsigned",
         "passed",
-        json!({ "error": unsigned_err.to_string() }),
+        &json!({ "error": unsigned_err.to_string() }),
     );
 
     let tampered_bundle = ConnectorBundle {
@@ -811,7 +813,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "registry_refuse_tampered",
         "passed",
-        json!({
+        &json!({
             "registry_error": tampered_err.to_string(),
             "cosign_error": cosign_tamper_err.to_string(),
         }),
@@ -836,7 +838,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "host_launch_allowed_signed",
         "passed",
-        serde_json::to_value(&allowed.audit_event).expect("host audit event json"),
+        &serde_json::to_value(&allowed.audit_event).expect("host audit event json"),
     );
 
     let unsigned_refusal = host_gate
@@ -857,7 +859,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "host_refuse_unsigned",
         "passed",
-        serde_json::to_value(&unsigned_refusal.audit_event).expect("host unsigned audit json"),
+        &serde_json::to_value(&unsigned_refusal.audit_event).expect("host unsigned audit json"),
     );
 
     let tampered_refusal = host_gate
@@ -878,7 +880,7 @@ fn supply_chain_attestation_e2e() {
     trail.record(
         "host_refuse_tampered",
         "passed",
-        serde_json::to_value(&tampered_refusal.audit_event).expect("host tamper audit json"),
+        &serde_json::to_value(&tampered_refusal.audit_event).expect("host tamper audit json"),
     );
 
     let phases: BTreeSet<_> = [

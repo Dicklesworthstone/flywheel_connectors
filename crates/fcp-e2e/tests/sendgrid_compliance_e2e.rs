@@ -1,6 +1,6 @@
-//! E2E SendGrid connector compliance tests.
+//! E2E `SendGrid` connector compliance tests.
 //!
-//! Exercises the SendGrid connector through the shared E2E harness:
+//! Exercises the `SendGrid` connector through the shared E2E harness:
 //! - Default deny behavior for capability mismatch
 //! - Allow path with valid capability token
 //! - Network guard allow/deny checks via manifest constraints

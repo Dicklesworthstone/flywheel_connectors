@@ -1,6 +1,6 @@
 //! Revocation cascade E2E (br-rfs4h, [E.1] Revocation E2E proof gap).
 //!
-//! GoldenFinch's smdf5 audit found that the
+//! `GoldenFinch`'s smdf5 audit found that the
 //! `Fcp.Invariants.Revocation.revocation_seal_check_use_atomicity`
 //! Lean witness has no `crates/fcp-e2e/tests/` real-service scenario
 //! that drives the full revocation chain end-to-end:
@@ -27,7 +27,7 @@
 //! Acceptance lifted from the bead:
 //! - Direct token revocation rejected via cascade walker ✓
 //! - Issuer-key revocation cascades to ALL minted tokens (m8j0q.A.9) ✓
-//! - Rejection within freshness SLA (RegistryStale guard) ✓
+//! - Rejection within freshness SLA (`RegistryStale` guard) ✓
 //! - Audit event emitted on denial (m8j0q.A.5) ✓
 //! - Mesh-wide propagation primitive verified (m8j0q.A.8) ✓
 //! - Lean witness registered in formal-invariant gate ✓

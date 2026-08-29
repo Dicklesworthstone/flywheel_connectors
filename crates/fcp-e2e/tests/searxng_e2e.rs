@@ -1,4 +1,4 @@
-//! SearXNG connector e2e evidence.
+//! `SearXNG` connector e2e evidence.
 //!
 //! The default lane is deterministic and uses loopback HTTP fixtures. Set
 //! `SEARXNG_E2E_URL` to enable the optional operator-host smoke path. Evidence

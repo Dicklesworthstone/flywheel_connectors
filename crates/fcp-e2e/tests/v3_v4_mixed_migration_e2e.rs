@@ -4,8 +4,8 @@
 //! defined by docs/post-quantum/v3_v4_compatibility_ledger.md and the
 //! `MigrationPhase` enum landed in br-kyopb.1.4.1:
 //!
-//!   Observe → DualAdvertise → DualSignRequired → V4Preferred
-//!     → V4RequiredForSensitive → V3ReceiveOnly → V4Only
+//!   Observe → `DualAdvertise` → `DualSignRequired` → `V4Preferred`
+//!     → `V4RequiredForSensitive` → `V3ReceiveOnly` → `V4Only`
 //!
 //! The five-node playbook covers every relevant peer-shape:
 //!
@@ -70,7 +70,7 @@ use fcp_prelude::SafetyTier;
 
 /// Per-phase per-scenario JSONL line for triage tooling. Visible under
 /// `cargo test -- --nocapture`.
-fn log_event(scenario_id: &str, phase: &str, outcome: &str, detail: serde_json::Value) {
+fn log_event(scenario_id: &str, phase: &str, outcome: &str, detail: &serde_json::Value) {
     let entry = json!({
         "ts": Utc::now().to_rfc3339(),
         "scenario_id": scenario_id,
@@ -451,7 +451,7 @@ fn walk_phase(
                     scenario_id,
                     &phase_label,
                     outcome,
-                    json!({
+                    &json!({
                         "initiator": initiator.id,
                         "responder": responder.id,
                         "tier": format!("{tier:?}"),
@@ -483,7 +483,7 @@ fn v3_v4_mixed_migration_s1_full_ladder_decisions_match_phase_semantics() {
         scenario_id,
         "setup",
         "ok",
-        json!({"playbook": FIVE_NODE_PLAYBOOK.len(), "policy": "default"}),
+        &json!({"playbook": FIVE_NODE_PLAYBOOK.len(), "policy": "default"}),
     );
 
     let phases = [
@@ -546,7 +546,7 @@ fn assert_phase_invariants(scenario_id: &str, ledger: &MeshCompatibilityLedger) 
             scenario_id,
             &format!("{phase:?}/inv1_safe_traffic_survives"),
             "ok",
-            json!({}),
+            &json!({}),
         );
     }
 
@@ -600,7 +600,7 @@ fn assert_phase_invariants(scenario_id: &str, ledger: &MeshCompatibilityLedger) 
             scenario_id,
             &format!("{phase:?}/inv2_sensitive_refuses_v3"),
             "ok",
-            json!({}),
+            &json!({}),
         );
     }
 }
@@ -631,7 +631,7 @@ fn v3_v4_mixed_migration_s2_phase_rollback_refused_unless_emergency() {
         scenario_id,
         "epoch1_signed",
         "ok",
-        json!({"phase": format!("{:?}", ledger1.body.phase), "root": root1.to_hex()}),
+        &json!({"phase": format!("{:?}", ledger1.body.phase), "root": root1.to_hex()}),
     );
 
     // Attempt epoch 2 ROLLBACK to DualAdvertise WITHOUT the emergency
@@ -655,7 +655,7 @@ fn v3_v4_mixed_migration_s2_phase_rollback_refused_unless_emergency() {
         scenario_id,
         "epoch2_rollback_strict",
         if rollback_accepted { "MISMATCH" } else { "ok" },
-        json!({
+        &json!({
             "from_phase": format!("{:?}", ledger1.body.phase),
             "to_phase": format!("{:?}", ledger2_rollback.body.phase),
             "emergency_flag": false,
@@ -688,7 +688,7 @@ fn v3_v4_mixed_migration_s2_phase_rollback_refused_unless_emergency() {
         scenario_id,
         "epoch2_rollback_emergency",
         if emergency_accepted { "ok" } else { "MISMATCH" },
-        json!({
+        &json!({
             "from_phase": format!("{:?}", ledger1.body.phase),
             "to_phase": format!("{:?}", ledger2_emergency.body.phase),
             "emergency_flag": true,
@@ -709,10 +709,10 @@ fn is_rollback_accepted(
     next_policy: &CompatibilityPolicy,
 ) -> bool {
     let is_rollback = next.body.phase < prev.body.phase;
-    if !is_rollback {
-        true
-    } else {
+    if is_rollback {
         next_policy.emergency_phase_rollback_allowed
+    } else {
+        true
     }
 }
 
@@ -746,7 +746,7 @@ fn v3_v4_mixed_migration_s3_unsigned_or_mis_signed_ledgers_refused() {
         scenario_id,
         "dual_signed",
         "ok",
-        json!({"root": root.to_hex()}),
+        &json!({"root": root.to_hex()}),
     );
 
     // Strip the ML-DSA half — required by phase, must REFUSE.
@@ -763,7 +763,7 @@ fn v3_v4_mixed_migration_s3_unsigned_or_mis_signed_ledgers_refused() {
         scenario_id,
         "missing_ml_dsa_half",
         "ok",
-        json!({"refused": format!("{err:?}")}),
+        &json!({"refused": format!("{err:?}")}),
     );
     // The phase explicitly requires ML-DSA — assert the schema agrees.
     assert!(
@@ -785,7 +785,7 @@ fn v3_v4_mixed_migration_s3_unsigned_or_mis_signed_ledgers_refused() {
         scenario_id,
         "missing_ed25519_half",
         "ok",
-        json!({"refused": format!("{err:?}")}),
+        &json!({"refused": format!("{err:?}")}),
     );
 
     // Tamper the body epoch — Ed25519 signature MUST break.
@@ -805,7 +805,7 @@ fn v3_v4_mixed_migration_s3_unsigned_or_mis_signed_ledgers_refused() {
         scenario_id,
         "tampered_epoch",
         "ok",
-        json!({"refused": format!("{err:?}")}),
+        &json!({"refused": format!("{err:?}")}),
     );
 }
 
@@ -825,7 +825,7 @@ fn v3_v4_mixed_migration_s4_v3_only_peers_refused_at_v4_only_deadline() {
         scenario_id,
         "setup",
         "ok",
-        json!({"phase": format!("{:?}", ledger.body.phase)}),
+        &json!({"phase": format!("{:?}", ledger.body.phase)}),
     );
 
     for initiator in FIVE_NODE_PLAYBOOK {
@@ -855,7 +855,7 @@ fn v3_v4_mixed_migration_s4_v3_only_peers_refused_at_v4_only_deadline() {
             }
         }
     }
-    log_event(scenario_id, "v3_only_peers_refused", "ok", json!({}));
+    log_event(scenario_id, "v3_only_peers_refused", "ok", &json!({}));
 
     // Flip the emergency flag → V3-only peers can RECEIVE safe traffic
     // again (recovery path). Risky+ remains refused.
@@ -902,7 +902,7 @@ fn v3_v4_mixed_migration_s4_v3_only_peers_refused_at_v4_only_deadline() {
         scenario_id,
         "emergency_recovery_paths",
         "ok",
-        json!({
+        &json!({
             "safe_recoveries": safe_recoveries,
             "sensitive_refusals": sensitive_refusals,
         }),
@@ -947,7 +947,7 @@ fn v3_v4_mixed_migration_s5_ledger_round_trips_canonical_cbor_per_phase() {
             scenario_id,
             &format!("{phase:?}"),
             "ok",
-            json!({"bytes": bytes.len(), "epoch": epoch}),
+            &json!({"bytes": bytes.len(), "epoch": epoch}),
         );
     }
 }

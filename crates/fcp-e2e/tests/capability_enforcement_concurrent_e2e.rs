@@ -1,6 +1,6 @@
 //! Real-concurrent end-to-end harness for capability enforcement.
 //!
-//! AmberLark's `crates/fcp-conformance/tests/host_invoke_loop_conformance.rs`
+//! `AmberLark`'s `crates/fcp-conformance/tests/host_invoke_loop_conformance.rs`
 //! (commit 6d16bf953) covers the value contract of each phase as a
 //! sequence of single-threaded scenarios. This harness moves four of
 //! those contracts into a real concurrent invoke load and pins the
@@ -321,6 +321,7 @@ impl RejectionKind {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn scenario_c_four_rejection_paths_emit_warning() {
     let signing_key = Arc::new(Ed25519SigningKey::generate());
     let pub_bytes = signing_key.verifying_key().to_bytes();
@@ -504,6 +505,7 @@ async fn scenario_c_four_rejection_paths_emit_warning() {
 // Scenario D: RevocationSeal staleness fires within SLA under jitter.
 // ────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 async fn scenario_d_revocation_seal_sla_under_jitter() {
     let registry: Arc<RwLock<RevocationRegistry>> =
         Arc::new(RwLock::new(RevocationRegistry::new()));

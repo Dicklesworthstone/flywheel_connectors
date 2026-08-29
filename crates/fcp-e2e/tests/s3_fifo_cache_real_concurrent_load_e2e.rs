@@ -135,7 +135,7 @@ async fn s3_fifo_cache_real_concurrent_load_holds_invariants() {
                 }
                 if op.is_multiple_of(8) {
                     let mut cache = cache.lock().await;
-                    cache.insert(hot_key.clone(), 0xDEADBEEF);
+                    cache.insert(hot_key.clone(), 0xDEAD_BEEF);
                 }
                 // Yield so other tasks observe the in-between state.
                 tokio::task::yield_now().await;
@@ -192,7 +192,7 @@ async fn s3_fifo_cache_real_concurrent_load_holds_invariants() {
         1,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "task_count": READERS + WRITERS,
             "ops_total": (READERS + WRITERS) * OPS_PER_TASK,
         }),
@@ -262,7 +262,7 @@ async fn s3_fifo_cache_real_concurrent_load_holds_invariants() {
         1,
         0,
         json!({
-            "total_duration_ms": started.elapsed().as_millis() as u64,
+            "total_duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }),
     );
 }
@@ -386,7 +386,7 @@ async fn s3_fifo_cache_concurrent_ghost_repromotion_observable() {
         json!({
             "resilient_ghost_key_observations": resilient_observations,
             "max_possible_observations": 16 * 8,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }),
     );
 }

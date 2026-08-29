@@ -4,7 +4,7 @@
 //!
 //! NOT wiremock. The server is a plain `tokio::net::TcpListener`
 //! that accepts a real TCP connection, parses the HTTP/1.1 request
-//! line, and writes a hand-crafted HTTP/1.1 response. The OAuth2
+//! line, and writes a hand-crafted HTTP/1.1 response. The `OAuth2`
 //! client uses its production `HttpClient` to issue the request —
 //! no in-process shim, no mock service.
 //!
@@ -67,17 +67,17 @@ fn log(test: &str, phase: &str, result: &str, passed: u32, failed: u32, ctx: ser
 
 /// Spin up a real in-process HTTP/1.1 server on 127.0.0.1:0. Returns
 /// the bound socket addr — caller uses the port to build the
-/// OAuth2Config.
+/// `OAuth2Config`.
 ///
 /// The server accepts a single connection, parses the request line,
-/// and responds to `POST /token` with a fixed OAuth2 token JSON
+/// and responds to `POST /token` with a fixed `OAuth2` token JSON
 /// response. Any other path returns 404. Designed for one
 /// request-response cycle per test invocation; the spawned task exits
 /// after serving the first request.
 /// Read until the end-of-headers marker (`\r\n\r\n`) using the
-/// asupersync-native poll_read/ReadBuf API (the OAuth client pipeline
+/// asupersync-native `poll_read`/`ReadBuf` API (the OAuth client pipeline
 /// runs under the asupersync runtime, so the loopback server must use
-/// the same runtime primitives — not tokio's AsyncReadExt).
+/// the same runtime primitives — not tokio's `AsyncReadExt`).
 async fn read_request_headers<R>(stream: &mut R) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -226,7 +226,7 @@ async fn oauth_provider_real_token_exchange_against_loopback_server() {
         2,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "access_token_round_tripped": true,
             "refresh_token_round_tripped": true,
             "no_mock_layer": true,
@@ -250,6 +250,7 @@ enum ExpectedOutcome {
 
 #[test]
 fn oauth_provider_url_validation_sweeps_16_adversarial_cases() {
+    use ExpectedOutcome::*;
     let started = Instant::now();
     log(
         "oauth_provider_url_validation",
@@ -263,7 +264,6 @@ fn oauth_provider_url_validation_sweeps_16_adversarial_cases() {
         }),
     );
 
-    use ExpectedOutcome::*;
     let cases: [(&str, &str, ExpectedOutcome); 16] = [
         // ── Load-bearing rejections (12) ──────────────────────────
         // Scheme smuggling — non-https, non-loopback-http schemes
@@ -388,7 +388,7 @@ fn oauth_provider_url_validation_sweeps_16_adversarial_cases() {
         18,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "total_cases": cases.len(),
             "load_bearing_rejections": rejections.len(),
             "documented_permissive_accepts": accepts.len(),
@@ -399,8 +399,8 @@ fn oauth_provider_url_validation_sweeps_16_adversarial_cases() {
     );
 }
 
-/// Targeted regression: building an OAuth2Client with a hostile URL
-/// MUST surface InvalidConfig at construction time, before any
+/// Targeted regression: building an `OAuth2Client` with a hostile URL
+/// MUST surface `InvalidConfig` at construction time, before any
 /// network request is issued. Catches a future refactor that defers
 /// validation to first-request time and lets a misconfigured client
 /// linger in process memory.

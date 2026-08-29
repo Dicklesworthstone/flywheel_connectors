@@ -273,6 +273,7 @@ async fn run_iteration(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn migrate_once(
     iteration: usize,
     migration_index: usize,
@@ -541,8 +542,8 @@ fn parse_seed(value: &str) -> Option<u64> {
     let hex = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"));
-    match hex {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(),
-        None => trimmed.parse::<u64>().ok(),
-    }
+    hex.map_or_else(
+        || trimmed.parse::<u64>().ok(),
+        |hex| u64::from_str_radix(hex, 16).ok(),
+    )
 }

@@ -1,7 +1,7 @@
 //! Symbol-first protocol E2E (br-carkm, [E.5] Symbol-First Protocol
 //! proof gap).
 //!
-//! GoldenFinch's smdf5 audit found that the
+//! `GoldenFinch`'s smdf5 audit found that the
 //! `Fcp.Invariants.Symbol.symbol_fungibility_reconstruction_guarantee`
 //! Lean witness exists but `crates/fcp-e2e/tests/` lacks the advertised
 //! real-service proof: split a sizeable object across N nodes, lose
@@ -21,14 +21,14 @@
 //! - Three-node split: lose one node entirely, reconstruct from the
 //!   remaining two — the bead's marquee scenario
 //! - BLAKE3 chain integrity: decoded payload hashes back to OTI's
-//!   payload_hash (no silent corruption)
+//!   `payload_hash` (no silent corruption)
 //! - Symbol fungibility: any K' ≈ K symbols suffice regardless of
 //!   which (source vs. repair, which node sourced them)
 //! - Insufficient-symbols rejection: < K symbols fails closed with
-//!   structured InsufficientSymbols error (defends the freshness
+//!   structured `InsufficientSymbols` error (defends the freshness
 //!   invariant — no partial decode)
 //! - Lean witness gate: `symbol_fungibility_reconstruction_guarantee`
-//!   registered in FORMAL_INVARIANT_THEOREMS
+//!   registered in `FORMAL_INVARIANT_THEOREMS`
 
 use chrono::Utc;
 use serde_json::json;
@@ -58,12 +58,12 @@ fn log_event(scenario_id: &str, phase: &str, outcome: &str, detail: Option<&str>
 /// is the byte index modulo 251 (a prime) which avoids accidental
 /// runs of zeros that could mask alignment bugs.
 fn make_payload(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 251) as u8).collect()
+    (0..size).map(|i| u8::try_from(i % 251).unwrap_or(u8::MAX)).collect()
 }
 
 /// Test config: smaller-than-default symbols so a 1MB payload yields
 /// ~512 symbols (enough granularity for partition + loss tests without
-/// blowing test runtime). Default repair_ratio_bps = 500 (5% overhead).
+/// blowing test runtime). Default `repair_ratio_bps` = 500 (5% overhead).
 fn test_config() -> RaptorQConfig {
     RaptorQConfig {
         symbol_size: 2048,
@@ -101,19 +101,19 @@ fn symbol_first_e2e_happy_path_round_trip() {
         Some(&format!("symbols={}", symbols.len())),
     );
 
-    let mut decoder = RaptorQDecoder::new(oti, &config);
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
     log_event(scenario, "decode", "running", None);
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     for (esi, data) in symbols {
-        if let Some(payload_out) = decoder
+        if let Some(payload_out) = rq_decoder
             .add_symbol(esi, data)
             .expect("add_symbol must not error on well-formed input")
         {
-            decoded = Some(payload_out);
+            maybe_decoded = Some(payload_out);
             break;
         }
     }
-    let decoded = decoded.expect("decoder must reconstruct from full symbol set");
+    let decoded = maybe_decoded.expect("decoder must reconstruct from full symbol set");
     log_event(
         scenario,
         "decode",
@@ -143,21 +143,21 @@ fn symbol_first_e2e_source_only_decode_succeeds() {
     let source_symbols = encoder.encode_source();
     assert_eq!(source_symbols.len(), k as usize);
 
-    let mut decoder = RaptorQDecoder::new(oti, &config);
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
     log_event(
         scenario,
         "decode_source_only",
         "running",
         Some(&format!("k={k}")),
     );
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     for (esi, data) in source_symbols {
-        if let Some(payload_out) = decoder.add_symbol(esi, data).expect("add_symbol ok") {
-            decoded = Some(payload_out);
+        if let Some(payload_out) = rq_decoder.add_symbol(esi, data).expect("add_symbol ok") {
+            maybe_decoded = Some(payload_out);
             break;
         }
     }
-    let decoded = decoded.expect("source-only decode MUST succeed on a perfect channel");
+    let decoded = maybe_decoded.expect("source-only decode MUST succeed on a perfect channel");
     assert_eq!(decoded, payload);
     log_event(scenario, "decode_source_only", "passed", None);
 }
@@ -219,17 +219,17 @@ fn symbol_first_e2e_forward_error_correction_under_30pct_loss() {
         )),
     );
 
-    let mut decoder = RaptorQDecoder::new(oti, &config);
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     let mut consumed = 0_usize;
     for (esi, data) in kept {
         consumed += 1;
-        if let Some(out) = decoder.add_symbol(esi, data).expect("add_symbol ok") {
-            decoded = Some(out);
+        if let Some(out) = rq_decoder.add_symbol(esi, data).expect("add_symbol ok") {
+            maybe_decoded = Some(out);
             break;
         }
     }
-    let decoded = decoded.expect("decoder MUST reconstruct under 30% loss with 40% repair");
+    let decoded = maybe_decoded.expect("decoder MUST reconstruct under 30% loss with 40% repair");
     assert_eq!(
         decoded, payload,
         "FEC recovery must produce identical bytes"
@@ -330,16 +330,16 @@ fn symbol_first_e2e_three_node_split_lose_one_reconstruct_from_two() {
     );
 
     // Reconstruct from the union of node A + node C.
-    let mut decoder = RaptorQDecoder::new(oti, &config);
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     for (esi, data) in surviving {
-        if let Some(out) = decoder.add_symbol(esi, data).expect("add_symbol ok") {
-            decoded = Some(out);
+        if let Some(out) = rq_decoder.add_symbol(esi, data).expect("add_symbol ok") {
+            maybe_decoded = Some(out);
             break;
         }
     }
     let decoded =
-        decoded.expect("two-of-three reconstruction MUST succeed (symbol fungibility property)");
+        maybe_decoded.expect("two-of-three reconstruction MUST succeed (symbol fungibility property)");
     assert_eq!(decoded, payload, "reconstructed bytes must equal source");
     log_event(scenario, "decode_two_of_three", "passed", None);
 }
@@ -371,15 +371,15 @@ fn symbol_first_e2e_blake3_payload_hash_chain_integrity() {
     log_event(scenario, "verify_oti_hash", "passed", None);
 
     let symbols = encoder.encode_all();
-    let mut decoder = RaptorQDecoder::new(oti, &config);
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     for (esi, data) in symbols {
-        if let Some(out) = decoder.add_symbol(esi, data).expect("add_symbol ok") {
-            decoded = Some(out);
+        if let Some(out) = rq_decoder.add_symbol(esi, data).expect("add_symbol ok") {
+            maybe_decoded = Some(out);
             break;
         }
     }
-    let decoded = decoded.expect("decoder reconstructs");
+    let decoded = maybe_decoded.expect("decoder reconstructs");
     let decoded_hash = *blake3::hash(&decoded).as_bytes();
     assert_eq!(
         decoded_hash, expected_hash,
@@ -415,13 +415,13 @@ fn symbol_first_e2e_symbol_fungibility_repair_only_decode() {
     let all_symbols = encoder.encode_all();
 
     // Filter to only repair symbols (ESI >= K' >= K).
-    let k_prime = (all_symbols.len() as u32).saturating_sub(encoder.repair_symbols());
+    let k_prime = u32::try_from(all_symbols.len()).unwrap_or(u32::MAX).saturating_sub(encoder.repair_symbols());
     let repair_only: Vec<(u32, Vec<u8>)> = all_symbols
         .into_iter()
         .filter(|(esi, _)| *esi >= k_prime)
         .collect();
     assert!(
-        (repair_only.len() as u32) >= k,
+        u32::try_from(repair_only.len()).unwrap_or(u32::MAX) >= k,
         "fixture: must have at least K repair symbols (got {} repair, K={k})",
         repair_only.len()
     );
@@ -432,15 +432,15 @@ fn symbol_first_e2e_symbol_fungibility_repair_only_decode() {
         Some(&format!("repair_count={} k={k}", repair_only.len())),
     );
 
-    let mut decoder = RaptorQDecoder::new(oti, &config);
-    let mut decoded: Option<Vec<u8>> = None;
+    let mut rq_decoder = RaptorQDecoder::new(oti, &config);
+    let mut maybe_decoded: Option<Vec<u8>> = None;
     for (esi, data) in repair_only {
-        if let Some(out) = decoder.add_symbol(esi, data).expect("add_symbol ok") {
-            decoded = Some(out);
+        if let Some(out) = rq_decoder.add_symbol(esi, data).expect("add_symbol ok") {
+            maybe_decoded = Some(out);
             break;
         }
     }
-    let decoded = decoded
+    let decoded = maybe_decoded
         .expect("symbol fungibility: repair-only decode MUST succeed when repair_count >= K");
     assert_eq!(decoded, payload);
     log_event(scenario, "decode_repair_only", "passed", None);

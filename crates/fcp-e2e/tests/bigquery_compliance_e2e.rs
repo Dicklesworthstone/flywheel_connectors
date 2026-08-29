@@ -1,6 +1,6 @@
-//! E2E BigQuery connector compliance tests.
+//! E2E `BigQuery` connector compliance tests.
 //!
-//! Exercises the BigQuery connector through the shared E2E harness:
+//! Exercises the `BigQuery` connector through the shared E2E harness:
 //! - Default deny behavior for capability mismatch
 //! - Allow path with valid capability token
 //! - Network guard allow/deny checks via manifest constraints

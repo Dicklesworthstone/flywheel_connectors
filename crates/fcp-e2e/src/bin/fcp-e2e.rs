@@ -1885,7 +1885,7 @@ mod tests {
             )],
         };
 
-        let error = super::write_report(&report, Some(path.clone()))
+        let error = super::write_report(&report, Some(&path))
             .expect_err("secret-bearing logs should be rejected before persistence");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

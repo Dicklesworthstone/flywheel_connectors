@@ -1,6 +1,6 @@
-//! E2E PostHog connector compliance tests.
+//! E2E `PostHog` connector compliance tests.
 //!
-//! Exercises the PostHog connector through the shared E2E harness:
+//! Exercises the `PostHog` connector through the shared E2E harness:
 //! - Default deny behavior for capability mismatch
 //! - Allow path with valid capability token
 //! - Network guard allow/deny checks via manifest constraints

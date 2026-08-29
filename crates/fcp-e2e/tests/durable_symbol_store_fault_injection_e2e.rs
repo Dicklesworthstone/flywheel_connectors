@@ -5,20 +5,20 @@
 //! Pre-prior-work coverage of `DurableSymbolStore`:
 //! - `crates/fcp-store/tests/store_repair_integration.rs` —
 //!   semantic-validation regressions.
-//! - `crates/fcp-store/tests/symbol_store_fuzz.rs` (CrimsonWolf
+//! - `crates/fcp-store/tests/symbol_store_fuzz.rs` (`CrimsonWolf`
 //!   7c6f83162) — round-trip + quota proptests.
 //! - `crates/fcp-store/tests/durable_wal_corruption_fuzz.rs`
-//!   (CrimsonWolf d4475cd3d) — random byte-mutation WAL replay.
+//!   (`CrimsonWolf` d4475cd3d) — random byte-mutation WAL replay.
 //!
 //! What none of those cover: **durability behaviour when the host
-//! filesystem starts refusing writes mid-mutation**. record_mutation
+//! filesystem starts refusing writes mid-mutation**. `record_mutation`
 //! advances `next_seq` only after `append_wal_record` succeeds, so a
 //! mid-write IO failure must surface a typed error AND leave the
 //! in-memory state coherent with the on-disk WAL prefix that did
 //! land. This harness exercises three real-fault scenarios against
 //! a real on-disk store rooted in `tempfile::TempDir`:
 //!
-//! 1. **Disk-full simulation via configured quota** — set max_bytes
+//! 1. **Disk-full simulation via configured quota** — set `max_bytes`
 //!    to a value the second symbol cannot fit. Pin: first symbol
 //!    succeeds, second fails with `QuotaExceeded`, store still
 //!    contains exactly the first symbol after re-open.
@@ -26,7 +26,7 @@
 //! 2. **Read-only filesystem mid-write** — set the WAL file mode
 //!    to read-only after the first put, then attempt a second put.
 //!    Pin: second put fails with a typed Io error, in-memory state
-//!    rolls back (next_seq does not advance past the failed write),
+//!    rolls back (`next_seq` does not advance past the failed write),
 //!    and re-opening the store recovers exactly the durable
 //!    prefix.
 //!
@@ -88,7 +88,7 @@ fn meta_for(seed: u8, k: u32) -> ObjectSymbolMeta {
         zone_id: ZoneId::work(),
         oti: ObjectTransmissionInfo {
             transfer_length: u64::from(k) * SYMBOL_BYTES as u64,
-            symbol_size: SYMBOL_BYTES as u16,
+            symbol_size: u16::try_from(SYMBOL_BYTES).unwrap_or(u16::MAX),
             source_blocks: 1,
             sub_blocks: 1,
             alignment: 8,
@@ -181,7 +181,7 @@ async fn dss_quota_exhaustion_mid_write_leaves_durable_state_coherent() {
         3,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "surviving_symbol_count": 1,
             "quota_exceeded_error_typed": true,
         }),
@@ -277,7 +277,7 @@ async fn dss_read_only_wal_mid_write_surfaces_typed_io_error() {
         4,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "io_error_typed": true,
             "post_fault_symbol_count": 2,
         }),
@@ -371,7 +371,7 @@ async fn dss_wal_truncated_mid_record_recovers_to_durable_prefix() {
         3,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "original_wal_len": original_len,
             "truncated_to": truncated_to,
             "post_truncation_wal_len": final_truncated_wal_len,
@@ -449,7 +449,7 @@ async fn dss_chained_quota_then_readonly_faults_compose_into_recoverable_state()
         5,
         0,
         json!({
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "fault_sequence": ["quota_exhaustion", "wal_readonly"],
             "final_symbol_count": 2,
         }),

@@ -1,6 +1,6 @@
-//! E2E DuckDB connector compliance tests.
+//! E2E `DuckDB` connector compliance tests.
 //!
-//! Exercises the DuckDB connector through the shared E2E harness:
+//! Exercises the `DuckDB` connector through the shared E2E harness:
 //! - Default deny behavior for capability mismatch
 //! - Allow path with valid capability token
 //! - Network guard allow/deny checks via manifest constraints

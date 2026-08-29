@@ -227,8 +227,7 @@ fn install_capture() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
 fn make_test_tempdir(test_name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let dir = std::env::temp_dir().join(format!("fcp-secretless-e99o6-{test_name}-{nanos}"));
     std::fs::create_dir_all(&dir).expect("create test tempdir");
     dir

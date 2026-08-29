@@ -188,7 +188,9 @@ fn v2_cutover_mechanism_risky_in_evaluation_denied_at_deployment_tier() -> Resul
             assert_eq!(check_name, "deployment_tier");
             assert_eq!(reason_code, "TIER_REQUIRES_MESH_ACTIVE");
         }
-        other => return Err(format!("expected Deny at deployment_tier, got {other:?}")),
+        outcome @ PipelineOutcome::Allow => {
+            return Err(format!("expected Deny at deployment_tier, got {outcome:?}"));
+        }
     }
 
     log_event(

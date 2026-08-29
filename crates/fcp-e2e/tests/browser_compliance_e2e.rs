@@ -4,7 +4,7 @@
 //! - Default deny behavior for capability mismatch
 //! - Allow path with valid capability token
 //! - Network guard allow/deny checks via manifest constraints
-//! - Dangerous operation approval gating for evaluate_js / form submit
+//! - Dangerous operation approval gating for `evaluate_js` / form submit
 //!
 //! All tests are deterministic with mock servers only.
 //! Run: `cargo test --package fcp-e2e --features browser`

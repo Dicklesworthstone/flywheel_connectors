@@ -131,7 +131,7 @@ impl RegistryBackedCredentialLeaseClient {
             match registry.release(&self.key, host_token) {
                 Ok(_) => released += 1,
                 Err(CredentialPoolError::UnknownLease { .. }) => {}
-                Err(error) => return Err(map_pool_client_error(error)),
+                Err(error) => return Err(map_pool_client_error(&error)),
             }
         }
         drop(registry);
@@ -202,8 +202,9 @@ impl CredentialLeaseClient for RegistryBackedCredentialLeaseClient {
         let request_id = request
             .operation
             .as_deref()
-            .map(|operation| format!("req-boundary-{operation}"))
-            .unwrap_or_else(|| "req-boundary-unspecified".to_owned());
+            .map_or_else(|| "req-boundary-unspecified".to_owned(), |operation| {
+                format!("req-boundary-{operation}")
+            });
         let provider = request.provider.as_deref().unwrap_or("groq");
         if provider != self.key.provider.as_str() {
             self.push_event(
@@ -264,7 +265,7 @@ impl CredentialLeaseClient for RegistryBackedCredentialLeaseClient {
                     "credential pool exhausted",
                 ));
             }
-            Err(error) => return Err(map_pool_client_error(error)),
+            Err(error) => return Err(map_pool_client_error(&error)),
         };
         let active_lease_count = active_lease_count(&registry, &self.key, host_lease.credential_id);
         let sdk_handle = format!("lease:credential-pool:{}", host_lease.token.as_u64());
@@ -382,7 +383,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
         "scenario_started",
         "setup",
         "pass",
-        json!({
+        &json!({
             "scenario_id": "credential-pool-groq-round-robin-cooldown",
             "operation": "chat.completions",
             "request_count": REQUEST_COUNT,
@@ -393,7 +394,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
     ));
 
     let (distribution, mut lease_records) =
-        run_parallel_round_robin_requests(registry, key.clone());
+        run_parallel_round_robin_requests(registry, &key);
     records.append(&mut lease_records);
 
     assert_eq!(
@@ -408,7 +409,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
         "round_robin_distribution_verified",
         "verify",
         "pass",
-        json!({
+        &json!({
             "distribution": distribution
                 .iter()
                 .map(|(credential_id, count)| json!({
@@ -433,7 +434,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
         "scenario_completed",
         "verify",
         "pass",
-        json!({
+        &json!({
             "duration_ms": (Utc::now() - started).num_milliseconds().max(0),
             "artifact_path": ARTIFACT_PATH
         }),
@@ -445,6 +446,7 @@ fn credential_pool_e2e_emits_redacted_round_robin_cooldown_and_exhaustion_eviden
     assert_eq!(fcp_e2e::scan_log_jsonl(&jsonl).error_count, 0);
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn credential_pool_boundary_exercises_sdk_host_and_structured_skip() {
     let started = Utc::now();
@@ -631,13 +633,13 @@ fn credential_pool_boundary_exercises_sdk_host_and_structured_skip() {
 
 fn run_parallel_round_robin_requests(
     registry: CredentialPoolRegistry,
-    key: CredentialPoolKey,
+    key: &CredentialPoolKey,
 ) -> (BTreeMap<CredentialId, u32>, Vec<Value>) {
     let registry = Arc::new(Mutex::new(registry));
     let handles = (0..REQUEST_COUNT)
         .map(|request_index| {
             let registry = Arc::clone(&registry);
-            let key = key.clone();
+            let key = CredentialPoolKey::clone(key);
             thread::spawn(move || {
                 let now = Utc::now();
                 let mut registry = registry.lock().expect("credential pool registry lock");
@@ -657,7 +659,7 @@ fn run_parallel_round_robin_requests(
                     "pass",
                     &key,
                     lease.credential_id,
-                    json!({
+                    &json!({
                         "request_index": request_index,
                         "operation": "chat.completions",
                         "strategy": "round_robin",
@@ -674,7 +676,7 @@ fn run_parallel_round_robin_requests(
                     "pass",
                     &key,
                     released_id,
-                    json!({
+                    &json!({
                         "request_index": request_index,
                         "operation": "chat.completions",
                         "outcome": "success"
@@ -712,7 +714,7 @@ fn append_cooldown_reroute_and_recovery_records(
         "pass",
         key,
         rate_limited.credential_id,
-        json!({
+        &json!({
             "operation": "chat.completions",
             "strategy": "round_robin",
             "injected_provider_status": 429
@@ -734,7 +736,7 @@ fn append_cooldown_reroute_and_recovery_records(
         "pass",
         key,
         cooldowned_id,
-        json!({
+        &json!({
             "operation": "chat.completions",
             "outcome": "error",
             "error_kind": "rate_limited",
@@ -749,7 +751,7 @@ fn append_cooldown_reroute_and_recovery_records(
         "pass",
         key,
         cooldowned_id,
-        json!({
+        &json!({
             "until_unix": cooldown_until.timestamp(),
             "reason": "rate_limited",
             "retry_after_seconds": 2
@@ -772,7 +774,7 @@ fn append_cooldown_reroute_and_recovery_records(
         "pass",
         key,
         rerouted_id,
-        json!({
+        &json!({
             "operation": "chat.completions",
             "outcome": "success",
             "rerouted_around_credential_id": cooldowned_id.to_string()
@@ -794,7 +796,7 @@ fn append_cooldown_reroute_and_recovery_records(
         "pass",
         key,
         cooldowned_id,
-        json!({
+        &json!({
             "operation": "chat.completions",
             "recovery_window_checked": true
         }),
@@ -832,7 +834,7 @@ fn append_pool_exhaustion_record(
         "credential_pool_exhausted",
         "verify",
         "pass",
-        json!({
+        &json!({
             "provider": key.provider.as_str(),
             "zone_id": key.zone_id.as_str(),
             "behavior": "wait",
@@ -849,7 +851,7 @@ fn append_audit_receipts(registry: &CredentialPoolRegistry, records: &mut Vec<Va
             "audit_receipt",
             "verify",
             "pass",
-            json!({
+            &json!({
                 "receipt_id": audit_receipt_id(&audit_value),
                 "kind": "credential_pool.admin_mutation",
                 "op": audit_operation_label(audit.operation),
@@ -977,13 +979,13 @@ fn lease_event(
     result: &str,
     key: &CredentialPoolKey,
     credential_id: CredentialId,
-    details: Value,
+    details: &Value,
 ) -> Value {
     scenario_event(
         event,
         phase,
         result,
-        json!({
+        &json!({
             "provider": key.provider.as_str(),
             "zone_id": key.zone_id.as_str(),
             "credential_id": credential_id.to_string(),
@@ -993,7 +995,7 @@ fn lease_event(
     )
 }
 
-fn scenario_event(event: &str, phase: &str, result: &str, details: Value) -> Value {
+fn scenario_event(event: &str, phase: &str, result: &str, details: &Value) -> Value {
     json!({
         "schema": SCHEMA,
         "event": event,
@@ -1009,13 +1011,12 @@ fn scenario_event(event: &str, phase: &str, result: &str, details: Value) -> Val
 
 fn live_boundary_skip_record() -> Value {
     let enabled = std::env::var("FCP_E2E_LIVE_CREDENTIAL_POOL_GROQ")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+        .is_ok_and(|value| !value.trim().is_empty());
     scenario_event(
         "live_boundary_status",
         "verify",
         if enabled { "degraded" } else { "skip" },
-        json!({
+        &json!({
             "live_fcp_host_spawned": false,
             "live_groq_connector_spawned": false,
             "skip_reason": if enabled {
@@ -1030,8 +1031,7 @@ fn live_boundary_skip_record() -> Value {
 
 fn boundary_live_skip_record(key: &CredentialPoolKey) -> Value {
     let enabled = std::env::var("FCP_E2E_LIVE_CREDENTIAL_POOL_GROQ")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+        .is_ok_and(|value| !value.trim().is_empty());
     boundary_event(
         "live_boundary_status",
         "verify",
@@ -1140,11 +1140,10 @@ fn cooldown_class_for(
                 .find(|entry| entry.credential_id == credential_id)
                 .and_then(|entry| entry.cooldown)
         })
-        .map(|cooldown| match cooldown {
+        .map_or("none", |cooldown| match cooldown {
             CredentialCooldown::Until { .. } => "rate_limited",
             CredentialCooldown::Permanent => "permanent_auth",
         })
-        .unwrap_or("none")
 }
 
 fn pool_reference_id() -> CredentialId {
@@ -1172,7 +1171,7 @@ fn sdk_error_kind_label(kind: SdkCredentialErrorKind) -> &'static str {
     }
 }
 
-fn map_pool_client_error(error: CredentialPoolError) -> CredentialLeaseClientError {
+fn map_pool_client_error(error: &CredentialPoolError) -> CredentialLeaseClientError {
     match error {
         CredentialPoolError::DuplicateCredential { .. }
         | CredentialPoolError::InvalidMaxConcurrentPerCredential { .. }
@@ -1183,10 +1182,8 @@ fn map_pool_client_error(error: CredentialPoolError) -> CredentialLeaseClientErr
         CredentialPoolError::InvalidProviderKey
         | CredentialPoolError::PoolNotFound { .. }
         | CredentialPoolError::CredentialNotFound { .. }
-        | CredentialPoolError::UnknownLease { .. } => {
-            CredentialLeaseClientError::rejected(error.to_string())
-        }
-        CredentialPoolError::PoolExhausted { .. }
+        | CredentialPoolError::UnknownLease { .. }
+        | CredentialPoolError::PoolExhausted { .. }
         | CredentialPoolError::PoolWaitRequired { .. } => {
             CredentialLeaseClientError::rejected(error.to_string())
         }

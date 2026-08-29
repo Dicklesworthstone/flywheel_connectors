@@ -1,7 +1,7 @@
 //! Threshold owner-key E2E (br-rl5q7, [E.6] Threshold Owner Key
 //! proof gap).
 //!
-//! GoldenFinch's smdf5 audit found no `crates/fcp-e2e/tests/`
+//! `GoldenFinch`'s smdf5 audit found no `crates/fcp-e2e/tests/`
 //! real-service scenario for a k-of-n FROST owner-key ceremony,
 //! signing a `RevocationObject`-shaped message, losing one
 //! participant, and completing the ceremony from the survivors.
@@ -21,7 +21,7 @@
 //! - Aggregated signature is byte-equivalent to a normal Ed25519
 //!   signature — round-trips through standard verifying-key paths,
 //!   no FROST-specific verifier needed downstream
-//! - Single share alone (k-1 = 1) cannot proceed: signing_package()
+//! - Single share alone (k-1 = 1) cannot proceed: `signing_package()`
 //!   rejects with structured error
 //! - Wrong-key forgery resistance: aggregated signature does NOT
 //!   verify under a different verifying key
@@ -493,8 +493,7 @@ fn threshold_owner_key_e2e_lean_witness_absence_documented() {
         !frost_themed,
         "smdf5 audit recorded NO FROST/threshold/ceremony Lean theorem; if a witness \
          was just added, update this scenario to assert the new theorem name AND \
-         update FORMAL_INVARIANT_THEOREMS to include it. (Currently registered: {:?})",
-        FORMAL_INVARIANT_THEOREMS
+         update FORMAL_INVARIANT_THEOREMS to include it. (Currently registered: {FORMAL_INVARIANT_THEOREMS:?})"
     );
     log_event(
         scenario,

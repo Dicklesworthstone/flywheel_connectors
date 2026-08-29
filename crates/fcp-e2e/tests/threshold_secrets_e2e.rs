@@ -357,13 +357,10 @@ fn threshold_secrets_e2e_rejects_k_minus_one_shares() -> Result<(), ThresholdSec
     log_event(scenario, "setup", "started", None);
 
     let engine = ThresholdSecretEngine::issue(fixture.secret_type, fixture.plaintext, K, N)?;
-    let err = match engine.reconstruct_selected(&[0, 1], &fixture.proof) {
-        Ok(_) => {
-            return Err(ThresholdSecretError::UnexpectedSuccess(
-                "K-1 reconstruction",
-            ));
-        }
-        Err(err) => err,
+    let Err(err) = engine.reconstruct_selected(&[0, 1], &fixture.proof) else {
+        return Err(ThresholdSecretError::UnexpectedSuccess(
+            "K-1 reconstruction",
+        ));
     };
     match err {
         ThresholdSecretError::InsufficientShares { required, provided } => {
@@ -395,13 +392,10 @@ fn threshold_secrets_e2e_cryptographic_proof_rejects_tampered_share()
     tampered_data[0] ^= 0x5A;
     opened[1] = ShamirShare::new(tampered_index, tampered_data);
 
-    let err = match engine.reconstruct_opened(&opened, &fixture.proof) {
-        Ok(_) => {
-            return Err(ThresholdSecretError::UnexpectedSuccess(
-                "tampered share proof",
-            ));
-        }
-        Err(err) => err,
+    let Err(err) = engine.reconstruct_opened(&opened, &fixture.proof) else {
+        return Err(ThresholdSecretError::UnexpectedSuccess(
+            "tampered share proof",
+        ));
     };
     match err {
         ThresholdSecretError::CommitmentMismatch { expected, actual } => {
@@ -427,19 +421,16 @@ fn threshold_secrets_e2e_wrong_aad_cannot_open_wrapped_share() -> Result<(), Thr
 
     let engine = ThresholdSecretEngine::issue(fixture.secret_type, fixture.plaintext, K, N)?;
     let node = &engine.nodes[0];
-    let err = match open_share(
+    let Err(err) = open_share(
         &node.sealed_share,
         &node.secret_key,
         b"z:project:qjcg0-wrong-zone",
         &node.node_id,
         engine.issued_at,
-    ) {
-        Ok(_) => {
-            return Err(ThresholdSecretError::UnexpectedSuccess(
-                "wrong AAD share open",
-            ));
-        }
-        Err(err) => err,
+    ) else {
+        return Err(ThresholdSecretError::UnexpectedSuccess(
+            "wrong AAD share open",
+        ));
     };
     log_event(
         scenario,

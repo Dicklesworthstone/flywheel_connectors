@@ -6,8 +6,8 @@
 //! - Network guard allow/deny checks via manifest constraints
 //!
 //! Note: Logseq is a local-only connector. Its manifest uses
-//! `localhost.localdomain` host allow with deny_localhost=false,
-//! deny_private_ranges=false, require_sni=false.
+//! `localhost.localdomain` host allow with `deny_localhost=false`,
+//! `deny_private_ranges=false`, `require_sni=false`.
 //!
 //! All tests are deterministic with mock servers only.
 //! Run: `cargo test --package fcp-e2e --features logseq`

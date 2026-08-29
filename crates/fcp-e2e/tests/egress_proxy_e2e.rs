@@ -1,6 +1,6 @@
 //! Egress proxy E2E (br-el1qe, [E.2] Egress Proxy E2E proof gap).
 //!
-//! GoldenFinch's smdf5 audit found that the production egress proxy
+//! `GoldenFinch`'s smdf5 audit found that the production egress proxy
 //! (`fcp_sandbox::EgressGuard` — the single outbound network path for
 //! connectors under strict / moderate sandbox profiles) has compliance
 //! and unit coverage but no `crates/fcp-e2e/tests/` real-service
@@ -28,8 +28,8 @@
 //! - Localhost when denied → `Denied { code: LocalhostDenied }`
 //! - Credential not authorized → `Denied { code: CredentialNotAuthorized }`
 //! - TCP connect to disallowed host → `Denied { code: HostNotAllowed }`
-//! - Wildcard host_allow accepts canonical subdomains → `allowed`
-//! - Audit event emitted on denial with structured DenyReason metadata
+//! - Wildcard `host_allow` accepts canonical subdomains → `allowed`
+//! - Audit event emitted on denial with structured `DenyReason` metadata
 
 use chrono::Utc;
 use serde_json::json;
@@ -96,8 +96,8 @@ fn http_request(url: &str) -> EgressHttpRequest {
     }
 }
 
-/// Build a structured audit entry from a real EgressError::Denied. The
-/// audit-side counterpart of an egress denial uses event_types::SECURITY_VIOLATION
+/// Build a structured audit entry from a real `EgressError::Denied`. The
+/// audit-side counterpart of an egress denial uses `event_types::SECURITY_VIOLATION`
 /// so SOC tooling can surface "connector tried to leave the sandbox" without
 /// rewiring the existing fork-detection pipeline.
 fn audit_entry_from_denial(
@@ -105,6 +105,12 @@ fn audit_entry_from_denial(
     err: &EgressError,
     target: &str,
 ) -> fcp_audit::AuditEntry {
+    #[derive(serde::Serialize)]
+    struct EgressDescriptor<'a> {
+        scenario: &'a str,
+        target: &'a str,
+    }
+
     let (deny_label, observed_value) = match err {
         EgressError::Denied { code, reason } => (
             format!("egress.{}", deny_reason_label(*code)),
@@ -113,11 +119,6 @@ fn audit_entry_from_denial(
         other => panic!("expected EgressError::Denied, got {other:?}"),
     };
 
-    #[derive(serde::Serialize)]
-    struct EgressDescriptor<'a> {
-        scenario: &'a str,
-        target: &'a str,
-    }
     let descriptor_hash =
         capability_constraint_request_descriptor_hash(&EgressDescriptor { scenario, target })
             .expect("descriptor hash computes");

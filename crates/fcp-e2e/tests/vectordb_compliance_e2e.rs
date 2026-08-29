@@ -1,7 +1,7 @@
 //! E2E vectordb connector compliance tests (flywheel_connectors-lszk.26.4).
 //!
 //! Exercises the vectordb connector through the E2E compliance harness:
-//! - Default deny (missing capability -> OperationNotGranted error)
+//! - Default deny (missing capability -> `OperationNotGranted` error)
 //! - Allow with valid token (happy path invoke via capability verification)
 //! - Network guard allow/deny (manifest `host_allow` validation)
 //! - Operation risk level gating (risk level verification)

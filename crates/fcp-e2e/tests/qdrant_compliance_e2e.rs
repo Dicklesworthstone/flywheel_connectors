@@ -2,9 +2,9 @@
 //!
 //! Exercises the Qdrant connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error)
-//! - Allow reads with valid token (happy path list_collections invoke)
-//! - Allow writes with valid token (happy path upsert_points invoke)
-//! - Network guard allow/deny (manifest host_allow validation)
+//! - Allow reads with valid token (happy path `list_collections` invoke)
+//! - Allow writes with valid token (happy path `upsert_points` invoke)
+//! - Network guard allow/deny (manifest `host_allow` validation)
 //!
 //! All tests are deterministic -- no real API calls.
 //! Run: `cargo test --package fcp-e2e --features qdrant`

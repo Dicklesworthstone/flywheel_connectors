@@ -1,6 +1,6 @@
-//! E2E DocuSign connector compliance tests.
+//! E2E `DocuSign` connector compliance tests.
 //!
-//! Exercises the DocuSign connector through the E2E compliance harness:
+//! Exercises the `DocuSign` connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error + decision receipt)
 //! - Allow with valid token (happy path invoke via mock REST API)
 //! - Network guard allow/deny (manifest `host_allow` wildcard validation)

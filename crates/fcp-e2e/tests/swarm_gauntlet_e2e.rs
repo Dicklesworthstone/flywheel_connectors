@@ -490,6 +490,7 @@ fn resource_snapshots(bundle: &SwarmLatencyEvidenceBundle) -> Vec<SwarmRegressio
         .collect()
 }
 
+#[allow(clippy::too_many_lines)] // linear evidence-record builder for the gauntlet; emission order is the artifact contract
 fn resource_ledger_records(
     command_line: &[String],
     git_revision: &str,
@@ -959,7 +960,7 @@ fn prewarm_latency(
     p50_ms: u64,
     p95_ms: u64,
     p99_ms: u64,
-    p999_ms: u64,
+    p999_percentile_ms: u64,
     max_ms: u64,
     mean_ms: u64,
 ) -> SwarmPrewarmLatencyPercentiles {
@@ -967,7 +968,7 @@ fn prewarm_latency(
         p50_ms,
         p95_ms,
         p99_ms,
-        p999_ms,
+        p999_ms: p999_percentile_ms,
         max_ms,
         mean_ms,
     }
@@ -1333,6 +1334,7 @@ fn batch_morselization_e2e_emits_replayable_jsonl() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // end-to-end scenario script; steps are sequential evidence emissions, not reusable logic
 #[test]
 fn prewarm_cold_start_e2e_emits_replayable_jsonl() -> Result<(), Box<dyn Error>> {
     let config = ConnectorPrewarmConfig::warm_pool(
@@ -1801,6 +1803,7 @@ fn prewarm_cold_start_e2e_emits_replayable_jsonl() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // end-to-end scenario script; steps are sequential evidence emissions, not reusable logic
 #[test]
 fn swarm_statistical_gate_e2e_emits_pass_fail_and_indeterminate_logs() -> Result<(), Box<dyn Error>>
 {
@@ -1921,6 +1924,7 @@ fn swarm_statistical_gate_e2e_emits_pass_fail_and_indeterminate_logs() -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // end-to-end scenario script; steps are sequential evidence emissions, not reusable logic
 #[test]
 fn swarm_controller_safety_e2e_emits_pass_fail_and_fallback_logs() -> Result<(), Box<dyn Error>> {
     let pass_scenario = SwarmControllerInteractionScenario::MixedPriority;

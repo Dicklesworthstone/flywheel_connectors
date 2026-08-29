@@ -1,4 +1,4 @@
-//! DuckDuckGo connector e2e evidence.
+//! `DuckDuckGo` connector e2e evidence.
 //!
 //! The default lane is deterministic and uses loopback HTTP fixtures. Set
 //! `DUCKDUCKGO_E2E=1` to enable the optional live smoke path. Evidence records

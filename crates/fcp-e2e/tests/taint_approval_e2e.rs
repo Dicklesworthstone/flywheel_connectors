@@ -2,11 +2,11 @@
 //!
 //! Exercises the provenance model end-to-end:
 //! - Taint blocking for dangerous/risky/safe operations
-//! - ApprovalToken elevation and declassification
-//! - SanitizerReceipt taint reduction
+//! - `ApprovalToken` elevation and declassification
+//! - `SanitizerReceipt` taint reduction
 //! - Provenance merge semantics (integrity=MIN, confidentiality=MAX, taint=OR)
 //! - Information flow / zone crossing rules
-//! - Full logged flows with E2eLogger structured logging
+//! - Full logged flows with `E2eLogger` structured logging
 //!
 //! All tests are synchronous and deterministic (no network, no async).
 
