@@ -2031,6 +2031,49 @@ mod tests {
     }
 
     #[test]
+    fn cutover_gate_overall_status_red_dominates_and_green_requires_unanimity() {
+        let args = MeshCutoverGateArgs::default();
+        let gates = mesh_cutover_gates(&args);
+
+        // One red gate forces the whole ladder red even if every other gate is green.
+        let mut one_red = gates.clone();
+        for (index, gate) in one_red.iter_mut().enumerate() {
+            gate.status = if index == 0 {
+                CutoverGateStatus::Red
+            } else {
+                CutoverGateStatus::Green
+            };
+        }
+        assert_eq!(
+            cutover_gate_overall_status(&one_red),
+            CutoverGateStatus::Red
+        );
+
+        // Green requires unanimity: a single skip keeps the ladder at skip.
+        let mut one_skip = gates.clone();
+        for (index, gate) in one_skip.iter_mut().enumerate() {
+            gate.status = if index == 1 {
+                CutoverGateStatus::Skip
+            } else {
+                CutoverGateStatus::Green
+            };
+        }
+        assert_eq!(
+            cutover_gate_overall_status(&one_skip),
+            CutoverGateStatus::Skip
+        );
+
+        let mut all_green = gates;
+        for gate in &mut all_green {
+            gate.status = CutoverGateStatus::Green;
+        }
+        assert_eq!(
+            cutover_gate_overall_status(&all_green),
+            CutoverGateStatus::Green
+        );
+    }
+
+    #[test]
     fn cutover_gate_targets_follow_args() {
         let args = MeshCutoverGateArgs {
             min_connectors: 5,
