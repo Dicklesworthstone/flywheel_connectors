@@ -258,7 +258,7 @@ pub struct ConstraintsEvaluatedSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstraintEnforcementReceipt {
     /// Content-addressed identifier (BLAKE3-keyed digest of the unsigned
-    /// receipt body). Computed by [`Self::compute_id`] at seal time.
+    /// receipt body). Computed by `compute_id` at seal time.
     pub receipt_id: ReceiptId,
     /// Content-addressed id of the capability token that was checked.
     pub token_id: ObjectId,
@@ -280,7 +280,7 @@ pub struct ConstraintEnforcementReceipt {
     pub revocation_head_seq_observed: u64,
     /// Identifier of the node that enforced this evaluation.
     pub enforcing_node_id: TailscaleNodeId,
-    /// Ed25519 signature over [`Self::signing_bytes`] using
+    /// Ed25519 signature over `signing_bytes` using
     /// `enforcing_node_id`'s signing key.
     pub signature: Ed25519Signature,
 }

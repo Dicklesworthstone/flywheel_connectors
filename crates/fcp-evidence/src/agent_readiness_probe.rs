@@ -3,7 +3,7 @@
 //! This module does not execute shell commands or call shared services. It
 //! defines the redaction-safe probe plan and deterministic no-network fixtures
 //! that production command wiring can satisfy before constructing an
-//! [`AgentReadinessReport`](crate::AgentReadinessReport).
+//! [`AgentReadinessReport`].
 
 #![allow(clippy::module_name_repetitions, clippy::struct_excessive_bools)]
 
