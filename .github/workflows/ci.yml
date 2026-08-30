@@ -751,12 +751,23 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
           df -h
-      - name: Generate coverage
+      - name: Generate coverage (platform crates)
         run: |
-          cargo llvm-cov --workspace \
+          PLATFORM_PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg ws "$GITHUB_WORKSPACE/crates/" \
+              '.packages[] | select(.manifest_path | startswith($ws)) | "-p \(.name)"' \
+            | tr '\n' ' ')
+          # Scope to the 42 platform crates (crates/*). Instrumenting the
+          # whole workspace (219 members incl. 177 connector glue crates)
+          # exhausts the runner during parallel linking (ld SIGBUS, bead
+          # 6thf5) even with line-tables-only debuginfo. Connector behavior
+          # is exercised by the Connectors job; platform logic is the
+          # coverage signal we trend.
+          cargo llvm-cov \
             --ignore-filename-regex "(tests/|benches/|fuzz/)" \
             --codecov \
-            --output-path codecov.json
+            --output-path codecov.json \
+            ${PLATFORM_PKGS}
 
       - uses: codecov/codecov-action@v7
         with:
@@ -767,10 +778,16 @@ jobs:
 
       - name: Coverage summary
         run: |
-          cargo llvm-cov --workspace --json --output-path cov.json 2>/dev/null || true
+          PLATFORM_PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg ws "$GITHUB_WORKSPACE/crates/" \
+              '.packages[] | select(.manifest_path | startswith($ws)) | "-p \(.name)"' \
+            | tr '\n' ' ')
+          cargo llvm-cov --json --output-path cov.json \
+            --ignore-filename-regex "(tests/|benches/|fuzz/)" \
+            ${PLATFORM_PKGS} 2>/dev/null || true
           if [[ -f cov.json ]]; then
             COVERAGE=$(jq -r '.data[0].totals.lines.percent // 0' cov.json)
-            echo "## Coverage: ${COVERAGE}%" >> $GITHUB_STEP_SUMMARY
+            echo "## Coverage: ${COVERAGE}% (platform crates)" >> $GITHUB_STEP_SUMMARY
           fi
 
   # ─────────────────────────────────────────────────────────────────────────────
