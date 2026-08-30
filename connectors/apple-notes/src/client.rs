@@ -3,7 +3,7 @@
 //! Subprocess invocations are bounded by the
 //! [`crate::types::AppleNotesConfig::subprocess_timeout_secs`] field
 //! (default 30s) per H.1 production hardening (krxpn). The
-//! [`bounded_subprocess`] module owns the timeout / kill-on-expiry /
+//! `bounded_subprocess` module owns the timeout / kill-on-expiry /
 //! stderr-truncation contract; see its module docs for the wire
 //! semantics.
 
