@@ -22,7 +22,7 @@ fn redacted_http_error(error: &reqwest::Error) -> String {
 ///
 /// `Debug` is hand-written (not derived) so the `Http` variant never prints the
 /// raw `reqwest::Error`, whose `url` field carries the API key. Both `Display`
-/// and `Debug` route it through [`redacted_http_error`].
+/// and `Debug` route it through `redacted_http_error`.
 #[derive(Error)]
 pub enum YouTubeError {
     /// HTTP request failed
