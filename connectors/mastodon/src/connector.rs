@@ -296,7 +296,7 @@ fn output_schema_for(operation: &str) -> Value {
 /// Mastodon connector configuration.
 #[derive(Clone, Deserialize)]
 struct MastodonConfig {
-    /// Mastodon instance URL (e.g., "https://mastodon.social").
+    /// Mastodon instance URL (e.g., `"https://mastodon.social"`).
     instance_url: String,
     /// OAuth2 access token.
     access_token: String,
