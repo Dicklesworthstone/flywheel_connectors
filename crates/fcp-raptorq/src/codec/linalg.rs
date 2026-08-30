@@ -884,7 +884,7 @@ impl GaussianSolver {
         self.rhs.swap(a, b);
     }
 
-    /// Eliminate: row[target] -= factor * row[pivot].
+    /// Eliminate: `row[target] -= factor * row[pivot]`.
     fn eliminate_row(&mut self, target: usize, pivot: usize, factor: Gf256) {
         if target == pivot {
             return;

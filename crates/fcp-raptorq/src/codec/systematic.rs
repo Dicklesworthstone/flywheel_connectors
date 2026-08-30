@@ -381,7 +381,7 @@ fn gf256_mul_slice_inplace(data: &mut [u8], c: Gf256) {
 /// RFC 6330 Section 5.3.3.3: LDPC pre-coding relationships.
 ///
 /// Two parts:
-/// 1. For i = 0..K'-1: each intermediate symbol C[i] participates
+/// 1. For i = 0..K'-1: each intermediate symbol `C[i]` participates
 ///    in 3 LDPC rows via a circulant pattern with step a = 1 + floor(i/S).
 /// 2. Identity block: row i has coefficient 1 in column K'+i, tying
 ///    each LDPC row to its check symbol C[K'+i].
@@ -426,7 +426,7 @@ fn build_ldpc_rows(matrix: &mut ConstraintMatrix, params: &SystematicParams, _se
 ///
 /// Where:
 /// - MT is an H x (K'+S) matrix built from the RFC 6330 Rand function
-/// - GAMMA is an H x H lower-triangular matrix with GAMMA[i][j] = alpha^(i-j)
+/// - GAMMA is an H x H lower-triangular matrix with `GAMMA[i][j] = alpha^(i-j)`
 /// - Each HDPC row r has a 1 in column K'+S+r (identity block)
 fn build_hdpc_rows(matrix: &mut ConstraintMatrix, params: &SystematicParams, _seed: u64) {
     use super::rfc6330::rand;
@@ -675,8 +675,8 @@ pub struct EmittedSymbol {
 /// 1. Source symbols (ESI 0..K-1) in ascending order
 /// 2. Repair symbols (ESI K..) in ascending order
 ///
-/// Use [`emit_systematic`] for source-only, [`emit_repair`] for repair-only,
-/// or [`emit_all`] for a combined stream.
+/// Use [`Self::emit_systematic`] for source-only, [`Self::emit_repair`] for repair-only,
+/// or [`Self::emit_all`] for a combined stream.
 #[derive(Debug)]
 pub struct SystematicEncoder {
     params: SystematicParams,
