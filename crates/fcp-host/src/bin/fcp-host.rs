@@ -2026,13 +2026,11 @@ impl SubprocessRegistry {
                 "connector {connector_id} has invalid cancellation_deadline_ms=0 (must be > 0)"
             )));
         }
-        Ok(
-            CancellationScope::new(
-                connector_id.to_string(),
-                configured_subprocess_archetype(&entry.config),
-            )
-            .with_deadline_override_ms(entry.config.cancellation_deadline_ms),
+        Ok(CancellationScope::new(
+            connector_id.to_string(),
+            configured_subprocess_archetype(&entry.config),
         )
+        .with_deadline_override_ms(entry.config.cancellation_deadline_ms))
     }
 
     /// Force-terminate a connector's subprocess: SIGTERM grace, then
@@ -7596,10 +7594,9 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
                         .await;
                     match result {
                         Ok(()) => {
-                            reap_state.cancellation.record_forced_cancellation(
-                                &expired.operation_id,
-                                Utc::now(),
-                            );
+                            reap_state
+                                .cancellation
+                                .record_forced_cancellation(&expired.operation_id, Utc::now());
                             tracing::warn!(
                                 event = "cancellation_forced",
                                 operation_id = %expired.operation_id,
@@ -14778,72 +14775,72 @@ mod tests {
 
     fn subprocess_test_connector_config(connector_id: &str) -> ConnectorConfig {
         ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: connector_id.to_string(),
-                    binary: compiled_test_connector_binary().display().to_string(),
-                    manifest_path: None,
-                    name: Some("Test Connector".to_string()),
-                    description: Some("Subprocess test connector".to_string()),
-                    args: Vec::new(),
-                    env: BTreeMap::from([(
-                        "FCP_TEST_CONNECTOR_ID".to_string(),
-                        connector_id.to_string(),
-                    )]),
-                    config: Some(json!({})),
-                    categories: vec!["test".to_string()],
-                    version: None,
-                    allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                    allowed_operations: Vec::new(),
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                }
+            cancellation_deadline_ms: None,
+            id: connector_id.to_string(),
+            binary: compiled_test_connector_binary().display().to_string(),
+            manifest_path: None,
+            name: Some("Test Connector".to_string()),
+            description: Some("Subprocess test connector".to_string()),
+            args: Vec::new(),
+            env: BTreeMap::from([(
+                "FCP_TEST_CONNECTOR_ID".to_string(),
+                connector_id.to_string(),
+            )]),
+            config: Some(json!({})),
+            categories: vec!["test".to_string()],
+            version: None,
+            allowed_zones: vec![ZoneId::work().as_str().to_string()],
+            allowed_operations: Vec::new(),
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        }
     }
 
     #[test]
     fn connector_inventory_update_replaces_empty_fields() {
         let existing = ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: "fcp.test.replace:utility:1.0.0".to_string(),
-                    binary: "/old/bin".to_string(),
-                    manifest_path: None,
-                    name: Some("Old Name".to_string()),
-                    description: Some("old description".to_string()),
-                    args: vec!["--old".to_string()],
-                    env: BTreeMap::from([("OLD_ENV".to_string(), "1".to_string())]),
-                    config: Some(json!({ "old": true })),
-                    categories: vec!["old".to_string()],
-                    version: Some("1.0.0".to_string()),
-                    allowed_zones: vec!["z:work".to_string()],
-                    allowed_operations: Vec::new(),
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                };
+            cancellation_deadline_ms: None,
+            id: "fcp.test.replace:utility:1.0.0".to_string(),
+            binary: "/old/bin".to_string(),
+            manifest_path: None,
+            name: Some("Old Name".to_string()),
+            description: Some("old description".to_string()),
+            args: vec!["--old".to_string()],
+            env: BTreeMap::from([("OLD_ENV".to_string(), "1".to_string())]),
+            config: Some(json!({ "old": true })),
+            categories: vec!["old".to_string()],
+            version: Some("1.0.0".to_string()),
+            allowed_zones: vec!["z:work".to_string()],
+            allowed_operations: Vec::new(),
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        };
         let incoming = ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: existing.id.clone(),
-                    binary: "/new/bin".to_string(),
-                    manifest_path: None,
-                    name: None,
-                    description: None,
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    config: None,
-                    categories: Vec::new(),
-                    version: None,
-                    allowed_zones: Vec::new(),
-                    allowed_operations: Vec::new(),
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                };
+            cancellation_deadline_ms: None,
+            id: existing.id.clone(),
+            binary: "/new/bin".to_string(),
+            manifest_path: None,
+            name: None,
+            description: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            config: None,
+            categories: Vec::new(),
+            version: None,
+            allowed_zones: Vec::new(),
+            allowed_operations: Vec::new(),
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        };
 
         let updated = replace_connector_update(&existing, &incoming);
 
@@ -15236,25 +15233,25 @@ deny_ptrace = true
 
     fn dispatcher_test_config(connector_id: &'static str) -> ConnectorConfig {
         ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: connector_id.to_string(),
-                    binary: "dispatcher-test".to_string(),
-                    manifest_path: None,
-                    name: Some(format!("{connector_id} test connector")),
-                    description: None,
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    config: None,
-                    categories: vec!["test".to_string()],
-                    version: None,
-                    allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                    allowed_operations: Vec::new(),
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                }
+            cancellation_deadline_ms: None,
+            id: connector_id.to_string(),
+            binary: "dispatcher-test".to_string(),
+            manifest_path: None,
+            name: Some(format!("{connector_id} test connector")),
+            description: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            config: None,
+            categories: vec!["test".to_string()],
+            version: None,
+            allowed_zones: vec![ZoneId::work().as_str().to_string()],
+            allowed_operations: Vec::new(),
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        }
     }
 
     fn zone_gate_dispatcher_state(
@@ -16912,25 +16909,25 @@ deny_ptrace = true
 
         // State A: legacy permissive — non-empty allow lists, enforce=false.
         let initial_config = ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: connector_id.to_string(),
-                    binary: "dispatcher-test".to_string(),
-                    manifest_path: None,
-                    name: Some("l9tt6 snapshot race fixture".to_string()),
-                    description: None,
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    config: None,
-                    categories: vec!["test".to_string()],
-                    version: None,
-                    allowed_zones: vec!["z:work".to_string()],
-                    allowed_operations: vec!["op.a".to_string()],
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                };
+            cancellation_deadline_ms: None,
+            id: connector_id.to_string(),
+            binary: "dispatcher-test".to_string(),
+            manifest_path: None,
+            name: Some("l9tt6 snapshot race fixture".to_string()),
+            description: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            config: None,
+            categories: vec!["test".to_string()],
+            version: None,
+            allowed_zones: vec!["z:work".to_string()],
+            allowed_operations: vec!["op.a".to_string()],
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        };
         let registry = dispatcher_registry_with_connector(connector_id, connector, initial_config);
 
         // Writer: strictly alternates the connector entry between
@@ -20274,25 +20271,25 @@ deny_ptrace = true
             connector_id,
             connector,
             ConnectorConfig {
-                        cancellation_deadline_ms: None,
-                        id: connector_id.to_string(),
-                        binary: "dispatcher-test".to_string(),
-                        manifest_path: None,
-                        name: Some("HRW Lease Refuse Test Connector".to_string()),
-                        description: None,
-                        args: Vec::new(),
-                        env: BTreeMap::new(),
-                        config: Some(json!({ "state": { "model": "singleton_writer" } })),
-                        categories: vec!["test".to_string()],
-                        version: None,
-                        allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                        allowed_operations: Vec::new(),
-                        enforce_operation_network_constraints: false,
-                        enforce_empty_allow_lists: false,
-                        runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                        prewarm: Default::default(),
-                        operation_network_constraints: BTreeMap::new(),
-                    },
+                cancellation_deadline_ms: None,
+                id: connector_id.to_string(),
+                binary: "dispatcher-test".to_string(),
+                manifest_path: None,
+                name: Some("HRW Lease Refuse Test Connector".to_string()),
+                description: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                config: Some(json!({ "state": { "model": "singleton_writer" } })),
+                categories: vec!["test".to_string()],
+                version: None,
+                allowed_zones: vec![ZoneId::work().as_str().to_string()],
+                allowed_operations: Vec::new(),
+                enforce_operation_network_constraints: false,
+                enforce_empty_allow_lists: false,
+                runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+                prewarm: Default::default(),
+                operation_network_constraints: BTreeMap::new(),
+            },
         );
         let state = dispatcher_app_state(
             registry,
@@ -21267,25 +21264,25 @@ deny_ptrace = true
             connector_key.clone(),
             RegistryEntry {
                 config: ConnectorConfig {
-                            cancellation_deadline_ms: None,
-                            id: connector_id.to_string(),
-                            binary: "dispatcher-test".to_string(),
-                            manifest_path: None,
-                            name: Some("Admit Safety Test Connector".to_string()),
-                            description: None,
-                            args: Vec::new(),
-                            env: BTreeMap::new(),
-                            config: None,
-                            categories: vec!["test".to_string()],
-                            version: None,
-                            allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                            allowed_operations: Vec::new(),
-                            enforce_operation_network_constraints: false,
-                            enforce_empty_allow_lists: false,
-                            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                            prewarm: Default::default(),
-                            operation_network_constraints: BTreeMap::new(),
-                        },
+                    cancellation_deadline_ms: None,
+                    id: connector_id.to_string(),
+                    binary: "dispatcher-test".to_string(),
+                    manifest_path: None,
+                    name: Some("Admit Safety Test Connector".to_string()),
+                    description: None,
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    config: None,
+                    categories: vec!["test".to_string()],
+                    version: None,
+                    allowed_zones: vec![ZoneId::work().as_str().to_string()],
+                    allowed_operations: Vec::new(),
+                    enforce_operation_network_constraints: false,
+                    enforce_empty_allow_lists: false,
+                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+                    prewarm: Default::default(),
+                    operation_network_constraints: BTreeMap::new(),
+                },
                 connector: ConnectorRuntime::Native(connector),
                 manifest_constraints: ManifestOperationConstraintCatalog::default(),
             },
@@ -21468,39 +21465,39 @@ deny_ptrace = true
             connector_id,
             connector,
             ConnectorConfig {
-                        cancellation_deadline_ms: None,
-                        id: connector_id.to_string(),
-                        binary: "dispatcher-test".to_string(),
-                        manifest_path: None,
-                        name: Some("Invoke Token Bucket Test Connector".to_string()),
-                        description: None,
-                        args: Vec::new(),
-                        env: BTreeMap::new(),
-                        config: Some(invoke_token_bucket_config(operation_id)),
-                        categories: vec!["test".to_string()],
-                        version: None,
-                        // TWO zones, deliberately. `invoke_token_bucket_is_partitioned_per_zone`
-                        // proves that one rate-limit pool keeps an independent bucket per
-                        // zone, which it can only observe by invoking the same pool from a
-                        // SECOND zone. Zone binding is stage 5 of the enforcement pipeline
-                        // and the rate-limit gate is stage 9, so a connector that is not
-                        // bound to `z:private` is refused long before its `z:private`
-                        // bucket is ever consulted — the test then fails on a zone-binding
-                        // denial while appearing to be about rate limiting.
-                        //
-                        // That is exactly what happened: 8234bb06b (angoc.2.1, "require
-                        // host allowed_zones") backfilled `vec![z:work]` into every test
-                        // fixture uniformly, which was right everywhere except here, where
-                        // it silently removed the test's premise. Do not "normalise" this
-                        // back to a single zone.
-                        allowed_zones: vec![ZoneId::work().as_str().to_string(), "z:private".to_string()],
-                        allowed_operations: Vec::new(),
-                        enforce_operation_network_constraints: false,
-                        enforce_empty_allow_lists: false,
-                        runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                        prewarm: Default::default(),
-                        operation_network_constraints: BTreeMap::new(),
-                    },
+                cancellation_deadline_ms: None,
+                id: connector_id.to_string(),
+                binary: "dispatcher-test".to_string(),
+                manifest_path: None,
+                name: Some("Invoke Token Bucket Test Connector".to_string()),
+                description: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                config: Some(invoke_token_bucket_config(operation_id)),
+                categories: vec!["test".to_string()],
+                version: None,
+                // TWO zones, deliberately. `invoke_token_bucket_is_partitioned_per_zone`
+                // proves that one rate-limit pool keeps an independent bucket per
+                // zone, which it can only observe by invoking the same pool from a
+                // SECOND zone. Zone binding is stage 5 of the enforcement pipeline
+                // and the rate-limit gate is stage 9, so a connector that is not
+                // bound to `z:private` is refused long before its `z:private`
+                // bucket is ever consulted — the test then fails on a zone-binding
+                // denial while appearing to be about rate limiting.
+                //
+                // That is exactly what happened: 8234bb06b (angoc.2.1, "require
+                // host allowed_zones") backfilled `vec![z:work]` into every test
+                // fixture uniformly, which was right everywhere except here, where
+                // it silently removed the test's premise. Do not "normalise" this
+                // back to a single zone.
+                allowed_zones: vec![ZoneId::work().as_str().to_string(), "z:private".to_string()],
+                allowed_operations: Vec::new(),
+                enforce_operation_network_constraints: false,
+                enforce_empty_allow_lists: false,
+                runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+                prewarm: Default::default(),
+                operation_network_constraints: BTreeMap::new(),
+            },
         );
         let mut policies = HashMap::new();
         policies.insert(ZoneId::work(), host_runtime_policy(ZoneId::work()));
@@ -21678,25 +21675,25 @@ deny_ptrace = true
             connector_key.clone(),
             RegistryEntry {
                 config: ConnectorConfig {
-                            cancellation_deadline_ms: None,
-                            id: connector_id.to_string(),
-                            binary: "dispatcher-test".to_string(),
-                            manifest_path: None,
-                            name: Some("Cascade Caller Test Connector".to_string()),
-                            description: None,
-                            args: Vec::new(),
-                            env: BTreeMap::new(),
-                            config: None,
-                            categories: vec!["test".to_string()],
-                            version: None,
-                            allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                            allowed_operations: Vec::new(),
-                            enforce_operation_network_constraints: false,
-                            enforce_empty_allow_lists: false,
-                            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                            prewarm: Default::default(),
-                            operation_network_constraints: BTreeMap::new(),
-                        },
+                    cancellation_deadline_ms: None,
+                    id: connector_id.to_string(),
+                    binary: "dispatcher-test".to_string(),
+                    manifest_path: None,
+                    name: Some("Cascade Caller Test Connector".to_string()),
+                    description: None,
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    config: None,
+                    categories: vec!["test".to_string()],
+                    version: None,
+                    allowed_zones: vec![ZoneId::work().as_str().to_string()],
+                    allowed_operations: Vec::new(),
+                    enforce_operation_network_constraints: false,
+                    enforce_empty_allow_lists: false,
+                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+                    prewarm: Default::default(),
+                    operation_network_constraints: BTreeMap::new(),
+                },
                 connector: ConnectorRuntime::Native(connector),
                 manifest_constraints: ManifestOperationConstraintCatalog::default(),
             },
@@ -21830,25 +21827,25 @@ deny_ptrace = true
             connector_id,
             connector,
             ConnectorConfig {
-                        cancellation_deadline_ms: None,
-                        id: connector_id.to_string(),
-                        binary: "dispatcher-test".to_string(),
-                        manifest_path: None,
-                        name: Some("Hybrid Owner Production Test Connector".to_string()),
-                        description: None,
-                        args: Vec::new(),
-                        env: BTreeMap::new(),
-                        config: None,
-                        categories: vec!["test".to_string()],
-                        version: None,
-                        allowed_zones: vec![ZoneId::work().as_str().to_string()],
-                        allowed_operations: Vec::new(),
-                        enforce_operation_network_constraints: false,
-                        enforce_empty_allow_lists: false,
-                        runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                        prewarm: Default::default(),
-                        operation_network_constraints: BTreeMap::new(),
-                    },
+                cancellation_deadline_ms: None,
+                id: connector_id.to_string(),
+                binary: "dispatcher-test".to_string(),
+                manifest_path: None,
+                name: Some("Hybrid Owner Production Test Connector".to_string()),
+                description: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                config: None,
+                categories: vec!["test".to_string()],
+                version: None,
+                allowed_zones: vec![ZoneId::work().as_str().to_string()],
+                allowed_operations: Vec::new(),
+                enforce_operation_network_constraints: false,
+                enforce_empty_allow_lists: false,
+                runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+                prewarm: Default::default(),
+                operation_network_constraints: BTreeMap::new(),
+            },
         );
         let lifecycle = Arc::new(HostAdminStateStore::new());
         let mut policies = HashMap::new();
@@ -22830,7 +22827,10 @@ deny_ptrace = true
             &cancellation,
             &operation_id,
             &request,
-            CancellationScope::new("fcp.test.cancel-owner:utility:1.0.0", ConnectorArchetype::Unknown),
+            CancellationScope::new(
+                "fcp.test.cancel-owner:utility:1.0.0",
+                ConnectorArchetype::Unknown,
+            ),
         )
         .expect("verified token subject should be tracked as cancellation owner");
 
@@ -25370,25 +25370,25 @@ done"#;
             .ensure_connector(&subprocess.summary.id);
 
         let connector_config = ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: connector_id.to_string(),
-                    binary: "in-process-telegram-test".to_string(),
-                    manifest_path: None,
-                    name: Some("Telegram".to_string()),
-                    description: Some("Telegram webhook ingress test connector".to_string()),
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    config: None,
-                    categories: vec!["telegram".to_string()],
-                    version: Some("1.0.0".to_string()),
-                    allowed_zones: vec![zone_id.to_string()],
-                    allowed_operations: vec![TELEGRAM_WEBHOOK_INGRESS_OPERATION.to_string()],
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: true,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                };
+            cancellation_deadline_ms: None,
+            id: connector_id.to_string(),
+            binary: "in-process-telegram-test".to_string(),
+            manifest_path: None,
+            name: Some("Telegram".to_string()),
+            description: Some("Telegram webhook ingress test connector".to_string()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            config: None,
+            categories: vec!["telegram".to_string()],
+            version: Some("1.0.0".to_string()),
+            allowed_zones: vec![zone_id.to_string()],
+            allowed_operations: vec![TELEGRAM_WEBHOOK_INGRESS_OPERATION.to_string()],
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: true,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        };
         let registry =
             dispatcher_registry_with_connector("fcp.telegram", subprocess, connector_config);
         let mut zone_policies = HashMap::new();
@@ -26965,25 +26965,25 @@ done"#;
     #[test]
     fn connector_config_debug() {
         let config = ConnectorConfig {
-                    cancellation_deadline_ms: None,
-                    id: "fcp.test:echo:1.0.0".to_string(),
-                    binary: "/bin/echo".to_string(),
-                    manifest_path: None,
-                    name: None,
-                    description: None,
-                    args: vec![],
-                    env: BTreeMap::new(),
-                    config: None,
-                    categories: vec![],
-                    version: None,
-                    allowed_zones: Vec::new(),
-                    allowed_operations: Vec::new(),
-                    enforce_operation_network_constraints: false,
-                    enforce_empty_allow_lists: false,
-                    runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
-                    prewarm: Default::default(),
-                    operation_network_constraints: BTreeMap::new(),
-                };
+            cancellation_deadline_ms: None,
+            id: "fcp.test:echo:1.0.0".to_string(),
+            binary: "/bin/echo".to_string(),
+            manifest_path: None,
+            name: None,
+            description: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            config: None,
+            categories: vec![],
+            version: None,
+            allowed_zones: Vec::new(),
+            allowed_operations: Vec::new(),
+            enforce_operation_network_constraints: false,
+            enforce_empty_allow_lists: false,
+            runtime_network_enforcement: RuntimeNetworkEnforcement::LegacyUnspecified,
+            prewarm: Default::default(),
+            operation_network_constraints: BTreeMap::new(),
+        };
         let dbg = format!("{config:?}");
         assert!(dbg.contains("ConnectorConfig"));
         assert!(dbg.contains("fcp.test:echo:1.0.0"));
