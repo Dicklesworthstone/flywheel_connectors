@@ -1,6 +1,6 @@
 //! Discovery API for agents to find and introspect connectors.
 //!
-//! Based on bead `bd-2h7e`: [FCP2] Host Discovery Endpoint.
+//! Based on bead `bd-2h7e`: \[FCP2\] Host Discovery Endpoint.
 //!
 //! Provides endpoints:
 //! - `discover` - List all connectors with summary

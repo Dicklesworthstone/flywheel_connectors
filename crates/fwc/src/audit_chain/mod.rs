@@ -44,7 +44,10 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 use crate::capability_replay::parse_since_seconds;
-use crate::truth::{KnowledgeState, LiveTruthResolver, QueryResult, RequiredTruthSource, ResolutionStrategy, ResolverConfig, TRUTH_SOURCE_SCHEMA_VERSION};
+use crate::truth::{
+    KnowledgeState, LiveTruthResolver, QueryResult, RequiredTruthSource, ResolutionStrategy,
+    ResolverConfig, TRUTH_SOURCE_SCHEMA_VERSION,
+};
 use types::{AuditEventOutput, AuditFilter, AuditTailError};
 
 pub(crate) const AUDIT_CHAIN_STATUS_SCHEMA_VERSION: &str = "fcp.fwc.audit_chain_status.v1";
@@ -941,9 +944,9 @@ fn chain_status_offline_report(
 ) -> Result<AuditChainStatusReport> {
     if let Some(error) = host_error {
         let mut report = missing_chain_status_report(args);
-        report
-            .warnings
-            .push(format!("host admin API audit-chain status query failed: {error}"));
+        report.warnings.push(format!(
+            "host admin API audit-chain status query failed: {error}"
+        ));
         return Ok(report);
     }
     build_artifact_chain_status_report(args, now_unix_secs)

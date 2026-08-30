@@ -7909,11 +7909,9 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
 
     match resolution {
         Ok(resolved) => {
-            if let Some(outcome) = enforce_required_truth_source(
-                "list",
-                args.require_source,
-                resolved.knowledge_state,
-            ) {
+            if let Some(outcome) =
+                enforce_required_truth_source("list", args.require_source, resolved.knowledge_state)
+            {
                 return Ok(outcome);
             }
             Ok(DispatchOutcome {
@@ -11360,20 +11358,20 @@ fn context_dispatch(args: &ContextArgs) -> Result<DispatchOutcome> {
             // context config); every other rung is not configured.
             let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
             let mut node_local_error: Option<anyhow::Error> = None;
-            let resolution = resolver.resolve_with_partials(
-                ResolutionStrategy::NodeLocalOnly,
-                |source| match source {
-                    KnowledgeState::NodeLocal => match context_current_node_local_payload() {
-                        Ok(payload) => QueryResult::Complete(payload),
-                        Err(error) => {
-                            let detail = format!("{error:#}");
-                            node_local_error = Some(error);
-                            QueryResult::Unavailable(detail)
-                        }
-                    },
-                    _ => QueryResult::NotConfigured,
-                },
-            );
+            let resolution =
+                resolver.resolve_with_partials(ResolutionStrategy::NodeLocalOnly, |source| {
+                    match source {
+                        KnowledgeState::NodeLocal => match context_current_node_local_payload() {
+                            Ok(payload) => QueryResult::Complete(payload),
+                            Err(error) => {
+                                let detail = format!("{error:#}");
+                                node_local_error = Some(error);
+                                QueryResult::Unavailable(detail)
+                            }
+                        },
+                        _ => QueryResult::NotConfigured,
+                    }
+                });
 
             match resolution {
                 Ok(resolved) => {
@@ -12970,11 +12968,9 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
 
     match resolution {
         Ok(resolved) => {
-            if let Some(outcome) = enforce_required_truth_source(
-                "show",
-                args.require_source,
-                resolved.knowledge_state,
-            ) {
+            if let Some(outcome) =
+                enforce_required_truth_source("show", args.require_source, resolved.knowledge_state)
+            {
                 return Ok(outcome);
             }
             Ok(DispatchOutcome {
@@ -21388,6 +21384,7 @@ fn managed_connector_from_artifact(
     existing: Option<&ManagedConnectorConfig>,
 ) -> ManagedConnectorConfig {
     ManagedConnectorConfig {
+        cancellation_deadline_ms: None,
         id: artifact.manifest.connector.id.to_string(),
         binary: artifact.package_output.binary_path.display().to_string(),
         name: Some(artifact.manifest.connector.name.clone()),
@@ -25423,9 +25420,8 @@ fn history_dispatch(args: &HistoryArgs) -> Result<DispatchOutcome> {
     // store); every other rung is not configured.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let mut offline_error: Option<anyhow::Error> = None;
-    let resolution = resolver.resolve_with_partials(
-        ResolutionStrategy::NodeLocalOnly,
-        |source| match source {
+    let resolution =
+        resolver.resolve_with_partials(ResolutionStrategy::NodeLocalOnly, |source| match source {
             KnowledgeState::Offline => match history_offline_payload(args) {
                 Ok(outcome) => QueryResult::Complete(outcome),
                 Err(error) => {
@@ -25435,8 +25431,7 @@ fn history_dispatch(args: &HistoryArgs) -> Result<DispatchOutcome> {
                 }
             },
             _ => QueryResult::NotConfigured,
-        },
-    );
+        });
 
     match resolution {
         Ok(resolved) => {
@@ -37697,6 +37692,7 @@ deny_ptrace = true
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
                             name: Some("GitHub Enterprise".to_string()),
@@ -37810,6 +37806,7 @@ deny_ptrace = true
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
                             name: Some("GitHub Enterprise".to_string()),
@@ -37905,6 +37902,7 @@ deny_ptrace = true
                     ConnectorInventoryMutationKind::Install,
                     false,
                     ManagedConnectorConfig {
+                        cancellation_deadline_ms: None,
                         id: "fcp.github:enterprise:v1".to_string(),
                         binary: "/opt/fcp/github-enterprise".to_string(),
                         name: Some("GitHub Enterprise".to_string()),
@@ -38004,6 +38002,7 @@ deny_ptrace = true
             write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
         let package_output_path = package_output_path.display().to_string();
         let previous = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
             name: Some("GitHub Enterprise".to_string()),
@@ -38023,6 +38022,7 @@ deny_ptrace = true
             operation_network_constraints: StdBTreeMap::new(),
         };
         let planned = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
             name: Some("GitHub Enterprise".to_string()),
@@ -38101,6 +38101,7 @@ deny_ptrace = true
             write_test_package_output("fcp.github:enterprise:v1", "1.2.4");
         let package_output_path = package_output_path.display().to_string();
         let previous = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
             name: Some("GitHub Enterprise".to_string()),
@@ -38120,6 +38121,7 @@ deny_ptrace = true
             operation_network_constraints: StdBTreeMap::new(),
         };
         let updated = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
             name: Some("GitHub Enterprise".to_string()),
@@ -47411,6 +47413,7 @@ require_attestation_types = ["in-toto"]"#,
                         ConnectorInventoryMutationKind::Install,
                         false,
                         ManagedConnectorConfig {
+                            cancellation_deadline_ms: None,
                             id: "fcp.github:enterprise:v1".to_string(),
                             binary: "/opt/fcp/github-enterprise".to_string(),
                             name: Some("GitHub Enterprise".to_string()),
@@ -47518,6 +47521,7 @@ require_attestation_types = ["in-toto"]"#,
             5,
         );
         let previous = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-old".to_string(),
             name: Some("GitHub Enterprise".to_string()),
@@ -47537,6 +47541,7 @@ require_attestation_types = ["in-toto"]"#,
             operation_network_constraints: StdBTreeMap::new(),
         };
         let updated = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "fcp.github:enterprise:v1".to_string(),
             binary: "/opt/fcp/github-enterprise-new".to_string(),
             name: Some("GitHub Enterprise".to_string()),

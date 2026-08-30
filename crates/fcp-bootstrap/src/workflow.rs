@@ -313,7 +313,7 @@ impl BootstrapWorkflow {
     /// Resume a partially-complete bootstrap workflow from its phase lock.
     ///
     /// Unlike [`Self::new`], this method ACCEPTS partial state: it reads
-    /// `init.lock` via [`detect_partial_state`] and positions the
+    /// `init.lock` via [`detect_partial_state`](crate::phase::detect_partial_state) and positions the
     /// workflow at the phase recorded there. The subsequent [`Self::run`]
     /// call then fast-forwards past any phase that had completed
     /// before the crash and re-runs the phase that was in progress.

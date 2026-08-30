@@ -8,7 +8,7 @@
 //!
 //! The planner combines multiple factors into a final score:
 //!
-//! 1. **Device Fitness** (base): Uses [`FitnessScore`] from device module
+//! 1. **Device Fitness** (base): Uses [`FitnessScore`](crate::device::FitnessScore) from device module
 //! 2. **Connector Availability**: Required connector must be installed with compatible version
 //! 3. **Data Locality**: Bonus for nodes that already have required symbols
 //! 4. **Lease Constraints**: Nodes holding conflicting leases are excluded

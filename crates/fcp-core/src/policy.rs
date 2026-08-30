@@ -2336,9 +2336,10 @@ pub enum PolicySimulationError {
 /// for policy *simulation* purposes. The claims are used only to
 /// extract principal and capability metadata for the dry-run decision —
 /// no authorization is granted based on these claims.  Real enforcement
-/// uses [`CapabilityVerifier::verify_bound`] (full 5/5 verification)
-/// which returns `CapabilityToken<BoundVerified>`, or
-/// [`CapabilityVerifier::verify_unbound`] at gateway vantage.
+/// uses [`CapabilityVerifier::verify_bound`](crate::capability::CapabilityVerifier::verify_bound)
+/// (full 5/5 verification) which returns `CapabilityToken<BoundVerified>`, or
+/// [`CapabilityVerifier::verify_unbound`](crate::capability::CapabilityVerifier::verify_unbound)
+/// at gateway vantage.
 ///
 /// # Errors
 /// Returns [`PolicySimulationError`] if required inputs are missing or invalid.

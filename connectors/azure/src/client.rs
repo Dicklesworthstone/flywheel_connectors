@@ -361,7 +361,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) if the HTTP client
+    /// Returns [`AzureError`] if the HTTP client
     /// cannot be built or the configuration is invalid.
     pub fn new(
         auth: AzureAuth,
@@ -453,7 +453,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on transport failure
+    /// Returns [`AzureError`] on transport failure
     /// or a non-2xx response.
     pub async fn list_subscriptions(&self) -> AzureResult<SubscriptionListResponse> {
         let query = [("api-version", self.subscriptions_api_version())];
@@ -464,7 +464,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn list_resource_groups(
         &self,
@@ -480,7 +480,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn list_resources(
         &self,
@@ -499,7 +499,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on transport failure
+    /// Returns [`AzureError`] on transport failure
     /// or a non-2xx response.
     pub async fn health_check(&self) -> AzureResult<()> {
         let _ = self.list_subscriptions().await?;
@@ -514,7 +514,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn blob_list_containers(
         &self,
@@ -535,7 +535,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn blob_list_blobs(
         &self,
@@ -563,7 +563,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn blob_get(
         &self,
@@ -646,7 +646,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn blob_put(
         &self,
@@ -726,7 +726,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn blob_delete(
         &self,
@@ -796,7 +796,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn keyvault_list_secrets(
         &self,
@@ -816,7 +816,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn keyvault_get_secret(
         &self,
@@ -839,7 +839,7 @@ impl AzureClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AzureError`](crate::error::AzureError) on invalid input,
+    /// Returns [`AzureError`] on invalid input,
     /// transport failure, or a non-2xx response.
     pub async fn keyvault_set_secret(
         &self,

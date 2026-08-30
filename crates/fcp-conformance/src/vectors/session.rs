@@ -9,7 +9,7 @@
 //! 2. Build info bytes: `"FCP2-SESSION-V1" || selected_suite || initiator_id || responder_id || hello_nonce || ack_nonce`
 //! 3. PRK = HKDF-SHA256(salt=`session_id`, ikm=`shared_secret`, info=`info`)
 //! 4. OKM = HKDF-SHA256-Expand(prk=PRK, info="FCP2-SESSION-KEYS-V1", length=96)
-//! 5. Split: `k_mac_i2r` = OKM[0:32], `k_mac_r2i` = OKM[32:64], `k_ctx` = OKM[64:96]
+//! 5. Split: `k_mac_i2r = OKM[0:32]`, `k_mac_r2i = OKM[32:64]`, `k_ctx = OKM[64:96]`
 
 use fcp_protocol::session::SessionCryptoSuite;
 use serde::{Deserialize, Serialize};

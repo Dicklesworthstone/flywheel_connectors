@@ -200,7 +200,7 @@ impl QuorumStatus {
 }
 
 /// Compute the effective quorum target for an emergency revocation:
-/// the lesser of [`PriorityGossipPolicy::EMERGENCY_QUORUM_WITNESSES`]
+/// the lesser of [`PriorityGossipPolicy::EMERGENCY_QUORUM_WITNESSES`](super::gossip::PriorityGossipPolicy::EMERGENCY_QUORUM_WITNESSES)
 /// and the majority of online peers (rounded up).
 ///
 /// Implements the "majority of online peers, whichever is smaller" rule from

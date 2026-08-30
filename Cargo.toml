@@ -451,3 +451,12 @@ strip = true
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Test profile: line-tables-only debuginfo. Full debuginfo across 219 crates
+# of test binaries exhausted GitHub runner disk/memory during parallel linking
+# (collect2: "ld terminated with signal 7 [Bus error]", run 33281823858
+# Test (ubuntu-latest) on fcp-hackernews, Golden Vectors on
+# fcp-synology-chat). Line tables keep backtraces useful at a fraction of
+# the size; local `cargo test` behavior is otherwise unchanged.
+[profile.test]
+debug = "line-tables-only"

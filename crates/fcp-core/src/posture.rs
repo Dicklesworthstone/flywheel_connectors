@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - [`PostureAttestation`] - Signed device posture claims from a trusted verifier
-//! - [`PostureAttribute`] - Individual posture attributes (OS version, disk encryption, etc.)
+//! - [`PostureAttributeKey`] - Individual posture attributes (OS version, disk encryption, etc.)
 //! - [`PostureRequirement`] - Policy-level requirements for device posture
 //!
 //! # Overview

@@ -48,16 +48,14 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use fcp_crypto::test_utils::InMemorySecretRegistry;
 use fcp_crypto::{CredentialIdHash, SecretFetchError, SecretFetchHook, ZeroizingSecret};
 use fcp_prelude::CredentialId;
 use fcp_testkit::MockApiServer;
 use serde_json::Value;
-use tracing::Subscriber;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use zeroize::ZeroizeOnDrop;
 
@@ -204,11 +202,34 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedEvents {
     }
 }
 
-/// Install a per-test tracing subscriber that captures every emitted
-/// event into the returned [`CapturedEvents`] handle. Drop the
-/// returned guard to remove the subscriber.
-fn install_capture() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
-    let captured = CapturedEvents::new();
+/// Serializes tests that install tracing capture.
+///
+/// Why a GLOBAL dispatch + lock instead of `set_default`'s thread-local
+/// dispatch: tracing's per-callsite interest cache is process-global and is
+/// NOT rebuilt when a thread-local default changes. The non-capture tests in
+/// this file exercise the same `secretless_e2e` callsites with no subscriber
+/// installed; if one runs first, the callsite's interest caches as `Never`
+/// and a later `set_default`-based capture receives zero events — the
+/// "passes isolated, fails in full-file parallel runs" flake (bead 36vxb).
+/// `set_global_default` rebuilds the interest cache and routes events from
+/// any thread, and the lock keeps each capture test's window exclusive.
+static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// The single global capture sink, installed with the subscriber on first use.
+static CAPTURE_SINK: LazyLock<CapturedEvents> = LazyLock::new(|| CapturedEvents::new());
+/// Holds the capture window open; drop to release the serial lock.
+struct CaptureGuard {
+    _serial: MutexGuard<'static, ()>,
+}
+
+/// Install process-global tracing capture. Returns the sink handle (all
+/// captured events so far — assertions are over-approximate but sound) and
+/// a guard that must stay alive for the duration of the test.
+fn install_capture() -> (CapturedEvents, CaptureGuard) {
+    let serial = CAPTURE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let captured = &*CAPTURE_SINK;
     let layer = fmt::layer()
         .with_writer(captured.clone())
         .with_target(true)
@@ -216,11 +237,14 @@ fn install_capture() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::new("trace"))
         .with(layer);
-    let guard = (Box::new(subscriber) as Box<dyn Subscriber + Send + Sync>).set_default();
-    (captured, guard)
+    // Set once per process; rebuilds tracing's interest cache so events are
+    // captured on any thread even if a non-capture test ran the same
+    // callsite first with no subscriber installed. A second install (the
+    // other capture test) fails harmlessly: both tests share the same
+    // CAPTURE_SINK writer, and the original global layer already targets it.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    (captured.clone(), CaptureGuard { _serial: serial })
 }
-
-// ── Per-test tempdir helper ─────────────────────────────────────────────
 
 /// Create a per-test tempdir at the system tempdir root. Returns the
 /// path; cleanup is via best-effort `remove_dir_all` at test end.

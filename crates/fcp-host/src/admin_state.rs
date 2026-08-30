@@ -147,6 +147,17 @@ pub struct ManagedConnectorConfig {
     /// include explicitly supported config-derived placeholders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_network_constraints: BTreeMap<String, ManagedNetworkConstraints>,
+    /// Operator override for the cancellation deadline of this connector's
+    /// operations, in milliseconds (`flywheel_connectors-861lx`).
+    ///
+    /// When `Some`, this wins over the per-archetype defaults (1 s for
+    /// bounded one-shot archetypes, 10 s for long-lived archetypes). The
+    /// host fails closed when an operation tracked with this connector
+    /// ignores its cancellation past the deadline: the connector
+    /// subprocess is force-terminated (SIGTERM grace, then SIGKILL) and
+    /// the cancellation audit event carries `forced = true`. Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_deadline_ms: Option<u64>,
 }
 
 /// Live connector inventory mutation kind handled by the host admin plane.
@@ -733,7 +744,7 @@ pub struct CapabilityIssuanceRequest {
     #[serde(default = "default_token_ttl_secs")]
     pub ttl_secs: u64,
     /// Optional not-before delay in seconds (deferred activation).
-    /// Must not exceed [`MAX_NOT_BEFORE_DELAY_SECS`].
+    /// Must not exceed `MAX_NOT_BEFORE_DELAY_SECS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_delay_secs: Option<u64>,
     /// If set, the token requires a holder proof from this node for replay resistance.
@@ -10465,6 +10476,7 @@ mod tests {
     #[test]
     fn managed_connector_config_full_roundtrip() {
         let config = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "test-connector".to_string(),
             binary: "/usr/bin/test".to_string(),
             manifest_path: None,
@@ -10491,6 +10503,7 @@ mod tests {
     #[test]
     fn managed_connector_config_serializes_explicit_prewarm_policy() {
         let config = ManagedConnectorConfig {
+            cancellation_deadline_ms: None,
             id: "test-connector".to_string(),
             binary: "/usr/bin/test".to_string(),
             manifest_path: None,
@@ -10530,6 +10543,7 @@ mod tests {
             kind: ConnectorInventoryMutationKind::Update,
             dry_run: true,
             connector: ManagedConnectorConfig {
+                cancellation_deadline_ms: None,
                 id: "fcp.github".to_string(),
                 binary: "[connector-binary]".to_string(),
                 manifest_path: Some("connectors/github/manifest.toml".to_string()),

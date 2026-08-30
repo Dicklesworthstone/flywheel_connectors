@@ -63,7 +63,7 @@ pub enum DegradedTransportError {
     /// that know the expected schema of a reconstructed payload. The decoder
     /// itself cannot raise this: the reconstructed wire payload carries the
     /// claimed schema hash but nothing to compare it against (see
-    /// [`DegradedModeDecoder::finish_reconstruction`] for the verification
+    /// `DegradedModeDecoder::finish_reconstruction` for the verification
     /// deferral; bead degraded-reconstruct-objectid-verify-qtmop).
     #[error("schema hash mismatch: expected {expected:?}, got {actual:?}")]
     SchemaHashMismatch {
@@ -77,7 +77,7 @@ pub enum DegradedTransportError {
     /// boundaries that re-derive the content address. The decoder itself
     /// cannot raise this: `derive_id` needs the object's `ObjectHeader` and
     /// the zone `ObjectIdKey`, neither of which exists at the degraded
-    /// transport layer (see [`DegradedModeDecoder::finish_reconstruction`];
+    /// transport layer (see `DegradedModeDecoder::finish_reconstruction`;
     /// bead degraded-reconstruct-objectid-verify-qtmop).
     #[error("object ID mismatch")]
     ObjectIdMismatch,
@@ -1067,7 +1067,7 @@ pub trait ControlPlaneHandler: Send + Sync {
 ///
 /// Test/replay fixture only: it indexes envelopes by their *claimed*
 /// `object_id` without content-address verification (which is impossible at
-/// this layer — see [`DegradedModeDecoder::finish_reconstruction`]). A
+/// this layer — see `DegradedModeDecoder::finish_reconstruction`). A
 /// production handler that promotes reconstructed payloads into an object
 /// store must route the write through a store with an injected
 /// `ObjectIdVerifier` instead of trusting the envelope's id.

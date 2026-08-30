@@ -1391,7 +1391,7 @@ pub enum MissingFieldPolicy {
 /// ## Missing-field policy
 ///
 /// When `ctx.safety_tier` OR `ctx.deployment_classification` is
-/// missing, the check honors [`Self::on_missing`]:
+/// missing, the check honors `on_missing`:
 ///
 /// * [`MissingFieldPolicy::Deny`] (production default) — returns
 ///   `CheckOutcome::Deny` with `reason_code`

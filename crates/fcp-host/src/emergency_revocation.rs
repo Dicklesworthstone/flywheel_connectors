@@ -75,7 +75,7 @@ pub struct EmergencyRevocationRequest {
 }
 
 impl EmergencyRevocationRequest {
-    /// Construct an unsigned request. Call [`Self::sign_with`] to
+    /// Construct an unsigned request. Call `sign_with` to
     /// attach the owner signature once the transcript is finalized.
     #[must_use]
     pub const fn new(

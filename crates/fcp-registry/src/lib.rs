@@ -320,7 +320,7 @@ pub struct RegistryTrustPolicy {
 /// enforcement requires the matching evidence bool to be `true`. A
 /// default-constructed `SupplyChainEvidence` carries no verification
 /// claims and MUST NOT pass a `require_*` gate. See
-/// [`enforce_supply_chain_verification_config`] below.
+/// `enforce_supply_chain_verification_config` below.
 ///
 /// Historical note (br-pcmm8, br-i5iv4): these fields were added after a
 /// review found the pre-existing presence-only checks
@@ -331,8 +331,8 @@ pub struct RegistryTrustPolicy {
 /// setters that require an actual verifier result type (which is itself
 /// only constructed by the trait's `verify_*` methods). Tests that need
 /// to short-circuit to a verified state go through the cfg-gated
-/// [`Self::mark_tuf_verified_for_tests`] /
-/// [`Self::mark_sigstore_verified_for_tests`] helpers, which are not
+/// `mark_tuf_verified_for_tests` /
+/// `mark_sigstore_verified_for_tests` helpers, which are not
 /// visible to downstream crates outside a `--features test-mocks` build.
 #[derive(Debug, Clone, Default)]
 pub struct SupplyChainEvidence {
@@ -382,13 +382,13 @@ impl SupplyChainEvidence {
     /// - [`Self::with_tuf_verification_result`] with a
     ///   `TufVerificationResult { verified: true, .. }` produced by a
     ///   [`TufVerifier::verify_target`] call, OR
-    /// - [`Self::mark_tuf_verified_for_tests`] under `#[cfg(any(test,
+    /// - `mark_tuf_verified_for_tests` under `#[cfg(any(test,
     ///   feature = "test-mocks"))]`.
     ///
     /// This boolean alone means "the target path is enumerated in validly
     /// signed TUF metadata", NOT "this binary matches the TUF target hash".
     /// The byte binding lives in [`Self::tuf_target_hash`] and is enforced
-    /// by [`enforce_supply_chain_verification_config`].
+    /// by `enforce_supply_chain_verification_config`.
     #[must_use]
     pub const fn tuf_verified(&self) -> bool {
         self.tuf_verified
@@ -456,7 +456,7 @@ impl SupplyChainEvidence {
     /// Promote this evidence with a Sigstore verification result.
     ///
     /// Records the identity and issuer the adapter reported so
-    /// [`enforce_supply_chain_verification_config`] can re-check them
+    /// `enforce_supply_chain_verification_config` can re-check them
     /// against the operator's trusted allowlists (br-g7jhf finding 5).
     #[must_use]
     pub fn with_sigstore_verification_result(
@@ -1253,7 +1253,7 @@ impl CosignBlobVerifier {
     /// identity — there is no certificate to extract an identity or issuer
     /// from. The two arguments are therefore *operator-declared labels* that
     /// name the key being pinned, and they are echoed into the result so
-    /// [`enforce_supply_chain_verification_config`] can match them against
+    /// `enforce_supply_chain_verification_config` can match them against
     /// the operator's own allowlist. They MUST come from operator
     /// configuration; never source them from publisher- or bundle-controlled
     /// data, which would make the allowlist self-satisfying. For a

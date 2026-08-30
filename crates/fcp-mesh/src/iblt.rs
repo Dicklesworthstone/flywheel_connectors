@@ -146,7 +146,7 @@ impl Iblt {
     /// Build an IBLT with an explicit cell count.
     ///
     /// The cell count must be at least [`IBLT_HASH_COUNT`] (3). Smaller values
-    /// cause [`Self::indices_for`] to silently produce duplicate hash positions,
+    /// cause `indices_for` to silently produce duplicate hash positions,
     /// which breaks the peeling invariant — a single insert would apply to the
     /// same cell multiple times and decode would not recover.
     ///

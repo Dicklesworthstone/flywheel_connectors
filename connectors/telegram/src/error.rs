@@ -15,7 +15,7 @@ pub type TelegramResult<T> = Result<T, TelegramError>;
 /// `Debug` is hand-written (not derived) so the `Http` variant never prints
 /// the raw `reqwest::Error`, whose `url` field would otherwise leak the bot
 /// token embedded in every Telegram API path. Both `Display` and `Debug`
-/// route the HTTP error through [`redact_telegram_bot_token_segments`].
+/// route the HTTP error through `redact_telegram_bot_token_segments`.
 #[derive(Error)]
 pub enum TelegramError {
     #[error("HTTP error: {}", redacted_http_error(.0))]

@@ -568,7 +568,7 @@ impl IbltPlaceholder {
     /// previous placeholder (`reconciliation_batch_size` callers pass
     /// the same value). The underlying `Iblt` is sized via
     /// [`Iblt::recommended_cell_count`] which floors at
-    /// [`MIN_RECOMMENDED_IBLT_CELLS`] — so even
+    /// [`MIN_RECOMMENDED_IBLT_CELLS`](crate::iblt::MIN_RECOMMENDED_IBLT_CELLS) — so even
     /// `with_max_changes(0)` produces a valid (if unused) sketch.
     ///
     /// # Panics
@@ -1931,7 +1931,7 @@ impl GossipConfig {
     /// The production sketch is a CBOR-encoded [`Iblt`] sized for
     /// `reconciliation_batch_size` expected differences
     /// ([`Iblt::recommended_cell_count`] returns ~1.5×N cells floored
-    /// at [`MIN_RECOMMENDED_IBLT_CELLS`]). Each cell is an `IbltCell`
+    /// at [`MIN_RECOMMENDED_IBLT_CELLS`](crate::iblt::MIN_RECOMMENDED_IBLT_CELLS)). Each cell is an `IbltCell`
     /// with `{count: i32, key_sum: [u8;32], hash_check: u32}` plus
     /// CBOR map overhead, landing in the ~70-byte range per cell in
     /// practice; the per-difference budget here is 128 bytes to
