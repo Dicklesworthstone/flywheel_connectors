@@ -46,7 +46,7 @@ Statuses use the README vocabulary. `PROVEN` means direct proof in this reposito
 | Symbol-First Protocol | `PROVEN` | `PROVEN` | None | `crates/fcp-raptorq/` (RFC 6330, chunked objects, dense GF(256) fallback, admission 16) | Verified |
 | Browser Real-CDP Control Plane | `PROVEN` | `PROVEN` | None | `connectors/browser/src/` (347 KB client: DirectCdpTargetSessionManager, launcher supervisor, cookie scope) | Verified (monolithic-module layout) |
 | Voice-Call Multi-Provider Parity | `PROVEN` | `PROVEN` | None | `crates/fcp-voice-call/`, twilio/telnyx/plivo wiring, 385-line verification script | Verified |
-| Manifest Operations Conformance | `PROVEN` | `PROVEN` | None | `manifest_operations_*.rs` scanners, drift ratchet, test-dir ratchet | Caveat recorded: the strict field-coverage *reject* test remains `#[ignore]`d (`4kw5f.9` debt, epic blocked) |
+| Manifest Operations Conformance | `PROVEN` | `PROVEN` | None | `manifest_operations_*.rs` scanners, drift ratchet, test-dir ratchet | CORRECTION 2026-08-30: an earlier draft of this row said the strict field-coverage *reject* test remained `#[ignore]`d — it is **not**: `manifest_operation_field_coverage_conformance.rs` carries no `#[ignore]` and the suite is green (3 passed, 0 ignored, verified via rch; matches the `4kw5f.9` closeout). The caveat applied to the blocked umbrella epic's follow-ups, not this test |
 | Computation Migration | `PROVEN` | `PROVEN` | None | `crates/fcp-kernel/src/computation_migration.rs`, reference + unplanned E2E | Verified |
 | Mesh-Native Architecture | `STEADY-STATE TARGET (NOT YET OPERATIONAL)` | `STEADY-STATE TARGET (NOT YET OPERATIONAL)` | None | `docs/FCP3_Transition_Scorecard.md` — all four cutover gates confirmed `SKIP` on 2026-08-29 | Status label suffix `(NOT YET OPERATIONAL)` had been dropped from the README row, breaking the pinning test; restored |
 
@@ -125,4 +125,4 @@ Q4 graduations.
 - Check that the September monthly cadence run (2026-09-01) completes and that the cadence failure annotation works if it does not.
 - Watch `flywheel_connectors-338gk` (fsqlite incremental-write corruption); until fixed, fleet discipline is <10 mutations per DB generation then rebuild from JSONL.
 - Keep Mesh-Native non-operational wording pinned until ordinary `fwc invoke` uses a real mesh-backed path with E2E evidence (all four cutover gates green).
-- Review whether `manifest_operation_field_coverage_conformance`'s `#[ignore]`d reject test can be re-enabled (`4kw5f.9` lineage).
+- RESOLVED 2026-08-30: `manifest_operation_field_coverage_conformance`'s reject test was already re-enabled (`4kw5f.9` closed 2026-05-16 with all child tracks green) — this review item is done, no action needed.
