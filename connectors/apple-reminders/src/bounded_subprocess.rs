@@ -13,7 +13,7 @@
 //!     cannot fill up and cause the child to deadlock waiting for
 //!     the parent to read.
 //!   * Polls [`std::process::Child::try_wait`] with a 50 ms cadence
-//!     against a deadline. On expiry, calls [`Child::kill`] and
+//!     against a deadline. On expiry, calls [`Child::kill`](std::process::Child::kill) and
 //!     surfaces [`SubprocessError::Timeout`].
 //!   * Truncates stderr to a documented byte cap to keep error
 //!     messages bounded even when the child is verbose.
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 /// per stream is generous for `osascript` (typical output is < 10 KB).
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// Polling cadence for [`Child::try_wait`]. Lower → tighter timeout
+/// Polling cadence for [`Child::try_wait`](std::process::Child::try_wait). Lower → tighter timeout
 /// resolution + more wakeups; higher → coarser deadline rounding.
 /// 50 ms is a good balance for desktop-automation latencies.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -79,7 +79,7 @@ pub enum SubprocessError {
 /// fires.
 ///
 /// On deadline expiry, the child is killed (best-effort
-/// [`Child::kill`] + [`Child::wait`]) and
+/// [`Child::kill`](std::process::Child::kill) + [`Child::wait`](std::process::Child::wait)) and
 /// [`SubprocessError::Timeout`] returns. The drain threads are
 /// joined unconditionally so no resources leak across timeouts.
 ///

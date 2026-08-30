@@ -3,7 +3,7 @@
 //! Subprocess invocations are bounded by the
 //! [`crate::types::AppleRemindersConfig::subprocess_timeout_secs`]
 //! field (default 30s) per H.1 production hardening (krxpn). The
-//! [`crate::bounded_subprocess`] module owns the timeout / kill-on-
+//! `bounded_subprocess` module owns the timeout / kill-on-
 //! expiry / stderr-truncation contract.
 
 use std::process::Command;
