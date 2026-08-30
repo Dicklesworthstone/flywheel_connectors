@@ -224,7 +224,7 @@ impl QuarantineStore {
 
     /// Get a quarantined object (unfiltered).
     ///
-    /// Returns the entry regardless of its [`QuarantinePolicy::quarantine_ttl_secs`]
+    /// Returns the entry regardless of its `quarantine_ttl_secs`
     /// freshness. Intended for internal admin/eviction paths that need to
     /// inspect stale records. **Callers consulting quarantine state for
     /// liveness MUST use [`Self::get_fresh`] instead** — otherwise an object
