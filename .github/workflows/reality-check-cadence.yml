@@ -21,9 +21,13 @@ jobs:
   monthly-reality-check:
     name: Monthly Reality Check Cadence
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -75,7 +79,7 @@ jobs:
             br --version
             exit 0
           fi
-          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag v0.2.3 --locked
+          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag v0.5.7 --locked
           br --version
 
       - name: File monthly bead when br is available
@@ -102,6 +106,46 @@ jobs:
           fi
           if ! br sync --flush-only --json | tee artifacts/reality-check/br-sync.json; then
             echo "::warning title=br sync failed::Cadence bead was created locally, but br sync failed in this runner"
+          fi
+      - name: Persist filed bead to main
+        if: success()
+        run: |
+          set -euo pipefail
+          if [ ! -s artifacts/reality-check/filed-bead.json ]; then
+            exit 0
+          fi
+          git config user.name "reality-check-cadence-bot"
+          git config user.email "actions@github.com"
+          git add .beads/
+          if git diff --cached --quiet; then
+            echo "No beads changes to persist"
+            exit 0
+          fi
+          git commit -m "beads: file monthly reality-check cadence bead (run ${{ github.run_id }})"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Comment on cadence tracker bead on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          if ! command -v br >/dev/null 2>&1; then
+            echo "::error title=cadence failure filing skipped::br unavailable for angoc.5 comment"
+            exit 0
+          fi
+          note="reality-check-cadence run ${{ github.run_id }} failed (event: ${{ github.event_name }}) at $(date -u +%FT%TZ). See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. The monthly reality-check artifact is at risk of being silently skipped; backfill via docs/reality/ if the next scheduled run does not cover it."
+          if br comments add flywheel_connectors-angoc.5 -m "$note" --json; then
+            br sync --flush-only --json || true
+            git config user.name "reality-check-cadence-bot"
+            git config user.email "actions@github.com"
+            git add .beads/
+            if ! git diff --cached --quiet; then
+              git commit -m "beads: record reality-check cadence failure on angoc.5 (run ${{ github.run_id }})"
+              git pull --rebase origin main || true
+              git push origin HEAD:main || echo "::error title=cadence failure push failed::could not persist angoc.5 comment to main"
+            fi
+          else
+            echo "::error title=cadence failure filing failed::br comments add on angoc.5 failed"
           fi
 
       - name: Annotate silent-failure risk

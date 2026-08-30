@@ -25724,25 +25724,29 @@ done"#;
         format!("blake3:{}", blake3::hash(value.as_bytes()).to_hex())
     }
 
-    fn prewarm_evidence_git_revision() -> String {
+    fn prewarm_evidence_git_revision() -> Option<String> {
         if let Ok(revision) = std::env::var("PREWARM_EVIDENCE_GIT_REVISION")
             && !revision.trim().is_empty()
         {
-            return revision;
+            return Some(revision.trim().to_string());
         }
 
         let output = std::process::Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .output()
-            .expect("resolve git revision for prewarm evidence");
-        assert!(
-            output.status.success(),
-            "git rev-parse should succeed for prewarm evidence"
-        );
-        String::from_utf8(output.stdout)
-            .expect("git revision is UTF-8")
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let revision = String::from_utf8(output.stdout)
+            .ok()?
             .trim()
-            .to_string()
+            .to_string();
+        if revision.is_empty() {
+            None
+        } else {
+            Some(revision)
+        }
     }
 
     fn prewarm_evidence_target_dir() -> String {
@@ -25987,6 +25991,15 @@ done"#;
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     #[allow(clippy::too_many_lines)]
     async fn production_prewarm_soak_evidence_emits_host_backed_measured_rejection_jsonl() {
+        let Some(git_revision) = prewarm_evidence_git_revision() else {
+            eprintln!(
+                "SKIP production_prewarm_soak_evidence_emits_host_backed_measured_rejection_jsonl: \
+                 no usable git repository (rch workers exclude .git by design) and \
+                 PREWARM_EVIDENCE_GIT_REVISION is unset; prewarm soak evidence requires a \
+                 resolved git revision, so this environment cannot produce valid evidence"
+            );
+            return;
+        };
         let connector_id = "fcp.test.prewarm-production-soak:utility:1.0.0";
         let operation_id = "test.echo";
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -26051,7 +26064,6 @@ done"#;
         );
 
         let target_dir = prewarm_evidence_target_dir();
-        let git_revision = prewarm_evidence_git_revision();
         let scenarios = [
             ProductionPrewarmEvidenceScenario {
                 scenario_id: "prewarm_empty_pool",
