@@ -79,6 +79,16 @@ None on status labels. Two prose-level overclaims were found and corrected:
 2. **`fwc` intent compiler size.** README said ~5.9k lines / 258 inline tests; measured 6,264 lines / 267 `#[test]` functions. Corrected.
 3. **Test-count claim.** "60,000+ tests" was challenged by a tool-capped scout estimate (~30–40k). An uncapped count found ~80,566 test attributes. Claim verified as written.
 
+## Graduations
+
+None this quarter. All 24 ledger rows retained their Q2 status labels (see
+the Delta Table); no feature moved between status tiers, so there is no
+`IMPLEMENTED` -> `PROVEN`-style graduation to record. The connector
+graduation epic (`flywheel_connectors-angoc.16`, 49 incubating connectors in
+4 batches) and the `tlon`/`huggingface` manifest-vs-surface reconciliation
+(see Still-Honest Limits) remain in progress and are the likely sources of
+Q4 graduations.
+
 ## Still-Honest Limits
 
 - `Zone Isolation` stays `LIMITED` (`angoc.2`, blocked).

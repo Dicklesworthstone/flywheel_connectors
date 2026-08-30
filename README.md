@@ -78,7 +78,7 @@ Status legend:
 | **Computation Migration** | `PROVEN` | Migrate-and-resume reference proof: CRIU-format checkpoint handoff, lease transfer, replay, byte-equivalent completion. | `crates/fcp-kernel/src/computation_migration.rs`, `crates/fcp-e2e/tests/computation_migration_reference.rs` |
 | **Mesh-Native Architecture** | `STEADY-STATE TARGET (NOT YET OPERATIONAL)` | Gossip, IBLT, XOR filters, masked IBLT anti-entropy, and LiveTruthResolver are built and tested. The production `fwc → fcp-host → connector subprocess` invoke path remains host-first today. Pinned by `crates/fwc/tests/readme_status_pinning.rs`. | `crates/fcp-mesh/`, `crates/fwc/src/truth.rs` |
 
-> **Audit status**: all status labels reconciled as of 2026-05-16 (see the Q3 report for the current reconciliation). The Mesh-Native downgrade rationale is tracked in `br-lvz4t`. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report and [`docs/quarterly/2026-Q3-claims-vs-reality.md`](docs/quarterly/2026-Q3-claims-vs-reality.md) for the current quarter.
+> **Audit status**: all status labels reconciled as of 2026-08-29 (see the Q3 report for the current reconciliation). The Mesh-Native downgrade rationale is tracked in `br-lvz4t`. See [`docs/quarterly/2026-Q2-claims-vs-reality.md`](docs/quarterly/2026-Q2-claims-vs-reality.md) for the inaugural quarterly debiasing report and [`docs/quarterly/2026-Q3-claims-vs-reality.md`](docs/quarterly/2026-Q3-claims-vs-reality.md) for the current quarter.
 
 ---
 
