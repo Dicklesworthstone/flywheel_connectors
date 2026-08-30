@@ -316,32 +316,51 @@ fn local_smoke_records(
 
 fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceRecord> {
     let controller = BackpressureController::default();
+    fairness_baseline_records(&controller)
+        .into_iter()
+        .chain(fairness_saturation_records(&controller))
+        .chain(fairness_shedding_records(&controller))
+        .map(|mut record| {
+            record.scenario_id = format!("{}.{}", cli.scenario_id, record.scenario_id);
+            record
+        })
+        .collect()
+}
+
+fn fairness_baseline_records(
+    controller: &BackpressureController,
+) -> Vec<FairnessLoadSheddingEvidenceRecord> {
+    vec![fairness_record(
+        "normal_traffic",
+        controller,
+        RequestPriority::Normal,
+        BackpressureTelemetry {
+            queue_pressure_per_mille: Some(120),
+            cpu_pressure_per_mille: Some(180),
+            useful_work_per_mille: Some(800),
+            ..BackpressureTelemetry::default()
+        },
+        fairness_context(
+            "request_response_saas",
+            "z:work",
+            "saas.read",
+            250,
+            240,
+            220,
+            (120, 0),
+        ),
+        2,
+        vec![4, 5, 7, 8, 9],
+    )]
+}
+
+fn fairness_saturation_records(
+    controller: &BackpressureController,
+) -> Vec<FairnessLoadSheddingEvidenceRecord> {
     vec![
         fairness_record(
-            "normal_traffic",
-            &controller,
-            RequestPriority::Normal,
-            BackpressureTelemetry {
-                queue_pressure_per_mille: Some(120),
-                cpu_pressure_per_mille: Some(180),
-                useful_work_per_mille: Some(800),
-                ..BackpressureTelemetry::default()
-            },
-            fairness_context(
-                "request_response_saas",
-                "z:work",
-                "saas.read",
-                250,
-                240,
-                220,
-                (120, 0),
-            ),
-            2,
-            vec![4, 5, 7, 8, 9],
-        ),
-        fairness_record(
             "single_connector_saturation",
-            &controller,
+            controller,
             RequestPriority::Low,
             BackpressureTelemetry {
                 queue_pressure_per_mille: Some(920),
@@ -363,7 +382,7 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
         ),
         fairness_record(
             "multi_zone_contention",
-            &controller,
+            controller,
             RequestPriority::Normal,
             BackpressureTelemetry {
                 queue_pressure_per_mille: Some(910),
@@ -385,7 +404,7 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
         ),
         fairness_record(
             "high_priority_emergency_work",
-            &controller,
+            controller,
             RequestPriority::Critical,
             BackpressureTelemetry {
                 queue_pressure_per_mille: Some(980),
@@ -405,6 +424,13 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
             38,
             vec![12, 18, 26, 40, 65],
         ),
+    ]
+}
+
+fn fairness_shedding_records(
+    controller: &BackpressureController,
+) -> Vec<FairnessLoadSheddingEvidenceRecord> {
+    vec![
         FairnessLoadSheddingEvidenceRecord::structured_skip(
             "revoked_principal",
             "request_response_saas",
@@ -414,7 +440,7 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
         ),
         fairness_record(
             "downstream_throttling",
-            &controller,
+            controller,
             RequestPriority::Normal,
             BackpressureTelemetry {
                 queue_pressure_per_mille: Some(400),
@@ -438,7 +464,7 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
         ),
         fairness_record(
             "shutdown_cancellation",
-            &controller,
+            controller,
             RequestPriority::Low,
             BackpressureTelemetry {
                 queue_pressure_per_mille: Some(300),
@@ -460,12 +486,6 @@ fn fairness_load_shed_records(cli: &Cli) -> Vec<FairnessLoadSheddingEvidenceReco
             vec![30, 55, 89, 144, 233],
         ),
     ]
-    .into_iter()
-    .map(|mut record| {
-        record.scenario_id = format!("{}.{}", cli.scenario_id, record.scenario_id);
-        record
-    })
-    .collect()
 }
 
 fn fairness_context(
@@ -576,7 +596,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "empty_snapshot_store",
             &config,
-            empty_store,
+            &empty_store,
             None,
             Some(82),
             Some(59 * 1024 * 1024),
@@ -586,7 +606,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "warm_resume",
             &config,
-            warm_resume,
+            &warm_resume,
             Some("blake3:snapshot-current"),
             Some(41),
             Some(61 * 1024 * 1024),
@@ -596,7 +616,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "stale_manifest",
             &config,
-            stale_manifest,
+            &stale_manifest,
             Some("blake3:snapshot-stale"),
             Some(91),
             Some(62 * 1024 * 1024),
@@ -606,7 +626,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "revoked_capability",
             &config,
-            revoked_capability,
+            &revoked_capability,
             Some("blake3:snapshot-current"),
             Some(88),
             Some(62 * 1024 * 1024),
@@ -616,7 +636,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "crash_before_checkout",
             &config,
-            crash_before_checkout,
+            &crash_before_checkout,
             Some("blake3:snapshot-current"),
             Some(96),
             Some(63 * 1024 * 1024),
@@ -626,7 +646,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "concurrent_swarm_startup",
             &config,
-            concurrent_swarm_startup,
+            &concurrent_swarm_startup,
             Some("blake3:snapshot-current"),
             Some(123),
             Some(68 * 1024 * 1024),
@@ -636,7 +656,7 @@ fn snapshot_resume_records(cli: &Cli) -> Vec<SnapshotResumeEvidence> {
             cli,
             "unsupported_platform",
             &config,
-            unsupported_platform,
+            &unsupported_platform,
             Some("blake3:snapshot-current"),
             None,
             None,
@@ -650,13 +670,13 @@ fn snapshot_record(
     cli: &Cli,
     scenario_suffix: &str,
     config: &ConnectorSnapshotResumeConfig,
-    observation: SnapshotResumeObservation,
+    observation: &SnapshotResumeObservation,
     manifest_hash: Option<&str>,
     activation_latency_ms: Option<u64>,
     memory_rss_bytes: Option<u64>,
     cleanup_result: &str,
 ) -> SnapshotResumeEvidence {
-    let decision = config.decide_resume(&observation);
+    let decision = config.decide_resume(observation);
     SnapshotResumeEvidence::new(SnapshotResumeEvidenceInput {
         scenario_id: format!("{}.{}", cli.scenario_id, scenario_suffix),
         connector_id: "fcp.synthetic.snapshot:utility:1.0.0".to_string(),
