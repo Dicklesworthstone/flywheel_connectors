@@ -38,7 +38,7 @@
 //! verifier (`EnforcementCheckId::CapabilityVerify`) — they are
 //! mutually exclusive per-token (a token is either V3-CWT or
 //! V4-lattice, never both, distinguished by an envelope tag). A V4
-//! token that passes [`verify_sub_token`] still flows through the
+//! token that passes `verify_sub_token` still flows through the
 //! downstream checks (`DeploymentTier`, `RevocationCascade`,
 //! `CapabilityConstraints`, etc.) just like a V3 token would.
 //!
@@ -150,7 +150,7 @@ pub struct DelegationCertificate {
 /// - `preimage` — the short vector `s` such that `A_op · s = c mod q`
 ///
 /// All four fields are part of the verification computation; mutating
-/// any of them invalidates the token under [`verify_sub_token`].
+/// any of them invalidates the token under `verify_sub_token`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatticeSubToken {
     /// Certificate id this sub-token chains to.

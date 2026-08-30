@@ -209,7 +209,7 @@ impl AttachmentValidation {
     /// Validate a filename for safety.
     ///
     /// Rejects path-traversal sequences (`..`), path separators (`/`, `\`),
-    /// null bytes, empty names, and names exceeding [`MAX_FILENAME_LENGTH`].
+    /// null bytes, empty names, and names exceeding `MAX_FILENAME_LENGTH`.
     pub fn validate_filename(filename: &str) -> Result<(), String> {
         if filename.is_empty() {
             return Err("filename must not be empty".to_string());
