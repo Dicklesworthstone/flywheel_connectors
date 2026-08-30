@@ -41399,7 +41399,8 @@ deny_ptrace = true
 
     #[test]
     fn execute_search_offline_hides_non_live_connectors_by_default() {
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "search", "zalouser", "--offline"]);
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "search", "zalouser", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["results"].as_array().map(Vec::len), Some(0));
