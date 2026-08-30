@@ -1794,7 +1794,7 @@ pub struct OperationSection {
     pub migration_supported: bool,
     /// Revocation freshness class declared by the connector author.
     ///
-    /// Determines the minimum [`FreshnessPolicy`] the host MUST enforce.
+    /// Determines the minimum [`FreshnessPolicy`](fcp_core::FreshnessPolicy) the host MUST enforce.
     /// Defaults to `safe` for backward compatibility with pre-C1.3 manifests.
     #[serde(default = "default_freshness_class")]
     pub revocation_freshness: RevocationFreshnessClass,
