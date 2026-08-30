@@ -2019,7 +2019,8 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -2112,8 +2113,15 @@ mod tests {
                 listener.set_nonblocking(true).unwrap();
                 for response in responses {
                     let stream = accept_test_connection(&listener);
-                    let request = handle_test_request(stream, &response);
-                    worker_requests.lock().unwrap().push(request);
+                    let (request, stream) = read_test_request(stream, &response);
+                    // Record BEFORE the response is written: once the
+                    // client can observe a response, requests() must
+                    // already contain its request, otherwise assertions
+                    // like `requests.len() == 1` race with this worker
+                    // thread under parallel test load (the 0v2sv CI
+                    // flake: left=0 right=1 after a successful invoke).
+                    worker_requests.lock().push(request);
+                    write_test_response(stream, &response);
                 }
             });
             Self {
@@ -2128,7 +2136,7 @@ mod tests {
         }
 
         fn requests(&self) -> Vec<TestHttpRequest> {
-            self.requests.lock().unwrap().clone()
+            self.requests.lock().clone()
         }
     }
 
@@ -2164,7 +2172,14 @@ mod tests {
         }
     }
 
-    fn handle_test_request(stream: TcpStream, response: &TestHttpResponse) -> TestHttpRequest {
+    /// Parses one request off `stream`. The caller MUST record the
+    /// returned request before handing the stream back to
+    /// [`write_test_response`] so `requests()` observations cannot race
+    /// the response (flywheel_connectors-0v2sv).
+    fn read_test_request(
+        stream: TcpStream,
+        response: &TestHttpResponse,
+    ) -> (TestHttpRequest, TcpStream) {
         stream
             .set_read_timeout(Some(StdDuration::from_secs(2)))
             .unwrap();
@@ -2213,7 +2228,15 @@ mod tests {
             reader.read_exact(&mut request_body).unwrap();
         }
 
-        let mut stream = reader.into_inner();
+        let request = TestHttpRequest {
+            headers,
+            body: request_body,
+        };
+        (request, reader.into_inner())
+    }
+
+    /// Writes the canned response and closes the stream.
+    fn write_test_response(mut stream: TcpStream, response: &TestHttpResponse) {
         let body = response.body.to_string();
         let reason = match response.status {
             200 => "OK",
@@ -2230,11 +2253,6 @@ mod tests {
         )
         .unwrap();
         stream.flush().unwrap();
-
-        TestHttpRequest {
-            headers,
-            body: request_body,
-        }
     }
 
     fn header_value<'a>(request: &'a TestHttpRequest, name: &str) -> Option<&'a str> {

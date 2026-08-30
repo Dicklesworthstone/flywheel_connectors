@@ -43,6 +43,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
+parking_lot = { workspace = true }
 wiremock.workspace = true
 futures-util.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
