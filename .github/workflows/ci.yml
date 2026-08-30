@@ -495,6 +495,15 @@ jobs:
         with:
           key: test-${{ matrix.os }}
 
+      # Full-workspace test builds exhausted the 14 GB runner image
+      # (ld: Bus error at 48 MB free on the 861lx run 33291928684).
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -520,6 +529,14 @@ jobs:
         with:
           toolchain: nightly-2026-08-25
       - uses: Swatinem/rust-cache@v2
+
+      # Full-workspace test builds exhaust the runner image (see the
+      # test job's Free disk space step).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
