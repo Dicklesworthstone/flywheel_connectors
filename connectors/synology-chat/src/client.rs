@@ -573,7 +573,7 @@ fn stringify_json_value(value: &serde_json::Value) -> Option<String> {
 /// Normalize an inbound webhook payload into a stable event envelope.
 ///
 /// This function converts a raw Synology Chat outgoing-webhook callback
-/// into a [`NormalizedInboundEvent`] with stringified identifiers and
+/// into a [`NormalizedInboundEvent`](crate::types::NormalizedInboundEvent) with stringified identifiers and
 /// optional token verification.
 ///
 /// # Token verification
