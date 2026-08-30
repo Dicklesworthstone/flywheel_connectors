@@ -23,4 +23,18 @@ ignore = [
     # trigger condition (an element Drop panicking during
     # clear/drop_left/drop_right) is unreachable from workspace call sites.
     "RUSTSEC-2026-0255",
+    # RUSTSEC-2025-0111: tokio-tar 0.3.1 parses PAX extended headers
+    # incorrectly, allowing file smuggling on extraction. No fixed upgrade
+    # exists (advisory `patched = []`; crate effectively unmaintained).
+    #   - sole consumer chain: tokio-tar <- testcontainers 0.23 <-
+    #     optional `integration-testcontainer` feature of the
+    #     elasticsearch and postgresql connectors (dev/integration-test
+    #     only; not built into any production connector or host binary).
+    # Exposure analysis: the smuggle-on-extract path requires extracting an
+    # attacker-controlled archive; testcontainers only unpacks images it
+    # pulls from the configured container registry inside developer/CI
+    # environments, and the workspace ships no archive-extraction code
+    # touching this crate. Revisit if testcontainers ships a fixed tokio-tar
+    # or the feature is removed.
+    "RUSTSEC-2025-0111",
 ]

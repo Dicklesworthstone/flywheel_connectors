@@ -295,9 +295,10 @@ rand = "0.8"
 rand_core = "0.6"
 rsa = { version = "0.9", features = ["sha2"] }
 rayon = "1.12.0"
-# matrix-sdk-crypto 0.16 requires Rust 1.88; keep the Matrix E2EE adapter on
-# the latest Rust-1.85-compatible release until the workspace MSRV moves.
-matrix-sdk-crypto = { version = "0.13.0", default-features = false }
+# matrix-sdk-crypto 0.16 clears RUSTSEC-2026-0159 (sender-binding gaps in
+# to-device messages). The old 1.85-MSRV pin is obsolete: the workspace
+# rust-version is 1.95.
+matrix-sdk-crypto = { version = "0.16.1", default-features = false }
 
 # Identifiers
 uuid = { version = "1.21", features = ["v4", "v5", "serde"] }
@@ -311,8 +312,8 @@ bitflags = "2.11"
 percent-encoding = "2.3"
 
 # WASI runtime
-wasmtime = { version = "41.0", features = ["component-model"] }
-wasmtime-wasi = "41.0"
+wasmtime = { version = "46.0.2", features = ["component-model"] }
+wasmtime-wasi = "46.0.2"
 
 # HTTP client
 reqwest = { version = "0.13", features = ["json", "query", "rustls"], default-features = false }

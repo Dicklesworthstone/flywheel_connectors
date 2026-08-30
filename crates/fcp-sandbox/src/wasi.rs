@@ -745,7 +745,7 @@ impl wasmtime::ResourceLimiter for WasiHostState {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<bool, wasmtime::Error> {
         // Enforce the memory limit bound
         Ok(desired <= self.memory_limit_bytes)
     }
@@ -755,7 +755,7 @@ impl wasmtime::ResourceLimiter for WasiHostState {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<bool, wasmtime::Error> {
         // Tables are allowed to grow up to a sane limit to prevent OOM via unbounded growth
         const MAX_TABLE_ELEMENTS: usize = 100_000;
         Ok(desired <= MAX_TABLE_ELEMENTS)
