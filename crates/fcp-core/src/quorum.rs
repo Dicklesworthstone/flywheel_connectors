@@ -42,7 +42,7 @@ use crate::ZoneId;
 /// - Signature validation: `satisfies_quorum(policy, risk_tier)`
 /// - Lease operations: `LeaseType.default_risk_tier()`
 ///
-/// **Note:** This is distinct from [`SafetyTier`] in `capability.rs`, which classifies
+/// **Note:** This is distinct from [`SafetyTier`](crate::capability::SafetyTier) in `capability.rs`, which classifies
 /// tool/operation safety for agent authorization. `RiskTier` is about "how many signatures?",
 /// while `SafetyTier` is about "can this agent do this operation?".
 ///

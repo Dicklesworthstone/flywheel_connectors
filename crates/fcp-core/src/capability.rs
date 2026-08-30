@@ -2860,7 +2860,7 @@ pub enum RiskLevel {
 /// - Provenance validation: `can_drive_operation(tier)`
 /// - CLI filtering: `--max-safety safe`
 ///
-/// **Note:** This is distinct from [`RiskTier`] in `quorum.rs`, which classifies
+/// **Note:** This is distinct from [`RiskTier`](crate::quorum::RiskTier) in `quorum.rs`, which classifies
 /// quorum/consensus requirements for distributed operations. `SafetyTier` is about
 /// "can this agent do this?", while `RiskTier` is about "how many signatures are needed?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

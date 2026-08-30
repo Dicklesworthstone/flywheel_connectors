@@ -24,14 +24,14 @@ use crate::{
 
 /// Sealed module prevents external crates from implementing FCP connector traits.
 ///
-/// All types that implement [`FcpConnector`] must also implement [`Sealed`].
-/// Use the [`impl_fcp_sealed!`] macro to satisfy this requirement.
+/// All types that implement [`FcpConnector`] must also implement [`Sealed`](sealed::Sealed).
+/// Use the `impl_fcp_sealed!` macro to satisfy this requirement.
 #[doc(hidden)]
 pub mod sealed {
     /// Marker trait that seals the FCP connector trait hierarchy.
     ///
     /// This trait cannot be implemented outside the FCP crate ecosystem.
-    /// Use [`impl_fcp_sealed!`] to implement it for your connector type.
+    /// Use `impl_fcp_sealed!` to implement it for your connector type.
     pub trait Sealed {}
 }
 
@@ -59,7 +59,7 @@ pub type EventStream = Pin<Box<dyn Stream<Item = FcpResult<EventEnvelope>> + Sen
 
 /// Core connector trait - all FCP connectors must implement this.
 ///
-/// This trait is **sealed** — external crates must use [`impl_fcp_sealed!`]
+/// This trait is **sealed** — external crates must use `impl_fcp_sealed!`
 /// to satisfy the `Sealed` supertrait before implementing `FcpConnector`.
 #[async_trait]
 pub trait FcpConnector: sealed::Sealed + Send + Sync {
@@ -335,8 +335,8 @@ pub trait Polling: FcpConnector {
     /// Requires a `CapabilityToken<ConstraintsEnforced>` (cryptographic
     /// verification, instance binding, and request-level capability
     /// constraints all passed). The connector runtime — the enforcement point
-    /// — is expected to call [`CapabilityVerifier::verify_bound`] or promote an
-    /// [`UnboundVerified`] token via [`CapabilityToken::promote_with_instance`],
+    /// — is expected to call [`CapabilityVerifier::verify_bound`](crate::capability::CapabilityVerifier::verify_bound) or promote an
+    /// [`UnboundVerified`](crate::capability::UnboundVerified) token via [`CapabilityToken::promote_with_instance`],
     /// then [`CapabilityToken::promote_with_constraints`] before calling these
     /// methods.
     async fn start_polling(
