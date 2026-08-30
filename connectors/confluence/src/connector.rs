@@ -40,7 +40,7 @@ const CAP_PAGES_WRITE: &str = "confluence.pages.write";
 /// Confluence connector configuration.
 #[derive(Clone, Deserialize)]
 struct ConfluenceConfig {
-    /// Base URL, e.g. "https://myinstance.atlassian.net/wiki"
+    /// Base URL, e.g. `"https://myinstance.atlassian.net/wiki"`
     base_url: String,
     email: String,
     api_token: String,
