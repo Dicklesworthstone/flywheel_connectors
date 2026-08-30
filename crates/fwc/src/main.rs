@@ -36623,7 +36623,7 @@ deny_ptrace = true
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["_truth_source"], "simulated");
     }
 
     #[test]
@@ -39100,7 +39100,7 @@ deny_ptrace = true
         let (exit_code, payload) = execute_json(&["fwc", "--json", "list", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
-        assert!(payload["hidden_by_default_omitted"].as_u64().unwrap_or(0) >= 3);
+        assert!(payload["hidden_by_default_omitted"].as_u64().unwrap_or(0) >= 2);
         let connectors = payload["connectors"].as_array().unwrap();
         assert!(
             connectors
@@ -39110,8 +39110,14 @@ deny_ptrace = true
         assert!(
             connectors
                 .iter()
-                .all(|connector| connector["slug"] != "tlon" && connector["slug"] != "zalouser")
+                .all(|connector| connector["slug"] != "zalouser")
         );
+        let tlon = connectors
+            .iter()
+            .find(|connector| connector["slug"] == "tlon")
+            .expect("graduated connectors should be visible by default");
+        assert_eq!(tlon["status"], "proven");
+        assert_eq!(tlon["hidden_by_default"], false);
         let zalo = connectors
             .iter()
             .find(|connector| connector["slug"] == "zalo")
@@ -39126,18 +39132,17 @@ deny_ptrace = true
             execute_json(&["fwc", "--json", "list", "--offline", "--include-hidden"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
-        let tlon = payload["connectors"]
+        let zalouser = payload["connectors"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|connector| connector["slug"] == "tlon")
-            .expect("tlon should be included with --include-hidden");
-        assert_eq!(tlon["status"], "incubating");
-        assert_eq!(tlon["hidden_by_default"], true);
-        assert!(tlon["non_live_rationale"].is_string());
-        assert!(tlon["graduation_guidance"].is_string());
+            .find(|connector| connector["slug"] == "zalouser")
+            .expect("zalouser should be included with --include-hidden");
+        assert_eq!(zalouser["status"], "quarantined");
+        assert_eq!(zalouser["hidden_by_default"], true);
+        assert!(zalouser["non_live_rationale"].is_string());
+        assert!(zalouser["graduation_guidance"].is_string());
     }
-
     #[test]
     fn prepare_cli_parses_mesh_status_command() {
         let prepared = prepare_cli(&["fwc".to_owned(), "mesh".to_owned(), "status".to_owned()])
@@ -41393,28 +41398,28 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_search_offline_hides_incubating_connectors_by_default() {
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "search", "tlon", "--offline"]);
+    fn execute_search_offline_hides_non_live_connectors_by_default() {
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "search", "zalouser", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["results"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]
-    fn execute_search_offline_include_hidden_surfaces_incubating_connector() {
+    fn execute_search_offline_include_hidden_surfaces_non_live_connector() {
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "search",
-            "tlon",
+            "zalouser",
             "--offline",
             "--include-hidden",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert!(payload["results"].as_array().unwrap().iter().any(|result| {
-            result["connector"] == "tlon"
-                && result["connector_status"] == "incubating"
+            result["connector"] == "zalouser"
+                && result["connector_status"] == "quarantined"
                 && result["hidden_by_default"] == true
         }));
     }
@@ -41491,7 +41496,7 @@ deny_ptrace = true
         assert_eq!(payload["connector"]["slug"], "github");
         assert_eq!(payload["connector"]["canonical_id"], "fcp.github");
         assert_eq!(payload["connector"]["format"], "wasi");
-        assert_eq!(payload["connector"]["status"], "ready");
+        assert_eq!(payload["connector"]["status"], "proven");
         assert_eq!(payload["connector"]["hidden_by_default"], false);
         assert_eq!(payload["connector"]["state"], "unknown");
         assert_eq!(payload["zones"]["home"], "z:work");
@@ -44850,7 +44855,7 @@ depends_on = ["missing"]
         assert_eq!(exit_code, CliExitCode::PolicyDenied.into());
         assert_eq!(payload["status"], "denied");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["_truth_source"], "simulated");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["command"], "simulate");
     }
@@ -44883,7 +44888,7 @@ depends_on = ["missing"]
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["_truth_source"], "simulated");
         assert_eq!(payload["phase"], "preflight");
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["preflight"]["allowed"], true);
@@ -47355,18 +47360,18 @@ depends_on = ["missing"]
 
     #[test]
     fn install_hidden_workspace_connector_requires_include_hidden() {
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "install", "tlon"]);
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "install", "zalouser"]);
 
         assert_eq!(exit_code, CliExitCode::Validation.into());
         assert_eq!(payload["error"]["type"], "hidden-connector-requires-opt-in");
-        assert_eq!(payload["connector"]["slug"], "tlon");
-        assert_eq!(payload["connector"]["status"], "incubating");
+        assert_eq!(payload["connector"]["slug"], "zalouser");
+        assert_eq!(payload["connector"]["status"], "quarantined");
     }
 
     #[test]
     fn install_hidden_workspace_connector_with_include_hidden_advances_to_host_check() {
         let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "install", "tlon", "--include-hidden"]);
+            execute_json(&["fwc", "--json", "install", "zalouser", "--include-hidden"]);
 
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["error"]["type"], "missing-host-endpoint");

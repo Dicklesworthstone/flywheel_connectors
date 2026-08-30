@@ -2696,8 +2696,16 @@ mod tests {
 
     #[test]
     fn get_git_info_returns_some_in_repo() {
+        // rch workers and other git-less checkouts legitimately yield None.
+        let in_repo = std::process::Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .is_ok_and(|output| output.status.success());
         let (commit, branch, dirty) = get_git_info();
-        // We're in a git repo, so these should be Some
+        if !in_repo {
+            assert!(commit.is_none() && branch.is_none() && dirty.is_none());
+            return;
+        }
         assert!(commit.is_some(), "expected git commit");
         assert!(branch.is_some(), "expected git branch");
         assert!(dirty.is_some(), "expected git dirty status");
