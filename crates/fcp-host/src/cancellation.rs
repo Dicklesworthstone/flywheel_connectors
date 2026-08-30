@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use fcp_async_core::process::Child;
 
 use chrono::{DateTime, Utc};
 pub use fcp_kernel::{
@@ -20,6 +22,113 @@ pub use fcp_kernel::{
 };
 
 use crate::{HostError, HostResult};
+
+use crate::ConnectorArchetype;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cancellation Deadlines (flywheel_connectors-861lx)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default cancellation deadline for bounded one-shot archetypes
+/// (`request_response`, `webhook`).
+pub const DEFAULT_CANCELLATION_DEADLINE_ONE_SHOT: Duration = Duration::from_secs(1);
+
+/// Default cancellation deadline for long-lived archetypes.
+///
+/// Applies to `streaming`, `bidirectional`, `polling`, and `unknown`.
+/// Long-lived connectors need a longer graceful window; `unknown` is
+/// deliberately conservative so a connector with missing runtime
+/// archetype metadata is never force-terminated prematurely.
+pub const DEFAULT_CANCELLATION_DEADLINE_LONG_LIVED: Duration = Duration::from_secs(10);
+
+/// Archetype-defaulted cancellation deadline (`flywheel_connectors-861lx`).
+#[must_use]
+pub const fn default_cancellation_deadline(archetype: ConnectorArchetype) -> Duration {
+    match archetype {
+        ConnectorArchetype::RequestResponse | ConnectorArchetype::Webhook => {
+            DEFAULT_CANCELLATION_DEADLINE_ONE_SHOT
+        }
+        ConnectorArchetype::Streaming
+        | ConnectorArchetype::Bidirectional
+        | ConnectorArchetype::Polling
+        | ConnectorArchetype::Unknown => DEFAULT_CANCELLATION_DEADLINE_LONG_LIVED,
+    }
+}
+
+/// Deadline policy recorded when a subprocess-backed operation is tracked.
+///
+/// Production invokes are backed by a connector subprocess that can be
+/// force-terminated when the operation ignores a cancellation request past
+/// its deadline. Registrations without a backing subprocess
+/// ([`CancellationController::track_with_owner`]) never expire.
+#[derive(Debug, Clone)]
+pub struct CancellationScope {
+    /// Connector whose subprocess backs the operation. The reaper
+    /// force-terminates this connector's subprocess on deadline expiry.
+    pub connector_id: String,
+    /// Archetype from which the deadline default is derived.
+    pub archetype: ConnectorArchetype,
+    /// Operator override
+    /// (`ManagedConnectorConfig::cancellation_deadline_ms`). Wins over the
+    /// archetype default when present.
+    pub deadline_override: Option<Duration>,
+}
+
+impl CancellationScope {
+    /// Build a scope with the archetype-default deadline.
+    #[must_use]
+    pub fn new(connector_id: impl Into<String>, archetype: ConnectorArchetype) -> Self {
+        Self {
+            connector_id: connector_id.into(),
+            archetype,
+            deadline_override: None,
+        }
+    }
+
+    /// Attach an operator deadline override in milliseconds.
+    #[must_use]
+    pub fn with_deadline_override_ms(mut self, override_ms: Option<u64>) -> Self {
+        self.deadline_override = override_ms.map(Duration::from_millis);
+        self
+    }
+
+    /// Effective deadline: operator override, else archetype default.
+    #[must_use]
+    pub const fn effective_deadline(&self) -> Duration {
+        match self.deadline_override {
+            Some(deadline) => deadline,
+            None => default_cancellation_deadline(self.archetype),
+        }
+    }
+}
+
+/// An operation whose cancellation deadline expired without completion.
+#[derive(Debug, Clone)]
+pub struct ExpiredCancellation {
+    /// Operation that ignored its cancellation past the deadline.
+    pub operation_id: String,
+    /// Connector whose subprocess should be force-terminated.
+    pub connector_id: String,
+    /// The effective deadline that expired.
+    pub deadline: Duration,
+}
+
+/// Force-terminates a connector subprocess (SIGTERM grace, then SIGKILL).
+///
+/// Enforcement primitive behind the cancellation-deadline reaper
+/// (`flywheel_connectors-861lx`). The child is intentionally not waited
+/// on (the asupersync process layer's `Child::wait` is synchronous); the
+/// spawning runner's `kill_on_drop` setting reaps the process when its
+/// handle is dropped.
+pub async fn force_terminate_child(child: &mut Child, grace: Duration) {
+    #[cfg(unix)]
+    {
+        // Best-effort graceful stop; SIGKILL below is the backstop.
+        let _ = child.signal(libc::SIGTERM);
+    }
+    fcp_async_core::time::sleep(grace).await;
+    let _ = child.start_kill();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Operation Tracker
@@ -40,6 +149,17 @@ struct TrackedOperation {
     /// closes br-jdaro, where knowing the client-chosen operation ID
     /// was sufficient to cancel any in-flight operation.
     owner: Option<String>,
+    /// Subprocess-backed deadline policy. `None` for bookkeeping-only
+    /// registrations ([`CancellationController::track_with_owner`]),
+    /// which never expire and are never force-terminated.
+    scope: Option<CancellationScope>,
+    /// Monotonic instant cancellation was requested (deadline anchor).
+    cancel_requested_at: Option<Instant>,
+    /// Original cancellation reason, replayed into the forced audit event.
+    cancel_reason: Option<CancelReason>,
+    /// Set once the reaper dispatched a force-terminate for this
+    /// operation, keeping reaped sweeps idempotent.
+    forced_cancel_sent: bool,
 }
 
 /// Controller that manages operation tracking and cancellation.
@@ -95,6 +215,42 @@ impl CancellationController {
                 completed: false,
                 cancel_requested: false,
                 owner: owner.map(str::to_string),
+                scope: None,
+                cancel_requested_at: None,
+                cancel_reason: None,
+                forced_cancel_sent: false,
+            },
+        );
+    }
+
+    /// Register a subprocess-backed operation with a cancellation deadline
+    /// (`flywheel_connectors-861lx`).
+    ///
+    /// Production invokes MUST use this method: when the operation ignores
+    /// a cancellation request past `scope`'s effective deadline, the reaper
+    /// reports it via [`Self::reap_expired`] so the host can force-terminate
+    /// `scope.connector_id`'s subprocess and audit `forced = true`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn track_operation(
+        &self,
+        operation_id: &str,
+        owner: Option<&str>,
+        scope: CancellationScope,
+    ) {
+        let mut ops = self.operations.lock().expect("operations lock");
+        ops.insert(
+            operation_id.to_string(),
+            TrackedOperation {
+                completed: false,
+                cancel_requested: false,
+                owner: owner.map(str::to_string),
+                scope: Some(scope),
+                cancel_requested_at: None,
+                cancel_reason: None,
+                forced_cancel_sent: false,
             },
         );
     }
@@ -186,6 +342,8 @@ impl CancellationController {
                         CancellationOutcome::Pending
                     } else {
                         op.cancel_requested = true;
+                        op.cancel_requested_at = Some(Instant::now());
+                        op.cancel_reason = Some(request.reason.clone());
                         CancellationOutcome::Cancelled
                     }
                 }
@@ -228,6 +386,7 @@ impl CancellationController {
             duration_ms,
             had_partial_result: false, // Set by caller when partial data exists
             had_checkpoint: checkpoint.is_some(),
+            forced: false,
         };
         self.audit_log.lock().expect("audit lock").push(audit_event);
 
@@ -239,6 +398,108 @@ impl CancellationController {
             cleanup_result,
             duration_ms,
         })
+    }
+
+    /// Sweep for operations whose cancellation deadline expired without
+    /// completion (`flywheel_connectors-861lx`).
+    ///
+    /// Returns each expired operation exactly once (the reaper marks it as
+    /// dispatched), so repeated sweeps never double force-terminate.
+    /// Completed operations and bookkeeping-only registrations (no scope)
+    /// never expire. The tracking entry is deliberately kept: the in-flight
+    /// invoke completes (or errors) on its own when the subprocess dies, and
+    /// no Strict-idempotency intent is released by a forced cancel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn reap_expired(&self, now: Instant) -> Vec<ExpiredCancellation> {
+        let mut ops = self.operations.lock().expect("operations lock");
+        let mut expired = Vec::new();
+        for (operation_id, op) in ops.iter_mut() {
+            if !op.cancel_requested || op.completed || op.forced_cancel_sent {
+                continue;
+            }
+            let Some(requested_at) = op.cancel_requested_at else {
+                continue;
+            };
+            let Some(scope) = op.scope.as_ref() else {
+                continue;
+            };
+            let deadline = scope.effective_deadline();
+            if now.saturating_duration_since(requested_at) >= deadline {
+                op.forced_cancel_sent = true;
+                expired.push(ExpiredCancellation {
+                    operation_id: operation_id.clone(),
+                    connector_id: scope.connector_id.clone(),
+                    deadline,
+                });
+            }
+        }
+        expired
+    }
+
+    /// Record the audit event for a force-terminated operation.
+    ///
+    /// Called by the host reaper after force-terminating the connector
+    /// subprocess for [`ExpiredCancellation`] entries returned by
+    /// [`Self::reap_expired`]. Emits `CancellationAuditEvent` with
+    /// `outcome = Cancelled` and `forced = true`, replaying the original
+    /// cancellation reason. The tracking entry stays until the regular
+    /// invoke path calls [`Self::complete`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn record_forced_cancellation(&self, operation_id: &str, now: DateTime<Utc>) {
+        let (reason, duration_ms) = {
+            let mut ops = self.operations.lock().expect("operations lock");
+            let Some(op) = ops.get_mut(operation_id) else {
+                return;
+            };
+            op.forced_cancel_sent = true;
+            let duration_ms = op
+                .cancel_requested_at
+                .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or_default();
+            (
+                op.cancel_reason
+                    .clone()
+                    .unwrap_or(CancelReason::UserRequested),
+                duration_ms,
+            )
+        };
+        self.audit_log
+            .lock()
+            .expect("audit lock")
+            .push(CancellationAuditEvent {
+                timestamp: now,
+                operation_id: operation_id.to_string(),
+                reason,
+                outcome: CancellationOutcome::Cancelled,
+                duration_ms,
+                had_partial_result: false,
+                had_checkpoint: false,
+                forced: true,
+            });
+    }
+
+    /// Re-arm a failed force-terminate so the next reaper sweep retries
+    /// it (`flywheel_connectors-861lx`). Completed operations are never
+    /// re-armed: once the invoke path reports completion the deadline is
+    /// moot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn rearm_force_terminate(&self, operation_id: &str) {
+        let mut ops = self.operations.lock().expect("operations lock");
+        if let Some(op) = ops.get_mut(operation_id) {
+            if !op.completed {
+                op.forced_cancel_sent = false;
+            }
+        }
     }
 
     /// Remove a completed or cancelled operation from tracking.
@@ -1362,6 +1623,7 @@ mod tests {
             duration_ms: 42,
             had_partial_result: true,
             had_checkpoint: true,
+            forced: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: CancellationAuditEvent = serde_json::from_str(&json).unwrap();
@@ -1370,6 +1632,7 @@ mod tests {
         assert_eq!(parsed.duration_ms, 42);
         assert!(parsed.had_partial_result);
         assert!(parsed.had_checkpoint);
+        assert!(!parsed.forced);
         assert_eq!(parsed.reason.label(), "resource_limit");
     }
 
@@ -1383,6 +1646,7 @@ mod tests {
             duration_ms: 7,
             had_partial_result: false,
             had_checkpoint: false,
+            forced: false,
         };
         let cloned = event.clone();
         assert_eq!(event.operation_id, "op_clone");
@@ -2483,6 +2747,7 @@ mod tests {
             duration_ms: 0,
             had_partial_result: false,
             had_checkpoint: false,
+            forced: false,
         };
         let dbg = format!("{event:?}");
         assert!(dbg.contains("CancellationAuditEvent"));
@@ -2499,6 +2764,7 @@ mod tests {
             duration_ms: 999,
             had_partial_result: true,
             had_checkpoint: false,
+            forced: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: CancellationAuditEvent = serde_json::from_str(&json).unwrap();
@@ -2517,6 +2783,7 @@ mod tests {
             duration_ms: 0,
             had_partial_result: false,
             had_checkpoint: false,
+            forced: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: CancellationAuditEvent = serde_json::from_str(&json).unwrap();
@@ -2533,6 +2800,7 @@ mod tests {
             duration_ms: u64::MAX,
             had_partial_result: false,
             had_checkpoint: false,
+            forced: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: CancellationAuditEvent = serde_json::from_str(&json).unwrap();
@@ -2837,5 +3105,189 @@ mod tests {
         assert_eq!(cleanup.cleaned, vec!["operation_state"]);
         assert!(cleanup.failed.is_empty());
         assert!(cleanup.success);
+    }
+    // ── flywheel_connectors-861lx: cancellation deadlines ──
+
+    #[test]
+    fn default_cancellation_deadline_per_archetype() {
+        assert_eq!(
+            default_cancellation_deadline(ConnectorArchetype::RequestResponse),
+            DEFAULT_CANCELLATION_DEADLINE_ONE_SHOT
+        );
+        assert_eq!(
+            default_cancellation_deadline(ConnectorArchetype::Webhook),
+            DEFAULT_CANCELLATION_DEADLINE_ONE_SHOT
+        );
+        for long_lived in [
+            ConnectorArchetype::Streaming,
+            ConnectorArchetype::Bidirectional,
+            ConnectorArchetype::Polling,
+            ConnectorArchetype::Unknown,
+        ] {
+            assert_eq!(
+                default_cancellation_deadline(long_lived),
+                DEFAULT_CANCELLATION_DEADLINE_LONG_LIVED
+            );
+        }
+    }
+
+    #[test]
+    fn scope_override_wins_over_archetype_default() {
+        let overridden = CancellationScope::new("c:rr:1.0", ConnectorArchetype::RequestResponse)
+            .with_deadline_override_ms(Some(250));
+        assert_eq!(overridden.effective_deadline(), Duration::from_millis(250));
+
+        let defaulted = CancellationScope::new("c:rr:1.0", ConnectorArchetype::RequestResponse);
+        assert_eq!(
+            defaulted.effective_deadline(),
+            DEFAULT_CANCELLATION_DEADLINE_ONE_SHOT
+        );
+    }
+
+    #[test]
+    fn deadline_expiry_reaps_only_overdue_uncompleted_ops() {
+        let ctrl = CancellationController::new();
+        ctrl.track_operation(
+            "op_overdue",
+            Some("user:alice"),
+            CancellationScope::new("c:slow:1.0", ConnectorArchetype::RequestResponse)
+                .with_deadline_override_ms(Some(100)),
+        );
+        ctrl.track_operation(
+            "op_completed",
+            Some("user:alice"),
+            CancellationScope::new("c:fast:1.0", ConnectorArchetype::RequestResponse)
+                .with_deadline_override_ms(Some(100)),
+        );
+        ctrl.track_operation(
+            "op_not_cancelled",
+            Some("user:alice"),
+            CancellationScope::new("c:idle:1.0", ConnectorArchetype::RequestResponse)
+                .with_deadline_override_ms(Some(100)),
+        );
+        let start = Instant::now();
+        for id in ["op_overdue", "op_completed"] {
+            let req = cancel_request(id, CancelReason::UserRequested);
+            ctrl.cancel(&req, Some("user:alice"), fixed_now()).unwrap();
+        }
+        ctrl.complete("op_completed");
+
+        // Before the deadline: nothing expires.
+        assert!(
+            ctrl.reap_expired(start + Duration::from_millis(50))
+                .is_empty()
+        );
+
+        // At/after the deadline: only the overdue uncompleted op expires.
+        let expired = ctrl.reap_expired(start + Duration::from_millis(150));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].operation_id, "op_overdue");
+        assert_eq!(expired[0].connector_id, "c:slow:1.0");
+        assert_eq!(expired[0].deadline, Duration::from_millis(100));
+
+        // Idempotence: the second sweep returns nothing.
+        assert!(
+            ctrl.reap_expired(start + Duration::from_millis(999))
+                .is_empty()
+        );
+
+        // The tracking entry is kept (invoke completion owns removal); a
+        // forced cancel releases no Strict-idempotency intent.
+        assert!(ctrl.is_cancel_requested("op_overdue"));
+        assert_eq!(ctrl.tracked_count(), 3);
+    }
+
+    #[test]
+    fn forced_cancellation_records_forced_audit_event() {
+        let ctrl = CancellationController::new();
+        ctrl.track_operation(
+            "op_forced",
+            Some("user:alice"),
+            CancellationScope::new("c:stuck:1.0", ConnectorArchetype::Streaming)
+                .with_deadline_override_ms(Some(50)),
+        );
+        let req = cancel_request(
+            "op_forced",
+            CancelReason::AgentAbort {
+                reason: "stuck".into(),
+            },
+        );
+        ctrl.cancel(&req, Some("user:alice"), fixed_now()).unwrap();
+        let expired = ctrl.reap_expired(Instant::now() + Duration::from_millis(100));
+        assert_eq!(expired.len(), 1);
+        ctrl.record_forced_cancellation("op_forced", fixed_now());
+
+        let events = ctrl.audit_events();
+        assert_eq!(events.len(), 2); // graceful request + forced record
+        let forced = &events[0]; // newest first
+        assert!(forced.forced);
+        assert_eq!(forced.outcome, CancellationOutcome::Cancelled);
+        assert!(matches!(forced.reason, CancelReason::AgentAbort { .. }));
+
+        // Bookkeeping-only registrations never expire, even far past any
+        // conceivable deadline.
+        let plain = CancellationController::new();
+        plain.track_with_owner("op_plain", None);
+        let req = cancel_request("op_plain", CancelReason::UserRequested);
+        plain.cancel(&req, None, fixed_now()).unwrap();
+        assert!(
+            plain
+                .reap_expired(Instant::now() + Duration::from_secs(3600))
+                .is_empty()
+        );
+    }
+
+    // ── flywheel_connectors-861lx: real force-terminate sequence ──
+
+    /// The SIGTERM lands immediately on a responsive process; the elapsed
+    /// time is dominated by the grace window.
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn force_terminate_child_kills_responsive_process() {
+        let mut child = fcp_async_core::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep process");
+        let start = Instant::now();
+        force_terminate_child(&mut child, Duration::from_millis(100)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2_500),
+            "force-terminate must complete promptly, took {elapsed:?}"
+        );
+        fcp_async_core::time::sleep(Duration::from_millis(150)).await;
+        let status = child
+            .try_wait()
+            .expect("try_wait must succeed after kill")
+            .expect("responsive process must have exited after SIGTERM");
+        assert!(
+            !status.success(),
+            "SIGTERM-terminated process must not report success"
+        );
+    }
+
+    /// A process that ignores SIGTERM must still die: the SIGKILL
+    /// backstop escalates after the grace window.
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn force_terminate_child_sigkill_backstop_beats_term_trap() {
+        let mut child = fcp_async_core::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn term-trapping process");
+        force_terminate_child(&mut child, Duration::from_millis(100)).await;
+        fcp_async_core::time::sleep(Duration::from_millis(150)).await;
+        let status = child
+            .try_wait()
+            .expect("try_wait must succeed after kill")
+            .expect("SIGKILL backstop must terminate a SIGTERM-immune process");
+        assert!(
+            !status.success(),
+            "SIGKILL-terminated process must not report success"
+        );
     }
 }

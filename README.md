@@ -2422,12 +2422,12 @@ Caller (fwc)                  fcp-host                   Connector              
    │                             │                          │                       │
    ├── Ctrl-C  ────────────►     │                          │                       │
    │   ── cancel ───────────►    │                          │                       │
-   │                             │── cancel notice ─────►   │                       │
-   │                             │  (FCPC control frame)    │                       │
-   │                             │                          ├── drop HTTP (close)   │
+   │                             │── deadline reaper ─────► │                       │
+   │                             │   force-terminates on    │                       │
+   │                             │   expiry (forced=true)   │                       │
    │                             │                          │                       │
-   │                             │                          ├── return Cancelled    │
-   │                             │◄─────────────────────────┤                       │
+   │                             │                          ├── dies mid-request    │
+   │   invoke fails (killed) ──► │                          │                       │
    │                             ├── record receipt with    │                       │
    │                             │   outcome=cancelled,     │                       │
    │                             │   external_effect=       │                       │
@@ -2437,7 +2437,7 @@ Caller (fwc)                  fcp-host                   Connector              
 
 Three properties of the cancellation machinery are worth pointing at:
 
-- **Bounded propagation latency.** The host's `cancellation.rs` module (`crates/fcp-host/src/cancellation.rs`) tracks cancellation per operation owner, records outcomes (`Cancelled`, `Pending`, `TooLate`) with 24-hour checkpoints, and emits audit events for every transition. The backstop for an unresponsive connector is the supervisor's graceful-shutdown machinery (`ShutdownCoordinator` in `supervisor.rs`), which escalates to a force-kill when the graceful shutdown timeout expires; a connector subprocess also self-terminates on parent-pid drop or supervisor heartbeat loss. Per-archetype cancellation *deadlines* with supervisor force-terminate on deadline expiry are designed but not yet implemented — that work is tracked in `flywheel_connectors-861lx`.
+- **Bounded propagation latency.** The host's `cancellation.rs` module (`crates/fcp-host/src/cancellation.rs`) tracks cancellation per operation owner, records outcomes (`Cancelled`, `Pending`, `TooLate`) with 24-hour checkpoints, and emits audit events for every transition. Every subprocess-backed invoke also registers a cancellation deadline: 1 s for bounded one-shot archetypes (`request_response`, `webhook`), 10 s for long-lived archetypes (`streaming`, `bidirectional`, `polling`, and `unknown`), overridable per connector through `cancellation_deadline_ms` in the managed connector inventory. A host reaper sweeps every 200 ms; an operation that ignores its cancellation past the deadline gets its connector subprocess force-terminated (SIGTERM with a 500 ms grace, then SIGKILL) and the cancellation audit event records `outcome = cancelled` with `forced = true`. Failed force-terminates are re-armed and retried by the next sweep, and the tracking entry is released only by the regular invoke-completion path, so a forced cancel never releases a Strict-idempotency `OperationIntent` (`flywheel_connectors-861lx`). A connector subprocess additionally self-terminates on parent-pid drop.
 - **Idempotency on retry.** A cancelled operation produces a receipt with `outcome = cancelled` and `external_effect` flags (`sent: yes/no`, `ack: yes/no/unknown`). Retries can decide whether to re-issue based on the recorded external effect rather than guessing. For `Strict` idempotency operations, the cancelled `OperationIntent` blocks naive retries until explicitly released by the caller.
 - **No orphaned external side effects on host crash.** If `fcp-host` itself crashes mid-invoke, the connector subprocess detects parent-pid drop (or supervisor heartbeat loss) and self-terminates. The receipt for the cancelled operation lands in the audit chain only if the connector successfully wrote it to its local state cache before exit; otherwise it remains a half-completed gap that the post-restart consistency check surfaces explicitly.
 

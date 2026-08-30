@@ -35,8 +35,7 @@ enum FixtureArchetype {
 impl FixtureArchetype {
     fn from_env_value(value: Option<&str>) -> Self {
         match value {
-            Some("unknown") => Self::Unknown,
-            Some("request_response") | Some("request-response") | Some("requestresponse") => {
+            Some("request_response" | "request-response" | "requestresponse") => {
                 Self::RequestResponse
             }
             Some("streaming") => Self::Streaming,
@@ -408,8 +407,7 @@ impl TestConnectorProfile {
             artifact_policy: FixtureArtifactPolicy::from_env(),
             handshake_mode: FixtureHandshakeMode::from_env(),
             require_handshake: std::env::var("FCP_TEST_CONNECTOR_REQUIRE_HANDSHAKE")
-                .map(|value| value == "1")
-                .unwrap_or(false),
+                .is_ok_and(|value| value == "1"),
         }
     }
 

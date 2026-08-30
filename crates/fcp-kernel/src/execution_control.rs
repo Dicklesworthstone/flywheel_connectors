@@ -270,6 +270,12 @@ pub struct CancellationAuditEvent {
     pub had_partial_result: bool,
     /// Whether a checkpoint was created.
     pub had_checkpoint: bool,
+    /// Whether the supervisor force-terminated the operation's connector
+    /// subprocess because the cancellation deadline expired without the
+    /// operation completing (`flywheel_connectors-861lx`). Always `false`
+    /// for graceful cancellations.
+    #[serde(default)]
+    pub forced: bool,
 }
 
 /// A transition between phases of a multi-step operation.

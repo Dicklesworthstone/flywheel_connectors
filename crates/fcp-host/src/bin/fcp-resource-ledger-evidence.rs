@@ -154,22 +154,22 @@ fn parse_cli(args: &[String]) -> Result<Option<Cli>, String> {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--scenario-id" => {
-                cli.scenario_id = iter
+                let value = iter
                     .next()
-                    .ok_or_else(|| "--scenario-id requires a value".to_string())?
-                    .clone();
+                    .ok_or_else(|| "--scenario-id requires a value".to_string())?;
+                cli.scenario_id.clone_from(value);
             }
             "--operation-id" => {
-                cli.operation_id = iter
+                let value = iter
                     .next()
-                    .ok_or_else(|| "--operation-id requires a value".to_string())?
-                    .clone();
+                    .ok_or_else(|| "--operation-id requires a value".to_string())?;
+                cli.operation_id.clone_from(value);
             }
             "--worker" => {
-                cli.worker_identity = iter
+                let value = iter
                     .next()
-                    .ok_or_else(|| "--worker requires a value".to_string())?
-                    .clone();
+                    .ok_or_else(|| "--worker requires a value".to_string())?;
+                cli.worker_identity.clone_from(value);
             }
             "--git-revision" => {
                 cli.git_revision = Some(

@@ -55,7 +55,7 @@ use fcp_host::{
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
     BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
     BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
-    CancellationController, CancellationRequest, CancellationResponse,
+    CancellationController, CancellationRequest, CancellationResponse, CancellationScope,
     CapabilityTokenVerifyRequest, ConfigRevisionRecord, ConnectorAdminState, ConnectorAdminStatus,
     ConnectorArchetype, ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
@@ -359,6 +359,15 @@ struct SubprocessConnector {
     handshaken_zone: Mutex<Option<ZoneId>>,
 }
 
+/// Internal runner control method: force-terminate the connector
+/// subprocess (`flywheel_connectors-861lx`). Never dispatched to the
+/// connector itself; intercepted by the runner task before RPC dispatch.
+const CONNECTOR_RPC_FORCE_TERMINATE: &str = "fcp.internal.force_terminate";
+/// Grace window between SIGTERM and SIGKILL during force-termination.
+const CONNECTOR_FORCE_KILL_GRACE: Duration = Duration::from_millis(500);
+/// Cancellation-deadline reaper sweep cadence.
+const CANCELLATION_REAPER_INTERVAL: Duration = Duration::from_millis(200);
+
 #[derive(Debug)]
 struct ConnectorRpcRequest {
     method: String,
@@ -466,7 +475,12 @@ impl SubprocessConnector {
         let runner_task = task::spawn(async move {
             let mut runner = runner;
             while let Some(request) = runner_rx.recv().await {
-                let response = runner.request(&request.method, request.params).await;
+                let response = if request.method == CONNECTOR_RPC_FORCE_TERMINATE {
+                    runner.force_terminate().await;
+                    Ok(json!({ "force_terminated": true }))
+                } else {
+                    runner.request(&request.method, request.params).await
+                };
                 let _ = request.response_tx.send(response);
             }
         });
@@ -1993,6 +2007,74 @@ impl SubprocessRegistry {
             .get(connector_id)
             .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
         require_allowed_zones_configured(connector_id, &entry.config.allowed_zones)
+    }
+
+    /// Resolve the cancellation scope for a connector: runtime archetype
+    /// plus the operator's deadline override, if any
+    /// (`flywheel_connectors-861lx`).
+    async fn cancellation_scope(
+        &self,
+        connector_id: &ConnectorId,
+    ) -> HostResult<CancellationScope> {
+        let state = self.state.read().await;
+        let entry = state
+            .connectors
+            .get(connector_id)
+            .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+        if entry.config.cancellation_deadline_ms == Some(0) {
+            return Err(HostError::Internal(format!(
+                "connector {connector_id} has invalid cancellation_deadline_ms=0 (must be > 0)"
+            )));
+        }
+        Ok(
+            CancellationScope::new(
+                connector_id.to_string(),
+                configured_subprocess_archetype(&entry.config),
+            )
+            .with_deadline_override_ms(entry.config.cancellation_deadline_ms),
+        )
+    }
+
+    /// Force-terminate a connector's subprocess: SIGTERM grace, then
+    /// SIGKILL (`flywheel_connectors-861lx`). Called by the cancellation
+    /// reaper when an operation ignores its cancellation deadline.
+    async fn force_terminate_connector(&self, connector_id: &ConnectorId) -> HostResult<()> {
+        let runner_tx = {
+            let state = self.state.read().await;
+            let entry = state
+                .connectors
+                .get(connector_id)
+                .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+            match &entry.connector {
+                ConnectorRuntime::Native(subprocess) => subprocess.runner_tx.clone(),
+                _ => {
+                    return Err(HostError::Internal(format!(
+                        "force-terminate unsupported for connector {connector_id} runtime variant"
+                    )));
+                }
+            }
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        runner_tx
+            .send(ConnectorRpcRequest {
+                method: CONNECTOR_RPC_FORCE_TERMINATE.to_string(),
+                params: json!({}),
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                HostError::RegistryError(
+                    "connector dispatcher unavailable for force-terminate".to_string(),
+                )
+            })?;
+        let response = response_rx.await.map_err(|_| {
+            HostError::RegistryError(
+                "connector dispatcher stopped before force-terminate reply".to_string(),
+            )
+        })?;
+        response.map(|_| ()).map_err(|err| {
+            HostError::RegistryError(format!("connector IO error during force-terminate: {err}"))
+        })
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -4040,6 +4122,13 @@ impl ConnectorProcessRunner {
             epoch: 0,
             next_request_seq: 0,
         })
+    }
+    /// Force-terminate the connector subprocess via the shared
+    /// cancellation-deadline kill sequence (SIGTERM grace, then SIGKILL;
+    /// `flywheel_connectors-861lx`). Runs on the connector's dedicated
+    /// runner task, so the child handle is only ever touched by one task.
+    async fn force_terminate(&mut self) {
+        fcp_host::force_terminate_child(&mut self._child, CONNECTOR_FORCE_KILL_GRACE).await;
     }
 
     fn next_request_id(&mut self) -> String {
@@ -6523,6 +6612,7 @@ fn track_verified_cancellation_owner(
     cancellation: &CancellationController,
     operation_id: &str,
     request: &InvokeRequest,
+    scope: CancellationScope,
 ) -> HostResult<()> {
     let verified_claims = request
         .capability_token
@@ -6539,7 +6629,7 @@ fn track_verified_cancellation_owner(
                 .to_string(),
         )
     })?;
-    cancellation.track_with_owner(operation_id, Some(cancellation_owner));
+    cancellation.track_operation(operation_id, Some(cancellation_owner), scope);
     Ok(())
 }
 
@@ -7480,6 +7570,64 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
         started_at: Instant::now(),
     });
+
+    // flywheel_connectors-861lx: cancellation-deadline reaper. Sweeps
+    // tracked operations whose cancellation deadline expired without
+    // completion and force-terminates the backing connector subprocess.
+    {
+        let reap_state = Arc::clone(&state);
+        task::spawn(async move {
+            loop {
+                fcp_async_core::time::sleep(CANCELLATION_REAPER_INTERVAL).await;
+                for expired in reap_state.cancellation.reap_expired(Instant::now()) {
+                    let connector_id: Option<ConnectorId> = expired.connector_id.parse().ok();
+                    let Some(connector_id) = connector_id else {
+                        tracing::error!(
+                            event = "cancellation_force_terminate_invalid_id",
+                            operation_id = %expired.operation_id,
+                            connector_id = %expired.connector_id,
+                            "cancellation deadline expired; connector id unparseable"
+                        );
+                        continue;
+                    };
+                    let result = reap_state
+                        .registry
+                        .force_terminate_connector(&connector_id)
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            reap_state.cancellation.record_forced_cancellation(
+                                &expired.operation_id,
+                                Utc::now(),
+                            );
+                            tracing::warn!(
+                                event = "cancellation_forced",
+                                operation_id = %expired.operation_id,
+                                connector_id = %expired.connector_id,
+                                deadline_ms = expired.deadline.as_millis() as u64,
+                                "cancellation deadline expired; connector subprocess force-terminated"
+                            );
+                        }
+                        Err(err) => {
+                            // Re-arm so the next sweep retries the
+                            // force-terminate until the connector is gone.
+                            reap_state
+                                .cancellation
+                                .rearm_force_terminate(&expired.operation_id);
+                            tracing::error!(
+                                event = "cancellation_force_terminate_failed",
+                                operation_id = %expired.operation_id,
+                                connector_id = %expired.connector_id,
+                                deadline_ms = expired.deadline.as_millis() as u64,
+                                error = %err,
+                                "cancellation deadline expired; force-terminate failed, will retry"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let protected_routes = Router::new()
         .route(
@@ -13218,8 +13366,18 @@ async fn invoke_handler(
     // header is only an equality check against the authenticated token
     // subject/principal_id claim; absent it, the request is still
     // authenticated and must not fall back to ownerless cancellation.
-    track_verified_cancellation_owner(state.cancellation.as_ref(), &operation_id, &request)
+    let cancellation_scope = state
+        .registry
+        .cancellation_scope(&connector_id)
+        .await
         .map_err(map_host_error)?;
+    track_verified_cancellation_owner(
+        state.cancellation.as_ref(),
+        &operation_id,
+        &request,
+        cancellation_scope,
+    )
+    .map_err(map_host_error)?;
     let source_request = request.clone();
     let invoke_result = state.registry.invoke(request).await;
     state.cancellation.complete(&operation_id);
@@ -25738,10 +25896,7 @@ done"#;
         if !output.status.success() {
             return None;
         }
-        let revision = String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .to_string();
+        let revision = String::from_utf8(output.stdout).ok()?.trim().to_string();
         if revision.is_empty() {
             None
         } else {
