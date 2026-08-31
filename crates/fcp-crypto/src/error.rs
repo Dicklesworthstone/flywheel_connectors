@@ -80,6 +80,10 @@ pub enum CryptoError {
     #[error("FROST operation failed: {0}")]
     FrostFailed(String),
 
+    /// Threshold HPKE failure (flywheel_connectors-angoc.11.6.1).
+    #[error("threshold hpke: {0}")]
+    ThresholdHpke(#[from] crate::threshold_hpke::ThresholdHpkeError),
+
     /// Serialization error.
     #[error("serialization error: {0}")]
     SerializationError(String),

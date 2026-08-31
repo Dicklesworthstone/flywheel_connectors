@@ -114,6 +114,7 @@ pub mod ml_dsa;
 pub mod owner_key;
 pub mod secret_fetch;
 pub mod shamir;
+pub mod threshold_hpke;
 pub mod vector_commit;
 pub mod x25519;
 pub mod xwing;
@@ -167,6 +168,10 @@ pub use secret_fetch::{
 pub use shamir::{
     SealedShamirShare, ShamirError, ShamirResult, ShamirShare, ZeroizingSecret, open_share,
     reconstruct_secret, seal_share, split_and_seal, split_secret, split_secret_with_rng,
+};
+pub use threshold_hpke::{
+    DecapShare, ThresholdHpkeCiphertext, ThresholdHpkeError, ThresholdHpkePublicKey, combine_decap,
+    decap_share, encap, encap_with_rng,
 };
 pub use x25519::{X25519PublicKey, X25519SecretKey, X25519SharedSecret};
 pub use xwing::{

@@ -71,6 +71,13 @@ fn core_crypto_error_display_matrix() -> Vec<CryptoErrorDisplayCase> {
             "HPKE operation failed: encap error",
         ),
         (
+            CryptoError::ThresholdHpke(fcp_crypto::ThresholdHpkeError::InsufficientShares {
+                got: 1,
+                required: 2,
+            }),
+            "threshold hpke: insufficient decap shares: got 1, need 2",
+        ),
+        (
             CryptoError::CoseFailed(String::from("invalid header")),
             "COSE operation failed: invalid header",
         ),
@@ -199,8 +206,8 @@ fn crypto_error_full_variant_matrix_pins_display_per_variant() {
     let matrix = variant_display_matrix();
     assert_eq!(
         matrix.len(),
-        33,
-        "CryptoError variant matrix length drift: expected 33, got {}",
+        34,
+        "CryptoError variant matrix length drift: expected 34, got {}",
         matrix.len()
     );
     for (variant, expected) in &matrix {
@@ -236,6 +243,7 @@ fn crypto_error_exhaustive_match_sentinel() {
         | CryptoError::SerializationError(_)
         | CryptoError::PayloadTooLarge { .. }
         | CryptoError::TokenValidationError(_)
+        | CryptoError::ThresholdHpke(_)
         | CryptoError::TokenExpired
         | CryptoError::TokenNotYetValid
         | CryptoError::MissingField(_)
