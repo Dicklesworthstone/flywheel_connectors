@@ -2312,7 +2312,7 @@ mod tests {
 
     #[test]
     fn resolve_with_partials_prefers_complete_over_partial() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_with_partials(ResolutionStrategy::PreferHost, |source| match source {
                 KnowledgeState::HostBacked => {
@@ -2465,7 +2465,7 @@ mod tests {
 
     #[test]
     fn scenario_host_down_falls_to_offline() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result = resolver.resolve_sync(ResolutionStrategy::PreferHost, |source| match source {
             KnowledgeState::Offline => Some(serde_json::json!({
                 "connector": "github",
@@ -2483,7 +2483,7 @@ mod tests {
 
     #[test]
     fn scenario_mesh_and_host_both_available() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| match source {
                 KnowledgeState::MeshBacked => Some("distributed-state"),
@@ -2731,7 +2731,7 @@ mod tests {
 
     #[test]
     fn scenario_mesh_resolution_with_evidence() {
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| match source {
                 KnowledgeState::MeshBacked => Some("distributed-health"),
@@ -2917,7 +2917,7 @@ mod tests {
     #[test]
     fn acceptance_mesh_backed_mode() {
         // MESH-BACKED: distributed state from mesh object store
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result =
             resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| match source {
                 KnowledgeState::MeshBacked => Some(serde_json::json!({
@@ -3015,7 +3015,7 @@ mod tests {
     #[test]
     fn acceptance_fallback_derived_mode() {
         // FALLBACK: all preferred sources fail, falling back to offline
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let mut source_log = Vec::new();
         let result = resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| {
             source_log.push((source, source == KnowledgeState::Offline));
@@ -3063,7 +3063,7 @@ mod tests {
     #[test]
     fn acceptance_refusal_mode() {
         // REFUSAL: all sources fail, resolver returns error
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
         let result: Result<TruthResolution<String>, _> = resolver.resolve_with_partials(
             ResolutionStrategy::BestAvailable,
             |source| match source {

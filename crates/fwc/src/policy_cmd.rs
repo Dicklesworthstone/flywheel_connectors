@@ -22,9 +22,9 @@ use fcp_policy::{
     ZoneTransportPolicy,
 };
 use fcp_prelude::{
-    DecisionReceipt, ObjectHeader, POLICY_BUNDLE_SIGNED_FIELDS, PolicyPreviewSample,
-    PolicySimulationError, PolicySimulationInput, compute_policy_bundle_hash, diff_policy_bundles,
-    preview_policy_bundles, simulate_policy_decision,
+    DecisionReceipt, ObjectEncryptionKind, ObjectHeader, POLICY_BUNDLE_SIGNED_FIELDS,
+    PolicyPreviewSample, PolicySimulationError, PolicySimulationInput, compute_policy_bundle_hash,
+    diff_policy_bundles, preview_policy_bundles, simulate_policy_decision,
 };
 use hex::decode as hex_decode;
 use semver::Version;
@@ -1458,7 +1458,7 @@ fn output_json_or_human<T: Serialize>(payload: &T, json: bool) -> Result<()> {
 fn default_zone_policy(invoke: &InvokeRequest) -> ZonePolicyObject {
     let schema = SchemaId::new("fcp.core", "ZonePolicy", Version::new(1, 0, 0));
     let header = ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: ObjectEncryptionKind::default(),
         schema,
         zone_id: invoke.zone_id.clone(),
         created_at: u64::try_from(Utc::now().timestamp()).unwrap_or(0),
@@ -3220,7 +3220,7 @@ mod tests {
         let zone = ZoneId::work();
         let schema = SchemaId::new("fcp.core", "ZoneDefinition", Version::new(1, 0, 0));
         let header = ObjectHeader {
-            encryption_kind: Default::default(),
+            encryption_kind: ObjectEncryptionKind::default(),
             schema,
             zone_id: zone.clone(),
             created_at: 0,

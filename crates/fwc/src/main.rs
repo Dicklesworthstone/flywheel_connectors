@@ -7456,6 +7456,12 @@ fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
 }
 
 fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
+    if let Some(outcome) =
+        enforce_required_truth_source("show", args.require_source, KnowledgeState::HostBacked)
+    {
+        return Ok(outcome);
+    }
+
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
@@ -7567,6 +7573,12 @@ fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
 
 #[allow(clippy::too_many_lines)]
 fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome> {
+    if let Some(outcome) =
+        enforce_required_truth_source("schema", args.require_source, KnowledgeState::HostBacked)
+    {
+        return Ok(outcome);
+    }
+
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
@@ -12605,6 +12617,12 @@ fn session_next_actions(session: &session::Session) -> Vec<String> {
 }
 
 fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome> {
+    if let Some(outcome) =
+        enforce_required_truth_source("search", args.require_source, KnowledgeState::HostBacked)
+    {
+        return Ok(outcome);
+    }
+
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
     let (connectors, metadata_gaps) = load_live_discovered_connectors(&client, &catalog)?;
@@ -12704,18 +12722,22 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
     // The truthfulness contract forbids silent downgrade: offline artifacts
     // are only a source when the operator asked for `--offline`, and a
     // configured-but-failed host propagates its transport error unchanged.
+    // Connector-resolution refusals and `--require-source` failures surface from
+    // the dispatchers as non-success outcomes: the queried source did answer,
+    // so they resolve as `Complete` and their exit code is reattached to the
+    // final dispatch unchanged.
     let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
+    let mut outcome_exit_code: Option<CliExitCode> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
         KnowledgeState::HostBacked => match resolved_host.as_ref() {
             Some(host) => match search_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) if outcome.exit_code == CliExitCode::Success => {
+                Ok(outcome) => {
+                    if outcome.exit_code != CliExitCode::Success {
+                        outcome_exit_code = Some(outcome.exit_code);
+                    }
                     QueryResult::Complete(outcome.payload)
                 }
-                Ok(outcome) => QueryResult::Error(format!(
-                    "host search returned exit code {:?}",
-                    outcome.exit_code
-                )),
                 Err(error) => {
                     let detail = format!("{error:#}");
                     host_error = Some(error);
@@ -12749,7 +12771,7 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
             }
             Ok(DispatchOutcome {
                 payload: resolved.value,
-                exit_code: CliExitCode::Success,
+                exit_code: outcome_exit_code.unwrap_or(CliExitCode::Success),
             })
         }
         Err(resolution_error) => {
