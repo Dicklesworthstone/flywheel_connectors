@@ -888,6 +888,7 @@ mod tests {
         StoredObject {
             object_id: ObjectId::from_bytes([id; 32]),
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
                 zone_id: zone_id.clone(),
                 created_at: 1_000_000,

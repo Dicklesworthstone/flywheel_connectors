@@ -25,6 +25,7 @@ struct HybridOwnerFixture {
 
 fn header(zone_id: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new("fcp.zone", "ZoneKeyManifest", Version::new(1, 0, 0)),
         zone_id: zone_id.clone(),
         created_at: ISSUED_AT,

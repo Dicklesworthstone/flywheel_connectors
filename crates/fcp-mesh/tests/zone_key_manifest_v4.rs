@@ -58,6 +58,7 @@ fn test_signature(valid_from: u64) -> NodeSignature {
 
 fn test_header(zone: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.zone",
             "ZoneKeyManifest",

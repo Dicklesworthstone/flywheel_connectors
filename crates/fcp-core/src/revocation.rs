@@ -974,6 +974,7 @@ mod tests {
 
     fn test_header() -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "RevocationObject", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,

@@ -29,6 +29,7 @@ fn standard_zone(index: usize) -> ZoneId {
 
 fn test_header(zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new(
             "fcp.core",
             "ZoneMutationFuzz",

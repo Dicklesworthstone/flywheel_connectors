@@ -1861,6 +1861,7 @@ mod tests {
         StoredObject {
             object_id: test_object_id(seed),
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: test_schema(),
                 zone_id: zone.clone(),
                 created_at: 42,
@@ -2121,6 +2122,7 @@ mod tests {
         // verify cleanly if replayed under the matching verifier.
         let genuine = |seed: u8, body: &[u8]| -> StoredObject {
             let header = ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: test_schema(),
                 zone_id: zone.clone(),
                 created_at: 100,

@@ -261,6 +261,7 @@ fn make_intent(planned_at: u64) -> OperationIntent {
     let zone = ZoneId::work();
     OperationIntent {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.operation", "intent", Version::new(1, 0, 0)),
             zone_id: zone.clone(),
             created_at: planned_at,

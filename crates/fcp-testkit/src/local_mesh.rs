@@ -637,6 +637,7 @@ impl LocalMeshHarness {
         let request_object_id = object_id_from_label(&format!("request:{idempotency_key}"));
         let outcome_object_id = object_id_from_label(&format!("outcome:{idempotency_key}"));
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.operation", "receipt", Version::new(1, 0, 0)),
             zone_id: self.zone_id.clone(),
             created_at: self.logical_time_ms / 1000,

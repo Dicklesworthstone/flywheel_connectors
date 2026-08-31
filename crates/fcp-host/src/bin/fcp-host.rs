@@ -4748,6 +4748,7 @@ fn resolve_verifying_key_from_sources(
 fn host_runtime_policy(zone_id: ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.core",
                 "ZonePolicyObject",
@@ -27857,6 +27858,7 @@ done"#;
         let seq_byte = u8::try_from(seq).expect("test sequence should fit in CBOR byte");
         fcp_core::ConnectorStateObject {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_store::FcpStoreConnectorStateStore::state_object_schema_id(),
                 zone_id: zone_id.clone(),
                 created_at: 1_800_200_000 + seq,
@@ -27913,6 +27915,7 @@ done"#;
     ) -> CoreLease {
         CoreLease {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.lease",
                     "lease",

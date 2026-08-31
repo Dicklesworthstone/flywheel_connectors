@@ -56,6 +56,7 @@ const fn test_signature() -> Signature {
 fn create_test_header(schema_name: &str) -> ObjectHeader {
     let zone = test_zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.connector_state", schema_name, Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1000,
@@ -70,6 +71,7 @@ fn create_test_header(schema_name: &str) -> ObjectHeader {
 fn create_test_header_with_refs(schema_name: &str, refs: Vec<ObjectId>) -> ObjectHeader {
     let zone = test_zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.connector_state", schema_name, Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1000,

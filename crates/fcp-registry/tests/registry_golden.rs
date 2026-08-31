@@ -45,6 +45,7 @@ fn deterministic_signature_artifact(
 
 fn revocation_header(schema_name: &str, created_at: u64) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", schema_name, Version::new(1, 0, 0)),
         zone_id: ZoneId::work(),
         created_at,

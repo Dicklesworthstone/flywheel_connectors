@@ -3792,6 +3792,7 @@ mod tests {
         let schema =
             fcp_cbor::SchemaId::new("fcp.test", "FetchedObject", semver::Version::new(1, 0, 0));
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema,
             zone_id: zone_id.clone(),
             created_at: 1,
@@ -3823,6 +3824,7 @@ mod tests {
     ) -> StoredObject {
         let schema = FcpStoreConnectorStateStore::root_schema_id();
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: schema.clone(),
             zone_id: zone_id.clone(),
             created_at: 1,
@@ -3857,6 +3859,7 @@ mod tests {
     fn test_core_lease(zone_id: &ZoneId, subject_object_id: ObjectId) -> fcp_prelude::Lease {
         let schema = fcp_cbor::SchemaId::new("fcp.lease", "lease", semver::Version::new(1, 0, 0));
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema,
             zone_id: zone_id.clone(),
             created_at: 10,
@@ -4707,6 +4710,7 @@ mod tests {
 
         let schema = FcpStoreConnectorStateStore::root_schema_id();
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: schema.clone(),
             zone_id: zone_id.clone(),
             created_at: 42,

@@ -444,6 +444,7 @@ fn computation_checkpoint(
     let state_cbor = encode_whisper_state(state)?;
     Ok(ComputationCheckpoint {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: ComputationCheckpoint::schema(),
             zone_id: computation.zone_id.clone(),
             created_at: current_timestamp(),

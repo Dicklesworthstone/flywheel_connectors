@@ -343,6 +343,7 @@ impl Lease {
 
         Self {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: params.schema,
                 zone_id: params.zone_id,
                 created_at,
@@ -2003,6 +2004,7 @@ mod tests {
         let zone = test_zone();
         Lease {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: SchemaId::new("fcp.lease", "lease", Version::new(1, 0, 0)),
                 zone_id: zone.clone(),
                 created_at: 1000,

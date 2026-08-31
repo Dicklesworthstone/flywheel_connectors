@@ -27,6 +27,7 @@ fn node(label: &str) -> TailscaleNodeId {
 fn header() -> ObjectHeader {
     let z = zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.zone",
             "ZoneKeyManifest",

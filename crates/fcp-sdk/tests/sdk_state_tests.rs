@@ -146,6 +146,7 @@ fn test_state_model_serialize_crdt() {
 
 fn test_header(created_at: u64) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.test", "ConnectorStateObject", Version::new(1, 0, 0)),
         zone_id: ZoneId::work(),
         created_at,
@@ -166,6 +167,7 @@ fn test_header(created_at: u64) -> ObjectHeader {
 #[cfg(feature = "cursor-store-object-store")]
 fn object_store_header(created_at: u64, zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.connector_state", "state_object", Version::new(1, 0, 0)),
         zone_id: zone_id.clone(),
         created_at,

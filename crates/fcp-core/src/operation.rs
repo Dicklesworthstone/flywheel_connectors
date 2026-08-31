@@ -674,6 +674,7 @@ mod tests {
     fn create_test_header() -> ObjectHeader {
         let zone = test_zone();
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.operation", "intent", Version::new(1, 0, 0)),
             zone_id: zone.clone(),
             created_at: 1000,

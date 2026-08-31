@@ -48,6 +48,7 @@ fn test_signature() -> NodeSignature {
 fn create_test_header(schema_name: &str) -> ObjectHeader {
     let zone = test_zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.operation", schema_name, Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1000,

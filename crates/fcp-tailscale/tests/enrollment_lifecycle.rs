@@ -41,6 +41,7 @@ fn create_test_keys() -> (
 
 fn create_header(zone_id: ZoneId, schema: SchemaId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema,
         zone_id: zone_id.clone(),
         created_at: now_ts_u64(),

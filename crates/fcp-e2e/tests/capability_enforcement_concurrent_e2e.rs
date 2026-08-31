@@ -330,6 +330,7 @@ async fn scenario_c_four_rejection_paths_emit_warning() {
     let mut registry = RevocationRegistry::new();
     let revocation_zone = ZoneId::work();
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.revocation",
             "RevocationObject",
@@ -535,6 +536,7 @@ async fn scenario_d_revocation_seal_sla_under_jitter() {
 
             let revocation_zone = ZoneId::work();
             let header = ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.revocation",
                     "RevocationObject",

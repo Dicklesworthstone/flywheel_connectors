@@ -96,6 +96,7 @@ fn signed_connector_manifest() -> ConnectorManifest {
 
 fn test_header(zone_id: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.zone",
             "ZoneKeyManifest",

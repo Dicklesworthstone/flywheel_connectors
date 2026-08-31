@@ -187,6 +187,7 @@ struct VerifiedLiveRequest {
 fn test_zone_policy(zone_id: ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.core",
                 "ZonePolicyObject",

@@ -1214,6 +1214,7 @@ pub fn held_lease_from_signed(lease: &CoreLease) -> HeldLease {
 fn core_lease_from_params(params: CoreLeaseParams, created_at: u64, expires_at: u64) -> CoreLease {
     CoreLease {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: params.schema,
             zone_id: params.zone_id,
             created_at,

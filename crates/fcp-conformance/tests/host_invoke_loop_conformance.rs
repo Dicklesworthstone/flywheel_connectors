@@ -452,6 +452,7 @@ fn conformance_invoke_loop_f_emergency_revocation_propagation() {
     // not verify the signature — that's a separate gate).
     let zone = ZoneId::work();
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.revocation",
             "RevocationObject",

@@ -222,6 +222,7 @@ fn capability_golden_payload_byte_tamper_is_rejected() {
 #[test]
 fn object_header_canonical_cbor_roundtrip_all_fields_populated() {
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.test", "RoundTrip", Version::new(2, 3, 4)),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,

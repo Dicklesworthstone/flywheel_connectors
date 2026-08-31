@@ -246,6 +246,7 @@ mod meshnode {
 
     fn test_header(zone_id: &ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.mesh", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -259,6 +260,7 @@ mod meshnode {
 
     fn status_header(zone_id: &ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.status", "DecodeStatus", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -420,6 +422,7 @@ mod meshnode {
         lease_id: ObjectId,
     ) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: ComputationCheckpoint::schema(),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -5561,6 +5564,7 @@ mod real_component_integration {
 
     fn test_header(zone_id: &ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.mesh", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -5662,6 +5666,7 @@ mod real_component_integration {
     ) -> fcp_core::DecisionReceipt {
         fcp_core::DecisionReceipt {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: SchemaId::new("fcp.core", "DecisionReceipt", Version::new(1, 0, 0)),
                 zone_id: zone_id.clone(),
                 created_at: 1_000,
@@ -6502,6 +6507,7 @@ mod real_component_integration {
 
         // Phase 2: Peer reports decode complete
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.status", "DecodeStatus", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,

@@ -258,6 +258,7 @@ fn state_cbor(seq: u64) -> Vec<u8> {
 
 fn state_header(seq: u64, lease: ObjectId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: FcpStoreConnectorStateStore::state_object_schema_id(),
         zone_id: zone_id(),
         created_at: 1_800_000_000 + seq,
@@ -314,6 +315,7 @@ fn stored_object_for<T: Serialize>(header: &ObjectHeader, value: &T) -> StoredOb
 fn root_with_head(head: ObjectId, created_at: u64) -> ConnectorStateRoot {
     ConnectorStateRoot {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: FcpStoreConnectorStateStore::root_schema_id(),
             zone_id: zone_id(),
             created_at,

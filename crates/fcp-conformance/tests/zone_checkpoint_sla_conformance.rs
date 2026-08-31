@@ -56,6 +56,7 @@ const fn test_object_id(seed: u8) -> ObjectId {
 
 fn checkpoint_header() -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.audit", "ZoneCheckpoint", Version::new(1, 0, 0)),
         zone_id: test_zone(),
         created_at: 0,

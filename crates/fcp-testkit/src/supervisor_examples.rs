@@ -401,6 +401,7 @@ impl FakeCursorStoreConnector {
         };
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "ConnectorStateObject", Version::new(1, 0, 0)),
             zone_id: self.zone_id.clone(),
             created_at,
@@ -444,6 +445,7 @@ impl FakeCursorStoreConnector {
     ) -> ConnectorStateSnapshot {
         let state_cbor = cursor_state.to_cbor().expect("cursor state should encode");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "ConnectorStateSnapshot", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: snapshotted_at,

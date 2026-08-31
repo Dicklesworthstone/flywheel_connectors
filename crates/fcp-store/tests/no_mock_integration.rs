@@ -40,6 +40,7 @@ fn test_schema() -> fcp_cbor::SchemaId {
 fn test_stored_object(n: u8) -> StoredObject {
     let zone = test_zone();
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema(),
         zone_id: zone,
         created_at: 1000,
@@ -112,6 +113,7 @@ fn test_object_meta(n: u8) -> ObjectSymbolMeta {
 
 fn durable_header(schema: fcp_cbor::SchemaId, zone: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema,
         zone_id: zone.clone(),
         created_at: 1_700_000_000,
@@ -1077,6 +1079,7 @@ async fn gc_collect_with_transcript_exposes_reason_log() {
         .put(StoredObject {
             object_id: reachable_id,
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: test_schema(),
                 zone_id: test_zone(),
                 created_at: 1_000_000,

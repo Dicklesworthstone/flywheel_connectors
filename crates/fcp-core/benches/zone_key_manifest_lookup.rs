@@ -26,6 +26,7 @@ use fcp_crypto::X25519SecretKey;
 
 fn header(zone: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: fcp_cbor::SchemaId::new(
             "fcp.zone",
             "ZoneKeyManifest",

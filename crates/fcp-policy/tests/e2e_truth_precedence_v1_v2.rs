@@ -57,6 +57,7 @@ const PHASE_BUDGET_MS: u128 = 250;
 
 fn build_object_header(zone_id: &ZoneId, created_at: u64) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", "RevocationObject", Version::new(1, 0, 0)),
         zone_id: zone_id.clone(),
         created_at,

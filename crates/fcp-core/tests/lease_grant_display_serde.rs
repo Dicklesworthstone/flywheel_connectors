@@ -53,6 +53,7 @@ fn build_lease() -> Lease {
     let subject = ObjectId::from_bytes([0x42; 32]);
     Lease {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.lease", "lease", Version::new(1, 0, 0)),
             zone_id: zone.clone(),
             created_at: 1_000,

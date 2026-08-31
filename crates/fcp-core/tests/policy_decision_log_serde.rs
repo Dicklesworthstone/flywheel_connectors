@@ -45,6 +45,7 @@ const fn obj(byte: u8) -> ObjectId {
 fn header() -> ObjectHeader {
     let zone = ZoneId::work();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.audit", "AuditEvent", Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1_700_000_000,

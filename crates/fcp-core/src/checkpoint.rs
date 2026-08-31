@@ -948,6 +948,7 @@ mod tests {
 
     fn test_migration_header(kind: &str, refs: Vec<ObjectId>) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", kind, Version::new(1, 0, 0)),
             zone_id: test_zone(),
             created_at: 1_700_000_000,

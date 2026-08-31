@@ -2178,6 +2178,7 @@ impl RegistryVerifier {
         let provenance = Provenance::new(zone_id.clone());
 
         let manifest_header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: manifest_schema,
             zone_id: zone_id.clone(),
             created_at: now,
@@ -2200,6 +2201,7 @@ impl RegistryVerifier {
         };
 
         let binary_header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: binary_schema,
             zone_id,
             created_at: now,
@@ -2329,6 +2331,7 @@ impl RegistryVerifier {
         let descriptor_body = CanonicalSerializer::serialize(&descriptor, &descriptor_schema)
             .map_err(RegistryError::Canonical)?;
         let descriptor_header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: descriptor_schema,
             zone_id: zone_id.clone(),
             created_at: mirrored_at,
@@ -4009,6 +4012,7 @@ sig = "{sig}"
         let zone = ZoneId::work();
         ZonePolicyObject {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: SchemaId::new("fcp.test", "ZonePolicyObject", Version::new(1, 0, 0)),
                 zone_id: zone.clone(),
                 created_at: 1_700_000_000,

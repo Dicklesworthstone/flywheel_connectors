@@ -179,6 +179,7 @@ fn test_schema_id() -> SchemaId {
 
 fn test_object_header(zone_id: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema_id(),
         zone_id: zone_id.clone(),
         created_at: 1_700_000_000,

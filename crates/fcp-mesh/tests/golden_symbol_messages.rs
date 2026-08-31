@@ -70,6 +70,7 @@ fn fixture_zone() -> ZoneId {
 
 fn fixture_header(schema_name: &str) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.protocol", schema_name, Version::new(1, 0, 0)),
         zone_id: fixture_zone(),
         created_at: 1_700_000_000,

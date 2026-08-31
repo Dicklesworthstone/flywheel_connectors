@@ -305,6 +305,7 @@ mod tests {
     #[test]
     fn control_plane_object_creation() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Request"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -326,6 +327,7 @@ mod tests {
     #[test]
     fn control_plane_object_derive_id() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Request"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -349,6 +351,7 @@ mod tests {
     #[test]
     fn control_plane_object_retention_ephemeral() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.health", "Heartbeat"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -367,6 +370,7 @@ mod tests {
     #[test]
     fn control_plane_object_serialization_roundtrip() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Request"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -534,6 +538,7 @@ mod tests {
     #[test]
     fn control_plane_object_debug_clone() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Request"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -553,6 +558,7 @@ mod tests {
     #[test]
     fn control_plane_object_schema_accessor() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.audit", "Head"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -570,6 +576,7 @@ mod tests {
     #[test]
     fn control_plane_object_empty_body() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.health", "Empty"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -587,6 +594,7 @@ mod tests {
     #[test]
     fn control_plane_object_large_body() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "BigPayload"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -605,6 +613,7 @@ mod tests {
     #[test]
     fn control_plane_object_derive_id_deterministic() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.receipt", "Exec"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -625,6 +634,7 @@ mod tests {
     #[test]
     fn control_plane_object_derive_id_differs_with_different_key() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.receipt", "Exec"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -646,6 +656,7 @@ mod tests {
     #[test]
     fn control_plane_object_derive_id_differs_with_different_body() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Req"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -727,6 +738,7 @@ mod tests {
     #[test]
     fn control_plane_object_body_with_binary_data() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Binary"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -750,6 +762,7 @@ mod tests {
 
         for ns in schemas_required {
             let header = ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: test_schema(ns, "Test"),
                 zone_id: ZoneId::work(),
                 created_at: 0,
@@ -769,6 +782,7 @@ mod tests {
 
         for ns in schemas_ephemeral {
             let header = ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: test_schema(ns, "Test"),
                 zone_id: ZoneId::work(),
                 created_at: 0,
@@ -790,6 +804,7 @@ mod tests {
     #[test]
     fn control_plane_object_serde_cbor_roundtrip() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.receipt", "Exec"),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -815,6 +830,7 @@ mod tests {
         let body = b"same body".to_vec();
 
         let header_a = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.invoke", "Req"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -825,6 +841,7 @@ mod tests {
             placement: None,
         };
         let header_b = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema("fcp.receipt", "Resp"),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -892,6 +909,7 @@ mod tests {
     #[test]
     fn control_plane_object_schema_version_preserved() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Versioned", Version::new(2, 3, 4)),
             zone_id: ZoneId::work(),
             created_at: 0,

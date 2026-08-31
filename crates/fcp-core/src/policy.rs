@@ -2428,6 +2428,7 @@ pub fn simulate_policy_decision(
     };
     let decision = engine.evaluate_invoke(&decision_input);
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", "DecisionReceipt", Version::new(1, 0, 0)),
         zone_id: invoke.zone_id.clone(),
         created_at: now_ms / 1000,
@@ -3418,6 +3419,7 @@ mod tests {
 
     fn test_header() -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000,
@@ -3823,6 +3825,7 @@ mod tests {
 
     fn test_header_for(schema_name: &str, zone_id: ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", schema_name, Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,

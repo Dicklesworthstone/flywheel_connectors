@@ -316,6 +316,7 @@ fn sample_object_header(schema: SchemaId) -> ObjectHeader {
     let zone = sample_zone();
     let provenance = Provenance::new(zone.clone());
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema,
         zone_id: zone,
         created_at: fixed_timestamp_secs(),

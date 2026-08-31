@@ -140,6 +140,7 @@ fn make_manifest(algorithm: ZoneKeyAlgorithm) -> ZoneKeyManifest {
     let zone = ZoneId::work();
     ZoneKeyManifest {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.zone", "ZoneKeyManifest", Version::new(1, 0, 0)),
             zone_id: zone.clone(),
             created_at: 1_700_000_000,

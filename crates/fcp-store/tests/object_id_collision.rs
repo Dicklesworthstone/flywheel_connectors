@@ -40,6 +40,7 @@ fn make_object(id: ObjectId, body: &[u8]) -> StoredObject {
     StoredObject {
         object_id: id,
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "CollisionTest", Version::new(1, 0, 0)),
             zone_id: test_zone(),
             created_at: 1_700_000_000,

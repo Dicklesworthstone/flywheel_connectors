@@ -49,7 +49,9 @@ fn unresponsive_operation_is_reaped_within_deadline_plus_epsilon() {
 
     let start = Instant::now();
     let cancel = request("op-unresponsive", CancelReason::UserRequested);
-    let response = ctrl.cancel(&cancel, Some("user:alice"), Utc::now()).unwrap();
+    let response = ctrl
+        .cancel(&cancel, Some("user:alice"), Utc::now())
+        .unwrap();
     assert_eq!(response.outcome, CancellationOutcome::Cancelled);
 
     // Before deadline + epsilon: nothing may be reaped.
@@ -61,7 +63,11 @@ fn unresponsive_operation_is_reaped_within_deadline_plus_epsilon() {
 
     // At deadline + epsilon: exactly the unresponsive operation.
     let expired = ctrl.reap_expired(start + Duration::from_millis(150));
-    assert_eq!(expired.len(), 1, "deadline expiry MUST report the operation");
+    assert_eq!(
+        expired.len(),
+        1,
+        "deadline expiry MUST report the operation"
+    );
     assert_eq!(expired[0].operation_id, "op-unresponsive");
     assert_eq!(expired[0].connector_id, "c:slow:1.0");
     assert_eq!(expired[0].deadline, Duration::from_millis(100));
@@ -88,19 +94,24 @@ fn responsive_operation_is_never_force_terminated() {
             .with_deadline_override_ms(Some(100)),
     );
     let start = Instant::now();
-    let cancel = request("op-responsive", CancelReason::AgentAbort {
-        reason: "operator stopped the run".into(),
-    });
-    ctrl.cancel(&cancel, Some("user:alice"), Utc::now()).unwrap();
+    let cancel = request(
+        "op-responsive",
+        CancelReason::AgentAbort {
+            reason: "operator stopped the run".into(),
+        },
+    );
+    ctrl.cancel(&cancel, Some("user:alice"), Utc::now())
+        .unwrap();
 
     // The connector acknowledges by finishing before the deadline.
     ctrl.complete("op-responsive");
 
     // Sweep far past the deadline: a completed operation MUST never be
     // reaped, and no forced audit event may exist.
-    assert!(ctrl
-        .reap_expired(start + Duration::from_secs(3600))
-        .is_empty());
+    assert!(
+        ctrl.reap_expired(start + Duration::from_secs(3600))
+            .is_empty()
+    );
     assert!(
         ctrl.audit_events().iter().all(|event| !event.forced),
         "responsive operations MUST NOT be force-terminated"
@@ -109,9 +120,7 @@ fn responsive_operation_is_never_force_terminated() {
 
 #[test]
 fn archetype_defaults_bound_the_effective_deadline() {
-    let one_shot = |archetype| {
-        CancellationScope::new("c:x:1.0", archetype).effective_deadline()
-    };
+    let one_shot = |archetype| CancellationScope::new("c:x:1.0", archetype).effective_deadline();
     assert_eq!(
         one_shot(ConnectorArchetype::RequestResponse),
         Duration::from_secs(1),
@@ -177,15 +186,21 @@ fn forced_cancellation_does_not_release_the_tracked_operation() {
         CancellationScope::new("c:stuck:1.0", ConnectorArchetype::Polling)
             .with_deadline_override_ms(Some(50)),
     );
-    let cancel = request("op-intent", CancelReason::TimeoutApproaching {
-        remaining_ms: 0,
-    });
-    ctrl.cancel(&cancel, Some("user:alice"), Utc::now()).unwrap();
+    let cancel = request(
+        "op-intent",
+        CancelReason::TimeoutApproaching { remaining_ms: 0 },
+    );
+    ctrl.cancel(&cancel, Some("user:alice"), Utc::now())
+        .unwrap();
     let expired = ctrl.reap_expired(Instant::now() + Duration::from_secs(1));
     assert_eq!(expired.len(), 1, "sweep must dispatch the force-terminate");
     ctrl.record_forced_cancellation("op-intent", Utc::now());
 
-    assert_eq!(ctrl.tracked_count(), 1, "forced cancel MUST NOT release the operation");
+    assert_eq!(
+        ctrl.tracked_count(),
+        1,
+        "forced cancel MUST NOT release the operation"
+    );
     assert!(ctrl.is_cancel_requested("op-intent"));
 }
 
@@ -199,7 +214,8 @@ fn failed_force_terminate_is_rearmed_and_retried() {
             .with_deadline_override_ms(Some(50)),
     );
     let cancel = request("op-retry", CancelReason::UserRequested);
-    ctrl.cancel(&cancel, Some("user:alice"), Utc::now()).unwrap();
+    ctrl.cancel(&cancel, Some("user:alice"), Utc::now())
+        .unwrap();
 
     let start = Instant::now();
     assert_eq!(
@@ -219,7 +235,10 @@ fn failed_force_terminate_is_rearmed_and_retried() {
     // After completion a re-arm is a no-op and the sweep stays empty.
     ctrl.complete("op-retry");
     ctrl.rearm_force_terminate("op-retry");
-    assert!(ctrl.reap_expired(start + Duration::from_millis(200)).is_empty());
+    assert!(
+        ctrl.reap_expired(start + Duration::from_millis(200))
+            .is_empty()
+    );
 }
 
 #[test]
@@ -231,7 +250,8 @@ fn bookkeeping_only_registrations_never_expire() {
     ctrl.track_with_owner("op-plain", None);
     let cancel = request("op-plain", CancelReason::UserRequested);
     ctrl.cancel(&cancel, None, Utc::now()).unwrap();
-    assert!(ctrl
-        .reap_expired(Instant::now() + Duration::from_secs(86_400))
-        .is_empty());
+    assert!(
+        ctrl.reap_expired(Instant::now() + Duration::from_secs(86_400))
+            .is_empty()
+    );
 }

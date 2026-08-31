@@ -96,6 +96,7 @@ fn create_test_manifest(_owner_key: &Ed25519SigningKey) -> ZoneKeyManifest {
 
     ZoneKeyManifest {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.zone", "ZoneKeyManifest", semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: valid_from,

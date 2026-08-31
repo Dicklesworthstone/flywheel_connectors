@@ -2016,10 +2016,10 @@ mod tests {
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_manifest::ConnectorManifest;
     use fcp_prelude::CapabilityConstraints;
+    use parking_lot::Mutex;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use parking_lot::Mutex;
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration as StdDuration, Instant as StdInstant};

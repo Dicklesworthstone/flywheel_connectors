@@ -255,6 +255,7 @@ fn create_test_manifest_for_zone(zone_id: ZoneId) -> ZoneKeyManifest {
 
     ZoneKeyManifest {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.zone", "ZoneKeyManifest", semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: valid_from,

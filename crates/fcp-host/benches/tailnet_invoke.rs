@@ -132,6 +132,7 @@ fn build_capability_token(signing_key: &Ed25519SigningKey, zone_id: &ZoneId) -> 
 fn permissive_zone_policy(zone_id: ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.core",
                 "ZonePolicyObject",

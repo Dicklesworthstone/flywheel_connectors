@@ -1353,6 +1353,7 @@ async fn offline_repair_artifact_bundle_captures_lifecycle_and_gc_evidence() {
         StoredObject {
             object_id,
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_core::ConnectorBinarySymbolSet::schema(),
                 zone_id: zone.clone(),
                 created_at: 1_700_000_000,

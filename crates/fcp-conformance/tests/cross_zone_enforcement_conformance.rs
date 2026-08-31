@@ -45,6 +45,7 @@ const TOKEN_TTL_MS: u64 = 60_000;
 
 fn test_header(zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", "CrossZoneTest", semver::Version::new(1, 0, 0)),
         zone_id: zone_id.clone(),
         created_at: NOW_MS,

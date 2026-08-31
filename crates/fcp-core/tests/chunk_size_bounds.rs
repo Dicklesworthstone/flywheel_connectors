@@ -21,6 +21,7 @@ fn test_checkpoint() -> ComputationCheckpoint {
 
     ComputationCheckpoint {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: ComputationCheckpoint::schema(),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_000,

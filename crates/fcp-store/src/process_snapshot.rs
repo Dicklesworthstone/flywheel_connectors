@@ -359,6 +359,7 @@ impl ProcessSnapshotManifest {
     ) -> Result<StoredObject, ProcessSnapshotError> {
         let body = self.canonical_bytes()?;
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: Self::schema_id(),
             zone_id,
             created_at,

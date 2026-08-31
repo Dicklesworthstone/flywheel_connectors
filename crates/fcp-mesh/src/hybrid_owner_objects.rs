@@ -319,6 +319,7 @@ mod tests {
 
     fn object_header(zone_id: ZoneId, name: &'static str) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new("fcp.mesh", name, semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_000,

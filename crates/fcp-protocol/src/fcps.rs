@@ -1872,6 +1872,7 @@ mod tests {
         let zone_id: ZoneId = "z:test".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -1914,6 +1915,7 @@ mod tests {
         let zone_id: ZoneId = "z:test2".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2026,6 +2028,7 @@ mod tests {
         let zone_id: ZoneId = "z:amplify-req".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2068,6 +2071,7 @@ mod tests {
         let zone_id: ZoneId = "z:hard-cap".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2106,6 +2110,7 @@ mod tests {
         let zone_id: ZoneId = "z:hard-cap-edge".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2142,6 +2147,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:try-new-cap".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2191,6 +2197,7 @@ mod tests {
         let zone_id: ZoneId = "z:ack-test".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolAck", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2228,6 +2235,7 @@ mod tests {
         let zone_id: ZoneId = "z:ack-wrong".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolAck", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2285,6 +2293,7 @@ mod tests {
         let zone_id: ZoneId = "z:req-test".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2321,6 +2330,7 @@ mod tests {
         let zone_id: ZoneId = "z:req-hint".parse().expect("zone parse");
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,
@@ -2359,6 +2369,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:req-bounds".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -2404,6 +2415,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:req-unauth".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -2463,6 +2475,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:req-pon".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -2694,6 +2707,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:det-test".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -2732,6 +2746,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:no-hint".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -2813,6 +2828,7 @@ mod tests {
 
         let zone_id: ZoneId = "z:auth-exceed".parse().expect("zone parse");
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.protocol", "SymbolRequest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
@@ -3058,6 +3074,7 @@ mod tests {
         use semver::Version;
         let zone_id: ZoneId = "z:test".parse().unwrap();
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Testobject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,

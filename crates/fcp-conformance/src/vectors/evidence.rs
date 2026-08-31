@@ -26,6 +26,7 @@ mod tests {
 
     fn test_header() -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Evidence", Version::new(0, 1, 0)),
             zone_id: test_zone(),
             created_at: 1_700_000_000,

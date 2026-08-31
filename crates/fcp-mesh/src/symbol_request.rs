@@ -853,6 +853,7 @@ mod tests {
     fn test_object_header() -> ObjectHeader {
         let zone_id = test_zone_id();
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_704_067_200,

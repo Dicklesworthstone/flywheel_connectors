@@ -52,6 +52,7 @@ const RECEIPT_DOMAIN_SEPARATOR: &[u8] = b"FCP2-RECEIPT-V1";
 
 fn header(zone: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", "OperationIntent", Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1_700_000_000,

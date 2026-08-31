@@ -60,6 +60,7 @@ fn canonical_zone_checkpoint() -> ZoneCheckpoint {
 
     ZoneCheckpoint {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "ZoneCheckpoint", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_123,

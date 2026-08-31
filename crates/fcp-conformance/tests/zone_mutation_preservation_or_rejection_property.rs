@@ -48,6 +48,7 @@ fn standard_zone_names() -> Vec<String> {
 
 fn test_header(zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new(
             "fcp.core",
             "ZoneMutationProperty",

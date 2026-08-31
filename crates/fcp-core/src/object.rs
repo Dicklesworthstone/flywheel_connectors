@@ -227,6 +227,39 @@ pub struct ObjectHeader {
     pub ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<ObjectPlacementPolicy>,
+    /// How the object body is encrypted (`flywheel_connectors-angoc.11.6.1`).
+    /// `Plain` (the default) is the content-addressed plaintext body;
+    /// `ThresholdHpkeQuorum` marks a body sealed with the threshold-HPKE
+    /// KEM so that only a `threshold`-of-`epoch` quorum holding FROST
+    /// decap shares can recover it.
+    #[serde(default, skip_serializing_if = "ObjectEncryptionKind::is_plain")]
+    pub encryption_kind: ObjectEncryptionKind,
+}
+
+/// Encryption state of an object body (NORMATIVE,
+/// `flywheel_connectors-angoc.11.6.1`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectEncryptionKind {
+    /// Body is stored as plaintext content-addressed bytes.
+    #[default]
+    Plain,
+    /// Body was sealed with the threshold-HPKE KEM; recovery requires
+    /// `threshold` decap shares from the ceremony `epoch`.
+    ThresholdHpkeQuorum {
+        /// Decap shares required to open the body.
+        threshold: u16,
+        /// FROST ceremony epoch that produced the group key.
+        epoch: u64,
+    },
+}
+
+impl ObjectEncryptionKind {
+    /// Whether this kind is the default plaintext form.
+    #[must_use]
+    pub const fn is_plain(&self) -> bool {
+        matches!(self, Self::Plain)
+    }
 }
 
 /// Eviction policy for garbage collection (NORMATIVE).
@@ -635,6 +668,7 @@ mod tests {
     #[test]
     fn object_header_serialization_roundtrip() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "TestObject", Version::new(1, 2, 3)),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -657,6 +691,7 @@ mod tests {
     #[test]
     fn object_header_optional_fields_omitted() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::public(),
             created_at: 0,
@@ -723,6 +758,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_format() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000_000,
@@ -745,6 +781,7 @@ mod tests {
     #[test]
     fn stored_object_derive_id_deterministic() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000_000,
@@ -766,6 +803,7 @@ mod tests {
     #[test]
     fn stored_object_derive_id_differs_by_body() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000_000,
@@ -787,6 +825,7 @@ mod tests {
     fn stored_object_serialization_roundtrip() {
         let key = ObjectIdKey::from_bytes([0_u8; 32]);
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000_000,
@@ -819,6 +858,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_rejects_oversized() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Test", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1051,6 +1091,7 @@ mod tests {
     #[test]
     fn object_header_with_multiple_refs() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Multi", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,
@@ -1073,6 +1114,7 @@ mod tests {
     #[test]
     fn object_header_with_placement_policy() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Placed", Version::new(1, 0, 0)),
             zone_id: ZoneId::community(),
             created_at: 2_000_000_000,
@@ -1157,6 +1199,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_deterministic() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Det", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 999,
@@ -1175,6 +1218,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_differ_by_header() {
         let header1 = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "A", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 100,
@@ -1185,6 +1229,7 @@ mod tests {
             placement: None,
         };
         let header2 = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "B", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 100,
@@ -1203,6 +1248,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_empty_body() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Empty", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1221,6 +1267,7 @@ mod tests {
     #[test]
     fn stored_object_derive_id_differs_by_key() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Key", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1242,6 +1289,7 @@ mod tests {
     #[test]
     fn stored_object_with_all_retention_classes() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Ret", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1282,6 +1330,7 @@ mod tests {
         let foreign = ObjectId::from_bytes([10_u8; 32]);
 
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Refs", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 500,
@@ -1677,6 +1726,7 @@ mod tests {
     #[test]
     fn object_header_large_refs_list() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "BigRefs", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_000,
@@ -1700,6 +1750,7 @@ mod tests {
     #[test]
     fn object_header_ttl_zero() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TTL0", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1717,6 +1768,7 @@ mod tests {
     #[test]
     fn object_header_ttl_max() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "TTLMax", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1734,6 +1786,7 @@ mod tests {
     #[test]
     fn object_header_clone() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Clonable", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 42,
@@ -1759,6 +1812,7 @@ mod tests {
             ZoneId::community(),
         ] {
             let header = ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: SchemaId::new("fcp.test", "Zone", Version::new(1, 0, 0)),
                 zone_id: zone.clone(),
                 created_at: 0,
@@ -1827,6 +1881,7 @@ mod tests {
     #[test]
     fn stored_object_canonical_bytes_includes_header_cbor() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "CborCheck", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 42,
@@ -1851,6 +1906,7 @@ mod tests {
         let body = b"same body";
 
         let header1 = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Zone", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1861,6 +1917,7 @@ mod tests {
             placement: None,
         };
         let header2 = ObjectHeader {
+            encryption_kind: Default::default(),
             zone_id: ZoneId::private(),
             provenance: Provenance::new(ZoneId::private()),
             ..header1.clone()
@@ -1875,6 +1932,7 @@ mod tests {
     fn stored_object_clone() {
         let key = ObjectIdKey::from_bytes([0_u8; 32]);
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Clone", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -1904,6 +1962,7 @@ mod tests {
     fn stored_object_empty_body_derive_id() {
         let key = ObjectIdKey::from_bytes([0_u8; 32]);
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Empty", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 0,
@@ -2025,6 +2084,7 @@ mod tests {
     #[test]
     fn object_header_cbor_roundtrip() {
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.test", "Cbor", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 555,

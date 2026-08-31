@@ -4834,6 +4834,7 @@ deny_ptrace = true
 
     fn test_object_header() -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.connector_state",
                 "state_object",

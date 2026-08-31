@@ -140,6 +140,7 @@ mod tests {
 
     fn test_header(zone: &ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: test_schema(),
             zone_id: zone.clone(),
             created_at: 0,

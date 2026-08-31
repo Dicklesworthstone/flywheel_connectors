@@ -14,6 +14,7 @@ fn fixture_manifest() -> ZoneKeyManifest {
     let zone_id = ZoneId::work();
     ZoneKeyManifest {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new("fcp.zone", "ZoneKeyManifest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_000,

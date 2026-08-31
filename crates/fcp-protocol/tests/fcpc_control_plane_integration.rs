@@ -85,6 +85,7 @@ fn invoke_request_round_trip_through_fcpc() {
 
     // 3. Create ControlPlaneObject header
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.invoke", "Request"),
         zone_id: original_request.zone_id.clone(),
         created_at: 1_700_000_000,
@@ -160,6 +161,7 @@ fn invoke_response_round_trip_through_fcpc() {
 
     // 3. Create ControlPlaneObject
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.invoke", "Response"),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_001,
@@ -323,6 +325,7 @@ fn bidirectional_invoke_conversation() {
 #[test]
 fn invoke_objects_have_required_retention() {
     let invoke_request_header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.invoke", "Request"),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,
@@ -334,6 +337,7 @@ fn invoke_objects_have_required_retention() {
     };
 
     let invoke_response_header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.invoke", "Response"),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,
@@ -355,6 +359,7 @@ fn invoke_objects_have_required_retention() {
 #[test]
 fn receipt_objects_have_required_retention() {
     let receipt_header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.receipt", "ExecutionReceipt"),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,
@@ -374,6 +379,7 @@ fn receipt_objects_have_required_retention() {
 #[test]
 fn health_objects_have_ephemeral_retention() {
     let health_header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema("fcp.health", "Ping"),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,

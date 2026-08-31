@@ -498,6 +498,7 @@ mod tests {
     fn test_manifest(zone_id: ZoneId, valid_from: u64) -> ZoneKeyManifest {
         ZoneKeyManifest {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.zone",
                     "ZoneKeyManifest",

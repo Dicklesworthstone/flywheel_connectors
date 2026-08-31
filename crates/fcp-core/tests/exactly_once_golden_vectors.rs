@@ -152,6 +152,7 @@ fn test_signature() -> NodeSignature {
 fn create_intent_header(created_at: u64) -> ObjectHeader {
     let zone = test_zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.operation", "intent", Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at,
@@ -166,6 +167,7 @@ fn create_intent_header(created_at: u64) -> ObjectHeader {
 fn create_receipt_header(created_at: u64) -> ObjectHeader {
     let zone = test_zone();
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.operation", "receipt", Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at,

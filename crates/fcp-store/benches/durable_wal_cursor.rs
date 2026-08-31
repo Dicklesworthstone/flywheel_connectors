@@ -49,6 +49,7 @@ fn bench_object(index: u64, body_len: usize, refs: Vec<ObjectId>) -> StoredObjec
     StoredObject {
         object_id: bench_object_id(index),
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: bench_schema(),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_000_u64.saturating_add(index),

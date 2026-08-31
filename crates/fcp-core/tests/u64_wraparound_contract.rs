@@ -54,6 +54,7 @@ fn test_zone() -> ZoneId {
 
 fn audit_header() -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.audit", "AuditEvent", Version::new(1, 0, 0)),
         zone_id: test_zone(),
         created_at: 0,
@@ -87,6 +88,7 @@ fn audit_event(seq: u64, prev: Option<ObjectId>) -> AuditEvent {
 
 fn revocation_header() -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.core", "RevocationEvent", Version::new(1, 0, 0)),
         zone_id: test_zone(),
         created_at: 0,

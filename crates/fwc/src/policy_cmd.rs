@@ -1458,6 +1458,7 @@ fn output_json_or_human<T: Serialize>(payload: &T, json: bool) -> Result<()> {
 fn default_zone_policy(invoke: &InvokeRequest) -> ZonePolicyObject {
     let schema = SchemaId::new("fcp.core", "ZonePolicy", Version::new(1, 0, 0));
     let header = ObjectHeader {
+        encryption_kind: Default::default(),
         schema,
         zone_id: invoke.zone_id.clone(),
         created_at: u64::try_from(Utc::now().timestamp()).unwrap_or(0),
@@ -3219,6 +3220,7 @@ mod tests {
         let zone = ZoneId::work();
         let schema = SchemaId::new("fcp.core", "ZoneDefinition", Version::new(1, 0, 0));
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema,
             zone_id: zone.clone(),
             created_at: 0,

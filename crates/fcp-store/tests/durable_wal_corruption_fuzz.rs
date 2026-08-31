@@ -52,6 +52,7 @@ fn test_object(seed: u8) -> StoredObject {
     StoredObject {
         object_id: test_object_id(seed),
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.test",
                 "WalFuzzObject",

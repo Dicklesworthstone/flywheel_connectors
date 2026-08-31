@@ -1330,6 +1330,7 @@ impl FcpStoreConnectorStateStore {
         provenance: fcp_prelude::Provenance,
     ) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema,
             zone_id: self.zone_id.clone(),
             created_at,
@@ -1978,6 +1979,7 @@ mod tests {
 
     fn header(schema: SchemaId, created_at: u64, lease: Option<ObjectId>) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema,
             zone_id: zone_id(),
             created_at,

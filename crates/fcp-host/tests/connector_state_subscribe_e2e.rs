@@ -127,6 +127,7 @@ fn state_cbor(seq: u64) -> Vec<u8> {
 
 fn state_header(seq: u64, lease: ObjectId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: FcpStoreConnectorStateStore::state_object_schema_id(),
         zone_id: zone_id(),
         created_at: 1_800_100_000 + seq,

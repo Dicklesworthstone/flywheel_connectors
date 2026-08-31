@@ -17,6 +17,7 @@ fn object_id_from_counter(counter: u64) -> ObjectId {
 fn revocation_for(object_id: ObjectId) -> RevocationObject {
     RevocationObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.core", "RevocationObject", Version::new(1, 0, 0)),
             zone_id: ZoneId::work(),
             created_at: 1_700_000_000,

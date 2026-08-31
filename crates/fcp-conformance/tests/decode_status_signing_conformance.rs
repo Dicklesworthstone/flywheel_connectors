@@ -32,6 +32,7 @@ use semver::Version;
 
 fn test_header(zone: &ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new("fcp.test", "TestObject", Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: 1_704_067_200,

@@ -112,6 +112,7 @@ impl ZoneFixture {
 
 fn object_header(zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: SchemaId::new(
             "fcp.e2e",
             "ZoneIsolationFixture",

@@ -44,6 +44,7 @@ fn test_schema() -> fcp_cbor::SchemaId {
 
 fn test_object_header() -> ObjectHeader {
     ObjectHeader {
+        encryption_kind: Default::default(),
         schema: test_schema(),
         zone_id: test_zone_id(),
         created_at: 1000,

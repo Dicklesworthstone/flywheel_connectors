@@ -200,6 +200,7 @@ fn render_rejection_matrix() -> String {
         let mut registry = RevocationRegistry::new();
         let zone = ZoneId::work();
         let header = ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.revocation",
                 "RevocationObject",

@@ -428,6 +428,7 @@ impl ZoneKeyManifest {
 
         Ok(Self {
             header: ObjectHeader {
+                encryption_kind: Default::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.zone",
                     "ZoneKeyManifest",
@@ -1484,6 +1485,7 @@ mod tests {
 
     fn test_header(zone_id: &ZoneId) -> ObjectHeader {
         ObjectHeader {
+            encryption_kind: Default::default(),
             schema: SchemaId::new("fcp.zone", "ZoneKeyManifest", Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 1_700_000_000,

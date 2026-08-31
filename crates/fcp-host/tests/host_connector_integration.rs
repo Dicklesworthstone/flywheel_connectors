@@ -126,6 +126,7 @@ const CONNECTOR_STATE_OBJECT_ID_KEY_ENV: &str = "FCP_CONNECTOR_STATE_OBJECT_ID_K
 fn test_zone_policy(zone_id: ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new(
                 "fcp.core",
                 "ZonePolicyObject",
@@ -2001,6 +2002,7 @@ fn durable_connector_state_object_for_test(
     let seq_byte = u8::try_from(seq).expect("test sequence should fit in CBOR byte");
     fcp_core::ConnectorStateObject {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_store::FcpStoreConnectorStateStore::state_object_schema_id(),
             zone_id: zone_id.clone(),
             created_at: 1_800_200_000 + seq,
@@ -2081,6 +2083,7 @@ fn durable_core_lease_for_test(
 ) -> CoreLease {
     CoreLease {
         header: ObjectHeader {
+            encryption_kind: Default::default(),
             schema: fcp_cbor::SchemaId::new("fcp.lease", "lease", semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: exp.saturating_sub(300),
