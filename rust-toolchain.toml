@@ -4,5 +4,5 @@
 # does not drift underneath agents and CI (flywheel_connectors-61py7). Bump
 # deliberately: verify clippy --workspace -D warnings and cargo fmt --check
 # stay green, and confirm rch workers can install the new pin, before landing.
-channel = "nightly-2026-08-25"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
