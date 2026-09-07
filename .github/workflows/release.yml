@@ -275,7 +275,7 @@ jobs:
             cosign sign-blob "$artifact" --bundle "${artifact}.sigstore.json" --yes
           done
 
-      - uses: softprops/action-gh-release@v3.0.2
+      - uses: softprops/action-gh-release@v3.0.3
         with:
           name: v${{ steps.version.outputs.version }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
