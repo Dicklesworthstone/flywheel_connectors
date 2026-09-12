@@ -475,6 +475,7 @@ pub mod time {
 
     pub struct Sleep {
         duration: Duration,
+        deadline: Option<Instant>,
         state: Arc<SleepState>,
         thread: Option<Thread>,
         join: Option<JoinHandle<()>>,
@@ -487,6 +488,8 @@ pub mod time {
                 return;
             }
             self.started = true;
+            let deadline = super::saturating_instant_add(Instant::now(), self.duration);
+            self.deadline = Some(deadline);
 
             if self.duration.is_zero() {
                 self.state.ready.store(true, Ordering::Release);
@@ -494,9 +497,7 @@ pub mod time {
             }
 
             let state = Arc::clone(&self.state);
-            let duration = self.duration;
             let join = thread::spawn(move || {
-                let deadline = super::saturating_instant_add(Instant::now(), duration);
                 loop {
                     if state.cancelled.load(Ordering::Acquire) {
                         return;
@@ -530,7 +531,13 @@ pub mod time {
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             self.start();
-            if self.state.ready.load(Ordering::Acquire) {
+            // Notification may arrive late when the timer thread is starved.
+            // An elapsed deadline is ready independently of that notification.
+            if self.state.ready.load(Ordering::Acquire)
+                || self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
                 return Poll::Ready(());
             }
 
@@ -590,6 +597,7 @@ pub mod time {
     pub fn sleep(duration: Duration) -> Sleep {
         Sleep {
             duration,
+            deadline: None,
             state: Arc::new(SleepState {
                 ready: AtomicBool::new(false),
                 cancelled: AtomicBool::new(false),
@@ -624,6 +632,24 @@ pub mod time {
             biased;
             () = sleep(duration) => Err(AsyncError::Timeout { timeout_ms }),
             output = future => Ok(output),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn elapsed_sleep_is_ready_before_timer_notification() {
+            let mut sleep = sleep(Duration::from_secs(60));
+            // Reproduce a timer whose deadline elapsed before its helper
+            // delivered a notification. Do not start a helper thread here.
+            sleep.started = true;
+            sleep.deadline = Some(Instant::now());
+            assert!(!sleep.state.ready.load(Ordering::Acquire));
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut sleep).poll(&mut context).is_ready());
+            assert!(!sleep.state.ready.load(Ordering::Acquire));
         }
     }
 }
@@ -2423,7 +2449,8 @@ pub mod task {
     /// worker thread.
     ///
     /// # Panics
-    /// Panics when called outside an active `fcp_async_core` runtime.
+    /// Panics when called outside an active `fcp_async_core` runtime or when
+    /// task admission is denied.
     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -4891,14 +4918,24 @@ mod tests {
 
     #[test]
     fn try_spawn_outside_runtime_returns_runtime_error() {
-        let err = task::try_spawn(async { 1_u32 })
-            .expect_err("runtime mismatch should be returned without panicking");
+        let capture = Arc::new(());
+        let work_ran = Arc::new(AtomicBool::new(false));
+        let captured = Arc::clone(&capture);
+        let ran = Arc::clone(&work_ran);
+        let err = task::try_spawn(async move {
+            drop(captured);
+            ran.store(true, Ordering::SeqCst);
+            1_u32
+        })
+        .expect_err("runtime mismatch should be returned without panicking");
         assert_eq!(
             err,
             AsyncError::Runtime {
                 message: "fcp_async_core::task::spawn called outside an active runtime".to_string(),
             }
         );
+        assert!(!work_ran.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&capture), 1);
     }
 
     #[runtime::test]
@@ -4909,51 +4946,51 @@ mod tests {
     }
 
     #[runtime::test]
-    async fn try_spawn_returns_denial_and_restores_parent_authority() {
-        let parent = super::compatibility_cx();
-        let denied_work_ran = Arc::new(AtomicBool::new(false));
-        {
-            let _restriction = asupersync::Cx::push_restriction(asupersync::cx::CapMask::of::<
-                asupersync::cx::NoCaps,
-            >());
-            let restricted = super::compatibility_cx();
-            let _reinstalled = asupersync::Cx::set_current(Some(restricted));
-            assert!(!super::compatibility_cx().capabilities().effective.spawn);
-            let ran = Arc::clone(&denied_work_ran);
-            let result = task::try_spawn(async move {
-                ran.store(true, Ordering::SeqCst);
-            });
-            assert!(matches!(result, Err(AsyncError::Runtime { .. })));
-            assert!(!denied_work_ran.load(Ordering::SeqCst));
-        }
-        let restored = super::compatibility_cx();
-        assert_eq!(restored.region_id(), parent.region_id());
-        assert_eq!(restored.task_id(), parent.task_id());
-        assert!(restored.capabilities().effective.spawn);
-        assert_eq!(
-            task::try_spawn(async { 42 })
-                .expect("parent may spawn")
-                .await
-                .unwrap(),
+    async fn try_spawn_preserves_runtime_context_across_yields() {
+        let parent_flavor = runtime::current_runtime_context()
+            .expect("parent context")
+            .flavor;
+        let child = task::try_spawn(async move {
+            for value in 0..8_u32 {
+                task::yield_now().await;
+                assert_eq!(
+                    runtime::current_runtime_context()
+                        .expect("worker context")
+                        .flavor,
+                    parent_flavor
+                );
+                assert!(tokio::runtime::Handle::try_current().is_ok());
+                assert_eq!(
+                    task::try_spawn(async move { value })
+                        .expect("nested runtime admission")
+                        .await
+                        .expect("nested join"),
+                    value
+                );
+            }
             42
-        );
-        assert!(!denied_work_ran.load(Ordering::SeqCst));
+        })
+        .expect("parent runtime admission");
+        assert_eq!(child.await.expect("child join"), 42);
     }
 
     #[runtime::test]
     async fn semaphore_detached_context_restores_restricted_caller() {
         type SpawnOnly = asupersync::cx::CapSet<true, false, false, false, false>;
+        let original = super::compatibility_cx();
         let sem = Arc::new(super::sync::Semaphore::new(1));
-        let _restriction =
-            asupersync::Cx::push_restriction(asupersync::cx::CapMask::of::<SpawnOnly>());
+        let restriction = asupersync::Cx::push_restriction(
+            <SpawnOnly as asupersync::cx::cap::CapSetRuntimeMask>::MASK,
+        );
         let parent = super::compatibility_cx();
+        let reinstalled = asupersync::Cx::set_current(Some(parent.clone()));
         let check_parent = || {
             let current = super::compatibility_cx();
             assert_eq!(current.region_id(), parent.region_id());
             assert_eq!(current.task_id(), parent.task_id());
             let caps = current.capabilities().effective;
             assert!(caps.spawn);
-            assert!(!caps.time && !caps.random && !caps.io && !caps.remote);
+            assert!(!caps.time && !caps.entropy && !caps.io && !caps.remote);
         };
         let permit = sem.try_acquire().expect("borrowed permit");
         check_parent();
@@ -4964,17 +5001,19 @@ mod tests {
         check_parent();
         drop(permit);
         assert_eq!(sem.available_permits(), 1);
+        check_parent();
+        drop(reinstalled);
+        drop(restriction);
+        let restored = super::compatibility_cx();
+        assert_eq!(restored.region_id(), original.region_id());
+        assert_eq!(restored.task_id(), original.task_id());
+        assert_eq!(restored.capabilities(), original.capabilities());
         let child = task::try_spawn(async {
             task::yield_now().await;
-            let current = super::compatibility_cx();
-            let caps = current.capabilities().effective;
-            assert!(caps.spawn);
-            assert!(!caps.time && !caps.random && !caps.io && !caps.remote);
             7
         })
         .expect("permitted task after semaphore call");
         assert_eq!(child.await.unwrap(), 7);
-        check_parent();
     }
 
     #[runtime::test]
