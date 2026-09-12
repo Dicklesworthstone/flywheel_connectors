@@ -28,7 +28,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-asupersync = { version = "=0.3.4", default-features = false }
+asupersync = { version = "=0.5.0", default-features = false }
 criterion = { workspace = true }
 fcp-testkit = { workspace = true }
 pretty_assertions = { workspace = true }

@@ -2446,7 +2446,7 @@ pub mod task {
     /// # Errors
     ///
     /// Returns [`AsyncError::Runtime`] when called outside an active
-    /// `fcp_async_core` runtime.
+    /// `fcp_async_core` runtime or when the runtime rejects task admission.
     pub fn try_spawn<F>(future: F) -> Result<JoinHandle<F::Output>, AsyncError>
     where
         F: Future + Send + 'static,
@@ -2477,14 +2477,19 @@ pub mod task {
             flavor: runtime_flavor,
         };
 
-        std::mem::drop(runtime.spawn(async move {
-            let result = match wrapped.await {
-                Ok(Ok(output)) => Ok(output),
-                Ok(Err(payload)) => Err(JoinError::panicked(payload.as_ref())),
-                Err(_) => Err(JoinError::cancelled()),
-            };
-            let _ = result_tx.send(result);
-        }));
+        let join = runtime
+            .try_spawn(async move {
+                let result = match wrapped.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(payload)) => Err(JoinError::panicked(payload.as_ref())),
+                    Err(_) => Err(JoinError::cancelled()),
+                };
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| AsyncError::Runtime {
+                message: format!("fcp_async_core::task::try_spawn admission failed: {error}"),
+            })?;
+        std::mem::drop(join);
 
         Ok(JoinHandle {
             receiver: result_rx,
@@ -4901,6 +4906,75 @@ mod tests {
         let handle = task::try_spawn(async { 42_u32 }).expect("spawn should succeed in runtime");
         let result = handle.await.expect("should join");
         assert_eq!(result, 42);
+    }
+
+    #[runtime::test]
+    async fn try_spawn_returns_denial_and_restores_parent_authority() {
+        let parent = super::compatibility_cx();
+        let denied_work_ran = Arc::new(AtomicBool::new(false));
+        {
+            let _restriction = asupersync::Cx::push_restriction(asupersync::cx::CapMask::of::<
+                asupersync::cx::NoCaps,
+            >());
+            let restricted = super::compatibility_cx();
+            let _reinstalled = asupersync::Cx::set_current(Some(restricted));
+            assert!(!super::compatibility_cx().capabilities().effective.spawn);
+            let ran = Arc::clone(&denied_work_ran);
+            let result = task::try_spawn(async move {
+                ran.store(true, Ordering::SeqCst);
+            });
+            assert!(matches!(result, Err(AsyncError::Runtime { .. })));
+            assert!(!denied_work_ran.load(Ordering::SeqCst));
+        }
+        let restored = super::compatibility_cx();
+        assert_eq!(restored.region_id(), parent.region_id());
+        assert_eq!(restored.task_id(), parent.task_id());
+        assert!(restored.capabilities().effective.spawn);
+        assert_eq!(
+            task::try_spawn(async { 42 })
+                .expect("parent may spawn")
+                .await
+                .unwrap(),
+            42
+        );
+        assert!(!denied_work_ran.load(Ordering::SeqCst));
+    }
+
+    #[runtime::test]
+    async fn semaphore_detached_context_restores_restricted_caller() {
+        type SpawnOnly = asupersync::cx::CapSet<true, false, false, false, false>;
+        let sem = Arc::new(super::sync::Semaphore::new(1));
+        let _restriction =
+            asupersync::Cx::push_restriction(asupersync::cx::CapMask::of::<SpawnOnly>());
+        let parent = super::compatibility_cx();
+        let check_parent = || {
+            let current = super::compatibility_cx();
+            assert_eq!(current.region_id(), parent.region_id());
+            assert_eq!(current.task_id(), parent.task_id());
+            let caps = current.capabilities().effective;
+            assert!(caps.spawn);
+            assert!(!caps.time && !caps.random && !caps.io && !caps.remote);
+        };
+        let permit = sem.try_acquire().expect("borrowed permit");
+        check_parent();
+        assert!(Arc::clone(&sem).try_acquire_owned().is_err());
+        check_parent();
+        drop(permit);
+        let permit = Arc::clone(&sem).try_acquire_owned().expect("owned permit");
+        check_parent();
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+        let child = task::try_spawn(async {
+            task::yield_now().await;
+            let current = super::compatibility_cx();
+            let caps = current.capabilities().effective;
+            assert!(caps.spawn);
+            assert!(!caps.time && !caps.random && !caps.io && !caps.remote);
+            7
+        })
+        .expect("permitted task after semaphore call");
+        assert_eq!(child.await.unwrap(), 7);
+        check_parent();
     }
 
     #[runtime::test]

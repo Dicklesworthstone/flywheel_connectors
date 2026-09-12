@@ -322,7 +322,7 @@ fcp-line = { path = "../../connectors/line", optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-asupersync = { version = "=0.3.4", default-features = false, features = ["tls", "tls-native-roots"] }
+asupersync = { version = "=0.5.0", default-features = false, features = ["tls", "tls-native-roots"] }
 fcp-kernel = { workspace = true }
 fcp-policy = { workspace = true }
 fcp-evidence = { workspace = true }
