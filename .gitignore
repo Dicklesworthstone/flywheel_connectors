@@ -239,3 +239,14 @@ __pycache__/
 
 # Ephemeral root-level test binary from cargo test experiments
 /test_default
+
+# === agent ephemeral residue 2026-09-15 ===
+# Root-level beads salvage trees (distinct from .beads/recovery_*/).
+.beads-recovery-*/
+# br live write locks and frankensqlite VFS namespace sidecars.
+.beads/*.lock
+.beads/*-fsqlite-ns-gate
+.beads/*-fsqlite-ns-use
+# Per-host gate wrappers at the repo root.
+/.gate_*.sh
+/.verify_*.sh
