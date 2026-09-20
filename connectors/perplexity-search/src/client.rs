@@ -14,6 +14,15 @@ use crate::types::{
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.perplexity.ai";
+const PERPLEXITY_API_HOST: &str = "api.perplexity.ai";
+const PERPLEXITY_INTEGRATION: &str = "flywheel-connectors";
+
+fn is_direct_perplexity_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(PERPLEXITY_API_HOST))
+    })
+}
 
 /// Perplexity API client with retry support.
 pub struct PerplexityClient {
@@ -157,7 +166,7 @@ impl PerplexityClient {
             async move {
                 debug!(attempt, endpoint = endpoint_label, "Perplexity request");
 
-                let req = if auth_material.is_empty() {
+                let mut req = if auth_material.is_empty() {
                     client.post(&url).json(&body)
                 } else {
                     client
@@ -166,6 +175,9 @@ impl PerplexityClient {
                         .header(reqwest::header::ACCEPT, "application/json")
                         .json(&body)
                 };
+                if is_direct_perplexity_url(&url) {
+                    req = req.header("X-Pplx-Integration", PERPLEXITY_INTEGRATION);
+                }
 
                 let resp = match req.send().await {
                     Ok(r) => r,
@@ -328,6 +340,19 @@ mod tests {
         .with_base_url("http://localhost:8080");
 
         assert_eq!(client.base_url(), "http://localhost:8080");
+    }
+
+    #[test]
+    fn integration_header_is_scoped_to_the_perplexity_api_host() {
+        assert!(is_direct_perplexity_url(
+            "https://api.perplexity.ai/chat/completions"
+        ));
+        assert!(!is_direct_perplexity_url(
+            "https://api.perplexity.ai.example.com/chat/completions"
+        ));
+        assert!(!is_direct_perplexity_url(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
     }
 
     #[test]
