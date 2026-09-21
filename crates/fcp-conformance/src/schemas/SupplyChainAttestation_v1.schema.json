@@ -24,10 +24,7 @@
     "subject_digest": { "$ref": "#/definitions/blake3Digest" },
     "predicate_type": {
       "type": "string",
-      "enum": [
-        "https://slsa.dev/provenance/v1",
-        "https://in-toto.io/Statement/v1"
-      ]
+      "enum": ["https://slsa.dev/provenance/v1", "https://in-toto.io/Statement/v1"]
     },
     "builder_id": {
       "type": "string",

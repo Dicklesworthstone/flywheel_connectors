@@ -11,10 +11,7 @@
   "operations": ["messages.read", "messages.list"],
   "token_id": [1, 2, 3, 4],
   "audience_binary": [9, 8, 7],
-  "grant_objects": [
-    [1, 1, 1],
-    [2, 2, 2]
-  ],
+  "grant_objects": [[1, 1, 1], [2, 2, 2]],
   "checkpoint_id": [170, 187, 204],
   "checkpoint_seq": 42,
   "issued_at": 1700000000,

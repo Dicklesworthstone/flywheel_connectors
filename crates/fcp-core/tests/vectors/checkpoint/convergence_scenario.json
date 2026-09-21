@@ -1,15 +1,7 @@
 {
   "zone_id": "z:work",
   "epoch_id": "epoch-convergence-test",
-  "nodes": [
-    "node-alpha",
-    "node-beta",
-    "node-gamma"
-  ],
+  "nodes": ["node-alpha", "node-beta", "node-gamma"],
   "expected_coordinator": "node-beta",
-  "expected_ranking": [
-    "node-beta",
-    "node-gamma",
-    "node-alpha"
-  ]
+  "expected_ranking": ["node-beta", "node-gamma", "node-alpha"]
 }

@@ -21,7 +21,16 @@
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "truth_requirement": {
       "type": "string",
@@ -123,12 +132,7 @@
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "overall_status",
-        "check_count",
-        "connector_self_check_count",
-        "is_degraded"
-      ],
+      "required": ["overall_status", "check_count", "connector_self_check_count", "is_degraded"],
       "properties": {
         "overall_status": {
           "type": "string",
@@ -187,17 +191,11 @@
       "properties": {
         "description": { "$ref": "#/$defs/non_empty_string" },
         "command": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         },
         "auto_safe": { "type": "boolean" },
         "reference_url": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         }
       }
     },
@@ -407,13 +405,7 @@
     "validation_error": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "status",
-        "command",
-        "schema_version",
-        "_truth_source",
-        "error"
-      ],
+      "required": ["status", "command", "schema_version", "_truth_source", "error"],
       "properties": {
         "status": { "const": "error" },
         "command": { "const": "doctor" },

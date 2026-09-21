@@ -11,9 +11,7 @@
               "path": "{userId}/messages",
               "httpMethod": "GET",
               "description": "List Gmail messages for a mailbox.",
-              "scopes": [
-                "https://www.googleapis.com/auth/gmail.readonly"
-              ],
+              "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
               "parameters": {
                 "userId": {
                   "type": "string",
@@ -34,9 +32,7 @@
               "path": "{userId}/messages/send",
               "httpMethod": "POST",
               "description": "Send a Gmail message.",
-              "scopes": [
-                "https://www.googleapis.com/auth/gmail.send"
-              ],
+              "scopes": ["https://www.googleapis.com/auth/gmail.send"],
               "parameters": {
                 "userId": {
                   "type": "string",
@@ -56,9 +52,7 @@
               "path": "{userId}/messages/history",
               "httpMethod": "GET",
               "description": "List mailbox change history.",
-              "scopes": [
-                "https://www.googleapis.com/auth/gmail.metadata"
-              ],
+              "scopes": ["https://www.googleapis.com/auth/gmail.metadata"],
               "parameters": {
                 "userId": {
                   "type": "string",
@@ -89,9 +83,7 @@
     },
     "Message": {
       "type": "object",
-      "required": [
-        "id"
-      ],
+      "required": ["id"],
       "properties": {
         "id": {
           "type": "string"
@@ -103,9 +95,7 @@
     },
     "SendRequest": {
       "type": "object",
-      "required": [
-        "raw"
-      ],
+      "required": ["raw"],
       "properties": {
         "raw": {
           "type": "string"

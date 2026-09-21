@@ -31,10 +31,7 @@
       "minLength": 1
     },
     "nullable_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "string_array": {
       "type": "array",

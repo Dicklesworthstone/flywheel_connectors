@@ -5,7 +5,7 @@
       "name": "ready_snapshot",
       "description": "Ready health snapshot with minimal fields",
       "data": {
-        "status": {"state": "ready"},
+        "status": { "state": "ready" },
         "uptime_ms": 0
       }
     },
@@ -13,7 +13,7 @@
       "name": "ready_snapshot_with_load",
       "description": "Ready health snapshot with load metric",
       "data": {
-        "status": {"state": "ready"},
+        "status": { "state": "ready" },
         "uptime_ms": 3600000,
         "load": 0.45
       }
@@ -22,7 +22,7 @@
       "name": "degraded_snapshot",
       "description": "Degraded health snapshot with reason",
       "data": {
-        "status": {"state": "degraded", "reason": "high latency"},
+        "status": { "state": "degraded", "reason": "high latency" },
         "uptime_ms": 7200000,
         "load": 0.85
       }
@@ -31,7 +31,7 @@
       "name": "error_snapshot",
       "description": "Error health snapshot",
       "data": {
-        "status": {"state": "error", "reason": "connection refused"},
+        "status": { "state": "error", "reason": "connection refused" },
         "uptime_ms": 1000
       }
     }

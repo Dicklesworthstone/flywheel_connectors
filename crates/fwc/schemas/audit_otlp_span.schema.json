@@ -1,159 +1,154 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "$id": "https://flywheel-connectors.dev/schemas/audit_otlp_span.v1.json",
-    "title": "Audit-chain OTLP Span",
-    "description": "Single OTLP span emitted by `fcp-audit` on every chain append. One span per audit entry; spans live under namespace `fcp.audit.entry`.",
-    "type": "object",
-    "required": [
-        "name",
-        "kind",
-        "status",
-        "start_time_unix_nano",
-        "end_time_unix_nano",
-        "attributes"
-    ],
-    "properties": {
-        "name": {
-            "type": "string",
-            "const": "fcp.audit.entry",
-            "description": "Span name is constant; one span per audit entry."
-        },
-        "kind": {
-            "type": "string",
-            "const": "INTERNAL",
-            "description": "Audit-append is an internal operation; no client/server semantic applies."
-        },
-        "status": {
-            "type": "object",
-            "required": ["code"],
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "enum": ["OK", "ERROR"]
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Set to the `reason_code` attribute when code = ERROR; empty otherwise."
-                }
-            },
-            "description": "OK when entry.decision = `accepted`; ERROR otherwise."
-        },
-        "start_time_unix_nano": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Nanoseconds since Unix epoch, sourced from the HLC physical component at the moment of audit append."
-        },
-        "end_time_unix_nano": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Start time + 1000 (a synthetic 1 microsecond duration). Audit append is a point event."
-        },
-        "attributes": {
-            "type": "object",
-            "required": [
-                "fcp.audit.entry.entry_id",
-                "fcp.audit.entry.hlc",
-                "fcp.audit.entry.hlc.l",
-                "fcp.audit.entry.hlc.c",
-                "fcp.audit.entry.hlc.node_id",
-                "fcp.audit.entry.zone",
-                "fcp.audit.entry.decision",
-                "fcp.audit.entry.reason_code",
-                "fcp.audit.entry.quorum_height",
-                "fcp.audit.entry.sig_kinds_present",
-                "fcp.audit.entry.seq",
-                "fcp.audit.entry.prev_hash_prefix"
-            ],
-            "properties": {
-                "fcp.audit.entry.entry_id": {
-                    "type": "string",
-                    "pattern": "^[0-9a-f]{32}$",
-                    "description": "32-hex-char prefix of the BLAKE3-256 canonical-body hash."
-                },
-                "fcp.audit.entry.hlc": {
-                    "type": "string",
-                    "pattern": "^[0-9]+\\.[0-9]+$",
-                    "description": "Hybrid Logical Clock encoded as `{l}.{c}` where `l` is the OTLP nanosecond physical component."
-                },
-                "fcp.audit.entry.hlc.l": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "HLC physical component encoded for OTLP as UTC nanoseconds (`entry.hlc.physical_ms * 1_000_000`)."
-                },
-                "fcp.audit.entry.hlc.c": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 4294967295,
-                    "description": "HLC logical counter (`entry.hlc.logical`)."
-                },
-                "fcp.audit.entry.hlc.node_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Stable node id that produced `entry.hlc`."
-                },
-                "fcp.audit.entry.zone": {
-                    "type": "string",
-                    "pattern": "^z:[a-zA-Z0-9_:.\\-]+$",
-                    "description": "Zone identifier, e.g. `z:work`, `z:public`."
-                },
-                "fcp.audit.entry.decision": {
-                    "type": "string",
-                    "enum": [
-                        "accepted",
-                        "rejected_predicate",
-                        "rejected_revocation",
-                        "rejected_expired"
-                    ]
-                },
-                "fcp.audit.entry.reason_code": {
-                    "type": "string",
-                    "description": "Structured reason enum value (e.g. RevokedBeforeUse, QuorumNotMet, Expired, Ok)."
-                },
-                "fcp.audit.entry.quorum_height": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "BLS-aggregate quorum signing height; 0 when no aggregate quorum sig is attached."
-                },
-                "fcp.audit.entry.sig_kinds_present": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["ed25519", "ml_dsa_65", "bls_aggregate", "stark"]
-                    },
-                    "minItems": 1,
-                    "uniqueItems": true,
-                    "description": "Non-empty subset of proof kinds attached to this entry. Hybrid Ed25519+ML-DSA (Phase N) appends emit both."
-                },
-                "fcp.audit.entry.seq": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Monotonically increasing chain position."
-                },
-                "fcp.audit.entry.prev_hash_prefix": {
-                    "type": "string",
-                    "pattern": "^[0-9a-f]{16}$",
-                    "description": "First 16 hex chars (8 bytes) of the previous entry's hash. Sufficient for chain-linkage tracing in dashboards without leaking the full hash."
-                }
-            },
-            "additionalProperties": false
-        },
-        "resource": {
-            "type": "object",
-            "description": "Resource attributes per OpenTelemetry semantic conventions. Populated by the exporter from the host runtime context.",
-            "properties": {
-                "service.name": {
-                    "type": "string",
-                    "const": "fcp-host"
-                },
-                "service.version": {
-                    "type": "string"
-                },
-                "service.instance.id": {
-                    "type": "string"
-                }
-            },
-            "required": ["service.name"]
-        }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://flywheel-connectors.dev/schemas/audit_otlp_span.v1.json",
+  "title": "Audit-chain OTLP Span",
+  "description": "Single OTLP span emitted by `fcp-audit` on every chain append. One span per audit entry; spans live under namespace `fcp.audit.entry`.",
+  "type": "object",
+  "required": [
+    "name",
+    "kind",
+    "status",
+    "start_time_unix_nano",
+    "end_time_unix_nano",
+    "attributes"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "const": "fcp.audit.entry",
+      "description": "Span name is constant; one span per audit entry."
     },
-    "additionalProperties": false
+    "kind": {
+      "type": "string",
+      "const": "INTERNAL",
+      "description": "Audit-append is an internal operation; no client/server semantic applies."
+    },
+    "status": {
+      "type": "object",
+      "required": ["code"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": ["OK", "ERROR"]
+        },
+        "message": {
+          "type": "string",
+          "description": "Set to the `reason_code` attribute when code = ERROR; empty otherwise."
+        }
+      },
+      "description": "OK when entry.decision = `accepted`; ERROR otherwise."
+    },
+    "start_time_unix_nano": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Nanoseconds since Unix epoch, sourced from the HLC physical component at the moment of audit append."
+    },
+    "end_time_unix_nano": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start time + 1000 (a synthetic 1 microsecond duration). Audit append is a point event."
+    },
+    "attributes": {
+      "type": "object",
+      "required": [
+        "fcp.audit.entry.entry_id",
+        "fcp.audit.entry.hlc",
+        "fcp.audit.entry.hlc.l",
+        "fcp.audit.entry.hlc.c",
+        "fcp.audit.entry.hlc.node_id",
+        "fcp.audit.entry.zone",
+        "fcp.audit.entry.decision",
+        "fcp.audit.entry.reason_code",
+        "fcp.audit.entry.quorum_height",
+        "fcp.audit.entry.sig_kinds_present",
+        "fcp.audit.entry.seq",
+        "fcp.audit.entry.prev_hash_prefix"
+      ],
+      "properties": {
+        "fcp.audit.entry.entry_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "32-hex-char prefix of the BLAKE3-256 canonical-body hash."
+        },
+        "fcp.audit.entry.hlc": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$",
+          "description": "Hybrid Logical Clock encoded as `{l}.{c}` where `l` is the OTLP nanosecond physical component."
+        },
+        "fcp.audit.entry.hlc.l": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "HLC physical component encoded for OTLP as UTC nanoseconds (`entry.hlc.physical_ms * 1_000_000`)."
+        },
+        "fcp.audit.entry.hlc.c": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "HLC logical counter (`entry.hlc.logical`)."
+        },
+        "fcp.audit.entry.hlc.node_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable node id that produced `entry.hlc`."
+        },
+        "fcp.audit.entry.zone": {
+          "type": "string",
+          "pattern": "^z:[a-zA-Z0-9_:.\\-]+$",
+          "description": "Zone identifier, e.g. `z:work`, `z:public`."
+        },
+        "fcp.audit.entry.decision": {
+          "type": "string",
+          "enum": ["accepted", "rejected_predicate", "rejected_revocation", "rejected_expired"]
+        },
+        "fcp.audit.entry.reason_code": {
+          "type": "string",
+          "description": "Structured reason enum value (e.g. RevokedBeforeUse, QuorumNotMet, Expired, Ok)."
+        },
+        "fcp.audit.entry.quorum_height": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "BLS-aggregate quorum signing height; 0 when no aggregate quorum sig is attached."
+        },
+        "fcp.audit.entry.sig_kinds_present": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["ed25519", "ml_dsa_65", "bls_aggregate", "stark"]
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Non-empty subset of proof kinds attached to this entry. Hybrid Ed25519+ML-DSA (Phase N) appends emit both."
+        },
+        "fcp.audit.entry.seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonically increasing chain position."
+        },
+        "fcp.audit.entry.prev_hash_prefix": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "First 16 hex chars (8 bytes) of the previous entry's hash. Sufficient for chain-linkage tracing in dashboards without leaking the full hash."
+        }
+      },
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "description": "Resource attributes per OpenTelemetry semantic conventions. Populated by the exporter from the host runtime context.",
+      "properties": {
+        "service.name": {
+          "type": "string",
+          "const": "fcp-host"
+        },
+        "service.version": {
+          "type": "string"
+        },
+        "service.instance.id": {
+          "type": "string"
+        }
+      },
+      "required": ["service.name"]
+    }
+  },
+  "additionalProperties": false
 }

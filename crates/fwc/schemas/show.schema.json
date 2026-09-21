@@ -18,10 +18,7 @@
       "minLength": 1
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "non_negative_integer": {
       "type": "integer",
@@ -29,7 +26,16 @@
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "truth_requirement": {
       "type": "string",
@@ -203,10 +209,7 @@
         "state": { "$ref": "#/$defs/non_empty_string" },
         "state_model": {},
         "archetypes": {
-          "anyOf": [
-            { "$ref": "#/$defs/string_array" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/string_array" }, { "type": "null" }]
         },
         "operation_count": { "$ref": "#/$defs/non_negative_integer" },
         "max_risk": { "$ref": "#/$defs/non_empty_string" },
@@ -381,10 +384,7 @@
           "properties": {
             "connector": { "$ref": "#/$defs/non_empty_string" },
             "require_source": {
-              "anyOf": [
-                { "$ref": "#/$defs/truth_requirement" },
-                { "type": "null" }
-              ]
+              "anyOf": [{ "$ref": "#/$defs/truth_requirement" }, { "type": "null" }]
             }
           }
         },

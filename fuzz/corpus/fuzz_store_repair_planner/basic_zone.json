@@ -40,9 +40,7 @@
       "include_policy": true,
       "source_symbols": 2,
       "symbol_size": 4,
-      "symbols": [
-        { "esi": 0, "data_hex": "aabbccdd", "source_node": 9, "stored_at": 1002 }
-      ]
+      "symbols": [{ "esi": 0, "data_hex": "aabbccdd", "source_node": 9, "stored_at": 1002 }]
     }
   ]
 }

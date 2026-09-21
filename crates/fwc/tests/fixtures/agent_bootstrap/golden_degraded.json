@@ -1,43 +1,43 @@
 {
-    "agent_name": "SunnyMoose",
-    "mode": "degraded",
-    "identity": {
-        "created": false,
-        "agent_mail_status": "unreachable",
-        "owner_email": "operator@example.dev"
-    },
-    "reservation": {
-        "scope": "src/**",
-        "ttl_seconds": 0,
-        "extended": false,
-        "reason": "flywheel_connectors-angoc.6.2"
-    },
-    "ready_beads": [
-        {
-            "id": "flywheel_connectors-d5yeb",
-            "title": "[tooling] MCP Agent Mail storage.sqlite3 corruption blocks registration and inbox access",
-            "priority": 1,
-            "score": 0.32
-        }
-    ],
-    "commit_template": {
-        "path": ".git/info/exclude_template",
-        "written": false
-    },
-    "doctor": {
-        "probes_run": 6,
-        "passed": 5,
-        "failed": 1,
-        "skipped": 0,
-        "by_probe": {
-            "agent_mail_health": "fail",
-            "disk_pressure": "pass",
-            "rch_worker_reachability": "pass",
-            "beads_db_integrity": "pass",
-            "agent_name_prefix": "pass",
-            "recent_commit_signing": "pass"
-        }
-    },
-    "total_duration_ms": 5180,
-    "exit_code": 4
+  "agent_name": "SunnyMoose",
+  "mode": "degraded",
+  "identity": {
+    "created": false,
+    "agent_mail_status": "unreachable",
+    "owner_email": "operator@example.dev"
+  },
+  "reservation": {
+    "scope": "src/**",
+    "ttl_seconds": 0,
+    "extended": false,
+    "reason": "flywheel_connectors-angoc.6.2"
+  },
+  "ready_beads": [
+    {
+      "id": "flywheel_connectors-d5yeb",
+      "title": "[tooling] MCP Agent Mail storage.sqlite3 corruption blocks registration and inbox access",
+      "priority": 1,
+      "score": 0.32
+    }
+  ],
+  "commit_template": {
+    "path": ".git/info/exclude_template",
+    "written": false
+  },
+  "doctor": {
+    "probes_run": 6,
+    "passed": 5,
+    "failed": 1,
+    "skipped": 0,
+    "by_probe": {
+      "agent_mail_health": "fail",
+      "disk_pressure": "pass",
+      "rch_worker_reachability": "pass",
+      "beads_db_integrity": "pass",
+      "agent_name_prefix": "pass",
+      "recent_commit_signing": "pass"
+    }
+  },
+  "total_duration_ms": 5180,
+  "exit_code": 4
 }

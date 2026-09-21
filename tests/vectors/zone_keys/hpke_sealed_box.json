@@ -83,10 +83,10 @@
   "aad_format": {
     "description": "AAD is canonical CBOR map with 4 fields",
     "fields": [
-      {"name": "zone_id", "type": "bytes"},
-      {"name": "recipient_node_id", "type": "bytes"},
-      {"name": "purpose", "type": "bytes"},
-      {"name": "issued_at", "type": "uint64"}
+      { "name": "zone_id", "type": "bytes" },
+      { "name": "recipient_node_id", "type": "bytes" },
+      { "name": "purpose", "type": "bytes" },
+      { "name": "issued_at", "type": "uint64" }
     ]
   }
 }

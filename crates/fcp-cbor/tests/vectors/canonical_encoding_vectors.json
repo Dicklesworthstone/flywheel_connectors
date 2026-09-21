@@ -232,7 +232,7 @@
     "description": "FCP2 serialized objects are prefixed with 32-byte schema hash",
     "format": "<32-byte schema hash><canonical CBOR payload>",
     "example": {
-      "schema": {"namespace": "fcp.test", "name": "Demo", "version": [0, 1, 0]},
+      "schema": { "namespace": "fcp.test", "name": "Demo", "version": [0, 1, 0] },
       "value": 42,
       "payload_structure": "[hash:32][cbor:1+]"
     }

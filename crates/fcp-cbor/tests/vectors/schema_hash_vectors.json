@@ -59,7 +59,7 @@
   "schema_id_canonical_encoding": {
     "description": "SchemaId is canonically encoded as CBOR array [namespace, name, [major, minor, patch]]",
     "example": {
-      "schema": {"namespace": "fcp.test", "name": "Demo", "version": [0, 1, 0]},
+      "schema": { "namespace": "fcp.test", "name": "Demo", "version": [0, 1, 0] },
       "cbor_diagnostic": "[\"fcp.test\", \"Demo\", [0, 1, 0]]",
       "notes": "Array elements are sorted by type (strings before arrays), keys within maps are sorted by length then lexicographically"
     }

@@ -1,29 +1,29 @@
 {
-    "name": "fcp.audit.entry",
-    "kind": "INTERNAL",
-    "status": {
-        "code": "OK",
-        "message": ""
-    },
-    "start_time_unix_nano": 1715630400000000000,
-    "end_time_unix_nano": 1715630400000001000,
-    "attributes": {
-        "fcp.audit.entry.entry_id": "7c3e9f1a2b8d5e6f4c1a9b8d7e6f5c4a",
-        "fcp.audit.entry.hlc": "1715630400000000000.0",
-        "fcp.audit.entry.hlc.l": 1715630400000000000,
-        "fcp.audit.entry.hlc.c": 0,
-        "fcp.audit.entry.hlc.node_id": "host-alpha-01",
-        "fcp.audit.entry.zone": "z:work",
-        "fcp.audit.entry.decision": "accepted",
-        "fcp.audit.entry.reason_code": "Ok",
-        "fcp.audit.entry.quorum_height": 0,
-        "fcp.audit.entry.sig_kinds_present": ["ed25519", "ml_dsa_65"],
-        "fcp.audit.entry.seq": 12036,
-        "fcp.audit.entry.prev_hash_prefix": "9a2b3c4d5e6f7081"
-    },
-    "resource": {
-        "service.name": "fcp-host",
-        "service.version": "0.1.0",
-        "service.instance.id": "host-alpha-01"
-    }
+  "name": "fcp.audit.entry",
+  "kind": "INTERNAL",
+  "status": {
+    "code": "OK",
+    "message": ""
+  },
+  "start_time_unix_nano": 1715630400000000000,
+  "end_time_unix_nano": 1715630400000001000,
+  "attributes": {
+    "fcp.audit.entry.entry_id": "7c3e9f1a2b8d5e6f4c1a9b8d7e6f5c4a",
+    "fcp.audit.entry.hlc": "1715630400000000000.0",
+    "fcp.audit.entry.hlc.l": 1715630400000000000,
+    "fcp.audit.entry.hlc.c": 0,
+    "fcp.audit.entry.hlc.node_id": "host-alpha-01",
+    "fcp.audit.entry.zone": "z:work",
+    "fcp.audit.entry.decision": "accepted",
+    "fcp.audit.entry.reason_code": "Ok",
+    "fcp.audit.entry.quorum_height": 0,
+    "fcp.audit.entry.sig_kinds_present": ["ed25519", "ml_dsa_65"],
+    "fcp.audit.entry.seq": 12036,
+    "fcp.audit.entry.prev_hash_prefix": "9a2b3c4d5e6f7081"
+  },
+  "resource": {
+    "service.name": "fcp-host",
+    "service.version": "0.1.0",
+    "service.instance.id": "host-alpha-01"
+  }
 }

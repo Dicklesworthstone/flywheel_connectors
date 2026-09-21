@@ -5,13 +5,7 @@
   "description": "Stable JSON output schema for `fwc proof readiness --json`.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "status",
-    "generated_at",
-    "targets",
-    "summary"
-  ],
+  "required": ["schema_version", "status", "generated_at", "targets", "summary"],
   "properties": {
     "schema_version": { "const": "fcp.fwc.proof-readiness.v1" },
     "status": { "$ref": "#/$defs/readiness_status" },
@@ -85,7 +79,15 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["artifact", "machine-class", "host-role", "schema", "freshness", "threshold", "environment"]
+          "enum": [
+            "artifact",
+            "machine-class",
+            "host-role",
+            "schema",
+            "freshness",
+            "threshold",
+            "environment"
+          ]
         },
         "id": { "$ref": "#/$defs/non_empty_string" },
         "message": { "$ref": "#/$defs/non_empty_string" }
@@ -103,16 +105,10 @@
           "pattern": "^(sha256|blake3):[0-9a-f]{64}$"
         },
         "machine_class": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         },
         "host_role": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         },
         "redacted": { "type": "boolean" }
       }
@@ -207,10 +203,7 @@
         "token_stats_requested": { "type": "boolean" },
         "token_stats_enabled": { "type": "boolean" },
         "token_stats_unavailable_reason": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         },
         "exit": { "$ref": "#/$defs/exit_metadata" },
         "token_stats": {

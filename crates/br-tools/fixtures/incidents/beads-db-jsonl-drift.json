@@ -11,8 +11,5 @@
     "delete .beads/.write.lock",
     "claim stale BV recommendation"
   ],
-  "redaction_markers": [
-    "<repo>",
-    "<issue>"
-  ]
+  "redaction_markers": ["<repo>", "<issue>"]
 }

@@ -1,1 +1,15 @@
-{"now_secs":1000,"timestamp":1000,"object_filter_digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"symbol_filter_digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"object_count":0,"symbol_count":0,"epoch_suffix":1,"corruption_mode":0,"sig_flip_byte":7}
+{
+  "now_secs": 1000,
+  "timestamp": 1000,
+  "object_filter_digest": [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ],
+  "symbol_filter_digest": [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ],
+  "object_count": 0,
+  "symbol_count": 0,
+  "epoch_suffix": 1,
+  "corruption_mode": 0,
+  "sig_flip_byte": 7
+}

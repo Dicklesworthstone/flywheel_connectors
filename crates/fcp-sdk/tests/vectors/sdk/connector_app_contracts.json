@@ -72,12 +72,8 @@
       "name": "connector_app_descriptor_helper_surface",
       "data": {
         "connector_id": "fcp.test.contract:utility:1.0.0",
-        "execution_forms": [
-          "native"
-        ],
-        "archetypes": [
-          "streaming"
-        ],
+        "execution_forms": ["native"],
+        "archetypes": ["streaming"],
         "state_model": {
           "type": "singleton_writer"
         },
@@ -112,15 +108,9 @@
         },
         "diagnostics": {
           "supports_self_check": true,
-          "reason_codes": [
-            "contract_self_check"
-          ],
-          "fixture_scenarios": [
-            "contract.happy_path"
-          ],
-          "local_repro_commands": [
-            "cargo test -p fcp-sdk contract::tests"
-          ],
+          "reason_codes": ["contract_self_check"],
+          "fixture_scenarios": ["contract.happy_path"],
+          "local_repro_commands": ["cargo test -p fcp-sdk contract::tests"],
           "testkit_entry_points": [
             "fcp_testkit::AsyncTestContext",
             "fcp_testkit::ConnectorTestHarness",

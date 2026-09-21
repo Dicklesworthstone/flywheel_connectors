@@ -14,60 +14,42 @@
       "proof_obligations",
       "workflow_artifacts"
     ],
-    "proof_obligation_levels": [
-      "unit",
-      "integration",
-      "e2e"
-    ],
+    "proof_obligation_levels": ["unit", "integration", "e2e"],
     "paired_scoreboard_surface": "docs/FCP3_Retirement_Kill_List.md"
   },
   "approved_exception_classes": [
     {
       "id": "test_only",
       "description": "Placeholder, stub, and TODO markers may appear in non-shipping test or fuzz surfaces when the marker does not leak into runtime code paths.",
-      "allowed_path_globs": [
-        "tests/**",
-        "**/tests/**",
-        "fuzz/**"
-      ],
+      "allowed_path_globs": ["tests/**", "**/tests/**", "fuzz/**"],
       "closure_rule": "Runtime code, manifests, and operator paths must not depend on these markers or import their behavior as a live fallback.",
       "owner_bead": "flywheel_connectors-24llg.1.2"
     },
     {
       "id": "mock_infrastructure",
       "description": "Shared mock infrastructure may use placeholder-like naming as test scaffolding only when it stays inside dedicated mock or fixture crates.",
-      "allowed_path_globs": [
-        "crates/fcp-testkit/**"
-      ],
+      "allowed_path_globs": ["crates/fcp-testkit/**"],
       "closure_rule": "Approved mock infrastructure must remain outside live runtime, catalog, and connector shipping paths.",
       "owner_bead": "flywheel_connectors-24llg.1.2"
     },
     {
       "id": "bench_fixture_only",
       "description": "Benchmark fixture helpers may use stub naming only for synthetic offline microbench input construction, not for user-facing benchmark results.",
-      "allowed_path_globs": [
-        "crates/fwc/benches/**",
-        "crates/fwc/src/bench_helpers.rs"
-      ],
+      "allowed_path_globs": ["crates/fwc/benches/**", "crates/fwc/src/bench_helpers.rs"],
       "closure_rule": "User-facing `fwc bench` commands must report real measurements; only internal offline fixture builders may retain stub terminology.",
       "owner_bead": "flywheel_connectors-24llg.6.4"
     },
     {
       "id": "offline_template_generation",
       "description": "Offline schema or template emitters may carry placeholder sentinel values when runtime install and update paths reject demo markers and generator regression tests keep emitted runtime code truthful.",
-      "allowed_path_globs": [
-        "crates/fwc/src/template.rs"
-      ],
+      "allowed_path_globs": ["crates/fwc/src/template.rs"],
       "closure_rule": "Any placeholder sentinel in an offline generator must stay off runtime execution paths and remain covered by generator regression tests.",
       "owner_bead": "flywheel_connectors-24llg.7.4"
     },
     {
       "id": "docs_and_evidence_only",
       "description": "Documentation and evidence artifacts may quote placeholder strings as part of audits, transcripts, or remediation records.",
-      "allowed_path_globs": [
-        "docs/**",
-        "artifacts/**"
-      ],
+      "allowed_path_globs": ["docs/**", "artifacts/**"],
       "closure_rule": "Quoted placeholder markers in docs or evidence must remain descriptive only and must not be presented as live runtime capability.",
       "owner_bead": "flywheel_connectors-24llg.1.4"
     }

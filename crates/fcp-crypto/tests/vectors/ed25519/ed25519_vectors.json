@@ -2,10 +2,7 @@
   "_comment": "Ed25519 signature test vectors derived from official test sources",
   "_version": "1.0.0",
   "_generated": "2026-02-01",
-  "_sources": [
-    "RFC 8032 §7.1 Ed25519 Test Vectors",
-    "Wycheproof Ed25519 test vectors (subset)"
-  ],
+  "_sources": ["RFC 8032 §7.1 Ed25519 Test Vectors", "Wycheproof Ed25519 test vectors (subset)"],
 
   "rfc8032_vectors": [
     {

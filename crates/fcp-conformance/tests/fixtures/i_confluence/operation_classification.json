@@ -1,113 +1,113 @@
 {
-    "comment": "Golden classification table for the I-CONFLUENCE conformance test. Each entry asserts that an operation with the documented (name, side_effects, idempotency_class) tuple SHALL classify as the named coordination_class per the rubric in docs/architecture/i_confluence_classification.md. Filed under flywheel_connectors-angoc.11.1.",
-    "rubric_version": "2026.Q3.v1",
-    "cases": [
-        {
-            "name": "list_charges",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "List operation, side-effect-free; matches the ^(get|list|...) read-name pattern"
-        },
-        {
-            "name": "get_charge",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "Get operation, side-effect-free; canonical read"
-        },
-        {
-            "name": "search_invoices",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "Search operation"
-        },
-        {
-            "name": "introspect",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "Connector introspect surface"
-        },
-        {
-            "name": "create_charge",
-            "side_effects": true,
-            "idempotency_class": "strict",
-            "expected_class": "requires_quorum",
-            "rationale": "Mutating + idempotency_class=strict (Stripe idempotency-key style) — quorum gives durability without per-resource fencing"
-        },
-        {
-            "name": "send_message",
-            "side_effects": true,
-            "idempotency_class": "best_effort",
-            "expected_class": "requires_quorum",
-            "rationale": "Mutating chat send — quorum prevents lost messages on peer failure"
-        },
-        {
-            "name": "refund_charge",
-            "side_effects": true,
-            "idempotency_class": "strict",
-            "expected_class": "requires_fencing",
-            "rationale": "Per-resource serialization required (the same charge cannot be refunded twice concurrently); HRW lease on (connector_id, charge_id) ensures exclusive writer"
-        },
-        {
-            "name": "update_subscription",
-            "side_effects": true,
-            "idempotency_class": "strict",
-            "expected_class": "requires_fencing",
-            "rationale": "Per-subscription serialization; concurrent updates fence on lease epoch"
-        },
-        {
-            "name": "delete_user",
-            "side_effects": true,
-            "idempotency_class": "strict",
-            "expected_class": "requires_fencing",
-            "rationale": "Per-user exclusive write; cannot race a concurrent re-create"
-        },
-        {
-            "name": "head_object",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "HTTP HEAD-style operation"
-        },
-        {
-            "name": "count_records",
-            "side_effects": false,
-            "idempotency_class": "strict",
-            "expected_class": "i_confluent",
-            "rationale": "Count operation — read-shaped"
-        }
-    ],
-    "invalid_combinations": [
-        {
-            "name": "list_charges",
-            "side_effects": true,
-            "expected_class": "i_confluent",
-            "expected_error": "i_confluent_must_have_side_effects_false",
-            "rationale": "The rubric's primary safety gate — i_confluent + side_effects=true is a misclassification"
-        },
-        {
-            "name": "create_charge",
-            "side_effects": false,
-            "expected_class": "requires_quorum",
-            "expected_error": "requires_quorum_must_have_side_effects_true",
-            "rationale": "Side-effect-free ops should be classified i_confluent, not requires_quorum (over-strict; wastes quorum cost)"
-        }
-    ],
-    "introspect_response_contract": {
-        "field_name": "coordination_class",
-        "field_type": "string",
-        "enum_values": ["i_confluent", "requires_quorum", "requires_fencing"],
-        "required": true,
-        "applies_to": "every entry in introspect_response.operations[]"
+  "comment": "Golden classification table for the I-CONFLUENCE conformance test. Each entry asserts that an operation with the documented (name, side_effects, idempotency_class) tuple SHALL classify as the named coordination_class per the rubric in docs/architecture/i_confluence_classification.md. Filed under flywheel_connectors-angoc.11.1.",
+  "rubric_version": "2026.Q3.v1",
+  "cases": [
+    {
+      "name": "list_charges",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "List operation, side-effect-free; matches the ^(get|list|...) read-name pattern"
     },
-    "expected_e2e_throughput_ratio": {
-        "test_name": "iconfluent_read_3x_throughput_vs_quorum",
-        "workload_size": 1000,
-        "read_ratio": 0.5,
-        "min_throughput_multiple": 3.0,
-        "rationale": "Synthetic 50%-read workload; classified reads should be >=3x throughput of force-quorum"
+    {
+      "name": "get_charge",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "Get operation, side-effect-free; canonical read"
+    },
+    {
+      "name": "search_invoices",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "Search operation"
+    },
+    {
+      "name": "introspect",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "Connector introspect surface"
+    },
+    {
+      "name": "create_charge",
+      "side_effects": true,
+      "idempotency_class": "strict",
+      "expected_class": "requires_quorum",
+      "rationale": "Mutating + idempotency_class=strict (Stripe idempotency-key style) — quorum gives durability without per-resource fencing"
+    },
+    {
+      "name": "send_message",
+      "side_effects": true,
+      "idempotency_class": "best_effort",
+      "expected_class": "requires_quorum",
+      "rationale": "Mutating chat send — quorum prevents lost messages on peer failure"
+    },
+    {
+      "name": "refund_charge",
+      "side_effects": true,
+      "idempotency_class": "strict",
+      "expected_class": "requires_fencing",
+      "rationale": "Per-resource serialization required (the same charge cannot be refunded twice concurrently); HRW lease on (connector_id, charge_id) ensures exclusive writer"
+    },
+    {
+      "name": "update_subscription",
+      "side_effects": true,
+      "idempotency_class": "strict",
+      "expected_class": "requires_fencing",
+      "rationale": "Per-subscription serialization; concurrent updates fence on lease epoch"
+    },
+    {
+      "name": "delete_user",
+      "side_effects": true,
+      "idempotency_class": "strict",
+      "expected_class": "requires_fencing",
+      "rationale": "Per-user exclusive write; cannot race a concurrent re-create"
+    },
+    {
+      "name": "head_object",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "HTTP HEAD-style operation"
+    },
+    {
+      "name": "count_records",
+      "side_effects": false,
+      "idempotency_class": "strict",
+      "expected_class": "i_confluent",
+      "rationale": "Count operation — read-shaped"
     }
+  ],
+  "invalid_combinations": [
+    {
+      "name": "list_charges",
+      "side_effects": true,
+      "expected_class": "i_confluent",
+      "expected_error": "i_confluent_must_have_side_effects_false",
+      "rationale": "The rubric's primary safety gate — i_confluent + side_effects=true is a misclassification"
+    },
+    {
+      "name": "create_charge",
+      "side_effects": false,
+      "expected_class": "requires_quorum",
+      "expected_error": "requires_quorum_must_have_side_effects_true",
+      "rationale": "Side-effect-free ops should be classified i_confluent, not requires_quorum (over-strict; wastes quorum cost)"
+    }
+  ],
+  "introspect_response_contract": {
+    "field_name": "coordination_class",
+    "field_type": "string",
+    "enum_values": ["i_confluent", "requires_quorum", "requires_fencing"],
+    "required": true,
+    "applies_to": "every entry in introspect_response.operations[]"
+  },
+  "expected_e2e_throughput_ratio": {
+    "test_name": "iconfluent_read_3x_throughput_vs_quorum",
+    "workload_size": 1000,
+    "read_ratio": 0.5,
+    "min_throughput_multiple": 3.0,
+    "rationale": "Synthetic 50%-read workload; classified reads should be >=3x throughput of force-quorum"
+  }
 }

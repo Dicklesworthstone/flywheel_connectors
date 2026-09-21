@@ -31,10 +31,7 @@
       "minLength": 1
     },
     "nullable_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "string_array": {
       "type": "array",
@@ -172,10 +169,7 @@
         "purpose": { "$ref": "#/$defs/non_empty_string" },
         "holder_node_id_hash": { "$ref": "#/$defs/non_empty_string" },
         "fencing_token": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
         },
         "expiry": { "$ref": "#/$defs/nullable_string" },
         "durable_lease_seq": {

@@ -342,7 +342,9 @@
       "examples": [],
       "ai_hints": {
         "when_to_use": "Use this to align an issue with a workflow or triage lane.",
-        "common_mistakes": ["Forgetting that this replaces the full label set rather than appending."],
+        "common_mistakes": [
+          "Forgetting that this replaces the full label set rather than appending."
+        ],
         "examples": [],
         "related": ["github.create_label", "github.get_issue"]
       }

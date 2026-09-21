@@ -4,17 +4,17 @@
     {
       "name": "stateless_model",
       "description": "Stateless connector - no persistent state",
-      "data": {"type": "stateless"}
+      "data": { "type": "stateless" }
     },
     {
       "name": "singleton_writer_model",
       "description": "Singleton writer - single authoritative state source",
-      "data": {"type": "singleton_writer"}
+      "data": { "type": "singleton_writer" }
     },
     {
       "name": "crdt_model",
       "description": "CRDT - Conflict-free replicated data type for distributed state",
-      "data": {"type": "crdt", "crdt_type": "lww_map"}
+      "data": { "type": "crdt", "crdt_type": "lww_map" }
     }
   ]
 }

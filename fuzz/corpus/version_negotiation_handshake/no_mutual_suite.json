@@ -1,1 +1,1 @@
-{"hello_vector":"hello.cbor","initiator_suite_ids":[1],"responder_suite_ids":[2]}
+{ "hello_vector": "hello.cbor", "initiator_suite_ids": [1], "responder_suite_ids": [2] }

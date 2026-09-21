@@ -2,10 +2,6 @@
   "command": "setup",
   "summary": "Webhook drift detected and repair is available.",
   "status": "repairable",
-  "repairs": [
-    "Re-register webhook endpoint",
-    "Rotate webhook secret",
-    "Reconfirm tenant binding"
-  ],
+  "repairs": ["Re-register webhook endpoint", "Rotate webhook secret", "Reconfirm tenant binding"],
   "resume_command": "fwc setup repair github --resume setup-run-17"
 }

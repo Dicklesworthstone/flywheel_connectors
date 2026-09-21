@@ -11,8 +11,5 @@
     "restart rch services",
     "mark tests green from posture labels"
   ],
-  "redaction_markers": [
-    "<repo>",
-    "<worker>"
-  ]
+  "redaction_markers": ["<repo>", "<worker>"]
 }

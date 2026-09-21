@@ -20,16 +20,8 @@
         "workspace_manifest",
         "offline-artifact"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json show github --offline",
       "notes": "Offline show answers must stay explicitly manifest-backed and non-authoritative, preserving manifest lifecycle status while leaving runtime state unknown."
     },
@@ -51,25 +43,14 @@
         "degraded": false,
         "fallback_derived": false
       },
-      "required_evidence_handles": [
-        "connector-status",
-        "host-health-snapshot"
-      ],
+      "required_evidence_handles": ["connector-status", "host-health-snapshot"],
       "human_summary_contains": [
         "Loaded live connector admin status for `github` from `fcp-host`.",
         "node-local-root-app",
         "connector-status"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> status github",
       "notes": "Node-local status answers must identify the host-admin route and preserve connector-status evidence handles."
     },
@@ -101,16 +82,8 @@
         "mesh-live-availability",
         "mesh-placement-policy"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> mesh explain-availability github",
       "notes": "Mesh explain-availability answers must freeze live host inventory provenance plus placement-backed offline-readiness fields."
     },
@@ -132,25 +105,14 @@
         "degraded": true,
         "fallback_derived": false
       },
-      "required_evidence_handles": [
-        "connector-health",
-        "host-health-snapshot"
-      ],
+      "required_evidence_handles": ["connector-health", "host-health-snapshot"],
       "human_summary_contains": [
         "Health detail for `fcp.github:enterprise:v1`.",
         "connector-health",
         "degraded"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> health fcp.github:enterprise:v1",
       "notes": "Degraded health answers must remain live-runtime while making the degraded contract explicit in provenance."
     },
@@ -179,24 +141,14 @@
         "host-inventory-apply",
         "post-install-status-unavailable"
       ],
-      "required_warning_substrings": [
-        "post-install connector status"
-      ],
+      "required_warning_substrings": ["post-install connector status"],
       "human_summary_contains": [
         "Installed `fcp.github:enterprise:v1` into the live host connector inventory and applied it immediately.",
         "post-install-status-unavailable",
         "post-install connector status"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> install /tmp/fcp.github-enterprise-v1.pkg.json",
       "notes": "Fallback-derived install answers must admit that live mutation succeeded while post-install truth remains degraded until host status can be read back."
     },
@@ -217,16 +169,8 @@
         "fwc status github --host",
         "fwc simulate github issues.create --host"
       ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> invoke github issues.create --input '{\"owner\":\"octocat\",\"repo\":\"hello-world\",\"title\":\"Denied issue\"}' --capability-token <token>",
       "error_type": "policy-denied",
       "preflight_allowed": false,
@@ -246,20 +190,9 @@
         "source": "workspace_manifest",
         "authoritative": false
       },
-      "required_evidence_handles": [
-        "manifest-parse-status",
-        "connector-checks"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_evidence_handles": ["manifest-parse-status", "connector-checks"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json doctor --offline",
       "notes": "Offline doctor answers must run manifest parsing and local configuration checks without requiring a running host, producing structured diagnostics that later live-host doctor can extend."
     },
@@ -281,20 +214,9 @@
         "degraded": false,
         "fallback_derived": false
       },
-      "required_evidence_handles": [
-        "connector-config",
-        "config-schema"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_evidence_handles": ["connector-config", "config-schema"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> config get github",
       "notes": "Config get answers are node-local and authoritative for the current host configuration state. Schema metadata accompanies the response for validation."
     },
@@ -316,20 +238,9 @@
         "degraded": false,
         "fallback_derived": false
       },
-      "required_evidence_handles": [
-        "auth-status",
-        "credential-validity"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_evidence_handles": ["auth-status", "credential-validity"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> auth verify github",
       "notes": "Auth verify answers must expose credential validity without leaking credential values. The provenance must be explicit about node-local scope since credentials are per-host."
     },
@@ -346,20 +257,9 @@
         "authoritative": true,
         "mesh_backed": true
       },
-      "required_evidence_handles": [
-        "audit-chain-head",
-        "operation-receipts"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_evidence_handles": ["audit-chain-head", "operation-receipts"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> history --connector github",
       "notes": "History answers backed by the audit chain must include evidence handles for the chain head and individual operation receipts, making the audit trail mechanically verifiable."
     },
@@ -380,20 +280,9 @@
         "degraded": true,
         "fallback_derived": false
       },
-      "required_evidence_handles": [
-        "readiness-status",
-        "degraded-components"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_evidence_handles": ["readiness-status", "degraded-components"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "rerun_command": "fwc --json --host <host> readiness github",
       "notes": "Degraded readiness probes must identify which components are degraded and expose the specific subsystem health states that caused the overall degradation."
     }

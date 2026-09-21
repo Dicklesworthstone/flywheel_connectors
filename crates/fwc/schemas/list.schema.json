@@ -17,10 +17,7 @@
       "minLength": 1
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "non_negative_integer": {
       "type": "integer",
@@ -28,7 +25,16 @@
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "truth_requirement": {
       "type": "string",
@@ -153,10 +159,7 @@
         "category": { "$ref": "#/$defs/nullable_non_empty_string" },
         "include_hidden": { "type": "boolean" },
         "require_source": {
-          "anyOf": [
-            { "$ref": "#/$defs/truth_requirement" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/truth_requirement" }, { "type": "null" }]
         }
       }
     },
@@ -235,10 +238,7 @@
         "format": { "$ref": "#/$defs/non_empty_string" },
         "state": { "$ref": "#/$defs/non_empty_string" },
         "archetypes": {
-          "anyOf": [
-            { "$ref": "#/$defs/string_array" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/string_array" }, { "type": "null" }]
         },
         "home_zone": {},
         "operation_count": { "$ref": "#/$defs/non_negative_integer" },

@@ -17,10 +17,7 @@
       "minLength": 1
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "non_negative_integer": {
       "type": "integer",
@@ -28,7 +25,16 @@
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "truth_requirement": {
       "type": "string",
@@ -127,13 +133,7 @@
     "fleet_host_health": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "status",
-        "connectors",
-        "uptime_seconds",
-        "active_connections",
-        "timestamp"
-      ],
+      "required": ["status", "connectors", "uptime_seconds", "active_connections", "timestamp"],
       "properties": {
         "status": { "$ref": "#/$defs/health_status" },
         "connectors": {
@@ -186,14 +186,7 @@
     "status_connector": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "slug",
-        "canonical_id",
-        "name",
-        "version",
-        "enabled",
-        "health"
-      ],
+      "required": ["slug", "canonical_id", "name", "version", "enabled", "health"],
       "properties": {
         "slug": { "$ref": "#/$defs/non_empty_string" },
         "canonical_id": { "$ref": "#/$defs/non_empty_string" },
@@ -256,13 +249,7 @@
     "rollout_status": {
       "type": "object",
       "additionalProperties": true,
-      "required": [
-        "connector_id",
-        "state",
-        "version",
-        "pinned",
-        "canary_percent"
-      ],
+      "required": ["connector_id", "state", "version", "pinned", "canary_percent"],
       "properties": {
         "connector_id": { "$ref": "#/$defs/non_empty_string" },
         "state": { "$ref": "#/$defs/non_empty_string" },
@@ -287,10 +274,7 @@
         },
         "connector": { "$ref": "#/$defs/nullable_non_empty_string" },
         "require_source": {
-          "anyOf": [
-            { "$ref": "#/$defs/truth_requirement" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/truth_requirement" }, { "type": "null" }]
         }
       }
     },

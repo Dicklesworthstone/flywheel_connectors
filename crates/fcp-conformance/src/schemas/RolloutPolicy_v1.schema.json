@@ -26,12 +26,7 @@
     },
     "success_thresholds": {
       "type": "object",
-      "required": [
-        "min_success_rate_bps",
-        "max_error_rate_bps",
-        "min_samples",
-        "window_secs"
-      ],
+      "required": ["min_success_rate_bps", "max_error_rate_bps", "min_samples", "window_secs"],
       "additionalProperties": false,
       "properties": {
         "min_success_rate_bps": {

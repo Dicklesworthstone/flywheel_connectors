@@ -232,22 +232,13 @@
       "minimum": 0
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "nullable_boolean": {
-      "anyOf": [
-        { "type": "boolean" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "type": "boolean" }, { "type": "null" }]
     },
     "nullable_non_negative_integer": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_negative_integer" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_negative_integer" }, { "type": "null" }]
     },
     "sha256": {
       "type": "string",
@@ -256,13 +247,7 @@
     "connector": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "requested_selector",
-        "slug",
-        "canonical_id",
-        "name",
-        "version"
-      ],
+      "required": ["requested_selector", "slug", "canonical_id", "name", "version"],
       "properties": {
         "requested_selector": { "$ref": "#/$defs/non_empty_string" },
         "slug": { "$ref": "#/$defs/non_empty_string" },
@@ -308,10 +293,7 @@
     "zone": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "requested",
-        "local_cache_marker_present"
-      ],
+      "required": ["requested", "local_cache_marker_present"],
       "properties": {
         "requested": { "$ref": "#/$defs/nullable_non_empty_string" },
         "supported_by_manifest": { "$ref": "#/$defs/nullable_boolean" },

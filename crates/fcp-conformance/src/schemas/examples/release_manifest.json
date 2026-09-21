@@ -1,29 +1,29 @@
 {
-    "format": "fcp-release-manifest",
-    "schema_version": "1.0",
-    "connector_id": "fcp.example:request-response:1",
-    "version": "1.2.3",
-    "digest": "blake3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "channel": "stable",
-    "required_caps": ["fcp.example.read", "fcp.example.write"],
-    "min_host_version": "0.1.0",
-    "signed_by": "owner-key-1",
-    "created_at": "2026-02-01T12:00:00Z",
-    "signature": {
-        "algorithm": "ed25519",
-        "key_id": "owner-key-1",
-        "signature": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "signed_fields": [
-            "format",
-            "schema_version",
-            "connector_id",
-            "version",
-            "digest",
-            "channel",
-            "required_caps",
-            "min_host_version",
-            "signed_by",
-            "created_at"
-        ]
-    }
+  "format": "fcp-release-manifest",
+  "schema_version": "1.0",
+  "connector_id": "fcp.example:request-response:1",
+  "version": "1.2.3",
+  "digest": "blake3-256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "channel": "stable",
+  "required_caps": ["fcp.example.read", "fcp.example.write"],
+  "min_host_version": "0.1.0",
+  "signed_by": "owner-key-1",
+  "created_at": "2026-02-01T12:00:00Z",
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "owner-key-1",
+    "signature": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "signed_fields": [
+      "format",
+      "schema_version",
+      "connector_id",
+      "version",
+      "digest",
+      "channel",
+      "required_caps",
+      "min_host_version",
+      "signed_by",
+      "created_at"
+    ]
+  }
 }

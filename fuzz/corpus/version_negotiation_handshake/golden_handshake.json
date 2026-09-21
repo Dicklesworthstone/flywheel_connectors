@@ -1,1 +1,6 @@
-{"hello_vector":"hello.cbor","ack_vector":"ack.cbor","initiator_suite_ids":[1,2],"responder_suite_ids":[1,2]}
+{
+  "hello_vector": "hello.cbor",
+  "ack_vector": "ack.cbor",
+  "initiator_suite_ids": [1, 2],
+  "responder_suite_ids": [1, 2]
+}

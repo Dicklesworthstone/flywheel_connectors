@@ -20,14 +20,20 @@
       "minimum": 0
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "schema_version": {
       "const": "fcp.fwc.truth-source.v1"
@@ -73,10 +79,7 @@
       "properties": {
         "connector": { "$ref": "#/$defs/nullable_non_empty_string" },
         "status": {
-          "anyOf": [
-            { "$ref": "#/$defs/operation_status" },
-            { "type": "null" }
-          ]
+          "anyOf": [{ "$ref": "#/$defs/operation_status" }, { "type": "null" }]
         },
         "since": { "$ref": "#/$defs/nullable_non_empty_string" },
         "limit": { "$ref": "#/$defs/non_negative_integer" }
@@ -178,14 +181,7 @@
     "history_not_found": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "status",
-        "command",
-        "schema_version",
-        "_truth_source",
-        "error",
-        "next_actions"
-      ],
+      "required": ["status", "command", "schema_version", "_truth_source", "error", "next_actions"],
       "properties": {
         "status": { "const": "error" },
         "command": { "const": "history" },
@@ -250,14 +246,7 @@
     "truth_resolver_internal_error": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "status",
-        "command",
-        "schema_version",
-        "_truth_source",
-        "error",
-        "next_actions"
-      ],
+      "required": ["status", "command", "schema_version", "_truth_source", "error", "next_actions"],
       "properties": {
         "status": { "const": "error" },
         "command": { "const": "history" },

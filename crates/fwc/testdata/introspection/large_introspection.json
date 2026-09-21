@@ -12,56 +12,1506 @@
     "last_health_check": "2026-03-10T00:00:00Z"
   },
   "tools": [
-    { "name": "bulk.op_01", "description": "Synthetic bulk operation 01.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_02", "description": "Synthetic bulk operation 02.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_03", "description": "Synthetic bulk operation 03.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_04", "description": "Synthetic bulk operation 04.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_05", "description": "Synthetic bulk operation 05.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_06", "description": "Synthetic bulk operation 06.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_07", "description": "Synthetic bulk operation 07.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_08", "description": "Synthetic bulk operation 08.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_09", "description": "Synthetic bulk operation 09.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_10", "description": "Synthetic bulk operation 10.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_11", "description": "Synthetic bulk operation 11.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_12", "description": "Synthetic bulk operation 12.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_13", "description": "Synthetic bulk operation 13.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_14", "description": "Synthetic bulk operation 14.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_15", "description": "Synthetic bulk operation 15.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_16", "description": "Synthetic bulk operation 16.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_17", "description": "Synthetic bulk operation 17.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_18", "description": "Synthetic bulk operation 18.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_19", "description": "Synthetic bulk operation 19.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_20", "description": "Synthetic bulk operation 20.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_21", "description": "Synthetic bulk operation 21.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_22", "description": "Synthetic bulk operation 22.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_23", "description": "Synthetic bulk operation 23.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_24", "description": "Synthetic bulk operation 24.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_25", "description": "Synthetic bulk operation 25.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_26", "description": "Synthetic bulk operation 26.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_27", "description": "Synthetic bulk operation 27.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_28", "description": "Synthetic bulk operation 28.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_29", "description": "Synthetic bulk operation 29.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_30", "description": "Synthetic bulk operation 30.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_31", "description": "Synthetic bulk operation 31.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_32", "description": "Synthetic bulk operation 32.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_33", "description": "Synthetic bulk operation 33.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_34", "description": "Synthetic bulk operation 34.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_35", "description": "Synthetic bulk operation 35.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_36", "description": "Synthetic bulk operation 36.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_37", "description": "Synthetic bulk operation 37.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_38", "description": "Synthetic bulk operation 38.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_39", "description": "Synthetic bulk operation 39.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_40", "description": "Synthetic bulk operation 40.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_41", "description": "Synthetic bulk operation 41.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_42", "description": "Synthetic bulk operation 42.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_43", "description": "Synthetic bulk operation 43.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_44", "description": "Synthetic bulk operation 44.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_45", "description": "Synthetic bulk operation 45.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_46", "description": "Synthetic bulk operation 46.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_47", "description": "Synthetic bulk operation 47.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_48", "description": "Synthetic bulk operation 48.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_49", "description": "Synthetic bulk operation 49.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } },
-    { "name": "bulk.op_50", "description": "Synthetic bulk operation 50.", "input_schema": { "type": "object", "properties": { "id": { "type": "string" }, "payload": { "type": "string" } }, "required": ["id"] }, "output_schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } }, "required": ["ok", "operation"] }, "capability": "bulk.read", "risk_level": "low", "safety_tier": "safe", "idempotency": "strict", "approval_mode": null, "requires_confirmation": false, "idempotent": true, "supports_simulate": true, "rate_limits": ["bulk-read"], "examples": [], "ai_hints": { "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.", "common_mistakes": ["Assuming synthetic fixtures reflect production latency."], "examples": [], "related": [] } }
+    {
+      "name": "bulk.op_01",
+      "description": "Synthetic bulk operation 01.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_02",
+      "description": "Synthetic bulk operation 02.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_03",
+      "description": "Synthetic bulk operation 03.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_04",
+      "description": "Synthetic bulk operation 04.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_05",
+      "description": "Synthetic bulk operation 05.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_06",
+      "description": "Synthetic bulk operation 06.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_07",
+      "description": "Synthetic bulk operation 07.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_08",
+      "description": "Synthetic bulk operation 08.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_09",
+      "description": "Synthetic bulk operation 09.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_10",
+      "description": "Synthetic bulk operation 10.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_11",
+      "description": "Synthetic bulk operation 11.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_12",
+      "description": "Synthetic bulk operation 12.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_13",
+      "description": "Synthetic bulk operation 13.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_14",
+      "description": "Synthetic bulk operation 14.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_15",
+      "description": "Synthetic bulk operation 15.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_16",
+      "description": "Synthetic bulk operation 16.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_17",
+      "description": "Synthetic bulk operation 17.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_18",
+      "description": "Synthetic bulk operation 18.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_19",
+      "description": "Synthetic bulk operation 19.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_20",
+      "description": "Synthetic bulk operation 20.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_21",
+      "description": "Synthetic bulk operation 21.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_22",
+      "description": "Synthetic bulk operation 22.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_23",
+      "description": "Synthetic bulk operation 23.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_24",
+      "description": "Synthetic bulk operation 24.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_25",
+      "description": "Synthetic bulk operation 25.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_26",
+      "description": "Synthetic bulk operation 26.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_27",
+      "description": "Synthetic bulk operation 27.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_28",
+      "description": "Synthetic bulk operation 28.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_29",
+      "description": "Synthetic bulk operation 29.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_30",
+      "description": "Synthetic bulk operation 30.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_31",
+      "description": "Synthetic bulk operation 31.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_32",
+      "description": "Synthetic bulk operation 32.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_33",
+      "description": "Synthetic bulk operation 33.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_34",
+      "description": "Synthetic bulk operation 34.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_35",
+      "description": "Synthetic bulk operation 35.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_36",
+      "description": "Synthetic bulk operation 36.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_37",
+      "description": "Synthetic bulk operation 37.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_38",
+      "description": "Synthetic bulk operation 38.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_39",
+      "description": "Synthetic bulk operation 39.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_40",
+      "description": "Synthetic bulk operation 40.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_41",
+      "description": "Synthetic bulk operation 41.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_42",
+      "description": "Synthetic bulk operation 42.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_43",
+      "description": "Synthetic bulk operation 43.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_44",
+      "description": "Synthetic bulk operation 44.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_45",
+      "description": "Synthetic bulk operation 45.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_46",
+      "description": "Synthetic bulk operation 46.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_47",
+      "description": "Synthetic bulk operation 47.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_48",
+      "description": "Synthetic bulk operation 48.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_49",
+      "description": "Synthetic bulk operation 49.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    },
+    {
+      "name": "bulk.op_50",
+      "description": "Synthetic bulk operation 50.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "payload": { "type": "string" } },
+        "required": ["id"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "operation": { "type": "string" } },
+        "required": ["ok", "operation"]
+      },
+      "capability": "bulk.read",
+      "risk_level": "low",
+      "safety_tier": "safe",
+      "idempotency": "strict",
+      "approval_mode": null,
+      "requires_confirmation": false,
+      "idempotent": true,
+      "supports_simulate": true,
+      "rate_limits": ["bulk-read"],
+      "examples": [],
+      "ai_hints": {
+        "when_to_use": "Use this to exercise high-cardinality bulk introspection paths.",
+        "common_mistakes": ["Assuming synthetic fixtures reflect production latency."],
+        "examples": [],
+        "related": []
+      }
+    }
   ],
   "rate_limits": {
     "limits": [],

@@ -2,10 +2,7 @@
   "_comment": "COSE_Sign1 test vectors per RFC 8152 and RFC 9052",
   "_version": "1.0.0",
   "_generated": "2026-02-01",
-  "_sources": [
-    "RFC 8152 Appendix C - Examples",
-    "RFC 9052 - Updated COSE examples"
-  ],
+  "_sources": ["RFC 8152 Appendix C - Examples", "RFC 9052 - Updated COSE examples"],
 
   "algorithm_identifiers": {
     "description": "COSE algorithm identifiers per IANA registry",
@@ -29,12 +26,7 @@
   "sig_structure": {
     "description": "Sig_structure for computing signature",
     "context_string": "Signature1",
-    "elements": [
-      "context (text)",
-      "body_protected (bstr)",
-      "external_aad (bstr)",
-      "payload (bstr)"
-    ]
+    "elements": ["context (text)", "body_protected (bstr)", "external_aad (bstr)", "payload (bstr)"]
   },
 
   "test_vectors": [

@@ -1,8 +1,5 @@
 {
-  "allowlist": [
-    "https://app.example.com/oauth/callback",
-    "http://127.0.0.1:3000/callback"
-  ],
+  "allowlist": ["https://app.example.com/oauth/callback", "http://127.0.0.1:3000/callback"],
   "redirect_uri": "https://app.example.com/oauth/callback",
   "callback_url": "https://app.example.com/oauth/callback?code=test&state=abc"
 }

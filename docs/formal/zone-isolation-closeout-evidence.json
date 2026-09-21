@@ -15,12 +15,7 @@
       "runner": "rch",
       "command": "rch exec -- cargo test -p fcp-host --test allowed_zones_required -- --nocapture",
       "required_status": "green",
-      "covers": [
-        "invoke",
-        "health",
-        "introspect",
-        "one-zone-allowed-path"
-      ]
+      "covers": ["invoke", "health", "introspect", "one-zone-allowed-path"]
     },
     {
       "id": "c1-conformance-no-permissive-branch",
@@ -49,11 +44,7 @@
       "runner": "ci",
       "command": "make lean-verify",
       "required_status": "green",
-      "covers": [
-        "all-five-formal-proof-files",
-        "zone-lattice-proof",
-        "no-sorry-no-admit"
-      ]
+      "covers": ["all-five-formal-proof-files", "zone-lattice-proof", "no-sorry-no-admit"]
     }
   ],
   "rch_summary": {

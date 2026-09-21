@@ -1,1 +1,1773 @@
-{"generated_at":"2026-04-03T03:34:04Z","inventory_path":"docs/testing/placeholder-inventory.json","approved_exception_classes":[{"id":"test_only","description":"Placeholder, stub, and TODO markers may appear in non-shipping test or fuzz surfaces when the marker does not leak into runtime code paths.","allowed_path_globs":["tests/**","**/tests/**","fuzz/**"],"closure_rule":"Runtime code, manifests, and operator paths must not depend on these markers or import their behavior as a live fallback.","owner_bead":"flywheel_connectors-24llg.1.2"},{"id":"mock_infrastructure","description":"Shared mock infrastructure may use placeholder-like naming as test scaffolding only when it stays inside dedicated mock or fixture crates.","allowed_path_globs":["crates/fcp-testkit/**"],"closure_rule":"Approved mock infrastructure must remain outside live runtime, catalog, and connector shipping paths.","owner_bead":"flywheel_connectors-24llg.1.2"},{"id":"bench_fixture_only","description":"Benchmark fixture helpers may use stub naming only for synthetic offline microbench input construction, not for user-facing benchmark results.","allowed_path_globs":["crates/fwc/benches/**","crates/fwc/src/bench_helpers.rs"],"closure_rule":"User-facing `fwc bench` commands must report real measurements; only internal offline fixture builders may retain stub terminology.","owner_bead":"flywheel_connectors-24llg.6.4"},{"id":"offline_template_generation","description":"Offline schema or template emitters may carry placeholder sentinel values when runtime install and update paths reject demo markers and generator regression tests keep emitted runtime code truthful.","allowed_path_globs":["crates/fwc/src/template.rs"],"closure_rule":"Any placeholder sentinel in an offline generator must stay off runtime execution paths and remain covered by generator regression tests.","owner_bead":"flywheel_connectors-24llg.7.4"},{"id":"docs_and_evidence_only","description":"Documentation and evidence artifacts may quote placeholder strings as part of audits, transcripts, or remediation records.","allowed_path_globs":["docs/**","artifacts/**"],"closure_rule":"Quoted placeholder markers in docs or evidence must remain descriptive only and must not be presented as live runtime capability.","owner_bead":"flywheel_connectors-24llg.1.4"}],"summary":{"total_findings":13,"present":10,"drifted":3,"runtime_blockers":9,"status_drifts":1,"operator_gaps":2,"scaffold_gaps":1,"allowed_scaffold_candidates":1,"failing_findings":13,"known_gap_blocking":9,"unexpected_match_findings":1,"approved_exception_findings":0,"cleared_findings":0},"findings":[{"id":"tlon-planned-only","title":"Tlon connector still ships as a planned-only scaffold","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.2.2","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","status":"present","matches":[{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","status":"present","matches":[{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":106,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","status":"present","matches":[{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":130,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":106,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":130,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":111,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":142,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":104,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":125,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":106,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":130,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"zalo-planned-only","title":"Zalo connector still ships as a planned-only scaffold","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.2.3","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","status":"present","matches":[{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","status":"present","matches":[{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":111,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","status":"present","matches":[{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":142,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":106,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":130,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":111,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":142,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":104,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":125,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":111,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":142,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"zalouser-planned-only","title":"Zalouser connector still ships as a planned-only scaffold","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.2.4","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","status":"present","matches":[{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","status":"present","matches":[{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":104,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","status":"present","matches":[{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":125,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":106,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":130,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":111,"text":"            \"surface_status\": \"planned_only\",","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":142,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":104,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":125,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":49,"text":"            \"surface_status\": \"planned_only\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"\"surface_status\": \"planned_only\"","line":104,"text":"            \"surface_status\": \"planned_only\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/src/connector.rs","needle":"Operation {operation} is planned but not implemented in this connector slice","line":125,"text":"                    \"Operation {operation} is planned but not implemented in this connector slice\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"huggingface-status-drift","title":"Hugging Face manifest and runtime status disagree","classification":"status_drift","owner_bead":"flywheel_connectors-24llg.2.5","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","status":"present","matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","status":"present","matches":[{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":138,"text":"            \"surface_status\": \"live\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":271,"text":"            \"surface_status\": \"live\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/huggingface/src/connector.rs","needle":"\"live_requests_supported\": self.configured","status":"present","matches":[{"path":"connectors/huggingface/src/connector.rs","needle":"\"live_requests_supported\": self.configured","line":155,"text":"            \"live_requests_supported\": self.configured,","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":138,"text":"            \"surface_status\": \"live\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"live_requests_supported\": self.configured","line":155,"text":"            \"live_requests_supported\": self.configured,","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":271,"text":"            \"surface_status\": \"live\",","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/tlon/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalo/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/zalouser/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":false,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/huggingface/manifest.toml","needle":"status = \"stub\"","line":14,"text":"status = \"stub\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":138,"text":"            \"surface_status\": \"live\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"live_requests_supported\": self.configured","line":155,"text":"            \"live_requests_supported\": self.configured,","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/huggingface/src/connector.rs","needle":"\"surface_status\": \"live\"","line":271,"text":"            \"surface_status\": \"live\",","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"aws-fake-sigv4","title":"AWS connector still uses fake signing instead of SigV4","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.3.2","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/aws/src/connector.rs","needle":"request_signing_not_implemented","status":"present","matches":[{"path":"connectors/aws/src/connector.rs","needle":"request_signing_not_implemented","line":301,"text":"                code: \"request_signing_not_implemented\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"connectors/aws/src/client.rs","needle":".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","status":"present","matches":[{"path":"connectors/aws/src/client.rs","needle":".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","line":534,"text":"        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/aws/src/client.rs","needle":".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","line":534,"text":"        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/aws/src/connector.rs","needle":"request_signing_not_implemented","line":301,"text":"                code: \"request_signing_not_implemented\",","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/aws/src/client.rs","needle":".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","line":534,"text":"        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"connectors/aws/src/connector.rs","needle":"request_signing_not_implemented","line":301,"text":"                code: \"request_signing_not_implemented\",","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"s3-placeholder-presign","title":"S3 presigned URLs still carry a placeholder signature","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.3.3","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/s3/src/client.rs","needle":"PLACEHOLDER_SIGNATURE","status":"present","matches":[{"path":"connectors/s3/src/client.rs","needle":"PLACEHOLDER_SIGNATURE","line":484,"text":"             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"connectors/s3/src/client.rs","needle":"PLACEHOLDER_SIGNATURE","line":484,"text":"             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"connectors/s3/src/client.rs","needle":"PLACEHOLDER_SIGNATURE","line":484,"text":"             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"gcp-service-account-jwt-missing","title":"GCP service-account auth still refuses JWT bearer signing","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.3.4","disposition":"runtime_blocker","status":"drifted","gate_status":"inventory_drift","gate_reason":"Committed inventory anchors no longer match the workspace.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"connectors/gcp/src/types.rs","needle":"GCP service_account mode requires JWT signing, which is not implemented yet.","status":"missing","matches":[]},{"path":"connectors/gcp/src/connector.rs","needle":"return Err(SERVICE_ACCOUNT_UNSUPPORTED_MESSAGE.into());","status":"missing","matches":[]}],"matches":[],"anchored_matches":[],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"bootstrap-hardware-token-stub","title":"Bootstrap hardware-token flow is still stubbed and hard-fails","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.4.2","disposition":"runtime_blocker","status":"drifted","gate_status":"inventory_drift","gate_reason":"Committed inventory anchors no longer match the workspace.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"crates/fcp-bootstrap/src/hardware_token.rs","needle":"This is a stub implementation - a real implementation would use the","status":"missing","matches":[]},{"path":"crates/fcp-bootstrap/src/workflow.rs","needle":"Hardware token support not yet fully implemented","status":"present","matches":[{"path":"crates/fcp-bootstrap/src/workflow.rs","needle":"Hardware token support not yet fully implemented","line":431,"text":"            \"Hardware token support not yet fully implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"crates/fcp-bootstrap/src/workflow.rs","needle":"Hardware token support not yet fully implemented","line":431,"text":"            \"Hardware token support not yet fully implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"crates/fcp-bootstrap/src/workflow.rs","needle":"Hardware token support not yet fully implemented","line":431,"text":"            \"Hardware token support not yet fully implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"connector-state-crdt-merge-placeholder","title":"Connector-state fork resolution still treats CRDT merge as a not-implemented placeholder","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.5.1","disposition":"runtime_blocker","status":"drifted","gate_status":"inventory_drift","gate_reason":"Committed inventory anchors no longer match the workspace.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"crates/fcp-core/src/connector_state.rs","needle":"CRDT merge requires delta-level merging (not implemented in detector)","status":"missing","matches":[]}],"matches":[],"anchored_matches":[],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"mesh-planner-zone-filter-placeholder","title":"Mesh planner zone filtering is still a no-op placeholder","classification":"runtime_blocker","owner_bead":"flywheel_connectors-24llg.5.2","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"crates/fcp-mesh/src/planner.rs","needle":"placeholder — needs NodeInfo zone integration","status":"present","matches":[{"path":"crates/fcp-mesh/src/planner.rs","needle":"placeholder — needs NodeInfo zone integration","line":698,"text":"                let _ = c; // placeholder — needs NodeInfo zone integration","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"crates/fcp-mesh/src/planner.rs","needle":"placeholder — needs NodeInfo zone integration","line":698,"text":"                let _ = c; // placeholder — needs NodeInfo zone integration","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"crates/fcp-mesh/src/planner.rs","needle":"placeholder — needs NodeInfo zone integration","line":698,"text":"                let _ = c; // placeholder — needs NodeInfo zone integration","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"fwc-intent-log-lifecycle-gap","title":"fwc intent still explains away missing log and lifecycle primitives","classification":"operator_gap","owner_bead":"flywheel_connectors-24llg.6.2","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"crates/fwc/src/intent.rs","needle":"Connector log tailing is not implemented as a real `fwc` primitive yet.","status":"present","matches":[{"path":"crates/fwc/src/intent.rs","needle":"Connector log tailing is not implemented as a real `fwc` primitive yet.","line":646,"text":"            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"crates/fwc/src/intent.rs","needle":"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.","status":"present","matches":[{"path":"crates/fwc/src/intent.rs","needle":"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.","line":649,"text":"            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"crates/fwc/src/intent.rs","needle":"Connector log tailing is not implemented as a real `fwc` primitive yet.","line":646,"text":"            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/intent.rs","needle":"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.","line":649,"text":"            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"crates/fwc/src/intent.rs","needle":"Connector log tailing is not implemented as a real `fwc` primitive yet.","line":646,"text":"            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/intent.rs","needle":"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.","line":649,"text":"            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"fwc-bench-placeholder-results","title":"fwc bench still mixes placeholder benchmark results into operator output","classification":"operator_gap","owner_bead":"flywheel_connectors-24llg.6.3","disposition":"runtime_blocker","status":"present","gate_status":"known_gap_blocking","gate_reason":"Known production/runtime placeholder gap is still present.","enforced_failure":true,"allowed_scaffold_candidate":false,"approved_exception_class":null,"anchors":[{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","status":"present","matches":[{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2022,"text":"        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2919,"text":"        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2932,"text":"        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3074,"text":"        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3081,"text":"            let result = BenchmarkResult::placeholder(","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3163,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"reason\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3170,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3196,"text":"        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3197,"text":"        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3651,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2022,"text":"        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2919,"text":"        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2932,"text":"        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3074,"text":"        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3081,"text":"            let result = BenchmarkResult::placeholder(","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3163,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"reason\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3170,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3196,"text":"        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3197,"text":"        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3651,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2022,"text":"        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2919,"text":"        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":2932,"text":"        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3074,"text":"        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3081,"text":"            let result = BenchmarkResult::placeholder(","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3163,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"reason\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3170,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3196,"text":"        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3197,"text":"        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/bench_cmd.rs","needle":"BenchmarkResult::placeholder(","line":3651,"text":"        let r = BenchmarkResult::placeholder(\"p\", \"n\");","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[]},{"id":"fwc-new-generator-runtime-placeholders","title":"fwc new still emits runtime placeholder operations and TODO-heavy limits","classification":"scaffold_gap","owner_bead":"flywheel_connectors-24llg.7.3","disposition":"allowed_scaffold_candidate","status":"present","gate_status":"unexpected_match","gate_reason":"Placeholder marker appears outside the anchored path or approved exception globs.","enforced_failure":true,"allowed_scaffold_candidate":true,"approved_exception_class":null,"anchors":[{"path":"crates/fwc/src/new_cmd.rs","needle":"[provides.operations.placeholder_operation]","status":"present","matches":[{"path":"crates/fwc/src/new_cmd.rs","needle":"[provides.operations.placeholder_operation]","line":801,"text":"[provides.operations.placeholder_operation]","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"crates/fwc/src/new_cmd.rs","needle":"\"api client not implemented\".to_string()","status":"present","matches":[{"path":"crates/fwc/src/new_cmd.rs","needle":"\"api client not implemented\".to_string()","line":1289,"text":"            \"api client not implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false}]},{"path":"crates/fwc/src/new_cmd.rs","needle":"TODO: Replace placeholders with the actual service limits before shipping.","status":"present","matches":[{"path":"crates/fwc/src/new_cmd.rs","needle":"TODO: Replace placeholders with the actual service limits before shipping.","line":1587,"text":"//! TODO: Replace placeholders with the actual service limits before shipping.","anchored":true,"inventory_anchored":true,"allowlisted":false}]}],"matches":[{"path":"crates/fcp-sdk/src/migration.rs","needle":"[provides.operations.placeholder_operation]","line":858,"text":"[provides.operations.placeholder_operation]","anchored":false,"inventory_anchored":false,"allowlisted":false},{"path":"crates/fwc/src/new_cmd.rs","needle":"[provides.operations.placeholder_operation]","line":801,"text":"[provides.operations.placeholder_operation]","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/new_cmd.rs","needle":"\"api client not implemented\".to_string()","line":1289,"text":"            \"api client not implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/new_cmd.rs","needle":"TODO: Replace placeholders with the actual service limits before shipping.","line":1587,"text":"//! TODO: Replace placeholders with the actual service limits before shipping.","anchored":true,"inventory_anchored":true,"allowlisted":false}],"anchored_matches":[{"path":"crates/fwc/src/new_cmd.rs","needle":"[provides.operations.placeholder_operation]","line":801,"text":"[provides.operations.placeholder_operation]","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/new_cmd.rs","needle":"\"api client not implemented\".to_string()","line":1289,"text":"            \"api client not implemented\".to_string(),","anchored":true,"inventory_anchored":true,"allowlisted":false},{"path":"crates/fwc/src/new_cmd.rs","needle":"TODO: Replace placeholders with the actual service limits before shipping.","line":1587,"text":"//! TODO: Replace placeholders with the actual service limits before shipping.","anchored":true,"inventory_anchored":true,"allowlisted":false}],"allowlisted_matches":[],"unexpected_matches":[{"path":"crates/fcp-sdk/src/migration.rs","needle":"[provides.operations.placeholder_operation]","line":858,"text":"[provides.operations.placeholder_operation]","anchored":false,"inventory_anchored":false,"allowlisted":false}]}]}
+{
+  "generated_at": "2026-04-03T03:34:04Z",
+  "inventory_path": "docs/testing/placeholder-inventory.json",
+  "approved_exception_classes": [
+    {
+      "id": "test_only",
+      "description": "Placeholder, stub, and TODO markers may appear in non-shipping test or fuzz surfaces when the marker does not leak into runtime code paths.",
+      "allowed_path_globs": ["tests/**", "**/tests/**", "fuzz/**"],
+      "closure_rule": "Runtime code, manifests, and operator paths must not depend on these markers or import their behavior as a live fallback.",
+      "owner_bead": "flywheel_connectors-24llg.1.2"
+    },
+    {
+      "id": "mock_infrastructure",
+      "description": "Shared mock infrastructure may use placeholder-like naming as test scaffolding only when it stays inside dedicated mock or fixture crates.",
+      "allowed_path_globs": ["crates/fcp-testkit/**"],
+      "closure_rule": "Approved mock infrastructure must remain outside live runtime, catalog, and connector shipping paths.",
+      "owner_bead": "flywheel_connectors-24llg.1.2"
+    },
+    {
+      "id": "bench_fixture_only",
+      "description": "Benchmark fixture helpers may use stub naming only for synthetic offline microbench input construction, not for user-facing benchmark results.",
+      "allowed_path_globs": ["crates/fwc/benches/**", "crates/fwc/src/bench_helpers.rs"],
+      "closure_rule": "User-facing `fwc bench` commands must report real measurements; only internal offline fixture builders may retain stub terminology.",
+      "owner_bead": "flywheel_connectors-24llg.6.4"
+    },
+    {
+      "id": "offline_template_generation",
+      "description": "Offline schema or template emitters may carry placeholder sentinel values when runtime install and update paths reject demo markers and generator regression tests keep emitted runtime code truthful.",
+      "allowed_path_globs": ["crates/fwc/src/template.rs"],
+      "closure_rule": "Any placeholder sentinel in an offline generator must stay off runtime execution paths and remain covered by generator regression tests.",
+      "owner_bead": "flywheel_connectors-24llg.7.4"
+    },
+    {
+      "id": "docs_and_evidence_only",
+      "description": "Documentation and evidence artifacts may quote placeholder strings as part of audits, transcripts, or remediation records.",
+      "allowed_path_globs": ["docs/**", "artifacts/**"],
+      "closure_rule": "Quoted placeholder markers in docs or evidence must remain descriptive only and must not be presented as live runtime capability.",
+      "owner_bead": "flywheel_connectors-24llg.1.4"
+    }
+  ],
+  "summary": {
+    "total_findings": 13,
+    "present": 10,
+    "drifted": 3,
+    "runtime_blockers": 9,
+    "status_drifts": 1,
+    "operator_gaps": 2,
+    "scaffold_gaps": 1,
+    "allowed_scaffold_candidates": 1,
+    "failing_findings": 13,
+    "known_gap_blocking": 9,
+    "unexpected_match_findings": 1,
+    "approved_exception_findings": 0,
+    "cleared_findings": 0
+  },
+  "findings": [
+    {
+      "id": "tlon-planned-only",
+      "title": "Tlon connector still ships as a planned-only scaffold",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.2.2",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/tlon/manifest.toml",
+              "needle": "status = \"stub\"",
+              "line": 14,
+              "text": "status = \"stub\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/tlon/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 49,
+              "text": "            \"surface_status\": \"planned_only\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "connectors/tlon/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 106,
+              "text": "            \"surface_status\": \"planned_only\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/tlon/src/connector.rs",
+              "needle": "Operation {operation} is planned but not implemented in this connector slice",
+              "line": 130,
+              "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 106,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 130,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 111,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 142,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 104,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 125,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 106,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 130,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "zalo-planned-only",
+      "title": "Zalo connector still ships as a planned-only scaffold",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.2.3",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalo/manifest.toml",
+              "needle": "status = \"stub\"",
+              "line": 14,
+              "text": "status = \"stub\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalo/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 49,
+              "text": "            \"surface_status\": \"planned_only\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "connectors/zalo/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 111,
+              "text": "            \"surface_status\": \"planned_only\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalo/src/connector.rs",
+              "needle": "Operation {operation} is planned but not implemented in this connector slice",
+              "line": 142,
+              "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 106,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 130,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 111,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 142,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 104,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 125,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 111,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 142,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "zalouser-planned-only",
+      "title": "Zalouser connector still ships as a planned-only scaffold",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.2.4",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalouser/manifest.toml",
+              "needle": "status = \"stub\"",
+              "line": 14,
+              "text": "status = \"stub\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalouser/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 49,
+              "text": "            \"surface_status\": \"planned_only\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "connectors/zalouser/src/connector.rs",
+              "needle": "\"surface_status\": \"planned_only\"",
+              "line": 104,
+              "text": "            \"surface_status\": \"planned_only\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/zalouser/src/connector.rs",
+              "needle": "Operation {operation} is planned but not implemented in this connector slice",
+              "line": 125,
+              "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 106,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 130,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 111,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 142,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 104,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 125,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 49,
+          "text": "            \"surface_status\": \"planned_only\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "\"surface_status\": \"planned_only\"",
+          "line": 104,
+          "text": "            \"surface_status\": \"planned_only\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/src/connector.rs",
+          "needle": "Operation {operation} is planned but not implemented in this connector slice",
+          "line": 125,
+          "text": "                    \"Operation {operation} is planned but not implemented in this connector slice\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "huggingface-status-drift",
+      "title": "Hugging Face manifest and runtime status disagree",
+      "classification": "status_drift",
+      "owner_bead": "flywheel_connectors-24llg.2.5",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/huggingface/manifest.toml",
+              "needle": "status = \"stub\"",
+              "line": 14,
+              "text": "status = \"stub\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"surface_status\": \"live\"",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/huggingface/src/connector.rs",
+              "needle": "\"surface_status\": \"live\"",
+              "line": 138,
+              "text": "            \"surface_status\": \"live\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "connectors/huggingface/src/connector.rs",
+              "needle": "\"surface_status\": \"live\"",
+              "line": 271,
+              "text": "            \"surface_status\": \"live\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"live_requests_supported\": self.configured",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/huggingface/src/connector.rs",
+              "needle": "\"live_requests_supported\": self.configured",
+              "line": 155,
+              "text": "            \"live_requests_supported\": self.configured,",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"surface_status\": \"live\"",
+          "line": 138,
+          "text": "            \"surface_status\": \"live\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"live_requests_supported\": self.configured",
+          "line": 155,
+          "text": "            \"live_requests_supported\": self.configured,",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"surface_status\": \"live\"",
+          "line": 271,
+          "text": "            \"surface_status\": \"live\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/tlon/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalo/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/zalouser/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": false,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/huggingface/manifest.toml",
+          "needle": "status = \"stub\"",
+          "line": 14,
+          "text": "status = \"stub\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"surface_status\": \"live\"",
+          "line": 138,
+          "text": "            \"surface_status\": \"live\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"live_requests_supported\": self.configured",
+          "line": 155,
+          "text": "            \"live_requests_supported\": self.configured,",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/huggingface/src/connector.rs",
+          "needle": "\"surface_status\": \"live\"",
+          "line": 271,
+          "text": "            \"surface_status\": \"live\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "aws-fake-sigv4",
+      "title": "AWS connector still uses fake signing instead of SigV4",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.3.2",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/aws/src/connector.rs",
+          "needle": "request_signing_not_implemented",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/aws/src/connector.rs",
+              "needle": "request_signing_not_implemented",
+              "line": 301,
+              "text": "                code: \"request_signing_not_implemented\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "connectors/aws/src/client.rs",
+          "needle": ".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/aws/src/client.rs",
+              "needle": ".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+              "line": 534,
+              "text": "        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/aws/src/client.rs",
+          "needle": ".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+          "line": 534,
+          "text": "        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/aws/src/connector.rs",
+          "needle": "request_signing_not_implemented",
+          "line": 301,
+          "text": "                code: \"request_signing_not_implemented\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/aws/src/client.rs",
+          "needle": ".header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+          "line": 534,
+          "text": "        .header(\"X-Aws-Access-Key-Id\", auth.access_key_id.as_str())",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "connectors/aws/src/connector.rs",
+          "needle": "request_signing_not_implemented",
+          "line": 301,
+          "text": "                code: \"request_signing_not_implemented\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "s3-placeholder-presign",
+      "title": "S3 presigned URLs still carry a placeholder signature",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.3.3",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/s3/src/client.rs",
+          "needle": "PLACEHOLDER_SIGNATURE",
+          "status": "present",
+          "matches": [
+            {
+              "path": "connectors/s3/src/client.rs",
+              "needle": "PLACEHOLDER_SIGNATURE",
+              "line": 484,
+              "text": "             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "connectors/s3/src/client.rs",
+          "needle": "PLACEHOLDER_SIGNATURE",
+          "line": 484,
+          "text": "             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "connectors/s3/src/client.rs",
+          "needle": "PLACEHOLDER_SIGNATURE",
+          "line": 484,
+          "text": "             &X-Amz-Signature=PLACEHOLDER_SIGNATURE\",",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "gcp-service-account-jwt-missing",
+      "title": "GCP service-account auth still refuses JWT bearer signing",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.3.4",
+      "disposition": "runtime_blocker",
+      "status": "drifted",
+      "gate_status": "inventory_drift",
+      "gate_reason": "Committed inventory anchors no longer match the workspace.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "connectors/gcp/src/types.rs",
+          "needle": "GCP service_account mode requires JWT signing, which is not implemented yet.",
+          "status": "missing",
+          "matches": []
+        },
+        {
+          "path": "connectors/gcp/src/connector.rs",
+          "needle": "return Err(SERVICE_ACCOUNT_UNSUPPORTED_MESSAGE.into());",
+          "status": "missing",
+          "matches": []
+        }
+      ],
+      "matches": [],
+      "anchored_matches": [],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "bootstrap-hardware-token-stub",
+      "title": "Bootstrap hardware-token flow is still stubbed and hard-fails",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.4.2",
+      "disposition": "runtime_blocker",
+      "status": "drifted",
+      "gate_status": "inventory_drift",
+      "gate_reason": "Committed inventory anchors no longer match the workspace.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fcp-bootstrap/src/hardware_token.rs",
+          "needle": "This is a stub implementation - a real implementation would use the",
+          "status": "missing",
+          "matches": []
+        },
+        {
+          "path": "crates/fcp-bootstrap/src/workflow.rs",
+          "needle": "Hardware token support not yet fully implemented",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fcp-bootstrap/src/workflow.rs",
+              "needle": "Hardware token support not yet fully implemented",
+              "line": 431,
+              "text": "            \"Hardware token support not yet fully implemented\".to_string(),",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "crates/fcp-bootstrap/src/workflow.rs",
+          "needle": "Hardware token support not yet fully implemented",
+          "line": 431,
+          "text": "            \"Hardware token support not yet fully implemented\".to_string(),",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "crates/fcp-bootstrap/src/workflow.rs",
+          "needle": "Hardware token support not yet fully implemented",
+          "line": 431,
+          "text": "            \"Hardware token support not yet fully implemented\".to_string(),",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "connector-state-crdt-merge-placeholder",
+      "title": "Connector-state fork resolution still treats CRDT merge as a not-implemented placeholder",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.5.1",
+      "disposition": "runtime_blocker",
+      "status": "drifted",
+      "gate_status": "inventory_drift",
+      "gate_reason": "Committed inventory anchors no longer match the workspace.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fcp-core/src/connector_state.rs",
+          "needle": "CRDT merge requires delta-level merging (not implemented in detector)",
+          "status": "missing",
+          "matches": []
+        }
+      ],
+      "matches": [],
+      "anchored_matches": [],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "mesh-planner-zone-filter-placeholder",
+      "title": "Mesh planner zone filtering is still a no-op placeholder",
+      "classification": "runtime_blocker",
+      "owner_bead": "flywheel_connectors-24llg.5.2",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fcp-mesh/src/planner.rs",
+          "needle": "placeholder — needs NodeInfo zone integration",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fcp-mesh/src/planner.rs",
+              "needle": "placeholder — needs NodeInfo zone integration",
+              "line": 698,
+              "text": "                let _ = c; // placeholder — needs NodeInfo zone integration",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "crates/fcp-mesh/src/planner.rs",
+          "needle": "placeholder — needs NodeInfo zone integration",
+          "line": 698,
+          "text": "                let _ = c; // placeholder — needs NodeInfo zone integration",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "crates/fcp-mesh/src/planner.rs",
+          "needle": "placeholder — needs NodeInfo zone integration",
+          "line": 698,
+          "text": "                let _ = c; // placeholder — needs NodeInfo zone integration",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "fwc-intent-log-lifecycle-gap",
+      "title": "fwc intent still explains away missing log and lifecycle primitives",
+      "classification": "operator_gap",
+      "owner_bead": "flywheel_connectors-24llg.6.2",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "Connector log tailing is not implemented as a real `fwc` primitive yet.",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/intent.rs",
+              "needle": "Connector log tailing is not implemented as a real `fwc` primitive yet.",
+              "line": 646,
+              "text": "            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/intent.rs",
+              "needle": "That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.",
+              "line": 649,
+              "text": "            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "Connector log tailing is not implemented as a real `fwc` primitive yet.",
+          "line": 646,
+          "text": "            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.",
+          "line": 649,
+          "text": "            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "Connector log tailing is not implemented as a real `fwc` primitive yet.",
+          "line": 646,
+          "text": "            \"Connector log tailing is not implemented as a real `fwc` primitive yet. Use the closest real evidence surfaces instead.\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/intent.rs",
+          "needle": "That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.",
+          "line": 649,
+          "text": "            \"That lifecycle transition is not implemented as a real `fwc` primitive because the host does not yet expose a truthful endpoint for it.\"",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "fwc-bench-placeholder-results",
+      "title": "fwc bench still mixes placeholder benchmark results into operator output",
+      "classification": "operator_gap",
+      "owner_bead": "flywheel_connectors-24llg.6.3",
+      "disposition": "runtime_blocker",
+      "status": "present",
+      "gate_status": "known_gap_blocking",
+      "gate_reason": "Known production/runtime placeholder gap is still present.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": false,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 2022,
+              "text": "        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 2919,
+              "text": "        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 2932,
+              "text": "        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3074,
+              "text": "        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3081,
+              "text": "            let result = BenchmarkResult::placeholder(",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3163,
+              "text": "        let r = BenchmarkResult::placeholder(\"p\", \"reason\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3170,
+              "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3196,
+              "text": "        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3197,
+              "text": "        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            },
+            {
+              "path": "crates/fwc/src/bench_cmd.rs",
+              "needle": "BenchmarkResult::placeholder(",
+              "line": 3651,
+              "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2022,
+          "text": "        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2919,
+          "text": "        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2932,
+          "text": "        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3074,
+          "text": "        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3081,
+          "text": "            let result = BenchmarkResult::placeholder(",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3163,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"reason\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3170,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3196,
+          "text": "        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3197,
+          "text": "        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3651,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2022,
+          "text": "        let result = BenchmarkResult::placeholder(\"test\", \"pending\").with_targets(Targets {",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2919,
+          "text": "        let result = BenchmarkResult::placeholder(\"test-bench\", \"not ready\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 2932,
+          "text": "        let result = BenchmarkResult::placeholder(\"bench-x\", \"pending\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3074,
+          "text": "        let result = BenchmarkResult::placeholder(format!(\"secrets-{k}-of-{n}\"), \"not implemented\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3081,
+          "text": "            let result = BenchmarkResult::placeholder(",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3163,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"reason\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3170,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3196,
+          "text": "        let r1 = BenchmarkResult::placeholder(\"a\", \"n1\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3197,
+          "text": "        let r2 = BenchmarkResult::placeholder(\"b\", \"n2\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/bench_cmd.rs",
+          "needle": "BenchmarkResult::placeholder(",
+          "line": 3651,
+          "text": "        let r = BenchmarkResult::placeholder(\"p\", \"n\");",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": []
+    },
+    {
+      "id": "fwc-new-generator-runtime-placeholders",
+      "title": "fwc new still emits runtime placeholder operations and TODO-heavy limits",
+      "classification": "scaffold_gap",
+      "owner_bead": "flywheel_connectors-24llg.7.3",
+      "disposition": "allowed_scaffold_candidate",
+      "status": "present",
+      "gate_status": "unexpected_match",
+      "gate_reason": "Placeholder marker appears outside the anchored path or approved exception globs.",
+      "enforced_failure": true,
+      "allowed_scaffold_candidate": true,
+      "approved_exception_class": null,
+      "anchors": [
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "[provides.operations.placeholder_operation]",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/new_cmd.rs",
+              "needle": "[provides.operations.placeholder_operation]",
+              "line": 801,
+              "text": "[provides.operations.placeholder_operation]",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "\"api client not implemented\".to_string()",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/new_cmd.rs",
+              "needle": "\"api client not implemented\".to_string()",
+              "line": 1289,
+              "text": "            \"api client not implemented\".to_string(),",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "TODO: Replace placeholders with the actual service limits before shipping.",
+          "status": "present",
+          "matches": [
+            {
+              "path": "crates/fwc/src/new_cmd.rs",
+              "needle": "TODO: Replace placeholders with the actual service limits before shipping.",
+              "line": 1587,
+              "text": "//! TODO: Replace placeholders with the actual service limits before shipping.",
+              "anchored": true,
+              "inventory_anchored": true,
+              "allowlisted": false
+            }
+          ]
+        }
+      ],
+      "matches": [
+        {
+          "path": "crates/fcp-sdk/src/migration.rs",
+          "needle": "[provides.operations.placeholder_operation]",
+          "line": 858,
+          "text": "[provides.operations.placeholder_operation]",
+          "anchored": false,
+          "inventory_anchored": false,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "[provides.operations.placeholder_operation]",
+          "line": 801,
+          "text": "[provides.operations.placeholder_operation]",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "\"api client not implemented\".to_string()",
+          "line": 1289,
+          "text": "            \"api client not implemented\".to_string(),",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "TODO: Replace placeholders with the actual service limits before shipping.",
+          "line": 1587,
+          "text": "//! TODO: Replace placeholders with the actual service limits before shipping.",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "anchored_matches": [
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "[provides.operations.placeholder_operation]",
+          "line": 801,
+          "text": "[provides.operations.placeholder_operation]",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "\"api client not implemented\".to_string()",
+          "line": 1289,
+          "text": "            \"api client not implemented\".to_string(),",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        },
+        {
+          "path": "crates/fwc/src/new_cmd.rs",
+          "needle": "TODO: Replace placeholders with the actual service limits before shipping.",
+          "line": 1587,
+          "text": "//! TODO: Replace placeholders with the actual service limits before shipping.",
+          "anchored": true,
+          "inventory_anchored": true,
+          "allowlisted": false
+        }
+      ],
+      "allowlisted_matches": [],
+      "unexpected_matches": [
+        {
+          "path": "crates/fcp-sdk/src/migration.rs",
+          "needle": "[provides.operations.placeholder_operation]",
+          "line": 858,
+          "text": "[provides.operations.placeholder_operation]",
+          "anchored": false,
+          "inventory_anchored": false,
+          "allowlisted": false
+        }
+      ]
+    }
+  ]
+}

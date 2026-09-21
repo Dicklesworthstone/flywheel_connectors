@@ -20,32 +20,50 @@
       "description": "Full FWC readiness: manifest complete AND Rust operations_info() includes input_schema, output_schema, and AgentHint (when_to_use + examples). Runtime introspection exposes all mandatory fields.",
       "count": 26,
       "connectors": [
-        {"id": "airtable",         "ops": 16, "cohort": "Productivity",  "gaps": ["replace_record: empty examples in manifest"]},
-        {"id": "anthropic",        "ops": 4,  "cohort": "Ai",            "gaps": []},
-        {"id": "browser",          "ops": 16, "cohort": "Browser",       "gaps": []},
-        {"id": "discord",          "ops": 9,  "cohort": "Messaging",     "gaps": ["edit_message: empty examples", "delete_message: empty examples"]},
-        {"id": "figma",            "ops": 17, "cohort": "Productivity",  "gaps": []},
-        {"id": "github",           "ops": 12, "cohort": "DevTools",      "gaps": []},
-        {"id": "gmail",            "ops": 8,  "cohort": "Messaging",     "gaps": []},
-        {"id": "google-ai",        "ops": 8,  "cohort": "Ai",            "gaps": []},
-        {"id": "google-calendar",  "ops": 11, "cohort": "Productivity",  "gaps": []},
-        {"id": "jira",             "ops": 12, "cohort": "DevTools",      "gaps": []},
-        {"id": "linear",           "ops": 8,  "cohort": "DevTools",      "gaps": []},
-        {"id": "llm-router",       "ops": 5,  "cohort": "Ai",            "gaps": []},
-        {"id": "microsoft365",     "ops": 30, "cohort": "Workspace",     "gaps": []},
-        {"id": "notion",           "ops": 16, "cohort": "Knowledge",     "gaps": []},
-        {"id": "openai",           "ops": 23, "cohort": "Ai",            "gaps": []},
-        {"id": "pinecone",         "ops": 9,  "cohort": "Data",          "gaps": []},
-        {"id": "plaid",            "ops": 10, "cohort": "Finance",       "gaps": []},
-        {"id": "qdrant",           "ops": 12, "cohort": "Data",          "gaps": []},
-        {"id": "s3",               "ops": 10, "cohort": "Storage",       "gaps": []},
-        {"id": "slack",            "ops": 10, "cohort": "Messaging",     "gaps": []},
-        {"id": "stripe",           "ops": 16, "cohort": "Finance",       "gaps": []},
-        {"id": "telegram",         "ops": 4,  "cohort": "Messaging",     "gaps": ["get_file: missing requires_approval", "get_file/answer_callback_query: missing examples in ai_hints"]},
-        {"id": "twilio",           "ops": 10, "cohort": "Messaging",     "gaps": []},
-        {"id": "twitter",          "ops": 21, "cohort": "Social",        "gaps": []},
-        {"id": "youtube",          "ops": 11, "cohort": "Social",        "gaps": []},
-        {"id": "zendesk",          "ops": 10, "cohort": "Workspace",     "gaps": []}
+        {
+          "id": "airtable",
+          "ops": 16,
+          "cohort": "Productivity",
+          "gaps": ["replace_record: empty examples in manifest"]
+        },
+        { "id": "anthropic", "ops": 4, "cohort": "Ai", "gaps": [] },
+        { "id": "browser", "ops": 16, "cohort": "Browser", "gaps": [] },
+        {
+          "id": "discord",
+          "ops": 9,
+          "cohort": "Messaging",
+          "gaps": ["edit_message: empty examples", "delete_message: empty examples"]
+        },
+        { "id": "figma", "ops": 17, "cohort": "Productivity", "gaps": [] },
+        { "id": "github", "ops": 12, "cohort": "DevTools", "gaps": [] },
+        { "id": "gmail", "ops": 8, "cohort": "Messaging", "gaps": [] },
+        { "id": "google-ai", "ops": 8, "cohort": "Ai", "gaps": [] },
+        { "id": "google-calendar", "ops": 11, "cohort": "Productivity", "gaps": [] },
+        { "id": "jira", "ops": 12, "cohort": "DevTools", "gaps": [] },
+        { "id": "linear", "ops": 8, "cohort": "DevTools", "gaps": [] },
+        { "id": "llm-router", "ops": 5, "cohort": "Ai", "gaps": [] },
+        { "id": "microsoft365", "ops": 30, "cohort": "Workspace", "gaps": [] },
+        { "id": "notion", "ops": 16, "cohort": "Knowledge", "gaps": [] },
+        { "id": "openai", "ops": 23, "cohort": "Ai", "gaps": [] },
+        { "id": "pinecone", "ops": 9, "cohort": "Data", "gaps": [] },
+        { "id": "plaid", "ops": 10, "cohort": "Finance", "gaps": [] },
+        { "id": "qdrant", "ops": 12, "cohort": "Data", "gaps": [] },
+        { "id": "s3", "ops": 10, "cohort": "Storage", "gaps": [] },
+        { "id": "slack", "ops": 10, "cohort": "Messaging", "gaps": [] },
+        { "id": "stripe", "ops": 16, "cohort": "Finance", "gaps": [] },
+        {
+          "id": "telegram",
+          "ops": 4,
+          "cohort": "Messaging",
+          "gaps": [
+            "get_file: missing requires_approval",
+            "get_file/answer_callback_query: missing examples in ai_hints"
+          ]
+        },
+        { "id": "twilio", "ops": 10, "cohort": "Messaging", "gaps": [] },
+        { "id": "twitter", "ops": 21, "cohort": "Social", "gaps": [] },
+        { "id": "youtube", "ops": 11, "cohort": "Social", "gaps": [] },
+        { "id": "zendesk", "ops": 10, "cohort": "Workspace", "gaps": [] }
       ]
     },
     "tier_2_manifest_only": {
@@ -53,56 +71,56 @@
       "count": 50,
       "remediation": "Migrate operations_info() from json!([...]) to Vec<OperationInfo> using typed fcp_core structs, pulling input_schema/output_schema/AgentHint from manifest data.",
       "connectors": [
-        {"id": "1password",       "ops": 5,  "cohort": "Storage"},
-        {"id": "algolia",         "ops": 4,  "cohort": "Data"},
-        {"id": "amplitude",       "ops": 3,  "cohort": "Analytics"},
-        {"id": "annas-archive",   "ops": 4,  "cohort": "Knowledge"},
-        {"id": "arxiv",           "ops": 13, "cohort": "Knowledge"},
-        {"id": "asana",           "ops": 5,  "cohort": "Productivity"},
-        {"id": "bigquery",        "ops": 4,  "cohort": "Data"},
-        {"id": "bitbucket",       "ops": 5,  "cohort": "DevTools"},
-        {"id": "bitwarden",       "ops": 5,  "cohort": "Storage"},
-        {"id": "box",             "ops": 5,  "cohort": "Storage"},
-        {"id": "clickup",         "ops": 5,  "cohort": "Productivity"},
-        {"id": "cron",            "ops": 5,  "cohort": "Automation"},
-        {"id": "datadog",         "ops": 8,  "cohort": "Infra"},
-        {"id": "docusign",        "ops": 10, "cohort": "Finance"},
-        {"id": "dropbox",         "ops": 4,  "cohort": "Storage"},
-        {"id": "duckdb",          "ops": 3,  "cohort": "Data"},
-        {"id": "elasticsearch",   "ops": 7,  "cohort": "Data"},
-        {"id": "evernote",        "ops": 5,  "cohort": "Knowledge"},
-        {"id": "gitlab",          "ops": 5,  "cohort": "DevTools"},
-        {"id": "grafana",         "ops": 9,  "cohort": "Infra"},
-        {"id": "homeassistant",   "ops": 15, "cohort": "Automation"},
-        {"id": "hubspot",         "ops": 11, "cohort": "Workspace"},
-        {"id": "intercom",        "ops": 6,  "cohort": "Messaging"},
-        {"id": "kubernetes",      "ops": 18, "cohort": "Infra"},
-        {"id": "linkedin",        "ops": 4,  "cohort": "Social"},
-        {"id": "logseq",          "ops": 4,  "cohort": "Knowledge"},
-        {"id": "mailchimp",       "ops": 5,  "cohort": "Messaging"},
-        {"id": "make",            "ops": 3,  "cohort": "Automation"},
-        {"id": "mcp-bridge",      "ops": 7,  "cohort": "Infra"},
-        {"id": "metabase",        "ops": 3,  "cohort": "Analytics"},
-        {"id": "mixpanel",        "ops": 3,  "cohort": "Analytics"},
-        {"id": "monday",          "ops": 4,  "cohort": "Productivity"},
-        {"id": "mongodb",         "ops": 6,  "cohort": "Data"},
-        {"id": "n8n",             "ops": 5,  "cohort": "Automation"},
-        {"id": "pandadoc",        "ops": 6,  "cohort": "Finance"},
-        {"id": "posthog",         "ops": 3,  "cohort": "Analytics"},
-        {"id": "pulumi",          "ops": 6,  "cohort": "Infra"},
-        {"id": "reddit",          "ops": 9,  "cohort": "Community"},
-        {"id": "retool",          "ops": 2,  "cohort": "Automation"},
-        {"id": "roam",            "ops": 4,  "cohort": "Knowledge"},
-        {"id": "salesforce",      "ops": 13, "cohort": "Workspace"},
-        {"id": "segment",         "ops": 3,  "cohort": "Analytics"},
-        {"id": "semanticscholar", "ops": 7,  "cohort": "Knowledge"},
-        {"id": "sendgrid",        "ops": 5,  "cohort": "Messaging"},
-        {"id": "sentry",          "ops": 17, "cohort": "DevTools"},
-        {"id": "snowflake",       "ops": 5,  "cohort": "Data"},
-        {"id": "spotify",         "ops": 13, "cohort": "Social"},
-        {"id": "todoist",         "ops": 5,  "cohort": "Productivity"},
-        {"id": "trello",          "ops": 5,  "cohort": "Productivity"},
-        {"id": "webhook-receiver","ops": 4,  "cohort": "Automation"}
+        { "id": "1password", "ops": 5, "cohort": "Storage" },
+        { "id": "algolia", "ops": 4, "cohort": "Data" },
+        { "id": "amplitude", "ops": 3, "cohort": "Analytics" },
+        { "id": "annas-archive", "ops": 4, "cohort": "Knowledge" },
+        { "id": "arxiv", "ops": 13, "cohort": "Knowledge" },
+        { "id": "asana", "ops": 5, "cohort": "Productivity" },
+        { "id": "bigquery", "ops": 4, "cohort": "Data" },
+        { "id": "bitbucket", "ops": 5, "cohort": "DevTools" },
+        { "id": "bitwarden", "ops": 5, "cohort": "Storage" },
+        { "id": "box", "ops": 5, "cohort": "Storage" },
+        { "id": "clickup", "ops": 5, "cohort": "Productivity" },
+        { "id": "cron", "ops": 5, "cohort": "Automation" },
+        { "id": "datadog", "ops": 8, "cohort": "Infra" },
+        { "id": "docusign", "ops": 10, "cohort": "Finance" },
+        { "id": "dropbox", "ops": 4, "cohort": "Storage" },
+        { "id": "duckdb", "ops": 3, "cohort": "Data" },
+        { "id": "elasticsearch", "ops": 7, "cohort": "Data" },
+        { "id": "evernote", "ops": 5, "cohort": "Knowledge" },
+        { "id": "gitlab", "ops": 5, "cohort": "DevTools" },
+        { "id": "grafana", "ops": 9, "cohort": "Infra" },
+        { "id": "homeassistant", "ops": 15, "cohort": "Automation" },
+        { "id": "hubspot", "ops": 11, "cohort": "Workspace" },
+        { "id": "intercom", "ops": 6, "cohort": "Messaging" },
+        { "id": "kubernetes", "ops": 18, "cohort": "Infra" },
+        { "id": "linkedin", "ops": 4, "cohort": "Social" },
+        { "id": "logseq", "ops": 4, "cohort": "Knowledge" },
+        { "id": "mailchimp", "ops": 5, "cohort": "Messaging" },
+        { "id": "make", "ops": 3, "cohort": "Automation" },
+        { "id": "mcp-bridge", "ops": 7, "cohort": "Infra" },
+        { "id": "metabase", "ops": 3, "cohort": "Analytics" },
+        { "id": "mixpanel", "ops": 3, "cohort": "Analytics" },
+        { "id": "monday", "ops": 4, "cohort": "Productivity" },
+        { "id": "mongodb", "ops": 6, "cohort": "Data" },
+        { "id": "n8n", "ops": 5, "cohort": "Automation" },
+        { "id": "pandadoc", "ops": 6, "cohort": "Finance" },
+        { "id": "posthog", "ops": 3, "cohort": "Analytics" },
+        { "id": "pulumi", "ops": 6, "cohort": "Infra" },
+        { "id": "reddit", "ops": 9, "cohort": "Community" },
+        { "id": "retool", "ops": 2, "cohort": "Automation" },
+        { "id": "roam", "ops": 4, "cohort": "Knowledge" },
+        { "id": "salesforce", "ops": 13, "cohort": "Workspace" },
+        { "id": "segment", "ops": 3, "cohort": "Analytics" },
+        { "id": "semanticscholar", "ops": 7, "cohort": "Knowledge" },
+        { "id": "sendgrid", "ops": 5, "cohort": "Messaging" },
+        { "id": "sentry", "ops": 17, "cohort": "DevTools" },
+        { "id": "snowflake", "ops": 5, "cohort": "Data" },
+        { "id": "spotify", "ops": 13, "cohort": "Social" },
+        { "id": "todoist", "ops": 5, "cohort": "Productivity" },
+        { "id": "trello", "ops": 5, "cohort": "Productivity" },
+        { "id": "webhook-receiver", "ops": 4, "cohort": "Automation" }
       ]
     },
     "tier_3_no_manifest": {
@@ -110,42 +128,189 @@
       "count": 3,
       "remediation": "Create manifest.toml with [connector] section, [[operations]] entries including ai_hints. Add AgentHint to Rust operations_info().",
       "connectors": [
-        {"id": "postgresql", "ops": 12, "cohort": "Data",   "rust_has_input_schema": true, "rust_has_agent_hints": false},
-        {"id": "redis",      "ops": 14, "cohort": "Data",   "rust_has_input_schema": true, "rust_has_agent_hints": false},
-        {"id": "whisper",    "ops": 8,  "cohort": "Ai",     "rust_has_input_schema": true, "rust_has_agent_hints": false}
+        {
+          "id": "postgresql",
+          "ops": 12,
+          "cohort": "Data",
+          "rust_has_input_schema": true,
+          "rust_has_agent_hints": false
+        },
+        {
+          "id": "redis",
+          "ops": 14,
+          "cohort": "Data",
+          "rust_has_input_schema": true,
+          "rust_has_agent_hints": false
+        },
+        {
+          "id": "whisper",
+          "ops": 8,
+          "cohort": "Ai",
+          "rust_has_input_schema": true,
+          "rust_has_agent_hints": false
+        }
       ]
     },
     "tier_4_structural": {
       "description": "Structural issues beyond the standard pattern: missing ai_hints in manifest, unusual crate structure, or incomplete field coverage.",
       "count": 4,
       "connectors": [
-        {"id": "terraform", "ops": 12, "cohort": "Infra",      "issue": "manifest present but all 12 operations missing [ai_hints] sections (no when_to_use, examples, common_mistakes)", "has_manifest": true, "rust_has_input_schema": false},
-        {"id": "vectordb",  "ops": 9,  "cohort": "Data",       "issue": "uses lib.rs with OperationInfo instead of connector.rs pattern; no standard connector.rs operations_info()", "has_manifest": true, "rust_has_input_schema": false},
-        {"id": "zapier",    "ops": 2,  "cohort": "Automation",  "issue": "Rust has input_schema but no AgentHint/when_to_use in operations_info()", "has_manifest": true, "rust_has_input_schema": true}
+        {
+          "id": "terraform",
+          "ops": 12,
+          "cohort": "Infra",
+          "issue": "manifest present but all 12 operations missing [ai_hints] sections (no when_to_use, examples, common_mistakes)",
+          "has_manifest": true,
+          "rust_has_input_schema": false
+        },
+        {
+          "id": "vectordb",
+          "ops": 9,
+          "cohort": "Data",
+          "issue": "uses lib.rs with OperationInfo instead of connector.rs pattern; no standard connector.rs operations_info()",
+          "has_manifest": true,
+          "rust_has_input_schema": false
+        },
+        {
+          "id": "zapier",
+          "ops": 2,
+          "cohort": "Automation",
+          "issue": "Rust has input_schema but no AgentHint/when_to_use in operations_info()",
+          "has_manifest": true,
+          "rust_has_input_schema": true
+        }
       ]
     }
   },
   "cohort_summary": {
-    "Messaging":    {"total": 7, "ready": 5, "degraded": 2, "connectors": ["discord", "gmail", "slack", "telegram", "twilio", "intercom", "mailchimp", "sendgrid"]},
-    "Social":       {"total": 4, "ready": 2, "degraded": 2, "connectors": ["twitter", "youtube", "linkedin", "spotify"]},
-    "Workspace":    {"total": 3, "ready": 2, "degraded": 1, "connectors": ["microsoft365", "zendesk", "hubspot", "salesforce"]},
-    "Productivity": {"total": 7, "ready": 3, "degraded": 4, "connectors": ["airtable", "figma", "google-calendar", "asana", "clickup", "monday", "todoist", "trello"]},
-    "Ai":           {"total": 4, "ready": 3, "degraded": 1, "connectors": ["anthropic", "google-ai", "llm-router", "openai", "whisper"]},
-    "DevTools":     {"total": 5, "ready": 3, "degraded": 2, "connectors": ["github", "jira", "linear", "bitbucket", "gitlab", "sentry"]},
-    "Infra":        {"total": 5, "ready": 0, "degraded": 5, "connectors": ["datadog", "grafana", "kubernetes", "mcp-bridge", "pulumi", "terraform"]},
-    "Data":         {"total": 7, "ready": 2, "degraded": 5, "connectors": ["pinecone", "qdrant", "algolia", "bigquery", "duckdb", "elasticsearch", "mongodb", "snowflake", "postgresql", "redis", "vectordb"]},
-    "Storage":      {"total": 4, "ready": 1, "degraded": 3, "connectors": ["s3", "1password", "bitwarden", "box", "dropbox"]},
-    "Analytics":    {"total": 4, "ready": 0, "degraded": 4, "connectors": ["amplitude", "metabase", "mixpanel", "posthog", "segment"]},
-    "Finance":      {"total": 3, "ready": 2, "degraded": 1, "connectors": ["plaid", "stripe", "docusign", "pandadoc"]},
-    "Browser":      {"total": 1, "ready": 1, "degraded": 0, "connectors": ["browser"]},
-    "Knowledge":    {"total": 5, "ready": 1, "degraded": 4, "connectors": ["notion", "annas-archive", "arxiv", "evernote", "logseq", "roam", "semanticscholar"]},
-    "Automation":   {"total": 6, "ready": 0, "degraded": 6, "connectors": ["cron", "homeassistant", "make", "n8n", "retool", "webhook-receiver", "zapier"]},
-    "Community":    {"total": 1, "ready": 0, "degraded": 1, "connectors": ["reddit"]}
+    "Messaging": {
+      "total": 7,
+      "ready": 5,
+      "degraded": 2,
+      "connectors": [
+        "discord",
+        "gmail",
+        "slack",
+        "telegram",
+        "twilio",
+        "intercom",
+        "mailchimp",
+        "sendgrid"
+      ]
+    },
+    "Social": {
+      "total": 4,
+      "ready": 2,
+      "degraded": 2,
+      "connectors": ["twitter", "youtube", "linkedin", "spotify"]
+    },
+    "Workspace": {
+      "total": 3,
+      "ready": 2,
+      "degraded": 1,
+      "connectors": ["microsoft365", "zendesk", "hubspot", "salesforce"]
+    },
+    "Productivity": {
+      "total": 7,
+      "ready": 3,
+      "degraded": 4,
+      "connectors": [
+        "airtable",
+        "figma",
+        "google-calendar",
+        "asana",
+        "clickup",
+        "monday",
+        "todoist",
+        "trello"
+      ]
+    },
+    "Ai": {
+      "total": 4,
+      "ready": 3,
+      "degraded": 1,
+      "connectors": ["anthropic", "google-ai", "llm-router", "openai", "whisper"]
+    },
+    "DevTools": {
+      "total": 5,
+      "ready": 3,
+      "degraded": 2,
+      "connectors": ["github", "jira", "linear", "bitbucket", "gitlab", "sentry"]
+    },
+    "Infra": {
+      "total": 5,
+      "ready": 0,
+      "degraded": 5,
+      "connectors": ["datadog", "grafana", "kubernetes", "mcp-bridge", "pulumi", "terraform"]
+    },
+    "Data": {
+      "total": 7,
+      "ready": 2,
+      "degraded": 5,
+      "connectors": [
+        "pinecone",
+        "qdrant",
+        "algolia",
+        "bigquery",
+        "duckdb",
+        "elasticsearch",
+        "mongodb",
+        "snowflake",
+        "postgresql",
+        "redis",
+        "vectordb"
+      ]
+    },
+    "Storage": {
+      "total": 4,
+      "ready": 1,
+      "degraded": 3,
+      "connectors": ["s3", "1password", "bitwarden", "box", "dropbox"]
+    },
+    "Analytics": {
+      "total": 4,
+      "ready": 0,
+      "degraded": 4,
+      "connectors": ["amplitude", "metabase", "mixpanel", "posthog", "segment"]
+    },
+    "Finance": {
+      "total": 3,
+      "ready": 2,
+      "degraded": 1,
+      "connectors": ["plaid", "stripe", "docusign", "pandadoc"]
+    },
+    "Browser": { "total": 1, "ready": 1, "degraded": 0, "connectors": ["browser"] },
+    "Knowledge": {
+      "total": 5,
+      "ready": 1,
+      "degraded": 4,
+      "connectors": [
+        "notion",
+        "annas-archive",
+        "arxiv",
+        "evernote",
+        "logseq",
+        "roam",
+        "semanticscholar"
+      ]
+    },
+    "Automation": {
+      "total": 6,
+      "ready": 0,
+      "degraded": 6,
+      "connectors": ["cron", "homeassistant", "make", "n8n", "retool", "webhook-receiver", "zapier"]
+    },
+    "Community": { "total": 1, "ready": 0, "degraded": 1, "connectors": ["reddit"] }
   },
   "gap_analysis": {
     "primary_gap": {
       "description": "53 of 83 connectors (64%) use raw JSON operations_info() that omits input_schema, output_schema, and AgentHint from runtime introspection. All mandatory fields exist in manifest.toml but are not surfaced at runtime.",
-      "affected_fields": ["input_schema", "output_schema", "ai_hints.when_to_use", "ai_hints.examples"],
+      "affected_fields": [
+        "input_schema",
+        "output_schema",
+        "ai_hints.when_to_use",
+        "ai_hints.examples"
+      ],
       "impact": "fwc commands (ops, schema, invoke) cannot display schemas or agent guidance for these connectors without falling back to manifest parsing.",
       "remediation_effort": "mechanical — migrate json!([...]) to typed OperationInfo construction",
       "estimated_ops": 371,
@@ -192,7 +357,17 @@
       "name": "Tier 2 DevTools + Infra (high-value)",
       "priority": "P1",
       "effort": "mechanical",
-      "connectors": ["bitbucket", "gitlab", "sentry", "datadog", "grafana", "kubernetes", "pulumi", "terraform", "mcp-bridge"],
+      "connectors": [
+        "bitbucket",
+        "gitlab",
+        "sentry",
+        "datadog",
+        "grafana",
+        "kubernetes",
+        "pulumi",
+        "terraform",
+        "mcp-bridge"
+      ],
       "action": "Migrate operations_info() to typed OperationInfo with input_schema, output_schema, AgentHint. Add ai_hints to terraform manifest."
     },
     {
@@ -200,7 +375,24 @@
       "name": "Tier 2 Data + Storage + Analytics",
       "priority": "P1",
       "effort": "mechanical",
-      "connectors": ["algolia", "bigquery", "duckdb", "elasticsearch", "mongodb", "snowflake", "vectordb", "1password", "bitwarden", "box", "dropbox", "amplitude", "metabase", "mixpanel", "posthog", "segment"],
+      "connectors": [
+        "algolia",
+        "bigquery",
+        "duckdb",
+        "elasticsearch",
+        "mongodb",
+        "snowflake",
+        "vectordb",
+        "1password",
+        "bitwarden",
+        "box",
+        "dropbox",
+        "amplitude",
+        "metabase",
+        "mixpanel",
+        "posthog",
+        "segment"
+      ],
       "action": "Migrate operations_info() to typed OperationInfo with full fields"
     },
     {
@@ -208,7 +400,21 @@
       "name": "Tier 2 Productivity + Workspace + Knowledge",
       "priority": "P1",
       "effort": "mechanical",
-      "connectors": ["asana", "clickup", "monday", "todoist", "trello", "hubspot", "salesforce", "annas-archive", "arxiv", "evernote", "logseq", "roam", "semanticscholar"],
+      "connectors": [
+        "asana",
+        "clickup",
+        "monday",
+        "todoist",
+        "trello",
+        "hubspot",
+        "salesforce",
+        "annas-archive",
+        "arxiv",
+        "evernote",
+        "logseq",
+        "roam",
+        "semanticscholar"
+      ],
       "action": "Migrate operations_info() to typed OperationInfo with full fields"
     },
     {
@@ -216,7 +422,20 @@
       "name": "Tier 2 Messaging + Social + Automation + Community",
       "priority": "P2",
       "effort": "mechanical",
-      "connectors": ["intercom", "mailchimp", "sendgrid", "linkedin", "spotify", "reddit", "cron", "homeassistant", "make", "n8n", "retool", "webhook-receiver"],
+      "connectors": [
+        "intercom",
+        "mailchimp",
+        "sendgrid",
+        "linkedin",
+        "spotify",
+        "reddit",
+        "cron",
+        "homeassistant",
+        "make",
+        "n8n",
+        "retool",
+        "webhook-receiver"
+      ],
       "action": "Migrate operations_info() to typed OperationInfo with full fields"
     },
     {

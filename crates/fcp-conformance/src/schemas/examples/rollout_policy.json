@@ -1,20 +1,20 @@
 {
-    "format": "fcp-rollout-policy",
-    "schema_version": "1.0",
-    "canary_percent": 10,
-    "min_canary_duration_secs": 3600,
-    "success_thresholds": {
-        "min_success_rate_bps": 9900,
-        "max_error_rate_bps": 100,
-        "min_samples": 100,
-        "window_secs": 3600
-    },
-    "rollback_rules": {
-        "max_error_rate_bps": 500,
-        "max_consecutive_failures": 3,
-        "min_samples": 30,
-        "window_secs": 600,
-        "auto_rollback": true
-    },
-    "created_at": "2026-02-01T12:00:00Z"
+  "format": "fcp-rollout-policy",
+  "schema_version": "1.0",
+  "canary_percent": 10,
+  "min_canary_duration_secs": 3600,
+  "success_thresholds": {
+    "min_success_rate_bps": 9900,
+    "max_error_rate_bps": 100,
+    "min_samples": 100,
+    "window_secs": 3600
+  },
+  "rollback_rules": {
+    "max_error_rate_bps": 500,
+    "max_consecutive_failures": 3,
+    "min_samples": 30,
+    "window_secs": 600,
+    "auto_rollback": true
+  },
+  "created_at": "2026-02-01T12:00:00Z"
 }

@@ -13,7 +13,5 @@
     }
   ],
   "offline_ready": false,
-  "missing_artifacts": [
-    "binary:x86_64-unknown-linux-gnu"
-  ]
+  "missing_artifacts": ["binary:x86_64-unknown-linux-gnu"]
 }

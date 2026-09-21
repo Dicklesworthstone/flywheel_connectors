@@ -4,22 +4,22 @@
     {
       "name": "starting_state",
       "description": "Connector is starting up",
-      "data": {"state": "starting"}
+      "data": { "state": "starting" }
     },
     {
       "name": "ready_state",
       "description": "Connector is ready to accept requests",
-      "data": {"state": "ready"}
+      "data": { "state": "ready" }
     },
     {
       "name": "degraded_state",
       "description": "Connector is operational but with issues",
-      "data": {"state": "degraded", "reason": "high latency"}
+      "data": { "state": "degraded", "reason": "high latency" }
     },
     {
       "name": "error_state",
       "description": "Connector is in error state",
-      "data": {"state": "error", "reason": "connection refused"}
+      "data": { "state": "error", "reason": "connection refused" }
     }
   ]
 }

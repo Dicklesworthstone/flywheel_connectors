@@ -1,1 +1,9 @@
-{"transfer_length":8,"symbol_size":8,"max_object_size":64,"exact_attempts":8,"malformed_every":0,"fill_byte":17,"exercise_admission_boundary":true}
+{
+  "transfer_length": 8,
+  "symbol_size": 8,
+  "max_object_size": 64,
+  "exact_attempts": 8,
+  "malformed_every": 0,
+  "fill_byte": 17,
+  "exercise_admission_boundary": true
+}

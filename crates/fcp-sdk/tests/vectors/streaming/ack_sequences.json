@@ -178,7 +178,7 @@
       "name": "trim_respects_pending_acks",
       "description": "Buffer retains events with pending acks even when over max",
       "initial_state": {
-        "buffer_limits": {"min": 2, "max": 3},
+        "buffer_limits": { "min": 2, "max": 3 },
         "pending_acks": [1],
         "buffer_seqs": [1, 2, 3, 4]
       },
@@ -196,7 +196,7 @@
       "name": "trim_after_ack",
       "description": "Acking oldest allows buffer to trim",
       "initial_state": {
-        "buffer_limits": {"min": 2, "max": 3},
+        "buffer_limits": { "min": 2, "max": 3 },
         "pending_acks": [1, 2, 3, 4],
         "buffer_seqs": [1, 2, 3, 4]
       },

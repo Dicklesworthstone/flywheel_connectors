@@ -96,11 +96,7 @@
     },
     "outcome": {
       "type": "string",
-      "enum": [
-        "pass",
-        "fail",
-        "planned"
-      ]
+      "enum": ["pass", "fail", "planned"]
     },
     "elapsed_ms": {
       "type": "integer",

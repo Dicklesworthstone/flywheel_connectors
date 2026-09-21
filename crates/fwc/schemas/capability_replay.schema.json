@@ -1,103 +1,98 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "$id": "https://flywheel-connectors.dev/schemas/capability_replay.v1.json",
-    "title": "Capability Replay Output",
-    "description": "Output of `fwc capability replay <token>`. Reconstructs the predicate-evaluation trace for a single capability token from the audit chain.",
-    "type": "object",
-    "required": [
-        "token_hash",
-        "final_verdict",
-        "total_steps",
-        "total_latency_us",
-        "audit_chain_range",
-        "trace"
-    ],
-    "properties": {
-        "token_hash": {
-            "type": "string",
-            "description": "BLAKE3-256 hash of the input token, prefixed with `blake3:`. The raw token MUST NOT appear anywhere in the output; this is the redaction-safe identifier operators see in logs and OTLP spans.",
-            "pattern": "^blake3:[0-9a-f]{1,64}$"
-        },
-        "final_verdict": {
-            "type": "string",
-            "enum": [
-                "accepted",
-                "rejected_predicate",
-                "rejected_revocation",
-                "rejected_expired"
-            ],
-            "description": "Terminal classification of the capability decision."
-        },
-        "total_steps": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Number of predicate steps in `trace`."
-        },
-        "total_latency_us": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Wall-clock latency of the replayed predicate evaluation, in microseconds. Reconstructed from audit-chain timestamps, not re-executed."
-        },
-        "audit_chain_range": {
-            "type": "object",
-            "required": ["start_seq", "end_seq"],
-            "properties": {
-                "start_seq": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "end_seq": {
-                    "type": "integer",
-                    "minimum": 0
-                }
-            },
-            "description": "Inclusive audit-chain sequence number range that the trace was reconstructed from."
-        },
-        "trace": {
-            "type": "array",
-            "items": {
-                "$ref": "#/definitions/PredicateStep"
-            },
-            "description": "Ordered list of predicate evaluation steps."
-        }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://flywheel-connectors.dev/schemas/capability_replay.v1.json",
+  "title": "Capability Replay Output",
+  "description": "Output of `fwc capability replay <token>`. Reconstructs the predicate-evaluation trace for a single capability token from the audit chain.",
+  "type": "object",
+  "required": [
+    "token_hash",
+    "final_verdict",
+    "total_steps",
+    "total_latency_us",
+    "audit_chain_range",
+    "trace"
+  ],
+  "properties": {
+    "token_hash": {
+      "type": "string",
+      "description": "BLAKE3-256 hash of the input token, prefixed with `blake3:`. The raw token MUST NOT appear anywhere in the output; this is the redaction-safe identifier operators see in logs and OTLP spans.",
+      "pattern": "^blake3:[0-9a-f]{1,64}$"
     },
-    "definitions": {
-        "PredicateStep": {
-            "type": "object",
-            "required": [
-                "rule_name",
-                "inputs_json",
-                "output",
-                "witness_chain_indices",
-                "evaluator_version"
-            ],
-            "properties": {
-                "rule_name": {
-                    "type": "string",
-                    "description": "Stable predicate rule identifier (e.g. zone_match, capability_token_signature_verify, revocation_check, expiry_check)."
-                },
-                "inputs_json": {
-                    "type": "object",
-                    "description": "Input bindings the rule was evaluated against. Secrets MUST be replaced with `{ \"<redacted>\": { \"len\": N } }`; raw secret bytes MUST NOT appear here."
-                },
-                "output": {
-                    "type": "boolean",
-                    "description": "Rule result. `false` for any non-terminal-revocation rejection makes `final_verdict = rejected_predicate`."
-                },
-                "witness_chain_indices": {
-                    "type": "array",
-                    "items": {
-                        "type": "integer",
-                        "minimum": 0
-                    },
-                    "description": "Audit-chain sequence numbers carrying the evidence this rule consumed. Cross-check with `fwc audit explain --seq <n>` (Phase M.1)."
-                },
-                "evaluator_version": {
-                    "type": "string",
-                    "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-                    "description": "Semver of the predicate evaluator implementation that produced this step at original evaluation time. Replays MUST use the recorded version, not the current one, when reconstructing."
-                }
-            }
+    "final_verdict": {
+      "type": "string",
+      "enum": ["accepted", "rejected_predicate", "rejected_revocation", "rejected_expired"],
+      "description": "Terminal classification of the capability decision."
+    },
+    "total_steps": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of predicate steps in `trace`."
+    },
+    "total_latency_us": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock latency of the replayed predicate evaluation, in microseconds. Reconstructed from audit-chain timestamps, not re-executed."
+    },
+    "audit_chain_range": {
+      "type": "object",
+      "required": ["start_seq", "end_seq"],
+      "properties": {
+        "start_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_seq": {
+          "type": "integer",
+          "minimum": 0
         }
+      },
+      "description": "Inclusive audit-chain sequence number range that the trace was reconstructed from."
+    },
+    "trace": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PredicateStep"
+      },
+      "description": "Ordered list of predicate evaluation steps."
     }
+  },
+  "definitions": {
+    "PredicateStep": {
+      "type": "object",
+      "required": [
+        "rule_name",
+        "inputs_json",
+        "output",
+        "witness_chain_indices",
+        "evaluator_version"
+      ],
+      "properties": {
+        "rule_name": {
+          "type": "string",
+          "description": "Stable predicate rule identifier (e.g. zone_match, capability_token_signature_verify, revocation_check, expiry_check)."
+        },
+        "inputs_json": {
+          "type": "object",
+          "description": "Input bindings the rule was evaluated against. Secrets MUST be replaced with `{ \"<redacted>\": { \"len\": N } }`; raw secret bytes MUST NOT appear here."
+        },
+        "output": {
+          "type": "boolean",
+          "description": "Rule result. `false` for any non-terminal-revocation rejection makes `final_verdict = rejected_predicate`."
+        },
+        "witness_chain_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Audit-chain sequence numbers carrying the evidence this rule consumed. Cross-check with `fwc audit explain --seq <n>` (Phase M.1)."
+        },
+        "evaluator_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "Semver of the predicate evaluator implementation that produced this step at original evaluation time. Replays MUST use the recorded version, not the current one, when reconstructing."
+        }
+      }
+    }
+  }
 }

@@ -4,7 +4,5 @@
   "body": "{\"event\":\"push\",\"delivery\":\"seed-1\"}",
   "secret": "seed-secret",
   "stripe_timestamp": "1700000000",
-  "stripe_signatures": [
-    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-  ]
+  "stripe_signatures": ["deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]
 }

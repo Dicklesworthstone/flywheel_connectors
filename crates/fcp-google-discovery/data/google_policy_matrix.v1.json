@@ -37,12 +37,8 @@
       {
         "surface_id": "gmail",
         "display_name": "Gmail connector provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/gmail.readonly"
-        ],
-        "required_api_enablement": [
-          "Gmail API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "required_api_enablement": ["Gmail API"],
         "project_prerequisites": [
           "OAuth consent screen configured for the selected project.",
           "OAuth client created for the user-auth flow used by the host provisioning UX."
@@ -60,27 +56,19 @@
           },
           {
             "trigger": "User enables message mutation workflows such as modify or trash.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/gmail.modify"
-            ],
-            "notes": [
-              "Trash/modify should not escalate directly to full mailbox access."
-            ]
+            "add_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+            "notes": ["Trash/modify should not escalate directly to full mailbox access."]
           },
           {
             "trigger": "User explicitly enables permanent delete or import-style full-mailbox operations.",
-            "add_scopes": [
-              "https://mail.google.com/"
-            ],
+            "add_scopes": ["https://mail.google.com/"],
             "notes": [
               "Restricted broad mailbox scope; require explicit acknowledgement that the workflow really needs irreversible or full-mailbox semantics."
             ]
           },
           {
             "trigger": "User enables settings, forwarding, or filter-management workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/gmail.settings.basic"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/gmail.settings.basic"],
             "notes": [
               "Forwarding and filter changes materially affect data routing and remain outside the default path."
             ]
@@ -107,12 +95,8 @@
       {
         "surface_id": "calendar",
         "display_name": "Google Calendar connector provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/calendar.readonly"
-        ],
-        "required_api_enablement": [
-          "Google Calendar API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/calendar.readonly"],
+        "required_api_enablement": ["Google Calendar API"],
         "project_prerequisites": [
           "OAuth consent screen configured for the selected project.",
           "OAuth client created for the interactive Calendar user-auth flow."
@@ -120,21 +104,15 @@
         "escalation_paths": [
           {
             "trigger": "User enables event create, update, delete, or quick-add workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/calendar.events"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "notes": [
               "Prefer event-scoped mutation access over broader calendar-management scopes."
             ]
           },
           {
             "trigger": "User needs to create or manage secondary calendars owned by the app.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/calendar.app.created"
-            ],
-            "notes": [
-              "Use the app-created scope before asking for full calendar ownership."
-            ]
+            "add_scopes": ["https://www.googleapis.com/auth/calendar.app.created"],
+            "notes": ["Use the app-created scope before asking for full calendar ownership."]
           },
           {
             "trigger": "User enables calendar-list mutation, calendar-property mutation, or ACL-management workflows.",
@@ -167,12 +145,8 @@
       {
         "surface_id": "meet",
         "display_name": "Google Meet connector provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/meetings.space.readonly"
-        ],
-        "required_api_enablement": [
-          "Google Meet API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/meetings.space.readonly"],
+        "required_api_enablement": ["Google Meet API"],
         "project_prerequisites": [
           "OAuth consent screen configured for the selected project.",
           "OAuth client created for the interactive Google Meet user-auth flow.",
@@ -181,36 +155,28 @@
         "escalation_paths": [
           {
             "trigger": "User enables Google Meet space creation workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/meetings.space.created"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/meetings.space.created"],
             "notes": [
               "Space creation is a write path and must stay separate from read-only space and conference artifact access."
             ]
           },
           {
             "trigger": "User enables Google Meet active-conference termination workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/meetings.space.created"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/meetings.space.created"],
             "notes": [
               "Ending an active conference is operationally disruptive and should be policy-gated by the connector operation."
             ]
           },
           {
             "trigger": "User enables Google Meet space settings read or patch workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/meetings.space.settings"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/meetings.space.settings"],
             "notes": [
               "Space settings expose or mutate meeting policy and should not be bundled into default artifact reads."
             ]
           },
           {
             "trigger": "User enables Google Meet Drive-backed transcript or smart-note text export.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/drive.meet.readonly"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/drive.meet.readonly"],
             "notes": [
               "Drive-backed Meet artifacts require a distinct Drive scope and must be surfaced as a separate escalation."
             ]
@@ -239,12 +205,8 @@
       {
         "surface_id": "people",
         "display_name": "Google People/Contacts connector provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/contacts.readonly"
-        ],
-        "required_api_enablement": [
-          "People API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/contacts.readonly"],
+        "required_api_enablement": ["People API"],
         "project_prerequisites": [
           "OAuth consent screen configured for the selected project.",
           "OAuth client created for the People user-auth flow used by the host provisioning UX."
@@ -252,27 +214,21 @@
         "escalation_paths": [
           {
             "trigger": "User enables contact create, update, photo update, or group-membership mutation workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/contacts"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/contacts"],
             "notes": [
               "Contact mutation requires the broad contacts scope; do not hide this behind read-only flows."
             ]
           },
           {
             "trigger": "User enables reads from Google-suggested other contacts.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/contacts.other.readonly"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/contacts.other.readonly"],
             "notes": [
               "Other Contacts is a distinct personal-data surface and should be an explicit opt-in above ordinary contact reads."
             ]
           },
           {
             "trigger": "User enables Google Workspace directory search or lookup workflows.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/directory.readonly"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/directory.readonly"],
             "notes": [
               "Directory reads expose org-wide profile data and should remain separate from personal contact access."
             ]
@@ -298,12 +254,8 @@
       {
         "surface_id": "admin_reports",
         "display_name": "Google Workspace Admin Reports connector provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/admin.reports.audit.readonly"
-        ],
-        "required_api_enablement": [
-          "Admin SDK API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/admin.reports.audit.readonly"],
+        "required_api_enablement": ["Admin SDK API"],
         "project_prerequisites": [
           "OAuth consent screen configured for the selected project or delegated Workspace-admin auth path.",
           "A Google Workspace domain administrator or approved delegated-admin credential path exists for the selected tenant.",
@@ -312,9 +264,7 @@
         "escalation_paths": [
           {
             "trigger": "User enables usage-report workflows (user, customer, or entity usage metrics).",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/admin.reports.usage.readonly"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/admin.reports.usage.readonly"],
             "notes": [
               "Usage telemetry is a separate restricted admin surface and should not be silently bundled into audit-log access."
             ]
@@ -341,13 +291,8 @@
       {
         "surface_id": "workspace_events",
         "display_name": "Google Workspace Events + Pub/Sub provisioning",
-        "default_scopes": [
-          "https://www.googleapis.com/auth/chat.messages.readonly"
-        ],
-        "required_api_enablement": [
-          "Google Workspace Events API",
-          "Google Cloud Pub/Sub API"
-        ],
+        "default_scopes": ["https://www.googleapis.com/auth/chat.messages.readonly"],
+        "required_api_enablement": ["Google Workspace Events API", "Google Cloud Pub/Sub API"],
         "project_prerequisites": [
           "Pub/Sub topic created in the same Google Cloud project used for the Workspace Events subscription.",
           "Publisher IAM granted to the Google Workspace delivery service account for the selected event source."
@@ -355,21 +300,15 @@
         "escalation_paths": [
           {
             "trigger": "User selects Chat membership events instead of message-only events.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/chat.memberships.readonly"
-            ],
+            "add_scopes": ["https://www.googleapis.com/auth/chat.memberships.readonly"],
             "notes": [
               "Prefer readonly membership access unless mutation/admin behavior is explicitly requested."
             ]
           },
           {
             "trigger": "User selects Chat space metadata events.",
-            "add_scopes": [
-              "https://www.googleapis.com/auth/chat.spaces.readonly"
-            ],
-            "notes": [
-              "Keep the default user-auth flow on readonly scopes whenever possible."
-            ]
+            "add_scopes": ["https://www.googleapis.com/auth/chat.spaces.readonly"],
+            "notes": ["Keep the default user-auth flow on readonly scopes whenever possible."]
           },
           {
             "trigger": "User enables Chat app-auth or higher-privilege event delivery paths that require administrator approval.",
@@ -428,14 +367,8 @@
         "workflow_id": "gmail.sync_history_checkpointed",
         "service": "gmail",
         "summary": "Incremental mailbox synchronization with checkpoint/lease fencing and history gap recovery.",
-        "operation_dependencies": [
-          "users.history.list",
-          "users.messages.get",
-          "users.threads.get"
-        ],
-        "required_capabilities": [
-          "gmail.read"
-        ],
+        "operation_dependencies": ["users.history.list", "users.messages.get", "users.threads.get"],
+        "required_capabilities": ["gmail.read"],
         "safety_constraints": [
           "Monotonic history checkpoint updates with anti-regression guard.",
           "Lease-aware execution so only one active sync writer advances cursor state."
@@ -453,10 +386,7 @@
           "users.messages.get",
           "users.messages.send"
         ],
-        "required_capabilities": [
-          "gmail.read",
-          "gmail.send"
-        ],
+        "required_capabilities": ["gmail.read", "gmail.send"],
         "safety_constraints": [
           "Recipient/domain allowlist checks before send.",
           "Human-visible draft/summary checkpoint before the send step."
@@ -469,15 +399,8 @@
         "workflow_id": "calendar.find_slot_then_schedule",
         "service": "calendar",
         "summary": "Find available meeting windows then create an event with participant and recurrence constraints.",
-        "operation_dependencies": [
-          "freebusy.query",
-          "events.list",
-          "events.insert"
-        ],
-        "required_capabilities": [
-          "gcal.read",
-          "gcal.write"
-        ],
+        "operation_dependencies": ["freebusy.query", "events.list", "events.insert"],
+        "required_capabilities": ["gcal.read", "gcal.write"],
         "safety_constraints": [
           "Do not schedule outside policy-defined working windows/timezones.",
           "Prevent duplicate event creation with idempotency keys or existing-event checks."
@@ -490,14 +413,8 @@
         "workflow_id": "calendar.safe_reschedule",
         "service": "calendar",
         "summary": "Reschedule existing calendar events with attendee-impact awareness and bounded update fields.",
-        "operation_dependencies": [
-          "events.get",
-          "events.patch"
-        ],
-        "required_capabilities": [
-          "gcal.read",
-          "gcal.write"
-        ],
+        "operation_dependencies": ["events.get", "events.patch"],
+        "required_capabilities": ["gcal.read", "gcal.write"],
         "safety_constraints": [
           "Only allow approved mutable fields for patch operations.",
           "Require explicit confirmation when attendee list or meeting location changes."
@@ -510,11 +427,7 @@
         "workflow_id": "bigquery.budget_guarded_query",
         "service": "bigquery",
         "summary": "Run analytic query jobs only after cost/allowlist preflight and store bounded result metadata.",
-        "operation_dependencies": [
-          "jobs.query",
-          "jobs.get",
-          "tabledata.list"
-        ],
+        "operation_dependencies": ["jobs.query", "jobs.get", "tabledata.list"],
         "required_capabilities": [
           "bigquery.jobs.write",
           "bigquery.jobs.read",
@@ -563,9 +476,7 @@
             "https://www.googleapis.com/auth/bigquery",
             "https://www.googleapis.com/auth/cloud-platform"
           ],
-          "notes": [
-            "Enforce dataset/project allowlists and per-query cost budgets in host policy."
-          ]
+          "notes": ["Enforce dataset/project allowlists and per-query cost budgets in host policy."]
         },
         {
           "operation_pattern": "jobs.*",
@@ -588,9 +499,7 @@
           "safety_tier": "risky",
           "approval_mode": "policy",
           "required_scopes": ["https://www.googleapis.com/auth/bigquery"],
-          "notes": [
-            "Streaming inserts mutate analytic datasets and should be policy-gated."
-          ]
+          "notes": ["Streaming inserts mutate analytic datasets and should be policy-gated."]
         },
         {
           "operation_pattern": "tables.delete",
@@ -599,9 +508,7 @@
           "safety_tier": "dangerous",
           "approval_mode": "interactive",
           "required_scopes": ["https://www.googleapis.com/auth/bigquery"],
-          "notes": [
-            "Permanent table deletion is destructive and requires interactive approval."
-          ]
+          "notes": ["Permanent table deletion is destructive and requires interactive approval."]
         },
         {
           "operation_pattern": "tables.insert",
@@ -1030,9 +937,7 @@
           "safety_tier": "safe",
           "approval_mode": "none",
           "required_scopes": [],
-          "notes": [
-            "Streaming output still requires host-level policy for downstream actions."
-          ]
+          "notes": ["Streaming output still requires host-level policy for downstream actions."]
         },
         {
           "operation_pattern": "cachedContents.create",
@@ -1091,9 +996,7 @@
           "safety_tier": "dangerous",
           "approval_mode": "interactive",
           "required_scopes": ["https://mail.google.com/"],
-          "notes": [
-            "Permanent delete should always require interactive confirmation."
-          ]
+          "notes": ["Permanent delete should always require interactive confirmation."]
         },
         {
           "operation_pattern": "users.messages.trash",
@@ -1283,9 +1186,7 @@
           "safety_tier": "dangerous",
           "approval_mode": "interactive",
           "required_scopes": ["https://www.googleapis.com/auth/contacts"],
-          "notes": [
-            "Bulk contact deletion should never ride on the default read-only posture."
-          ]
+          "notes": ["Bulk contact deletion should never ride on the default read-only posture."]
         },
         {
           "operation_pattern": "people.createContact",
@@ -1334,9 +1235,7 @@
           "safety_tier": "risky",
           "approval_mode": "policy",
           "required_scopes": ["https://www.googleapis.com/auth/contacts"],
-          "notes": [
-            "Photo updates still mutate durable personal profile data."
-          ]
+          "notes": ["Photo updates still mutate durable personal profile data."]
         },
         {
           "operation_pattern": "people.get",
@@ -1368,9 +1267,7 @@
             "https://www.googleapis.com/auth/userinfo.email",
             "https://www.googleapis.com/auth/userinfo.profile"
           ],
-          "notes": [
-            "Batch profile reads amplify privacy impact even when they are non-mutating."
-          ]
+          "notes": ["Batch profile reads amplify privacy impact even when they are non-mutating."]
         },
         {
           "operation_pattern": "people.connections.list",
@@ -1382,9 +1279,7 @@
             "https://www.googleapis.com/auth/contacts.readonly",
             "https://www.googleapis.com/auth/contacts"
           ],
-          "notes": [
-            "Bulk contact enumeration is privacy-sensitive even without mutation."
-          ]
+          "notes": ["Bulk contact enumeration is privacy-sensitive even without mutation."]
         },
         {
           "operation_pattern": "people.searchContacts",
@@ -1404,9 +1299,7 @@
           "risk_level": "medium",
           "safety_tier": "safe",
           "approval_mode": "policy",
-          "required_scopes": [
-            "https://www.googleapis.com/auth/contacts.other.readonly"
-          ],
+          "required_scopes": ["https://www.googleapis.com/auth/contacts.other.readonly"],
           "notes": [
             "Other Contacts is a separate auto-suggested contact corpus and should remain an explicit opt-in."
           ]
@@ -1417,9 +1310,7 @@
           "risk_level": "medium",
           "safety_tier": "safe",
           "approval_mode": "policy",
-          "required_scopes": [
-            "https://www.googleapis.com/auth/directory.readonly"
-          ],
+          "required_scopes": ["https://www.googleapis.com/auth/directory.readonly"],
           "notes": [
             "Directory lookups expose org-wide profile data rather than just the user's contacts."
           ]
@@ -1430,9 +1321,7 @@
           "risk_level": "medium",
           "safety_tier": "safe",
           "approval_mode": "policy",
-          "required_scopes": [
-            "https://www.googleapis.com/auth/directory.readonly"
-          ],
+          "required_scopes": ["https://www.googleapis.com/auth/directory.readonly"],
           "notes": [
             "Directory search should stay policy-gated because it broadens discovery across the workspace."
           ]

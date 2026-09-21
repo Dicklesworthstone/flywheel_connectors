@@ -61,11 +61,7 @@
     "measurement_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "truth_model",
-        "green_requires",
-        "proxy_signals_rejected"
-      ],
+      "required": ["truth_model", "green_requires", "proxy_signals_rejected"],
       "properties": {
         "truth_model": { "const": "fail-closed" },
         "green_requires": { "$ref": "#/$defs/non_empty_string" },
@@ -105,10 +101,7 @@
       "type": "object"
     },
     "nullable_non_negative_integer": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_negative_integer" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_negative_integer" }, { "type": "null" }]
     },
     "nullable_sha256": {
       "anyOf": [

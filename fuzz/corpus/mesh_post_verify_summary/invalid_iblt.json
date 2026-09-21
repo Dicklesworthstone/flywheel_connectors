@@ -1,1 +1,19 @@
-{"now_secs":120,"timestamp":100,"object_filter_digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"symbol_filter_digest":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"object_count":1,"symbol_count":1,"iblt":[110,111,116,45,106,115,111,110],"iblt_mode":1,"summary_ttl_secs":30,"max_objects_per_summary":8,"max_symbols_per_summary":16,"reconciliation_batch_size":4,"epoch_suffix":2}
+{
+  "now_secs": 120,
+  "timestamp": 100,
+  "object_filter_digest": [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ],
+  "symbol_filter_digest": [
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+  ],
+  "object_count": 1,
+  "symbol_count": 1,
+  "iblt": [110, 111, 116, 45, 106, 115, 111, 110],
+  "iblt_mode": 1,
+  "summary_ttl_secs": 30,
+  "max_objects_per_summary": 8,
+  "max_symbols_per_summary": 16,
+  "reconciliation_batch_size": 4,
+  "epoch_suffix": 2
+}

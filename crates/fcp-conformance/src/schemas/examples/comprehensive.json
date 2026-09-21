@@ -146,37 +146,27 @@
       "role_id": "viewer",
       "name": "Viewer",
       "description": "Read-only access",
-      "caps": [
-        { "capability_id": "data:read" }
-      ]
+      "caps": [{ "capability_id": "data:read" }]
     },
     {
       "role_id": "editor",
       "name": "Editor",
       "description": "Read and write access",
-      "caps": [
-        { "capability_id": "data:write" }
-      ],
+      "caps": [{ "capability_id": "data:write" }],
       "includes": ["viewer"]
     },
     {
       "role_id": "operator",
       "name": "Operator",
       "description": "Operational access including API calls",
-      "caps": [
-        { "capability_id": "api:invoke" },
-        { "capability_id": "connector:configure" }
-      ],
+      "caps": [{ "capability_id": "api:invoke" }, { "capability_id": "connector:configure" }],
       "includes": ["editor"]
     },
     {
       "role_id": "admin",
       "name": "Administrator",
       "description": "Full administrative access",
-      "caps": [
-        { "capability_id": "admin:manage" },
-        { "capability_id": "zone:configure" }
-      ],
+      "caps": [{ "capability_id": "admin:manage" }, { "capability_id": "zone:configure" }],
       "includes": ["operator"]
     }
   ],

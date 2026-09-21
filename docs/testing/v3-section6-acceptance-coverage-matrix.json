@@ -13,9 +13,7 @@
   },
   "rows": [
     {
-      "active_scanner_issue_codes": [
-        "src_mock_leakage"
-      ],
+      "active_scanner_issue_codes": ["src_mock_leakage"],
       "affected_connector_count": 17,
       "affected_connectors": [
         "anthropic",
@@ -77,9 +75,7 @@
       "total_scope": "all_connectors"
     },
     {
-      "active_scanner_issue_codes": [
-        "src_mock_leakage"
-      ],
+      "active_scanner_issue_codes": ["src_mock_leakage"],
       "affected_connector_count": 17,
       "affected_connectors": [
         "anthropic",
@@ -152,9 +148,7 @@
       "requirement": "Every connector with lib.rs has deterministic_contract coverage for configure -> health/self_check -> introspect -> invoke lifecycle, error propagation, and provider failure behavior.",
       "sample_affected_connectors": [],
       "scanner_backing": "yes",
-      "scanner_issue_codes": [
-        "missing_deterministic_contract"
-      ],
+      "scanner_issue_codes": ["missing_deterministic_contract"],
       "score": 1.0,
       "section": "6b/6d",
       "status": "scanner_pass_weak",
@@ -175,9 +169,7 @@
       "requirement": "Every connector has at least one final acceptance suite from local_non_mock, host_e2e, or live according to the archetype matrix.",
       "sample_affected_connectors": [],
       "scanner_backing": "yes",
-      "scanner_issue_codes": [
-        "missing_acceptance_suite"
-      ],
+      "scanner_issue_codes": ["missing_acceptance_suite"],
       "score": 1.0,
       "section": "6b/6e",
       "status": "conformant",
@@ -186,9 +178,7 @@
       "total_scope": "all_connectors"
     },
     {
-      "active_scanner_issue_codes": [
-        "src_mock_leakage"
-      ],
+      "active_scanner_issue_codes": ["src_mock_leakage"],
       "affected_connector_count": 17,
       "affected_connectors": [
         "anthropic",
@@ -261,10 +251,7 @@
       "requirement": "Connector archetypes map to the required minimum acceptance boundary: local_non_mock, host_e2e, live, or combinations.",
       "sample_affected_connectors": [],
       "scanner_backing": "partial",
-      "scanner_issue_codes": [
-        "missing_acceptance_suite",
-        "missing_required_live_suite"
-      ],
+      "scanner_issue_codes": ["missing_acceptance_suite", "missing_required_live_suite"],
       "score": 1.0,
       "section": "6e",
       "status": "conformant",
@@ -306,10 +293,7 @@
       "requirement": "When local non-mock is impossible, the connector provides deterministic_contract, host_e2e when expected, live sandbox/device coverage, and README replay guidance.",
       "sample_affected_connectors": [],
       "scanner_backing": "partial",
-      "scanner_issue_codes": [
-        "missing_required_live_suite",
-        "live_suite_missing_env_gate"
-      ],
+      "scanner_issue_codes": ["missing_required_live_suite", "live_suite_missing_env_gate"],
       "score": 1.0,
       "section": "6f",
       "status": "conformant",
@@ -330,9 +314,7 @@
       "requirement": "Every local_non_mock, host_e2e, and live suite emits schema-valid JSONL, suite class, replay artifacts, provenance, and redaction-safe logs.",
       "sample_affected_connectors": [],
       "scanner_backing": "partial",
-      "scanner_issue_codes": [
-        "live_suite_missing_env_gate"
-      ],
+      "scanner_issue_codes": ["live_suite_missing_env_gate"],
       "score": 1.0,
       "section": "6g",
       "status": "scanner_pass_weak",

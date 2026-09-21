@@ -1,51 +1,286 @@
 {
   "fixtures": [
-    { "path": "access/approval_request_bundle.json", "kind": "future_json", "purpose": "Future-facing access-planning approval bundle snapshot.", "validation": "json" },
-    { "path": "access/policy_bundle_current.json", "kind": "policy_bundle", "purpose": "Current zone policy bundle for Track O fixture flows.", "validation": "typed" },
-    { "path": "access/policy_bundle_previous.json", "kind": "policy_bundle", "purpose": "Previous zone policy bundle used for diff and rollback fixtures.", "validation": "typed" },
-    { "path": "access/policy_conflict_report.json", "kind": "future_json", "purpose": "Synthetic policy-conflict report for access remediation UX.", "validation": "json" },
-    { "path": "access/revocation_snapshot.json", "kind": "future_json", "purpose": "Synthetic revocation freshness snapshot for blocked access work.", "validation": "json" },
-    { "path": "api_responses/error_401_response.json", "kind": "api_error", "purpose": "Unauthorized upstream response fixture.", "validation": "json" },
-    { "path": "api_responses/error_429_response.json", "kind": "api_error", "purpose": "Rate-limited upstream response fixture.", "validation": "json" },
-    { "path": "api_responses/error_500_response.json", "kind": "api_error", "purpose": "Generic server-side upstream failure fixture.", "validation": "json" },
-    { "path": "api_responses/github_create_issue_response.json", "kind": "api_response", "purpose": "Output payload matching github.create_issue.", "validation": "schema" },
-    { "path": "api_responses/github_list_issues_response.json", "kind": "api_response", "purpose": "Output payload matching github.list_issues.", "validation": "schema" },
-    { "path": "api_responses/slack_send_message_response.json", "kind": "api_response", "purpose": "Output payload matching slack.send_message.", "validation": "schema" },
-    { "path": "batch/dependent_batch.jsonl", "kind": "batch_jsonl", "purpose": "Dependent heterogeneous batch fixture with explicit ordering.", "validation": "semantic" },
-    { "path": "batch/invalid_batch.jsonl", "kind": "batch_jsonl", "purpose": "Semantically invalid batch fixture for error handling.", "validation": "semantic" },
-    { "path": "batch/mixed_batch.jsonl", "kind": "batch_jsonl", "purpose": "Mixed-connector batch fixture for heterogeneous dispatch.", "validation": "semantic" },
-    { "path": "batch/simple_batch.jsonl", "kind": "batch_jsonl", "purpose": "Homogeneous batch fixture for map-style execution.", "validation": "semantic" },
-    { "path": "generator/truthful_request_response_bundle.json", "kind": "golden_json", "purpose": "Canonical truthful request-response scaffold bundle emitted by fwc new for exact regression coverage.", "validation": "json" },
-    { "path": "golden/access_plan.json", "kind": "golden_json", "purpose": "Future access command JSON render snapshot.", "validation": "json" },
-    { "path": "golden/access_plan.toon", "kind": "golden_toon", "purpose": "Future access command TOON render snapshot.", "validation": "text" },
-    { "path": "golden/dispatch_invocations.json", "kind": "golden_json", "purpose": "Representative future dispatch invocation argv vectors.", "validation": "json" },
-    { "path": "golden/mesh_rollout.json", "kind": "golden_json", "purpose": "Future mesh command JSON render snapshot.", "validation": "json" },
-    { "path": "golden/mesh_rollout.toon", "kind": "golden_toon", "purpose": "Future mesh command TOON render snapshot.", "validation": "text" },
-    { "path": "golden/setup_repair.json", "kind": "golden_json", "purpose": "Future setup command JSON repair snapshot.", "validation": "json" },
-    { "path": "golden/setup_repair.toon", "kind": "golden_toon", "purpose": "Future setup command TOON repair snapshot.", "validation": "text" },
-    { "path": "host_integration/fixture_matrix.json", "kind": "host_integration_matrix", "purpose": "Typed matrix describing representative host-backed fixture coverage across connector archetypes.", "validation": "typed" },
-    { "path": "introspection/github_introspection.json", "kind": "introspection", "purpose": "Rich GitHub introspection response with ten operations.", "validation": "typed" },
-    { "path": "introspection/large_introspection.json", "kind": "introspection", "purpose": "High-cardinality introspection response with fifty operations.", "validation": "typed" },
-    { "path": "introspection/minimal_introspection.json", "kind": "introspection", "purpose": "Minimal single-operation introspection response.", "validation": "typed" },
-    { "path": "introspection/slack_introspection.json", "kind": "introspection", "purpose": "Slack introspection response with five operations.", "validation": "typed" },
-    { "path": "mesh/connector_admin_status_degraded.json", "kind": "mesh_typed", "purpose": "Typed degraded connector admin-state snapshot.", "validation": "typed" },
-    { "path": "mesh/install_output_mirrored.json", "kind": "mesh_local_typed", "purpose": "Install result fixture showing mirrored artifacts.", "validation": "typed-local" },
-    { "path": "mesh/managed_connector_inventory.json", "kind": "mesh_typed", "purpose": "Typed managed inventory snapshot for mesh-aware flows.", "validation": "typed" },
-    { "path": "mesh/node_targeting_snapshot.json", "kind": "future_json", "purpose": "Future node-targeting explanation snapshot for Track Q.", "validation": "json" },
-    { "path": "mesh/offline_availability_snapshot.json", "kind": "future_json", "purpose": "Future offline-availability and mirror snapshot for Track Q.", "validation": "json" },
-    { "path": "mesh/rollout_audit_event_promote.json", "kind": "mesh_typed", "purpose": "Typed rollout promotion audit event.", "validation": "typed" },
-    { "path": "mesh/startup_reconciliation_report.json", "kind": "mesh_typed", "purpose": "Typed startup reconciliation summary for admin-state convergence.", "validation": "typed" },
-    { "path": "operation_inputs/invalid_create_issue.json", "kind": "operation_input", "purpose": "Invalid github.create_issue payload missing a required field.", "validation": "schema" },
-    { "path": "operation_inputs/valid_create_issue.json", "kind": "operation_input", "purpose": "Valid github.create_issue payload.", "validation": "schema" },
-    { "path": "operator_truth/fixture_matrix.json", "kind": "operator_truth_matrix", "purpose": "Frozen operator-truth contract matrix for offline, node-local, mesh-backed, degraded, fallback-derived, and truthful refusal CLI answers, including replay metadata and acceptance-bundle routing.", "validation": "typed" },
-    { "path": "operation_inputs/valid_send_message.json", "kind": "operation_input", "purpose": "Valid slack.send_message payload.", "validation": "schema" },
-    { "path": "pipelines/conditional_pipe.toml", "kind": "pipeline_toml", "purpose": "Conditional pipeline fixture with branch-style conditions.", "validation": "semantic" },
-    { "path": "pipelines/invalid_pipe.toml", "kind": "pipeline_toml", "purpose": "Semantically invalid pipeline fixture with a dependency cycle.", "validation": "semantic" },
-    { "path": "pipelines/multi_step_pipe.toml", "kind": "pipeline_toml", "purpose": "Five-step pipeline fixture for orchestration tests.", "validation": "semantic" },
-    { "path": "pipelines/simple_pipe.toml", "kind": "pipeline_toml", "purpose": "Smallest useful two-step pipeline fixture.", "validation": "semantic" },
-    { "path": "setup/provisioning_recipe_github.json", "kind": "setup_typed", "purpose": "Typed provisioning recipe for OAuth plus webhook onboarding.", "validation": "typed" },
-    { "path": "setup/provisioning_state_awaiting_human.json", "kind": "setup_typed", "purpose": "Typed provisioning state awaiting human action.", "validation": "typed" },
-    { "path": "setup/provisioning_validation_drifted.json", "kind": "setup_typed", "purpose": "Typed provisioning validation failure showing drifted prerequisites.", "validation": "typed" },
-    { "path": "setup/setup_descriptor_github.json", "kind": "setup_typed", "purpose": "Typed setup descriptor for guided GitHub onboarding.", "validation": "typed" }
+    {
+      "path": "access/approval_request_bundle.json",
+      "kind": "future_json",
+      "purpose": "Future-facing access-planning approval bundle snapshot.",
+      "validation": "json"
+    },
+    {
+      "path": "access/policy_bundle_current.json",
+      "kind": "policy_bundle",
+      "purpose": "Current zone policy bundle for Track O fixture flows.",
+      "validation": "typed"
+    },
+    {
+      "path": "access/policy_bundle_previous.json",
+      "kind": "policy_bundle",
+      "purpose": "Previous zone policy bundle used for diff and rollback fixtures.",
+      "validation": "typed"
+    },
+    {
+      "path": "access/policy_conflict_report.json",
+      "kind": "future_json",
+      "purpose": "Synthetic policy-conflict report for access remediation UX.",
+      "validation": "json"
+    },
+    {
+      "path": "access/revocation_snapshot.json",
+      "kind": "future_json",
+      "purpose": "Synthetic revocation freshness snapshot for blocked access work.",
+      "validation": "json"
+    },
+    {
+      "path": "api_responses/error_401_response.json",
+      "kind": "api_error",
+      "purpose": "Unauthorized upstream response fixture.",
+      "validation": "json"
+    },
+    {
+      "path": "api_responses/error_429_response.json",
+      "kind": "api_error",
+      "purpose": "Rate-limited upstream response fixture.",
+      "validation": "json"
+    },
+    {
+      "path": "api_responses/error_500_response.json",
+      "kind": "api_error",
+      "purpose": "Generic server-side upstream failure fixture.",
+      "validation": "json"
+    },
+    {
+      "path": "api_responses/github_create_issue_response.json",
+      "kind": "api_response",
+      "purpose": "Output payload matching github.create_issue.",
+      "validation": "schema"
+    },
+    {
+      "path": "api_responses/github_list_issues_response.json",
+      "kind": "api_response",
+      "purpose": "Output payload matching github.list_issues.",
+      "validation": "schema"
+    },
+    {
+      "path": "api_responses/slack_send_message_response.json",
+      "kind": "api_response",
+      "purpose": "Output payload matching slack.send_message.",
+      "validation": "schema"
+    },
+    {
+      "path": "batch/dependent_batch.jsonl",
+      "kind": "batch_jsonl",
+      "purpose": "Dependent heterogeneous batch fixture with explicit ordering.",
+      "validation": "semantic"
+    },
+    {
+      "path": "batch/invalid_batch.jsonl",
+      "kind": "batch_jsonl",
+      "purpose": "Semantically invalid batch fixture for error handling.",
+      "validation": "semantic"
+    },
+    {
+      "path": "batch/mixed_batch.jsonl",
+      "kind": "batch_jsonl",
+      "purpose": "Mixed-connector batch fixture for heterogeneous dispatch.",
+      "validation": "semantic"
+    },
+    {
+      "path": "batch/simple_batch.jsonl",
+      "kind": "batch_jsonl",
+      "purpose": "Homogeneous batch fixture for map-style execution.",
+      "validation": "semantic"
+    },
+    {
+      "path": "generator/truthful_request_response_bundle.json",
+      "kind": "golden_json",
+      "purpose": "Canonical truthful request-response scaffold bundle emitted by fwc new for exact regression coverage.",
+      "validation": "json"
+    },
+    {
+      "path": "golden/access_plan.json",
+      "kind": "golden_json",
+      "purpose": "Future access command JSON render snapshot.",
+      "validation": "json"
+    },
+    {
+      "path": "golden/access_plan.toon",
+      "kind": "golden_toon",
+      "purpose": "Future access command TOON render snapshot.",
+      "validation": "text"
+    },
+    {
+      "path": "golden/dispatch_invocations.json",
+      "kind": "golden_json",
+      "purpose": "Representative future dispatch invocation argv vectors.",
+      "validation": "json"
+    },
+    {
+      "path": "golden/mesh_rollout.json",
+      "kind": "golden_json",
+      "purpose": "Future mesh command JSON render snapshot.",
+      "validation": "json"
+    },
+    {
+      "path": "golden/mesh_rollout.toon",
+      "kind": "golden_toon",
+      "purpose": "Future mesh command TOON render snapshot.",
+      "validation": "text"
+    },
+    {
+      "path": "golden/setup_repair.json",
+      "kind": "golden_json",
+      "purpose": "Future setup command JSON repair snapshot.",
+      "validation": "json"
+    },
+    {
+      "path": "golden/setup_repair.toon",
+      "kind": "golden_toon",
+      "purpose": "Future setup command TOON repair snapshot.",
+      "validation": "text"
+    },
+    {
+      "path": "host_integration/fixture_matrix.json",
+      "kind": "host_integration_matrix",
+      "purpose": "Typed matrix describing representative host-backed fixture coverage across connector archetypes.",
+      "validation": "typed"
+    },
+    {
+      "path": "introspection/github_introspection.json",
+      "kind": "introspection",
+      "purpose": "Rich GitHub introspection response with ten operations.",
+      "validation": "typed"
+    },
+    {
+      "path": "introspection/large_introspection.json",
+      "kind": "introspection",
+      "purpose": "High-cardinality introspection response with fifty operations.",
+      "validation": "typed"
+    },
+    {
+      "path": "introspection/minimal_introspection.json",
+      "kind": "introspection",
+      "purpose": "Minimal single-operation introspection response.",
+      "validation": "typed"
+    },
+    {
+      "path": "introspection/slack_introspection.json",
+      "kind": "introspection",
+      "purpose": "Slack introspection response with five operations.",
+      "validation": "typed"
+    },
+    {
+      "path": "mesh/connector_admin_status_degraded.json",
+      "kind": "mesh_typed",
+      "purpose": "Typed degraded connector admin-state snapshot.",
+      "validation": "typed"
+    },
+    {
+      "path": "mesh/install_output_mirrored.json",
+      "kind": "mesh_local_typed",
+      "purpose": "Install result fixture showing mirrored artifacts.",
+      "validation": "typed-local"
+    },
+    {
+      "path": "mesh/managed_connector_inventory.json",
+      "kind": "mesh_typed",
+      "purpose": "Typed managed inventory snapshot for mesh-aware flows.",
+      "validation": "typed"
+    },
+    {
+      "path": "mesh/node_targeting_snapshot.json",
+      "kind": "future_json",
+      "purpose": "Future node-targeting explanation snapshot for Track Q.",
+      "validation": "json"
+    },
+    {
+      "path": "mesh/offline_availability_snapshot.json",
+      "kind": "future_json",
+      "purpose": "Future offline-availability and mirror snapshot for Track Q.",
+      "validation": "json"
+    },
+    {
+      "path": "mesh/rollout_audit_event_promote.json",
+      "kind": "mesh_typed",
+      "purpose": "Typed rollout promotion audit event.",
+      "validation": "typed"
+    },
+    {
+      "path": "mesh/startup_reconciliation_report.json",
+      "kind": "mesh_typed",
+      "purpose": "Typed startup reconciliation summary for admin-state convergence.",
+      "validation": "typed"
+    },
+    {
+      "path": "operation_inputs/invalid_create_issue.json",
+      "kind": "operation_input",
+      "purpose": "Invalid github.create_issue payload missing a required field.",
+      "validation": "schema"
+    },
+    {
+      "path": "operation_inputs/valid_create_issue.json",
+      "kind": "operation_input",
+      "purpose": "Valid github.create_issue payload.",
+      "validation": "schema"
+    },
+    {
+      "path": "operator_truth/fixture_matrix.json",
+      "kind": "operator_truth_matrix",
+      "purpose": "Frozen operator-truth contract matrix for offline, node-local, mesh-backed, degraded, fallback-derived, and truthful refusal CLI answers, including replay metadata and acceptance-bundle routing.",
+      "validation": "typed"
+    },
+    {
+      "path": "operation_inputs/valid_send_message.json",
+      "kind": "operation_input",
+      "purpose": "Valid slack.send_message payload.",
+      "validation": "schema"
+    },
+    {
+      "path": "pipelines/conditional_pipe.toml",
+      "kind": "pipeline_toml",
+      "purpose": "Conditional pipeline fixture with branch-style conditions.",
+      "validation": "semantic"
+    },
+    {
+      "path": "pipelines/invalid_pipe.toml",
+      "kind": "pipeline_toml",
+      "purpose": "Semantically invalid pipeline fixture with a dependency cycle.",
+      "validation": "semantic"
+    },
+    {
+      "path": "pipelines/multi_step_pipe.toml",
+      "kind": "pipeline_toml",
+      "purpose": "Five-step pipeline fixture for orchestration tests.",
+      "validation": "semantic"
+    },
+    {
+      "path": "pipelines/simple_pipe.toml",
+      "kind": "pipeline_toml",
+      "purpose": "Smallest useful two-step pipeline fixture.",
+      "validation": "semantic"
+    },
+    {
+      "path": "setup/provisioning_recipe_github.json",
+      "kind": "setup_typed",
+      "purpose": "Typed provisioning recipe for OAuth plus webhook onboarding.",
+      "validation": "typed"
+    },
+    {
+      "path": "setup/provisioning_state_awaiting_human.json",
+      "kind": "setup_typed",
+      "purpose": "Typed provisioning state awaiting human action.",
+      "validation": "typed"
+    },
+    {
+      "path": "setup/provisioning_validation_drifted.json",
+      "kind": "setup_typed",
+      "purpose": "Typed provisioning validation failure showing drifted prerequisites.",
+      "validation": "typed"
+    },
+    {
+      "path": "setup/setup_descriptor_github.json",
+      "kind": "setup_typed",
+      "purpose": "Typed setup descriptor for guided GitHub onboarding.",
+      "validation": "typed"
+    }
   ]
 }

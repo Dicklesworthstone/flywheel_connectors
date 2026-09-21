@@ -14,14 +14,20 @@
       "minLength": 1
     },
     "nullable_non_empty_string": {
-      "anyOf": [
-        { "$ref": "#/$defs/non_empty_string" },
-        { "type": "null" }
-      ]
+      "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }]
     },
     "truth_source": {
       "type": "string",
-      "enum": ["mesh", "host", "node-local", "offline", "degraded", "fallback-derived", "simulated", "unavailable"]
+      "enum": [
+        "mesh",
+        "host",
+        "node-local",
+        "offline",
+        "degraded",
+        "fallback-derived",
+        "simulated",
+        "unavailable"
+      ]
     },
     "truth_requirement": {
       "type": "string",
@@ -105,13 +111,7 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "name",
-            "endpoint",
-            "default_zone",
-            "node_identity",
-            "config_overrides"
-          ],
+          "required": ["name", "endpoint", "default_zone", "node_identity", "config_overrides"],
           "properties": {
             "name": { "$ref": "#/$defs/non_empty_string" },
             "endpoint": { "$ref": "#/$defs/non_empty_string" },

@@ -1,102 +1,102 @@
 {
-    "comment": "Golden mutation-kind cases for MutationHarness. Each entry asserts that applying the named kind to `input_bytes_hex` at `byte_index` produces `expected_mutated_bytes_hex`. The harness loads these to verify its mutation engine matches the spec — independent of any connector parse step. Filed under flywheel_connectors-angoc.18.2.",
-    "kinds": [
-        {
-            "kind": "BitFlip",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 0,
-            "bit_index": 0,
-            "expected_mutated_bytes_hex": "49656c6c6f",
-            "note": "Flip bit 0 of 'H' (0x48) → 0x49 = 'I'"
-        },
-        {
-            "kind": "BitFlip",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 0,
-            "bit_index": 7,
-            "expected_mutated_bytes_hex": "c8656c6c6f",
-            "note": "Flip bit 7 (sign-bit) of 'H' (0x48) → 0xC8; same as HighBitFlip"
-        },
-        {
-            "kind": "ByteZero",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 2,
-            "expected_mutated_bytes_hex": "4865006c6f",
-            "note": "Replace 3rd byte 'l' with 0x00"
-        },
-        {
-            "kind": "ByteMax",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 4,
-            "expected_mutated_bytes_hex": "48656c6cff",
-            "note": "Replace last byte 'o' with 0xFF"
-        },
-        {
-            "kind": "Truncate",
-            "input_bytes_hex": "48656c6c6f20576f726c64",
-            "truncate_last_n": 5,
-            "expected_mutated_bytes_hex": "48656c6c6f20",
-            "note": "Drop last 5 bytes from 'Hello World' (11 bytes) → 'Hello ' (6 bytes)"
-        },
-        {
-            "kind": "Truncate",
-            "input_bytes_hex": "48656c6c6f20576f726c64",
-            "truncate_last_n": 11,
-            "expected_mutated_bytes_hex": "",
-            "note": "Truncate the entire input; harness should produce an empty slice without panic"
-        },
-        {
-            "kind": "NullByteInjection",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 2,
-            "expected_mutated_bytes_hex": "4865006c6c6f",
-            "note": "Insert 0x00 before byte index 2; original 5 bytes become 6 bytes"
-        },
-        {
-            "kind": "HighBitFlip",
-            "input_bytes_hex": "48656c6c6f",
-            "byte_index": 1,
-            "expected_mutated_bytes_hex": "48e56c6c6f",
-            "note": "XOR byte index 1 ('e' = 0x65) with 0x80 → 0xE5"
-        }
-    ],
-    "result_classes": [
-        {
-            "class": "Rejected",
-            "description": "parse_fn returns Err(_) with a structured error type. The GOOD path: connector caught the malformed input.",
-            "ok_pattern": "Err(ParseError::* or InvalidFieldError::*)"
-        },
-        {
-            "class": "GracefulFieldError",
-            "description": "parse_fn returns Ok(T) where T carries a field-level error variant. Connector parsed the envelope but flagged a bad field.",
-            "ok_pattern": "Ok(Response { ..., fields: [.., FieldResult::Error { .. }, ..] })"
-        },
-        {
-            "class": "GracefulPartialAccept",
-            "description": "parse_fn returns Ok(T) from a mutation that only affected a truly-don't-care byte. Acceptable.",
-            "ok_pattern": "Ok(T) AND mutation_byte_position was in unused/padding region"
-        },
-        {
-            "class": "SilentAccept",
-            "description": "THE BUG: parse_fn returns Ok(T) with the mutated payload silently coerced or truncated. Mutation report flags this.",
-            "ok_pattern": "Ok(T) AND mutation_byte_position changed a load-bearing field AND error not surfaced"
-        },
-        {
-            "class": "PanicDetected",
-            "description": "parse_fn panicked. Hard fail; harness uses catch_unwind to recover and continue tallying.",
-            "ok_pattern": "(panic caught by catch_unwind)"
-        }
-    ],
-    "expected_pilot_outcomes": [
-        {
-            "pilot": "connectors/stripe",
-            "operation": "stripe.charge.get",
-            "mutations": 200,
-            "max_panics": 0,
-            "max_silent_accept": 0,
-            "min_rejected_pct": 50,
-            "p99_latency_ms": 30,
-            "note": "Stripe charge response has amount + currency + status as load-bearing fields; silent coercion on any of those is operationally dangerous."
-        }
-    ]
+  "comment": "Golden mutation-kind cases for MutationHarness. Each entry asserts that applying the named kind to `input_bytes_hex` at `byte_index` produces `expected_mutated_bytes_hex`. The harness loads these to verify its mutation engine matches the spec — independent of any connector parse step. Filed under flywheel_connectors-angoc.18.2.",
+  "kinds": [
+    {
+      "kind": "BitFlip",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 0,
+      "bit_index": 0,
+      "expected_mutated_bytes_hex": "49656c6c6f",
+      "note": "Flip bit 0 of 'H' (0x48) → 0x49 = 'I'"
+    },
+    {
+      "kind": "BitFlip",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 0,
+      "bit_index": 7,
+      "expected_mutated_bytes_hex": "c8656c6c6f",
+      "note": "Flip bit 7 (sign-bit) of 'H' (0x48) → 0xC8; same as HighBitFlip"
+    },
+    {
+      "kind": "ByteZero",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 2,
+      "expected_mutated_bytes_hex": "4865006c6f",
+      "note": "Replace 3rd byte 'l' with 0x00"
+    },
+    {
+      "kind": "ByteMax",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 4,
+      "expected_mutated_bytes_hex": "48656c6cff",
+      "note": "Replace last byte 'o' with 0xFF"
+    },
+    {
+      "kind": "Truncate",
+      "input_bytes_hex": "48656c6c6f20576f726c64",
+      "truncate_last_n": 5,
+      "expected_mutated_bytes_hex": "48656c6c6f20",
+      "note": "Drop last 5 bytes from 'Hello World' (11 bytes) → 'Hello ' (6 bytes)"
+    },
+    {
+      "kind": "Truncate",
+      "input_bytes_hex": "48656c6c6f20576f726c64",
+      "truncate_last_n": 11,
+      "expected_mutated_bytes_hex": "",
+      "note": "Truncate the entire input; harness should produce an empty slice without panic"
+    },
+    {
+      "kind": "NullByteInjection",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 2,
+      "expected_mutated_bytes_hex": "4865006c6c6f",
+      "note": "Insert 0x00 before byte index 2; original 5 bytes become 6 bytes"
+    },
+    {
+      "kind": "HighBitFlip",
+      "input_bytes_hex": "48656c6c6f",
+      "byte_index": 1,
+      "expected_mutated_bytes_hex": "48e56c6c6f",
+      "note": "XOR byte index 1 ('e' = 0x65) with 0x80 → 0xE5"
+    }
+  ],
+  "result_classes": [
+    {
+      "class": "Rejected",
+      "description": "parse_fn returns Err(_) with a structured error type. The GOOD path: connector caught the malformed input.",
+      "ok_pattern": "Err(ParseError::* or InvalidFieldError::*)"
+    },
+    {
+      "class": "GracefulFieldError",
+      "description": "parse_fn returns Ok(T) where T carries a field-level error variant. Connector parsed the envelope but flagged a bad field.",
+      "ok_pattern": "Ok(Response { ..., fields: [.., FieldResult::Error { .. }, ..] })"
+    },
+    {
+      "class": "GracefulPartialAccept",
+      "description": "parse_fn returns Ok(T) from a mutation that only affected a truly-don't-care byte. Acceptable.",
+      "ok_pattern": "Ok(T) AND mutation_byte_position was in unused/padding region"
+    },
+    {
+      "class": "SilentAccept",
+      "description": "THE BUG: parse_fn returns Ok(T) with the mutated payload silently coerced or truncated. Mutation report flags this.",
+      "ok_pattern": "Ok(T) AND mutation_byte_position changed a load-bearing field AND error not surfaced"
+    },
+    {
+      "class": "PanicDetected",
+      "description": "parse_fn panicked. Hard fail; harness uses catch_unwind to recover and continue tallying.",
+      "ok_pattern": "(panic caught by catch_unwind)"
+    }
+  ],
+  "expected_pilot_outcomes": [
+    {
+      "pilot": "connectors/stripe",
+      "operation": "stripe.charge.get",
+      "mutations": 200,
+      "max_panics": 0,
+      "max_silent_accept": 0,
+      "min_rejected_pct": 50,
+      "p99_latency_ms": 30,
+      "note": "Stripe charge response has amount + currency + status as load-bearing fields; silent coercion on any of those is operationally dangerous."
+    }
+  ]
 }

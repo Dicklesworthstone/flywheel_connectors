@@ -1,51 +1,51 @@
 {
-    "agent_name": "SunnyMoose",
-    "mode": "fresh",
-    "identity": {
-        "created": true,
-        "agent_mail_status": "registered",
-        "owner_email": "operator@example.dev",
-        "identity_id": "ident-7c3e9f1a-2b8d-4e6f-9c1a-9b8d7e6f5c4a"
+  "agent_name": "SunnyMoose",
+  "mode": "fresh",
+  "identity": {
+    "created": true,
+    "agent_mail_status": "registered",
+    "owner_email": "operator@example.dev",
+    "identity_id": "ident-7c3e9f1a-2b8d-4e6f-9c1a-9b8d7e6f5c4a"
+  },
+  "reservation": {
+    "scope": "src/**",
+    "ttl_seconds": 3600,
+    "extended": false,
+    "reason": "flywheel_connectors-angoc.6.2",
+    "expires_at": "2026-05-14T03:00:00Z"
+  },
+  "ready_beads": [
+    {
+      "id": "flywheel_connectors-angoc.7.2.1",
+      "title": "[Phase M.5.1] Deferred Rust impl for audit-chain OTLP parity export",
+      "priority": 3,
+      "score": 0.18
     },
-    "reservation": {
-        "scope": "src/**",
-        "ttl_seconds": 3600,
-        "extended": false,
-        "reason": "flywheel_connectors-angoc.6.2",
-        "expires_at": "2026-05-14T03:00:00Z"
-    },
-    "ready_beads": [
-        {
-            "id": "flywheel_connectors-angoc.7.2.1",
-            "title": "[Phase M.5.1] Deferred Rust impl for audit-chain OTLP parity export",
-            "priority": 3,
-            "score": 0.18
-        },
-        {
-            "id": "flywheel_connectors-angoc.18.2.1",
-            "title": "[Phase H.2.1] Deferred Rust impl for mutation testing harness",
-            "priority": 3,
-            "score": 0.15
-        }
-    ],
-    "commit_template": {
-        "path": ".git/info/exclude_template",
-        "written": true
-    },
-    "doctor": {
-        "probes_run": 6,
-        "passed": 6,
-        "failed": 0,
-        "skipped": 0,
-        "by_probe": {
-            "agent_mail_health": "pass",
-            "disk_pressure": "pass",
-            "rch_worker_reachability": "pass",
-            "beads_db_integrity": "pass",
-            "agent_name_prefix": "pass",
-            "recent_commit_signing": "pass"
-        }
-    },
-    "total_duration_ms": 1245,
-    "exit_code": 0
+    {
+      "id": "flywheel_connectors-angoc.18.2.1",
+      "title": "[Phase H.2.1] Deferred Rust impl for mutation testing harness",
+      "priority": 3,
+      "score": 0.15
+    }
+  ],
+  "commit_template": {
+    "path": ".git/info/exclude_template",
+    "written": true
+  },
+  "doctor": {
+    "probes_run": 6,
+    "passed": 6,
+    "failed": 0,
+    "skipped": 0,
+    "by_probe": {
+      "agent_mail_health": "pass",
+      "disk_pressure": "pass",
+      "rch_worker_reachability": "pass",
+      "beads_db_integrity": "pass",
+      "agent_name_prefix": "pass",
+      "recent_commit_signing": "pass"
+    }
+  },
+  "total_duration_ms": 1245,
+  "exit_code": 0
 }

@@ -110,14 +110,7 @@
     "script_entry": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "timestamp",
-        "script",
-        "step",
-        "correlation_id",
-        "duration_ms",
-        "result"
-      ],
+      "required": ["timestamp", "script", "step", "correlation_id", "duration_ms", "result"],
       "properties": {
         "timestamp": { "$ref": "#/$defs/timestamp" },
         "log_version": { "$ref": "#/$defs/log_version" },

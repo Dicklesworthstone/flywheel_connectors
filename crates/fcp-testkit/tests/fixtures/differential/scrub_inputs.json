@@ -1,92 +1,102 @@
 {
-    "comment": "Golden inputs + expected scrubbed outputs for DifferentialHarness default rules. Each entry asserts that applying the named rule to `input` produces `expected`. Filed under flywheel_connectors-angoc.18.1.",
-    "cases": [
-        {
-            "rule": "uuid_v4",
-            "input": "request_id=550e8400-e29b-41d4-a716-446655440000",
-            "expected": "request_id=<UUID>",
-            "note": "RFC 4122 v4 UUID with the canonical 4xxx variant byte"
-        },
-        {
-            "rule": "uuid_v4",
-            "input": "uuid_lowercase: 7c3e9f1a-2b8d-4e6f-9c1a-9b8d7e6f5c4a and uuid_upper: 7C3E9F1A-2B8D-4E6F-9C1A-9B8D7E6F5C4A",
-            "expected": "uuid_lowercase: <UUID> and uuid_upper: 7C3E9F1A-2B8D-4E6F-9C1A-9B8D7E6F5C4A",
-            "note": "Default rule matches lowercase only; uppercase UUIDs need a separate rule or case-insensitive flag"
-        },
-        {
-            "rule": "rfc3339_timestamp",
-            "input": "created_at=2026-05-13T18:42:31Z, updated_at=2026-05-13T19:00:00.123+00:00",
-            "expected": "created_at=<TS>, updated_at=<TS>",
-            "note": "Both Z and explicit offset forms"
-        },
-        {
-            "rule": "rfc3339_timestamp",
-            "input": "deadline=2026-12-31T23:59:59-08:00",
-            "expected": "deadline=<TS>",
-            "note": "Negative offset"
-        },
-        {
-            "rule": "unix_seconds_2026",
-            "input": "iat=1715630400 exp=1715716800",
-            "expected": "iat=<UNIX> exp=<UNIX>",
-            "note": "10-digit epoch seconds in 2023-2029 window"
-        },
-        {
-            "rule": "unix_millis_2026",
-            "input": "ts_ms=1715630400000",
-            "expected": "ts_ms=<UNIX_MS>",
-            "note": "13-digit epoch millis"
-        },
-        {
-            "rule": "bearer_token_prefix",
-            "input": "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789",
-            "expected": "Authorization: Bearer <TOKEN>",
-            "note": "GitHub-style PAT bearer; harness must not leak token bytes"
-        },
-        {
-            "rule": "etag",
-            "input": "If-Match: \"abc123def456\" and weak: W/\"7c3e9f1a\"",
-            "expected": "If-Match: \"<ETAG>\" and weak: W/\"<ETAG>\"",
-            "note": "Both strong and weak ETag forms"
-        },
-        {
-            "rule": "connection_id",
-            "input": "stripe_request_id=req_QWERTYUIOPasdfghjkl and webhook_id=cnx_a1b2c3d4",
-            "expected": "stripe_request_id=<CONN_ID> and webhook_id=<CONN_ID>",
-            "note": "Stripe-style req_ + generic cnx_ prefixes"
-        }
-    ],
-    "diff_cases": [
-        {
-            "name": "equivalent_after_scrub",
-            "loopback": {"id": "fixture-uuid-7c3e9f1a", "created_at": "2026-05-13T18:42:31Z", "amount": 12.50, "currency": "USD"},
-            "live": {"id": "live-uuid-9a2b3c4d", "created_at": "2026-05-13T19:00:00Z", "amount": 12.50, "currency": "USD"},
-            "expected_verdict": "equivalent",
-            "note": "Loopback and live differ in id + timestamp only — those are scrubbed; rest is byte-equivalent"
-        },
-        {
-            "name": "divergent_field_currency",
-            "loopback": {"id": "u1", "amount": 12.50, "currency": "USD"},
-            "live": {"id": "u2", "amount": 12.50, "currency": "EUR"},
-            "expected_verdict": "divergent",
-            "expected_field": "currency",
-            "note": "currency mismatch is real semantic drift"
-        },
-        {
-            "name": "divergent_missing_field",
-            "loopback": {"id": "u1", "amount": 12.50},
-            "live": {"id": "u2", "amount": 12.50, "currency": "USD"},
-            "expected_verdict": "divergent",
-            "expected_field": "currency",
-            "note": "live added a field the loopback fixture doesn't return"
-        },
-        {
-            "name": "parse_error_live_invalid_json",
-            "loopback": {"id": "u1"},
-            "live_raw": "<html>503 Service Unavailable</html>",
-            "expected_verdict": "parse_error",
-            "expected_side": "Live",
-            "note": "Live returned HTML error page; harness short-circuits to ParseError"
-        }
-    ]
+  "comment": "Golden inputs + expected scrubbed outputs for DifferentialHarness default rules. Each entry asserts that applying the named rule to `input` produces `expected`. Filed under flywheel_connectors-angoc.18.1.",
+  "cases": [
+    {
+      "rule": "uuid_v4",
+      "input": "request_id=550e8400-e29b-41d4-a716-446655440000",
+      "expected": "request_id=<UUID>",
+      "note": "RFC 4122 v4 UUID with the canonical 4xxx variant byte"
+    },
+    {
+      "rule": "uuid_v4",
+      "input": "uuid_lowercase: 7c3e9f1a-2b8d-4e6f-9c1a-9b8d7e6f5c4a and uuid_upper: 7C3E9F1A-2B8D-4E6F-9C1A-9B8D7E6F5C4A",
+      "expected": "uuid_lowercase: <UUID> and uuid_upper: 7C3E9F1A-2B8D-4E6F-9C1A-9B8D7E6F5C4A",
+      "note": "Default rule matches lowercase only; uppercase UUIDs need a separate rule or case-insensitive flag"
+    },
+    {
+      "rule": "rfc3339_timestamp",
+      "input": "created_at=2026-05-13T18:42:31Z, updated_at=2026-05-13T19:00:00.123+00:00",
+      "expected": "created_at=<TS>, updated_at=<TS>",
+      "note": "Both Z and explicit offset forms"
+    },
+    {
+      "rule": "rfc3339_timestamp",
+      "input": "deadline=2026-12-31T23:59:59-08:00",
+      "expected": "deadline=<TS>",
+      "note": "Negative offset"
+    },
+    {
+      "rule": "unix_seconds_2026",
+      "input": "iat=1715630400 exp=1715716800",
+      "expected": "iat=<UNIX> exp=<UNIX>",
+      "note": "10-digit epoch seconds in 2023-2029 window"
+    },
+    {
+      "rule": "unix_millis_2026",
+      "input": "ts_ms=1715630400000",
+      "expected": "ts_ms=<UNIX_MS>",
+      "note": "13-digit epoch millis"
+    },
+    {
+      "rule": "bearer_token_prefix",
+      "input": "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789",
+      "expected": "Authorization: Bearer <TOKEN>",
+      "note": "GitHub-style PAT bearer; harness must not leak token bytes"
+    },
+    {
+      "rule": "etag",
+      "input": "If-Match: \"abc123def456\" and weak: W/\"7c3e9f1a\"",
+      "expected": "If-Match: \"<ETAG>\" and weak: W/\"<ETAG>\"",
+      "note": "Both strong and weak ETag forms"
+    },
+    {
+      "rule": "connection_id",
+      "input": "stripe_request_id=req_QWERTYUIOPasdfghjkl and webhook_id=cnx_a1b2c3d4",
+      "expected": "stripe_request_id=<CONN_ID> and webhook_id=<CONN_ID>",
+      "note": "Stripe-style req_ + generic cnx_ prefixes"
+    }
+  ],
+  "diff_cases": [
+    {
+      "name": "equivalent_after_scrub",
+      "loopback": {
+        "id": "fixture-uuid-7c3e9f1a",
+        "created_at": "2026-05-13T18:42:31Z",
+        "amount": 12.5,
+        "currency": "USD"
+      },
+      "live": {
+        "id": "live-uuid-9a2b3c4d",
+        "created_at": "2026-05-13T19:00:00Z",
+        "amount": 12.5,
+        "currency": "USD"
+      },
+      "expected_verdict": "equivalent",
+      "note": "Loopback and live differ in id + timestamp only — those are scrubbed; rest is byte-equivalent"
+    },
+    {
+      "name": "divergent_field_currency",
+      "loopback": { "id": "u1", "amount": 12.5, "currency": "USD" },
+      "live": { "id": "u2", "amount": 12.5, "currency": "EUR" },
+      "expected_verdict": "divergent",
+      "expected_field": "currency",
+      "note": "currency mismatch is real semantic drift"
+    },
+    {
+      "name": "divergent_missing_field",
+      "loopback": { "id": "u1", "amount": 12.5 },
+      "live": { "id": "u2", "amount": 12.5, "currency": "USD" },
+      "expected_verdict": "divergent",
+      "expected_field": "currency",
+      "note": "live added a field the loopback fixture doesn't return"
+    },
+    {
+      "name": "parse_error_live_invalid_json",
+      "loopback": { "id": "u1" },
+      "live_raw": "<html>503 Service Unavailable</html>",
+      "expected_verdict": "parse_error",
+      "expected_side": "Live",
+      "note": "Live returned HTML error page; harness short-circuits to ParseError"
+    }
+  ]
 }

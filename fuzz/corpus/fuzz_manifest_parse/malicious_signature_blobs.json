@@ -1,1 +1,1 @@
-{"case":"malicious_signature_blobs","manifest_vector":"manifest_valid.toml"}
+{ "case": "malicious_signature_blobs", "manifest_vector": "manifest_valid.toml" }

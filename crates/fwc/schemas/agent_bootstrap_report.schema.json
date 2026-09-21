@@ -1,156 +1,156 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "$id": "https://flywheel-connectors.dev/schemas/agent_bootstrap_report.v1.json",
-    "title": "Agent Bootstrap Report",
-    "description": "Structured report emitted by `fwc agent-bootstrap <name>` on stdout. Captures the outcome of all 6 macro steps with idempotency-aware fields.",
-    "type": "object",
-    "required": [
-        "agent_name",
-        "mode",
-        "identity",
-        "reservation",
-        "ready_beads",
-        "commit_template",
-        "doctor",
-        "total_duration_ms",
-        "exit_code"
-    ],
-    "properties": {
-        "agent_name": {
-            "type": "string",
-            "pattern": "^[A-Z][a-zA-Z]+$",
-            "description": "Agent persona name; not PII (personas are public identifiers)."
-        },
-        "mode": {
-            "type": "string",
-            "enum": ["fresh", "rebootstrap", "degraded"],
-            "description": "fresh = first-time bootstrap (identity created, reservation created, doctor green); rebootstrap = identity already present, reservation extended; degraded = agent-mail unreachable, identity step skipped."
-        },
-        "identity": {
-            "type": "object",
-            "required": ["created", "agent_mail_status"],
-            "properties": {
-                "created": {
-                    "type": "boolean",
-                    "description": "true on first bootstrap of this name; false on every subsequent call"
-                },
-                "agent_mail_status": {
-                    "type": "string",
-                    "enum": ["registered", "already_present", "unreachable"]
-                },
-                "owner_email": {
-                    "type": "string",
-                    "format": "email"
-                },
-                "identity_id": {
-                    "type": "string",
-                    "description": "Stable across rebootstrap; UUID or name-hash"
-                }
-            }
-        },
-        "reservation": {
-            "type": "object",
-            "required": ["scope", "ttl_seconds", "extended"],
-            "properties": {
-                "scope": {
-                    "type": "string"
-                },
-                "ttl_seconds": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Reservation TTL in seconds; zero means no reservation was created, as in degraded mode or --scope none."
-                },
-                "extended": {
-                    "type": "boolean",
-                    "description": "true when the reservation already existed and was renewed (extends TTL rather than duplicating)"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Bead id recorded with the reservation for audit"
-                },
-                "expires_at": {
-                    "type": "string",
-                    "format": "date-time"
-                }
-            }
-        },
-        "ready_beads": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["id", "title", "priority"],
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "pattern": "^flywheel_connectors-[a-z0-9]+(\\.[0-9]+)*$"
-                    },
-                    "title": {
-                        "type": "string"
-                    },
-                    "priority": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 4
-                    },
-                    "score": {
-                        "type": "number",
-                        "minimum": 0
-                    }
-                }
-            }
-        },
-        "commit_template": {
-            "type": "object",
-            "required": ["path", "written"],
-            "properties": {
-                "path": {
-                    "type": "string"
-                },
-                "written": {
-                    "type": "boolean"
-                }
-            }
-        },
-        "doctor": {
-            "type": "object",
-            "required": ["probes_run", "passed", "failed", "skipped", "by_probe"],
-            "properties": {
-                "probes_run": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "passed": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "failed": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "skipped": {
-                    "type": "integer",
-                    "minimum": 0
-                },
-                "by_probe": {
-                    "type": "object",
-                    "patternProperties": {
-                        "^[a-z_]+$": {
-                            "type": "string",
-                            "enum": ["pass", "fail", "skipped"]
-                        }
-                    },
-                    "additionalProperties": false
-                }
-            }
-        },
-        "total_duration_ms": {
-            "type": "integer",
-            "minimum": 0
-        },
-        "exit_code": {
-            "type": "integer",
-            "enum": [0, 2, 3, 4, 5]
-        }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://flywheel-connectors.dev/schemas/agent_bootstrap_report.v1.json",
+  "title": "Agent Bootstrap Report",
+  "description": "Structured report emitted by `fwc agent-bootstrap <name>` on stdout. Captures the outcome of all 6 macro steps with idempotency-aware fields.",
+  "type": "object",
+  "required": [
+    "agent_name",
+    "mode",
+    "identity",
+    "reservation",
+    "ready_beads",
+    "commit_template",
+    "doctor",
+    "total_duration_ms",
+    "exit_code"
+  ],
+  "properties": {
+    "agent_name": {
+      "type": "string",
+      "pattern": "^[A-Z][a-zA-Z]+$",
+      "description": "Agent persona name; not PII (personas are public identifiers)."
     },
-    "additionalProperties": false
+    "mode": {
+      "type": "string",
+      "enum": ["fresh", "rebootstrap", "degraded"],
+      "description": "fresh = first-time bootstrap (identity created, reservation created, doctor green); rebootstrap = identity already present, reservation extended; degraded = agent-mail unreachable, identity step skipped."
+    },
+    "identity": {
+      "type": "object",
+      "required": ["created", "agent_mail_status"],
+      "properties": {
+        "created": {
+          "type": "boolean",
+          "description": "true on first bootstrap of this name; false on every subsequent call"
+        },
+        "agent_mail_status": {
+          "type": "string",
+          "enum": ["registered", "already_present", "unreachable"]
+        },
+        "owner_email": {
+          "type": "string",
+          "format": "email"
+        },
+        "identity_id": {
+          "type": "string",
+          "description": "Stable across rebootstrap; UUID or name-hash"
+        }
+      }
+    },
+    "reservation": {
+      "type": "object",
+      "required": ["scope", "ttl_seconds", "extended"],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reservation TTL in seconds; zero means no reservation was created, as in degraded mode or --scope none."
+        },
+        "extended": {
+          "type": "boolean",
+          "description": "true when the reservation already existed and was renewed (extends TTL rather than duplicating)"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Bead id recorded with the reservation for audit"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "ready_beads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "priority"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^flywheel_connectors-[a-z0-9]+(\\.[0-9]+)*$"
+          },
+          "title": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "commit_template": {
+      "type": "object",
+      "required": ["path", "written"],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "written": {
+          "type": "boolean"
+        }
+      }
+    },
+    "doctor": {
+      "type": "object",
+      "required": ["probes_run", "passed", "failed", "skipped", "by_probe"],
+      "properties": {
+        "probes_run": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_probe": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-z_]+$": {
+              "type": "string",
+              "enum": ["pass", "fail", "skipped"]
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "total_duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 2, 3, 4, 5]
+    }
+  },
+  "additionalProperties": false
 }

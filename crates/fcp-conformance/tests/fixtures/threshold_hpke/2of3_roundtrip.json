@@ -1,72 +1,75 @@
 {
-    "comment": "Golden round-trip vector for the 2-of-3 threshold-HPKE KEM. Pins the deterministic ceremony seed + plaintext + expected ciphertext shape + decap-share contract. The runtime impl must produce a working roundtrip when fed these inputs. Filed under flywheel_connectors-angoc.11.6.",
-    "schema_version": "fcp.threshold-hpke.v1",
-    "ceremony": {
-        "threshold": 2,
-        "total_participants": 3,
-        "ceremony_seed_hex": "0000000000000000000000000000000000000000000000000000000000000001",
-        "context_signing": "frost-sign-v1",
-        "context_kem": "frost-kem-v1",
-        "participants": [
-            {"index": 1, "name": "p1", "public_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"},
-            {"index": 2, "name": "p2", "public_key_hex": "0202020202020202020202020202020202020202020202020202020202020202"},
-            {"index": 3, "name": "p3", "public_key_hex": "0303030303030303030303030303030303030303030303030303030303030303"}
-        ]
-    },
-    "encap_input": {
-        "info_bytes_hex": "7a3a776f726b3a6566373265",
-        "info_decoded": "z:work:ef72e",
-        "plaintext_bytes_hex": "48656c6c6f206d6573682d7468726573686f6c64204b454d21",
-        "plaintext_decoded": "Hello mesh-threshold KEM!",
-        "aad_bytes_hex": "6f626a5f6964",
-        "aad_decoded": "obj_id"
-    },
-    "expected_ciphertext_shape": {
-        "encapsulated_key_bytes_len": 32,
-        "aead_body_bytes_len_min": 28,
-        "aead_body_bytes_len_max": 64,
-        "tag_bytes_len": 16,
-        "note": "Encapsulated key is the X25519 ephemeral public key (32 bytes). AEAD body length is plaintext_len + tag_len (16). Note: this fixture does not pin EXACT ciphertext bytes because the implementation choice of ephemeral randomness MAY vary; the implementation MUST verify the roundtrip property instead."
-    },
-    "expected_decap_shares": {
-        "comment": "When 2 of 3 participants compute decap shares, the combine function MUST yield the original plaintext. Order independence MUST hold.",
-        "share_subsets_that_must_decap_successfully": [
-            [1, 2],
-            [1, 3],
-            [2, 3]
-        ],
-        "share_subsets_that_must_fail_with_InsufficientShares": [
-            [],
-            [1],
-            [2],
-            [3]
-        ]
-    },
-    "roundtrip_property": {
-        "description": "For each 2-element subset S of {1, 2, 3}, combine_decap(encap_output, S) returns the original plaintext bytes.",
-        "expected_recovered_plaintext_bytes_hex": "48656c6c6f206d6573682d7468726573686f6c64204b454d21"
-    },
-    "byzantine_tolerance": {
-        "comment": "If any participant submits an inconsistent share (e.g., decap-share for a different ciphertext), combine_decap MUST return ThresholdHpkeError::InconsistentShares rather than a wrong plaintext.",
-        "inconsistent_share_subsets": [
-            {
-                "good_shares_from": [1],
-                "bad_shares_from": [2],
-                "bad_share_description": "Decap share computed from a different ciphertext (different epoch)",
-                "expected_error": "InconsistentShares"
-            }
-        ]
-    },
-    "hybrid_mode_placeholder": {
-        "status": "pending",
-        "depends_on_bead": "flywheel_connectors-angoc.8 (Phase N hybrid PQ signing)",
-        "note": "When the Phase N PQ track exposes a stable ML-KEM-768 share-derivation API, the hybrid mode fixture (concatenated classical+PQ encapsulation, both decap or fail) gets added as 2of3_hybrid_roundtrip.json."
-    },
-    "performance_budget": {
-        "from_frost_pkpkg_p99_ms": 5,
-        "encap_p99_ms": 10,
-        "decap_share_p99_ms": 10,
-        "combine_decap_t2_p99_ms": 15,
-        "machine_class": "laptop_m2"
-    }
+  "comment": "Golden round-trip vector for the 2-of-3 threshold-HPKE KEM. Pins the deterministic ceremony seed + plaintext + expected ciphertext shape + decap-share contract. The runtime impl must produce a working roundtrip when fed these inputs. Filed under flywheel_connectors-angoc.11.6.",
+  "schema_version": "fcp.threshold-hpke.v1",
+  "ceremony": {
+    "threshold": 2,
+    "total_participants": 3,
+    "ceremony_seed_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+    "context_signing": "frost-sign-v1",
+    "context_kem": "frost-kem-v1",
+    "participants": [
+      {
+        "index": 1,
+        "name": "p1",
+        "public_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+      },
+      {
+        "index": 2,
+        "name": "p2",
+        "public_key_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      {
+        "index": 3,
+        "name": "p3",
+        "public_key_hex": "0303030303030303030303030303030303030303030303030303030303030303"
+      }
+    ]
+  },
+  "encap_input": {
+    "info_bytes_hex": "7a3a776f726b3a6566373265",
+    "info_decoded": "z:work:ef72e",
+    "plaintext_bytes_hex": "48656c6c6f206d6573682d7468726573686f6c64204b454d21",
+    "plaintext_decoded": "Hello mesh-threshold KEM!",
+    "aad_bytes_hex": "6f626a5f6964",
+    "aad_decoded": "obj_id"
+  },
+  "expected_ciphertext_shape": {
+    "encapsulated_key_bytes_len": 32,
+    "aead_body_bytes_len_min": 28,
+    "aead_body_bytes_len_max": 64,
+    "tag_bytes_len": 16,
+    "note": "Encapsulated key is the X25519 ephemeral public key (32 bytes). AEAD body length is plaintext_len + tag_len (16). Note: this fixture does not pin EXACT ciphertext bytes because the implementation choice of ephemeral randomness MAY vary; the implementation MUST verify the roundtrip property instead."
+  },
+  "expected_decap_shares": {
+    "comment": "When 2 of 3 participants compute decap shares, the combine function MUST yield the original plaintext. Order independence MUST hold.",
+    "share_subsets_that_must_decap_successfully": [[1, 2], [1, 3], [2, 3]],
+    "share_subsets_that_must_fail_with_InsufficientShares": [[], [1], [2], [3]]
+  },
+  "roundtrip_property": {
+    "description": "For each 2-element subset S of {1, 2, 3}, combine_decap(encap_output, S) returns the original plaintext bytes.",
+    "expected_recovered_plaintext_bytes_hex": "48656c6c6f206d6573682d7468726573686f6c64204b454d21"
+  },
+  "byzantine_tolerance": {
+    "comment": "If any participant submits an inconsistent share (e.g., decap-share for a different ciphertext), combine_decap MUST return ThresholdHpkeError::InconsistentShares rather than a wrong plaintext.",
+    "inconsistent_share_subsets": [
+      {
+        "good_shares_from": [1],
+        "bad_shares_from": [2],
+        "bad_share_description": "Decap share computed from a different ciphertext (different epoch)",
+        "expected_error": "InconsistentShares"
+      }
+    ]
+  },
+  "hybrid_mode_placeholder": {
+    "status": "pending",
+    "depends_on_bead": "flywheel_connectors-angoc.8 (Phase N hybrid PQ signing)",
+    "note": "When the Phase N PQ track exposes a stable ML-KEM-768 share-derivation API, the hybrid mode fixture (concatenated classical+PQ encapsulation, both decap or fail) gets added as 2of3_hybrid_roundtrip.json."
+  },
+  "performance_budget": {
+    "from_frost_pkpkg_p99_ms": 5,
+    "encap_p99_ms": 10,
+    "decap_share_p99_ms": 10,
+    "combine_decap_t2_p99_ms": 15,
+    "machine_class": "laptop_m2"
+  }
 }

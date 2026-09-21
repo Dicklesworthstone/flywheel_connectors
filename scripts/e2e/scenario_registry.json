@@ -17,12 +17,7 @@
       "failure_class",
       "user_impact_category"
     ],
-    "uniqueness_constraints": [
-      "key",
-      "scenario_id",
-      "script",
-      "contract_id"
-    ],
+    "uniqueness_constraints": ["key", "scenario_id", "script", "contract_id"],
     "allowed_archetypes": [
       "request_response",
       "streaming",

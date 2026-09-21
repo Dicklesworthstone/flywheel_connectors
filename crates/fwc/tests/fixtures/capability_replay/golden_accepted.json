@@ -1,63 +1,63 @@
 {
-    "token_hash": "blake3:7c3e9f1a2b8d5e6f4c1a9b8d7e6f5c4a",
-    "final_verdict": "accepted",
-    "total_steps": 5,
-    "total_latency_us": 245,
-    "audit_chain_range": {
-        "start_seq": 12034,
-        "end_seq": 12040
+  "token_hash": "blake3:7c3e9f1a2b8d5e6f4c1a9b8d7e6f5c4a",
+  "final_verdict": "accepted",
+  "total_steps": 5,
+  "total_latency_us": 245,
+  "audit_chain_range": {
+    "start_seq": 12034,
+    "end_seq": 12040
+  },
+  "trace": [
+    {
+      "rule_name": "zone_match",
+      "inputs_json": {
+        "src_zone": "z:work",
+        "dst_zone": "z:work"
+      },
+      "output": true,
+      "witness_chain_indices": [12034],
+      "evaluator_version": "1.2.0"
     },
-    "trace": [
-        {
-            "rule_name": "zone_match",
-            "inputs_json": {
-                "src_zone": "z:work",
-                "dst_zone": "z:work"
-            },
-            "output": true,
-            "witness_chain_indices": [12034],
-            "evaluator_version": "1.2.0"
-        },
-        {
-            "rule_name": "capability_token_signature_verify",
-            "inputs_json": {
-                "alg": "ml-dsa-65",
-                "issuer": "owner-key-v4"
-            },
-            "output": true,
-            "witness_chain_indices": [12035],
-            "evaluator_version": "1.2.0"
-        },
-        {
-            "rule_name": "instance_binding_match",
-            "inputs_json": {
-                "claimed_instance_id": "inst-7a3f",
-                "requested_instance_id": "inst-7a3f"
-            },
-            "output": true,
-            "witness_chain_indices": [12036],
-            "evaluator_version": "1.2.0"
-        },
-        {
-            "rule_name": "revocation_check",
-            "inputs_json": {
-                "registry_root": "blake3:9a2b3c4d5e6f",
-                "freshness_secs": 12
-            },
-            "output": true,
-            "witness_chain_indices": [12037, 12038],
-            "evaluator_version": "1.2.0"
-        },
-        {
-            "rule_name": "expiry_check",
-            "inputs_json": {
-                "not_before_unix": 1715587200,
-                "not_after_unix": 1715673600,
-                "now_unix": 1715630400
-            },
-            "output": true,
-            "witness_chain_indices": [12039, 12040],
-            "evaluator_version": "1.2.0"
-        }
-    ]
+    {
+      "rule_name": "capability_token_signature_verify",
+      "inputs_json": {
+        "alg": "ml-dsa-65",
+        "issuer": "owner-key-v4"
+      },
+      "output": true,
+      "witness_chain_indices": [12035],
+      "evaluator_version": "1.2.0"
+    },
+    {
+      "rule_name": "instance_binding_match",
+      "inputs_json": {
+        "claimed_instance_id": "inst-7a3f",
+        "requested_instance_id": "inst-7a3f"
+      },
+      "output": true,
+      "witness_chain_indices": [12036],
+      "evaluator_version": "1.2.0"
+    },
+    {
+      "rule_name": "revocation_check",
+      "inputs_json": {
+        "registry_root": "blake3:9a2b3c4d5e6f",
+        "freshness_secs": 12
+      },
+      "output": true,
+      "witness_chain_indices": [12037, 12038],
+      "evaluator_version": "1.2.0"
+    },
+    {
+      "rule_name": "expiry_check",
+      "inputs_json": {
+        "not_before_unix": 1715587200,
+        "not_after_unix": 1715673600,
+        "now_unix": 1715630400
+      },
+      "output": true,
+      "witness_chain_indices": [12039, 12040],
+      "evaluator_version": "1.2.0"
+    }
+  ]
 }

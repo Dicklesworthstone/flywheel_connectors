@@ -68,11 +68,7 @@
         "decision": "allow",
         "datalog_derivation": "allow if zone=z:work and cap=messages.send",
         "quorum_height": 7,
-        "signers": [
-          "node-a",
-          "node-b",
-          "node-c"
-        ]
+        "signers": ["node-a", "node-b", "node-c"]
       },
       "issuer_kid": null,
       "signature": null
@@ -130,10 +126,7 @@
       "request_id": "request-work-1",
       "decision": "allow",
       "reason_code": "policy.allow.zone_work",
-      "evidence": [
-        "entry-work-admission",
-        "entry-work-invoke"
-      ],
+      "evidence": ["entry-work-admission", "entry-work-invoke"],
       "audit_entry_id": "entry-work-invoke",
       "explanation": "work zone policy allowed messages.send",
       "decided_at": 1700083000,

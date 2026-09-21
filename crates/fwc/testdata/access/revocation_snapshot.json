@@ -3,9 +3,6 @@
   "connector": "fcp.github:enterprise:v1",
   "revocation_fresh": false,
   "checkpoint_fresh": true,
-  "stale_objects": [
-    "approval-token/pr-merge-42",
-    "grant/github.issue_write/temporary"
-  ],
+  "stale_objects": ["approval-token/pr-merge-42", "grant/github.issue_write/temporary"],
   "operator_action": "refresh revocation state before retrying the blocked operation"
 }

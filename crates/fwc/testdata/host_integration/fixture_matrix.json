@@ -13,21 +13,9 @@
       "reversibility": "mixed",
       "operation_family": "issues",
       "tool_count": 2,
-      "provenance_markers": [
-        "live-host-discovery",
-        "mock-host-sequence",
-        "cual-workflow"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "provenance_markers": ["live-host-discovery", "mock-host-sequence", "cual-workflow"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Primary request-response workflow fixture used by workflow_search_to_invoke_to_history_full_chain."
     },
     {
@@ -43,10 +31,7 @@
       "reversibility": "reversible",
       "operation_family": "events",
       "tool_count": 1,
-      "provenance_markers": [
-        "live-host-stream",
-        "reconnect-observable"
-      ],
+      "provenance_markers": ["live-host-stream", "reconnect-observable"],
       "required_artifacts": [
         "trace.jsonl",
         "summary.json",
@@ -54,10 +39,7 @@
         "session_transcript.json",
         "replay.sh"
       ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Long-lived streaming fixture used to classify watch/log/reconnect scenarios."
     },
     {
@@ -73,11 +55,7 @@
       "reversibility": "irreversible",
       "operation_family": "webhooks",
       "tool_count": 3,
-      "provenance_markers": [
-        "live-host-introspection",
-        "receipt-correlation",
-        "artifact-bundle"
-      ],
+      "provenance_markers": ["live-host-introspection", "receipt-correlation", "artifact-bundle"],
       "required_artifacts": [
         "trace.jsonl",
         "summary.json",
@@ -85,10 +63,7 @@
         "session_transcript.json",
         "replay.sh"
       ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Webhook receipt fixture for irreversible host-backed delivery flows."
     },
     {
@@ -104,10 +79,7 @@
       "reversibility": "mixed",
       "operation_family": "sync",
       "tool_count": 2,
-      "provenance_markers": [
-        "live-host-polling",
-        "cursor-state"
-      ],
+      "provenance_markers": ["live-host-polling", "cursor-state"],
       "required_artifacts": [
         "trace.jsonl",
         "summary.json",
@@ -115,10 +87,7 @@
         "session_transcript.json",
         "replay.sh"
       ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Polling fixture covering multi-profile auth and resumable cursor semantics."
     },
     {
@@ -134,10 +103,7 @@
       "reversibility": "mixed",
       "operation_family": "browser-session",
       "tool_count": 2,
-      "provenance_markers": [
-        "session-capture",
-        "artifact-bundle"
-      ],
+      "provenance_markers": ["session-capture", "artifact-bundle"],
       "required_artifacts": [
         "trace.jsonl",
         "summary.json",
@@ -145,10 +111,7 @@
         "session_transcript.json",
         "replay.sh"
       ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Browser-session fixture for automation flows that need replayable evidence."
     },
     {
@@ -164,20 +127,9 @@
       "reversibility": "reversible",
       "operation_family": "queries",
       "tool_count": 2,
-      "provenance_markers": [
-        "live-host-query",
-        "result-handle"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "provenance_markers": ["live-host-query", "result-handle"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Database fixture for reversible query flows and durable result inspection."
     },
     {
@@ -193,20 +145,9 @@
       "reversibility": "mixed",
       "operation_family": "lifecycle",
       "tool_count": 4,
-      "provenance_markers": [
-        "desired-vs-observed-state",
-        "startup-reconciliation"
-      ],
-      "required_artifacts": [
-        "trace.jsonl",
-        "summary.json",
-        "environment.json",
-        "replay.sh"
-      ],
-      "required_log_fields": [
-        "correlation_id",
-        "phase"
-      ],
+      "provenance_markers": ["desired-vs-observed-state", "startup-reconciliation"],
+      "required_artifacts": ["trace.jsonl", "summary.json", "environment.json", "replay.sh"],
+      "required_log_fields": ["correlation_id", "phase"],
       "notes": "Lifecycle-heavy fixture for enable/disable/start/stop/reconcile management scenarios."
     }
   ]

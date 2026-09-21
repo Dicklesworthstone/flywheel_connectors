@@ -11,8 +11,5 @@
     "claim workspace health from narrow proof",
     "overwrite another agent's edits"
   ],
-  "redaction_markers": [
-    "<repo>",
-    "<owned_files>"
-  ]
+  "redaction_markers": ["<repo>", "<owned_files>"]
 }

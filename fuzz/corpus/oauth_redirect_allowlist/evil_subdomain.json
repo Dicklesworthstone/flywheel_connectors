@@ -1,7 +1,5 @@
 {
-  "allowlist": [
-    "https://app.example.com/oauth/callback"
-  ],
+  "allowlist": ["https://app.example.com/oauth/callback"],
   "redirect_uri": "https://app.example.com.evil.invalid/oauth/callback",
   "callback_url": "https://app.example.com.evil.invalid/oauth/callback?code=test"
 }

@@ -4,13 +4,7 @@
   "title": "FCP proof-bundle registry",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema",
-    "registry_id",
-    "generated_at_unix_ms",
-    "sources",
-    "proofs"
-  ],
+  "required": ["schema", "registry_id", "generated_at_unix_ms", "sources", "proofs"],
   "properties": {
     "schema": {
       "const": "fcp.proof-bundle-registry.v1"
@@ -40,13 +34,7 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "source_id",
-        "path",
-        "purpose",
-        "source_kind",
-        "default_proof_class"
-      ],
+      "required": ["source_id", "path", "purpose", "source_kind", "default_proof_class"],
       "properties": {
         "source_id": {
           "type": "string",
@@ -97,31 +85,20 @@
                 "const": "structured_skip"
               }
             },
-            "required": [
-              "proof_class"
-            ]
+            "required": ["proof_class"]
           },
           "then": {
-            "required": [
-              "structured_skip"
-            ]
+            "required": ["structured_skip"]
           }
         },
         {
           "if": {
             "properties": {
               "proof_class": {
-                "enum": [
-                  "replay",
-                  "offline_static",
-                  "static_doc",
-                  "structured_skip"
-                ]
+                "enum": ["replay", "offline_static", "static_doc", "structured_skip"]
               }
             },
-            "required": [
-              "proof_class"
-            ]
+            "required": ["proof_class"]
           },
           "then": {
             "properties": {
@@ -190,11 +167,7 @@
     "source_document": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "source_id",
-        "section",
-        "row_label"
-      ],
+      "required": ["source_id", "section", "row_label"],
       "properties": {
         "source_id": {
           "type": "string",
@@ -261,11 +234,7 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "path",
-        "kind",
-        "required"
-      ],
+      "required": ["path", "kind", "required"],
       "allOf": [
         {
           "if": {
@@ -274,14 +243,10 @@
                 "const": true
               }
             },
-            "required": [
-              "required"
-            ]
+            "required": ["required"]
           },
           "then": {
-            "required": [
-              "digest"
-            ]
+            "required": ["digest"]
           }
         }
       ],
@@ -309,17 +274,10 @@
     "digest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "algorithm",
-        "value"
-      ],
+      "required": ["algorithm", "value"],
       "properties": {
         "algorithm": {
-          "enum": [
-            "blake3",
-            "sha256",
-            "sha512"
-          ]
+          "enum": ["blake3", "sha256", "sha512"]
         },
         "value": {
           "type": "string",
@@ -330,11 +288,7 @@
     "freshness_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "max_age_ms",
-        "required_for_green",
-        "stale_action"
-      ],
+      "required": ["max_age_ms", "required_for_green", "stale_action"],
       "properties": {
         "max_age_ms": {
           "type": "integer",
@@ -344,35 +298,20 @@
           "type": "boolean"
         },
         "stale_action": {
-          "enum": [
-            "fail_closed",
-            "warn_only",
-            "skip_only"
-          ]
+          "enum": ["fail_closed", "warn_only", "skip_only"]
         }
       }
     },
     "verifier": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "command",
-        "result",
-        "observed_at_unix_ms",
-        "log_path",
-        "live_claim"
-      ],
+      "required": ["command", "result", "observed_at_unix_ms", "log_path", "live_claim"],
       "properties": {
         "command": {
           "$ref": "#/$defs/command"
         },
         "result": {
-          "enum": [
-            "passed",
-            "failed",
-            "blocked",
-            "skipped"
-          ]
+          "enum": ["passed", "failed", "blocked", "skipped"]
         },
         "observed_at_unix_ms": {
           "type": "integer",
@@ -390,10 +329,7 @@
     "structured_skip": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "allowed",
-        "reason_code"
-      ],
+      "required": ["allowed", "reason_code"],
       "properties": {
         "allowed": {
           "type": "boolean"
@@ -411,17 +347,10 @@
     "redaction": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "classification"
-      ],
+      "required": ["classification"],
       "properties": {
         "classification": {
-          "enum": [
-            "public",
-            "internal",
-            "redacted",
-            "secret_bearing"
-          ]
+          "enum": ["public", "internal", "redacted", "secret_bearing"]
         },
         "notes": {
           "type": "string"
@@ -439,14 +368,7 @@
       ]
     },
     "proof_class": {
-      "enum": [
-        "live",
-        "host_backed",
-        "replay",
-        "offline_static",
-        "static_doc",
-        "structured_skip"
-      ]
+      "enum": ["live", "host_backed", "replay", "offline_static", "static_doc", "structured_skip"]
     }
   }
 }

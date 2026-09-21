@@ -6,13 +6,6 @@
   "transcript": "fetch_inbox(project=<repo>, agent=SwiftGull) -> mcp-agent-mail unavailable; storage handle [REDACTED_DB] returned SQLITE_BUSY. AGENTS.md says retry once, continue work without repairing Agent Mail, and never restart the shared service.",
   "expected_classification": "degraded_coordination",
   "expected_agent_action": "Retry Agent Mail once, proceed with Beads/BV coordination if still degraded, and record the fallback in the bead thread when service returns.",
-  "forbidden_actions": [
-    "am service restart",
-    "am doctor repair",
-    "kill mcp-agent-mail"
-  ],
-  "redaction_markers": [
-    "<repo>",
-    "[REDACTED_DB]"
-  ]
+  "forbidden_actions": ["am service restart", "am doctor repair", "kill mcp-agent-mail"],
+  "redaction_markers": ["<repo>", "[REDACTED_DB]"]
 }
