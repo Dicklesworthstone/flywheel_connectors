@@ -15,10 +15,30 @@ use crate::types::{
 
 pub const DEFAULT_BASE_URL: &str = "https://api.perplexity.ai";
 
+/// Header Perplexity uses to attribute API traffic to a client integration.
+const INTEGRATION_HEADER: &str = "X-Pplx-Integration";
+/// Value identifying this connector in Perplexity's attribution telemetry.
+const INTEGRATION_NAME: &str = "flywheel-connectors";
+
+/// Returns whether `base_url` points at Perplexity's own API host (the only
+/// place the attribution header is meaningful; proxies such as `OpenRouter`,
+/// self-hosted mocks, and look-alike hosts must not receive it).
+fn targets_perplexity_api(base_url: &str) -> bool {
+    url::Url::parse(base_url).is_ok_and(|parsed| {
+        parsed.scheme() == "https"
+            && parsed
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("api.perplexity.ai"))
+    })
+}
+
 /// Perplexity API client with retry support.
 pub struct PerplexityClient {
     http: Client,
     base_url: String,
+    /// True when `base_url` is Perplexity's own API host, so requests carry
+    /// the integration attribution header.
+    attribute_requests: bool,
     auth: PerplexityAuth,
     runtime: ConnectorRuntime,
     retry_config: HttpRetryConfig,
@@ -59,6 +79,7 @@ impl PerplexityClient {
         Ok(Self {
             http,
             base_url: DEFAULT_BASE_URL.into(),
+            attribute_requests: targets_perplexity_api(DEFAULT_BASE_URL),
             auth,
             runtime,
             retry_config,
@@ -68,6 +89,7 @@ impl PerplexityClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
+        self.attribute_requests = targets_perplexity_api(&self.base_url);
         self
     }
 
@@ -148,6 +170,7 @@ impl PerplexityClient {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let auth_material = self.auth.api_key.clone();
+        let attribute_requests = self.attribute_requests;
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
@@ -157,7 +180,7 @@ impl PerplexityClient {
             async move {
                 debug!(attempt, endpoint = endpoint_label, "Perplexity request");
 
-                let req = if auth_material.is_empty() {
+                let mut req = if auth_material.is_empty() {
                     client.post(&url).json(&body)
                 } else {
                     client
@@ -166,6 +189,9 @@ impl PerplexityClient {
                         .header(reqwest::header::ACCEPT, "application/json")
                         .json(&body)
                 };
+                if attribute_requests {
+                    req = req.header(INTEGRATION_HEADER, INTEGRATION_NAME);
+                }
 
                 let resp = match req.send().await {
                     Ok(r) => r,
@@ -313,6 +339,36 @@ mod tests {
         .with_base_url("https://api.perplexity.ai/");
 
         assert!(!client.base_url().ends_with('/'));
+    }
+
+    #[test]
+    fn attribution_only_targets_perplexity_api_host() {
+        assert!(targets_perplexity_api("https://api.perplexity.ai"));
+        assert!(targets_perplexity_api("https://API.Perplexity.AI/"));
+        assert!(!targets_perplexity_api("http://api.perplexity.ai"));
+        assert!(!targets_perplexity_api(
+            "https://api.perplexity.ai.example.com"
+        ));
+        assert!(!targets_perplexity_api("https://openrouter.ai/api/v1"));
+        assert!(!targets_perplexity_api("http://localhost:8080"));
+        assert!(!targets_perplexity_api("not a url"));
+    }
+
+    #[test]
+    fn attribution_flag_follows_base_url() {
+        let client = PerplexityClient::new(
+            PerplexityAuth {
+                api_key: "pplx-t".into(),
+            },
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(client.attribute_requests);
+        let client = client.with_base_url("https://openrouter.ai/api/v1/");
+        assert!(!client.attribute_requests);
+        let client = client.with_base_url("https://api.perplexity.ai/");
+        assert!(client.attribute_requests);
     }
 
     #[test]
