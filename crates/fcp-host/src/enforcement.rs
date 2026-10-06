@@ -5014,6 +5014,7 @@ mod tests {
         let token_id = ObjectId::from_bytes([0xAA; 32]);
         let revocation = fcp_core::RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
                 zone_id: ZoneId::work(),
                 schema: SchemaId::new(
                     "fcp.core",
@@ -5069,6 +5070,7 @@ mod tests {
         let token_id = ObjectId::from_bytes([0xAA; 32]);
         let revocation = fcp_core::RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
                 zone_id: ZoneId::work(),
                 schema: SchemaId::new(
                     "fcp.core",

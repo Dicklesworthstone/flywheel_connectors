@@ -1,5 +1,11 @@
 //! Minimal fcp-host HTTP server with discovery and doctor endpoints.
 
+// Proving the admin handlers' futures `Send` walks the whole
+// inventory-apply → registry-build → connector-spawn chain, which exceeds the
+// default trait-solver depth (future-incompat `overflow evaluating the
+// requirement` on the axum `Handler` bound).
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -356,7 +362,12 @@ struct SubprocessConnector {
     resilience: Arc<ResilienceLayer>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
     state_root: Option<PathBuf>,
-    handshaken_zone: Mutex<Option<ZoneId>>,
+    /// Held across the handshake RPC and the first zone-bound RPC
+    /// (br-j1pjg/br-utiw3), so the guard must be `Send`: request futures
+    /// run under axum and `task::spawn`. asupersync 0.5 guards are `!Send`,
+    /// so this one critical section uses the runtime-agnostic
+    /// `futures_util` mutex instead of `fcp_async_core::sync::Mutex`.
+    handshaken_zone: futures_util::lock::Mutex<Option<ZoneId>>,
 }
 
 /// Internal runner control method: force-terminate the connector
@@ -492,7 +503,7 @@ impl SubprocessConnector {
             resilience,
             capability_verifying_key,
             state_root,
-            handshaken_zone: Mutex::new(None),
+            handshaken_zone: futures_util::lock::Mutex::new(None),
         };
 
         if let Some(config_payload) = config.config {
@@ -15089,7 +15100,7 @@ deny_ptrace = true
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: None,
             state_root: None,
-            handshaken_zone: Mutex::new(None),
+            handshaken_zone: futures_util::lock::Mutex::new(None),
         });
         connector.resilience.ensure_connector(&connector.summary.id);
         connector
@@ -23497,7 +23508,7 @@ done"#
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: None,
             state_root: None,
-            handshaken_zone: Mutex::new(None),
+            handshaken_zone: futures_util::lock::Mutex::new(None),
         };
         connector.resilience.ensure_connector(&connector.summary.id);
 
@@ -25364,7 +25375,7 @@ done"#;
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: Some(signing_key.verifying_key().to_bytes()),
             state_root: Some(state_root.path().to_path_buf()),
-            handshaken_zone: Mutex::new(None),
+            handshaken_zone: futures_util::lock::Mutex::new(None),
         });
         subprocess
             .resilience

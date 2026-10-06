@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use blake3::hash;
 use chrono::{DateTime, Utc};
-use fcp_async_core::sync::{Mutex, RwLock};
+use fcp_async_core::sync::RwLock;
 use fcp_kernel::{
     ConnectorHealth, ConnectorId, LifecycleError, LifecycleManager, LifecycleRecord,
     LifecycleState, LifecycleStatus, TransitionReason,
@@ -2807,7 +2807,6 @@ struct LegacyHostLifecycleSnapshot {
 pub struct HostAdminStateStore {
     state: RwLock<HostAdminStateSnapshot>,
     state_path: Option<PathBuf>,
-    persist_lock: Mutex<()>,
 }
 
 impl Default for HostAdminStateStore {
@@ -2823,7 +2822,6 @@ impl HostAdminStateStore {
         Self {
             state: RwLock::new(HostAdminStateSnapshot::default()),
             state_path: None,
-            persist_lock: Mutex::new(()),
         }
     }
 
@@ -2864,7 +2862,6 @@ impl HostAdminStateStore {
         Ok(Self {
             state: RwLock::new(state),
             state_path,
-            persist_lock: Mutex::new(()),
         })
     }
 
@@ -2872,17 +2869,20 @@ impl HostAdminStateStore {
     where
         F: FnOnce(&mut HostAdminStateSnapshot) -> Result<T, LifecycleError>,
     {
-        let _persist_guard = self.persist_lock.lock().await;
-        let mut snapshot = self.state.read().await.clone();
+        // The write guard serializes read-modify-persist-commit. It is taken
+        // by the only `.await` in this function and never held across another
+        // one: asupersync guards are `!Send`, and the `async_trait` lifecycle
+        // futures that call this must stay `Send`.
+        let mut state = self.state.write().await;
+        let mut snapshot = state.clone();
         let result = mutate(&mut snapshot)?;
 
-        let path = self.state_path.clone();
-        // Host admin-state writes are serialized behind `persist_lock` and only
-        // flush one small JSON snapshot, so persisting inline is preferable to
-        // reaching for a Tokio-only blocking shim in the async-core stack.
-        persist_admin_state_snapshot(path.as_deref(), &snapshot)?;
+        // Writes only flush one small JSON snapshot, so persisting inline is
+        // preferable to reaching for a Tokio-only blocking shim in the
+        // async-core stack.
+        persist_admin_state_snapshot(self.state_path.as_deref(), &snapshot)?;
 
-        *self.state.write().await = snapshot;
+        *state = snapshot;
         Ok(result)
     }
 

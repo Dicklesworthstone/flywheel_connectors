@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use fcp_async_core::sync::{Mutex, RwLock};
+use fcp_async_core::sync::RwLock;
 use fcp_kernel::{
     AgentHint, ApprovalMode, ConnectorHealth, ConnectorId, IdempotencyClass, Introspection,
     OperationInfo, RateLimitDeclarations, RequestId, SelfCheckReport, UsageBudgetSnapshot,
@@ -1281,7 +1281,13 @@ pub struct DiscoveryCache {
     /// Cached connector summaries.
     cache: RwLock<Option<CachedDiscovery>>,
     /// Serializes cache refreshes so concurrent misses collapse to one load.
-    refresh_lock: Mutex<()>,
+    ///
+    /// The guard is held across `registry.list().await`, so it must be
+    /// `Send` (discovery futures run under axum and `task::spawn`).
+    /// asupersync 0.5 guards are `!Send`; the runtime-agnostic
+    /// `futures_util` mutex is used for this single-flight lock instead. It
+    /// does not poison: a loader that panics releases the lock on unwind.
+    refresh_lock: futures_util::lock::Mutex<()>,
     /// Time-to-live.
     ttl: Duration,
 }
@@ -1306,7 +1312,7 @@ impl DiscoveryCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             cache: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
+            refresh_lock: futures_util::lock::Mutex::new(()),
             ttl,
         }
     }
@@ -1343,16 +1349,16 @@ impl DiscoveryCache {
         }
 
         // The refresh lock provides single-flight refresh to avoid a thundering
-        // herd of concurrent registry loads. Two cases must skip it:
-        //  - `ttl == 0` disables caching, so the fast-path check above always
-        //    misses; holding one mutex across `registry.list().await` would then
-        //    serialize *every* concurrent discovery call through a single lock.
-        //  - a poisoned lock (a prior loader panicked while holding it) must not
-        //    brick discovery forever — degrade to an unsynchronized refresh.
+        // herd of concurrent registry loads. `ttl == 0` disables caching, so the
+        // fast-path check above always misses; holding one mutex across
+        // `registry.list().await` would then serialize *every* concurrent
+        // discovery call through a single lock, so that case skips it. A loader
+        // that panics while holding the lock releases it on unwind, so a prior
+        // panic can never brick discovery.
         let _refresh_guard = if self.ttl.is_zero() {
             None
         } else {
-            self.refresh_lock.lock_poison_tolerant().await
+            Some(self.refresh_lock.lock().await)
         };
         let registry_version = registry.version();
         if let Some(cached) = self.cached_result(registry_version).await {
@@ -2312,9 +2318,9 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn discovery_recovers_after_loader_panic_poisons_refresh_lock() {
-        // A loader panic while the refresh lock is held poisons that lock. The
-        // cache must degrade to an unsynchronized refresh rather than propagating
-        // the poison panic on every subsequent call (permanent discovery outage).
+        // A loader panic while the refresh lock is held must not leave the lock
+        // wedged or poisoned: the next refresh has to succeed rather than fail
+        // on every subsequent call (permanent discovery outage).
         let calls = Arc::new(AtomicUsize::new(0));
         let summary = make_summary(
             "poison",
@@ -2331,8 +2337,8 @@ mod tests {
         #[allow(clippy::duration_suboptimal_units)]
         let cache = Arc::new(DiscoveryCache::new(Duration::from_secs(60)));
 
-        // First refresh panics inside the loader (while holding the refresh lock),
-        // poisoning it. `task::spawn` catches the unwind and reports it as an err.
+        // First refresh panics inside the loader (while holding the refresh lock).
+        // `task::spawn` catches the unwind and reports it as an err.
         let first = {
             let cache = Arc::clone(&cache);
             let registry = Arc::clone(&registry);
@@ -2340,10 +2346,10 @@ mod tests {
         };
         assert!(
             first.is_err(),
-            "first refresh should panic inside the loader and poison the refresh lock"
+            "first refresh should panic inside the loader while holding the refresh lock"
         );
 
-        // The refresh lock is now poisoned; discovery must still recover.
+        // The panicking holder released the lock; discovery must recover.
         let recovered = cache.get_or_refresh(Arc::as_ref(&registry)).await;
         assert!(!recovered.cache_hit);
         assert_eq!(recovered.connectors.len(), 1);

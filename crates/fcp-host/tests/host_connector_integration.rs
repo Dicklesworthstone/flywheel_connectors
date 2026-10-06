@@ -19,7 +19,6 @@ use fcp_async_core::process::{
     Child as AsyncChild, ChildStdin as AsyncChildStdin, ChildStdout as AsyncChildStdout,
     Command as AsyncCommand, Stdio as AsyncStdio,
 };
-use fcp_async_core::sync::Mutex;
 use fcp_async_core::task::JoinHandle as AsyncJoinHandle;
 use fcp_core::{
     AttestationMaterial, AttestationMetadata, AttestationPredicateType, CapabilityConstraints,
@@ -401,7 +400,10 @@ impl PolicyEngine for AllowAllPolicy {
 
 struct SubprocessConnector {
     summary: ConnectorSummary,
-    runner: Mutex<ConnectorProcessRunner>,
+    // Held across the request/response IO awaits inside `rpc`, and the
+    // registry trait requires `Send` futures; asupersync 0.5 guards are
+    // `!Send`, so this uses the runtime-agnostic `futures_util` mutex.
+    runner: futures_util::lock::Mutex<ConnectorProcessRunner>,
 }
 
 impl SubprocessConnector {
@@ -425,7 +427,7 @@ impl SubprocessConnector {
 
         Ok(Self {
             summary,
-            runner: Mutex::new(runner),
+            runner: futures_util::lock::Mutex::new(runner),
         })
     }
 

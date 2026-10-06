@@ -245,14 +245,15 @@ async fn sweep_band_concurrently(
             // bulkhead.pressure_per_mille — that's the concurrency
             // shape we need to exercise replay_matches() under.
             let per_priority = sample_one_per_priority(&layer, &cid, "sweep");
-            let mut guard = observations.lock().await;
-            for (priority, decision) in &per_priority {
-                guard.record(*priority, decision);
+            {
+                let mut guard = observations.lock().await;
+                for (priority, decision) in &per_priority {
+                    guard.record(*priority, decision);
+                }
             }
             // Yield to let permit-holders re-grab permits between
             // sweeps so the bulkhead state actually moves around.
             if sweep.is_multiple_of(8) {
-                drop(guard);
                 fcp_async_core::task::yield_now().await;
             }
         }));

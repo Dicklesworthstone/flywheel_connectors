@@ -3772,6 +3772,7 @@ mod tests {
     fn test_object_header() -> fcp_core::ObjectHeader {
         let zone_id = ZoneId::work();
         fcp_core::ObjectHeader {
+            encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
             schema: fcp_cbor::SchemaId::new("fcp.test", "TestObj", semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: 0,
