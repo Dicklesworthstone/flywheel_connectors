@@ -364,6 +364,7 @@ mod response_validation {
             cache_ttl_secs: Some(300),
             from_cache: false,
             retry_after_secs: None,
+            route: None,
         };
 
         let resp = SimulateResponse::allowed(RequestId::new("req_006")).with_metadata(meta);
@@ -841,6 +842,7 @@ fn generate_simulate_response_vectors() {
             cache_ttl_secs: Some(60),
             from_cache: false,
             retry_after_secs: None,
+            route: None,
         });
 
     vectors.push(SimulateResponseVector {

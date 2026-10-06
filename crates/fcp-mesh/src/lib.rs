@@ -5,6 +5,7 @@
 //! - [`device`] - Device profile types for execution planning and capability reporting
 //! - [`gossip`] - Gossip protocol for metadata and object announcement
 //! - [`iblt`] - Production invertible bloom lookup tables for compact set differences
+//! - [`invoke_route`] - Mesh-backed invoke routing: signed peer forwards, HRW holder routing
 //! - [`quorum`] - Compact BLS12-381 aggregate quorum certificates for mesh decisions
 //! - [`session`] - Session layer with authenticated handshake, key schedule, and anti-replay
 //! - [`symbol_request`] - Symbol request handling with bounded requests and targeted repair
@@ -36,6 +37,7 @@ pub mod device;
 pub mod emergency_revocation;
 pub mod gossip;
 pub mod iblt;
+pub mod invoke_route;
 pub mod node;
 pub mod planner;
 pub mod quorum;

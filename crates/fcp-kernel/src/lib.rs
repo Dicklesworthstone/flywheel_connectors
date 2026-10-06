@@ -36,8 +36,8 @@ mod execution_control;
 // ── Invocation Protocol ──────────────────────────────────────────
 
 pub use fcp_core::{
-    InvokeContext, InvokeRequest, InvokeResponse, InvokeStatus, InvokeValidationError, RequestId,
-    ResponseMetadata,
+    InvokeContext, InvokeRequest, InvokeResponse, InvokeRouteProvenance, InvokeStatus,
+    InvokeTruthSource, InvokeValidationError, RequestId, ResponseMetadata,
 };
 
 // ── Handshake / Session ──────────────────────────────────────────

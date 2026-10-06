@@ -83,6 +83,9 @@ pub mod event_types {
     /// Emitted when the registry/dispatcher returns an error before or
     /// during connector execution.
     pub const INVOKE_ERROR: &str = "invoke.error";
+    /// Emitted by the entry node when it relays the request to a mesh peer
+    /// (the executing peer appends its own allow/result events).
+    pub const INVOKE_MESH_FORWARDED: &str = "invoke.mesh_forwarded";
 }
 
 /// Phase-specific payload for an invoke audit append.
@@ -111,6 +114,19 @@ pub enum InvokePhase {
         /// Wall-clock duration from request enter to dispatch failure.
         duration_ms: u64,
     },
+    /// The entry node relayed the request to a mesh peer.
+    MeshForwarded {
+        /// Peer that answered (or the last peer attempted).
+        target_node: String,
+        /// Stable routing decision code.
+        decision: String,
+        /// HTTP-equivalent status the executor reported, if it answered.
+        executor_status: Option<u16>,
+        /// Peers that failed before delivery, in attempt order.
+        failed_attempts: Vec<String>,
+        /// Wall-clock duration of the relay.
+        duration_ms: u64,
+    },
 }
 
 impl InvokePhase {
@@ -120,6 +136,7 @@ impl InvokePhase {
             Self::PreflightDeny { .. } => event_types::INVOKE_DENY,
             Self::DispatchResult { .. } => event_types::INVOKE_RESULT,
             Self::DispatchError { .. } => event_types::INVOKE_ERROR,
+            Self::MeshForwarded { .. } => event_types::INVOKE_MESH_FORWARDED,
         }
     }
 
@@ -135,6 +152,13 @@ impl InvokePhase {
                 }
             }
             Self::DispatchError { .. } => Severity::Error,
+            Self::MeshForwarded {
+                executor_status, ..
+            } => match executor_status {
+                Some(status) if *status >= 200 && *status < 300 => Severity::Info,
+                Some(_) => Severity::Warning,
+                None => Severity::Error,
+            },
         }
     }
 
@@ -158,6 +182,19 @@ impl InvokePhase {
             }
             Self::DispatchError { error, duration_ms } => vec![
                 ("error".into(), json!(error)),
+                ("duration_ms".into(), json!(duration_ms)),
+            ],
+            Self::MeshForwarded {
+                target_node,
+                decision,
+                executor_status,
+                failed_attempts,
+                duration_ms,
+            } => vec![
+                ("target_node".into(), json!(target_node)),
+                ("decision".into(), json!(decision)),
+                ("executor_status".into(), json!(executor_status)),
+                ("failed_attempts".into(), json!(failed_attempts)),
                 ("duration_ms".into(), json!(duration_ms)),
             ],
         }

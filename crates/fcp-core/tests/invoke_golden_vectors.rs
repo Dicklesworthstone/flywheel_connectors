@@ -388,6 +388,7 @@ mod response_validation {
             cache_ttl_secs: Some(300),
             from_cache: false,
             retry_after_secs: None,
+            route: None,
         });
 
         let meta = resp.response_metadata.unwrap();
@@ -425,6 +426,7 @@ mod response_validation {
             cache_ttl_secs: None,
             from_cache: true,
             retry_after_secs: None,
+            route: None,
         };
 
         assert!(meta.from_cache);
@@ -438,6 +440,7 @@ mod response_validation {
             cache_ttl_secs: None,
             from_cache: false,
             retry_after_secs: Some(60),
+            route: None,
         };
 
         assert_eq!(meta.retry_after_secs, Some(60));

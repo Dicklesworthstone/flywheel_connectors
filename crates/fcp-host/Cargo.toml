@@ -48,6 +48,7 @@ base64 = { workspace = true }
 hex = { workspace = true }
 ciborium = { workspace = true }
 subtle = { workspace = true }
+zeroize = { workspace = true }
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }

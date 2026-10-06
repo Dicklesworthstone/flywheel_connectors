@@ -45,6 +45,7 @@ mod error;
 #[allow(dead_code)]
 mod health;
 mod invoke_audit;
+pub mod mesh_routing;
 mod migration_linux;
 #[cfg(target_os = "macos")]
 mod migration_macos;

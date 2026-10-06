@@ -517,6 +517,96 @@ pub struct ResponseMetadata {
     /// Retry-after hint in seconds (for rate-limited responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u32>,
+
+    /// Where the operation actually executed (mesh-backed truth label).
+    ///
+    /// Stamped by mesh-aware hosts so the client can tell a peer-executed
+    /// answer (`mesh-backed`) from one executed by the host it called
+    /// (`host-backed`). Absent on responses from hosts without a mesh peer
+    /// directory, which are host-backed by construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<InvokeRouteProvenance>,
+}
+
+/// Which tier of the truth ladder produced an invoke answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvokeTruthSource {
+    /// A mesh peer (the HRW-elected holder or an advertising peer) executed
+    /// the operation after a signed peer-to-peer forward.
+    MeshBacked,
+    /// The host that received the client request executed the operation.
+    HostBacked,
+}
+
+impl InvokeTruthSource {
+    /// Stable label used in JSON output and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MeshBacked => "mesh-backed",
+            Self::HostBacked => "host-backed",
+        }
+    }
+}
+
+/// Route provenance for one invoke: who executed it and why.
+///
+/// Node identifiers are the operator-assigned mesh node ids (Tailscale node
+/// ids in production). `decision` is a stable machine-readable code naming
+/// the routing rule that fired (for example `hrw_holder_forward`,
+/// `local_is_hrw_holder`, `advertised_peer_forward`, `peer_unreachable_local_fallback`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvokeRouteProvenance {
+    /// Truth tier that produced the answer.
+    pub truth_source: InvokeTruthSource,
+    /// Node that executed the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
+    /// Node that accepted the request from the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_node: Option<String>,
+    /// Number of mesh forwarding hops between entry node and executor.
+    #[serde(default)]
+    pub hop_count: u8,
+    /// Stable code naming the routing rule that selected the executor.
+    pub decision: String,
+    /// Peers that were attempted and failed before the executor answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_attempts: Vec<String>,
+}
+
+impl InvokeRouteProvenance {
+    /// Provenance for an answer executed by the host that received it.
+    #[must_use]
+    pub fn host_backed(node: Option<String>, decision: impl Into<String>) -> Self {
+        Self {
+            truth_source: InvokeTruthSource::HostBacked,
+            served_by: node.clone(),
+            entry_node: node,
+            hop_count: 0,
+            decision: decision.into(),
+            failed_attempts: Vec::new(),
+        }
+    }
+
+    /// Provenance for an answer executed by a mesh peer.
+    #[must_use]
+    pub fn mesh_backed(
+        entry_node: String,
+        served_by: String,
+        hop_count: u8,
+        decision: impl Into<String>,
+    ) -> Self {
+        Self {
+            truth_source: InvokeTruthSource::MeshBacked,
+            served_by: Some(served_by),
+            entry_node: Some(entry_node),
+            hop_count,
+            decision: decision.into(),
+            failed_attempts: Vec::new(),
+        }
+    }
 }
 
 /// Invoke response status.
@@ -819,7 +909,7 @@ impl InvokeResponse {
 
     /// Set response metadata.
     #[must_use]
-    pub const fn with_metadata(mut self, metadata: ResponseMetadata) -> Self {
+    pub fn with_metadata(mut self, metadata: ResponseMetadata) -> Self {
         self.response_metadata = Some(metadata);
         self
     }
@@ -1062,7 +1152,7 @@ impl SimulateResponse {
 
     /// Set response metadata.
     #[must_use]
-    pub const fn with_metadata(mut self, metadata: ResponseMetadata) -> Self {
+    pub fn with_metadata(mut self, metadata: ResponseMetadata) -> Self {
         self.response_metadata = Some(metadata);
         self
     }
@@ -2372,6 +2462,7 @@ mod tests {
                 cache_ttl_secs: Some(300),
                 from_cache: false,
                 retry_after_secs: None,
+                route: None,
             }),
         };
 
@@ -3309,6 +3400,7 @@ mod tests {
             cache_ttl_secs: Some(300),
             from_cache: true,
             retry_after_secs: Some(60),
+            route: None,
         };
         let cloned = meta;
         assert_eq!(cloned.processing_time_ms, Some(42));
@@ -3323,6 +3415,7 @@ mod tests {
             cache_ttl_secs: None,
             from_cache: false,
             retry_after_secs: Some(30),
+            route: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: ResponseMetadata = serde_json::from_str(&json).unwrap();

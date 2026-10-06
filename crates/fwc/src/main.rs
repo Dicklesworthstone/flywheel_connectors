@@ -330,9 +330,9 @@ use fcp_host::{
 };
 use fcp_kernel::{
     AgentHint, ApprovalMode, BudgetStatus, CapabilityId, ConnectorHealth, ConnectorId,
-    InvokeRequest, InvokeResponse, InvokeStatus, LifecycleState, LifecycleStatus, OperationId,
-    OperationInfo, RateLimitDeclarations, RequestId, RolloutPolicy, SafetyTier, SelfCheckStatus,
-    SupplyChainAttestation,
+    InvokeRequest, InvokeResponse, InvokeStatus, InvokeTruthSource, LifecycleState,
+    LifecycleStatus, OperationId, OperationInfo, RateLimitDeclarations, RequestId, RolloutPolicy,
+    SafetyTier, SelfCheckStatus, SupplyChainAttestation,
 };
 use fcp_manifest::ConnectorManifest;
 use fcp_mesh::{
@@ -23919,21 +23919,37 @@ fn invoke_dispatch_host(
         latency_ms,
     );
 
+    let route = invoke_response_route(&response);
+    let mesh_executor = route
+        .filter(|route| route.truth_source == InvokeTruthSource::MeshBacked)
+        .and_then(|route| route.served_by.clone());
     payload["phase"] = json!("execution");
     payload["status"] = json!(match response.status {
         InvokeStatus::Ok => "ok",
         InvokeStatus::Error => "error",
     });
-    payload["message"] = json!(match response.status {
-        InvokeStatus::Ok => format!(
+    payload["message"] = json!(match (response.status, mesh_executor.as_deref()) {
+        (InvokeStatus::Ok, Some(executor)) => format!(
+            "Executed `{}.{}` on mesh peer `{executor}` (relayed by `fcp-host`).",
+            connector.slug, operation.name
+        ),
+        (InvokeStatus::Ok, None) => format!(
             "Executed `{}.{}` through `fcp-host`.",
             connector.slug, operation.name
         ),
-        InvokeStatus::Error => format!(
+        (InvokeStatus::Error, Some(executor)) => format!(
+            "Mesh peer `{executor}` ran `{}.{}` and the connector returned an error response.",
+            connector.slug, operation.name
+        ),
+        (InvokeStatus::Error, None) => format!(
             "`fcp-host` ran `{}.{}` and the connector returned an error response.",
             connector.slug, operation.name
         ),
     });
+    if let Some(route) = route {
+        payload["route"] = serde_json::to_value(route)?;
+    }
+    let knowledge_state = invoke_response_knowledge_state(&response);
     payload["response"] = response_value;
     payload["next_actions"] = json!(match response.status {
         InvokeStatus::Ok => vec![
@@ -23951,7 +23967,7 @@ fn invoke_dispatch_host(
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "invoke");
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    inject_truth_source_metadata(&mut payload, knowledge_state);
     Ok(DispatchOutcome {
         payload,
         exit_code: match response.status {
@@ -23959,6 +23975,24 @@ fn invoke_dispatch_host(
             InvokeStatus::Error => CliExitCode::Connector,
         },
     })
+}
+
+/// Route provenance a mesh-aware host stamped on an invoke answer.
+fn invoke_response_route(response: &InvokeResponse) -> Option<&fcp_kernel::InvokeRouteProvenance> {
+    response
+        .response_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.route.as_ref())
+}
+
+/// Truth tier of a live invoke answer (bridge plan A.2/A.5): `MeshBacked`
+/// exactly when the host reports that a mesh peer executed the operation,
+/// otherwise `HostBacked` (the host `fwc` called executed it).
+fn invoke_response_knowledge_state(response: &InvokeResponse) -> KnowledgeState {
+    match invoke_response_route(response).map(|route| route.truth_source) {
+        Some(InvokeTruthSource::MeshBacked) => KnowledgeState::MeshBacked,
+        Some(InvokeTruthSource::HostBacked) | None => KnowledgeState::HostBacked,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -31831,6 +31865,55 @@ mod tests {
         .expect("mesh truth-source payload should render");
 
         assert!(!outcome.text.contains("answer source"));
+    }
+
+    #[test]
+    fn invoke_truth_source_follows_host_route_provenance() {
+        let mut response = fcp_kernel::InvokeResponse::ok(
+            fcp_kernel::RequestId::new("req-mesh"),
+            json!({ "ok": true }),
+        );
+        assert_eq!(
+            super::invoke_response_knowledge_state(&response),
+            KnowledgeState::HostBacked,
+            "hosts without a mesh directory stamp nothing: host-backed by construction"
+        );
+
+        response = response.with_metadata(fcp_kernel::ResponseMetadata {
+            route: Some(fcp_kernel::InvokeRouteProvenance::mesh_backed(
+                "node-a".to_owned(),
+                "node-b".to_owned(),
+                1,
+                "advertised_peer_forward",
+            )),
+            ..Default::default()
+        });
+        assert_eq!(
+            super::invoke_response_knowledge_state(&response),
+            KnowledgeState::MeshBacked
+        );
+        let mut payload = json!({ "status": "ok", "command": "invoke" });
+        super::inject_truth_source_metadata(
+            &mut payload,
+            super::invoke_response_knowledge_state(&response),
+        );
+        assert_eq!(payload["_truth_source"], "mesh");
+        assert_eq!(
+            super::invoke_response_route(&response).and_then(|route| route.served_by.as_deref()),
+            Some("node-b")
+        );
+
+        response = response.with_metadata(fcp_kernel::ResponseMetadata {
+            route: Some(fcp_kernel::InvokeRouteProvenance::host_backed(
+                Some("node-a".to_owned()),
+                "local_connector",
+            )),
+            ..Default::default()
+        });
+        assert_eq!(
+            super::invoke_response_knowledge_state(&response),
+            KnowledgeState::HostBacked
+        );
     }
 
     #[test]

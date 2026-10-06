@@ -53,15 +53,28 @@ pub struct HttpHostProcess {
     stderr_thread: Option<JoinHandle<()>>,
 }
 
+/// Reserve a loopback address for a host whose URL must be known before it
+/// starts (mesh peers list each other's endpoints).
+pub fn reserve_local_bind_addr() -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    let bind_listener = StdTcpListener::bind("127.0.0.1:0")?;
+    let bind_addr = bind_listener.local_addr()?;
+    drop(bind_listener);
+    Ok(bind_addr)
+}
+
 impl HttpHostProcess {
     pub async fn spawn_with_env(
         connector_configs: Vec<Value>,
         extra_env: &[(&str, &str)],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let bind_listener = StdTcpListener::bind("127.0.0.1:0")?;
-        let bind_addr = bind_listener.local_addr()?;
-        drop(bind_listener);
+        Self::spawn_at_with_env(reserve_local_bind_addr()?, connector_configs, extra_env).await
+    }
 
+    pub async fn spawn_at_with_env(
+        bind_addr: std::net::SocketAddr,
+        connector_configs: Vec<Value>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let base_url = format!("http://{bind_addr}");
         let lifecycle_state_dir = tempfile::tempdir()?;
         let lifecycle_state_path = lifecycle_state_dir.path().join("lifecycle-state.json");
@@ -189,6 +202,11 @@ where
         .await?
         .error_for_status()?;
     Ok(response.json::<T>().await?)
+}
+
+/// Plain (non-singleton) `fcp-test-connector` inventory entry bound to `z:work`.
+pub fn plain_test_connector_config(connector_id: &ConnectorId, name: &str) -> Value {
+    test_connector_config(connector_id, name, &["test"])
 }
 
 pub fn singleton_writer_test_connector_config(connector_id: &ConnectorId, name: &str) -> Value {
@@ -465,7 +483,7 @@ fn build_live_capability_token(
 fn test_zone_policy(zone_id: ZoneId) -> ZonePolicyObject {
     ZonePolicyObject {
         header: ObjectHeader {
-            encryption_kind: Default::default(),
+            encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
             schema: fcp_cbor::SchemaId::new(
                 "fcp.core",
                 "ZonePolicyObject",
@@ -719,7 +737,7 @@ fn durable_connector_state_object_for_test(
     let seq_byte = u8::try_from(seq).expect("test sequence should fit in CBOR byte");
     fcp_core::ConnectorStateObject {
         header: ObjectHeader {
-            encryption_kind: Default::default(),
+            encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
             schema: fcp_store::FcpStoreConnectorStateStore::state_object_schema_id(),
             zone_id: zone_id.clone(),
             created_at: 1_800_200_000 + seq,
@@ -781,7 +799,7 @@ fn durable_core_lease_for_test(
 ) -> CoreLease {
     CoreLease {
         header: ObjectHeader {
-            encryption_kind: Default::default(),
+            encryption_kind: fcp_core::ObjectEncryptionKind::Plain,
             schema: fcp_cbor::SchemaId::new("fcp.lease", "lease", semver::Version::new(1, 0, 0)),
             zone_id: zone_id.clone(),
             created_at: exp.saturating_sub(300),
