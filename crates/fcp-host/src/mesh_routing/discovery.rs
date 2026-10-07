@@ -4,6 +4,8 @@
 //! a total deadline that includes waiting for the refresh lock. Completed
 //! results are cached immediately so cancelling a caller loses neither
 //! verified inventories nor the ability of another caller to resume discovery.
+//! A persistent attempt cursor prevents an unreachable prefix of the directory
+//! from monopolizing every refresh budget and starving later peers.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -47,7 +49,31 @@ impl CachedAdvertisement {
 #[derive(Debug, Default)]
 struct AdvertisementCache {
     generation: u64,
+    // Advance when a fetch starts, including fetches later cancelled. The
+    // directory is immutable for the lifetime of its router.
+    next_peer_index: usize,
     entries: HashMap<String, CachedAdvertisement>,
+}
+
+impl AdvertisementCache {
+    fn stale_peers(&self, directory: &MeshPeerDirectory, now_ms: u64) -> Vec<(usize, MeshPeer)> {
+        let mut peers: Vec<_> = directory.peers().enumerate().collect();
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let start = self.next_peer_index % peers.len();
+        peers.rotate_left(start);
+        peers
+            .into_iter()
+            .filter(|(_, peer)| {
+                !self
+                    .entries
+                    .get(peer.node_id.as_str())
+                    .is_some_and(|entry| entry.is_reusable(now_ms))
+            })
+            .map(|(index, peer)| (index, peer.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -85,21 +111,11 @@ impl PeerDiscovery {
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let now_ms = unix_now_ms();
-                let stale_peers: Vec<_> = directory
-                    .peers()
-                    .filter(|peer| {
-                        !cache
-                            .entries
-                            .get(peer.node_id.as_str())
-                            .is_some_and(|entry| entry.is_reusable(now_ms))
-                    })
-                    .cloned()
-                    .collect();
-                (cache.generation, stale_peers)
+                (cache.generation, cache.stale_peers(directory, unix_now_ms()))
             };
             let mut pending = stream::iter(stale_peers)
-                .map(|peer| {
+                .map(|(index, peer)| {
+                    self.record_attempt(generation, index, directory.len());
                     let node_id = peer.node_id.clone();
                     let result = fetch(peer);
                     async move { (node_id, result.await) }
@@ -162,6 +178,16 @@ impl PeerDiscovery {
         self.snapshot(directory, unix_now_ms())
     }
 
+    fn record_attempt(&self, generation: u64, index: usize, peer_count: usize) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.generation == generation {
+            cache.next_peer_index = if index + 1 < peer_count { index + 1 } else { 0 };
+        }
+    }
+
     fn snapshot(&self, directory: &MeshPeerDirectory, now_ms: u64) -> Vec<MeshPeerAdvertisement> {
         let cache = self
             .cache
@@ -182,6 +208,7 @@ impl PeerDiscovery {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.generation = cache.generation.wrapping_add(1);
+        cache.next_peer_index = 0;
         cache.entries.clear();
     }
 }
@@ -402,5 +429,58 @@ mod tests {
             .await;
         assert_eq!(recovered.len(), 2);
         assert_eq!(fetched.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelled_refreshes_rotate_past_unreachable_peer_prefixes() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(MAX_CONCURRENT_FETCHES * 2 + 1, &key);
+        let discovery = PeerDiscovery::new();
+        let attempted = Mutex::new(Vec::new());
+        for _ in 0..3 {
+            let mut refresh = Box::pin(discovery.collect(&directory, |peer| {
+                attempted.lock().unwrap().push(peer.node_id.as_str().to_owned());
+                pending::<Result<MeshPeerAdvertisement, String>>()
+            }));
+            assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+            drop(refresh);
+        }
+        let attempted = attempted.into_inner().unwrap();
+        assert_eq!(attempted.len(), MAX_CONCURRENT_FETCHES * 3);
+        let distinct: std::collections::BTreeSet<_> = attempted.into_iter().collect();
+        assert_eq!(distinct.len(), directory.len(), "a dead prefix must not starve later peers");
+        assert!(discovery.snapshot(&directory, unix_now_ms()).is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn total_deadline_preserves_completed_inventory_and_releases_refresh() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(2, &key);
+        let discovery = PeerDiscovery::new();
+        let refresh = discovery.collect(&directory, |peer| {
+            let ad = advertisement(&peer, &key);
+            async move {
+                if peer.node_id.as_str() == "peer-001" {
+                    pending::<()>().await;
+                }
+                Ok(ad)
+            }
+        });
+        let result = fcp_async_core::time::timeout(
+            REFRESH_TIMEOUT + Duration::from_secs(2),
+            refresh,
+        )
+        .await
+        .expect("discovery must enforce its own total deadline");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].node_id.as_str(), "peer-000");
+        let recovered = discovery
+            .collect(&directory, |peer| {
+                assert_eq!(peer.node_id.as_str(), "peer-001");
+                let ad = advertisement(&peer, &key);
+                async move { Ok(ad) }
+            })
+            .await;
+        assert_eq!(recovered.len(), 2);
     }
 }
