@@ -2,6 +2,7 @@
 name = "fcp-host"
 version = "0.2.1"
 edition = "2024"
+default-run = "fcp-host"
 description = "FCP Host - Node Gateway/Orchestrator for the Flywheel Connector Protocol"
 license = "Apache-2.0"
 repository = "https://github.com/flywheel-ai/flywheel_connectors"
