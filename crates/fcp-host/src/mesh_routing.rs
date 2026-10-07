@@ -18,6 +18,9 @@
 //! Discovery uses a shared refresh with bounded concurrency and a total
 //! deadline. Failed peers are briefly negative-cached; inventories are always
 //! authenticated and must remain within their signed freshness window.
+//! Outbound RPCs share router-wide, per-peer, and serialized-request-byte
+//! ceilings. Admission is fail-fast before network I/O, with no waiter queue;
+//! cancellation releases reservations, including while reading a reply.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -29,6 +32,9 @@
 //! - `FCP_HOST_MESH_PEERS` or `FCP_HOST_MESH_PEERS_FILE` — JSON array of
 //!   `{ "node_id", "endpoint", "public_key_hex" }` peer entries.
 //! - `FCP_HOST_MESH_FORWARD_TIMEOUT_MS` (optional) — per-forward deadline.
+//! - `FCP_HOST_MESH_FORWARD_MAX_IN_FLIGHT` (optional, default 32).
+//! - `FCP_HOST_MESH_FORWARD_MAX_PER_PEER` (optional, default 4).
+//! - `FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES` (optional, default 64 MiB).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -39,14 +45,20 @@ use fcp_crypto::ed25519::Ed25519SigningKey;
 use fcp_mesh::invoke_route::{
     AdvertisedConnector, DEFAULT_MESH_FORWARD_MAX_SKEW_MS, DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
     MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshForwardReplayGuard, MeshForwardReply,
-    MeshPeerAdvertisement, MeshPeerDirectory,
+    MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
 };
 use zeroize::Zeroizing;
 
 use crate::{HostError, HostResult};
 
+mod admission;
 mod discovery;
 
+use admission::{ForwardControl, LIMIT_ENV_KEYS};
+pub use admission::{
+    MESH_FORWARD_MAX_IN_FLIGHT_ENV, MESH_FORWARD_MAX_PER_PEER_ENV,
+    MESH_FORWARD_MAX_REQUEST_BYTES_ENV, MeshForwardLimits, MeshForwardUsage,
+};
 use discovery::PeerDiscovery;
 
 /// Env var naming this node's mesh id.
@@ -140,7 +152,8 @@ impl MeshRoutingSettings {
             || key_file.is_some()
             || peers_inline.is_some()
             || peers_file.is_some()
-            || timeout_raw.is_some();
+            || timeout_raw.is_some()
+            || LIMIT_ENV_KEYS.iter().any(|name| lookup(name).is_some());
         if !any_mesh_setting {
             return Ok(None);
         }
@@ -238,7 +251,7 @@ fn read_signing_key_file(path: &Path) -> HostResult<Ed25519SigningKey> {
 /// Why a forward did not produce a verified reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshForwardFailure {
-    /// The request never reached the peer (connect/build failure).
+    /// The request never reached the peer (admission/connect/build failure).
     NotDelivered {
         /// Target peer.
         peer: String,
@@ -316,6 +329,7 @@ pub struct MeshRouter {
     signing_key: Ed25519SigningKey,
     replay_guard: Mutex<MeshForwardReplayGuard>,
     advertisements: PeerDiscovery,
+    forwards: ForwardControl,
     client: reqwest::Client,
 }
 
@@ -324,18 +338,32 @@ impl std::fmt::Debug for MeshRouter {
         f.debug_struct("MeshRouter")
             .field("local_node", self.directory.local_node())
             .field("peer_count", &self.directory.len())
+            .field("forward_limits", &self.forwards.limits())
             .finish_non_exhaustive()
     }
 }
 
 impl MeshRouter {
-    /// Build a router from parsed settings.
+    /// Build a router with default outbound resource ceilings.
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::InvalidFilter`] for an invalid peer directory or
-    /// [`HostError::Internal`] when the HTTP client cannot be built.
+    /// See [`Self::with_forward_limits`].
     pub fn new(settings: MeshRoutingSettings) -> HostResult<Self> {
+        Self::with_forward_limits(settings, MeshForwardLimits::default())
+    }
+
+    /// Build a router with explicit, validated outbound resource ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::InvalidFilter`] for invalid limits or a peer
+    /// directory, or [`HostError::Internal`] when the HTTP client cannot be built.
+    pub fn with_forward_limits(
+        settings: MeshRoutingSettings,
+        limits: MeshForwardLimits,
+    ) -> HostResult<Self> {
+        let forwards = ForwardControl::new(limits)?;
         let directory = MeshPeerDirectory::from_json(settings.node_id, &settings.peers_json)
             .map_err(|error| HostError::InvalidFilter(error.to_string()))?;
         let client = reqwest::Client::builder()
@@ -358,6 +386,7 @@ impl MeshRouter {
                 DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
             )),
             advertisements: PeerDiscovery::new(),
+            forwards,
             client,
         })
     }
@@ -366,9 +395,38 @@ impl MeshRouter {
     ///
     /// # Errors
     ///
-    /// See [`MeshRoutingSettings::from_env`] and [`Self::new`].
+    /// See [`Self::from_lookup`].
     pub fn from_env() -> HostResult<Option<Self>> {
-        MeshRoutingSettings::from_env()?.map(Self::new).transpose()
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Load routing, trust, and admission settings through one environment view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a startup error for partial routing configuration or malformed
+    /// resource limits, never a silent unbounded or host-first fallback.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> HostResult<Option<Self>> {
+        let limits = MeshForwardLimits::from_lookup(&lookup)?;
+        MeshRoutingSettings::from_lookup(&lookup)?
+            .map(|settings| Self::with_forward_limits(settings, limits))
+            .transpose()
+    }
+
+    /// Effective outbound resource ceilings.
+    #[must_use]
+    pub const fn forward_limits(&self) -> MeshForwardLimits {
+        self.forwards.limits()
+    }
+
+    /// Atomic snapshot of active forwards; no payload or credential contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if admission state is poisoned rather than reporting
+    /// invented free capacity.
+    pub fn forward_usage(&self) -> HostResult<MeshForwardUsage> {
+        self.forwards.snapshot()
     }
 
     /// This node's id.
@@ -430,10 +488,14 @@ impl MeshRouter {
 
     /// Forward `body` to `target` and return its verified reply.
     ///
+    /// Shared admission reserves a router slot, a peer slot, and the exact
+    /// serialized request length before network I/O. Reservations remain held
+    /// through reply verification and are released on completion or cancellation.
+    ///
     /// # Errors
     ///
     /// Returns a [`MeshForwardFailure`] classifying whether the request may
-    /// have executed on the peer.
+    /// have executed on the peer. Admission refusals are never delivered.
     pub async fn forward(
         &self,
         target: &TailscaleNodeId,
@@ -462,6 +524,20 @@ impl MeshRouter {
                 peer: peer_label.clone(),
                 detail: format!("envelope serialization failed: {error}"),
             })?;
+        self.forwards
+            .execute(&peer_label, payload.len(), || {
+                self.forward_transport(peer, payload, &envelope)
+            })
+            .await
+    }
+
+    async fn forward_transport(
+        &self,
+        peer: &MeshPeer,
+        payload: Vec<u8>,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<MeshForwardReply, MeshForwardFailure> {
+        let peer_label = peer.node_id.as_str().to_owned();
         let url = format!("{}{MESH_FORWARD_ROUTE}", peer.endpoint);
         let response = self
             .client
@@ -497,7 +573,7 @@ impl MeshRouter {
                 },
             })?;
         reply
-            .verify_for(&envelope, &self.directory)
+            .verify_for(envelope, &self.directory)
             .map_err(|error| MeshForwardFailure::InvalidReply {
                 peer: peer_label,
                 error,
@@ -994,5 +1070,58 @@ mod tests {
         .unwrap_err();
         assert!(matches!(failure, MeshForwardFailure::InvalidReply { .. }));
         assert!(!failure.safe_to_retry());
+    }
+
+    #[test]
+    fn router_loads_admission_limits_without_ambient_environment() {
+        assert!(MeshRouter::from_lookup(|_| None).unwrap().is_none());
+        for variable in LIMIT_ENV_KEYS {
+            assert!(MeshRouter::from_lookup(|name| {
+                (name == variable).then(|| "8".to_owned())
+            }).is_err(), "a limit alone must not silently disable mesh routing");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = write_key_file(&dir, &Ed25519SigningKey::generate());
+        let peers = peers_json(&[("node-b", &Ed25519SigningKey::generate())]);
+        let router = MeshRouter::from_lookup(|name| match name {
+            MESH_NODE_ID_ENV => Some("node-a".to_owned()),
+            MESH_SIGNING_KEY_FILE_ENV => Some(key_file.clone()),
+            MESH_PEERS_ENV => Some(peers.clone()),
+            MESH_FORWARD_MAX_IN_FLIGHT_ENV => Some("8".to_owned()),
+            MESH_FORWARD_MAX_PER_PEER_ENV => Some("2".to_owned()),
+            MESH_FORWARD_MAX_REQUEST_BYTES_ENV => Some("4096".to_owned()),
+            _ => None,
+        }).unwrap().unwrap();
+        assert_eq!(router.forward_limits(), MeshForwardLimits {
+            max_in_flight: 8, max_per_peer: 2, max_request_bytes: 4096,
+        });
+        assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+    }
+
+    #[test]
+    fn forward_byte_admission_refuses_without_connecting_to_the_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let router = MeshRouter::with_forward_limits(
+            MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("node-a"),
+                signing_key: Ed25519SigningKey::generate(),
+                peers_json: serde_json::json!([{
+                    "node_id": "node-b",
+                    "endpoint": format!("http://{}", listener.local_addr().unwrap()),
+                    "public_key_hex": hex::encode(Ed25519SigningKey::generate().verifying_key().to_bytes()),
+                }]).to_string(),
+                forward_timeout: Duration::from_secs(1),
+            },
+            MeshForwardLimits { max_in_flight: 1, max_per_peer: 1, max_request_bytes: 1 },
+        ).unwrap();
+        let failure = fcp_async_core::runtime::block_on_sync(router.forward(
+            &TailscaleNodeId::new("node-b"),
+            MeshForwardBody::Introspect { connector_id: "fcp.test:utility:1.0.0".to_owned() },
+        )).unwrap().unwrap_err();
+        assert!(failure.safe_to_retry());
+        assert!(failure.summary().contains("request_byte_limit"));
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
     }
 }
