@@ -11,7 +11,9 @@
 //! executor's node id. A candidate that fails *before* the request could have
 //! been delivered is skipped in favour of the next ranked advertiser; a
 //! forward whose outcome is unknown is never retried elsewhere, so
-//! non-idempotent operations cannot double-execute.
+//! non-idempotent operations cannot double-execute. Unsigned HTTP refusals
+//! are also ambiguous: an intermediary can fail after execution, and a replay
+//! refusal can mean an earlier delivery already executed.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -64,7 +66,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_CACHE_TTL: Duration = Duration::from_secs(10);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_ERROR_DETAIL_BYTES: usize = 2048;
 
 /// Current Unix time in milliseconds.
 #[must_use]
@@ -239,13 +240,14 @@ pub enum MeshForwardFailure {
         /// Redaction-safe detail.
         detail: String,
     },
-    /// The peer refused the envelope before executing anything.
+    /// An unsigned HTTP response refused the forward. This does not prove
+    /// that execution did not occur, so it must not permit failover.
     Rejected {
         /// Target peer.
         peer: String,
         /// HTTP status of the refusal.
         status: u16,
-        /// Peer's refusal message (bounded).
+        /// Redaction-safe explanation, never the unsigned response body.
         detail: String,
     },
     /// The request may have reached the peer; its outcome is unknown.
@@ -267,9 +269,13 @@ pub enum MeshForwardFailure {
 impl MeshForwardFailure {
     /// Whether nothing can have executed on the peer, so trying another
     /// candidate (or the local connector) cannot double-execute.
+    ///
+    /// Neither an unsigned HTTP status nor a request-level transport error
+    /// establishes this. In particular, HTTP 409 can reject a replay of an
+    /// already-executed request, and a proxy can return 5xx after execution.
     #[must_use]
     pub const fn safe_to_retry(&self) -> bool {
-        matches!(self, Self::NotDelivered { .. } | Self::Rejected { .. })
+        matches!(self, Self::NotDelivered { .. })
     }
 
     /// Target peer.
@@ -292,7 +298,7 @@ impl MeshForwardFailure {
                 peer,
                 status,
                 detail,
-            } => format!("{peer}: rejected forward with HTTP {status} ({detail})"),
+            } => format!("{peer}: unsigned HTTP {status}; outcome unknown ({detail})"),
             Self::OutcomeUnknown { peer, detail } => format!("{peer}: outcome unknown ({detail})"),
             Self::InvalidReply { peer, error } => format!("{peer}: invalid reply ({error})"),
         }
@@ -336,6 +342,8 @@ impl MeshRouter {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(settings.forward_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // Only the mesh layer may decide whether another delivery is safe.
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|error| {
                 HostError::Internal(format!(
@@ -464,21 +472,22 @@ impl MeshRouter {
             .await
             .map_err(|error| classify_send_error(&peer_label, &error))?;
         let status = response.status();
+        if !status.is_success() {
+            // HTTP status is not signed execution evidence. Even a 401/409/503
+            // can come from an intermediary after the peer accepted the call.
+            // Do not read or expose the untrusted body, and never fan out.
+            return Err(MeshForwardFailure::Rejected {
+                peer: peer_label,
+                status: status.as_u16(),
+                detail: "no authenticated proof of non-execution; failover refused".to_owned(),
+            });
+        }
         let bytes = read_bounded(response, MAX_REPLY_BYTES)
             .await
             .map_err(|detail| MeshForwardFailure::OutcomeUnknown {
                 peer: peer_label.clone(),
                 detail,
             })?;
-        if !status.is_success() {
-            let detail = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_DETAIL_BYTES)])
-                .into_owned();
-            return Err(MeshForwardFailure::Rejected {
-                peer: peer_label,
-                status: status.as_u16(),
-                detail,
-            });
-        }
         let reply: MeshForwardReply =
             serde_json::from_slice(&bytes).map_err(|error| MeshForwardFailure::InvalidReply {
                 peer: peer_label.clone(),
@@ -612,7 +621,9 @@ fn redact_reqwest(error: &reqwest::Error) -> String {
 
 fn classify_send_error(peer: &str, error: &reqwest::Error) -> MeshForwardFailure {
     let detail = redact_reqwest(error);
-    if error.is_connect() || error.is_builder() || error.is_request() && !error.is_timeout() {
+    // is_request() includes failures while waiting for response headers after
+    // the entire request was delivered. Only pre-send failures are retryable.
+    if error.is_connect() || error.is_builder() {
         MeshForwardFailure::NotDelivered {
             peer: peer.to_owned(),
             detail,
@@ -822,15 +833,16 @@ mod tests {
         let rejected = MeshForwardFailure::Rejected {
             peer: "node-b".to_owned(),
             status: 401,
-            detail: "signature".to_owned(),
+            detail: "unsigned refusal".to_owned(),
         };
         let unknown = MeshForwardFailure::OutcomeUnknown {
             peer: "node-b".to_owned(),
             detail: "timeout".to_owned(),
         };
         assert!(not_delivered.safe_to_retry());
-        assert!(rejected.safe_to_retry());
+        assert!(!rejected.safe_to_retry());
         assert!(!unknown.safe_to_retry());
+        assert!(rejected.summary().contains("outcome unknown"));
         assert!(unknown.summary().contains("outcome unknown"));
         assert_eq!(rejected.peer(), "node-b");
     }
@@ -889,5 +901,160 @@ mod tests {
             unknown_peer,
             Err(MeshForwardFailure::NotDelivered { .. })
         ));
+    }
+
+    // A real TCP peer reads the entire signed invoke before deciding how to
+    // answer. This exercises reqwest's delivery classification, not a model
+    // of it. Both accept and I/O are bounded so a regression cannot hang CI.
+    fn forward_after_receipt(
+        respond: impl FnOnce(MeshForwardEnvelope, Ed25519SigningKey) -> Option<(u16, String)>
+        + Send
+        + 'static,
+    ) -> Result<MeshForwardReply, MeshForwardFailure> {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let peer_key = Ed25519SigningKey::generate();
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("node-a"),
+            signing_key: Ed25519SigningKey::generate(),
+            peers_json: serde_json::json!([{
+                "node_id": "node-b",
+                "endpoint": endpoint,
+                "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+            }])
+            .to_string(),
+            forward_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "forward never connected");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let envelope = {
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "POST /rpc/mesh/forward HTTP/1.1\r\n");
+                let mut content_length = None;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(!line.is_empty(), "EOF in request headers");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let length = content_length.expect("known-length signed envelope");
+                assert!(length < 64 * 1024);
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                serde_json::from_slice::<MeshForwardEnvelope>(&bytes).unwrap()
+            };
+            assert!(matches!(&envelope.body, MeshForwardBody::Invoke { .. }));
+            if let Some((status, body)) = respond(envelope, peer_key) {
+                // Including Location pins redirect refusal as well as errors.
+                let header = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nLocation: /must-not-retry\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).unwrap();
+                // The client may close without reading an unsigned error body.
+                let _ = socket.write_all(body.as_bytes());
+            }
+        });
+        let result = fcp_async_core::runtime::block_on_sync(router.forward(
+            &TailscaleNodeId::new("node-b"),
+            MeshForwardBody::Invoke {
+                request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                asserted_principal: Some("test-principal".to_owned()),
+            },
+        ))
+        .expect("runtime");
+        server.join().expect("peer must receive the complete invoke");
+        result
+    }
+
+    #[test]
+    fn forward_eof_after_request_receipt_is_not_retryable() {
+        let failure = forward_after_receipt(|_, _| None).unwrap_err();
+        assert!(matches!(failure, MeshForwardFailure::OutcomeUnknown { .. }));
+        assert!(!failure.safe_to_retry(), "lost reply cannot justify fanout");
+    }
+
+    #[test]
+    fn forward_unsigned_http_status_never_proves_non_execution() {
+        for status in [301, 307, 400, 401, 403, 409, 421, 429, 500, 502, 503, 504] {
+            let failure = forward_after_receipt(move |_, _| {
+                Some((status, "secret-from-unsigned-error-body".to_owned()))
+            })
+            .unwrap_err();
+            assert!(matches!(
+                failure,
+                MeshForwardFailure::Rejected { status: actual, .. } if actual == status
+            ));
+            assert!(!failure.safe_to_retry(), "HTTP {status} cannot justify fanout");
+            assert!(!failure.summary().contains("secret-from-unsigned-error-body"));
+        }
+    }
+
+    #[test]
+    fn forward_malformed_success_reply_is_not_retryable() {
+        let failure = forward_after_receipt(|_, _| Some((200, "not a signed reply".to_owned())))
+            .unwrap_err();
+        assert!(matches!(failure, MeshForwardFailure::InvalidReply { .. }));
+        assert!(!failure.safe_to_retry());
+    }
+
+    #[test]
+    fn forward_signed_executor_error_is_a_result_not_failover() {
+        let reply = forward_after_receipt(|envelope, key| {
+            let reply = MeshForwardReply::sign(
+                &key,
+                TailscaleNodeId::new("node-b"),
+                &envelope,
+                500,
+                "{\"error\":\"operation failed after acceptance\"}".to_owned(),
+            );
+            Some((200, serde_json::to_string(&reply).unwrap()))
+        })
+        .unwrap();
+        assert_eq!(reply.status, 500);
+        assert_eq!(reply.served_by.as_str(), "node-b");
+        assert!(reply.body_json.contains("operation failed after acceptance"));
+    }
+
+    #[test]
+    fn forward_wrong_signer_reply_is_not_retryable() {
+        let failure = forward_after_receipt(|envelope, _| {
+            let reply = MeshForwardReply::sign(
+                &Ed25519SigningKey::generate(),
+                TailscaleNodeId::new("node-b"),
+                &envelope,
+                200,
+                "{}".to_owned(),
+            );
+            Some((200, serde_json::to_string(&reply).unwrap()))
+        })
+        .unwrap_err();
+        assert!(matches!(failure, MeshForwardFailure::InvalidReply { .. }));
+        assert!(!failure.safe_to_retry());
     }
 }
