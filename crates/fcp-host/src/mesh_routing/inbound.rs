@@ -3,9 +3,12 @@
 //! Only verified nonce identities enter this queue. The worker never dispatches
 //! a connector operation; success means the existing journal has synced the
 //! nonce. Cancellation cannot undo a commit or permit a repeated dispatch.
+//! Reply waits have a deadline independent of filesystem progress. Expiry drops
+//! only the caller's receiver, never the journal writer or its live nonce state.
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use fcp_async_core::channel::oneshot;
 use fcp_mesh::invoke_route::MeshForwardError;
@@ -14,6 +17,7 @@ use crate::mesh_replay::{DurableMeshReplayGuard, VerifiedMeshReplayNonce, replay
 use crate::{HostError, HostResult};
 
 const QUEUE_CAPACITY: usize = 32;
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 type AdmissionResult = Result<(), MeshForwardError>;
 
 struct Request {
@@ -81,10 +85,28 @@ impl InboundReplayWorker {
     }
 
     pub(super) async fn check(&self, identity: VerifiedMeshReplayNonce) -> AdmissionResult {
-        self.submit(identity)?
-            .await
-            .map_err(|_| replay_unavailable("worker_stopped"))?
+        wait_for_admission(self.submit(identity)?, ADMISSION_TIMEOUT).await
     }
+}
+
+async fn wait_for_admission(
+    completion: oneshot::Receiver<AdmissionResult>,
+    timeout: Duration,
+) -> AdmissionResult {
+    // A timeout may race a durable commit. Do not revoke the nonce, stop the
+    // worker, or report provable non-delivery. The awaiting handler must not
+    // execute on this error, and upstream unsigned-refusal rules still apply.
+    fcp_async_core::time::timeout(timeout, completion)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                event = "mesh_inbound_replay_deadline",
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "mesh admission reply deadline elapsed; nonce may be consumed"
+            );
+            replay_unavailable("replay_admission_deadline")
+        })?
+        .map_err(|_| replay_unavailable("worker_stopped"))?
 }
 
 impl Drop for InboundReplayWorker {
@@ -310,5 +332,71 @@ mod tests {
         };
         let result = worker.submit(identity(READY));
         assert!(matches!(result, Err(ref error) if unavailable(error, "worker_stopped")));
+    }
+
+    #[test]
+    fn deadline_releases_waiter_and_rejects_late_success() {
+        let (sender, receiver) = oneshot::channel();
+        let error = fcp_async_core::runtime::block_on_sync(wait_for_admission(
+            receiver,
+            Duration::from_millis(1),
+        ))
+        .unwrap()
+        .unwrap_err();
+        assert!(unavailable(&error, "replay_admission_deadline"));
+        assert!(sender.send(Ok(())).is_err(), "late success cannot revive the caller");
+    }
+
+    #[test]
+    fn completed_admission_and_storage_errors_are_preserved() {
+        for expected in [Ok(()), Err(replay_unavailable("commit_failed"))] {
+            let (sender, receiver) = oneshot::channel();
+            sender.send(expected.clone()).unwrap();
+            let actual = fcp_async_core::runtime::block_on_sync(wait_for_admission(
+                receiver,
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn closed_completion_is_not_misclassified_as_deadline() {
+        let (sender, receiver) = oneshot::channel();
+        drop(sender);
+        let error = fcp_async_core::runtime::block_on_sync(wait_for_admission(
+            receiver,
+            Duration::from_secs(5),
+        ))
+        .unwrap()
+        .unwrap_err();
+        assert!(unavailable(&error, "worker_stopped"));
+    }
+
+    #[test]
+    fn timed_out_job_can_commit_without_dispatch_or_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("replay"));
+        let worker = InboundReplayWorker::spawn_with_clock(Arc::clone(&state), 2, || READY).unwrap();
+        let held = state.lock().unwrap();
+        let nonce = identity(READY);
+        let receiver = worker.submit(nonce.clone()).unwrap();
+        let outcome = fcp_async_core::runtime::block_on_sync(wait_for_admission(
+            receiver,
+            Duration::from_millis(1),
+        ));
+        // Release before asserting, so even a failed deadline cannot strand
+        // the journal thread during stack unwinding.
+        drop(held);
+        assert!(unavailable(
+            &outcome.unwrap().unwrap_err(),
+            "replay_admission_deadline"
+        ));
+        assert!(matches!(
+            result(worker.submit(nonce).unwrap()),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        result(worker.submit(identity(READY)).unwrap()).unwrap();
     }
 }

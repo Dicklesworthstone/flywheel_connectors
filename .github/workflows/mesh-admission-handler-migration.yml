@@ -1,0 +1,139 @@
+name: Prepare reviewed mesh admission integration
+
+'on':
+  push:
+    branches: [main]
+    paths: [.github/workflows/mesh-admission-handler-migration.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-mesh-admission-integration
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/flywheel_connectors' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          clean: false
+          fetch-depth: 1
+          show-progress: false
+      - name: Check exact sources, parse candidates, and prepare blobs without publishing
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import difflib
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+
+          # Creates unreferenced blobs only. Publishing remains an explicit,
+          # separately reviewed ref update, never an automatic push or PR.
+          BASE_BLOBS = {
+              "crates/fcp-host/src/bin/fcp-host.rs": "aa653d02ac51a206e88a5ca9b1fee2557b931925",
+              "crates/fcp-host/src/mesh_routing.rs": "e69f77e483d64424ea5997a22d3fb1dc35fdb277",
+              "crates/fcp-host/src/mesh_routing/inbound_tests.rs": "66d7b141a912bc9f9d82d3078d35d67e87a05887",
+          }
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          if git("branch", "--show-current") != "main":
+              raise SystemExit("Only a main checkout may prepare this migration")
+
+          EDITS = json.loads(r'''[
+            {
+              "path": "crates/fcp-host/src/bin/fcp-host.rs",
+              "old": "    if let Err(error) = router.accept_inbound(&envelope) {",
+              "new": "    if let Err(error) = router.accept_inbound_async(&envelope).await {"
+            },
+            {
+              "path": "crates/fcp-host/src/bin/fcp-host.rs",
+              "old": "        MeshForwardError::ReplayCacheSaturated { .. } => StatusCode::SERVICE_UNAVAILABLE,",
+              "new": "        MeshForwardError::ReplayCacheSaturated { .. }\n        | MeshForwardError::Malformed {\n            field: \"replay_journal\",\n            ..\n        } => StatusCode::SERVICE_UNAVAILABLE,"
+            },
+            {
+              "path": "crates/fcp-host/src/bin/fcp-host.rs",
+              "old": "fn mesh_forward_error_status(error: &fcp_mesh::invoke_route::MeshForwardError) -> StatusCode {",
+              "new": "#[cfg(test)]\n#[test]\nfn mesh_replay_admission_errors_preserve_http_semantics() {\n    use fcp_mesh::invoke_route::MeshForwardError;\n    for reason in [\"commit_failed\", \"replay_admission_queue_full\", \"worker_stopped\"] {\n        let error = MeshForwardError::Malformed {\n            field: \"replay_journal\",\n            detail: reason.to_owned(),\n        };\n        assert_eq!(mesh_forward_error_status(&error), StatusCode::SERVICE_UNAVAILABLE);\n    }\n    assert_eq!(\n        mesh_forward_error_status(&MeshForwardError::Malformed {\n            field: \"nonce\",\n            detail: \"invalid nonce\".to_owned(),\n        }),\n        StatusCode::BAD_REQUEST\n    );\n    assert_eq!(\n        mesh_forward_error_status(&MeshForwardError::Replayed {\n            origin: \"peer\".to_owned(),\n        }),\n        StatusCode::CONFLICT\n    );\n    assert_eq!(\n        mesh_forward_error_status(&MeshForwardError::ReplayCacheSaturated { capacity: 1 }),\n        StatusCode::SERVICE_UNAVAILABLE\n    );\n}\n\nfn mesh_forward_error_status(error: &fcp_mesh::invoke_route::MeshForwardError) -> StatusCode {"
+            },
+            {
+              "path": "crates/fcp-host/src/mesh_routing.rs",
+              "old": "            return replay.accept(envelope, &self.directory, unix_now_ms());",
+              "new": "            let started_at_ms = unix_now_ms();\n            replay.accept(envelope, &self.directory, started_at_ms)?;\n            return self.finish_inbound_admission(envelope, started_at_ms, unix_now_ms());"
+            },
+            {
+              "path": "crates/fcp-host/src/mesh_routing.rs",
+              "old": "        if let Some(worker) = &self.inbound_worker {\n            let identity = VerifiedMeshReplayNonce::verify(\n                envelope,\n                &self.directory,\n                unix_now_ms(),\n                DEFAULT_MESH_FORWARD_MAX_SKEW_MS,\n            )?;\n            return worker.check(identity).await;\n        }",
+              "new": "        if let Some(worker) = &self.inbound_worker {\n            let started_at_ms = unix_now_ms();\n            let identity = VerifiedMeshReplayNonce::verify(\n                envelope,\n                &self.directory,\n                started_at_ms,\n                DEFAULT_MESH_FORWARD_MAX_SKEW_MS,\n            )?;\n            worker.check(identity).await?;\n            return self.finish_inbound_admission(envelope, started_at_ms, unix_now_ms());\n        }"
+            },
+            {
+              "path": "crates/fcp-host/src/mesh_routing.rs",
+              "old": "    /// Sign the reply to an accepted inbound envelope.\n    #[must_use]\n    pub fn sign_reply(",
+              "new": "    // Queue admission is not the last await: slow sync or delayed polling of\n    // its reply can exhaust freshness after the worker's pre-commit check.\n    // Refusal here leaves the durably committed nonce consumed.\n    fn finish_inbound_admission(\n        &self,\n        envelope: &MeshForwardEnvelope,\n        started_at_ms: u64,\n        now_ms: u64,\n    ) -> Result<(), MeshForwardError> {\n        if now_ms < started_at_ms {\n            return Err(replay_unavailable(\"clock_rollback_after_admission\"));\n        }\n        envelope.verify(&self.directory, now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)\n    }\n\n    /// Sign the reply to an accepted inbound envelope.\n    #[must_use]\n    pub fn sign_reply("
+            },
+            {
+              "path": "crates/fcp-host/src/mesh_routing/inbound_tests.rs",
+              "old": "#[test]\nfn first_async_poll_does_not_wait_for_the_journal_mutex() {",
+              "new": "#[test]\nfn completion_rechecks_expiry_without_forgetting_the_committed_nonce() {\n    let fixture = Fixture::new();\n    let router = fixture.router();\n    let envelope = fixture.envelope();\n    router.accept_inbound(&envelope).unwrap();\n    let issued = envelope.issued_at_ms;\n    assert!(matches!(\n        router.finish_inbound_admission(\n            &envelope, issued, issued + DEFAULT_MESH_FORWARD_MAX_SKEW_MS + 1,\n        ),\n        Err(MeshForwardError::Stale { .. })\n    ));\n    assert!(matches!(\n        router.accept_inbound(&envelope),\n        Err(MeshForwardError::Replayed { .. })\n    ));\n}\n\n#[test]\nfn completion_clock_rollback_is_not_mistaken_for_freshness() {\n    let fixture = Fixture::new();\n    let router = fixture.router();\n    let envelope = fixture.envelope();\n    let issued = envelope.issued_at_ms;\n    assert!(matches!(\n        router.finish_inbound_admission(&envelope, issued + 1, issued),\n        Err(MeshForwardError::Malformed { field: \"replay_journal\", detail })\n            if detail.contains(\"clock_rollback_after_admission\")\n    ));\n}\n\n#[test]\nfn completion_freshness_boundary_is_inclusive() {\n    let fixture = Fixture::new();\n    let router = fixture.router();\n    let envelope = fixture.envelope();\n    let issued = envelope.issued_at_ms;\n    router.finish_inbound_admission(\n        &envelope, issued, issued + DEFAULT_MESH_FORWARD_MAX_SKEW_MS,\n    ).unwrap();\n}\n\n#[test]\nfn first_async_poll_does_not_wait_for_the_journal_mutex() {"
+            }
+          ]''')
+
+          candidates = {}
+          for path, expected in BASE_BLOBS.items():
+              raw = Path(path).read_bytes()
+              actual = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"Source changed: {path}; review before preparing another migration")
+              original = raw.decode("utf-8")
+              updated = original
+              for edit in EDITS:
+                  if edit["path"] != path:
+                      continue
+                  if updated.count(edit["old"]) != 1:
+                      raise SystemExit(f"Non-unique edit anchor in {path}")
+                  updated = updated.replace(edit["old"], edit["new"], 1)
+              if updated == original:
+                  raise SystemExit(f"No substantive edit for {path}")
+              patch = "".join(difflib.unified_diff(
+                  original.splitlines(keepends=True), updated.splitlines(keepends=True),
+                  fromfile="a/" + path, tofile="b/" + path,
+              ))
+              subprocess.run(["git", "apply", "--check", "-"], input=patch, text=True, check=True)
+              # Parse candidates without replacing untouched source. This is a
+              # syntax check, not compilation or execution of the Cargo tests.
+              subprocess.run(
+                  ["rustup", "run", "stable", "rustfmt", "--edition", "2024",
+                   "--config", "skip_children=true", "--emit", "stdout"],
+                  input=updated, text=True, check=True, stdout=subprocess.DEVNULL,
+              )
+              print(patch)
+              candidates[path] = updated
+
+          result = {"base_commit": git("rev-parse", "HEAD"),
+                    "base_tree": git("rev-parse", "HEAD^{tree}"), "files": []}
+          for path, content in candidates.items():
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/git/blobs",
+                  data=json.dumps({"content": content, "encoding": "utf-8"}).encode(),
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json",
+                           "X-GitHub-Api-Version": "2022-11-28"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  blob = json.load(response)
+              result["files"].append({"path": path, "old_sha": BASE_BLOBS[path], "new_sha": blob["sha"]})
+          print("PREPARED_MESH_INTEGRATION=" + json.dumps(result, sort_keys=True))
