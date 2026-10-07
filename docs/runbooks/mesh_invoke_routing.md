@@ -2,9 +2,10 @@
 
 Bridge plan Phase A.2 (`MeshInvokeTransport`). Code: `crates/fcp-mesh/src/invoke_route.rs`
 (envelopes, directory, replay guard, routing rules), `crates/fcp-host/src/mesh_routing.rs`
-(host configuration and HTTP transport), and `crates/fcp-host/src/mesh_routing/discovery.rs`
-(bounded authenticated discovery), wired into `fcp-host` at `/rpc/invoke`, `/rpc/preflight`,
-`/rpc/introspect/{id}`, and `/rpc/discover`.
+(host configuration and HTTP transport), `crates/fcp-host/src/mesh_routing/discovery.rs`
+(bounded authenticated discovery), and `crates/fcp-host/src/mesh_routing/admission.rs`
+(outbound resource admission and peer circuit recovery), wired into `fcp-host` at
+`/rpc/invoke`, `/rpc/preflight`, `/rpc/introspect/{id}`, and `/rpc/discover`.
 Multi-process proof: `crates/fcp-host/tests/mesh_invoke_e2e.rs`.
 
 ## What it does
@@ -25,8 +26,9 @@ the call, and `_truth_source: "host"` otherwise.
 
 ## Configuration
 
-All of the following are required together. A partial configuration makes `fcp-host` refuse
-to start, so no node silently falls back to host-first.
+The node identity, signing key, and peer directory are required together. A partial
+configuration makes `fcp-host` refuse to start, so no node silently falls back to host-first.
+Timeout and resource ceilings are optional once that configuration is complete.
 
 | Env var | Meaning |
 |---------|---------|
@@ -34,6 +36,14 @@ to start, so no node silently falls back to host-first.
 | `FCP_HOST_MESH_SIGNING_KEY_FILE` | File holding this node's hex-encoded 32-byte Ed25519 secret key. |
 | `FCP_HOST_MESH_PEERS` / `FCP_HOST_MESH_PEERS_FILE` | JSON array of `{ "node_id", "endpoint", "public_key_hex" }`. One shared file can be shipped to every node; each host skips its own entry. |
 | `FCP_HOST_MESH_FORWARD_TIMEOUT_MS` | Optional per-forward deadline (default 60000). |
+| `FCP_HOST_MESH_FORWARD_MAX_IN_FLIGHT` | Optional router-wide simultaneous-forward ceiling (default 32). |
+| `FCP_HOST_MESH_FORWARD_MAX_PER_PEER` | Optional per-peer simultaneous-forward ceiling (default 4; must not exceed the router ceiling). |
+| `FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES` | Optional aggregate serialized-request-byte ceiling for admitted forwards (default 67108864, or 64 MiB). |
+
+All ceilings must be positive integers. Empty, malformed, overflowing, zero, or inconsistent
+values are startup errors, not a request to disable admission. Limits alone do not silently
+turn an incompletely configured mesh router into a host-first deployment. Embedded callers
+can use `MeshRouter::with_forward_limits` for explicit limits or `MeshRouter::new` for defaults.
 
 Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses.
 
@@ -57,10 +67,11 @@ Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses
 
 ## Failure semantics
 
-- Only a failure proving the request was not delivered (connection establishment or request
-  construction failure) permits trying the next HRW-ranked advertiser. Each failed attempt
-  is listed in `route.failed_attempts`.
-- `singleton_writer` connectors never fan out: they have exactly one executor.
+- Only a failure proving the request was not delivered (local admission refusal, connection
+  establishment, or request construction failure) permits trying the next HRW-ranked
+  advertiser. Each failed attempt is listed in `route.failed_attempts`.
+- `singleton_writer` connectors never fan out: they have exactly one executor. A busy or
+  circuit-open holder does not authorize execution on another node.
 - A lost reply, post-send connection failure, timeout, invalid signature, malformed reply, or
   unsigned HTTP refusal stops failover. HTTP status alone is not proof of non-execution:
   a proxy can return 5xx after execution, and a 409 replay refusal can mean an earlier delivery
@@ -68,7 +79,46 @@ Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses
   non-idempotent operation. Unsigned response bodies are not copied into diagnostics.
 - HTTP redirects and implicit HTTP-client retries are disabled. The mesh layer owns delivery
   decisions. A verified executor error is returned as that executor's result, not retried.
-- If every advertiser is provably undeliverable, the entry node returns `503` with the attempts.
+- If every advertiser is provably undeliverable or locally refused before sending, the entry
+  node returns `503` with the attempts.
+
+## Outbound admission and peer recovery
+
+Every forward atomically reserves one router slot, one peer slot, and its exact serialized
+request length before network I/O. The reservation is held through body reading and reply
+verification. Success, error, panic in future construction, and caller cancellation all release
+it. Admission is fail-fast: there is no unbounded queue of waiting requests, and no synchronous
+mutex is held across network awaits. A slow peer cannot occupy more than its per-peer ceiling.
+
+The request-byte ceiling does not count returned response bodies or all host memory. Each
+response remains independently limited to 16 MiB. `MeshRouter::forward_limits` reports the
+active ceilings; `MeshRouter::forward_usage` returns an atomic, redaction-safe snapshot of
+in-flight counts and serialized request bytes, with per-peer counts in stable order. Poisoned
+admission state refuses new forwards and returns a snapshot error rather than inventing free
+capacity.
+
+Three consecutive transport failures open that peer's circuit for five seconds. A malformed
+or unauthenticated reply opens it immediately for thirty seconds. After cooldown, exactly one
+new caller is admitted as the recovery probe. Failed probes back off to ten, twenty, then at
+most thirty seconds. An authenticated reply closes the circuit and resets backoff, including a
+signed operation error: application failure is not transport failure. There are no automatic
+replays or synthetic write probes; the single probe is an already-requested forward.
+
+An open circuit changes only admission of later requests. The original timeout, unsigned HTTP
+error, or invalid reply is returned unchanged and remains non-retryable. A subsequent request
+refused by the circuit has not been sent and may follow the normal routing rule's alternatives.
+Resource saturation cannot consume the recovery-probe slot. Cancelling a probe releases both
+resources and probe ownership, retaining cooldown without escalating it or claiming recovery.
+Ordinary caller cancellation is not counted as a peer failure.
+
+Generation identity fences in-flight observations: a late success cannot close a newer open
+circuit, and a late failure cannot poison a completed recovery. Circuit state is local to the
+router process and is not a quorum vote or proof of mesh readiness. A fresh advertisement does
+not reset it; the invoke transport must authenticate a reply to recover.
+
+Structured events distinguish `mesh_forward_admission_refused` (peer plus reason) from
+`mesh_forward_peer_circuit` (peer, state, reason, cooldown_ms). Neither event includes request
+contents, credentials, or unsigned response bodies.
 
 ## Discovery under failure and load
 
@@ -94,7 +144,7 @@ from `mesh_discovery_deadline`.
 
 - The default deployment is still host-first. The README Mesh-Native row stays `STEADY-STATE
   TARGET (NOT YET OPERATIONAL)` until production evidence exists.
-- Membership is a static peer file, not gossip. Peer health beyond per-request delivery is not
-  yet fed into `MeshQuorumSignals`.
+- Membership is a static peer file, not gossip. Local transport circuits are not yet fed into
+  `MeshQuorumSignals` and must not be treated as authenticated quorum membership.
 - A locally installed connector always executes locally. There is no planner-driven placement
   of local connectors onto peers.
