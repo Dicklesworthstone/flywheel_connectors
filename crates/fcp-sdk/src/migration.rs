@@ -663,6 +663,11 @@ impl RetryLoop {
     /// - The retry policy's max attempts is reached
     /// - The context deadline expires or cancellation is triggered
     ///
+    /// Each attempt, including construction of its future, runs under the
+    /// context. An interrupted attempt is dropped and is never retried here:
+    /// cancellation or timeout does not prove that an upstream side effect
+    /// did not happen. Attempts and backoff share the same absolute deadline.
+    ///
     /// # Errors
     ///
     /// Returns the last error encountered (either from the operation or from
@@ -714,7 +719,15 @@ impl RetryLoop {
 
             debug!(attempt, "executing retry attempt");
 
-            match operation(attempt).await {
+            // Defer even calling the closure until the context admits work.
+            // Awaiting the attempt directly only bounded the backoff, leaving
+            // hung I/O uncancellable and allowing expired requests to send.
+            let outcome = ctx
+                .run(async { operation(attempt).await })
+                .await
+                .map_err(E::from_async_error)?;
+
+            match outcome {
                 AttemptOutcome::Success(value) => return Ok(value),
                 AttemptOutcome::Terminal(error) => return Err(error),
                 AttemptOutcome::Retryable { error, retry_after } => {
@@ -2269,5 +2282,176 @@ mod tests {
         assert!(!is_http_status_retryable(401));
         assert!(!is_http_status_retryable(404));
         assert!(!is_http_status_retryable(501));
+    }
+
+    mod retry_loop_context {
+        use std::future::{Future, pending};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::*;
+
+        type Outcome = AttemptOutcome<(), TestError>;
+
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        async fn bounded(future: impl Future<Output = Result<(), TestError>>) -> Result<(), TestError> {
+            fcp_async_core::time::timeout(Duration::from_secs(5), future)
+                .await
+                .expect("retry loop ignored its context and hit the watchdog")
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn expired_context_does_not_call_attempt_factory() {
+            let ctx = ExecutionContext::request_scoped(Duration::ZERO);
+            let policy = RetryPolicy::new();
+            let mut attempts = 0;
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |_| {
+                // Deliberately outside the future: even constructing an
+                // attempt must not initiate work after the deadline.
+                attempts += 1;
+                std::future::ready(AttemptOutcome::Success(()))
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::DeadlineExceeded(_))));
+            assert_eq!(attempts, 0);
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn cancellation_precedes_expiry_without_calling_attempt_factory() {
+            let ctx = ExecutionContext::request_scoped(Duration::ZERO);
+            ctx.cancel();
+            let policy = RetryPolicy::new();
+            let mut attempts = 0;
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |_| {
+                attempts += 1;
+                std::future::ready(AttemptOutcome::Success(()))
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::Cancelled)));
+            assert_eq!(attempts, 0);
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn cancellation_drops_in_flight_attempt_without_replay() {
+            let ctx = ExecutionContext::background();
+            let policy = RetryPolicy::new().with_max_attempts(None);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |_| {
+                attempts += 1;
+                let guard = DropFlag(Arc::clone(&dropped));
+                let cancel = ctx.clone();
+                async move {
+                    let _guard = guard;
+                    // Cancel after admission, while the attempt is pending.
+                    // No race-prone sleep or independently scheduled task.
+                    cancel.cancel();
+                    pending::<Outcome>().await
+                }
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::Cancelled)));
+            assert_eq!(attempts, 1);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn deadline_drops_in_flight_attempt_without_replay() {
+            let policy = RetryPolicy::new().with_max_attempts(None);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+            let ctx = ExecutionContext::request_scoped(Duration::from_millis(100));
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |_| {
+                attempts += 1;
+                let guard = DropFlag(Arc::clone(&dropped));
+                async move {
+                    let _guard = guard;
+                    pending::<Outcome>().await
+                }
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::DeadlineExceeded(_))));
+            assert_eq!(attempts, 1);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn cancellation_also_bounds_later_attempts() {
+            let ctx = ExecutionContext::background();
+            let policy = RetryPolicy::new()
+                .with_base_backoff_ms(1)
+                .with_jitter_enabled(false)
+                .with_max_attempts(None);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |attempt| {
+                attempts += 1;
+                let dropped = Arc::clone(&dropped);
+                let cancel = ctx.clone();
+                async move {
+                    if attempt == 0 {
+                        return AttemptOutcome::Retryable {
+                            error: TestError::Transient("connect refused".into()),
+                            retry_after: None,
+                        };
+                    }
+                    let _guard = DropFlag(dropped);
+                    cancel.cancel();
+                    pending::<Outcome>().await
+                }
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::Cancelled)));
+            assert_eq!(attempts, 2);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+
+        #[fcp_async_core::runtime::test]
+        async fn deadline_also_bounds_later_attempts() {
+            let policy = RetryPolicy::new()
+                .with_base_backoff_ms(1)
+                .with_jitter_enabled(false)
+                .with_max_attempts(None);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+            let ctx = ExecutionContext::request_scoped(Duration::from_millis(100));
+
+            let result = bounded(RetryLoop::execute(&ctx, &policy, |attempt| {
+                attempts += 1;
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    if attempt == 0 {
+                        return AttemptOutcome::Retryable {
+                            error: TestError::Transient("connect refused".into()),
+                            retry_after: None,
+                        };
+                    }
+                    let _guard = DropFlag(dropped);
+                    pending::<Outcome>().await
+                }
+            }))
+            .await;
+
+            assert!(matches!(result, Err(TestError::DeadlineExceeded(_))));
+            assert_eq!(attempts, 2);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
     }
 }
