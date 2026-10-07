@@ -39,6 +39,55 @@ const MAX_FILE_BYTES: usize = HEADER_LEN + MAX_RECORDS * RECORD_LEN;
 
 type ReplayKey = [u8; 32];
 
+/// An authenticated replay identity, stripped of request and credential bodies.
+///
+/// Private fields prevent queue callers from constructing an unchecked identity.
+/// The receiving journal independently rechecks node scope and freshness after
+/// queue/mutex waits; transport authentication alone does not authorize dispatch.
+#[derive(Clone)]
+pub(crate) struct VerifiedMeshReplayNonce {
+    scope: [u8; 32],
+    key: ReplayKey,
+    origin: String,
+    issued_at_ms: u64,
+}
+
+impl VerifiedMeshReplayNonce {
+    pub(crate) fn verify(
+        envelope: &MeshForwardEnvelope,
+        directory: &MeshPeerDirectory,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> Result<Self, MeshForwardError> {
+        envelope.verify(directory, now_ms, window_ms)?;
+        let scope = hash_parts(
+            b"FCP-MESH-REPLAY-NODE-V1",
+            &[directory.local_node().as_str().as_bytes()],
+        );
+        Self::from_authenticated(envelope, scope)
+    }
+
+    fn from_authenticated(
+        envelope: &MeshForwardEnvelope,
+        scope: [u8; 32],
+    ) -> Result<Self, MeshForwardError> {
+        let mut nonce = [0_u8; 16];
+        hex::decode_to_slice(&envelope.nonce, &mut nonce).map_err(|_| MeshForwardError::Malformed {
+            field: "nonce",
+            detail: "expected 16 bytes encoded as hex".to_owned(),
+        })?;
+        Ok(Self {
+            scope,
+            key: hash_parts(
+                b"FCP-MESH-REPLAY-ID-V1",
+                &[envelope.origin_node.as_str().as_bytes(), &nonce],
+            ),
+            origin: envelope.origin_node.as_str().to_owned(),
+            issued_at_ms: envelope.issued_at_ms,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     expires_at_ms: u64,
@@ -251,34 +300,40 @@ impl DurableMeshReplayGuard {
         envelope: &MeshForwardEnvelope,
         now_ms: u64,
     ) -> Result<(), MeshForwardError> {
+        let identity = VerifiedMeshReplayNonce::from_authenticated(envelope, self.scope)?;
+        self.accept_verified(&identity, now_ms)
+    }
+
+    /// Commit an opaque, previously authenticated identity on the blocking worker.
+    /// This does not permit execution until the existing journal sync completes.
+    pub(crate) fn accept_verified(
+        &mut self,
+        identity: &VerifiedMeshReplayNonce,
+        now_ms: u64,
+    ) -> Result<(), MeshForwardError> {
+        if identity.scope != self.scope {
+            return Err(replay_unavailable("node_scope_mismatch"));
+        }
         if self.io_failed {
             return Err(replay_unavailable("storage_failed"));
         }
         if now_ms < self.high_water_ms {
             return Err(replay_unavailable("clock_rollback"));
         }
-        if envelope.issued_at_ms.abs_diff(now_ms) > self.window_ms {
+        if identity.issued_at_ms.abs_diff(now_ms) > self.window_ms {
             return Err(MeshForwardError::Stale {
                 what: "forward",
-                issued_at_ms: envelope.issued_at_ms,
+                issued_at_ms: identity.issued_at_ms,
                 now_ms,
                 window_ms: self.window_ms,
             });
         }
-        let mut nonce = [0_u8; 16];
-        hex::decode_to_slice(&envelope.nonce, &mut nonce).map_err(|_| MeshForwardError::Malformed {
-            field: "nonce",
-            detail: "expected 16 bytes encoded as hex".to_owned(),
-        })?;
-        let key = hash_parts(
-            b"FCP-MESH-REPLAY-ID-V1",
-            &[envelope.origin_node.as_str().as_bytes(), &nonce],
-        );
+        let key = identity.key;
         self.high_water_ms = now_ms;
         self.expire(now_ms);
         if self.entries.contains_key(&key) {
             return Err(MeshForwardError::Replayed {
-                origin: envelope.origin_node.as_str().to_owned(),
+                origin: identity.origin.clone(),
             });
         }
         if self.entries.len() >= self.capacity {
@@ -287,7 +342,7 @@ impl DurableMeshReplayGuard {
             });
         }
         let entry = Entry {
-            expires_at_ms: envelope.issued_at_ms.saturating_add(self.window_ms),
+            expires_at_ms: identity.issued_at_ms.saturating_add(self.window_ms),
             observed_at_ms: now_ms,
         };
         // Latch before any persistence or allocation that could unwind. Only a

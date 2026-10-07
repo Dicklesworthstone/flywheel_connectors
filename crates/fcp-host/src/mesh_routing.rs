@@ -41,7 +41,7 @@
 //!   defaults to the signing-key filename with `.mesh-replay` appended.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fcp_core::TailscaleNodeId;
@@ -54,11 +54,19 @@ use fcp_mesh::invoke_route::{
 use zeroize::Zeroizing;
 
 pub use crate::mesh_replay::MESH_REPLAY_JOURNAL_ENV;
-use crate::mesh_replay::{DurableMeshReplayGuard, companion, replay_unavailable};
+use crate::mesh_replay::{
+    DurableMeshReplayGuard, VerifiedMeshReplayNonce, companion, replay_unavailable,
+};
 use crate::{HostError, HostResult};
 
 mod admission;
 mod discovery;
+mod inbound;
+
+use inbound::InboundReplayWorker;
+
+#[cfg(all(test, unix))]
+mod inbound_tests;
 
 use admission::{ForwardControl, LIMIT_ENV_KEYS};
 pub use admission::{
@@ -335,7 +343,8 @@ pub struct MeshRouter {
     directory: MeshPeerDirectory,
     signing_key: Ed25519SigningKey,
     replay_guard: Mutex<MeshForwardReplayGuard>,
-    durable_replay: Option<Mutex<DurableMeshReplayGuard>>,
+    durable_replay: Option<Arc<Mutex<DurableMeshReplayGuard>>>,
+    inbound_worker: Option<InboundReplayWorker>,
     advertisements: PeerDiscovery,
     forwards: ForwardControl,
     client: reqwest::Client,
@@ -398,6 +407,7 @@ impl MeshRouter {
                 DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
             )),
             durable_replay: None,
+            inbound_worker: None,
             advertisements: PeerDiscovery::new(),
             forwards,
             client,
@@ -427,7 +437,9 @@ impl MeshRouter {
             DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
             unix_now_ms(),
         )?;
-        router.durable_replay = Some(Mutex::new(replay));
+        let replay = Arc::new(Mutex::new(replay));
+        router.inbound_worker = Some(InboundReplayWorker::spawn(Arc::clone(&replay))?);
+        router.durable_replay = Some(replay);
         Ok(router)
     }
 
@@ -528,6 +540,8 @@ impl MeshRouter {
     /// Verify an inbound envelope and consume its nonce before dispatch.
     ///
     /// Persistent routers commit and sync the nonce before returning success.
+    /// This synchronous API can block on disk I/O; async request handlers must
+    /// use [`Self::accept_inbound_async`] to keep disk waits off their executor.
     /// The clock is sampled under the lock so concurrent callers cannot create
     /// apparent clock rollback by reaching admission in a different order.
     ///
@@ -549,6 +563,39 @@ impl MeshRouter {
         let now_ms = unix_now_ms();
         envelope.verify(&self.directory, now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
         replay.check_and_record(envelope, now_ms)
+    }
+
+    /// Authenticate and durably admit a forward without blocking on journal I/O.
+    ///
+    /// Only an opaque verified nonce identity enters the bounded worker queue;
+    /// request bodies and credentials stay with the awaiting handler. A full
+    /// queue fails immediately, and freshness is rechecked after all waits.
+    /// Cancellation may consume a nonce without dispatching its operation. It
+    /// never reverses an admission or permits another execution of that nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns authentication, freshness, replay, or admission-unavailable errors.
+    /// Success is returned only after the journal has committed and synced.
+    pub async fn accept_inbound_async(
+        &self,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<(), MeshForwardError> {
+        if let Some(worker) = &self.inbound_worker {
+            let identity = VerifiedMeshReplayNonce::verify(
+                envelope,
+                &self.directory,
+                unix_now_ms(),
+                DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+            )?;
+            return worker.check(identity).await;
+        }
+        if self.durable_replay.is_some() {
+            // An internal wiring failure must not silently fall back to blocking
+            // storage I/O or to the process-local replay guard.
+            return Err(replay_unavailable("worker_not_configured"));
+        }
+        self.accept_inbound(envelope)
     }
 
     /// Sign the reply to an accepted inbound envelope.
