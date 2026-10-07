@@ -21,6 +21,8 @@
 //! Outbound RPCs share router-wide, per-peer, and serialized-request-byte
 //! ceilings. Admission is fail-fast before network I/O, with no waiter queue;
 //! cancellation releases reservations, including while reading a reply.
+//! Environment-configured hosts sync accepted inbound nonces to a durable
+//! journal before dispatch, preserving replay rejection across restarts.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -35,8 +37,10 @@
 //! - `FCP_HOST_MESH_FORWARD_MAX_IN_FLIGHT` (optional, default 32).
 //! - `FCP_HOST_MESH_FORWARD_MAX_PER_PEER` (optional, default 4).
 //! - `FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES` (optional, default 64 MiB).
+//! - `FCP_HOST_MESH_REPLAY_JOURNAL` (optional) — persistent journal path;
+//!   defaults to the signing-key filename with `.mesh-replay` appended.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +53,8 @@ use fcp_mesh::invoke_route::{
 };
 use zeroize::Zeroizing;
 
+pub use crate::mesh_replay::MESH_REPLAY_JOURNAL_ENV;
+use crate::mesh_replay::{DurableMeshReplayGuard, companion, replay_unavailable};
 use crate::{HostError, HostResult};
 
 mod admission;
@@ -153,7 +159,8 @@ impl MeshRoutingSettings {
             || peers_inline.is_some()
             || peers_file.is_some()
             || timeout_raw.is_some()
-            || LIMIT_ENV_KEYS.iter().any(|name| lookup(name).is_some());
+            || LIMIT_ENV_KEYS.iter().any(|name| lookup(name).is_some())
+            || lookup(MESH_REPLAY_JOURNAL_ENV).is_some();
         if !any_mesh_setting {
             return Ok(None);
         }
@@ -328,6 +335,7 @@ pub struct MeshRouter {
     directory: MeshPeerDirectory,
     signing_key: Ed25519SigningKey,
     replay_guard: Mutex<MeshForwardReplayGuard>,
+    durable_replay: Option<Mutex<DurableMeshReplayGuard>>,
     advertisements: PeerDiscovery,
     forwards: ForwardControl,
     client: reqwest::Client,
@@ -339,12 +347,16 @@ impl std::fmt::Debug for MeshRouter {
             .field("local_node", self.directory.local_node())
             .field("peer_count", &self.directory.len())
             .field("forward_limits", &self.forwards.limits())
+            .field("durable_replay", &self.durable_replay.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl MeshRouter {
-    /// Build a router with default outbound resource ceilings.
+    /// Build an embedded router with default outbound resource ceilings.
+    ///
+    /// This constructor has process-local replay protection. Persistent hosts
+    /// must use [`Self::from_env`] or [`Self::with_replay_journal`] instead.
     ///
     /// # Errors
     ///
@@ -353,7 +365,7 @@ impl MeshRouter {
         Self::with_forward_limits(settings, MeshForwardLimits::default())
     }
 
-    /// Build a router with explicit, validated outbound resource ceilings.
+    /// Build an embedded router with explicit outbound ceilings and volatile replay state.
     ///
     /// # Errors
     ///
@@ -385,10 +397,38 @@ impl MeshRouter {
                 DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
                 DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
             )),
+            durable_replay: None,
             advertisements: PeerDiscovery::new(),
             forwards,
             client,
         })
+    }
+
+    /// Build a router whose inbound admission survives executor restarts.
+    ///
+    /// The journal is synced before an accepted envelope can reach dispatch.
+    /// The path and its companion lock must remain on trusted persistent storage
+    /// for the lifetime of the node identity; see [`DurableMeshReplayGuard`].
+    ///
+    /// # Errors
+    ///
+    /// Returns configuration, locking, recovery, or storage errors. Never falls
+    /// back to volatile replay protection when persistent admission is unavailable.
+    pub fn with_replay_journal(
+        settings: MeshRoutingSettings,
+        limits: MeshForwardLimits,
+        path: &Path,
+    ) -> HostResult<Self> {
+        let mut router = Self::with_forward_limits(settings, limits)?;
+        let replay = DurableMeshReplayGuard::open(
+            path,
+            router.local_node(),
+            DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+            DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
+            unix_now_ms(),
+        )?;
+        router.durable_replay = Some(Mutex::new(replay));
+        Ok(router)
     }
 
     /// Build a router from the process environment, if configured.
@@ -400,17 +440,47 @@ impl MeshRouter {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Load routing, trust, and admission settings through one environment view.
+    /// Load routing, trust, admission, and durable replay settings through one view.
+    ///
+    /// Environment-configured hosts always use persistent replay protection. The
+    /// default journal is adjacent to the signing key; an explicit path supports
+    /// read-only secret mounts with a separate writable state volume.
     ///
     /// # Errors
     ///
-    /// Returns a startup error for partial routing configuration or malformed
-    /// resource limits, never a silent unbounded or host-first fallback.
+    /// Returns a startup error for partial routing configuration, malformed
+    /// resource limits, or unavailable replay storage, never a silent fallback.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> HostResult<Option<Self>> {
         let limits = MeshForwardLimits::from_lookup(&lookup)?;
-        MeshRoutingSettings::from_lookup(&lookup)?
-            .map(|settings| Self::with_forward_limits(settings, limits))
-            .transpose()
+        let Some(settings) = MeshRoutingSettings::from_lookup(&lookup)? else {
+            return Ok(None);
+        };
+        let path = match lookup(MESH_REPLAY_JOURNAL_ENV) {
+            Some(raw) => {
+                let value = raw.trim();
+                if value.is_empty() {
+                    return Err(HostError::InvalidFilter(format!(
+                        "{MESH_REPLAY_JOURNAL_ENV} must be a nonempty persistent file path"
+                    )));
+                }
+                PathBuf::from(value)
+            }
+            None => {
+                let key_file = lookup(MESH_SIGNING_KEY_FILE_ENV).ok_or_else(|| {
+                    HostError::InvalidFilter(format!(
+                        "mesh replay protection requires {MESH_SIGNING_KEY_FILE_ENV}"
+                    ))
+                })?;
+                companion(Path::new(key_file.trim()), ".mesh-replay")
+            }
+        };
+        Self::with_replay_journal(settings, limits, &path).map(Some)
+    }
+
+    /// Whether inbound admission uses a persistent, exclusively held journal.
+    #[must_use]
+    pub const fn has_durable_replay(&self) -> bool {
+        self.durable_replay.is_some()
     }
 
     /// Effective outbound resource ceilings.
@@ -455,18 +525,30 @@ impl MeshRouter {
         )
     }
 
-    /// Verify an inbound envelope and consume its nonce.
+    /// Verify an inbound envelope and consume its nonce before dispatch.
+    ///
+    /// Persistent routers commit and sync the nonce before returning success.
+    /// The clock is sampled under the lock so concurrent callers cannot create
+    /// apparent clock rollback by reaching admission in a different order.
     ///
     /// # Errors
     ///
-    /// Returns the verification or replay error.
+    /// Returns the verification, replay, or persistent-admission error. Poisoned
+    /// state fails closed rather than risking another dispatch of a consumed nonce.
     pub fn accept_inbound(&self, envelope: &MeshForwardEnvelope) -> Result<(), MeshForwardError> {
+        if let Some(replay) = &self.durable_replay {
+            let mut replay = replay
+                .lock()
+                .map_err(|_| replay_unavailable("state_poisoned"))?;
+            return replay.accept(envelope, &self.directory, unix_now_ms());
+        }
+        let mut replay = self
+            .replay_guard
+            .lock()
+            .map_err(|_| replay_unavailable("state_poisoned"))?;
         let now_ms = unix_now_ms();
         envelope.verify(&self.directory, now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
-        self.replay_guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .check_and_record(envelope, now_ms)
+        replay.check_and_record(envelope, now_ms)
     }
 
     /// Sign the reply to an accepted inbound envelope.

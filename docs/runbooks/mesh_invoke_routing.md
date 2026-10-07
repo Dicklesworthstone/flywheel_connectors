@@ -6,7 +6,9 @@ Bridge plan Phase A.2 (`MeshInvokeTransport`). Code: `crates/fcp-mesh/src/invoke
 (bounded authenticated discovery), and `crates/fcp-host/src/mesh_routing/admission.rs`
 (outbound resource admission and peer circuit recovery), wired into `fcp-host` at
 `/rpc/invoke`, `/rpc/preflight`, `/rpc/introspect/{id}`, and `/rpc/discover`.
-Multi-process proof: `crates/fcp-host/tests/mesh_invoke_e2e.rs`.
+Persistent inbound admission: `crates/fcp-host/src/mesh_replay.rs`.
+Multi-process forwarding coverage: `crates/fcp-host/tests/mesh_invoke_e2e.rs`.
+Restart/crash admission coverage: `crates/fcp-host/tests/mesh_replay_restart.rs`.
 
 ## What it does
 
@@ -39,11 +41,15 @@ Timeout and resource ceilings are optional once that configuration is complete.
 | `FCP_HOST_MESH_FORWARD_MAX_IN_FLIGHT` | Optional router-wide simultaneous-forward ceiling (default 32). |
 | `FCP_HOST_MESH_FORWARD_MAX_PER_PEER` | Optional per-peer simultaneous-forward ceiling (default 4; must not exceed the router ceiling). |
 | `FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES` | Optional aggregate serialized-request-byte ceiling for admitted forwards (default 67108864, or 64 MiB). |
+| `FCP_HOST_MESH_REPLAY_JOURNAL` | Optional persistent replay journal file. Default: signing-key filename with `.mesh-replay` appended, for example `/state/node.key.mesh-replay`. Parent directory must already exist. |
 
 All ceilings must be positive integers. Empty, malformed, overflowing, zero, or inconsistent
 values are startup errors, not a request to disable admission. Limits alone do not silently
 turn an incompletely configured mesh router into a host-first deployment. Embedded callers
-can use `MeshRouter::with_forward_limits` for explicit limits or `MeshRouter::new` for defaults.
+can use `MeshRouter::with_forward_limits` for explicit limits or `MeshRouter::new` for defaults;
+these embedded constructors retain process-local replay state. Persistent embedded hosts
+must use `MeshRouter::with_replay_journal` instead. `MeshRouter::from_env` and `from_lookup`
+always enable durable replay protection when mesh routing is configured.
 
 Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses.
 
@@ -59,6 +65,8 @@ Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses
 - Inbound checks, each with its own HTTP status: unknown signer, bad signature, or outside the
   ±30 s freshness window (`401`); addressed to another node (`421`); replayed `(origin, nonce)`
   (`409`); replay cache saturated (`503`, fails closed rather than forgetting a live nonce).
+- Environment-configured executors authenticate and sync each accepted nonce before dispatch.
+  An executor restart does not erase a still-live nonce from its persistent journal.
 - Replies are signed by the executor and bound to the request's origin and nonce, so a reply
   cannot be replayed onto another request or come from a different peer.
 - Forwarding is single-hop: a request that arrived over the mesh always executes locally.
@@ -81,6 +89,53 @@ Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses
   decisions. A verified executor error is returned as that executor's result, not retried.
 - If every advertiser is provably undeliverable or locally refused before sending, the entry
   node returns `503` with the attempts.
+
+## Persistent replay admission and recovery
+
+**Deployment change:** configured mesh hosts now need writable persistent replay storage.
+For read-only secret mounts, set `FCP_HOST_MESH_REPLAY_JOURNAL` to a file on a separate
+persistent state volume. Do not place it in a temporary directory or an ephemeral container
+layer. The `.lock` and `.compact` companion filenames are reserved. Every process using the
+same executor identity must use the same journal; do not share the identity across independent
+journal copies or rename the signing-key path without preserving the configured journal.
+
+Before the inbound handler can dispatch an operation, the router verifies the envelope,
+reserves its `(origin, nonce)`, appends a checksummed record, and calls `sync_all`. Only then
+does admission return success. The clock is sampled inside the admission mutex. An append or
+sync error latches the guard closed; poisoned state also refuses further admission. Startup
+refuses a locked, corrupt, torn, empty-existing, incorrectly scoped, or oversized journal.
+There is no automatic reset or volatile fallback. Runtime storage refusal uses the existing
+`Malformed` error with `field="replay_journal"`; it does not authorize the entry node to retry.
+
+The journal stores domain-separated replay-key hashes and expiry/observation timestamps,
+not request JSON, capability tokens, asserted principals, signatures, or response bodies.
+It is bound to the executor node ID and freshness window. Nonces remain live through the
+inclusive freshness boundary, including future-dated envelopes admitted within clock skew.
+A persisted clock high-water mark prevents recovery from resurrecting previously expired
+requests after a backward clock jump.
+
+The default capacity is 16,384 live nonces. The append log holds at most 32,768 fixed 80-byte
+records plus a 96-byte header. Compaction writes and syncs a complete replacement, atomically
+renames it, and syncs its directory; the old journal is not truncated in place. A separate
+exclusive file lock remains held across that replacement, preventing another executor from
+acquiring the newly replaced data inode as a separate admission owner. A temporary compacted
+copy can coexist with the bounded log during replacement.
+
+Storage must provide working file locks, file sync, directory sync, and atomic replacement.
+Unix files are created with mode 0600, existing group/other-accessible files are refused, and
+final-component symlinks are not followed. The parent directories and filesystem are trusted.
+Unsupported platforms/filesystems fail closed; the checked-in persistence tests are Unix-only,
+and they do not establish Windows or network-filesystem durability. Checksums detect damaged
+records, not deliberate file rollback or a malicious storage administrator. Never remove the
+journal or restore an older copy merely to clear a startup failure. Correct the storage/clock
+problem while preserving history, or coordinate retirement of the executor identity before
+discarding its state.
+
+This is **at-most-once admission of the same signed envelope**, not exactly-once execution.
+A crash after the nonce is synced but before connector dispatch may consume a request that
+never executes. A crash after an external side effect may leave an unknown outcome. There is
+no stored-result replay and no permission to retry with a new nonce. Connector-level durable
+idempotency and reconciliation are still required to resolve those cases.
 
 ## Outbound admission and peer recovery
 
