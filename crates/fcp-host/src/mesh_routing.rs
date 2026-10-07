@@ -15,6 +15,10 @@
 //! are also ambiguous: an intermediary can fail after execution, and a replay
 //! refusal can mean an earlier delivery already executed.
 //!
+//! Discovery uses a shared refresh with bounded concurrency and a total
+//! deadline. Failed peers are briefly negative-cached; inventories are always
+//! authenticated and must remain within their signed freshness window.
+//!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
 //!
@@ -26,7 +30,6 @@
 //!   `{ "node_id", "endpoint", "public_key_hex" }` peer entries.
 //! - `FCP_HOST_MESH_FORWARD_TIMEOUT_MS` (optional) — per-forward deadline.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,14 +37,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fcp_core::TailscaleNodeId;
 use fcp_crypto::ed25519::Ed25519SigningKey;
 use fcp_mesh::invoke_route::{
-    AdvertisedConnector, DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS, DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
-    DEFAULT_MESH_FORWARD_REPLAY_CAPACITY, MeshForwardBody, MeshForwardEnvelope, MeshForwardError,
-    MeshForwardReplayGuard, MeshForwardReply, MeshPeerAdvertisement, MeshPeerDirectory,
+    AdvertisedConnector, DEFAULT_MESH_FORWARD_MAX_SKEW_MS, DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
+    MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshForwardReplayGuard, MeshForwardReply,
+    MeshPeerAdvertisement, MeshPeerDirectory,
 };
-use futures_util::future::join_all;
 use zeroize::Zeroizing;
 
 use crate::{HostError, HostResult};
+
+mod discovery;
+
+use discovery::PeerDiscovery;
 
 /// Env var naming this node's mesh id.
 pub const MESH_NODE_ID_ENV: &str = "FCP_HOST_MESH_NODE_ID";
@@ -64,7 +70,6 @@ pub const MESH_ADVERTISEMENT_ROUTE: &str = "/rpc/mesh/advertisement";
 const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
-const ADVERTISEMENT_CACHE_TTL: Duration = Duration::from_secs(10);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Current Unix time in milliseconds.
@@ -305,17 +310,12 @@ impl MeshForwardFailure {
     }
 }
 
-struct CachedAdvertisement {
-    fetched_at: Instant,
-    advertisement: MeshPeerAdvertisement,
-}
-
 /// Mesh routing state shared by every host request.
 pub struct MeshRouter {
     directory: MeshPeerDirectory,
     signing_key: Ed25519SigningKey,
     replay_guard: Mutex<MeshForwardReplayGuard>,
-    advertisements: Mutex<HashMap<String, CachedAdvertisement>>,
+    advertisements: PeerDiscovery,
     client: reqwest::Client,
 }
 
@@ -357,7 +357,7 @@ impl MeshRouter {
                 DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
                 DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
             )),
-            advertisements: Mutex::new(HashMap::new()),
+            advertisements: PeerDiscovery::new(),
             client,
         })
     }
@@ -505,81 +505,26 @@ impl MeshRouter {
         Ok(reply)
     }
 
-    /// Verified advertisements from every reachable peer.
+    /// Fresh, verified advertisements from reachable peers, in node-id order.
     ///
-    /// Advertisements are cached for a few seconds; unreachable peers or
-    /// advertisements that fail verification are skipped (and logged), so a
-    /// single bad peer never blocks routing to the others.
+    /// Concurrent callers share one refresh. Discovery permits at most 16
+    /// simultaneous peer fetches and has a five-second total deadline,
+    /// including time waiting for another refresh. A deadline returns the
+    /// completed, still-fresh inventories only; it never invents availability.
     pub async fn peer_advertisements(&self) -> Vec<MeshPeerAdvertisement> {
-        let mut fresh = Vec::new();
-        let mut stale_peers = Vec::new();
-        {
-            let cache = self
-                .advertisements
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for peer in self.directory.peers() {
-                match cache.get(peer.node_id.as_str()) {
-                    Some(cached) if cached.fetched_at.elapsed() < ADVERTISEMENT_CACHE_TTL => {
-                        fresh.push(cached.advertisement.clone());
-                    }
-                    _ => stale_peers.push(peer.clone()),
-                }
-            }
-        }
-        if stale_peers.is_empty() {
-            return fresh;
-        }
-        let fetched = join_all(stale_peers.iter().map(|peer| async move {
-            let result = self
-                .fetch_advertisement(&peer.node_id, &peer.endpoint)
-                .await;
-            (peer.node_id.clone(), result)
-        }))
-        .await;
-        let mut cache = self
-            .advertisements
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (node_id, result) in fetched {
-            match result {
-                Ok(advertisement) => {
-                    cache.insert(
-                        node_id.as_str().to_owned(),
-                        CachedAdvertisement {
-                            fetched_at: Instant::now(),
-                            advertisement: advertisement.clone(),
-                        },
-                    );
-                    fresh.push(advertisement);
-                }
-                Err(detail) => {
-                    cache.remove(node_id.as_str());
-                    tracing::warn!(
-                        event = "mesh_advertisement_unavailable",
-                        peer = node_id.as_str(),
-                        detail = %detail,
-                        "skipping mesh peer advertisement"
-                    );
-                }
-            }
-        }
-        fresh
-    }
-
-    /// Drop cached advertisements so the next lookup refetches.
-    pub fn invalidate_advertisements(&self) {
         self.advertisements
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .collect(&self.directory, |peer| async move {
+                self.fetch_advertisement(&peer.endpoint).await
+            })
+            .await
     }
 
-    async fn fetch_advertisement(
-        &self,
-        node_id: &TailscaleNodeId,
-        endpoint: &str,
-    ) -> Result<MeshPeerAdvertisement, String> {
+    /// Drop cached advertisements and fence pre-invalidation fetches.
+    pub fn invalidate_advertisements(&self) {
+        self.advertisements.invalidate();
+    }
+
+    async fn fetch_advertisement(&self, endpoint: &str) -> Result<MeshPeerAdvertisement, String> {
         let url = format!("{endpoint}{MESH_ADVERTISEMENT_ROUTE}");
         let response = self
             .client
@@ -595,17 +540,10 @@ impl MeshRouter {
             ));
         }
         let bytes = read_bounded(response, MAX_REPLY_BYTES).await?;
-        let advertisement: MeshPeerAdvertisement = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("advertisement is not valid JSON: {error}"))?;
-        advertisement
-            .verify(
-                node_id,
-                &self.directory,
-                unix_now_ms(),
-                DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(advertisement)
+        // The discovery cache authenticates the result against the requested
+        // node and directory before accepting it, including signed freshness.
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("advertisement is not valid JSON: {error}"))
     }
 }
 

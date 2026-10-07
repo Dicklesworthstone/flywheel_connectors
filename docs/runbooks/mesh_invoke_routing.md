@@ -1,9 +1,10 @@
 # Mesh-Backed Invoke Routing
 
 Bridge plan Phase A.2 (`MeshInvokeTransport`). Code: `crates/fcp-mesh/src/invoke_route.rs`
-(envelopes, directory, replay guard, routing rules) and `crates/fcp-host/src/mesh_routing.rs`
-(host configuration, HTTP transport, advertisement cache), wired into `fcp-host` at
-`/rpc/invoke`, `/rpc/preflight`, `/rpc/introspect/{id}`, and `/rpc/discover`.
+(envelopes, directory, replay guard, routing rules), `crates/fcp-host/src/mesh_routing.rs`
+(host configuration and HTTP transport), and `crates/fcp-host/src/mesh_routing/discovery.rs`
+(bounded authenticated discovery), wired into `fcp-host` at `/rpc/invoke`, `/rpc/preflight`,
+`/rpc/introspect/{id}`, and `/rpc/discover`.
 Multi-process proof: `crates/fcp-host/tests/mesh_invoke_e2e.rs`.
 
 ## What it does
@@ -56,16 +57,38 @@ Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses
 
 ## Failure semantics
 
-- If a candidate fails before the request could have been delivered (connect refused, or the
-  envelope was rejected), the entry node tries the next HRW-ranked advertiser. Each failed
-  attempt is listed in `route.failed_attempts`.
+- Only a failure proving the request was not delivered (connection establishment or request
+  construction failure) permits trying the next HRW-ranked advertiser. Each failed attempt
+  is listed in `route.failed_attempts`.
 - `singleton_writer` connectors never fan out: they have exactly one executor.
-- If the outcome is unknown (timeout or broken connection after send), the entry node returns
-  `502` and does not retry, because the operation may have executed on the peer.
-- If every advertiser is undeliverable, the entry node returns `503` with the attempts.
-- Advertisements (`GET /rpc/mesh/advertisement`, signed `fcp.mesh.peer-advertisement.v1`) are
-  cached for 10 s. Advertisements that are unreachable or fail verification are skipped and
-  logged as `mesh_advertisement_unavailable`.
+- A lost reply, post-send connection failure, timeout, invalid signature, malformed reply, or
+  unsigned HTTP refusal stops failover. HTTP status alone is not proof of non-execution:
+  a proxy can return 5xx after execution, and a 409 replay refusal can mean an earlier delivery
+  already executed. The entry node surfaces the ambiguous outcome instead of duplicating a
+  non-idempotent operation. Unsigned response bodies are not copied into diagnostics.
+- HTTP redirects and implicit HTTP-client retries are disabled. The mesh layer owns delivery
+  decisions. A verified executor error is returned as that executor's result, not retried.
+- If every advertiser is provably undeliverable, the entry node returns `503` with the attempts.
+
+## Discovery under failure and load
+
+Advertisements (`GET /rpc/mesh/advertisement`, signed `fcp.mesh.peer-advertisement.v1`) are
+cached for up to 10 seconds, but never beyond their signed freshness window. Every newly
+fetched inventory must verify against the requested peer's directory key and node id.
+
+Concurrent callers share one refresh per router, with at most 16 fetches in flight. Each fetch
+has a three-second deadline; the whole discovery call has a five-second deadline including
+waiting for another refresh. Completed inventories are stored as they arrive. A deadline or
+caller cancellation drops outstanding requests and releases the refresh lock; later calls can
+resume the missing work without throwing away completed results.
+
+Failed or invalid advertisements are negative-cached for one second to avoid probing a dead
+peer on every incoming request. Negative entries never advertise connectors or imply
+availability. Results are returned in stable node-id order, regardless of completion order.
+Invalidation clears both positive and negative entries and fences results from older in-flight
+refreshes. Deadline-limited discovery returns only completed, still-fresh verified inventories;
+it does not claim that the catalog is complete. Logs distinguish `mesh_advertisement_unavailable`
+from `mesh_discovery_deadline`.
 
 ## Not yet covered
 
