@@ -23,6 +23,8 @@
 //! cancellation releases reservations, including while reading a reply.
 //! Environment-configured hosts sync accepted inbound nonces to a durable
 //! journal before dispatch, preserving replay rejection across restarts.
+//! Optional owner-signed membership pins the mesh identity and owner roots,
+//! persists accepted generations, and refuses new mesh work after expiration.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -39,6 +41,9 @@
 //! - `FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES` (optional, default 64 MiB).
 //! - `FCP_HOST_MESH_REPLAY_JOURNAL` (optional) — persistent journal path;
 //!   defaults to the signing-key filename with `.mesh-replay` appended.
+//! - `FCP_HOST_MESH_ID`, `FCP_HOST_MESH_DIRECTORY_OWNER_KEYS`, and
+//!   `FCP_HOST_MESH_DIRECTORY_STATE` select owner-signed membership together.
+//!   The peer source then contains a signed directory rather than a raw array.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -60,6 +65,7 @@ use crate::mesh_replay::{
 use crate::{HostError, HostResult};
 
 mod admission;
+mod directory;
 mod discovery;
 mod inbound;
 
@@ -72,6 +78,10 @@ use admission::{ForwardControl, LIMIT_ENV_KEYS};
 pub use admission::{
     MESH_FORWARD_MAX_IN_FLIGHT_ENV, MESH_FORWARD_MAX_PER_PEER_ENV,
     MESH_FORWARD_MAX_REQUEST_BYTES_ENV, MeshForwardLimits, MeshForwardUsage,
+};
+use directory::{DIRECTORY_ENV_KEYS, DirectoryGuard};
+pub use directory::{
+    MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
 };
 use discovery::PeerDiscovery;
 
@@ -168,6 +178,7 @@ impl MeshRoutingSettings {
             || peers_file.is_some()
             || timeout_raw.is_some()
             || LIMIT_ENV_KEYS.iter().any(|name| lookup(name).is_some())
+            || DIRECTORY_ENV_KEYS.iter().any(|name| lookup(name).is_some())
             || lookup(MESH_REPLAY_JOURNAL_ENV).is_some();
         if !any_mesh_setting {
             return Ok(None);
@@ -196,17 +207,18 @@ impl MeshRoutingSettings {
                 )));
             }
             (Some(inline), None) => inline,
-            (None, Some(path)) => std::fs::read_to_string(&path).map_err(|error| {
-                invalid(format!(
-                    "cannot read {MESH_PEERS_FILE_ENV} `{path}`: {error}"
-                ))
-            })?,
+            (None, Some(path)) => directory::read_peer_file(Path::new(&path))?,
             (None, None) => {
                 return Err(invalid(format!(
                     "mesh routing requires {MESH_PEERS_ENV} or {MESH_PEERS_FILE_ENV}"
                 )));
             }
         };
+        if peers_json.len() > fcp_mesh::peer_manifest::MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES {
+            return Err(invalid(
+                "peer directory source exceeds its byte limit".to_owned(),
+            ));
+        }
 
         let forward_timeout = match timeout_raw {
             None => DEFAULT_FORWARD_TIMEOUT,
@@ -348,6 +360,7 @@ pub struct MeshRouter {
     advertisements: PeerDiscovery,
     forwards: ForwardControl,
     client: reqwest::Client,
+    membership: Option<DirectoryGuard>,
 }
 
 impl std::fmt::Debug for MeshRouter {
@@ -357,6 +370,7 @@ impl std::fmt::Debug for MeshRouter {
             .field("peer_count", &self.directory.len())
             .field("forward_limits", &self.forwards.limits())
             .field("durable_replay", &self.durable_replay.is_some())
+            .field("owner_signed_membership", &self.membership.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -411,6 +425,7 @@ impl MeshRouter {
             advertisements: PeerDiscovery::new(),
             forwards,
             client,
+            membership: None,
         })
     }
 
@@ -457,6 +472,8 @@ impl MeshRouter {
     /// Environment-configured hosts always use persistent replay protection. The
     /// default journal is adjacent to the signing key; an explicit path supports
     /// read-only secret mounts with a separate writable state volume.
+    /// Signed membership additionally verifies independent owner roots, pins
+    /// this node's signing key, and commits a generation checkpoint before use.
     ///
     /// # Errors
     ///
@@ -464,9 +481,10 @@ impl MeshRouter {
     /// resource limits, or unavailable replay storage, never a silent fallback.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> HostResult<Option<Self>> {
         let limits = MeshForwardLimits::from_lookup(&lookup)?;
-        let Some(settings) = MeshRoutingSettings::from_lookup(&lookup)? else {
+        let Some(mut settings) = MeshRoutingSettings::from_lookup(&lookup)? else {
             return Ok(None);
         };
+        let prepared = directory::prepare(&lookup, &mut settings)?;
         let path = match lookup(MESH_REPLAY_JOURNAL_ENV) {
             Some(raw) => {
                 let value = raw.trim();
@@ -486,13 +504,33 @@ impl MeshRouter {
                 companion(Path::new(key_file.trim()), ".mesh-replay")
             }
         };
-        Self::with_replay_journal(settings, limits, &path).map(Some)
+        let mut router = Self::with_replay_journal(settings, limits, &path)?;
+        router.membership = prepared
+            .map(directory::PreparedDirectory::activate)
+            .transpose()?;
+        Ok(Some(router))
     }
 
     /// Whether inbound admission uses a persistent, exclusively held journal.
     #[must_use]
     pub const fn has_durable_replay(&self) -> bool {
         self.durable_replay.is_some()
+    }
+
+    /// Whether this router enforces owner-signed, persistently checkpointed membership.
+    ///
+    /// This reports the configured trust mode, not current availability. An
+    /// expired signed directory remains signed-mode and refuses new mesh work.
+    #[must_use]
+    pub const fn has_owner_signed_membership(&self) -> bool {
+        self.membership.is_some()
+    }
+
+    fn ensure_membership_valid(&self) -> Result<(), MeshForwardError> {
+        if let Some(membership) = &self.membership {
+            membership.check()?;
+        }
+        Ok(())
     }
 
     /// Effective outbound resource ceilings.
@@ -523,12 +561,17 @@ impl MeshRouter {
         &self.directory
     }
 
-    /// Sign this node's advertisement.
+    /// Sign this node's advertisement, withdrawing inventory after membership expires.
     #[must_use]
     pub fn sign_advertisement(
         &self,
         connectors: Vec<AdvertisedConnector>,
     ) -> MeshPeerAdvertisement {
+        let connectors = if self.ensure_membership_valid().is_ok() {
+            connectors
+        } else {
+            Vec::new()
+        };
         MeshPeerAdvertisement::sign(
             &self.signing_key,
             self.local_node().clone(),
@@ -550,19 +593,24 @@ impl MeshRouter {
     /// Returns the verification, replay, or persistent-admission error. Poisoned
     /// state fails closed rather than risking another dispatch of a consumed nonce.
     pub fn accept_inbound(&self, envelope: &MeshForwardEnvelope) -> Result<(), MeshForwardError> {
+        self.ensure_membership_valid()?;
         if let Some(replay) = &self.durable_replay {
             let mut replay = replay
                 .lock()
                 .map_err(|_| replay_unavailable("state_poisoned"))?;
-            return replay.accept(envelope, &self.directory, unix_now_ms());
+            self.ensure_membership_valid()?;
+            replay.accept(envelope, &self.directory, unix_now_ms())?;
+            return self.ensure_membership_valid();
         }
         let mut replay = self
             .replay_guard
             .lock()
             .map_err(|_| replay_unavailable("state_poisoned"))?;
         let now_ms = unix_now_ms();
+        self.ensure_membership_valid()?;
         envelope.verify(&self.directory, now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
-        replay.check_and_record(envelope, now_ms)
+        replay.check_and_record(envelope, now_ms)?;
+        self.ensure_membership_valid()
     }
 
     /// Authenticate and durably admit a forward without blocking on journal I/O.
@@ -581,6 +629,7 @@ impl MeshRouter {
         &self,
         envelope: &MeshForwardEnvelope,
     ) -> Result<(), MeshForwardError> {
+        self.ensure_membership_valid()?;
         if let Some(worker) = &self.inbound_worker {
             let identity = VerifiedMeshReplayNonce::verify(
                 envelope,
@@ -588,7 +637,10 @@ impl MeshRouter {
                 unix_now_ms(),
                 DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
             )?;
-            return worker.check(identity).await;
+            worker.check(identity).await?;
+            // A queue wait or durable sync may cross the membership deadline.
+            // Consuming a nonce without dispatch is safe; undoing it is not.
+            return self.ensure_membership_valid();
         }
         if self.durable_replay.is_some() {
             // An internal wiring failure must not silently fall back to blocking
@@ -631,6 +683,11 @@ impl MeshRouter {
         body: MeshForwardBody,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = target.as_str().to_owned();
+        self.ensure_membership_valid()
+            .map_err(|error| MeshForwardFailure::NotDelivered {
+                peer: peer_label.clone(),
+                detail: error.to_string(),
+            })?;
         let Some(peer) = self.directory.peer(target) else {
             return Err(MeshForwardFailure::NotDelivered {
                 peer: peer_label,
@@ -667,6 +724,13 @@ impl MeshRouter {
         envelope: &MeshForwardEnvelope,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = peer.node_id.as_str().to_owned();
+        // Recheck after signing, serialization, and resource admission, before
+        // constructing network work. No expired directory may initiate a send.
+        self.ensure_membership_valid()
+            .map_err(|error| MeshForwardFailure::NotDelivered {
+                peer: peer_label.clone(),
+                detail: error.to_string(),
+            })?;
         let url = format!("{}{MESH_FORWARD_ROUTE}", peer.endpoint);
         let response = self
             .client
@@ -704,8 +768,15 @@ impl MeshRouter {
         reply
             .verify_for(envelope, &self.directory)
             .map_err(|error| MeshForwardFailure::InvalidReply {
-                peer: peer_label,
+                peer: peer_label.clone(),
                 error,
+            })?;
+        // A request may already have executed when trust expires during I/O.
+        // Refuse the result without ever reclassifying it as safe to replay.
+        self.ensure_membership_valid()
+            .map_err(|error| MeshForwardFailure::OutcomeUnknown {
+                peer: peer_label,
+                detail: error.to_string(),
             })?;
         Ok(reply)
     }
@@ -717,11 +788,21 @@ impl MeshRouter {
     /// including time waiting for another refresh. A deadline returns the
     /// completed, still-fresh inventories only; it never invents availability.
     pub async fn peer_advertisements(&self) -> Vec<MeshPeerAdvertisement> {
-        self.advertisements
+        if self.ensure_membership_valid().is_err() {
+            self.advertisements.invalidate();
+            return Vec::new();
+        }
+        let advertisements = self
+            .advertisements
             .collect(&self.directory, |peer| async move {
                 self.fetch_advertisement(&peer.endpoint).await
             })
-            .await
+            .await;
+        if self.ensure_membership_valid().is_err() {
+            self.advertisements.invalidate();
+            return Vec::new();
+        }
+        advertisements
     }
 
     /// Drop cached advertisements and fence pre-invalidation fetches.
@@ -730,6 +811,8 @@ impl MeshRouter {
     }
 
     async fn fetch_advertisement(&self, endpoint: &str) -> Result<MeshPeerAdvertisement, String> {
+        self.ensure_membership_valid()
+            .map_err(|error| error.to_string())?;
         let url = format!("{endpoint}{MESH_ADVERTISEMENT_ROUTE}");
         let response = self
             .client
@@ -745,6 +828,8 @@ impl MeshRouter {
             ));
         }
         let bytes = read_bounded(response, MAX_REPLY_BYTES).await?;
+        self.ensure_membership_valid()
+            .map_err(|error| error.to_string())?;
         // The discovery cache authenticates the result against the requested
         // node and directory before accepting it, including signed freshness.
         serde_json::from_slice(&bytes)
