@@ -1,4 +1,4 @@
-//! Offline issuance and inspection of owner-authorized mesh membership.
+//! Issuance, inspection, and authenticated delivery of mesh membership.
 //!
 //! Owner secret material is read only from a bounded private file, zeroized
 //! after use, and never accepted through command-line values or printed.
@@ -21,9 +21,17 @@ use fcp_mesh::peer_manifest::{
 };
 use zeroize::Zeroizing;
 
+#[path = "fcp-mesh-directory/sync.rs"]
+mod sync;
+
 const USAGE: &str = "Usage:
   fcp-mesh-directory sign --owner-key-file PATH --payload PATH
+  fcp-mesh-directory sync --url URL --owner-public-key-file PATH --mesh-id ID --node-id ID --node-public-key-file PATH --directory PATH
   fcp-mesh-directory verify --owner-public-key-file PATH --mesh-id ID --node-id ID --node-public-key-file PATH --directory PATH
+
+sync fetches an owner-signed document and atomically installs --directory.
+It uses HTTPS (literal loopback HTTP is allowed for local testing), refuses
+rollback and generation reuse, and never changes the host checkpoint.
 
 sign writes the signed directory JSON to stdout. verify writes a JSON summary.
 Key files contain 32 bytes encoded as 64 hex characters. The owner secret file
@@ -52,6 +60,10 @@ fn arguments(args: Vec<OsString>) -> Result<(String, BTreeMap<String, OsString>)
         .ok_or_else(|| USAGE.to_owned())?;
     let required: &[&str] = match command.as_str() {
         "sign" => &["--owner-key-file", "--payload"],
+        "sync" => &[
+            "--url", "--owner-public-key-file", "--mesh-id", "--node-id",
+            "--node-public-key-file", "--directory",
+        ],
         "verify" => &[
             "--owner-public-key-file", "--mesh-id", "--node-id",
             "--node-public-key-file", "--directory",
@@ -126,6 +138,9 @@ fn run(args: Vec<OsString>, output: &mut impl Write) -> Result<()> {
         return output.write_all(USAGE.as_bytes()).map_err(|_| "output failed".to_owned());
     }
     let (command, options) = arguments(args)?;
+    if command == "sync" {
+        return sync::run(&options, output);
+    }
     if command == "sign" {
         let key = read_key(Path::new(&options["--owner-key-file"]), true)?;
         let owner = Ed25519SigningKey::from_bytes(&key)
