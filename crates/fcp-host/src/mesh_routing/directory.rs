@@ -101,6 +101,12 @@ impl DirectoryGuard {
     pub(super) fn check(&self) -> Result<(), MeshForwardError> {
         self.state.snapshot().map(|_| ())
     }
+
+    pub(super) fn snapshot(
+        &self,
+    ) -> Result<Arc<fcp_mesh::invoke_route::MeshPeerDirectory>, MeshForwardError> {
+        self.state.snapshot()
+    }
 }
 
 /// Preserve the existing explicit static configuration mode. Setting any signed
@@ -464,7 +470,7 @@ mod tests {
         router.membership = Some(DirectoryGuard {
             _worker: None,
             state: Arc::new(reload::LiveMembership::new(
-                router.directory().clone(),
+                router.directory().as_ref().clone(),
                 MeshPeerDirectoryCheckpoint {
                     schema_version: 1,
                     mesh_id: "expiry-test".to_owned(),

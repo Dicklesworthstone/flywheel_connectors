@@ -29,6 +29,7 @@
 //! arrived over the mesh always executes locally, so routing loops are
 //! impossible even when two nodes disagree about the eligible-node set.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use fcp_core::{ObjectId, TailscaleNodeId, ZoneId};
@@ -1035,12 +1036,13 @@ impl InvokeRouteDecision {
 /// request came over the mesh and must execute locally.
 #[must_use]
 pub fn decide_singleton_writer_route(
-    directory: &MeshPeerDirectory,
+    directory: impl Borrow<MeshPeerDirectory>,
     zone_id: &ZoneId,
     subject_id: &ObjectId,
     eligible_nodes: &[TailscaleNodeId],
     arrived_hop_count: u8,
 ) -> InvokeRouteDecision {
+    let directory = directory.borrow();
     if arrived_hop_count > 0 {
         return InvokeRouteDecision::Local {
             code: decision_codes::ARRIVED_VIA_MESH,
@@ -1100,12 +1102,13 @@ pub fn advertised_connector_route_subject(connector_id: &str, zone_id: &ZoneId) 
 /// may execute, and the executor's own HRW admission gate is authoritative.
 #[must_use]
 pub fn decide_advertised_connector_route(
-    directory: &MeshPeerDirectory,
+    directory: impl Borrow<MeshPeerDirectory>,
     connector_id: &str,
     zone_id: Option<&ZoneId>,
     advertisements: &[MeshPeerAdvertisement],
     arrived_hop_count: u8,
 ) -> InvokeRouteDecision {
+    let directory = directory.borrow();
     if arrived_hop_count > 0 {
         return InvokeRouteDecision::Local {
             code: decision_codes::ARRIVED_VIA_MESH,
@@ -1864,6 +1867,32 @@ mod tests {
             )
             .code(),
             decision_codes::NO_ADVERTISING_PEER
+        );
+    }
+
+    #[test]
+    fn routing_accepts_owned_snapshots_without_changing_election() {
+        let mesh = Mesh::new(&["node-a", "node-b", "node-c"]);
+        let snapshot = std::sync::Arc::new(mesh.directory("node-a"));
+        let eligible = vec![node("node-a"), node("node-b"), node("node-c")];
+        let zone = ZoneId::work();
+        let subject = ObjectId::from_bytes([17; 32]);
+        assert_eq!(
+            decide_singleton_writer_route(
+                std::sync::Arc::clone(&snapshot), &zone, &subject, &eligible, 0,
+            ),
+            decide_singleton_writer_route(snapshot.as_ref(), &zone, &subject, &eligible, 0),
+        );
+        let advertisements = vec![offering(&mesh, "node-b", &["z:work"], false)];
+        assert_eq!(
+            decide_advertised_connector_route(
+                std::sync::Arc::clone(&snapshot), "fcp.remote:utility:1.0.0",
+                Some(&zone), &advertisements, 0,
+            ),
+            decide_advertised_connector_route(
+                snapshot.as_ref(), "fcp.remote:utility:1.0.0",
+                Some(&zone), &advertisements, 0,
+            ),
         );
     }
 }

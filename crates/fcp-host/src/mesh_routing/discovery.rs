@@ -27,6 +27,9 @@ const FAILURE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct CachedAdvertisement {
+    // Bind positive AND negative entries to the exact authorized identity and
+    // endpoint. A node id alone is not a cache key across membership reloads.
+    peer: MeshPeer,
     checked_at: Instant,
     // A negative cache entry suppresses repeated probes of a failing peer.
     // It never supplies an inventory or counts as evidence of availability.
@@ -34,7 +37,10 @@ struct CachedAdvertisement {
 }
 
 impl CachedAdvertisement {
-    fn is_reusable(&self, now_ms: u64) -> bool {
+    fn is_reusable(&self, peer: &MeshPeer, now_ms: u64) -> bool {
+        if &self.peer != peer {
+            return false;
+        }
         match &self.advertisement {
             Some(advertisement) => {
                 self.checked_at.elapsed() < SUCCESS_CACHE_TTL
@@ -50,7 +56,7 @@ impl CachedAdvertisement {
 struct AdvertisementCache {
     generation: u64,
     // Advance when a fetch starts, including fetches later cancelled. The
-    // directory is immutable for the lifetime of its router.
+    // cursor is reduced modulo the current snapshot's peer count.
     next_peer_index: usize,
     entries: HashMap<String, CachedAdvertisement>,
 }
@@ -69,7 +75,7 @@ impl AdvertisementCache {
                 !self
                     .entries
                     .get(peer.node_id.as_str())
-                    .is_some_and(|entry| entry.is_reusable(now_ms))
+                    .is_some_and(|entry| entry.is_reusable(peer, now_ms))
             })
             .map(|(index, peer)| (index, peer.clone()))
             .collect()
@@ -91,7 +97,7 @@ impl PeerDiscovery {
     }
 
     /// Fetch missing inventories through `fetch`, then authenticate them
-    /// against the immutable router directory. Transport success alone is
+    /// against this immutable membership snapshot. Transport success alone is
     /// never sufficient to populate the cache.
     pub(super) async fn collect<F, Fut>(
         &self,
@@ -107,25 +113,30 @@ impl PeerDiscovery {
             // have refreshed everything while this caller was waiting.
             let _refresh_guard = self.refresh.lock().await;
             let (generation, stale_peers) = {
-                let cache = self
+                let mut cache = self
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Repeated additions/removals must not grow an unbounded cache.
+                // Also remove old negative entries when a peer's endpoint/key
+                // changes, so recovery does not wait for the old failure TTL.
+                cache.entries.retain(|_, entry| {
+                    directory.peer(&entry.peer.node_id) == Some(&entry.peer)
+                });
                 (cache.generation, cache.stale_peers(directory, unix_now_ms()))
             };
             let mut pending = stream::iter(stale_peers)
                 .map(|(index, peer)| {
                     self.record_attempt(generation, index, directory.len());
-                    let node_id = peer.node_id.clone();
-                    let result = fetch(peer);
-                    async move { (node_id, result.await) }
+                    let result = fetch(peer.clone());
+                    async move { (peer, result.await) }
                 })
                 .buffer_unordered(MAX_CONCURRENT_FETCHES);
-            while let Some((node_id, result)) = pending.next().await {
+            while let Some((peer, result)) = pending.next().await {
                 let result = result.and_then(|advertisement| {
                     advertisement
                         .verify(
-                            &node_id,
+                            &peer.node_id,
                             directory,
                             unix_now_ms(),
                             DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
@@ -147,7 +158,7 @@ impl PeerDiscovery {
                     Err(detail) => {
                         tracing::warn!(
                             event = "mesh_advertisement_unavailable",
-                            peer = node_id.as_str(),
+                            peer = peer.node_id.as_str(),
                             detail = %detail,
                             "skipping mesh peer advertisement"
                         );
@@ -155,8 +166,9 @@ impl PeerDiscovery {
                     }
                 };
                 cache.entries.insert(
-                    node_id.as_str().to_owned(),
+                    peer.node_id.as_str().to_owned(),
                     CachedAdvertisement {
+                        peer,
                         checked_at: Instant::now(),
                         advertisement,
                     },
@@ -196,9 +208,11 @@ impl PeerDiscovery {
         // Directory order is stable even when fetches complete out of order.
         directory
             .peers()
-            .filter_map(|peer| cache.entries.get(peer.node_id.as_str()))
-            .filter(|entry| entry.is_reusable(now_ms))
-            .filter_map(|entry| entry.advertisement.clone())
+            .filter_map(|peer| {
+                cache.entries.get(peer.node_id.as_str())
+                    .filter(|entry| entry.is_reusable(peer, now_ms))
+                    .and_then(|entry| entry.advertisement.clone())
+            })
             .collect()
     }
 
@@ -366,6 +380,7 @@ mod tests {
         discovery.cache.lock().unwrap().entries.insert(
             peer.node_id.as_str().to_owned(),
             CachedAdvertisement {
+                peer: peer.clone(),
                 checked_at: Instant::now(),
                 advertisement: Some(ad),
             },
@@ -482,5 +497,87 @@ mod tests {
             })
             .await;
         assert_eq!(recovered.len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn key_rotation_never_reuses_an_old_positive_cache_entry() {
+        let old_key = Ed25519SigningKey::generate();
+        let new_key = Ed25519SigningKey::generate();
+        let old_directory = directory(1, &old_key);
+        let new_directory = directory(1, &new_key);
+        let discovery = PeerDiscovery::new();
+        let old = discovery.collect(&old_directory, |peer| {
+            let ad = advertisement(&peer, &old_key);
+            async move { Ok(ad) }
+        }).await;
+        assert_eq!(old.len(), 1);
+        assert!(discovery.snapshot(&new_directory, unix_now_ms()).is_empty());
+        let calls = AtomicUsize::new(0);
+        let current = discovery.collect(&new_directory, |peer| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let ad = advertisement(&peer, &new_key);
+            async move { Ok(ad) }
+        }).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(current.len(), 1);
+        assert_ne!(current[0].signature, old[0].signature);
+        current[0].verify(
+            &TailscaleNodeId::new("peer-000"), &new_directory,
+            unix_now_ms(), DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
+        ).unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn endpoint_change_invalidates_positive_and_negative_entries() {
+        let key = Ed25519SigningKey::generate();
+        let old_directory = directory(1, &key);
+        let new_directory = MeshPeerDirectory::from_configs(
+            TailscaleNodeId::new("local"),
+            &[MeshPeerConfig {
+                node_id: "peer-000".to_owned(),
+                endpoint: "http://127.0.0.1:29999".to_owned(),
+                public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+            }],
+        ).unwrap();
+        for initially_available in [false, true] {
+            let discovery = PeerDiscovery::new();
+            discovery.collect(&old_directory, |peer| {
+                let ad = advertisement(&peer, &key);
+                async move {
+                    if initially_available { Ok(ad) } else { Err("unreachable".to_owned()) }
+                }
+            }).await;
+            assert!(discovery.snapshot(&new_directory, unix_now_ms()).is_empty());
+            let calls = AtomicUsize::new(0);
+            let current = discovery.collect(&new_directory, |peer| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(peer.endpoint, "http://127.0.0.1:29999");
+                let ad = advertisement(&peer, &key);
+                async move { Ok(ad) }
+            }).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(current.len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn removed_peer_entries_are_pruned_instead_of_accumulating() {
+        let key = Ed25519SigningKey::generate();
+        let initial = directory(4, &key);
+        let reduced = directory(1, &key);
+        let discovery = PeerDiscovery::new();
+        discovery.collect(&initial, |peer| {
+            let ad = advertisement(&peer, &key);
+            async move { Ok(ad) }
+        }).await;
+        let calls = AtomicUsize::new(0);
+        let result = discovery.collect(&reduced, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err("unchanged peer should not be fetched".to_owned()) }
+        }).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].node_id.as_str(), "peer-000");
+        assert_eq!(discovery.cache.lock().unwrap().entries.len(), 1);
     }
 }

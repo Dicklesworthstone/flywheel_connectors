@@ -178,13 +178,6 @@ impl Refresher {
             .checkpoint.clone();
         verified.check_successor(&previous)
             .map_err(|error| invalid(&error.to_string()))?;
-        {
-            let current = membership.publication.read()
-                .map_err(|_| invalid("membership publication is poisoned"))?;
-            if !current.directory.peers().eq(verified.directory().peers()) {
-                return Err(invalid("membership topology changed; restart required"));
-            }
-        }
         if verified.checkpoint().generation == previous.generation {
             // Same-generation reloads never renew the monotonic deadline. An
             // observed expiration cannot be undone by rewinding the wall clock.
@@ -261,7 +254,7 @@ mod tests {
         owner: Ed25519SigningKey,
         payload: MeshPeerDirectoryPayload,
         refresher: Refresher,
-        membership: LiveMembership,
+        membership: Arc<LiveMembership>,
     }
 
     impl Fixture {
@@ -322,7 +315,7 @@ mod tests {
                     last_observed_ms: now_ms,
                     storage_failed: false,
                 },
-                membership,
+                membership: Arc::new(membership),
             };
             fixture.write_source();
             fixture
@@ -330,11 +323,75 @@ mod tests {
 
         fn write_source(&self) {
             let signed = SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap();
-            std::fs::write(&self.refresher.source.path, serde_json::to_vec(&signed).unwrap()).unwrap();
+            let staged = self.refresher.source.path.with_extension("staged");
+            std::fs::write(&staged, serde_json::to_vec(&signed).unwrap()).unwrap();
+            std::fs::rename(staged, &self.refresher.source.path).unwrap();
         }
 
         fn refresh(&mut self) -> HostResult<()> {
             self.refresher.refresh(&self.membership)
+        }
+
+        fn router(&self) -> crate::mesh_routing::MeshRouter {
+            let mut router = crate::mesh_routing::MeshRouter::with_replay_journal(
+                MeshRoutingSettings {
+                    node_id: TailscaleNodeId::new("local"),
+                    signing_key: Ed25519SigningKey::from_bytes(&[32; 32]).unwrap(),
+                    peers_json: serde_json::to_string(&self.payload.peers).unwrap(),
+                    forward_timeout: Duration::from_secs(5),
+                },
+                crate::mesh_routing::MeshForwardLimits::default(),
+                &self.dir.path().join("replay"),
+            ).unwrap();
+            router.membership = Some(DirectoryGuard {
+                _worker: None,
+                state: Arc::clone(&self.membership),
+                _lock: tempfile::tempfile().unwrap(),
+            });
+            router
+        }
+
+        fn envelope(&self, peer_key: &Ed25519SigningKey) -> fcp_mesh::invoke_route::MeshForwardEnvelope {
+            fcp_mesh::invoke_route::MeshForwardEnvelope::sign(
+                peer_key,
+                TailscaleNodeId::new("peer"),
+                TailscaleNodeId::new("local"),
+                unix_now_ms(),
+                fcp_mesh::invoke_route::MeshForwardBody::Introspect {
+                    connector_id: "fcp.test:utility:1.0.0".to_owned(),
+                },
+            ).unwrap()
+        }
+
+        fn start_file_router(&self) -> crate::mesh_routing::MeshRouter {
+            use crate::mesh_routing::{
+                MESH_NODE_ID_ENV, MESH_REPLAY_JOURNAL_ENV, MESH_SIGNING_KEY_FILE_ENV,
+            };
+
+            let key_path = self.dir.path().join("local.key");
+            let key = Ed25519SigningKey::from_bytes(&[32; 32]).unwrap();
+            let mut file = private_options().create(true).truncate(true).open(&key_path).unwrap();
+            file.write_all(hex::encode(key.to_bytes()).as_bytes()).unwrap();
+            crate::mesh_routing::MeshRouter::from_lookup(|name| match name {
+                MESH_NODE_ID_ENV => Some("local".to_owned()),
+                MESH_SIGNING_KEY_FILE_ENV => Some(key_path.display().to_string()),
+                MESH_PEERS_FILE_ENV => Some(self.refresher.source.path.display().to_string()),
+                MESH_DIRECTORY_ID_ENV => Some(self.payload.mesh_id.clone()),
+                MESH_DIRECTORY_OWNER_KEYS_ENV => Some(serde_json::json!([
+                    hex::encode(self.owner.verifying_key().to_bytes())
+                ]).to_string()),
+                MESH_DIRECTORY_STATE_ENV => Some(self.refresher.state_path.display().to_string()),
+                MESH_REPLAY_JOURNAL_ENV => Some(self.dir.path().join("replay").display().to_string()),
+                _ => None,
+            }).unwrap().unwrap()
+        }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            assert!(start.elapsed() < Duration::from_secs(5), "membership worker did not converge");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -425,14 +482,250 @@ mod tests {
     }
 
     #[test]
-    fn changed_topology_requires_router_reconfiguration() {
+    fn removed_peer_is_published_only_after_its_checkpoint_is_committed() {
         let mut fixture = Fixture::new();
-        let before = std::fs::read(&fixture.refresher.state_path).unwrap();
+        let router = fixture.router();
+        let before = router.directory();
+        let peer_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
         fixture.payload.generation = 2;
         fixture.payload.peers.truncate(1);
         fixture.write_source();
-        assert!(fixture.refresh().unwrap_err().to_string().contains("topology changed"));
-        assert_eq!(std::fs::read(&fixture.refresher.state_path).unwrap(), before);
+        fixture.refresh().unwrap();
+        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
+        assert!(router.directory().is_empty());
+        assert_eq!(before.len(), 1, "retained snapshots must remain immutable");
+        assert!(matches!(
+            router.accept_inbound(&fixture.envelope(&peer_key)),
+            Err(MeshForwardError::UnknownPeer(_)),
+        ));
+    }
+
+    #[test]
+    fn key_and_endpoint_rotation_update_existing_router_without_clearing_replays() {
+        let mut fixture = Fixture::new();
+        let router = fixture.router();
+        let old_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let new_key = Ed25519SigningKey::from_bytes(&[34; 32]).unwrap();
+        let accepted = fixture.envelope(&old_key);
+        router.accept_inbound(&accepted).unwrap();
+        fixture.payload.generation = 2;
+        fixture.payload.peers[1].public_key_hex = hex::encode(new_key.verifying_key().to_bytes());
+        fixture.payload.peers[1].endpoint = "http://127.0.0.1:29999".to_owned();
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert_eq!(
+            router.directory().peer(&TailscaleNodeId::new("peer")).unwrap().endpoint,
+            "http://127.0.0.1:29999",
+        );
+        assert!(matches!(
+            router.accept_inbound(&fixture.envelope(&old_key)),
+            Err(MeshForwardError::SignatureInvalid { .. }),
+        ));
+        router.accept_inbound(&fixture.envelope(&new_key)).unwrap();
+        fixture.payload.generation = 3;
+        fixture.payload.peers[1].public_key_hex = hex::encode(old_key.verifying_key().to_bytes());
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert!(matches!(router.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
+        assert!(router.has_durable_replay());
+        assert_eq!(router.forward_usage().unwrap(), crate::mesh_routing::MeshForwardUsage::default());
+    }
+
+    #[test]
+    fn queued_inbound_nonce_remains_consumed_when_membership_changes_before_dispatch() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let mut fixture = Fixture::new();
+        let router = fixture.router();
+        let peer_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let envelope = fixture.envelope(&peer_key);
+        let original_peers = fixture.payload.peers.clone();
+        // Hold only the replay journal, not membership. The real worker queues
+        // admission while the membership writer publishes a removal.
+        let journal = router.durable_replay.as_ref().unwrap().lock().unwrap();
+        let mut pending = Box::pin(router.accept_inbound_async(&envelope));
+        assert!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        fixture.payload.generation = 2;
+        fixture.payload.peers.truncate(1);
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        drop(journal);
+        let result = fcp_async_core::runtime::block_on_sync(
+            fcp_async_core::time::timeout(Duration::from_secs(5), pending),
+        ).unwrap().unwrap();
+        assert!(matches!(result, Err(MeshForwardError::Malformed { field: "peer_directory", .. })));
+        fixture.payload.generation = 3;
+        fixture.payload.peers = original_peers;
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert!(matches!(
+            fcp_async_core::runtime::block_on_sync(router.accept_inbound_async(&envelope)).unwrap(),
+            Err(MeshForwardError::Replayed { .. }),
+        ));
+    }
+
+    #[test]
+    fn generation_change_fences_old_snapshots_even_when_a_removed_peer_is_readded() {
+        let mut fixture = Fixture::new();
+        let router = fixture.router();
+        let snapshot = router.trusted_directory().unwrap();
+        let original_peers = fixture.payload.peers.clone();
+        fixture.payload.generation = 2;
+        fixture.payload.peers.truncate(1);
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        fixture.payload.generation = 3;
+        fixture.payload.peers = original_peers;
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert!(router.ensure_current_directory(&snapshot).is_err());
+        assert_eq!(router.directory().len(), 1);
+    }
+
+    #[test]
+    fn file_worker_rotates_removes_and_readds_peers_without_losing_nonce_history() {
+        let mut fixture = Fixture::new();
+        let router = fixture.start_file_router();
+        let old_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let new_key = Ed25519SigningKey::from_bytes(&[34; 32]).unwrap();
+        let accepted = fixture.envelope(&old_key);
+        router.accept_inbound(&accepted).unwrap();
+        let original_peers = fixture.payload.peers.clone();
+        fixture.payload.generation = 2;
+        fixture.payload.peers[1].public_key_hex = hex::encode(new_key.verifying_key().to_bytes());
+        fixture.payload.peers[1].endpoint = "http://127.0.0.1:29999".to_owned();
+        fixture.write_source();
+        wait_until(|| router.directory().peer(&TailscaleNodeId::new("peer"))
+            .is_some_and(|peer| peer.verifying_key == new_key.verifying_key()));
+        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
+        assert!(matches!(router.accept_inbound(&fixture.envelope(&old_key)),
+            Err(MeshForwardError::SignatureInvalid { .. })));
+        router.accept_inbound(&fixture.envelope(&new_key)).unwrap();
+        fixture.payload.generation = 3;
+        fixture.payload.peers.truncate(1);
+        fixture.write_source();
+        wait_until(|| read_checkpoint(&fixture.refresher.state_path).ok()
+            .is_some_and(|state| state.generation == 3) && router.directory().is_empty());
+        assert!(router.accept_inbound(&fixture.envelope(&new_key)).is_err());
+        fixture.payload.generation = 4;
+        fixture.payload.peers = original_peers;
+        fixture.write_source();
+        wait_until(|| router.directory().peer(&TailscaleNodeId::new("peer"))
+            .is_some_and(|peer| peer.verifying_key == old_key.verifying_key()));
+        assert!(matches!(router.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
+        drop(router);
+        // Worker shutdown must release the checkpoint lock only after its last
+        // possible write, and restart must preserve the same replay journal.
+        let restarted = fixture.start_file_router();
+        assert!(matches!(restarted.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
+        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 4);
+    }
+
+    #[test]
+    fn file_worker_fences_untrusted_replacements_and_recovers_with_a_valid_successor() {
+        let mut fixture = Fixture::new();
+        let router = fixture.start_file_router();
+        let accepted_checkpoint = read_checkpoint(&fixture.refresher.state_path).ok().unwrap();
+        let peer_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let pending = fixture.envelope(&peer_key);
+        fixture.owner = Ed25519SigningKey::from_bytes(&[99; 32]).unwrap();
+        fixture.payload.generation = 2;
+        fixture.write_source();
+        wait_until(|| router.directory().is_empty());
+        assert!(router.accept_inbound(&pending).is_err());
+        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap(), accepted_checkpoint);
+        fixture.owner = Ed25519SigningKey::from_bytes(&[31; 32]).unwrap();
+        fixture.write_source();
+        wait_until(|| router.directory().len() == 1);
+        router.accept_inbound(&pending).unwrap();
+        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn delivered_forward_crossing_a_membership_change_is_never_retry_safe() {
+        use std::io::{BufRead, BufReader};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
+        use crate::mesh_routing::{MeshForwardFailure, MeshForwardUsage};
+
+        let mut fixture = Fixture::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fixture.payload.generation = 2;
+        fixture.payload.peers[1].endpoint = format!("http://{}", listener.local_addr().unwrap());
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        let router = fixture.router();
+        let server = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(start.elapsed() < Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let envelope = {
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "POST /rpc/mesh/forward HTTP/1.1\r\n");
+                let mut length = None;
+                let mut header_bytes = line.len();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    header_bytes += line.len();
+                    assert!(!line.is_empty() && header_bytes <= 8192);
+                    if line == "\r\n" { break; }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let length = length.unwrap();
+                assert!(length <= 8192);
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                serde_json::from_slice::<MeshForwardEnvelope>(&bytes).unwrap()
+            };
+            assert!(matches!(&envelope.body, MeshForwardBody::Invoke { .. }));
+            // Receipt precedes revocation. A signed answer from the old key is
+            // still genuine evidence, but must not pass the current-generation gate.
+            fixture.payload.generation = 3;
+            fixture.payload.peers.truncate(1);
+            fixture.write_source();
+            fixture.refresh().unwrap();
+            let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+            let reply = MeshForwardReply::sign(
+                &key, TailscaleNodeId::new("peer"), &envelope, 200, "{}".to_owned(),
+            );
+            let body = serde_json::to_vec(&reply).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
+            fixture
+        });
+        let result = fcp_async_core::runtime::block_on_sync(router.forward(
+            &TailscaleNodeId::new("peer"),
+            MeshForwardBody::Invoke {
+                request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                asserted_principal: None,
+            },
+        )).unwrap();
+        let fixture = server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+        assert!(!error.safe_to_retry());
+        assert!(router.directory().is_empty());
+        assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+        drop(router);
+        drop(fixture);
     }
 
     #[test]
