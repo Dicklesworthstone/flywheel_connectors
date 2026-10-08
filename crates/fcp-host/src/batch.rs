@@ -544,22 +544,28 @@ impl BatchZoneValidator {
 
     /// Validate all operations are zone-accessible.
     ///
+    /// Both the registered tool binding and an explicit operation zone must be
+    /// accessible. An operation zone selects a target; it cannot authorize an
+    /// unregistered tool or conceal a more privileged registered binding.
+    ///
     /// Returns the IDs of operations that violate zone constraints.
     ///
     /// # Errors
-    /// Returns [`HostError::PreflightFailed`] when any operation crosses a
-    /// zone boundary that the current agent zone cannot access.
+    /// Returns [`HostError::PreflightFailed`] when a tool has no registered
+    /// binding or either zone is inaccessible to the current agent.
     pub fn validate(&self, operations: &[BatchOperation]) -> HostResult<()> {
         let mut violations = Vec::new();
         let mut unknown_tools = Vec::new();
         for op in operations {
-            match self.effective_zone(op) {
-                Some(zone) => {
-                    if !zone_accessible(&self.agent_zone, zone) {
-                        violations.push(op.id.clone());
-                    }
-                }
-                None => unknown_tools.push(op.id.clone()),
+            let Some(bound_zone) = self.registry.get_zone(&op.tool) else {
+                unknown_tools.push(op.id.clone());
+                continue;
+            };
+            let target_zone = op.zone.as_ref().unwrap_or(bound_zone);
+            if !zone_accessible(&self.agent_zone, bound_zone)
+                || !zone_accessible(&self.agent_zone, target_zone)
+            {
+                violations.push(op.id.clone());
             }
         }
         if !unknown_tools.is_empty() {
@@ -4128,7 +4134,7 @@ mod tests {
                 error: None,
                 duration_ms: 5,
             }],
-            total_duration_ms: 10,
+            total_duration_ms: 0,
             schedule_report: None,
         };
         let cloned = resp.clone();
