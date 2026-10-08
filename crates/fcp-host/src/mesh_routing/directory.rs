@@ -1,12 +1,14 @@
 //! Signed membership activation, trusted checkpoints, and runtime expiration.
 //!
-//! This runs during host startup, before the router is published. No request
-//! handler performs checkpoint I/O. The separate lock is held for the router's
-//! lifetime, including across atomic checkpoint replacement.
+//! Startup commits the first checkpoint before publishing the router. File-backed
+//! signed sources are subsequently checked by a dedicated worker; request handlers
+//! never perform source or checkpoint I/O. The separate lock outlives that worker,
+//! including across atomic checkpoint replacement.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,9 +20,11 @@ use fcp_mesh::peer_manifest::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{MeshRoutingSettings, unix_now_ms};
+use super::{MESH_PEERS_FILE_ENV, MeshRoutingSettings, unix_now_ms};
 use crate::mesh_replay::companion;
 use crate::{HostError, HostResult};
+
+mod reload;
 
 /// Independently pinned identity of an owner-signed mesh directory.
 pub const MESH_DIRECTORY_ID_ENV: &str = "FCP_HOST_MESH_ID";
@@ -42,12 +46,15 @@ const INITIALIZED: &[u8] = b"FCP-MESH-DIRECTORY-INITIALIZED-V1\n";
 pub(super) struct PreparedDirectory {
     verified: VerifiedMeshPeerDirectory,
     state_path: PathBuf,
+    reload_source: Option<reload::ReloadSource>,
 }
 
 pub(super) struct DirectoryGuard {
+    // Fields drop in order: stop/join the writer before releasing its lock.
+    _worker: Option<reload::ReloadWorker>,
+    state: Arc<reload::LiveMembership>,
     // A replaced data inode must never become a second lock/admission owner.
     _lock: File,
-    validity: MembershipValidity,
 }
 
 struct MembershipValidity {
@@ -82,7 +89,7 @@ impl MembershipValidity {
             self.expired.store(true, Ordering::Release);
             return Err(MeshForwardError::Malformed {
                 field: "peer_directory",
-                detail: "owner-signed membership expired; install a fresh signed generation and restart"
+                detail: "owner-signed membership expired; install a fresh signed generation"
                     .to_owned(),
             });
         }
@@ -92,7 +99,7 @@ impl MembershipValidity {
 
 impl DirectoryGuard {
     pub(super) fn check(&self) -> Result<(), MeshForwardError> {
-        self.validity.check_at(unix_now_ms(), Instant::now())
+        self.state.snapshot().map(|_| ())
     }
 }
 
@@ -152,9 +159,20 @@ pub(super) fn prepare(
         .map_err(|error| invalid(&error.to_string()))?;
     settings.peers_json = serde_json::to_string(&verified.payload().peers)
         .map_err(|_| invalid("verified directory could not be serialized"))?;
+    let reload_source = lookup(MESH_PEERS_FILE_ENV)
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(|path| reload::ReloadSource {
+            path: PathBuf::from(path),
+            mesh_id,
+            trusted_owners,
+            local_node: settings.node_id.clone(),
+            local_key: settings.signing_key.verifying_key(),
+        });
     Ok(Some(PreparedDirectory {
         verified,
         state_path,
+        reload_source,
     }))
 }
 
@@ -164,6 +182,7 @@ impl PreparedDirectory {
         let Self {
             verified,
             state_path,
+            reload_source,
         } = self;
         let validity = MembershipValidity::new(
             verified.payload().expires_at_ms,
@@ -218,9 +237,18 @@ impl PreparedDirectory {
         validity
             .check_at(unix_now_ms(), Instant::now())
             .map_err(|error| invalid(&error.to_string()))?;
-        Ok(DirectoryGuard {
-            _lock: lock,
+        let state = Arc::new(reload::LiveMembership::new(
+            verified.directory().clone(),
+            checkpoint,
             validity,
+        ));
+        let worker = reload_source
+            .map(|source| reload::spawn(source, state_path, Arc::clone(&state), now_ms))
+            .transpose()?;
+        Ok(DirectoryGuard {
+            _worker: worker,
+            state,
+            _lock: lock,
         })
     }
 }
@@ -434,12 +462,24 @@ mod tests {
         // Exercise the real router boundary with the actual guard latched,
         // without sleeps, a wall-clock race, or a network-service substitute.
         router.membership = Some(DirectoryGuard {
+            _worker: None,
+            state: Arc::new(reload::LiveMembership::new(
+                router.directory().clone(),
+                MeshPeerDirectoryCheckpoint {
+                    schema_version: 1,
+                    mesh_id: "expiry-test".to_owned(),
+                    local_node: "local".to_owned(),
+                    generation: 1,
+                    payload_hash_hex: "00".repeat(32),
+                    last_observed_ms: 0,
+                },
+                MembershipValidity {
+                    expires_at_ms: u64::MAX,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    expired: AtomicBool::new(true),
+                },
+            )),
             _lock: tempfile::tempfile().unwrap(),
-            validity: MembershipValidity {
-                expires_at_ms: u64::MAX,
-                deadline: Instant::now() + Duration::from_secs(60),
-                expired: AtomicBool::new(true),
-            },
         });
         let body = MeshForwardBody::Introspect {
             connector_id: "fcp.test:utility:1.0.0".to_owned(),
