@@ -778,6 +778,11 @@ impl BatchExecutor {
     /// Within each tier, operations are executed sequentially (async parallel
     /// execution is handled at a higher layer).
     ///
+    /// The batch deadline is checked before every operation, including within
+    /// a dependency tier. A synchronous handler cannot be interrupted: if it
+    /// returns after the deadline, its known result is retained, the batch is
+    /// marked aborted, and no subsequent operation is admitted.
+    ///
     /// # Errors
     /// Returns any validation or planning error produced before execution
     /// begins. Individual operation failures are captured in the response.
@@ -794,7 +799,10 @@ impl BatchExecutor {
             matches!(request.options.scheduler.mode, BatchSchedulerMode::Adaptive)
                 .then_some(schedule_report);
         let start = Instant::now();
-        let timeout = Duration::from_millis(request.options.timeout_ms);
+        let deadline = BatchDeadline {
+            started_at: start,
+            timeout: Duration::from_millis(request.options.timeout_ms),
+        };
         let op_map: HashMap<&str, &BatchOperation> = request
             .operations
             .iter()
@@ -805,12 +813,7 @@ impl BatchExecutor {
         let mut aborted = false;
 
         for tier in &plan.tiers {
-            if aborted {
-                record_skipped_operations(&mut results_map, &tier.operation_ids, None);
-                continue;
-            }
-
-            if start.elapsed() >= timeout {
+            if deadline.is_expired() {
                 aborted = true;
                 let timeout_error = batch_timeout_error();
                 record_skipped_operations(
@@ -821,6 +824,11 @@ impl BatchExecutor {
                 continue;
             }
 
+            if aborted {
+                record_skipped_operations(&mut results_map, &tier.operation_ids, None);
+                continue;
+            }
+
             execute_tier(
                 tier,
                 &op_map,
@@ -828,6 +836,7 @@ impl BatchExecutor {
                 request.options.stop_on_first_error,
                 &handler,
                 &mut aborted,
+                deadline,
             );
         }
 
@@ -1451,6 +1460,23 @@ fn record_skipped_operations(
     }
 }
 
+/// Elapsed-time budget avoids overflowing `Instant` for very large timeouts.
+#[derive(Debug, Clone, Copy)]
+struct BatchDeadline {
+    started_at: Instant,
+    timeout: Duration,
+}
+
+impl BatchDeadline {
+    fn remaining(self) -> Duration {
+        self.timeout.saturating_sub(self.started_at.elapsed())
+    }
+
+    fn is_expired(self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
 fn execute_tier<F>(
     tier: &ExecutionTier,
     operation_map: &HashMap<&str, &BatchOperation>,
@@ -1458,10 +1484,20 @@ fn execute_tier<F>(
     stop_on_first_error: bool,
     handler: &F,
     aborted: &mut bool,
+    deadline: BatchDeadline,
 ) where
     F: Fn(&BatchOperation) -> Result<serde_json::Value, BatchOperationError>,
 {
     for operation_id in &tier.operation_ids {
+        if deadline.is_expired() {
+            *aborted = true;
+            results_map.insert(
+                operation_id.clone(),
+                skipped_result(operation_id.clone(), Some(batch_timeout_error())),
+            );
+            continue;
+        }
+
         if *aborted {
             results_map.insert(
                 operation_id.clone(),
@@ -1481,7 +1517,9 @@ fn execute_tier<F>(
 
         let started_at = Instant::now();
         let result = executed_result(operation_id, handler(operation), started_at);
-        if stop_on_first_error && result.status == OperationResultStatus::Error {
+        if deadline.is_expired()
+            || (stop_on_first_error && result.status == OperationResultStatus::Error)
+        {
             *aborted = true;
         }
         results_map.insert(operation_id.clone(), result);
@@ -1530,7 +1568,7 @@ fn build_response(
 }
 
 const fn batch_status(aborted: bool, completed: usize, failed: usize) -> BatchStatus {
-    if aborted && failed > 0 {
+    if aborted {
         BatchStatus::Aborted
     } else if failed == 0 {
         BatchStatus::Success
@@ -3632,10 +3670,10 @@ mod tests {
     // ── New tests: batch_status edge cases ──
 
     #[test]
-    fn batch_status_aborted_no_failures_is_success() {
-        // aborted=true but failed=0 should produce Success (no failed ops)
-        let status = batch_status(true, 5, 0);
-        assert_eq!(status, BatchStatus::Success);
+    fn batch_status_aborted_without_failures_is_aborted() {
+        // Deadline exhaustion can abort a batch without a provider failure.
+        assert_eq!(batch_status(true, 0, 0), BatchStatus::Aborted);
+        assert_eq!(batch_status(true, 5, 0), BatchStatus::Aborted);
     }
 
     #[test]
@@ -3962,7 +4000,11 @@ mod tests {
     fn no_cycle_wide_fan_out() {
         let mut ops = vec![op("root", "t", &[])];
         for i in 0..10 {
-            ops.push(op(&format!("child{i}"), "t", &["root"]));
+            ops.push(op(&format!("child{i}"), "t", &[]));
+        }
+        // Each child must depend on root, matching the fan-out graph.
+        for operation in &mut ops[1..] {
+            operation.depends_on = vec!["root".to_owned()];
         }
         assert!(!has_cycle(&ops));
     }
@@ -4134,7 +4176,7 @@ mod tests {
                 error: None,
                 duration_ms: 5,
             }],
-            total_duration_ms: 0,
+            total_duration_ms: 10,
             schedule_report: None,
         };
         let cloned = resp.clone();
