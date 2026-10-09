@@ -21,6 +21,10 @@ use fcp_mesh::peer_manifest::{
 use serde::Serialize;
 use url::{Host, Url};
 
+#[cfg(unix)]
+#[path = "sync/watch.rs"]
+mod watch;
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZED: &[u8] = b"FCP-MESH-DIRECTORY-SYNC-V1\n";
 
@@ -247,7 +251,7 @@ mod disk {
             Ok(Self { path: path.to_path_buf(), lock, initialized: !marker.is_empty() })
         }
 
-        fn read_installed(&self) -> SyncResult<Option<String>> {
+        pub(super) fn read_installed(&self) -> SyncResult<Option<String>> {
             let mut file = match options().open(&self.path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && !self.initialized => {
@@ -269,7 +273,7 @@ mod disk {
                 .map_err(|_| SyncError::Local("installed source is not UTF-8"))
         }
 
-        fn mark_initialized(&mut self) -> SyncResult<()> {
+        pub(super) fn mark_initialized(&mut self) -> SyncResult<()> {
             if !self.initialized {
                 self.lock.write_all(INITIALIZED).and_then(|()| self.lock.sync_all())
                     .map_err(|error| storage("initialize", &error))?;
@@ -354,6 +358,16 @@ pub(super) fn run(options: &BTreeMap<String, OsString>, output: &mut impl io::Wr
         serde_json::to_writer(&mut *output, &report).map_err(|_| "sync output failed".to_owned())?;
         writeln!(output).map_err(|_| "sync output failed".to_owned())
     }
+}
+
+pub(super) fn run_watch(options: &BTreeMap<String, OsString>, output: &mut impl io::Write) -> super::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (options, output);
+        Err("membership installation requires Unix filesystem guarantees".to_owned())
+    }
+    #[cfg(unix)]
+    watch::run(options, output)
 }
 
 #[cfg(all(test, unix))]

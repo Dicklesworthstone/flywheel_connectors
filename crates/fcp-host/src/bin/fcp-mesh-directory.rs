@@ -27,11 +27,16 @@ mod sync;
 const USAGE: &str = "Usage:
   fcp-mesh-directory sign --owner-key-file PATH --payload PATH
   fcp-mesh-directory sync --url URL --owner-public-key-file PATH --mesh-id ID --node-id ID --node-public-key-file PATH --directory PATH
+  fcp-mesh-directory watch --url URL --owner-public-key-file PATH --mesh-id ID --node-id ID --node-public-key-file PATH --directory PATH [--interval-secs N] [--max-backoff-secs N]
   fcp-mesh-directory verify --owner-public-key-file PATH --mesh-id ID --node-id ID --node-public-key-file PATH --directory PATH
 
 sync fetches an owner-signed document and atomically installs --directory.
 It uses HTTPS (literal loopback HTTP is allowed for local testing), refuses
 rollback and generation reuse, and never changes the host checkpoint.
+watch continuously syncs with one installer lock and flushed JSONL reports.
+It polls every 30 seconds by default, backs off remote failures up to 300 seconds,
+and stops on local state/storage faults. Both settings must be 1..3600 seconds;
+max backoff must be at least the polling interval. Stop it with your supervisor.
 
 sign writes the signed directory JSON to stdout. verify writes a JSON summary.
 Key files contain 32 bytes encoded as 64 hex characters. The owner secret file
@@ -60,7 +65,7 @@ fn arguments(args: Vec<OsString>) -> Result<(String, BTreeMap<String, OsString>)
         .ok_or_else(|| USAGE.to_owned())?;
     let required: &[&str] = match command.as_str() {
         "sign" => &["--owner-key-file", "--payload"],
-        "sync" => &[
+        "sync" | "watch" => &[
             "--url", "--owner-public-key-file", "--mesh-id", "--node-id",
             "--node-public-key-file", "--directory",
         ],
@@ -70,10 +75,15 @@ fn arguments(args: Vec<OsString>) -> Result<(String, BTreeMap<String, OsString>)
         ],
         _ => return Err(USAGE.to_owned()),
     };
+    let optional: &[&str] = if command == "watch" {
+        &["--interval-secs", "--max-backoff-secs"]
+    } else {
+        &[]
+    };
     let mut options = BTreeMap::new();
     while let Some(name) = args.next() {
         let name = name.into_string().map_err(|_| "option name is not UTF-8".to_owned())?;
-        if !required.contains(&name.as_str()) {
+        if !required.contains(&name.as_str()) && !optional.contains(&name.as_str()) {
             return Err("unknown option for this command".to_owned());
         }
         let value = args.next().filter(|value| !value.is_empty())
@@ -141,6 +151,9 @@ fn run(args: Vec<OsString>, output: &mut impl Write) -> Result<()> {
     if command == "sync" {
         return sync::run(&options, output);
     }
+    if command == "watch" {
+        return sync::run_watch(&options, output);
+    }
     if command == "sign" {
         let key = read_key(Path::new(&options["--owner-key-file"]), true)?;
         let owner = Ed25519SigningKey::from_bytes(&key)
@@ -207,6 +220,27 @@ mod tests {
         assert_eq!(command, "sign");
         assert_eq!(options["--payload"], "membership.json");
         assert!(arguments(args(&["sign", "--owner-key", "do-not-echo-secret"])).is_err());
+    }
+
+    #[test]
+    fn watch_options_are_optional_and_never_accepted_by_one_shot_commands() {
+        let base = args(&[
+            "watch", "--url", "https://example.com/members", "--owner-public-key-file", "owner.pub",
+            "--mesh-id", "mesh", "--node-id", "local", "--node-public-key-file", "node.pub",
+            "--directory", "members.json",
+        ]);
+        assert_eq!(arguments(base.clone()).unwrap().0, "watch");
+        let mut configured = base.clone();
+        configured.extend(args(&["--interval-secs", "10", "--max-backoff-secs", "60"]));
+        assert_eq!(arguments(configured.clone()).unwrap().1["--interval-secs"], "10");
+        configured[0] = OsString::from("sync");
+        assert!(arguments(configured).is_err());
+        let mut duplicate = base.clone();
+        duplicate.extend(args(&["--interval-secs", "1", "--interval-secs", "2"]));
+        assert!(arguments(duplicate).is_err());
+        let mut secret = base;
+        secret.extend(args(&["--owner-key", "do-not-echo-secret"]));
+        assert!(!arguments(secret).unwrap_err().contains("do-not-echo-secret"));
     }
 
     #[test]
