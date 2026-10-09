@@ -86,6 +86,14 @@ impl From<HttpClientError> for DiscordHttpErrorInfo {
                 is_timeout: false,
                 is_connect: true,
             },
+            // The native deadline can expire after Discord receives the body.
+            // It supplies neither an HTTP response nor proof of non-delivery.
+            HttpClientError::DeadlineExceeded => Self {
+                message: "request deadline exceeded".to_owned(),
+                status_code: None,
+                is_timeout: true,
+                is_connect: false,
+            },
             HttpClientError::Cancelled => Self {
                 message: "request cancelled".to_string(),
                 status_code: None,
@@ -305,6 +313,39 @@ pub type DiscordResult<T> = Result<T, DiscordError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_http_deadline_is_timeout_without_delivery_or_response_evidence() {
+        let error = DiscordError::from_http_client_error(HttpClientError::DeadlineExceeded);
+        let DiscordError::Http(info) = &error else {
+            panic!("native deadline must remain a transport error");
+        };
+        assert!(info.is_timeout);
+        assert!(!info.is_connect);
+        assert_eq!(info.status_code, None);
+        assert!(!error.replay_is_safe());
+        assert_eq!(error.retry_after(), None);
+        assert_eq!(
+            error.is_retryable(),
+            ConnectorErrorMapping::is_retryable(&error)
+        );
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::External { status_code: None, retry_after: None, .. }
+        ));
+    }
+
+    #[test]
+    fn native_http_deadline_cannot_enter_the_non_idempotent_retry_path() {
+        use fcp_sdk::migration::AttemptOutcome;
+
+        let error = DiscordError::from_http_client_error(HttpClientError::DeadlineExceeded);
+        // Use the same final replay gate as DiscordApiClient::request.
+        let replayable = error.replay_is_safe();
+        let outcome: AttemptOutcome<(), DiscordError> =
+            AttemptOutcome::retryable_if_replayable(error, None, replayable);
+        assert!(matches!(outcome, AttemptOutcome::Terminal(_)));
+    }
 
     // ---- Display ----
 

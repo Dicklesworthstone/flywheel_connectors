@@ -129,6 +129,14 @@ impl From<HttpClientError> for HttpErrorInfo {
                 is_connect: false,
                 is_request: true,
             },
+            // Expiration is not a response and may occur after a mutation was sent.
+            HttpClientError::DeadlineExceeded => Self {
+                message: "request deadline exceeded".to_owned(),
+                status_code: None,
+                is_timeout: true,
+                is_connect: false,
+                is_request: false,
+            },
             HttpClientError::Cancelled => Self {
                 message: "request cancelled".to_string(),
                 status_code: None,
@@ -419,6 +427,31 @@ impl GraphqlClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_http_deadline_preserves_timeout_without_connect_or_status_claims() {
+        let info = HttpErrorInfo::from(HttpClientError::DeadlineExceeded);
+        assert!(info.is_timeout);
+        assert!(!info.is_connect);
+        assert!(!info.is_request);
+        assert_eq!(info.status_code, None);
+        let bytes = serde_json::to_vec(&info).unwrap();
+        assert_eq!(serde_json::from_slice::<HttpErrorInfo>(&bytes).unwrap(), info);
+    }
+
+    #[test]
+    fn native_http_deadline_converts_through_the_public_error_surface() {
+        let error = GraphqlClientError::from(HttpClientError::DeadlineExceeded);
+        let GraphqlClientError::Http(info) = &error else {
+            panic!("native deadline must remain a transport error");
+        };
+        assert!(info.is_timeout);
+        assert!(!info.is_connect);
+        assert!(matches!(
+            error.to_fcp_error("test"),
+            FcpError::External { status_code: None, retry_after: None, .. }
+        ));
+    }
 
     // ---- HttpErrorInfo ----
 
