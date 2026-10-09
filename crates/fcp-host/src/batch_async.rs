@@ -2,9 +2,10 @@
 //!
 //! Futures are owned by the batch, not detached onto a runtime. Admission is
 //! bounded before invoking the handler factory; responses retain submission order
-//! even when independent operations finish out of order.
+//! even when independent operations finish out of order. Dependencies release
+//! their own successors without imposing a barrier on unrelated branches.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use crate::{
     BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation,
     BatchOperationError, BatchScheduleReport, BatchSchedulerMode, BatchStatus,
-    HostResult, OperationResult, OperationResultStatus,
+    ExecutionPlan, HostResult, OperationResult, OperationResultStatus,
 };
 
 // A timer need not represent the entire caller-supplied u64 millisecond budget.
@@ -26,11 +27,15 @@ const MAX_TIMER_WAIT: Duration = Duration::from_secs(60);
 impl BatchExecutor {
     /// Execute independent batch operations concurrently, up to `max_parallelism`.
     ///
-    /// Uses the same whole-batch validation, zone checks, topological tiers, and
-    /// adaptive scheduling plan as [`Self::execute_sync`]. No handler is called
-    /// until validation succeeds. A dependency must have succeeded before its
-    /// dependent is admitted; unrelated branches may continue after a failure.
-    /// Results and counters use the existing [`BatchInvokeResponse`] wire shape.
+    /// Uses the same whole-batch validation, zone checks, and deterministic or
+    /// adaptive planning preference as [`Self::execute_sync`]. No handler is
+    /// called until validation succeeds. Unlike synchronous tier execution, a
+    /// dependent becomes eligible as soon as its own dependencies finish; an
+    /// unrelated slow operation does not impose a batch-wide tier barrier.
+    /// Among currently ready operations, the original plan order wins. A
+    /// dependency must have succeeded before its dependent is admitted;
+    /// unrelated branches may continue after a failure. Results and counters
+    /// use the existing [`BatchInvokeResponse`] wire shape.
     ///
     /// `stop_on_first_error` stops admission when the first failure is observed.
     /// Already admitted handlers are drained until completion or the overall
@@ -118,78 +123,132 @@ impl BatchExecutor {
         let report = matches!(request.options.scheduler.mode, BatchSchedulerMode::Adaptive)
             .then_some(report);
         let mut run = BatchRun::new(request, started_at);
+        let mut dependencies = DependencyQueue::new(request, &plan, &run.indices);
         let limit = usize::try_from(request.options.max_parallelism)
             .unwrap_or(usize::MAX)
             .min(request.operations.len());
         let mut cooperative_steps = 0_u8;
+        let mut active = FuturesUnordered::new();
 
-        'tiers: for tier in &plan.tiers {
-            let mut waiting = tier.operation_ids.iter();
-            let mut active = FuturesUnordered::new();
-            loop {
-                run.check_limits(context);
-                if run.interrupted() {
-                    break 'tiers;
-                }
-                while run.halt.is_none() && active.len() < limit {
-                    run.check_limits(context);
-                    if run.halt.is_some() {
-                        break;
-                    }
-                    let Some(id) = waiting.next() else {
-                        break;
-                    };
-                    let index = run.indices[id.as_str()];
-                    let operation = &request.operations[index];
-                    if !run.dependencies_succeeded(operation) {
-                        run.results[index] = Some(skipped(
-                            operation,
-                            "DEP_FAILED",
-                            "dependency did not complete successfully",
-                        ));
-                        cooperate(&mut cooperative_steps).await;
-                        continue;
-                    }
-                    // A factory may perform work before returning its future.
-                    // Record admission first so even an unpolled future is not
-                    // mistaken for an operation whose execution never began.
-                    run.admitted_at[index] = Some(Instant::now());
-                    let future = handler(operation);
-                    active.push(async move { (index, future.await) });
-                    cooperate(&mut cooperative_steps).await;
-                }
-                run.check_limits(context);
-                if run.interrupted() {
-                    break 'tiers;
-                }
-                if active.is_empty() {
-                    break;
-                }
-                let next = fcp_async_core::time::timeout(
-                    run.remaining(context).min(MAX_TIMER_WAIT),
-                    active.next(),
-                );
-                let result = match context {
-                    Some(context) => context.run(next).await.and_then(std::convert::identity),
-                    None => next.await,
-                };
-                match result {
-                    Ok(Some((index, result))) => run.record(index, result),
-                    Ok(None) => break,
-                    Err(AsyncError::Timeout { .. }) => {}
-                    Err(AsyncError::Cancelled) => run.halt = Some(Halt::Cancelled),
-                    Err(_) => run.halt = Some(Halt::RuntimeFailure),
-                }
-                // A timer expiration merely wakes the original budget check.
-                // It never restarts a handler or refreshes the batch deadline.
-                cooperate(&mut cooperative_steps).await;
-            }
-            if run.halt.is_some() {
+        loop {
+            run.check_limits(context);
+            if run.interrupted() {
                 break;
             }
+            while run.halt.is_none() && active.len() < limit {
+                run.check_limits(context);
+                if run.halt.is_some() {
+                    break;
+                }
+                let Some(index) = dependencies.pop_ready() else {
+                    break;
+                };
+                let operation = &request.operations[index];
+                if !run.dependencies_succeeded(operation) {
+                    run.results[index] = Some(skipped(
+                        operation,
+                        "DEP_FAILED",
+                        "dependency did not complete successfully",
+                    ));
+                    // A skipped node is settled too. Release its descendants
+                    // into failure propagation, never into handler execution.
+                    dependencies.complete(index);
+                    cooperate(&mut cooperative_steps).await;
+                    continue;
+                }
+                // A factory may perform work before returning its future.
+                // Record admission first so even an unpolled future is not
+                // mistaken for an operation whose execution never began.
+                run.admitted_at[index] = Some(Instant::now());
+                let future = handler(operation);
+                active.push(async move { (index, future.await) });
+                cooperate(&mut cooperative_steps).await;
+            }
+            run.check_limits(context);
+            if run.interrupted() || active.is_empty() {
+                break;
+            }
+            let next = fcp_async_core::time::timeout(
+                run.remaining(context).min(MAX_TIMER_WAIT),
+                active.next(),
+            );
+            let result = match context {
+                Some(context) => context.run(next).await.and_then(std::convert::identity),
+                None => next.await,
+            };
+            match result {
+                Ok(Some((index, result))) => {
+                    run.record(index, result);
+                    dependencies.complete(index);
+                }
+                Ok(None) => break,
+                Err(AsyncError::Timeout { .. }) => {}
+                Err(AsyncError::Cancelled) => run.halt = Some(Halt::Cancelled),
+                Err(_) => run.halt = Some(Halt::RuntimeFailure),
+            }
+            // A timer expiration merely wakes the original budget check.
+            // It never restarts a handler or refreshes the batch deadline.
+            cooperate(&mut cooperative_steps).await;
         }
+        // Release handler-owned resources before constructing the final response.
+        // Unresolved admissions remain recorded as outcome-unknown, not skipped.
+        drop(active);
         run.check_limits(context);
         Ok(run.finish(report))
+    }
+}
+
+/// A completion-driven ready frontier over the already validated dependency DAG.
+/// A plan supplies deterministic preference, not barriers between unrelated work.
+struct DependencyQueue {
+    remaining: Vec<usize>,
+    dependents: Vec<Vec<usize>>,
+    ranks: Vec<usize>,
+    ready: BTreeSet<(usize, usize)>,
+}
+
+impl DependencyQueue {
+    fn new(
+        request: &BatchInvokeRequest,
+        plan: &ExecutionPlan,
+        indices: &HashMap<&str, usize>,
+    ) -> Self {
+        let count = request.operations.len();
+        let mut queue = Self {
+            remaining: vec![0; count],
+            dependents: vec![Vec::new(); count],
+            ranks: vec![0; count],
+            ready: BTreeSet::new(),
+        };
+        for (rank, id) in plan.tiers.iter().flat_map(|tier| &tier.operation_ids).enumerate() {
+            queue.ranks[indices[id.as_str()]] = rank;
+        }
+        for (index, operation) in request.operations.iter().enumerate() {
+            queue.remaining[index] = operation.depends_on.len();
+            for dependency in &operation.depends_on {
+                queue.dependents[indices[dependency.as_str()]].push(index);
+            }
+            if queue.remaining[index] == 0 {
+                queue.ready.insert((queue.ranks[index], index));
+            }
+        }
+        queue
+    }
+
+    fn pop_ready(&mut self) -> Option<usize> {
+        self.ready.pop_first().map(|(_, index)| index)
+    }
+
+    fn complete(&mut self, index: usize) {
+        // Each operation settles once. Repeated dependency references have
+        // matching counts and edges, so they cannot schedule a handler twice.
+        for &dependent in &self.dependents[index] {
+            debug_assert!(self.remaining[dependent] > 0);
+            self.remaining[dependent] -= 1;
+            if self.remaining[dependent] == 0 {
+                self.ready.insert((self.ranks[dependent], dependent));
+            }
+        }
     }
 }
 

@@ -30,24 +30,39 @@ async fn execute(request: &BatchInvokeRequest) {
 
 ## Execution semantics
 
-All validation and planning precede handler construction. Each dependency tier
-uses the existing deterministic FIFO or adaptive order. At most
-`max_parallelism` handlers are admitted at once, including futures that have not
-yet been polled. A newly free slot is filled without waiting for other operations
-in the same tier. Tiers remain sequential, preserving the existing plan contract.
-A dependent runs only after all its dependencies succeeded. Failed dependencies
-propagate `DEP_FAILED` skips, while independent branches can still complete.
+All validation and planning precede handler construction. A completion-driven
+ready queue tracks each operation's outstanding dependencies. At most
+`max_parallelism` handlers are admitted across the entire batch, including futures
+that have not yet been polled and operations at different dependency depths.
+A dependent becomes eligible when all its own dependencies have settled; it runs
+only when every dependency succeeded. There is no barrier waiting for unrelated
+operations in an earlier planning tier.
+
+For example, with two slots and the dependency chain `a -> c -> d` alongside an
+independent slow `b`, the executor can finish `c` and `d` while `b` is still
+waiting. A join depending on both `a` and `b` still waits for both. Applications
+requiring an ordering constraint must declare that dependency explicitly instead
+of relying on the old accidental tier barrier. Synchronous execution and the
+planner's tier representation remain unchanged.
+
+Among currently ready operations, the existing deterministic FIFO/adaptive plan
+order supplies the admission preference. Completion timing can change which nodes
+are ready; the executor never starts a blocked higher-ranked node ahead of its
+prerequisites. Failed and skipped dependencies propagate `DEP_FAILED` iteratively
+through their descendants without stopping unrelated branches. Repeated references
+to the same dependency cannot admit a handler twice.
 
 Responses stay in original submission order regardless of completion order.
 Provider error details and retry hints are preserved; the executor itself never
 retries operations. Adaptive reports remain the planner's FIFO-versus-scheduled
-counterfactual, not a measurement of actual concurrent queueing latency.
+counterfactual, not an execution trace or a measurement of actual concurrent
+queueing latency. Interleaving dependency depths does not rewrite that report.
 
 With `stop_on_first_error`, no new handler is admitted after a failure is observed.
-Already admitted operations are drained until they finish or the overall batch
-budget expires. This retains their actual results instead of describing possibly
-executed operations as skipped. Multiple operations may already have been admitted
-before the first failure is observed.
+Already admitted operations at any dependency depth are drained until they finish
+or the overall batch budget expires. This retains their actual results instead of
+describing possibly executed operations as skipped. Multiple operations may already
+have been admitted before the first failure is observed.
 
 ## Deadlines and unknown outcomes
 
@@ -108,13 +123,17 @@ or detached task is created. These yield points cannot preempt a blocking handle
 rch exec -- cargo test --locked -p fcp-host --test batch_async
 ```
 
-The tests use controlled futures to check real overlap and slot refill, tier
+The tests use controlled futures to check real overlap and slot refill, dependency
 ordering, failure propagation, stop-and-drain behavior, timeout accounting,
 whole-batch rejection, adaptive planning, non-Send borrowing, and drop cleanup.
 Timing-based deadline cases are bounded separately from the overlap assertions.
 Context regressions additionally cover pre-cancellation and pre-expiration,
 partial-response retention, inherited cancellation, competing deadlines, draining
 interruption, cancellation inside a handler factory, and ready-heavy fairness.
+Dependency-frontier regressions cover fast chains beside blocked roots, fan-in,
+diamond graphs and repeated edges, failure propagation before cancellation,
+first-error draining across depths, adaptive ready order, the global concurrency
+bound, and iterative propagation through 1024 skipped descendants.
 A cross-component TCP case runs batch handlers through `MeshRouter::forward` to
 two signing peers. Neither peer replies before both authenticated invokes arrive,
 so sequential execution cannot pass the bounded barrier. This exercises the mesh

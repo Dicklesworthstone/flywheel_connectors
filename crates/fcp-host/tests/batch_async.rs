@@ -149,7 +149,7 @@ async fn dependents_wait_for_success_and_transitive_failures_do_not_stop_other_b
 }
 
 #[fcp_async_core::runtime::test]
-async fn dependency_tiers_do_not_overlap_even_when_one_parent_finishes_early() {
+async fn a_ready_dependent_does_not_wait_for_an_unrelated_slow_parent() {
     let executor = BatchExecutor::new();
     let request = request(vec![op("a", &[]), op("b", &[]), op("c", &["a"])], 2);
     let usage = Rc::new(Usage::default());
@@ -164,11 +164,14 @@ async fn dependency_tiers_do_not_overlap_even_when_one_parent_finishes_early() {
         }
     }));
     assert!(poll!(batch.as_mut()).is_pending());
-    assert_eq!(*usage.created.borrow(), ["a", "b"]);
+    assert_eq!(*usage.created.borrow(), ["a", "b", "c"]);
+    assert_eq!(usage.active.get(), 1, "only the unrelated blocked operation remains");
     slow.release();
     let response = batch.await.unwrap();
     assert_eq!(*usage.created.borrow(), ["a", "b", "c"]);
     assert_eq!(response.completed, 3);
+    assert_eq!(usage.peak.get(), 2);
+    assert_accounting(&response, 3);
 }
 
 #[fcp_async_core::runtime::test]
@@ -687,5 +690,245 @@ mod mesh {
         assert_eq!(response.results[1].output, Some(json!({ "executor": "peer-b" })));
         assert_eq!(router.forward_usage().unwrap(), fcp_host::mesh_routing::MeshForwardUsage::default());
         assert_accounting(&response, 2);
+    }
+}
+
+mod dependencies {
+    use fcp_async_core::ExecutionContext;
+
+    use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn an_entire_fast_chain_progresses_while_an_unrelated_root_is_blocked() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![
+            op("e", &["d"]), op("d", &["c"]), op("c", &["a"]),
+            op("b", &[]), op("a", &[]),
+        ], 2);
+        let slow = Gate::default();
+        let usage = Rc::new(Usage::default());
+        let mut batch = Box::pin(executor.execute_async(&request, |op| {
+            let reservation = Reservation::enter(&usage, &op.id);
+            let slow = &slow;
+            async move {
+                let _reservation = reservation;
+                if op.id == "b" { slow.wait().await; }
+                Ok(op.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*usage.created.borrow(), ["a", "b", "c", "d", "e"]);
+        assert_eq!(usage.active.get(), 1);
+        assert_eq!(usage.peak.get(), 2, "the bound is global, not per dependency depth");
+        slow.release();
+        let response = batch.await.unwrap();
+        assert_eq!(response.status, BatchStatus::Success);
+        assert_eq!(response.results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["e", "d", "c", "b", "a"]);
+        assert_eq!(usage.active.get(), 0);
+        assert_accounting(&response, 5);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn fan_in_waits_for_every_parent_without_stalling_a_separate_ready_chain() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![
+            op("a", &[]), op("b", &[]), op("c", &["a"]),
+            op("d", &["a", "b"]), op("e", &["c"]),
+        ], 2);
+        let slow = Gate::default();
+        let calls = RefCell::new(Vec::new());
+        let mut batch = Box::pin(executor.execute_async(&request, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            let slow = &slow;
+            async move {
+                if op.id == "b" { slow.wait().await; }
+                Ok(op.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*calls.borrow(), ["a", "b", "c", "e"]);
+        slow.release();
+        let response = batch.await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b", "c", "e", "d"]);
+        assert_eq!(response.completed, 5);
+        assert_accounting(&response, 5);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn duplicate_edges_and_diamond_dependencies_admit_each_handler_once() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![
+            op("a", &[]), op("b", &["a", "a"]), op("c", &["a"]),
+            op("d", &["b", "c", "b"]),
+        ], 3);
+        let calls = RefCell::new(Vec::new());
+        let response = executor.execute_async(&request, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            ready(Ok(op.input.clone()))
+        }).await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b", "c", "d"]);
+        assert_eq!(response.completed, 4);
+        assert_accounting(&response, 4);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn failed_descendants_are_settled_before_an_unrelated_root_is_cancelled() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![
+            op("a", &[]), op("b", &[]), op("c", &["a"]),
+            op("d", &["c"]), op("e", &["b"]),
+        ], 2);
+        let context = ExecutionContext::background();
+        let calls = RefCell::new(Vec::new());
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            async move {
+                if op.id == "a" { Err(failure()) } else {
+                    pending::<()>().await;
+                    Ok(json!(null))
+                }
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b"]);
+        for index in [2, 3] {
+            assert_eq!(response.results[index].error.as_ref().unwrap().code, "DEP_FAILED");
+        }
+        assert_eq!(response.results[1].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
+        assert_eq!(response.results[4].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_accounting(&response, 5);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_preserves_cross_depth_results_and_releases_all_active_depths() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![
+            op("a", &[]), op("b", &[]), op("c", &["a"]), op("d", &["c"]),
+        ], 2);
+        let context = ExecutionContext::background();
+        let usage = Rc::new(Usage::default());
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |op| {
+            let reservation = Reservation::enter(&usage, &op.id);
+            async move {
+                let _reservation = reservation;
+                if op.id != "a" { pending::<()>().await; }
+                Ok(op.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*usage.created.borrow(), ["a", "b", "c"]);
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(response.results[0].status, OperationResultStatus::Success);
+        for index in [1, 2] {
+            let error = response.results[index].error.as_ref().unwrap();
+            assert_eq!(error.code, "BATCH_OUTCOME_UNKNOWN");
+            assert_eq!(error.retry_after_ms, None);
+        }
+        assert_eq!(response.results[3].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(usage.active.get(), 0);
+        assert_eq!(usage.peak.get(), 2);
+        assert_accounting(&response, 4);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn a_dependent_failure_stops_new_work_but_drains_a_slower_root() {
+        let executor = BatchExecutor::new();
+        let mut request = request(vec![
+            op("a", &[]), op("b", &[]), op("c", &["a"]),
+            op("d", &["c"]), op("e", &["b"]),
+        ], 2);
+        request.options.stop_on_first_error = true;
+        let slow = Gate::default();
+        let calls = RefCell::new(Vec::new());
+        let mut batch = Box::pin(executor.execute_async(&request, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            let slow = &slow;
+            async move {
+                if op.id == "b" { slow.wait().await; }
+                if op.id == "c" { Err(failure()) } else { Ok(op.input.clone()) }
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*calls.borrow(), ["a", "b", "c"]);
+        slow.release();
+        let response = batch.await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b", "c"]);
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!((response.completed, response.failed, response.skipped), (2, 1, 2));
+        assert_eq!(response.results[2].error.as_ref().unwrap().retry_after_ms, Some(17));
+        for index in [3, 4] {
+            assert_eq!(response.results[index].error.as_ref().unwrap().code, "BATCH_ABORTED");
+        }
+        assert_accounting(&response, 5);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn the_ready_frontier_preserves_adaptive_order_and_the_global_bound() {
+        let executor = BatchExecutor::new();
+        let mut request = request(vec![
+            op("a", &[]), op("b", &[]), op("c", &["b"]), op("d", &["b"]),
+        ], 2);
+        request.options.scheduler.mode = BatchSchedulerMode::Adaptive;
+        request.operations[3].scheduler.priority = BatchOperationPriority::Critical;
+        let slow = Gate::default();
+        let usage = Rc::new(Usage::default());
+        let mut batch = Box::pin(executor.execute_async(&request, |op| {
+            let reservation = Reservation::enter(&usage, &op.id);
+            let slow = &slow;
+            async move {
+                let _reservation = reservation;
+                if op.id == "a" { slow.wait().await; }
+                Ok(op.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*usage.created.borrow(), ["a", "b", "d", "c"]);
+        assert_eq!(usage.peak.get(), 2);
+        slow.release();
+        let response = batch.await.unwrap();
+        assert_eq!(response.status, BatchStatus::Success);
+        assert!(response.schedule_report.is_some());
+        assert_accounting(&response, 4);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn long_failure_chains_propagate_iteratively_and_keep_cancellation_responsive() {
+        let executor = BatchExecutor::new();
+        let mut operations = vec![op("a", &[]), op("b", &[])];
+        let mut parent = "a".to_owned();
+        for index in 0..1024 {
+            let id = format!("n-{index:04}");
+            operations.push(op(&id, &[&parent]));
+            parent = id;
+        }
+        let request = request(operations, 2);
+        let context = ExecutionContext::background();
+        let calls = RefCell::new(Vec::new());
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            async move {
+                if op.id == "a" { Err(failure()) } else {
+                    pending::<()>().await;
+                    Ok(json!(null))
+                }
+            }
+        }));
+        // Bounded manual polling crosses cooperative yields, never releases b,
+        // and does not use sleep-based timing to infer failure propagation.
+        for _ in 0..64 {
+            assert!(poll!(batch.as_mut()).is_pending());
+        }
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b"]);
+        for result in &response.results[2..] {
+            assert_eq!(result.status, OperationResultStatus::Skipped);
+            assert_eq!(result.error.as_ref().unwrap().code, "DEP_FAILED");
+        }
+        assert_eq!(response.failed, 2);
+        assert_accounting(&response, 1026);
     }
 }
