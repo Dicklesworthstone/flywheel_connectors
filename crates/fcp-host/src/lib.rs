@@ -17,6 +17,7 @@
 mod admin_state;
 mod agent_api;
 mod batch;
+mod batch_async;
 mod budget;
 mod cancellation;
 mod credentials;
