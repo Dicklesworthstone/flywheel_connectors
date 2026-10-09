@@ -24,7 +24,11 @@ use super::{MESH_PEERS_FILE_ENV, MeshRoutingSettings, unix_now_ms};
 use crate::mesh_replay::companion;
 use crate::{HostError, HostResult};
 
+mod peer_authority;
 mod reload;
+
+use peer_authority::PeerContinuity;
+pub(super) use peer_authority::PeerSnapshot;
 
 /// Independently pinned identity of an owner-signed mesh directory.
 pub const MESH_DIRECTORY_ID_ENV: &str = "FCP_HOST_MESH_ID";
@@ -106,6 +110,20 @@ impl DirectoryGuard {
         &self,
     ) -> Result<Arc<fcp_mesh::invoke_route::MeshPeerDirectory>, MeshForwardError> {
         self.state.snapshot()
+    }
+
+    pub(super) fn peer_snapshot(
+        &self,
+        node_id: &fcp_core::TailscaleNodeId,
+    ) -> Result<PeerSnapshot, MeshForwardError> {
+        self.state.peer_snapshot(node_id)
+    }
+
+    pub(super) fn check_peer_snapshot(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<(), MeshForwardError> {
+        self.state.check_peer_snapshot(snapshot)
     }
 }
 

@@ -20,9 +20,19 @@ pub(super) struct ReloadSource {
 
 struct Publication {
     directory: Arc<MeshPeerDirectory>,
+    continuity: PeerContinuity,
     checkpoint: MeshPeerDirectoryCheckpoint,
     validity: MembershipValidity,
     failure: Option<&'static str>,
+}
+
+impl Publication {
+    fn check(&self) -> Result<(), MeshForwardError> {
+        if let Some(reason) = self.failure {
+            return Err(unavailable(reason));
+        }
+        self.validity.check_at(unix_now_ms(), Instant::now())
+    }
 }
 
 pub(super) struct LiveMembership {
@@ -37,6 +47,7 @@ impl LiveMembership {
     ) -> Self {
         Self {
             publication: RwLock::new(Publication {
+                continuity: PeerContinuity::new(&directory),
                 directory: Arc::new(directory),
                 checkpoint,
                 validity,
@@ -47,11 +58,28 @@ impl LiveMembership {
 
     pub(super) fn snapshot(&self) -> Result<Arc<MeshPeerDirectory>, MeshForwardError> {
         let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
-        if let Some(reason) = current.failure {
-            return Err(unavailable(reason));
-        }
-        current.validity.check_at(unix_now_ms(), Instant::now())?;
+        current.check()?;
         Ok(Arc::clone(&current.directory))
+    }
+
+    pub(super) fn peer_snapshot(
+        &self,
+        node_id: &TailscaleNodeId,
+    ) -> Result<PeerSnapshot, MeshForwardError> {
+        let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
+        current.check()?;
+        // Capture keys and their continuity epoch under the same read lock.
+        current.continuity.snapshot(Arc::clone(&current.directory), node_id)
+    }
+
+    pub(super) fn check_peer_snapshot(
+        &self,
+        snapshot: &PeerSnapshot,
+    ) -> Result<(), MeshForwardError> {
+        let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
+        // Preserved peer authority never bypasses expiry or a storage/source fence.
+        current.check()?;
+        current.continuity.check(snapshot)
     }
 
     fn refuse(&self, reason: &'static str) {
@@ -222,13 +250,30 @@ impl Refresher {
             .map_err(|error| invalid(&error.to_string()))?;
         let generation = checkpoint.generation;
         let peer_count = directory.len();
-        *membership.publication.write()
-            .map_err(|_| invalid("membership publication is poisoned"))? = Publication {
-            directory,
-            checkpoint,
-            validity,
-            failure: None,
-        };
+        {
+            let mut current = membership.publication.write()
+                .map_err(|_| invalid("membership publication is poisoned"))?;
+            // Publish the successor epochs together with the durable directory.
+            // No request sees a new key with an old epoch or an uncommitted peer.
+            let published_at = unix_now_ms();
+            let published_now = Instant::now();
+            validity.check_at(published_at, published_now)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let continuity = if current.validity.check_at(published_at, published_now).is_ok() {
+                current.continuity.successor(&directory)
+            } else {
+                // A renewal after an authority gap admits new calls, but must
+                // not revive snapshots held before expiration was observed.
+                PeerContinuity::new(&directory)
+            };
+            *current = Publication {
+                directory,
+                continuity,
+                checkpoint,
+                validity,
+                failure: None,
+            };
+        }
         self.last_observed_ms = committed_at;
         self.storage_failed = false;
         tracing::info!(
@@ -566,10 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_change_fences_old_snapshots_even_when_a_removed_peer_is_readded() {
+    fn peer_authority_fences_old_snapshots_even_when_a_removed_peer_is_readded() {
         let mut fixture = Fixture::new();
         let router = fixture.router();
-        let snapshot = router.trusted_directory().unwrap();
+        let snapshot = router.trusted_peer(&TailscaleNodeId::new("peer")).unwrap();
         let original_peers = fixture.payload.peers.clone();
         fixture.payload.generation = 2;
         fixture.payload.peers.truncate(1);
@@ -579,7 +624,7 @@ mod tests {
         fixture.payload.peers = original_peers;
         fixture.write_source();
         fixture.refresh().unwrap();
-        assert!(router.ensure_current_directory(&snapshot).is_err());
+        assert!(router.ensure_current_peer(&snapshot).is_err());
         assert_eq!(router.directory().len(), 1);
     }
 
@@ -726,6 +771,239 @@ mod tests {
         assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
         drop(router);
         drop(fixture);
+    }
+
+    mod continuity {
+        use std::future::Future;
+        use std::io::{BufRead, BufReader};
+        use std::task::{Context, Waker};
+
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
+        use crate::mesh_routing::{MeshForwardFailure, MeshForwardUsage};
+
+        use super::*;
+
+        fn publish(fixture: &mut Fixture) {
+            fixture.payload.generation += 1;
+            fixture.write_source();
+            fixture.refresh().unwrap();
+        }
+
+        fn add_other_peer(fixture: &mut Fixture) {
+            let key = Ed25519SigningKey::from_bytes(&[35; 32]).unwrap();
+            fixture.payload.peers.push(MeshPeerConfig {
+                node_id: "other".to_owned(),
+                endpoint: "http://127.0.0.1:19003".to_owned(),
+                public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+            });
+        }
+
+        #[test]
+        fn queued_admission_survives_published_renewal_and_peer_join() {
+            for join in [false, true] {
+                let mut fixture = Fixture::new();
+                let router = fixture.router();
+                let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+                let envelope = fixture.envelope(&key);
+                let before = router.trusted_directory().unwrap();
+                let journal = router.durable_replay.as_ref().unwrap().lock().unwrap();
+                let mut pending = Box::pin(router.accept_inbound_async(&envelope));
+                assert!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                fixture.payload.expires_at_ms += 60_000;
+                if join {
+                    add_other_peer(&mut fixture);
+                }
+                publish(&mut fixture);
+                assert!(!Arc::ptr_eq(&before, &router.trusted_directory().unwrap()));
+                drop(journal);
+                fcp_async_core::runtime::block_on_sync(
+                    fcp_async_core::time::timeout(Duration::from_secs(5), pending),
+                ).unwrap().unwrap().unwrap();
+                assert!(matches!(
+                    router.accept_inbound(&envelope),
+                    Err(MeshForwardError::Replayed { .. }),
+                ), "successful continuity must not reset nonce history");
+            }
+        }
+
+        #[test]
+        fn renewal_after_expiration_does_not_revive_old_peer_snapshots() {
+            for expiration in ["observed", "wall_clock", "monotonic"] {
+                let mut fixture = Fixture::new();
+                let router = fixture.router();
+                let node = TailscaleNodeId::new("peer");
+                let old = router.trusted_peer(&node).unwrap();
+                {
+                    let mut current = fixture.membership.publication.write().unwrap();
+                    match expiration {
+                        "observed" => current.validity.expired.store(true, Ordering::Release),
+                        "wall_clock" => current.validity.expires_at_ms = 0,
+                        _ => current.validity.deadline = Instant::now(),
+                    }
+                }
+                // Do not check the old snapshot before publication: the writer
+                // must notice an expiry gap even when no request latched it.
+                fixture.payload.expires_at_ms += 60_000;
+                publish(&mut fixture);
+                assert!(router.ensure_current_peer(&old).is_err(),
+                    "{expiration}: an authority gap breaks continuity");
+                let fresh = router.trusted_peer(&node).unwrap();
+                router.ensure_current_peer(&fresh).unwrap();
+            }
+        }
+
+        #[test]
+        fn source_and_checkpoint_fences_are_not_bypassed_by_peer_continuity() {
+            let mut fixture = Fixture::new();
+            let router = fixture.router();
+            let node = TailscaleNodeId::new("peer");
+            let snapshot = router.trusted_peer(&node).unwrap();
+            for reason in ["signed_source_rejected", "checkpoint_commit_in_progress"] {
+                fixture.membership.refuse(reason);
+                assert!(router.ensure_current_peer(&snapshot).is_err());
+                assert!(router.trusted_peer(&node).is_err());
+                // Use the real same-generation revalidation to recover a
+                // transient source fence, without creating a new authority.
+                fixture.refresh().unwrap();
+                router.ensure_current_peer(&snapshot).unwrap();
+            }
+            // The terminal storage-failure state must refuse preserved authority.
+            fixture.refresher.storage_failed = true;
+            fixture.membership.refuse("checkpoint_failure_requires_restart");
+            fixture.payload.expires_at_ms += 60_000;
+            assert!(fixture.refresh().is_err());
+            assert!(router.ensure_current_peer(&snapshot).is_err());
+        }
+
+        // Receive a complete signed invoke before publishing changes, then
+        // return a reply signed by the original executor. Every I/O is bounded.
+        // This tests the actual forwarding path, not just an epoch comparison.
+        fn forward_across_update(change: fn(&mut Fixture)) -> Result<MeshForwardReply, MeshForwardFailure> {
+            let mut fixture = Fixture::new();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            fixture.payload.peers[1].endpoint = format!("http://{}", listener.local_addr().unwrap());
+            publish(&mut fixture);
+            let router = fixture.router();
+            let server = std::thread::spawn(move || {
+                let start = Instant::now();
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(start.elapsed() < Duration::from_secs(5), "forward did not connect");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let envelope = {
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line, "POST /rpc/mesh/forward HTTP/1.1\r\n");
+                    let mut length = None;
+                    let mut header_bytes = line.len();
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        header_bytes += line.len();
+                        assert!(!line.is_empty() && header_bytes <= 8192);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let length = length.unwrap();
+                    assert!(length <= 8192);
+                    let mut bytes = vec![0; length];
+                    reader.read_exact(&mut bytes).unwrap();
+                    serde_json::from_slice::<MeshForwardEnvelope>(&bytes).unwrap()
+                };
+                assert!(matches!(&envelope.body, MeshForwardBody::Invoke { .. }));
+                change(&mut fixture);
+                publish(&mut fixture);
+                let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+                let reply = MeshForwardReply::sign(
+                    &key,
+                    TailscaleNodeId::new("peer"),
+                    &envelope,
+                    200,
+                    "{\"committed\":true}".to_owned(),
+                );
+                let body = serde_json::to_vec(&reply).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(&body).unwrap();
+                fixture
+            });
+            let result = fcp_async_core::runtime::block_on_sync(router.forward(
+                &TailscaleNodeId::new("peer"),
+                MeshForwardBody::Invoke {
+                    request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
+                    asserted_principal: None,
+                },
+            )).unwrap();
+            let fixture = server.join().unwrap();
+            assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+            drop(router);
+            drop(fixture);
+            result
+        }
+
+        #[test]
+        fn delivered_reply_survives_renewal_and_unrelated_peer_churn() {
+            fn renew(fixture: &mut Fixture) {
+                fixture.payload.expires_at_ms += 60_000;
+            }
+            fn other_churn(fixture: &mut Fixture) {
+                add_other_peer(fixture);
+                publish(fixture);
+                let key = Ed25519SigningKey::from_bytes(&[36; 32]).unwrap();
+                fixture.payload.peers[2].public_key_hex = hex::encode(key.verifying_key().to_bytes());
+                fixture.payload.peers[2].endpoint = "http://127.0.0.1:19004".to_owned();
+                publish(fixture);
+                fixture.payload.peers.truncate(2);
+            }
+            for change in [renew as fn(&mut Fixture), add_other_peer, other_churn] {
+                let reply = forward_across_update(change).unwrap();
+                assert_eq!(reply.status, 200);
+                assert_eq!(reply.served_by.as_str(), "peer");
+                assert_eq!(reply.body_json, "{\"committed\":true}");
+            }
+        }
+
+        #[test]
+        fn delivered_reply_cannot_cross_target_removal_or_key_and_endpoint_aba() {
+            fn remove(fixture: &mut Fixture) {
+                fixture.payload.peers.truncate(1);
+            }
+            fn rotate_and_restore(fixture: &mut Fixture) {
+                let original = fixture.payload.peers[1].public_key_hex.clone();
+                let replacement = Ed25519SigningKey::from_bytes(&[37; 32]).unwrap();
+                fixture.payload.peers[1].public_key_hex = hex::encode(replacement.verifying_key().to_bytes());
+                publish(fixture);
+                fixture.payload.peers[1].public_key_hex = original;
+            }
+            fn move_endpoint_and_restore(fixture: &mut Fixture) {
+                let original = fixture.payload.peers[1].endpoint.clone();
+                fixture.payload.peers[1].endpoint = "http://127.0.0.1:19006".to_owned();
+                publish(fixture);
+                fixture.payload.peers[1].endpoint = original;
+            }
+            for change in [
+                remove as fn(&mut Fixture), rotate_and_restore, move_endpoint_and_restore,
+            ] {
+                let error = forward_across_update(change).unwrap_err();
+                assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
+                assert!(!error.safe_to_retry(), "a delivered write must never fan out");
+            }
+        }
     }
 
     #[test]

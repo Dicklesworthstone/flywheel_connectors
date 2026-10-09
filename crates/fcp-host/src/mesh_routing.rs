@@ -28,8 +28,11 @@
 //! File-backed signed membership hot-reloads complete peer snapshots, including
 //! additions, removals, key rotations, and endpoint changes. Checkpoint commits
 //! precede publication; replay journals and resource reservations are not reset.
-//! A request crossing a membership generation change is conservatively refused.
-//! Once network delivery may have occurred, that refusal is never retry-safe.
+//! In-flight calls retain authority across published renewals and unrelated peer
+//! changes. Removing their peer or changing its key/endpoint fences the call,
+//! including remove/re-add and rotate/restore sequences. Once delivery may have
+//! occurred, an authority failure is never retry-safe. Expiration and checkpoint
+//! publication/storage fences still apply to every request.
 //!
 //! Configuration (all three are required together; a partial configuration
 //! is a startup error rather than a silent single-host fallback):
@@ -84,7 +87,7 @@ pub use admission::{
     MESH_FORWARD_MAX_IN_FLIGHT_ENV, MESH_FORWARD_MAX_PER_PEER_ENV,
     MESH_FORWARD_MAX_REQUEST_BYTES_ENV, MeshForwardLimits, MeshForwardUsage,
 };
-use directory::{DIRECTORY_ENV_KEYS, DirectoryGuard};
+use directory::{DIRECTORY_ENV_KEYS, DirectoryGuard, PeerSnapshot};
 pub use directory::{
     MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
 };
@@ -551,6 +554,20 @@ impl MeshRouter {
         }
     }
 
+    fn trusted_peer(&self, node_id: &TailscaleNodeId) -> Result<PeerSnapshot, MeshForwardError> {
+        match &self.membership {
+            Some(membership) => membership.peer_snapshot(node_id),
+            None => PeerSnapshot::unversioned(Arc::clone(&self.directory), node_id),
+        }
+    }
+
+    fn ensure_current_peer(&self, snapshot: &PeerSnapshot) -> Result<(), MeshForwardError> {
+        match &self.membership {
+            Some(membership) => membership.check_peer_snapshot(snapshot),
+            None => self.ensure_current_directory(snapshot.directory()),
+        }
+    }
+
     fn ensure_current_directory(
         &self,
         snapshot: &Arc<MeshPeerDirectory>,
@@ -568,12 +585,12 @@ impl MeshRouter {
     fn finish_inbound_admission(
         &self,
         envelope: &MeshForwardEnvelope,
-        snapshot: &Arc<MeshPeerDirectory>,
+        snapshot: &PeerSnapshot,
     ) -> Result<(), MeshForwardError> {
-        // Recheck after journal I/O without undoing a consumed nonce. Pointer
-        // identity also fences removal followed by re-addition of the same key.
-        envelope.verify(snapshot, unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
-        self.ensure_current_directory(snapshot)
+        // Recheck after journal I/O without undoing a consumed nonce. An
+        // unrelated directory update is not a revocation of this origin.
+        envelope.verify(snapshot.directory(), unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
+        self.ensure_current_peer(snapshot)
     }
 
     /// Effective outbound resource ceilings.
@@ -645,8 +662,8 @@ impl MeshRouter {
             let mut replay = replay
                 .lock()
                 .map_err(|_| replay_unavailable("state_poisoned"))?;
-            let snapshot = self.trusted_directory()?;
-            replay.accept(envelope, &snapshot, unix_now_ms())?;
+            let snapshot = self.trusted_peer(&envelope.origin_node)?;
+            replay.accept(envelope, snapshot.directory(), unix_now_ms())?;
             return self.finish_inbound_admission(envelope, &snapshot);
         }
         let mut replay = self
@@ -654,8 +671,8 @@ impl MeshRouter {
             .lock()
             .map_err(|_| replay_unavailable("state_poisoned"))?;
         let now_ms = unix_now_ms();
-        let snapshot = self.trusted_directory()?;
-        envelope.verify(&snapshot, now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
+        let snapshot = self.trusted_peer(&envelope.origin_node)?;
+        envelope.verify(snapshot.directory(), now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
         replay.check_and_record(envelope, now_ms)?;
         self.finish_inbound_admission(envelope, &snapshot)
     }
@@ -678,10 +695,10 @@ impl MeshRouter {
     ) -> Result<(), MeshForwardError> {
         self.ensure_membership_valid()?;
         if let Some(worker) = &self.inbound_worker {
-            let snapshot = self.trusted_directory()?;
+            let snapshot = self.trusted_peer(&envelope.origin_node)?;
             let identity = VerifiedMeshReplayNonce::verify(
                 envelope,
-                &snapshot,
+                snapshot.directory(),
                 unix_now_ms(),
                 DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
             )?;
@@ -731,12 +748,12 @@ impl MeshRouter {
         body: MeshForwardBody,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = target.as_str().to_owned();
-        let snapshot = self.trusted_directory()
+        let snapshot = self.trusted_peer(target)
             .map_err(|error| MeshForwardFailure::NotDelivered {
                 peer: peer_label.clone(),
                 detail: error.to_string(),
             })?;
-        let Some(peer) = snapshot.peer(target) else {
+        let Some(peer) = snapshot.directory().peer(target) else {
             return Err(MeshForwardFailure::NotDelivered {
                 peer: peer_label,
                 detail: "peer is not in the local mesh directory".to_owned(),
@@ -770,12 +787,12 @@ impl MeshRouter {
         peer: &MeshPeer,
         payload: Vec<u8>,
         envelope: &MeshForwardEnvelope,
-        snapshot: &Arc<MeshPeerDirectory>,
+        snapshot: &PeerSnapshot,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = peer.node_id.as_str().to_owned();
         // Recheck after signing, serialization, and resource admission, before
-        // constructing network work. No expired directory may initiate a send.
-        self.ensure_current_directory(snapshot)
+        // constructing network work. No expired or revoked peer may initiate a send.
+        self.ensure_current_peer(snapshot)
             .map_err(|error| MeshForwardFailure::NotDelivered {
                 peer: peer_label.clone(),
                 detail: error.to_string(),
@@ -815,14 +832,15 @@ impl MeshRouter {
                 },
             })?;
         reply
-            .verify_for(envelope, snapshot)
+            .verify_for(envelope, snapshot.directory())
             .map_err(|error| MeshForwardFailure::InvalidReply {
                 peer: peer_label.clone(),
                 error,
             })?;
-        // A request may already have executed when membership changes during I/O.
-        // Refuse the result without ever reclassifying it as safe to replay.
-        self.ensure_current_directory(snapshot)
+        // A request may already have executed when this peer's authority changes.
+        // Renewals and edits to other peers do not discard its authenticated result.
+        // An actual revocation still never makes a delivered request safe to replay.
+        self.ensure_current_peer(snapshot)
             .map_err(|error| MeshForwardFailure::OutcomeUnknown {
                 peer: peer_label,
                 detail: error.to_string(),

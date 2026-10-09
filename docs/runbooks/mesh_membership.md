@@ -163,16 +163,32 @@ full filesystem control from rolling back both state and its marker.
 A running router enforces both wall-clock expiration and a monotonic deadline.
 Once expiry is observed, clock rollback cannot revive that directory. It refuses
 new inbound admission and outbound forwarding, withdraws advertised connector
-inventory, and stops returning cached peer inventories. It rechecks the exact
-membership snapshot after inbound queue/sync waits and after discovery/reply waits.
+inventory, and stops returning cached peer inventories. Inbound admission and
+outbound replies recheck the particular peer's authority after waits. Discovery
+still requires the complete directory snapshot to remain current.
 
-Requests crossing any published generation change are conservatively refused,
-even when the new generation only renews validity. This prevents an in-flight
-request from surviving a remove-and-readd sequence unnoticed. A queued inbound
-request may consume its nonce without dispatch; the nonce is never rolled back.
-Expiration or a generation change before send is `NotDelivered`. After delivery
-may have occurred, refusal is `OutcomeUnknown` (or another non-retryable transport
-or verification failure), never evidence that another peer may safely execute the
+In-flight calls can survive a published validity renewal or a change to another
+peer when their own peer's node id, verifying key, and endpoint remain continuously
+authorized. A process-local authority epoch is preserved for each unchanged peer
+and published atomically with the durably committed directory. This does not
+re-elect an in-flight call's executor or relax capability, zone, or lease gates.
+
+Removing the call's peer or changing its key or endpoint breaks that continuity.
+Restoring identical values in a later generation does not revive an old request:
+remove-and-readd and rotate-and-restore sequences receive a new epoch. Renewing
+after the old membership expired also starts fresh epochs, even for unchanged
+peers. New calls may proceed after renewal; pre-expiration calls remain fenced.
+
+Current expiration, rejected-source, checkpoint-commit, and storage-failure fences
+still apply. A call that completes its check during the short checkpoint commit
+fence can still be refused; this is not a guarantee of zero failures during a
+reload. Unrelated completed updates, however, no longer discard an otherwise
+valid authenticated result. A queued inbound request may consume its nonce
+without dispatch; the nonce is never rolled back.
+
+An authority failure before send is `NotDelivered`. After delivery may have
+occurred, refusal is `OutcomeUnknown` (or another non-retryable transport or
+verification failure), never evidence that another peer may safely execute the
 request. Already accepted operations are not retroactively cancelled; reply
 signing remains available to report known outcomes. This membership gate does not
 replace connector capability, zone, lease, or revocation enforcement.
@@ -195,6 +211,9 @@ Regression cases cover owner distrust, exact-byte tampering, scope/key binding,
 generation rollback and reuse, restart replay protection, persistent corruption
 and missing-state handling, unsafe inode rejection, exclusive activation, bounded
 input, monotonic expiry, live file renewal/rotation/removal, discovery cache
-identity changes, queued admission across revocation, and a delivered forward
-whose signed reply crosses a membership change. These are test cases in the
-repository, not a claim of successful execution or deployed mesh cutover.
+identity changes, queued admission across revocation and harmless renewal,
+peer-specific remove/readd and key/endpoint round trips, and delivered forwards
+whose signed replies cross membership changes. Unrelated published changes
+preserve valid replies; target revocation and expiration gaps do not. These are
+test cases in the repository, not a claim of successful execution or deployed
+mesh cutover.
