@@ -74,6 +74,34 @@ in-flight futures and does not start queued operations. It does not stop unrelat
 tasks a handler chose to spawn, terminate a provider operation, or produce a
 partial response to a caller that already discarded the batch future.
 
+## Inherited cancellation and request deadlines
+
+Use `BatchExecutor::execute_async_with_context(request, &context, handler)` when
+ the caller has an `fcp_async_core::ExecutionContext`. Do not wrap the whole batch
+in `context.run(...)` when partial results matter: that would discard the batch
+future and its accumulated response on cancellation or timeout.
+
+The context-aware executor observes the existing context's cancellation and
+remaining deadline at admission and while waiting for active operations. The
+earlier of the context deadline and the batch budget wins. It never renews either
+deadline and never cancels the caller's shared context itself. Cancellation from
+a parent context reaches a batch using its inherited child context. Authorization
+of a user-requested cancellation remains the caller's responsibility; this API
+does not expose an unauthenticated cancellation endpoint.
+
+Cancellation returns an `Aborted` response with all results already observed.
+Never-admitted work is skipped with `BATCH_CANCELLED`; unresolved admitted work
+is an error with `BATCH_OUTCOME_UNKNOWN` and no retry hint. Context deadline
+expiration uses the existing timeout classification. Cancellation takes priority
+when both are observed together and also interrupts stop-on-first-error draining.
+This is a bounded local stop, not an acknowledgment that the provider rolled back
+or even received a cancellation request.
+
+Both async APIs yield periodically during admission, dependency-skip processing,
+and completion handling, so ready-heavy batches do not monopolize a local
+executor and prevent its cancellation tasks from running. No additional worker
+or detached task is created. These yield points cannot preempt a blocking handler.
+
 ## Focused regression command
 
 ```sh
@@ -84,3 +112,10 @@ The tests use controlled futures to check real overlap and slot refill, tier
 ordering, failure propagation, stop-and-drain behavior, timeout accounting,
 whole-batch rejection, adaptive planning, non-Send borrowing, and drop cleanup.
 Timing-based deadline cases are bounded separately from the overlap assertions.
+Context regressions additionally cover pre-cancellation and pre-expiration,
+partial-response retention, inherited cancellation, competing deadlines, draining
+interruption, cancellation inside a handler factory, and ready-heavy fairness.
+A cross-component TCP case runs batch handlers through `MeshRouter::forward` to
+two signing peers. Neither peer replies before both authenticated invokes arrive,
+so sequential execution cannot pass the bounded barrier. This exercises the mesh
+transport, not a provider operation or a newly deployed host HTTP batch route.

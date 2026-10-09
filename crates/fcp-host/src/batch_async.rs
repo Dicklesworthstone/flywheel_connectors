@@ -5,9 +5,11 @@
 //! even when independent operations finish out of order.
 
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use fcp_async_core::{AsyncError, ExecutionContext};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
@@ -54,6 +56,57 @@ impl BatchExecutor {
     pub async fn execute_async<'a, F, Fut>(
         &self,
         request: &'a BatchInvokeRequest,
+        handler: F,
+    ) -> HostResult<BatchInvokeResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
+    {
+        self.execute_async_inner(request, None, handler).await
+    }
+
+    /// Execute a batch under an existing FCP cancellation/deadline context.
+    ///
+    /// Unlike wrapping the entire batch in `context.run(...)`, this method
+    /// returns the accumulated per-operation results when the context stops it.
+    /// The earlier of the context deadline and the batch budget wins; neither
+    /// is renewed while waiting. Cancellation takes precedence when both are
+    /// observed together, including before admission and during error draining.
+    ///
+    /// Cancellation skips never-admitted work with `BATCH_CANCELLED` and drops
+    /// unresolved admitted futures, reporting those as `BATCH_OUTCOME_UNKNOWN`.
+    /// Known results remain intact. This does not acknowledge cancellation of
+    /// external side effects or authorize retries. It never cancels or extends
+    /// the supplied context itself. Authorize user cancellation before triggering
+    /// that context, just as for the host's existing cancellation controller.
+    ///
+    /// Ready-heavy batches periodically yield so a cancellation task on the same
+    /// executor can run. Blocking handler factories, polls, and destructors still
+    /// cannot be preempted. Other semantics match [`Self::execute_async`].
+    ///
+    /// # Errors
+    /// Returns validation/planning failures before any handler is invoked.
+    /// Cancellation, timeout, and operation failures are represented in the batch
+    /// response rather than discarding partial results in a top-level error.
+    #[allow(clippy::future_not_send)]
+    pub async fn execute_async_with_context<'a, F, Fut>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: &ExecutionContext,
+        handler: F,
+    ) -> HostResult<BatchInvokeResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
+    {
+        self.execute_async_inner(request, Some(context), handler).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn execute_async_inner<'a, F, Fut>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: Option<&ExecutionContext>,
         mut handler: F,
     ) -> HostResult<BatchInvokeResponse>
     where
@@ -68,17 +121,18 @@ impl BatchExecutor {
         let limit = usize::try_from(request.options.max_parallelism)
             .unwrap_or(usize::MAX)
             .min(request.operations.len());
+        let mut cooperative_steps = 0_u8;
 
         'tiers: for tier in &plan.tiers {
             let mut waiting = tier.operation_ids.iter();
             let mut active = FuturesUnordered::new();
             loop {
-                run.check_deadline();
-                if run.timed_out() {
+                run.check_limits(context);
+                if run.interrupted() {
                     break 'tiers;
                 }
                 while run.halt.is_none() && active.len() < limit {
-                    run.check_deadline();
+                    run.check_limits(context);
                     if run.halt.is_some() {
                         break;
                     }
@@ -93,6 +147,7 @@ impl BatchExecutor {
                             "DEP_FAILED",
                             "dependency did not complete successfully",
                         ));
+                        cooperate(&mut cooperative_steps).await;
                         continue;
                     }
                     // A factory may perform work before returning its future.
@@ -101,30 +156,39 @@ impl BatchExecutor {
                     run.admitted_at[index] = Some(Instant::now());
                     let future = handler(operation);
                     active.push(async move { (index, future.await) });
+                    cooperate(&mut cooperative_steps).await;
                 }
-                run.check_deadline();
-                if run.timed_out() {
+                run.check_limits(context);
+                if run.interrupted() {
                     break 'tiers;
                 }
                 if active.is_empty() {
                     break;
                 }
-                if let Ok(Some((index, result))) = fcp_async_core::time::timeout(
-                    run.remaining().min(MAX_TIMER_WAIT),
+                let next = fcp_async_core::time::timeout(
+                    run.remaining(context).min(MAX_TIMER_WAIT),
                     active.next(),
-                )
-                .await
-                {
-                    run.record(index, result);
+                );
+                let result = match context {
+                    Some(context) => context.run(next).await.and_then(std::convert::identity),
+                    None => next.await,
+                };
+                match result {
+                    Ok(Some((index, result))) => run.record(index, result),
+                    Ok(None) => break,
+                    Err(AsyncError::Timeout { .. }) => {}
+                    Err(AsyncError::Cancelled) => run.halt = Some(Halt::Cancelled),
+                    Err(_) => run.halt = Some(Halt::RuntimeFailure),
                 }
                 // A timer expiration merely wakes the original budget check.
                 // It never restarts a handler or refreshes the batch deadline.
+                cooperate(&mut cooperative_steps).await;
             }
             if run.halt.is_some() {
                 break;
             }
         }
-        run.check_deadline();
+        run.check_limits(context);
         Ok(run.finish(report))
     }
 }
@@ -133,6 +197,28 @@ impl BatchExecutor {
 enum Halt {
     FirstError,
     Timeout,
+    Cancelled,
+    RuntimeFailure,
+}
+
+// One batch must not monopolize a local executor merely because all its
+// factories/futures are immediately ready. No detached task is needed to yield.
+async fn cooperate(steps: &mut u8) {
+    *steps += 1;
+    if *steps < 64 {
+        return;
+    }
+    *steps = 0;
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }).await;
 }
 
 struct BatchRun<'a> {
@@ -159,18 +245,25 @@ impl<'a> BatchRun<'a> {
         }
     }
 
-    fn remaining(&self) -> Duration {
-        self.timeout.saturating_sub(self.started_at.elapsed())
+    fn remaining(&self, context: Option<&ExecutionContext>) -> Duration {
+        let batch_remaining = self.timeout.saturating_sub(self.started_at.elapsed());
+        context.and_then(ExecutionContext::remaining_budget)
+            .map_or(batch_remaining, |remaining| remaining.min(batch_remaining))
     }
 
-    fn check_deadline(&mut self) {
-        if self.remaining().is_zero() {
+    fn check_limits(&mut self, context: Option<&ExecutionContext>) {
+        if matches!(self.halt, Some(Halt::Cancelled | Halt::RuntimeFailure)) {
+            return;
+        }
+        if context.is_some_and(ExecutionContext::is_cancelled) {
+            self.halt = Some(Halt::Cancelled);
+        } else if self.remaining(context).is_zero() {
             self.halt = Some(Halt::Timeout);
         }
     }
 
-    const fn timed_out(&self) -> bool {
-        matches!(self.halt, Some(Halt::Timeout))
+    const fn interrupted(&self) -> bool {
+        matches!(self.halt, Some(Halt::Timeout | Halt::Cancelled | Halt::RuntimeFailure))
     }
 
     fn dependencies_succeeded(&self, operation: &BatchOperation) -> bool {
@@ -203,6 +296,8 @@ impl<'a> BatchRun<'a> {
     fn finish(mut self, schedule_report: Option<BatchScheduleReport>) -> BatchInvokeResponse {
         let (skip_code, skip_message) = match self.halt {
             Some(Halt::Timeout) => ("BATCH_TIMEOUT", "batch timeout exceeded before admission"),
+            Some(Halt::Cancelled) => ("BATCH_CANCELLED", "batch context cancelled before admission"),
+            Some(Halt::RuntimeFailure) => ("BATCH_RUNTIME_ERROR", "batch runtime failed before admission"),
             _ => ("BATCH_ABORTED", "batch stopped before admission"),
         };
         let results: Vec<_> = self.request.operations.iter().enumerate().map(|(index, operation)| {
@@ -214,7 +309,7 @@ impl<'a> BatchRun<'a> {
                         output: None,
                         error: Some(operation_error(
                             "BATCH_OUTCOME_UNKNOWN",
-                            "batch deadline interrupted an admitted operation; side effects may have occurred; do not retry without reconciliation",
+                            "batch interrupted an admitted operation; side effects may have occurred; do not retry without reconciliation",
                         )),
                         duration_ms: elapsed_millis(started_at),
                     }

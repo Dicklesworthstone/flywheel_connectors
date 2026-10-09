@@ -364,3 +364,328 @@ async fn a_noncooperative_late_result_is_retained_without_admitting_the_next_ope
     assert_eq!(response.results[0].output, Some(json!({ "committed": true })));
     assert_eq!(response.results[1].error.as_ref().unwrap().code, "BATCH_TIMEOUT");
 }
+
+mod context {
+    use fcp_async_core::ExecutionContext;
+
+    use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn pre_cancelled_context_admits_nothing_and_wins_over_an_expired_budget() {
+        let executor = BatchExecutor::new();
+        let mut request = request(vec![op("a", &[]), op("b", &["a"])], 2);
+        request.options.timeout_ms = 0;
+        let context = ExecutionContext::request_scoped(Duration::ZERO);
+        context.cancel();
+        let called = Cell::new(false);
+        let response = executor.execute_async_with_context(&request, &context, |_| {
+            called.set(true);
+            ready(Ok(json!(true)))
+        }).await.unwrap();
+        assert!(!called.get());
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!(response.skipped, 2);
+        for result in &response.results {
+            assert_eq!(result.error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        }
+        assert_accounting(&response, 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn expired_context_admits_nothing_even_with_an_unlimited_batch_budget() {
+        let executor = BatchExecutor::new();
+        let mut request = request(vec![op("a", &[])], 1);
+        request.options.timeout_ms = u64::MAX;
+        let context = ExecutionContext::request_scoped(Duration::ZERO);
+        let called = Cell::new(false);
+        let response = executor.execute_async_with_context(&request, &context, |_| {
+            called.set(true);
+            ready(Ok(json!(true)))
+        }).await.unwrap();
+        assert!(!called.get());
+        assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_TIMEOUT");
+        assert!(!context.is_cancelled());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_returns_partial_results_and_drops_unresolved_futures() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![op("a", &[]), op("b", &[]), op("c", &["b"])], 1);
+        let context = ExecutionContext::background();
+        let usage = Rc::new(Usage::default());
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |op| {
+            let reservation = Reservation::enter(&usage, &op.id);
+            async move {
+                let _reservation = reservation;
+                if op.id != "a" { pending::<()>().await; }
+                Ok(op.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        assert_eq!(*usage.created.borrow(), ["a", "b"]);
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!(response.results[0].output, Some(json!({ "id": "a" })));
+        assert_eq!(response.results[1].status, OperationResultStatus::Error);
+        assert_eq!(response.results[1].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
+        assert_eq!(response.results[1].error.as_ref().unwrap().retry_after_ms, None);
+        assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
+        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(usage.active.get(), 0);
+        assert_accounting(&response, 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn the_earlier_deadline_wins_without_cancelling_the_callers_context() {
+        for context_first in [false, true] {
+            let executor = BatchExecutor::new();
+            let mut request = request(vec![op("a", &[]), op("b", &["a"])], 1);
+            request.options.timeout_ms = if context_first { 30_000 } else { 250 };
+            let context = ExecutionContext::request_scoped(Duration::from_millis(
+                if context_first { 250 } else { 30_000 },
+            ));
+            let usage = Rc::new(Usage::default());
+            let response = fcp_async_core::time::timeout(Duration::from_secs(5),
+                executor.execute_async_with_context(&request, &context, |op| {
+                    let reservation = Reservation::enter(&usage, &op.id);
+                    async move {
+                        let _reservation = reservation;
+                        pending::<()>().await;
+                        Ok(json!(null))
+                    }
+                }),
+            ).await.expect("the short deadline must win").unwrap();
+            assert_eq!(response.status, BatchStatus::Aborted);
+            assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
+            assert_eq!(response.results[1].error.as_ref().unwrap().code, "BATCH_TIMEOUT");
+            assert_eq!(usage.active.get(), 0);
+            assert!(!context.is_cancelled(), "a batch must not cancel sibling work");
+            if !context_first {
+                assert!(!context.remaining_budget().unwrap().is_zero());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn parent_context_cancellation_reaches_the_inherited_batch_context() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![op("a", &[])], 1);
+        let parent = ExecutionContext::background();
+        let child = parent.child();
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &child, |_| async {
+            pending::<()>().await;
+            Ok(json!(null))
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        parent.cancel();
+        let response = batch.await.unwrap();
+        assert!(child.is_cancelled());
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_interrupts_first_error_draining_without_erasing_the_provider_error() {
+        let executor = BatchExecutor::new();
+        let mut request = request(vec![op("a", &[]), op("b", &[]), op("c", &[])], 2);
+        request.options.stop_on_first_error = true;
+        let context = ExecutionContext::background();
+        let calls = RefCell::new(Vec::new());
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |op| {
+            calls.borrow_mut().push(op.id.clone());
+            async move {
+                if op.id == "a" { Err(failure()) } else {
+                    pending::<()>().await;
+                    Ok(json!(null))
+                }
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(*calls.borrow(), ["a", "b"]);
+        assert_eq!(response.results[0].error.as_ref().unwrap().code, "PROVIDER_ERROR");
+        assert_eq!(response.results[0].error.as_ref().unwrap().retry_after_ms, Some(17));
+        assert_eq!(response.results[1].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
+        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_accounting(&response, 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_in_a_factory_stops_the_next_admission_before_polling_the_first_future() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![op("a", &[]), op("b", &[]), op("c", &[])], 3);
+        let context = ExecutionContext::background();
+        let calls = Cell::new(0);
+        let polled = Cell::new(false);
+        let response = executor.execute_async_with_context(&request, &context, |_| {
+            calls.set(calls.get() + 1);
+            context.cancel();
+            let polled = &polled;
+            async move { polled.set(true); Ok(json!(true)) }
+        }).await.unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(!polled.get());
+        assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN",
+            "factory admission may itself have performed a side effect");
+        assert_eq!(response.skipped, 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn ready_heavy_work_yields_so_cancellation_on_the_same_executor_can_be_observed() {
+        let executor = BatchExecutor::new();
+        let request = request((0..128).map(|index| op(&format!("op-{index:03}"), &[])).collect(), 1);
+        let context = ExecutionContext::background();
+        let calls = Cell::new(0);
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |_| {
+            calls.set(calls.get() + 1);
+            ready(Ok(json!(true)))
+        }));
+        assert!(poll!(batch.as_mut()).is_pending(), "ready work must yield cooperatively");
+        assert!(calls.get() > 0 && calls.get() < 128);
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert!(response.completed > 0 && response.skipped > 0);
+        assert_accounting(&response, 128);
+    }
+}
+
+mod mesh {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    use fcp_core::TailscaleNodeId;
+    use fcp_crypto::ed25519::Ed25519SigningKey;
+    use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings, unix_now_ms};
+    use fcp_mesh::invoke_route::{
+        DEFAULT_MESH_FORWARD_MAX_SKEW_MS, MeshForwardBody, MeshForwardEnvelope,
+        MeshForwardReply, MeshPeerConfig, MeshPeerDirectory,
+    };
+
+    use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn independent_batch_handlers_forward_signed_invokes_to_two_real_tcp_peers_concurrently() {
+        let local_key = Ed25519SigningKey::from_bytes(&[71; 32]).unwrap();
+        let origin = MeshPeerConfig {
+            node_id: "entry".to_owned(),
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            public_key_hex: hex::encode(local_key.verifying_key().to_bytes()),
+        };
+        let (received_tx, received_rx) = mpsc::channel();
+        let mut peers = Vec::new();
+        let mut releases = Vec::new();
+        let mut servers = Vec::new();
+        for (node, seed) in [("peer-b", 72), ("peer-c", 73)] {
+            let key = Ed25519SigningKey::from_bytes(&[seed; 32]).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            peers.push(MeshPeerConfig {
+                node_id: node.to_owned(),
+                endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                public_key_hex: hex::encode(key.verifying_key().to_bytes()),
+            });
+            let directory = MeshPeerDirectory::from_configs(
+                TailscaleNodeId::new(node), std::slice::from_ref(&origin),
+            ).unwrap();
+            let received = received_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            servers.push(thread::spawn(move || {
+                let started = Instant::now();
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(started.elapsed() < Duration::from_secs(5), "invoke did not connect");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let envelope = {
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert_eq!(line, "POST /rpc/mesh/forward HTTP/1.1\r\n");
+                    let mut length = None;
+                    let mut header_bytes = line.len();
+                    loop {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                        header_bytes += line.len();
+                        assert!(!line.is_empty() && header_bytes <= 8192);
+                        if line == "\r\n" { break; }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                    let length = length.unwrap();
+                    assert!(length <= 8192);
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    serde_json::from_slice::<MeshForwardEnvelope>(&body).unwrap()
+                };
+                envelope.verify(&directory, unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS).unwrap();
+                assert!(matches!(&envelope.body, MeshForwardBody::Invoke { .. }));
+                received.send(node).unwrap();
+                // Neither peer responds until BOTH authenticated requests have
+                // arrived. A sequential executor cannot pass this bounded barrier.
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let reply = MeshForwardReply::sign(
+                    &key, TailscaleNodeId::new(node), &envelope, 200,
+                    json!({ "executor": node }).to_string(),
+                );
+                let body = serde_json::to_vec(&reply).unwrap();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(&body).unwrap();
+            }));
+        }
+        drop(received_tx);
+        let coordinator = thread::spawn(move || {
+            let first = received_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let second = received_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(first, second);
+            for release in releases { release.send(()).unwrap(); }
+        });
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("entry"),
+            signing_key: local_key,
+            peers_json: serde_json::to_string(&peers).unwrap(),
+            forward_timeout: Duration::from_secs(8),
+        }).unwrap();
+        let executor = BatchExecutor::new();
+        let request = request(vec![op("peer-c", &[]), op("peer-b", &[])], 2);
+        let response = executor.execute_async(&request, |op| {
+            let router = &router;
+            async move {
+                let reply = router.forward(&TailscaleNodeId::new(op.id.clone()), MeshForwardBody::Invoke {
+                    request_json: op.input.to_string(),
+                    asserted_principal: None,
+                }).await.map_err(|error| BatchOperationError {
+                    code: "MESH_FORWARD_FAILED".to_owned(),
+                    message: error.summary(),
+                    retry_after_ms: None,
+                })?;
+                Ok(serde_json::from_str(&reply.body_json).unwrap())
+            }
+        }).await;
+        coordinator.join().unwrap();
+        for server in servers { server.join().unwrap(); }
+        let response = response.unwrap();
+        assert_eq!(response.status, BatchStatus::Success);
+        assert_eq!(response.results[0].output, Some(json!({ "executor": "peer-c" })));
+        assert_eq!(response.results[1].output, Some(json!({ "executor": "peer-b" })));
+        assert_eq!(router.forward_usage().unwrap(), fcp_host::mesh_routing::MeshForwardUsage::default());
+        assert_accounting(&response, 2);
+    }
+}
