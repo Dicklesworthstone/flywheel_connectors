@@ -13,7 +13,7 @@ use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
 
 use super::{McpClient, transport};
-use crate::error::{McpBridgeError, McpBridgeResult};
+use crate::error::{McpBridgeError, McpBridgeResult, check_tool_outcome};
 use crate::types::JsonRpcRequest;
 
 mod discovery;
@@ -252,7 +252,13 @@ impl McpClient {
                         {
                             return AttemptOutcome::Terminal(error);
                         }
-                        AttemptOutcome::Success(value)
+                        // MCP can report a tool failure inside a successful
+                        // JSON-RPC result. Do not release a dependent workflow
+                        // or retry an already executed tool on that basis.
+                        match check_tool_outcome(method, value) {
+                            Ok(value) => AttemptOutcome::Success(value),
+                            Err(error) => AttemptOutcome::Terminal(error),
+                        }
                     }
                     Err(RpcFailure::SessionExpired) => {
                         self.invalidate_session(&session).await;
@@ -311,3 +317,6 @@ mod tests;
 
 #[cfg(test)]
 mod continuation_tests;
+
+#[cfg(test)]
+mod tool_outcome_tests;

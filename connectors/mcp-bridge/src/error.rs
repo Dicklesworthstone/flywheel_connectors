@@ -7,6 +7,10 @@ use fcp_prelude::FcpError;
 use fcp_sdk::ConnectorErrorMapping;
 use thiserror::Error;
 
+mod tool_execution;
+pub use tool_execution::ToolExecutionFailure;
+pub(crate) use tool_execution::check_tool_outcome;
+
 /// Result alias for MCP Bridge operations.
 pub type McpBridgeResult<T> = Result<T, McpBridgeError>;
 
@@ -24,6 +28,11 @@ pub enum McpBridgeError {
     /// MCP server returned a JSON-RPC error
     #[error("MCP server error ({code}): {message}")]
     McpError { code: i64, message: String },
+
+    /// The RPC succeeded, but the tool reported `isError: true`.
+    /// Kept distinct from a protocol error and never safe to replay by default.
+    #[error(transparent)]
+    ToolExecution(#[from] ToolExecutionFailure),
 
     /// Rate limited (429)
     #[error("Rate limited, retry after {retry_after_ms}ms")]
@@ -103,6 +112,7 @@ impl McpBridgeError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::ToolExecution(failure) => failure.to_fcp_error(),
             Self::Http(e) => FcpError::External {
                 service: "mcp-bridge".into(),
                 message: e.to_string(),
