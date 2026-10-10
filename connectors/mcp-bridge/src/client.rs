@@ -13,8 +13,10 @@ use tracing::{debug, info, instrument};
 
 use crate::{
     error::{McpBridgeError, McpBridgeResult},
-    types::{ApiErrorResponse, JsonRpcRequest, JsonRpcResponse},
+    types::{ApiErrorResponse, JsonRpcRequest},
 };
+
+mod transport;
 
 /// MCP server authentication.
 #[derive(Clone)]
@@ -73,6 +75,8 @@ impl McpClient {
     pub fn new(auth: McpAuth, base_url: &str) -> McpBridgeResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
+            // Redirecting a POST can replay a tool call or leak session headers.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("fcp-mcp-bridge/0.1.0 (FCP connector)")
             .build()?;
 
@@ -132,18 +136,21 @@ impl McpClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
 
-        let body = resp.text().await.unwrap_or_default();
+        let body = match transport::read_bounded(resp, 64 * 1024).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => "MCP HTTP error body unavailable or exceeds limit".to_owned(),
+        };
         let detail = serde_json::from_str::<ApiErrorResponse>(&body)
             .ok()
             .and_then(|e| e.message.or(e.error))
-            .unwrap_or_else(|| body.clone());
+            .unwrap_or(body);
 
         match status.as_u16() {
             401 => Err(McpBridgeError::Unauthorized),
             403 => Err(McpBridgeError::Forbidden),
             404 => Err(McpBridgeError::NotFound { resource: detail }),
             429 => Err(McpBridgeError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(60) * 1000,
+                retry_after_ms: retry_after.unwrap_or(60).saturating_mul(1000),
             }),
             code => Err(McpBridgeError::Api {
                 status_code: code,
@@ -152,13 +159,12 @@ impl McpClient {
         }
     }
 
-    /// Send a JSON-RPC request to the MCP server.
-    #[instrument(skip(self, params), fields(mcp_method))]
     /// Issue an MCP JSON-RPC call.
     ///
     /// Replay safety is derived from the MCP method: the discovery and read
     /// methods are pure reads, while `tools/call` invokes an arbitrary
     /// downstream tool whose effects this bridge cannot see (br-kxd3e).
+    #[instrument(skip(self, params), fields(mcp_method))]
     pub async fn rpc_call(
         &self,
         mcp_method: &str,
@@ -213,18 +219,8 @@ impl McpClient {
                         }
                     }
                     Err(error) if error.is_retryable() => {
-                        // br-kxd3e: `tools/call` forwards an ARBITRARY tool
-                        // invocation on a downstream MCP server. This bridge
-                        // cannot know what that tool does, so it cannot know
-                        // whether replaying it duplicates a side effect —
-                        // which makes fail-closed the only defensible default.
-                        // A rate limit is still replayable: it was refused
-                        // WITHOUT the downstream tool running. The discovery
-                        // and read methods pass `replay_safe`.
-                        //
-                        // The auth/session-expiry arm above is deliberately
-                        // ahead of this one and stays retryable: those failures
-                        // are rejected before the tool executes.
+                        // A tools/call can have arbitrary effects. Neither a
+                        // timeout nor a 5xx proves the tool did not execute.
                         let replayable = replay_safe || error.replay_is_safe();
                         let retry_after = error.retry_after();
                         AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
@@ -250,22 +246,46 @@ impl McpClient {
 
         let resp = req.send().await?;
         let status = resp.status();
-
         if !status.is_success() {
             return self.handle_http_error(status, resp).await;
         }
+        let session_id = resp.headers().get("Mcp-Session-Id").cloned();
+        transport::read_rpc_response(resp, request.id, |reply| {
+            self.send_server_reply(url, session_id.as_ref(), reply)
+        })
+        .await
+    }
 
-        let body = resp.text().await?;
-        let rpc_response: JsonRpcResponse = serde_json::from_str(&body)?;
-
-        if let Some(err) = rpc_response.error {
-            return Err(McpBridgeError::McpError {
-                code: err.code,
-                message: err.message,
-            });
+    /// Respond on the same endpoint without forwarding a server request to any
+    /// FCP tool, filesystem, model, or other ambient capability.
+    async fn send_server_reply(
+        &self,
+        url: &str,
+        session_id: Option<&reqwest::header::HeaderValue>,
+        reply: serde_json::Value,
+    ) -> McpBridgeResult<()> {
+        let mut request = self
+            .add_auth(self.client.post(url))
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&reply);
+        if let Some(session_id) = session_id {
+            request = request.header("Mcp-Session-Id", session_id);
         }
-
-        Ok(rpc_response.result.unwrap_or(serde_json::Value::Null))
+        let response = request.send().await.map_err(|_| {
+            transport::invalid_response(
+                "server-request reply failed; initiating call outcome is unknown",
+            )
+        })?;
+        let status = response.status();
+        // This is an auxiliary POST after the initiating call was accepted.
+        // Its failure must never trigger a replay of that original tool call.
+        if status != StatusCode::ACCEPTED {
+            return Err(transport::invalid_response(
+                "server-request reply was not accepted; initiating call outcome is unknown",
+            ));
+        }
+        Ok(())
     }
 
     fn should_retry_rpc_error(&self, error: &McpBridgeError, attempt: u32) -> bool {
