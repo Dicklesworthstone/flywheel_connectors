@@ -12,8 +12,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CapabilityGrant, CapabilityId, CapabilityToken, ConnectorId, EventCaps, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, InstanceId, OperationId, SessionId, ZoneId,
+    FcpResult, HandshakeRequest, HandshakeResponse, InstanceId, InvokeRequest, OperationId,
+    SessionId, ZoneId,
 };
+
+mod usage;
+pub use usage::StandaloneInvocation;
+use usage::UsageLedger;
 
 /// Negotiated capability authority for one standalone connector process.
 ///
@@ -39,6 +44,7 @@ struct Authority {
     verifier: CapabilityVerifier,
     zone: ZoneId,
     capabilities: BTreeSet<String>,
+    usage: UsageLedger,
 }
 
 impl StandaloneSession {
@@ -122,6 +128,7 @@ impl StandaloneSession {
             ),
             zone: request.zone,
             capabilities,
+            usage: UsageLedger::default(),
         });
         Ok(response)
     }
@@ -130,7 +137,9 @@ impl StandaloneSession {
     ///
     /// Resource URIs must be extracted from the actual operation input by the
     /// caller, never accepted as an alternate caller-supplied authorization list.
-    /// The witness can be required by the provider-dispatch function signature.
+    /// Also checks whether a signed call ceiling would allow another admission,
+    /// without spending or reserving it. Simulation may use this method; actual
+    /// provider execution must use [`Self::admit`] and its admission witness.
     ///
     /// # Errors
     /// Fails closed without a handshake, for a different target/zone, for an
@@ -163,7 +172,49 @@ impl StandaloneSession {
         if !authority.capabilities.contains(capability.as_str()) {
             return Err(denied("Required capability was not negotiated in this session"));
         }
-        authority.verifier.verify_bound(token, capability, operation, resource_uris)
+        let token = authority.verifier.verify_bound(token, capability, operation, resource_uris)?;
+        authority.usage.check(&token)?;
+        Ok(token)
+    }
+
+    /// Authorize and atomically charge one provider invocation.
+    ///
+    /// Consumes the signed `max_calls` allowance before dispatch and checks an
+    /// exact signed `idempotency_key` scope when present. Neither errors nor
+    /// dropped futures refund admissions. This is not result deduplication.
+    ///
+    /// At most 4096 finite grants are tracked per negotiated instance, without
+    /// eviction or wall-clock pruning. Full or poisoned accounting fails closed.
+    /// Invalidation discards accounting only together with the old instance
+    /// authority, whose tokens can no longer pass bound verification.
+    ///
+    /// Cumulative byte/credential accounting and mesh-wide admission, revocation,
+    /// holder-proof, approval and lease enforcement remain host responsibilities.
+    ///
+    /// # Errors
+    /// Rejects malformed requests, authorization failures, spent grants, reused
+    /// token IDs with different signed claims, and mismatched key scopes.
+    pub fn admit(
+        &self,
+        request: &InvokeRequest,
+        resource_uris: &[String],
+    ) -> FcpResult<StandaloneInvocation> {
+        if request.r#type != "invoke" || request.id.0.is_empty() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Admission requires an invoke request with a non-empty ID".into(),
+            });
+        }
+        request.validate_idempotency_key().map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid invocation idempotency key".into(),
+        })?;
+        let token = self.authorize(
+            &request.connector_id, &request.zone_id, &request.operation,
+            request.capability_token.clone(), resource_uris,
+        )?;
+        self.authority.as_ref().ok_or(FcpError::NotHandshaken)?
+            .usage.admit(token, request.idempotency_key.as_deref())
     }
 }
 
@@ -394,5 +445,78 @@ mod tests {
     fn manifest_hash_is_sha256_of_exact_utf8_bytes() {
         assert_eq!(manifest_hash("abc"), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_ne!(manifest_hash("abc"), manifest_hash("abc\n"));
+    }
+
+    fn limited_request(session: &StandaloneSession, key: &Ed25519SigningKey) -> InvokeRequest {
+        let constraints = CapabilityConstraints {
+            resource_allow: vec!["urn:fixture:allowed".into()],
+            max_calls: Some(1),
+            idempotency_key: Some("scoped-key".into()),
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        let raw = CapabilityTokenBuilder::new()
+            .capability_id(READ).zone_id("z:work").principal("user:test")
+            .operations(&[GET]).issuer("node:test")
+            .target_instance(session.instance_id().as_str()).token_id(b"admission-test")
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&cbor).unwrap().sign(key).unwrap();
+        InvokeRequest {
+            r#type: "invoke".into(), id: crate::RequestId::new("first"),
+            connector_id: ConnectorId::from_static("fcp.fixture"),
+            operation: OperationId::from_static(GET), zone_id: ZoneId::work(),
+            input: serde_json::json!({}), capability_token: CapabilityToken::from_raw(raw),
+            holder_proof: None, context: None, idempotency_key: Some("scoped-key".into()),
+            lease_seq: None, deadline_ms: None, correlation_id: None, provenance: None,
+            approval_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_admission_spends_once_despite_changed_request_ids() {
+        let (session, key) = established();
+        let mut request = limited_request(&session, &key);
+        for _ in 0..4 { authorize(&session, request.capability_token.clone()).unwrap(); }
+        drop(session.admit(&request, &["urn:fixture:allowed".into()]).unwrap());
+        request.id = crate::RequestId::new("second");
+        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        assert!(authorize(&session, request.capability_token).is_err());
+    }
+
+    #[test]
+    fn invalid_signature_cannot_allocate_or_spend_an_account() {
+        let (session, key) = established();
+        let foreign = Ed25519SigningKey::generate();
+        assert!(session.admit(&limited_request(&session, &foreign),
+            &["urn:fixture:allowed".into()]).is_err());
+        session.admit(&limited_request(&session, &key), &["urn:fixture:allowed".into()]).unwrap();
+    }
+
+    #[test]
+    fn rejected_envelopes_resources_and_key_scopes_do_not_spend() {
+        let (session, key) = established();
+        let mut request = limited_request(&session, &key);
+        request.r#type = "simulate".into();
+        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        request.r#type = "invoke".into();
+        assert!(session.admit(&request, &["urn:fixture:denied".into()]).is_err());
+        request.idempotency_key = Some("wrong".into());
+        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        request.idempotency_key = Some("x".repeat(129));
+        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        request.idempotency_key = Some("scoped-key".into());
+        session.admit(&request, &["urn:fixture:allowed".into()]).unwrap();
+    }
+
+    #[test]
+    fn resetting_accounting_also_revokes_the_old_instance_grant() {
+        let (mut session, key) = established();
+        let old = limited_request(&session, &key);
+        session.admit(&old, &["urn:fixture:allowed".into()]).unwrap();
+        session.handshake(handshake(&key)).unwrap();
+        assert!(session.admit(&old, &["urn:fixture:allowed".into()]).is_err());
+        session.admit(&limited_request(&session, &key), &["urn:fixture:allowed".into()]).unwrap();
     }
 }

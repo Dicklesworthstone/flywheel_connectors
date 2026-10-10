@@ -104,7 +104,7 @@ pub use crate::{
 // Checkpoint, lease, and budget primitives
 pub use crate::{
     BudgetEnforcement, BudgetStatus, CheckpointProposal, CheckpointTrigger, ComputationCheckpoint,
-    Lease, LeaseHandoff, LeaseId, LeaseParams, LeasePurpose, LeaseRequest, LeaseResponse,
+    Lease, LeaseHandoff, LeaseId, LeaseParams, LeaseRequest, LeaseResponse,
     UsageBudgetLimit, UsageBudgetPolicy, UsageBudgetSnapshot, UsageBudgetUsage,
 };
 
@@ -146,7 +146,7 @@ pub use jsonl::{JsonlConfig, serve_jsonl};
 
 /// Instance-bound authority for standalone connector control channels.
 mod standalone;
-pub use standalone::StandaloneSession;
+pub use standalone::{StandaloneInvocation, StandaloneSession};
 
 // External crates commonly needed
 pub use serde::{Deserialize, Serialize};

@@ -14,11 +14,13 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+ciborium.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 fcp-async-core = { path = "../fcp-async-core" }
 fcp-core = { path = "../fcp-core" }
+fcp-crypto = { path = "../fcp-crypto" }
 fcp-prelude = { path = "../fcp-prelude" }
 fcp-evidence = { path = "../fcp-evidence" }
 fcp-kernel = { path = "../fcp-kernel" }
