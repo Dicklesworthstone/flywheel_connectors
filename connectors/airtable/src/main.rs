@@ -31,14 +31,10 @@ use std::io::{BufRead, Write};
 
 use anyhow::Result;
 use fcp_async_core::runtime::Builder;
+use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_airtable::connector::AirtableConnector;
-
-struct ProtocolResponse {
-    body: serde_json::Value,
-    should_exit: bool,
-}
 
 fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -56,66 +52,31 @@ fn main() -> Result<()> {
 /// Run the FCP JSON-RPC style protocol loop.
 fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout = std::io::stdout();
+    run_fcp_loop_with_io(stdin.lock(), stdout.lock(), JsonlConfig::default())
+}
+
+/// Share the production framing and dispatcher with in-memory regression tests.
+fn run_fcp_loop_with_io(
+    reader: impl BufRead,
+    writer: impl Write,
+    config: JsonlConfig,
+) -> Result<()> {
     let mut connector = AirtableConnector::new();
-
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if should_skip_protocol_line(&line) {
-            continue;
-        }
-
-        let response = runtime.block_on(async { handle_message(&mut connector, &line).await });
-
-        let response_json = serde_json::to_string(&response.body)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-        if response.should_exit {
-            break;
-        }
-    }
-
+    serve_jsonl(reader, writer, config, |method, params| {
+        runtime.block_on(dispatch(&mut connector, method, params))
+    })?;
     Ok(())
 }
 
-fn should_skip_protocol_line(line: &str) -> bool {
-    line.trim().is_empty()
-}
-
-fn parse_error_response(error: impl std::fmt::Display) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "error": {
-            "code": "FCP-1001",
-            "message": format!("Invalid JSON: {error}")
-        }
-    })
-}
-
-/// Handle a single FCP message.
-async fn handle_message(connector: &mut AirtableConnector, message: &str) -> ProtocolResponse {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => {
-            return ProtocolResponse {
-                body: parse_error_response(e),
-                should_exit: false,
-            };
-        }
-    };
-
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
-
-    let is_shutdown_request = method == "shutdown";
-    let result = match method {
+/// Dispatch a validated envelope without changing operation-specific validation.
+async fn dispatch(
+    connector: &mut AirtableConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
         "health" => connector.handle_health().await,
@@ -129,100 +90,143 @@ async fn handle_message(connector: &mut AirtableConnector, message: &str) -> Pro
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
-
-    let should_exit = is_shutdown_request && result.is_ok();
-
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            ProtocolResponse {
-                body: response,
-                should_exit,
-            }
-        }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            ProtocolResponse {
-                body: response,
-                should_exit,
-            }
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+    use serde_json::Value;
+
+    fn responses(bytes: &[u8]) -> Vec<Value> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("JSON response"))
+            .collect()
+    }
 
     #[test]
     fn protocol_loop_skips_whitespace_only_lines() {
-        assert!(should_skip_protocol_line(""));
-        assert!(should_skip_protocol_line(" \t "));
-        assert!(!should_skip_protocol_line("{\"jsonrpc\":\"2.0\"}"));
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(
+            Cursor::new(b"\n \t\r\n\n"),
+            &mut output,
+            JsonlConfig::default(),
+        )
+        .unwrap();
+        assert!(output.is_empty());
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn invalid_json_is_wrapped_in_jsonrpc_parse_error() {
-        let mut connector = AirtableConnector::new();
-        let response = handle_message(&mut connector, "{not json").await;
+    #[test]
+    fn invalid_json_is_wrapped_and_next_request_still_runs() {
+        let input = b"{not json\n{\"method\":\"health\",\"id\":9}\n";
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
 
-        assert!(!response.should_exit);
-        assert_eq!(response.body["jsonrpc"], "2.0");
-        assert!(response.body["id"].is_null());
-        assert_eq!(response.body["error"]["code"], "FCP-1001");
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["jsonrpc"], "2.0");
+        assert!(replies[0]["id"].is_null());
+        assert_eq!(replies[0]["error"]["code"], "FCP-1001");
         assert!(
-            response.body["error"]["message"]
+            replies[0]["error"]["message"]
                 .as_str()
                 .is_some_and(|message| message.starts_with("Invalid JSON:"))
         );
+        assert_eq!(replies[1]["id"], 9);
+        assert!(replies[1].get("result").is_some());
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn shutdown_requests_exit_after_acknowledgement() {
-        let mut connector = AirtableConnector::new();
-        let response = handle_message(
-            &mut connector,
-            r#"{"jsonrpc":"2.0","id":7,"method":"shutdown","params":{}}"#,
-        )
-        .await;
+    #[test]
+    fn shutdown_requests_exit_after_acknowledgement() {
+        let shutdown = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\",\"params\":{}}\n";
+        let mut input = shutdown.to_vec();
+        input.extend_from_slice(b"{\"method\":\"invoke\",\"id\":8}\n");
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(&mut reader, &mut output, JsonlConfig::default()).unwrap();
 
-        assert!(response.should_exit);
-        assert_eq!(response.body["jsonrpc"], "2.0");
-        assert_eq!(response.body["id"], 7);
-        assert_eq!(response.body["result"]["status"], "shutdown");
+        assert_eq!(reader.position(), shutdown.len() as u64);
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["jsonrpc"], "2.0");
+        assert_eq!(replies[0]["id"], 7);
+        assert_eq!(replies[0]["result"]["status"], "shutdown");
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn non_shutdown_requests_keep_protocol_loop_running() {
-        let mut connector = AirtableConnector::new();
-        let response = handle_message(
-            &mut connector,
-            r#"{"jsonrpc":"2.0","id":9,"method":"health","params":{}}"#,
+    #[test]
+    fn non_shutdown_requests_keep_protocol_loop_running() {
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"health\",\"params\":{}}\n",
+            "{\"method\":\"health\",\"id\":10}\n",
+            "{\"method\":\"shutdown\",\"id\":11}\n",
+        );
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(
+            Cursor::new(input.as_bytes()),
+            &mut output,
+            JsonlConfig::default(),
         )
-        .await;
+        .unwrap();
 
-        assert!(!response.should_exit);
-        assert_eq!(response.body["jsonrpc"], "2.0");
-        assert_eq!(response.body["id"], 9);
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 3);
+        for (reply, id) in replies.iter().zip([9, 10, 11]) {
+            assert_eq!(reply["jsonrpc"], "2.0");
+            assert_eq!(reply["id"], id);
+            assert!(reply.get("result").is_some());
+        }
+        assert_eq!(replies[2]["result"]["status"], "shutdown");
+    }
+
+    #[test]
+    fn malformed_shutdown_envelope_does_not_stop_the_connector() {
+        let input = concat!(
+            "{\"jsonrpc\":\"1.0\",\"method\":\"shutdown\",\"id\":1}\n",
+            "{\"method\":\"health\",\"id\":2}\n",
+            "{\"method\":\"shutdown\",\"id\":3}\n",
+        );
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(
+            Cursor::new(input.as_bytes()),
+            &mut output,
+            JsonlConfig::default(),
+        )
+        .unwrap();
+
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0]["id"], 1);
+        assert_eq!(replies[0]["error"]["code"], "FCP-1001");
+        assert_eq!(replies[1]["id"], 2);
+        assert!(replies[1].get("result").is_some());
+        assert_eq!(replies[2]["result"]["status"], "shutdown");
+    }
+
+    #[test]
+    fn oversized_input_stops_before_dispatch_or_follow_on_requests() {
+        let input = concat!(
+            "{\"method\":\"configure\",\"params\":{\"token\":\"must-not-be-used\"}}\n",
+            "{\"method\":\"shutdown\"}\n",
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        let result = run_fcp_loop_with_io(
+            &mut reader,
+            &mut output,
+            JsonlConfig {
+                max_request_bytes: 16,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(reader.position(), 18);
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["error"]["code"], "FCP-1004");
+        assert!(!String::from_utf8(output).unwrap().contains("must-not-be-used"));
     }
 }
