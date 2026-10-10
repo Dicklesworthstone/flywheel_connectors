@@ -30,7 +30,7 @@ use fcp_async_core::runtime::Builder;
 use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use fcp_mcp_bridge::connector::McpBridgeConnector;
+use fcp_mcp_bridge::server::McpBridgeServer;
 
 fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -55,35 +55,12 @@ fn run_fcp_loop_with_io(
     writer: impl Write,
     config: JsonlConfig,
 ) -> Result<()> {
-    let mut connector = McpBridgeConnector::new();
+    let mut server = McpBridgeServer::new()?;
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     serve_jsonl(reader, writer, config, |method, params| {
-        runtime.block_on(dispatch(&mut connector, method, params))
+        runtime.block_on(server.dispatch(method, params))
     })?;
     Ok(())
-}
-
-/// Dispatch only validated envelopes; leave operation validation to the connector.
-async fn dispatch(
-    connector: &mut McpBridgeConnector,
-    method: &str,
-    params: serde_json::Value,
-) -> fcp_core::FcpResult<serde_json::Value> {
-    match method {
-        "configure" => connector.handle_configure(params).await,
-        "handshake" => connector.handle_handshake(params).await,
-        "health" => connector.handle_health().await,
-        "doctor" => connector.handle_doctor().await,
-        "self_check" => connector.handle_self_check().await,
-        "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
-        "simulate" => connector.handle_simulate(params).await,
-        "shutdown" => connector.handle_shutdown(params).await,
-        _ => Err(fcp_core::FcpError::InvalidRequest {
-            code: 1002,
-            message: format!("Unknown method: {method}"),
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -100,6 +77,23 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).expect("JSON response"))
             .collect()
+    }
+
+    fn encode_requests(requests: &[Value]) -> String {
+        let mut input = String::new();
+        for request in requests {
+            input.push_str(&serde_json::to_string(request).unwrap());
+            input.push('\n');
+        }
+        input
+    }
+
+    fn handshake_request(id: u32) -> Value {
+        json!({"id": id, "method": "handshake", "params": {
+            "protocol_version": "2.0.0", "zone": "z:work",
+            "host_public_key": vec![1_u8; 32], "nonce": vec![9_u8; 32],
+            "capabilities_requested": ["mcp.tools.write"],
+        }})
     }
 
     #[test]
@@ -138,13 +132,13 @@ mod tests {
     #[test]
     fn configuration_and_nine_operation_catalog_survive_shared_framing() {
         // Configuration and FCP handshake are local; no upstream MCP call occurs.
-        let input = concat!(
-            "{\"id\":1,\"method\":\"configure\",\"params\":{\"mcp_url\":\"http://127.0.0.1:1\"}}\n",
-            "{\"id\":2,\"method\":\"handshake\",\"params\":{\"session_id\":\"local-test\"}}\n",
-            "{\"id\":3,\"method\":\"health\"}\n",
-            "{\"id\":4,\"method\":\"introspect\"}\n",
-            "{\"id\":5,\"method\":\"shutdown\"}\n",
-        );
+        let input = encode_requests(&[
+            json!({"id": 1, "method": "configure", "params": {"mcp_url": "http://127.0.0.1:1"}}),
+            handshake_request(2),
+            json!({"id": 3, "method": "health"}),
+            json!({"id": 4, "method": "introspect"}),
+            json!({"id": 5, "method": "shutdown"}),
+        ]);
         let mut output = Vec::new();
         run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
         let responses = replies(&output);
@@ -180,6 +174,27 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0]["error"]["code"], "FCP-1004");
         assert!(!String::from_utf8(output).unwrap().contains("do-not-echo"));
+    }
+
+    #[test]
+    fn production_dispatch_rejects_unsigned_invocation_before_provider_io() {
+        let input = encode_requests(&[
+            json!({"id": 1, "method": "configure", "params": {"mcp_url": "http://127.0.0.1:1"}}),
+            handshake_request(2),
+            json!({"id": 3, "method": "invoke", "params": {
+                "operation_id": "mcp.tools.call", "input": {"name": "write", "arguments": {}},
+            }}),
+            json!({"id": 4, "method": "health"}),
+            json!({"id": 5, "method": "shutdown"}),
+        ]);
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
+        let responses = replies(&output);
+        assert_eq!(responses.len(), 5);
+        assert_eq!(responses[2]["id"], 3);
+        assert_eq!(responses[2]["error"]["code"], "FCP-1003");
+        assert_eq!(responses[3]["result"]["requests"], 0);
+        assert_eq!(responses[4]["result"], json!({}));
     }
 
     #[test]
