@@ -104,7 +104,7 @@ pub use crate::{
 // Checkpoint, lease, and budget primitives
 pub use crate::{
     BudgetEnforcement, BudgetStatus, CheckpointProposal, CheckpointTrigger, ComputationCheckpoint,
-    Lease, LeaseHandoff, LeaseId, LeaseParams, LeaseRequest, LeaseResponse,
+    Lease, LeaseHandoff, LeaseId, LeaseParams, LeasePurpose, LeaseRequest, LeaseResponse,
     UsageBudgetLimit, UsageBudgetPolicy, UsageBudgetSnapshot, UsageBudgetUsage,
 };
 

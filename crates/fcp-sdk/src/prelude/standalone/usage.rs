@@ -346,4 +346,66 @@ mod tests {
         assert!(!text.contains("secret"));
         assert_eq!(permit.token().claims().get_jti(), Some(b"secret-cti".as_slice()));
     }
+
+    #[test]
+    fn different_verified_operations_share_the_same_signed_allowance() {
+        let ledger = UsageLedger::default();
+        let original = token(Some(2), b"shared-operation-budget", None);
+        let key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
+        let verifier = CapabilityVerifier::new(
+            key.verifying_key().to_bytes(), ZoneId::work(),
+            InstanceId::try_from("inst_usage_fixture".to_owned()).unwrap(),
+        );
+        let other = verifier.verify_bound(
+            CapabilityToken::from_raw(original.raw().clone()),
+            &CapabilityId::from_static("fixture.read"),
+            &OperationId::from_static("fixture.list"), &[],
+        ).unwrap();
+        ledger.admit(original.clone(), None).unwrap();
+        ledger.admit(other.clone(), None).unwrap();
+        assert!(ledger.admit(original, None).is_err());
+        assert!(ledger.admit(other, None).is_err());
+        assert_eq!(ledger.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn changing_unprotected_cose_headers_cannot_create_a_new_allowance() {
+        let ledger = UsageLedger::default();
+        let original = token(Some(1), b"envelope-independent-budget", None);
+        ledger.admit(original.clone(), None).unwrap();
+        let bytes = original.raw().to_cbor().unwrap();
+        let mut envelope: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let inner = match &mut envelope {
+            ciborium::Value::Tag(_, value) => value.as_mut(),
+            value => value,
+        };
+        let ciborium::Value::Array(fields) = inner else {
+            panic!("COSE Sign1 must be an array");
+        };
+        let ciborium::Value::Map(headers) = &mut fields[1] else {
+            panic!("COSE unprotected headers must be a map");
+        };
+        headers.push((
+            ciborium::Value::Integer(999.into()),
+            ciborium::Value::Text("unprotected-request-marker".into()),
+        ));
+        let mut changed = Vec::new();
+        ciborium::into_writer(&envelope, &mut changed).unwrap();
+        assert_ne!(bytes, changed);
+        let raw = fcp_crypto::cose::CoseToken::from_cbor(&changed).unwrap();
+        let key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
+        let verifier = CapabilityVerifier::new(
+            key.verifying_key().to_bytes(), ZoneId::work(),
+            InstanceId::try_from("inst_usage_fixture".to_owned()).unwrap(),
+        );
+        // A verifier may reject extra unprotected headers outright. If it
+        // accepts them, the unchanged signed claims still name a spent grant.
+        if let Ok(verified) = verifier.verify_bound(
+            CapabilityToken::from_raw(raw), &CapabilityId::from_static("fixture.read"),
+            &OperationId::from_static("fixture.get"), &[],
+        ) {
+            assert!(ledger.admit(verified, None).is_err());
+        }
+        assert_eq!(ledger.lock().unwrap().len(), 1);
+    }
 }
