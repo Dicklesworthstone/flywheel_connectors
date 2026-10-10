@@ -57,6 +57,17 @@ struct LoopbackServer {
 
 impl LoopbackServer {
     fn start(exchanges: Vec<Exchange>) -> Self {
+        let handshake = [
+            Exchange::json("200 OK", &json!({
+                "jsonrpc": "2.0", "id": 0,
+                "result": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                    "serverInfo": {"name": "raw-loopback", "version": "1"}
+                }
+            })),
+            Exchange { response_status: "202 Accepted", response_body: String::new(), extra_headers: "" },
+        ];
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind MCP loopback listener");
         listener
             .set_nonblocking(true)
@@ -65,8 +76,9 @@ impl LoopbackServer {
             .local_addr()
             .expect("read MCP loopback listener address");
         let handle = thread::spawn(move || {
-            exchanges
+            handshake
                 .into_iter()
+                .chain(exchanges)
                 .map(|exchange| {
                     let stream = accept_with_deadline(&listener);
                     handle_request(stream, &exchange)
@@ -85,11 +97,25 @@ impl LoopbackServer {
     }
 
     fn join(mut self) -> Vec<CapturedRequest> {
-        self.handle
+        let requests = self.handle
             .take()
             .expect("loopback thread present")
             .join()
-            .expect("loopback thread completed")
+            .expect("loopback thread completed");
+        // Keep all wire requests in the evidence, including the two lifecycle
+        // messages that must precede every operation on a fresh connection.
+        let initialize: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(initialize["method"], "initialize");
+        assert_eq!(initialize["jsonrpc"], "2.0");
+        assert_eq!(initialize["id"], 0);
+        assert_eq!(initialize["params"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(initialize["params"]["capabilities"], json!({}));
+        assert_eq!(header_value(&requests[0].headers, "authorization"), format!("Bearer {LOOPBACK_CREDENTIAL}"));
+        assert_http_boundary(&requests[1]);
+        let initialized: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(initialized["method"], "notifications/initialized");
+        assert!(initialized.get("id").is_none());
+        requests
     }
 }
 
@@ -346,7 +372,7 @@ async fn local_non_mock_tools_list_posts_streamable_http_boundary_and_scans_cata
         .await
         .expect("list MCP tools");
     let requests = server.join();
-    let body = assert_rpc_request(&requests[0], "tools/list");
+    let body = assert_rpc_request(&requests[2], "tools/list");
 
     assert_eq!(body["params"], json!({}));
     let tools = result["tools"].as_array().expect("tools array");
@@ -417,7 +443,7 @@ async fn local_non_mock_tools_call_posts_arguments_boundary() {
         .await
         .expect("call MCP tool");
     let requests = server.join();
-    let body = assert_rpc_request(&requests[0], "tools/call");
+    let body = assert_rpc_request(&requests[2], "tools/call");
 
     assert_eq!(body["params"]["name"], "search_workspace");
     assert_eq!(body["params"]["arguments"]["query"], "release");
@@ -457,7 +483,7 @@ async fn local_non_mock_resources_read_and_prompts_list_use_json_rpc_boundary() 
             "200 OK",
             &json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 2,
                 "result": {
                     "prompts": [
                         {
@@ -487,14 +513,14 @@ async fn local_non_mock_resources_read_and_prompts_list_use_json_rpc_boundary() 
         .expect("list MCP prompts");
     let requests = server.join();
 
-    let resource_body = assert_rpc_request(&requests[0], "resources/read");
+    let resource_body = assert_rpc_request(&requests[2], "resources/read");
     assert_eq!(
         resource_body["params"]["uri"],
         "file:///workspace/README.md"
     );
     assert_eq!(resource["contents"][0]["text"], "# Workspace");
 
-    let prompts_body = assert_rpc_request(&requests[1], "prompts/list");
+    let prompts_body = assert_rpc_request(&requests[3], "prompts/list");
     assert_eq!(prompts_body["params"], json!({}));
     assert_eq!(prompts["prompts"][0]["name"], "summarize_project");
     assert!(
@@ -548,7 +574,7 @@ async fn local_non_mock_block_mode_rejects_suspicious_provider_descriptions() {
         .await
         .expect_err("suspicious MCP tool description should be blocked");
     let requests = server.join();
-    assert_rpc_request(&requests[0], "tools/list");
+    assert_rpc_request(&requests[2], "tools/list");
     let error_text = format!("{error:?}");
     assert!(error_text.contains("blocked by description scanner"));
 
@@ -588,8 +614,8 @@ async fn local_non_mock_provider_unauthorized_redacts_auth_material_and_counts_r
         .await
         .expect_err("provider auth failure should propagate as redacted FCP error");
     let requests = server.join();
-    assert_eq!(requests.len(), 2);
-    for request in &requests {
+    assert_eq!(requests.len(), 4);
+    for request in &requests[2..] {
         assert_rpc_request(request, "tools/list");
         assert_eq!(
             header_value(&request.headers, "authorization"),

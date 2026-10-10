@@ -13,9 +13,44 @@
 
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
 use fcp_mcp_bridge::connector::McpBridgeConnector;
+
+/// Every operation fixture is a real initialized MCP server, including the
+/// stateless cases where InitializeResult does not issue a session header.
+struct MockServer(wiremock::MockServer);
+
+impl std::ops::Deref for MockServer {
+    type Target = wiremock::MockServer;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl MockServer {
+    async fn start() -> Self { Self::start_with_session(None).await }
+
+    async fn start_with_session(session_id: Option<&'static str>) -> Self {
+        let server = wiremock::MockServer::start().await;
+        let mut response = ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                "serverInfo": {"name": "integration-fixture", "version": "1"}
+            }
+        }));
+        if let Some(session_id) = session_id {
+            response = response.insert_header("Mcp-Session-Id", session_id);
+        }
+        Mock::given(method("POST")).and(path("/mcp"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(response).with_priority(0).mount(&server).await;
+        Mock::given(method("POST")).and(path("/mcp"))
+            .and(body_partial_json(json!({"method": "notifications/initialized"})))
+            .respond_with(ResponseTemplate::new(202)).with_priority(0).mount(&server).await;
+        Self(server)
+    }
+}
 
 async fn setup_connector(mock_url: &str) -> McpBridgeConnector {
     let mut c = McpBridgeConnector::new();
@@ -899,7 +934,7 @@ async fn auth_error_retries_once_then_succeeds() {
         .and(path("/mcp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 1,
             "result": {"tools": []}
         })))
         .mount(&server)
@@ -963,7 +998,7 @@ async fn error_404() {
 
 #[fcp_async_core::runtime::test]
 async fn session_expired_retries_once_then_succeeds() {
-    let server = MockServer::start().await;
+    let server = MockServer::start_with_session(Some("negotiated-session")).await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .respond_with(
@@ -976,7 +1011,7 @@ async fn session_expired_retries_once_then_succeeds() {
         .and(path("/mcp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 1,
             "result": {"resources": []}
         })))
         .mount(&server)
@@ -1219,11 +1254,12 @@ async fn counters_multiple_requests() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {"tools": []}
-        })))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": {"tools": []}
+            }))
+        })
         .mount(&server)
         .await;
 

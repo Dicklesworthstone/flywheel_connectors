@@ -390,7 +390,7 @@ mod tests {
         let request = crate::types::JsonRpcRequest {
             jsonrpc: "2.0", id: 1, method: "tools/list".into(), params: json!({}),
         };
-        assert_eq!(client.rpc_call_once(&format!("{}/mcp", server.uri()), &request).await.unwrap(), json!({"tools":[]}));
+        assert_eq!(client.rpc_call_once(&format!("{}/mcp", server.uri()), &request, None).await.unwrap(), json!({"tools":[]}));
     }
 
     #[fcp_async_core::runtime::test]
