@@ -30,10 +30,12 @@ const OP_TOOLS_LIST: &str = "mcp.tools.list";
 const OP_TOOLS_CALL: &str = "mcp.tools.call";
 const OP_RESOURCES_LIST: &str = "mcp.resources.list";
 const OP_RESOURCES_READ: &str = "mcp.resources.read";
+const OP_RESOURCE_TEMPLATES_LIST: &str = "mcp.resources.templates.list";
 const OP_PROMPTS_LIST: &str = "mcp.prompts.list";
+const OP_PROMPTS_GET: &str = "mcp.prompts.get";
 const OP_SAMPLING_HANDLE: &str = "mcp.sampling.handle";
 const OP_SERVER_METRICS: &str = "mcp.server.metrics";
-const OPERATION_ORDER: [&str; 7] = [
+const OPERATION_ORDER: [&str; 9] = [
     OP_TOOLS_LIST,
     OP_TOOLS_CALL,
     OP_RESOURCES_LIST,
@@ -41,6 +43,8 @@ const OPERATION_ORDER: [&str; 7] = [
     OP_PROMPTS_LIST,
     OP_SAMPLING_HANDLE,
     OP_SERVER_METRICS,
+    OP_RESOURCE_TEMPLATES_LIST,
+    OP_PROMPTS_GET,
 ];
 
 /// Parsed and validated MCP Bridge connector configuration.
@@ -450,7 +454,9 @@ impl McpBridgeConnector {
             OP_TOOLS_CALL => self.invoke_tools_call(client, &input).await,
             OP_RESOURCES_LIST => self.invoke_resources_list(client).await,
             OP_RESOURCES_READ => self.invoke_resources_read(client, &input).await,
+            OP_RESOURCE_TEMPLATES_LIST => self.invoke_resource_templates_list(client).await,
             OP_PROMPTS_LIST => self.invoke_prompts_list(client).await,
+            OP_PROMPTS_GET => self.invoke_prompts_get(client, &input).await,
             OP_SAMPLING_HANDLE => self.invoke_sampling_handle(&input).await,
             OP_SERVER_METRICS => self.invoke_server_metrics(client).await,
             _ => {
@@ -560,6 +566,23 @@ impl McpBridgeConnector {
     ) -> Result<serde_json::Value, McpBridgeError> {
         let data = client.prompts_list().await?;
         self.annotate_catalog(data, "prompts", "prompt", false)
+    }
+
+    async fn invoke_resource_templates_list(
+        &self,
+        client: &McpClient,
+    ) -> Result<serde_json::Value, McpBridgeError> {
+        let data = client.resource_templates_list().await?;
+        self.annotate_catalog(data, "resourceTemplates", "resource template", false)
+    }
+
+    async fn invoke_prompts_get(
+        &self,
+        client: &McpClient,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, McpBridgeError> {
+        let name = require_str(input, "name")?;
+        client.prompts_get(name, input.get("arguments")).await
     }
 
     async fn invoke_sampling_handle(
@@ -1181,10 +1204,10 @@ mod tests {
     }
 
     #[test]
-    fn operations_info_has_7_operations() {
+    fn operations_info_has_9_operations() {
         let ops = operations_info();
         let arr = ops.as_array().unwrap();
-        assert_eq!(arr.len(), 7);
+        assert_eq!(arr.len(), 9);
     }
 
     #[test]

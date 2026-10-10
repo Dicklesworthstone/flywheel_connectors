@@ -320,6 +320,65 @@ async fn shutdown_refuses_new_prompt_and_template_reads_before_network_io() {
     assert!(requests(&server).await.is_empty());
 }
 
+#[test]
+fn expanded_manifest_passes_strict_validation_and_uses_existing_read_capabilities() {
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../../manifest.toml"))
+        .expect("strict validation must include the recalculated interface hash");
+    assert_eq!(manifest.provides.operations.len(), 9);
+    for (id, capability) in [("mcp.prompts.get","mcp.prompts.read"),
+        ("mcp.resources.templates.list","mcp.resources.read")] {
+        let operation = &manifest.provides.operations[id];
+        assert_eq!(operation.capability.as_str(), capability);
+        assert_eq!(operation.network_constraints.as_ref().unwrap().max_redirects, 0);
+        assert_eq!(operation.input_schema["type"], "object");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn fcp_dispatch_and_introspection_expose_both_new_operations() {
+    let server = MockServer::start().await;
+    mount_initialization(&server, json!({"prompts":{},"resources":{}})).await;
+    mount_result(&server, "prompts/get", rich_prompt()).await;
+    mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[
+        {"name":"example","uriTemplate":"example:{id}","description":"Example records"}
+    ]})).await;
+    let mut connector = crate::connector::McpBridgeConnector::new();
+    connector.handle_configure(json!({"mcp_url":server.uri()})).await.unwrap();
+    connector.handle_handshake(json!({"session_id":"fcp-test"})).await.unwrap();
+    let introspection = connector.handle_introspect().await.unwrap();
+    let operations = introspection["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 9);
+    for id in ["mcp.prompts.get", "mcp.resources.templates.list"] {
+        assert!(operations.iter().any(|op| op["id"] == id));
+        assert_eq!(connector.handle_simulate(json!({"operation_id":id})).await.unwrap()["allowed"], true);
+    }
+    let prompt = connector.handle_invoke(json!({
+        "operation_id":"mcp.prompts.get", "input":{"name":"review","arguments":{"code":"example"}}
+    })).await.unwrap();
+    assert_eq!(prompt, rich_prompt());
+    let templates = connector.handle_invoke(json!({
+        "operation_id":"mcp.resources.templates.list", "input":{}
+    })).await.unwrap();
+    assert_eq!(templates["resourceTemplates"][0]["uriTemplate"], "example:{id}");
+    assert_eq!(templates["resourceTemplates"][0]["injection_findings"], json!([]));
+    assert_eq!(requests(&server).await.len(), 4);
+}
+
+#[fcp_async_core::runtime::test]
+async fn fcp_prompt_validation_errors_are_terminal_and_counted_without_network_io() {
+    let server = MockServer::start().await;
+    let mut connector = crate::connector::McpBridgeConnector::new();
+    connector.handle_configure(json!({"mcp_url":server.uri()})).await.unwrap();
+    connector.handle_handshake(json!({"session_id":"fcp-test"})).await.unwrap();
+    let error = connector.handle_invoke(json!({
+        "operation_id":"mcp.prompts.get", "input":{"name":"review","arguments":{"code":42}}
+    })).await.unwrap_err();
+    assert!(matches!(error, fcp_prelude::FcpError::External {retryable:false,..}));
+    let metrics = connector.handle_invoke(json!({"operation_id":"mcp.server.metrics"})).await.unwrap();
+    assert_eq!(metrics["errors"], 1);
+    assert!(requests(&server).await.is_empty());
+}
+
 #[fcp_async_core::runtime::test]
 async fn template_catalog_enforces_entry_and_utf8_cursor_byte_limits() {
     for excessive_entries in [true, false] {
