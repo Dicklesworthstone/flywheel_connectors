@@ -1,0 +1,124 @@
+name: Prepare reviewed HTTP batch integration
+
+'on':
+  push:
+    branches: [main]
+    paths: [.github/workflows/http-batch-integration.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-http-batch-integration
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/flywheel_connectors' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          clean: false
+          fetch-depth: 1
+          show-progress: false
+      - name: Verify the reviewed patch and prepare an unreferenced host source blob
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+
+          REPO = 'Dicklesworthstone/flywheel_connectors'
+          PATH = 'crates/fcp-host/src/bin/fcp-host.rs'
+          BASE_BLOB = 'aa653d02ac51a206e88a5ca9b1fee2557b931925'
+          PATCH_SHA256 = 'ef643277aff3854e87f0d9a398b633c555f14fa254983b5d20d500f80a8d8632'
+          # Immutable transport chunks of the reviewed, gzip-compressed patch.
+          # They are not executable code. Verify every object and the complete
+          # uncompressed patch before applying it to the checked-out source.
+          CHUNKS = [
+              'aa365a3af32b248c259b494dcc08348dd8a4ded8',
+              '39cd2585935f074b6a2970345d8bced9c52806a6',
+              '629a5b2e7dcc53b0c67806c74dda5bfb1524ff30',
+              'dcd317d64b44f1f589b359403f4ad7a2802b35ee',
+          ]
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          def blob_sha(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+          def api(suffix, data=None):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + REPO + suffix,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'Accept': 'application/vnd.github+json',
+                      'Content-Type': 'application/json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                  method='GET' if data is None else 'POST',
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          if git('branch', '--show-current') != 'main':
+              raise SystemExit('Only a main checkout may prepare this integration')
+          if git('status', '--porcelain'):
+              raise SystemExit('Refusing to prepare against a dirty checkout')
+          original = Path(PATH).read_bytes()
+          if blob_sha(original) != BASE_BLOB:
+              raise SystemExit('Host source changed; reconcile the patch before preparing another candidate')
+
+          compressed = bytearray()
+          for sha in CHUNKS:
+              obj = api('/git/blobs/' + sha)
+              if obj.get('encoding') != 'base64':
+                  raise SystemExit('Unexpected Git blob encoding')
+              chunk = base64.b64decode(''.join(obj['content'].split()), validate=True)
+              if blob_sha(chunk) != sha:
+                  raise SystemExit('Patch transport object checksum mismatch')
+              compressed.extend(chunk)
+          patch = gzip.decompress(compressed)
+          if hashlib.sha256(patch).hexdigest() != PATCH_SHA256:
+              raise SystemExit('Reviewed patch checksum mismatch')
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', '-'], input=patch, check=True)
+          if git('diff', '--name-only') != PATH:
+              raise SystemExit('Patch changed an unexpected path')
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          candidate = Path(PATH).read_bytes()
+          # A Rust parser check only: this is not a Cargo build or executed test.
+          subprocess.run(
+              ['rustup', 'run', 'stable', 'rustfmt', '--edition', '2024',
+               '--config', 'skip_children=true', '--emit', 'stdout'],
+              input=candidate, check=True, stdout=subprocess.DEVNULL,
+          )
+          print(patch.decode())
+          blob = api('/git/blobs', {'content': candidate.decode(), 'encoding': 'utf-8'})
+          if blob['sha'] != blob_sha(candidate):
+              raise SystemExit('Prepared source upload checksum mismatch')
+          result = {
+              'base_commit': git('rev-parse', 'HEAD'),
+              'base_tree': git('rev-parse', 'HEAD^{tree}'),
+              'path': PATH,
+              'old_sha': BASE_BLOB,
+              'new_sha': blob['sha'],
+              'patch_sha256': PATCH_SHA256,
+              'validation': 'exact patch application, diff whitespace, Rust syntax; Cargo tests not run',
+          }
+          # No commits or ref updates occur here. Publication is reviewed and
+          # performed separately through the GitHub connector, without a PR.
+          print('PREPARED_HTTP_BATCH=' + json.dumps(result, sort_keys=True))
