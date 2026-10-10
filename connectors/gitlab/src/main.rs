@@ -28,6 +28,7 @@ use std::io::{BufRead, Write};
 
 use anyhow::Result;
 use fcp_async_core::runtime::Builder;
+use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_gitlab::connector::GitLabConnector;
@@ -45,41 +46,26 @@ fn main() -> Result<()> {
 
 fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout = std::io::stdout();
+    run_fcp_loop_with_io(stdin.lock(), stdout.lock())
+}
+
+/// Use the same framing and dispatch path for stdio and in-memory regression tests.
+fn run_fcp_loop_with_io(reader: impl BufRead, writer: impl Write) -> Result<()> {
     let mut connector = GitLabConnector::new();
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-        let response = runtime.block_on(async { handle_message(&mut connector, &line).await });
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
+    serve_jsonl(reader, writer, JsonlConfig::default(), |method, params| {
+        runtime.block_on(dispatch(&mut connector, method, params))
+    })?;
     Ok(())
 }
 
-async fn handle_message(connector: &mut GitLabConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => {
-            return serde_json::json!({
-                "error": {"code": "FCP-1001", "message": format!("Invalid JSON: {e}")}
-            });
-        }
-    };
-
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
-
-    let result = match method {
+async fn dispatch(
+    connector: &mut GitLabConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
         "health" => connector.handle_health().await,
@@ -93,28 +79,62 @@ async fn handle_message(connector: &mut GitLabConnector, message: &str) -> serde
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
+    }
+}
 
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({"jsonrpc": "2.0", "result": value});
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
-        Err(e) => {
-            let mut response = serde_json::json!({"jsonrpc": "2.0", "error": e.to_response()});
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use serde_json::Value;
+
+    fn responses(bytes: &[u8]) -> Vec<Value> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("JSON response"))
+            .collect()
+    }
+
+    #[test]
+    fn shutdown_acknowledges_and_stops_before_next_request() {
+        let shutdown = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\",\"params\":{}}\n";
+        let mut input = shutdown.to_vec();
+        input.extend_from_slice(b"{\"method\":\"invoke\",\"id\":8}\n");
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        run_fcp_loop_with_io(&mut reader, &mut output).unwrap();
+
+        assert_eq!(reader.position(), shutdown.len() as u64);
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["jsonrpc"], "2.0");
+        assert_eq!(replies[0]["id"], 7);
+        assert!(replies[0].get("result").is_some());
+        assert!(replies[0].get("error").is_none());
+    }
+
+    #[test]
+    fn malformed_and_unknown_requests_recover_through_real_dispatch() {
+        let input = concat!(
+            "\n \t\r\n{not json\n",
+            "{\"method\":\"unknown\",\"id\":2}\n",
+            "{\"method\":\"shutdown\",\"id\":3}\n",
+        );
+        let mut output = Vec::new();
+
+        run_fcp_loop_with_io(Cursor::new(input.as_bytes()), &mut output).unwrap();
+
+        let replies = responses(&output);
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0]["jsonrpc"], "2.0");
+        assert!(replies[0]["id"].is_null());
+        assert_eq!(replies[0]["error"]["code"], "FCP-1001");
+        assert_eq!(replies[1]["id"], 2);
+        assert_eq!(replies[1]["error"]["code"], "FCP-1002");
+        assert_eq!(replies[2]["id"], 3);
+        assert!(replies[2].get("result").is_some());
     }
 }

@@ -140,6 +140,10 @@ pub use crate::{
 // Retry helpers
 pub use crate::{RetryDecision, RetryPolicy};
 
+/// Shared standalone JSONL framing implementation.
+mod jsonl;
+pub use jsonl::{JsonlConfig, serve_jsonl};
+
 // External crates commonly needed
 pub use serde::{Deserialize, Serialize};
 pub use serde_json::json;
