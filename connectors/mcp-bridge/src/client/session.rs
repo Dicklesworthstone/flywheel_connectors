@@ -201,7 +201,13 @@ impl McpClient {
         }
         let replay_safe = matches!(
             method,
-            "tools/list" | "resources/list" | "resources/read" | "prompts/list" | "ping"
+            "tools/list"
+                | "resources/list"
+                | "resources/templates/list"
+                | "resources/read"
+                | "prompts/list"
+                | "prompts/get"
+                | "ping"
         );
         let request = JsonRpcRequest {
             jsonrpc: "2.0",

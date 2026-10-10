@@ -64,6 +64,7 @@ impl Catalog {
         let (field, identity_field) = match method {
             "tools/list" => ("tools", "name"),
             "resources/list" => ("resources", "uri"),
+            "resources/templates/list" => ("resourceTemplates", "uriTemplate"),
             "prompts/list" => ("prompts", "name"),
             _ => return Err(transport::invalid_response("not a paginated discovery method")),
         };
@@ -100,6 +101,11 @@ impl Catalog {
             Some(_) => return Err(transport::invalid_response("invalid or oversized discovery cursor")),
         };
         for entry in &entries {
+            if self.field == "resourceTemplates"
+                && !entry.get("name").and_then(Value::as_str).is_some_and(|name| !name.is_empty())
+            {
+                return Err(transport::invalid_response("resource template has no valid name"));
+            }
             let identity = entry.get(self.identity_field).and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| transport::invalid_response("discovery entry has no valid identity"))?;

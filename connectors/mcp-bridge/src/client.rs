@@ -282,6 +282,12 @@ impl McpClient {
         self.discovery_list("resources/list").await
     }
 
+    /// List every parameterized resource template under the discovery budget.
+    /// URI templates are opaque data; this never expands or fetches them.
+    pub async fn resource_templates_list(&self) -> McpBridgeResult<serde_json::Value> {
+        self.discovery_list("resources/templates/list").await
+    }
+
     /// Read a resource from the MCP server.
     pub async fn resources_read(&self, uri: &str) -> McpBridgeResult<serde_json::Value> {
         self.rpc_call("resources/read", json!({"uri": uri})).await
@@ -291,7 +297,76 @@ impl McpClient {
     pub async fn prompts_list(&self) -> McpBridgeResult<serde_json::Value> {
         self.discovery_list("prompts/list").await
     }
+
+    /// Render a server-provided prompt, preserving all returned content blocks.
+    /// Arguments follow MCP's string-valued map contract. No model is invoked
+    /// and no embedded resource or resource link is fetched by this operation.
+    pub async fn prompts_get(
+        &self,
+        name: &str,
+        arguments: Option<&serde_json::Value>,
+    ) -> McpBridgeResult<serde_json::Value> {
+        if name.is_empty() {
+            return Err(McpBridgeError::McpError {
+                code: -32602,
+                message: "prompt name must not be empty".into(),
+            });
+        }
+        let mut params = json!({"name": name});
+        if let Some(arguments) = arguments {
+            if !arguments.as_object().is_some_and(|arguments| {
+                arguments.values().all(serde_json::Value::is_string)
+            }) {
+                return Err(McpBridgeError::McpError {
+                    code: -32602,
+                    message: "prompt arguments must be an object containing only strings".into(),
+                });
+            }
+            // Do not trim, coerce, interpolate or log caller-supplied values.
+            params["arguments"] = arguments.clone();
+        }
+        let result = self.rpc_call("prompts/get", params).await?;
+        validate_prompt_result(&result)?;
+        Ok(result)
+    }
 }
+
+/// Validate the core GetPromptResult envelope without discarding extensions.
+/// The transport has already bounded bytes and checked the JSON-RPC envelope.
+fn validate_prompt_result(result: &serde_json::Value) -> McpBridgeResult<()> {
+    use serde_json::Value;
+    let invalid = || transport::invalid_response("invalid prompts/get result");
+    let object = result.as_object().ok_or_else(invalid)?;
+    if object.get("description").is_some_and(|value| !value.is_string()) {
+        return Err(invalid());
+    }
+    let messages = object.get("messages").and_then(Value::as_array).ok_or_else(invalid)?;
+    for message in messages {
+        if !matches!(message.get("role").and_then(Value::as_str), Some("user" | "assistant")) {
+            return Err(invalid());
+        }
+        let content = message.get("content").and_then(Value::as_object).ok_or_else(invalid)?;
+        let string_field = |name: &str| content.get(name).is_some_and(Value::is_string);
+        let valid = match content.get("type").and_then(Value::as_str) {
+            Some("text") => string_field("text"),
+            Some("image" | "audio") => string_field("data") && string_field("mimeType"),
+            Some("resource_link") => string_field("uri") && string_field("name"),
+            Some("resource") => content.get("resource").is_some_and(|resource| {
+                resource.get("uri").is_some_and(Value::is_string)
+                    && (resource.get("text").is_some_and(Value::is_string)
+                        || resource.get("blob").is_some_and(Value::is_string))
+            }),
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod prompt_resource_tests;
 
 #[cfg(test)]
 mod tests {
