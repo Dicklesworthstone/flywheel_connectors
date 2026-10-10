@@ -11,9 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use fcp_core::{BoundVerified, CapabilityToken, FcpError, FcpResult, HandshakeRequest,
+use fcp_core::{FcpError, FcpResult, HandshakeRequest,
     InvokeRequest, InvokeResponse, OperationId, RequestId, SimulateRequest, SimulateResponse};
-use fcp_sdk::prelude::StandaloneSession;
+use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -150,23 +150,26 @@ impl McpBridgeServer {
         validate_request(&request.r#type, "invoke", &request.id, &request.input)?;
         request.validate_idempotency_key().map_err(|_| invalid("Invalid idempotency key"))?;
         let resource_uris = resource_uris(&request.operation, &request.input)?;
-        let witness = self.session.authorize(
-            &request.connector_id, &request.zone_id, &request.operation,
-            request.capability_token, &resource_uris,
-        )?;
         let budget = request.deadline_ms.map(Duration::from_millis)
-            .unwrap_or(MAX_INVOKE_TIMEOUT).min(MAX_INVOKE_TIMEOUT)
-            .saturating_sub(started.elapsed());
-        if budget.is_zero() {
+            .unwrap_or(MAX_INVOKE_TIMEOUT).min(MAX_INVOKE_TIMEOUT);
+        if budget.saturating_sub(started.elapsed()).is_zero() {
             return Err(invalid("Invocation deadline elapsed before MCP dispatch"));
         }
-        self.invoke_verified(witness, request.id, request.operation, request.input, budget).await
+        // Verification and the signed usage charge precede every provider
+        // operation. Changes to request IDs or input cannot refill a grant.
+        // Once admitted, errors, interruption and dropped futures do not refund.
+        let witness = self.session.admit(&request, &resource_uris)?;
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(invalid("Invocation deadline elapsed before MCP dispatch"));
+        }
+        self.invoke_verified(witness, request.id, request.operation, request.input, remaining).await
     }
 
     /// The only process-boundary path that can execute a provider operation.
     async fn invoke_verified(
         &self,
-        _witness: CapabilityToken<BoundVerified>,
+        _witness: StandaloneInvocation,
         id: RequestId,
         operation: OperationId,
         input: Value,
@@ -191,7 +194,8 @@ impl McpBridgeServer {
             Ok(_) => SimulateResponse::allowed(request.id),
             Err(error) => SimulateResponse::denied(request.id, error.to_string(), error.error_code()),
         };
-        // Authorization simulation is local; it neither invokes a provider nor
+        // Authorization simulation checks remaining call quota without charging
+        // or reserving it. It is local; it neither invokes a provider nor
         // fabricates availability, cost estimates or guarantees of API success.
         encode(&response)
     }
@@ -251,6 +255,7 @@ async fn await_invocation(
 #[cfg(test)]
 mod tests {
     use fcp_async_core::runtime::Builder;
+    use fcp_core::CapabilityToken;
 
     use super::*;
 

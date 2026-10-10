@@ -132,7 +132,6 @@ impl UsageLedger {
             if account.is_none() && entries.len() >= self.capacity {
                 return Err(FcpError::ResourceExhausted {
                     resource: "standalone capability usage ledger capacity".into(),
-                    retry_after_ms: None,
                 });
             }
         }
@@ -280,7 +279,7 @@ mod tests {
         let first = token(Some(2), b"first", None);
         ledger.admit(first.clone(), None).unwrap();
         assert!(matches!(ledger.admit(token(Some(1), b"second", None), None),
-            Err(FcpError::ResourceExhausted { retry_after_ms: None, .. })));
+            Err(FcpError::ResourceExhausted { .. })));
         ledger.admit(first.clone(), None).unwrap();
         assert!(ledger.admit(first, None).is_err());
         assert_eq!(ledger.lock().unwrap().len(), 1);
