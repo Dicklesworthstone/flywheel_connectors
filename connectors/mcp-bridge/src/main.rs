@@ -27,6 +27,7 @@ use std::io::{BufRead, Write};
 
 use anyhow::Result;
 use fcp_async_core::runtime::Builder;
+use fcp_sdk::prelude::{JsonlConfig, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_mcp_bridge::connector::McpBridgeConnector;
@@ -44,51 +45,31 @@ fn main() -> Result<()> {
 
 fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout = std::io::stdout();
+    run_fcp_loop_with_io(stdin.lock(), stdout.lock(), JsonlConfig::default())
+}
+
+/// Use the production framing and dispatch path in both the binary and tests.
+fn run_fcp_loop_with_io(
+    reader: impl BufRead,
+    writer: impl Write,
+    config: JsonlConfig,
+) -> Result<()> {
     let mut connector = McpBridgeConnector::new();
-
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.is_empty() {
-            continue;
-        }
-
-        let response = runtime.block_on(async { handle_message(&mut connector, &line).await });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+    serve_jsonl(reader, writer, config, |method, params| {
+        runtime.block_on(dispatch(&mut connector, method, params))
+    })?;
     Ok(())
 }
 
-async fn handle_message(connector: &mut McpBridgeConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => {
-            return serde_json::json!({
-                "error": {
-                    "code": "FCP-1001",
-                    "message": format!("Invalid JSON: {e}")
-                }
-            });
-        }
-    };
-
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let result = match method {
+/// Dispatch only validated envelopes; leave operation validation to the connector.
+async fn dispatch(
+    connector: &mut McpBridgeConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
         "health" => connector.handle_health().await,
@@ -102,35 +83,153 @@ async fn handle_message(connector: &mut McpBridgeConnector, message: &str) -> se
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
+    }
+}
 
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Cursor};
+
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn replies(output: &[u8]) -> Vec<Value> {
+        output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("JSON response"))
+            .collect()
+    }
+
+    #[test]
+    fn shutdown_flushes_ack_and_leaves_following_request_unread() {
+        let shutdown = b"{\"id\":7,\"method\":\"shutdown\"}\n";
+        let mut input = shutdown.to_vec();
+        input.extend_from_slice(b"{\"id\":8,\"method\":\"configure\",\"params\":{}}\n");
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(&mut reader, &mut output, JsonlConfig::default()).unwrap();
+        assert_eq!(reader.position(), shutdown.len() as u64);
+        assert_eq!(replies(&output), vec![json!({"jsonrpc":"2.0","id":7,"result":{}})]);
+    }
+
+    #[test]
+    fn malformed_frames_recover_without_dispatching_shutdown() {
+        let input = concat!(
+            "not-json\n",
+            "{\"jsonrpc\":\"1.0\",\"method\":\"shutdown\",\"id\":1}\n",
+            "{\"method\":\"health\",\"id\":2}\n",
+            "{\"method\":\"shutdown\",\"id\":3}\n",
+        );
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
+        let responses = replies(&output);
+        assert_eq!(responses.len(), 4);
+        for response in &responses[..2] {
+            assert_eq!(response["error"]["code"], "FCP-1001");
         }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
+        assert_eq!(responses[2]["id"], 2);
+        assert_eq!(responses[2]["result"]["configured"], false);
+        assert_eq!(responses[3]["id"], 3);
+        assert_eq!(responses[3]["result"], json!({}));
+    }
+
+    #[test]
+    fn configuration_and_nine_operation_catalog_survive_shared_framing() {
+        // Configuration and FCP handshake are local; no upstream MCP call occurs.
+        let input = concat!(
+            "{\"id\":1,\"method\":\"configure\",\"params\":{\"mcp_url\":\"http://127.0.0.1:1\"}}\n",
+            "{\"id\":2,\"method\":\"handshake\",\"params\":{\"session_id\":\"local-test\"}}\n",
+            "{\"id\":3,\"method\":\"health\"}\n",
+            "{\"id\":4,\"method\":\"introspect\"}\n",
+            "{\"id\":5,\"method\":\"shutdown\"}\n",
+        );
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
+        let responses = replies(&output);
+        assert_eq!(responses.len(), 5);
+        for (index, response) in responses.iter().enumerate() {
+            assert_eq!(response["id"], index + 1);
+            assert!(response.get("error").is_none(), "{response}");
         }
+        assert_eq!(responses[2]["result"]["configured"], true);
+        assert_eq!(responses[2]["result"]["handshaken"], true);
+        let operations = responses[3]["result"]["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 9);
+        for id in ["mcp.prompts.get", "mcp.resources.templates.list"] {
+            assert!(operations.iter().any(|operation| operation["id"] == id));
+        }
+    }
+
+    #[test]
+    fn oversized_frame_stops_before_configure_and_hides_its_payload() {
+        let input = concat!(
+            "{\"method\":\"configure\",\"params\":{\"api_key\":\"do-not-echo\"}}\n",
+            "{\"method\":\"health\"}\n",
+        );
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        assert!(run_fcp_loop_with_io(
+            &mut reader,
+            &mut output,
+            JsonlConfig { max_request_bytes: 16 },
+        ).is_err());
+        assert_eq!(reader.position(), 18);
+        let responses = replies(&output);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"]["code"], "FCP-1004");
+        assert!(!String::from_utf8(output).unwrap().contains("do-not-echo"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_frames_are_ignored() {
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new("\n \t\r\n"), &mut output, JsonlConfig::default()).unwrap();
+        assert!(output.is_empty());
+    }
+
+    struct FailedOutput {
+        fail_write: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn assert_output_failure_stops_dispatch(fail_write: bool) {
+        let first = "{\"id\":1,\"method\":\"health\"}\n";
+        let input = format!("{first}{{\"id\":2,\"method\":\"configure\",\"params\":{{}}}}\n");
+        let mut reader = Cursor::new(input);
+        let mut output = FailedOutput { fail_write, bytes: Vec::new() };
+        assert!(run_fcp_loop_with_io(&mut reader, &mut output, JsonlConfig::default()).is_err());
+        assert_eq!(reader.position(), first.len() as u64);
+        if !fail_write {
+            let responses = replies(&output.bytes);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0]["id"], 1);
+        }
+    }
+
+    #[test]
+    fn write_failure_stops_dispatch_without_retry() {
+        assert_output_failure_stops_dispatch(true);
+    }
+
+    #[test]
+    fn flush_failure_stops_dispatch_without_retry() {
+        assert_output_failure_stops_dispatch(false);
     }
 }
