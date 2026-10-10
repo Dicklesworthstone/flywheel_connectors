@@ -16,6 +16,8 @@ use super::{McpClient, transport};
 use crate::error::{McpBridgeError, McpBridgeResult};
 use crate::types::JsonRpcRequest;
 
+mod discovery;
+
 pub(super) const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_SESSION_ID_BYTES: usize = 1024;
 

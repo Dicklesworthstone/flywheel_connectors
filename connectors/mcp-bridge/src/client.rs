@@ -254,9 +254,11 @@ impl McpClient {
 
     // -- MCP Operations --
 
-    /// List tools from the MCP server.
+    /// List every tool under one deadline (128 pages, 10,000 entries, 16 MiB).
+    /// Returns an error rather than a partial catalog when a limit is exceeded.
+    /// Use `rpc_call("tools/list", params)` for an explicit single-page request.
     pub async fn tools_list(&self) -> McpBridgeResult<serde_json::Value> {
-        self.rpc_call("tools/list", json!({})).await
+        self.discovery_list("tools/list").await
     }
 
     /// Call a tool on the MCP server.
@@ -275,9 +277,9 @@ impl McpClient {
         .await
     }
 
-    /// List resources from the MCP server.
+    /// List every resource with the same aggregate bounds as [`Self::tools_list`].
     pub async fn resources_list(&self) -> McpBridgeResult<serde_json::Value> {
-        self.rpc_call("resources/list", json!({})).await
+        self.discovery_list("resources/list").await
     }
 
     /// Read a resource from the MCP server.
@@ -285,9 +287,9 @@ impl McpClient {
         self.rpc_call("resources/read", json!({"uri": uri})).await
     }
 
-    /// List prompts from the MCP server.
+    /// List every prompt with the same aggregate bounds as [`Self::tools_list`].
     pub async fn prompts_list(&self) -> McpBridgeResult<serde_json::Value> {
-        self.rpc_call("prompts/list", json!({})).await
+        self.discovery_list("prompts/list").await
     }
 }
 
