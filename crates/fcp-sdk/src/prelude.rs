@@ -144,6 +144,10 @@ pub use crate::{RetryDecision, RetryPolicy};
 mod jsonl;
 pub use jsonl::{JsonlConfig, serve_jsonl};
 
+/// Instance-bound authority for standalone connector control channels.
+mod standalone;
+pub use standalone::StandaloneSession;
+
 // External crates commonly needed
 pub use serde::{Deserialize, Serialize};
 pub use serde_json::json;
