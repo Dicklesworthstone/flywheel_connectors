@@ -3,7 +3,7 @@
 //! Session publication follows the initialized notification, not just the
 //! initialize response. A cancelled initializer leaves no half-ready state.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -20,6 +20,11 @@ mod discovery;
 
 pub(super) const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_SESSION_ID_BYTES: usize = 1024;
+
+fn is_cursor_continuation(method: &str, params: &Value) -> bool {
+    matches!(method, "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list")
+        && params.get("cursor").is_some()
+}
 
 pub(super) struct McpSession {
     pub(super) id: Option<HeaderValue>,
@@ -162,6 +167,24 @@ impl McpClient {
         }
     }
 
+    async fn bind_continuation_session(
+        &self,
+        bound: &OnceLock<Arc<McpSession>>,
+        session: &Arc<McpSession>,
+    ) -> McpBridgeResult<()> {
+        let original = bound.get_or_init(|| Arc::clone(session));
+        let current = self.session.lock().await;
+        if Arc::ptr_eq(original, session)
+            && current.as_ref().is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            Ok(())
+        } else {
+            Err(transport::invalid_response(
+                "MCP session changed during cursor continuation; restart discovery from page one",
+            ))
+        }
+    }
+
     pub(super) async fn execute_session_rpc(
         &self,
         method: &str,
@@ -190,10 +213,16 @@ impl McpClient {
         let context = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let recovered = AtomicBool::new(false);
+        // Explicit single-page callers manage cursor lifetime across calls.
+        // Within this call, retries may not move a continuation to another
+        // negotiated session, even when the server reuses its opaque ID.
+        let continuation = is_cursor_continuation(method, &request.params);
+        let cursor_session = OnceLock::new();
         RetryLoop::execute(&context, &policy, |attempt| {
             let url = &url;
             let request = &request;
             let recovered = &recovered;
+            let cursor_session = &cursor_session;
             async move {
                 let session = match self.ensure_session(url).await {
                     Ok(session) => session,
@@ -206,15 +235,32 @@ impl McpClient {
                     }
                     Err(error) => return AttemptOutcome::Terminal(error),
                 };
+                if continuation
+                    && let Err(error) = self.bind_continuation_session(cursor_session, &session).await
+                {
+                    return AttemptOutcome::Terminal(error);
+                }
                 if !session.allows_method(method) {
                     return AttemptOutcome::Terminal(transport::invalid_response(
                         "server did not negotiate the requested capability",
                     ));
                 }
                 match self.rpc_call_once(url, request, Some(&session)).await {
-                    Ok(value) => AttemptOutcome::Success(value),
+                    Ok(value) => {
+                        if continuation
+                            && let Err(error) = self.bind_continuation_session(cursor_session, &session).await
+                        {
+                            return AttemptOutcome::Terminal(error);
+                        }
+                        AttemptOutcome::Success(value)
+                    }
                     Err(RpcFailure::SessionExpired) => {
                         self.invalidate_session(&session).await;
+                        if continuation {
+                            return AttemptOutcome::Terminal(transport::invalid_response(
+                                "MCP session expired during cursor continuation; restart discovery from page one",
+                            ));
+                        }
                         let error = McpBridgeError::NotFound {
                             resource: "negotiated MCP session no longer exists".into(),
                         };
@@ -262,3 +308,6 @@ impl McpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod continuation_tests;
