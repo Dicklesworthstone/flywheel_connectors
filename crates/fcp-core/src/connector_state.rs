@@ -897,6 +897,21 @@ pub enum ConnectorStateError {
         /// Canonical head at the time of conflict.
         canonical_head: Option<ObjectId>,
     },
+    /// A singleton writer has been superseded by a committed fencing token.
+    ///
+    /// Refreshing only the prev pointer cannot authorize this writer again;
+    /// it must obtain current lease authority before retrying.
+    #[error(
+        "connector state lease is stale for {connector_id}: held {held_seq}, current {current_seq}"
+    )]
+    StaleLease {
+        /// Connector whose write was fenced out.
+        connector_id: ConnectorId,
+        /// Fencing token carried by the rejected state object.
+        held_seq: u64,
+        /// Fencing token on the current canonical head.
+        current_seq: u64,
+    },
     /// The state payload or object envelope was malformed.
     #[error("malformed connector state for {connector_id}: {reason}")]
     MalformedState {
@@ -1031,7 +1046,7 @@ pub trait ConnectorStateStore: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns [`ConnectorStateError`] if the object is malformed, unauthorized,
-    /// or canonical storage cannot persist it.
+    /// fenced out by a newer committed lease, or canonical storage cannot persist it.
     async fn append_object(
         &self,
         connector_id: &ConnectorId,

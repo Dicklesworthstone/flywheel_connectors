@@ -24,7 +24,7 @@ use fcp_prelude::{
     ConnectorStateSnapshot, ConnectorStateStore, ConnectorStateWriteAuthorization, InstanceId,
     ObjectHeader, ObjectId, ObjectIdKey, RetentionClass, StorageMeta, StoredObject, ZoneId,
 };
-use futures_util::stream;
+use futures_util::{lock::Mutex as AsyncMutex, stream};
 use parking_lot::RwLock;
 use semver::Version;
 use serde::Serialize;
@@ -136,6 +136,15 @@ pub enum ConnectorStateStoreError {
         expected: u64,
         /// Incoming sequence number.
         got: u64,
+    },
+
+    /// A singleton writer's lease was superseded by the canonical head.
+    #[error("connector state lease is stale: held {held_seq}, current {current_seq}")]
+    StaleLease {
+        /// Fencing token carried by the incoming state object.
+        held_seq: u64,
+        /// Fencing token on the canonical head.
+        current_seq: u64,
     },
 
     /// The root points at an object that cannot be loaded.
@@ -572,7 +581,34 @@ impl FcpStoreConnectorStateStore {
     ) -> Result<ConnectorStateAppendOutcome> {
         self.validate_incoming_state_object(&state_obj)?;
 
-        let current = self.current_head().await?;
+        // Independently constructed adapters over the same object store must
+        // share the compare-and-commit gate, not just cloned adapters. This is
+        // local serialization; replicated stores still need distributed lease
+        // validation and fork detection at their admission boundary.
+        let _append_guard = self.change_bus.append_guard.lock().await;
+        let root = self.read_root().await?;
+        if let Some((_root_id, root)) = &root
+            && root.model != self.state_model
+        {
+            return Err(ConnectorStateStoreError::IdentityMismatch {
+                field: "model",
+                expected: format!("{:?}", root.model),
+                got: format!("{:?}", self.state_model),
+            });
+        }
+        let current = match root.and_then(|(_root_id, root)| root.head) {
+            Some(head_id) => Some(self.load_state_object(&head_id).await?),
+            None => None,
+        };
+        if self.state_model.is_singleton_writer()
+            && let Some((_head_id, head)) = &current
+            && state_obj.lease_seq < head.lease_seq
+        {
+            return Err(ConnectorStateStoreError::StaleLease {
+                held_seq: state_obj.lease_seq,
+                current_seq: head.lease_seq,
+            });
+        }
         let expected_prev = current.as_ref().map(|(object_id, _state)| *object_id);
         if state_obj.prev != expected_prev {
             return Ok(ConnectorStateAppendOutcome::Conflict {
@@ -595,15 +631,17 @@ impl FcpStoreConnectorStateStore {
             });
         }
 
+        // A cancelled put can have become durable even if its result was not
+        // observed. Invalidate every adapter's cache before releasing the gate
+        // on such an exit, so the next append re-reads canonical storage. The
+        // backing store must order reads after admitted writes, including when
+        // a caller drops its response future.
+        let mut root_write = PendingRootWrite::new(&self.change_bus);
         let object_id = self
             .store_state_object_with_retry(state_obj.clone())
             .await?;
         let root = self.root_for_head(&state_obj, object_id);
         let root_object_id = self.store_root_with_retry(root).await?;
-        let snapshot_object_id = self
-            .maybe_emit_snapshot_after_root_commit(object_id, &state_obj)
-            .await;
-
         self.publish_change(
             ConnectorStateChangeKind::ObjectAppended,
             Some(object_id),
@@ -614,6 +652,13 @@ impl FcpStoreConnectorStateStore {
             Some(root_object_id),
             Some(state_obj.seq),
         );
+        root_write.committed = true;
+
+        // Snapshot failure or cancellation must not hide a committed root
+        // from readers and change subscribers.
+        let snapshot_object_id = self
+            .maybe_emit_snapshot_after_root_commit(object_id, &state_obj)
+            .await;
         if let Some(snapshot_object_id) = snapshot_object_id {
             self.publish_change(
                 ConnectorStateChangeKind::SnapshotEmitted,
@@ -750,6 +795,7 @@ impl FcpStoreConnectorStateStore {
     }
 
     async fn flush_before_lease_yield_inner(&self) -> Result<ConnectorStateLeaseYieldFlush> {
+        let _append_guard = self.change_bus.append_guard.lock().await;
         let Some((root_object_id, root)) = self.read_root().await? else {
             return Ok(ConnectorStateLeaseYieldFlush::missing(self));
         };
@@ -861,6 +907,7 @@ impl FcpStoreConnectorStateStore {
     }
 
     async fn compact_inner(&self, before_seq: u64) -> Result<usize> {
+        let _append_guard = self.change_bus.append_guard.lock().await;
         // The current head is still referenced by the root, so relaxing its
         // retention would let a retention-only GC strand the live chain
         // (`read_root`/`current_head` would then fail with `MissingHead`).
@@ -1569,6 +1616,14 @@ impl FcpStoreConnectorStateStore {
                     reason: format!("root references missing state object {head}"),
                 }
             }
+            ConnectorStateStoreError::StaleLease {
+                held_seq,
+                current_seq,
+            } => ConnectorStateError::StaleLease {
+                connector_id: self.connector_id.clone(),
+                held_seq,
+                current_seq,
+            },
             ConnectorStateStoreError::UnexpectedSchema { .. }
             | ConnectorStateStoreError::IdentityMismatch { .. }
             | ConnectorStateStoreError::HeaderBodyMismatch
@@ -1719,6 +1774,7 @@ impl ConnectorStateStore for FcpStoreConnectorStateStore {
 struct ConnectorStateChangeBus {
     sender: broadcast::Sender<ConnectorStateChange>,
     root_generation: AtomicU64,
+    append_guard: AsyncMutex<()>,
 }
 
 impl ConnectorStateChangeBus {
@@ -1727,6 +1783,7 @@ impl ConnectorStateChangeBus {
         Self {
             sender,
             root_generation: AtomicU64::new(0),
+            append_guard: AsyncMutex::new(()),
         }
     }
 
@@ -1736,6 +1793,31 @@ impl ConnectorStateChangeBus {
 
     fn mark_root_updated(&self) {
         self.root_generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Invalidate a possibly committed root before an interrupted append releases
+/// its serialization gate. This does not claim that a failed put committed;
+/// it makes the next reader resolve that uncertainty from storage.
+struct PendingRootWrite<'a> {
+    change_bus: &'a ConnectorStateChangeBus,
+    committed: bool,
+}
+
+impl<'a> PendingRootWrite<'a> {
+    const fn new(change_bus: &'a ConnectorStateChangeBus) -> Self {
+        Self {
+            change_bus,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for PendingRootWrite<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.change_bus.mark_root_updated();
+        }
     }
 }
 
@@ -1804,8 +1886,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        MemoryObjectStore, MemoryObjectStoreConfig, MemorySymbolStore, MemorySymbolStoreConfig,
-        ObjectSymbolMeta, ObjectTransmissionInfo, StoredSymbol, SymbolMeta,
+        DurableObjectStore, DurableObjectStoreConfig, MemoryObjectStore, MemoryObjectStoreConfig,
+        MemorySymbolStore, MemorySymbolStoreConfig, ObjectSymbolMeta, ObjectTransmissionInfo,
+        StoredSymbol, SymbolMeta,
     };
 
     fn run_async<F, T>(future: F) -> T
@@ -1877,6 +1960,114 @@ mod tests {
                 ));
             }
             self.inner.put(object).await
+        }
+
+        async fn get(&self, id: &ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
+            self.inner.get(id).await
+        }
+
+        async fn exists(&self, id: &ObjectId) -> bool {
+            self.inner.exists(id).await
+        }
+
+        async fn delete(&self, id: &ObjectId) -> std::result::Result<(), ObjectStoreError> {
+            self.inner.delete(id).await
+        }
+
+        async fn get_header(
+            &self,
+            id: &ObjectId,
+        ) -> std::result::Result<ObjectHeader, ObjectStoreError> {
+            self.inner.get_header(id).await
+        }
+
+        async fn get_storage_meta(
+            &self,
+            id: &ObjectId,
+        ) -> std::result::Result<StorageMeta, ObjectStoreError> {
+            self.inner.get_storage_meta(id).await
+        }
+
+        async fn set_retention(
+            &self,
+            id: &ObjectId,
+            retention: RetentionClass,
+        ) -> std::result::Result<(), ObjectStoreError> {
+            self.inner.set_retention(id, retention).await
+        }
+
+        async fn list_zone(&self, zone_id: &ZoneId) -> Vec<ObjectId> {
+            self.inner.list_zone(zone_id).await
+        }
+
+        async fn storage_used(&self) -> u64 {
+            self.inner.storage_used().await
+        }
+
+        async fn storage_quota(&self) -> u64 {
+            self.inner.storage_quota().await
+        }
+    }
+
+    /// Hold one real memory-store put at a selected persistence boundary.
+    /// Tests poll the competing operations explicitly, without sleep-based
+    /// scheduling or an executor-specific task cancellation API.
+    struct PausedPutObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        pause_on_put: usize,
+        pause_after_write: bool,
+        puts: AtomicUsize,
+        release: parking_lot::Mutex<(bool, Option<std::task::Waker>)>,
+    }
+
+    impl PausedPutObjectStore {
+        fn new(pause_on_put: usize, pause_after_write: bool) -> Self {
+            Self {
+                inner: store(),
+                pause_on_put,
+                pause_after_write,
+                puts: AtomicUsize::new(0),
+                release: parking_lot::Mutex::new((false, None)),
+            }
+        }
+
+        async fn pause(&self) {
+            std::future::poll_fn(|cx| {
+                let mut release = self.release.lock();
+                if release.0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    release.1 = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+
+        fn release(&self) {
+            let waker = {
+                let mut release = self.release.lock();
+                release.0 = true;
+                release.1.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PausedPutObjectStore {
+        async fn put(&self, object: StoredObject) -> std::result::Result<(), ObjectStoreError> {
+            let put_number = self.puts.fetch_add(1, Ordering::SeqCst) + 1;
+            if put_number == self.pause_on_put && !self.pause_after_write {
+                self.pause().await;
+            }
+            self.inner.put(object).await?;
+            if put_number == self.pause_on_put && self.pause_after_write {
+                self.pause().await;
+            }
+            Ok(())
         }
 
         async fn get(&self, id: &ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
@@ -2394,6 +2585,330 @@ mod tests {
         let (head1, _) = append_ok(&state_store, state(1, Some(head0), lease_id(2)));
         let root = run_async(state_store.read_root()).unwrap().unwrap().1;
         assert_eq!(root.head, Some(head1));
+    }
+
+    #[test]
+    fn append_serializes_shared_store_writers_and_lease_yield() {
+        run_async(async {
+            let object_store = Arc::new(PausedPutObjectStore::new(3, false));
+            let first_store = test_store(object_store.clone());
+            // Construct an independent adapter: sharing only a clone's lock
+            // would not protect real SDK callers that create fresh adapters.
+            let second_store = test_store(object_store.clone());
+            let (authorization, signing_key) = write_authorization_with_key();
+            let connector = connector_id();
+            let base = ConnectorStateStore::append_object(
+                &first_store,
+                &connector,
+                &authorization,
+                signed_state(0, None, lease_id(1), &signing_key),
+            )
+            .await
+            .unwrap();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head0, ..
+            } = base
+            else {
+                panic!("initial append must commit");
+            };
+            assert_eq!(
+                second_store.read_root().await.unwrap().unwrap().1.head,
+                Some(head0)
+            );
+
+            let mut first = Box::pin(ConnectorStateStore::append_object(
+                &first_store,
+                &connector,
+                &authorization,
+                signed_state(1, Some(head0), lease_id(2), &signing_key),
+            ));
+            assert!(futures_util::poll!(first.as_mut()).is_pending());
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 3);
+
+            let mut second = Box::pin(ConnectorStateStore::append_object(
+                &second_store,
+                &connector,
+                &authorization,
+                signed_state(1, Some(head0), lease_id(3), &signing_key),
+            ));
+            assert!(futures_util::poll!(second.as_mut()).is_pending());
+            let mut flush = Box::pin(second_store.flush_before_lease_yield());
+            assert!(futures_util::poll!(flush.as_mut()).is_pending());
+            let mut compact = Box::pin(second_store.compact(u64::MAX));
+            assert!(futures_util::poll!(compact.as_mut()).is_pending());
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 3);
+
+            object_store.release();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head1, ..
+            } = first.await.unwrap()
+            else {
+                panic!("first writer must commit");
+            };
+            assert_eq!(
+                second.await.unwrap(),
+                ConnectorStateAppendOutcome::Conflict {
+                    canonical_head: Some(head1),
+                    canonical_seq: Some(1),
+                }
+            );
+            let flush = flush.await.unwrap();
+            assert_eq!(flush.head_object_id, Some(head1));
+            assert_eq!(flush.last_canonical_seq, Some(1));
+            assert_eq!(compact.await.unwrap(), 1);
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 4);
+            assert_eq!(object_store.list_zone(&zone_id()).await.len(), 4);
+            assert_eq!(
+                object_store
+                    .get_storage_meta(&head1)
+                    .await
+                    .unwrap()
+                    .retention,
+                RetentionClass::Pinned
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_append_after_root_persistence_invalidates_shared_caches() {
+        run_async(async {
+            let object_store = Arc::new(PausedPutObjectStore::new(4, true));
+            let first_store = test_store(object_store.clone());
+            let second_store = test_store(object_store.clone());
+            let initial = first_store
+                .append_object(state(0, None, lease_id(1)))
+                .await
+                .unwrap();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head0, ..
+            } = initial
+            else {
+                panic!("initial append must commit");
+            };
+            // Both adapters cache the old root before the response to the
+            // following durable root write is deliberately lost.
+            assert_eq!(
+                first_store.read_root().await.unwrap().unwrap().1.head,
+                Some(head0)
+            );
+            assert_eq!(
+                second_store.read_root().await.unwrap().unwrap().1.head,
+                Some(head0)
+            );
+            let next = state(1, Some(head0), lease_id(2));
+            let head1 = first_store
+                .stored_object(&next.header, &next, RetentionClass::Pinned)
+                .unwrap()
+                .object_id;
+            let mut interrupted = Box::pin(first_store.append_object(next));
+            assert!(futures_util::poll!(interrupted.as_mut()).is_pending());
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 4);
+            drop(interrupted);
+
+            let conflict = second_store
+                .append_object(state(1, Some(head0), lease_id(3)))
+                .await
+                .unwrap();
+            assert_eq!(
+                conflict,
+                ConnectorStateAppendOutcome::Conflict {
+                    canonical_head: Some(head1),
+                    canonical_seq: Some(1),
+                }
+            );
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 4);
+            assert_eq!(
+                first_store.read_root().await.unwrap().unwrap().1.head,
+                Some(head1)
+            );
+            assert!(matches!(
+                second_store
+                    .append_object(state(2, Some(head1), lease_id(3)))
+                    .await
+                    .unwrap(),
+                ConnectorStateAppendOutcome::Committed { seq: 2, .. }
+            ));
+            assert_eq!(second_store.read_chain(None, 10).await.unwrap().len(), 3);
+        });
+    }
+
+    #[test]
+    fn append_publishes_committed_root_before_optional_snapshot_finishes() {
+        run_async(async {
+            let object_store = Arc::new(PausedPutObjectStore::new(5, false));
+            let first_store = test_store(object_store.clone()).with_snapshot_every_entries(2);
+            let second_store = test_store(object_store.clone());
+            let initial = first_store
+                .append_object(state(0, None, lease_id(1)))
+                .await
+                .unwrap();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head0, ..
+            } = initial
+            else {
+                panic!("initial append must commit");
+            };
+            assert_eq!(
+                second_store.read_root().await.unwrap().unwrap().1.head,
+                Some(head0)
+            );
+            let mut changes =
+                ConnectorStateStore::subscribe_changes(&second_store, &connector_id())
+                    .await
+                    .unwrap();
+            let mut next = Box::pin(first_store.append_object(state(1, Some(head0), lease_id(2))));
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 5);
+
+            for expected in [
+                ConnectorStateChangeKind::ObjectAppended,
+                ConnectorStateChangeKind::RootUpdated,
+            ] {
+                let std::task::Poll::Ready(Some(Ok(change))) = futures_util::poll!(changes.next())
+                else {
+                    panic!("committed root changes must be available while snapshot is pending");
+                };
+                assert_eq!(change.kind, expected);
+                assert_eq!(change.seq, Some(1));
+            }
+            assert_eq!(
+                second_store
+                    .canonical_status(None)
+                    .await
+                    .unwrap()
+                    .last_canonical_seq,
+                Some(1)
+            );
+            drop(next);
+            assert_eq!(
+                second_store
+                    .canonical_status(None)
+                    .await
+                    .unwrap()
+                    .last_canonical_seq,
+                Some(1)
+            );
+        });
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn singleton_fencing_survives_wal_and_checkpoint_reopen() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let (authorization, signing_key) = write_authorization_with_key();
+        let connector = connector_id();
+        for checkpoint_after_ops in [0, 2] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp_dir.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x72; 32]);
+            let head1 = {
+                let state_store =
+                    test_store(Arc::new(DurableObjectStore::open(config.clone()).unwrap()));
+                let initial = ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector,
+                    &authorization,
+                    signed_state(0, None, lease_id(1), &signing_key),
+                )
+                .await
+                .unwrap();
+                let ConnectorStateAppendOutcome::Committed {
+                    object_id: head0, ..
+                } = initial
+                else {
+                    panic!("initial append must commit");
+                };
+                let mut handoff = signed_state(1, Some(head0), lease_id(2), &signing_key);
+                handoff.lease_seq = 50;
+                handoff.sign_with(&signing_key).unwrap();
+                let committed = ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector,
+                    &authorization,
+                    handoff,
+                )
+                .await
+                .unwrap();
+                let ConnectorStateAppendOutcome::Committed { object_id, .. } = committed else {
+                    panic!("new lease holder must commit");
+                };
+                object_id
+            };
+
+            let object_store = Arc::new(DurableObjectStore::open(config).unwrap());
+            let state_store = test_store(object_store.clone());
+            let mut stale = signed_state(2, Some(head1), lease_id(1), &signing_key);
+            stale.lease_seq = 10;
+            stale.sign_with(&signing_key).unwrap();
+            let error =
+                ConnectorStateStore::append_object(&state_store, &connector, &authorization, stale)
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                ConnectorStateError::StaleLease {
+                    connector_id: connector.clone(),
+                    held_seq: 10,
+                    current_seq: 50,
+                }
+            );
+            let serialized = serde_json::to_value(&error).unwrap();
+            assert_eq!(serialized["error"], "stale_lease");
+            assert_eq!(
+                serde_json::from_value::<ConnectorStateError>(serialized).unwrap(),
+                error
+            );
+            assert_eq!(object_store.list_zone(&zone_id()).await.len(), 4);
+            assert_eq!(state_store.current_head().await.unwrap().unwrap().0, head1);
+
+            // Renewing a lease can retain its fencing token while changing the
+            // lease object's content id; that is not a stale writer.
+            let mut renewed = signed_state(2, Some(head1), lease_id(3), &signing_key);
+            renewed.lease_seq = 50;
+            renewed.sign_with(&signing_key).unwrap();
+            assert!(matches!(
+                ConnectorStateStore::append_object(
+                    &state_store,
+                    &connector,
+                    &authorization,
+                    renewed
+                )
+                .await
+                .unwrap(),
+                ConnectorStateAppendOutcome::Committed { seq: 2, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn singleton_fencing_cannot_be_disabled_by_changing_store_model() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone());
+        let (head, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let crdt = ConnectorStateModel::Crdt {
+            crdt_type: fcp_prelude::CrdtType::LwwMap,
+        };
+        let changed_model = test_store(object_store).with_state_model(crdt.clone());
+        let mut stale = state(1, Some(head), lease_id(2));
+        stale.lease_seq = 1;
+        stale.sign_with(&test_state_signing_key()).unwrap();
+        assert!(matches!(
+            run_async(changed_model.append_object(stale)),
+            Err(ConnectorStateStoreError::IdentityMismatch { field: "model", .. })
+        ));
+
+        let crdt_store = test_store(store()).with_state_model(crdt);
+        let (crdt_head, _) = append_ok(&crdt_store, state(0, None, lease_id(1)));
+        let mut independent_writer = state(1, Some(crdt_head), lease_id(2));
+        independent_writer.lease_seq = 1;
+        independent_writer
+            .sign_with(&test_state_signing_key())
+            .unwrap();
+        assert!(matches!(
+            run_async(crdt_store.append_object(independent_writer)).unwrap(),
+            ConnectorStateAppendOutcome::Committed { seq: 1, .. }
+        ));
     }
 
     #[test]
