@@ -671,6 +671,7 @@ async fn run_owned(
         receipt_recorded,
         audit_event_id,
         sampling_completed: None,
+        sampling_operation_id: None,
         response_http_status: None,
     };
 
@@ -694,6 +695,7 @@ async fn run_owned(
                     asserted_principal.as_deref(),
                     &request,
                     response,
+                    &ticket,
                     deadline,
                 )
                 .await

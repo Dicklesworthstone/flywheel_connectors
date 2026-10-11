@@ -582,6 +582,12 @@ pub struct InvocationFinalization {
     /// Hash-linked host audit event identifier, if recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
+    /// Planned sampling child operation ID, recorded before child admission.
+    ///
+    /// This is a lookup link, not proof of dispatch or an exact attempt ticket.
+    /// Incomplete child effects block reuse of this operation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_operation_id: Option<String>,
     /// Whether required sampling enrichment completed; absent when not required
     /// or when the host has not yet recorded the enrichment decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4849,6 +4855,14 @@ impl HostAdminStateStore {
         if let Some(audit_event_id) = &finalization.audit_event_id {
             validate_invocation_metadata(audit_event_id, "audit_event_id")?;
         }
+        if let Some(child_id) = &finalization.sampling_operation_id {
+            validate_invocation_metadata(child_id, "sampling_operation_id")?;
+            if child_id == &ticket.operation_id {
+                return Err(HostError::InvalidFilter(
+                    "sampling child must have a distinct operation identifier".to_string(),
+                ));
+            }
+        }
         if finalization
             .response_http_status
             .is_some_and(|status| !(100..=599).contains(&status))
@@ -4877,6 +4891,14 @@ impl HostAdminStateStore {
                     "refusing to replace invocation audit evidence",
                 ));
             }
+            if previous.sampling_operation_id.is_some()
+                && finalization.sampling_operation_id.is_some()
+                && previous.sampling_operation_id != finalization.sampling_operation_id
+            {
+                return Err(invocation_state_error(
+                    "refusing to replace the planned sampling child identifier",
+                ));
+            }
             if previous.response_http_status.is_some()
                 && finalization.response_http_status.is_some()
                 && previous.response_http_status != finalization.response_http_status
@@ -4889,6 +4911,9 @@ impl HostAdminStateStore {
             previous.receipt_recorded |= finalization.receipt_recorded;
             if finalization.audit_event_id.is_some() {
                 previous.audit_event_id = finalization.audit_event_id;
+            }
+            if finalization.sampling_operation_id.is_some() {
+                previous.sampling_operation_id = finalization.sampling_operation_id;
             }
             previous.sampling_completed =
                 match (previous.sampling_completed, finalization.sampling_completed) {
@@ -5727,6 +5752,7 @@ mod tests {
                     budget_recorded: true,
                     receipt_recorded: true,
                     audit_event_id: Some("audit-1".to_string()),
+                    sampling_operation_id: None,
                     sampling_completed: None,
                     response_http_status: Some(200),
                 },
@@ -5902,6 +5928,7 @@ mod tests {
                     budget_recorded: true,
                     receipt_recorded: false,
                     audit_event_id: Some("audit-source".to_string()),
+                    sampling_operation_id: None,
                     sampling_completed: None,
                     response_http_status: None,
                 },
@@ -5954,6 +5981,109 @@ mod tests {
                 .await
                 .is_err(),
             "a final HTTP error does not resolve an ambiguous sampling child",
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_sampling_link_is_immutable_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("linked-invocations.json");
+        let store = HostAdminStateStore::with_state_path(state_path.clone()).unwrap();
+        let ticket = store
+            .admit_invocation(invocation_admission("parent"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+
+        for child_id in [
+            String::new(),
+            "parent".to_string(),
+            "child\ninvalid".to_string(),
+            "x".repeat(MAX_INVOCATION_METADATA_BYTES + 1),
+        ] {
+            assert!(
+                store
+                    .record_invocation_finalization(
+                        &ticket,
+                        InvocationFinalization {
+                            sampling_operation_id: Some(child_id),
+                            sampling_completed: Some(false),
+                            ..InvocationFinalization::default()
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .invocation_record("parent", None)
+                .await
+                .unwrap()
+                .finalization
+                .is_none()
+        );
+
+        store
+            .record_invocation_finalization(
+                &ticket,
+                InvocationFinalization {
+                    sampling_operation_id: Some("planned-child".to_string()),
+                    sampling_completed: Some(false),
+                    ..InvocationFinalization::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_invocation_finalization(
+                    &ticket,
+                    InvocationFinalization {
+                        sampling_operation_id: Some("unrelated-child".to_string()),
+                        sampling_completed: Some(true),
+                        ..InvocationFinalization::default()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        store
+            .record_invocation_finalization(
+                &ticket,
+                InvocationFinalization {
+                    budget_recorded: true,
+                    ..InvocationFinalization::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let reopened = HostAdminStateStore::with_state_path(state_path).unwrap();
+        let record = reopened.invocation_record("parent", None).await.unwrap();
+        let finalization = record.finalization.unwrap();
+        assert_eq!(
+            finalization.sampling_operation_id.as_deref(),
+            Some("planned-child")
+        );
+        assert_eq!(finalization.sampling_completed, Some(false));
+        assert!(finalization.budget_recorded);
+        assert_eq!(finalization.response_http_status, None);
+        assert!(
+            reopened
+                .admit_invocation(invocation_admission("parent"))
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .admit_invocation(invocation_admission("independent"))
+                .await
+                .is_ok(),
+            "semantic link rejections must not fence unrelated durable admission"
         );
     }
 

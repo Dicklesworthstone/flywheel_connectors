@@ -11988,6 +11988,7 @@ async fn maybe_orchestrate_mcp_sampling(
     asserted_principal: Option<&str>,
     source: &InvokeRequest,
     response: InvokeResponse,
+    parent_ticket: &fcp_host::InvocationTicket,
     deadline: Instant,
 ) -> HostResult<(InvokeResponse, Option<bool>)> {
     if source.operation.as_str() != MCP_SAMPLING_HANDLE_OPERATION {
@@ -12005,6 +12006,29 @@ async fn maybe_orchestrate_mcp_sampling(
             "MCP sampling child request must have a distinct invocation id".to_string(),
         ));
     }
+    // Persist the selected child identity before any child preflight or
+    // admission. The link is an inspection path, not evidence of dispatch.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(HostError::Unavailable(
+            "MCP sampling deadline expired before child linkage".to_string(),
+        ));
+    }
+    fcp_async_core::time::timeout(
+        remaining,
+        state.lifecycle.record_invocation_finalization(
+            parent_ticket,
+            fcp_host::InvocationFinalization {
+                sampling_operation_id: Some(downstream_request.id.to_string()),
+                sampling_completed: Some(false),
+                ..fcp_host::InvocationFinalization::default()
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        HostError::Unavailable("MCP sampling child linkage deadline expired".to_string())
+    })??;
 
     tracing::info!(
         event = "mcp_sampling_host_dispatch",
@@ -15231,91 +15255,61 @@ async fn execute_batch_operation(
     state: Arc<AppState>,
     operation: HttpBatchOperation,
     principal_override: Option<Arc<str>>,
+    batch_deadline: Option<Instant>,
 ) -> OperationResult {
     let started_at = Instant::now();
-    let request = operation.request;
-    let connector_id = request.connector_id.clone();
-    let operation_name = request.operation.to_string();
-    let idempotency_key = request.idempotency_key.clone();
-    let zone_id = request.zone_id.clone();
-
-    if let Err(err) = request.validate_idempotency_key() {
-        return OperationResult {
-            id: operation.id,
-            status: OperationResultStatus::Error,
-            output: None,
-            error: Some(batch_error_from_host_error(HostError::InvalidFilter(
-                format!("invalid invoke request: {err}"),
-            ))),
-            duration_ms: elapsed_millis(started_at),
-        };
-    }
-
-    let preflight = evaluate_live_preflight(&state, &request, principal_override.as_deref()).await;
-
-    if !preflight.allowed {
-        let reason = preflight
-            .reason
-            .unwrap_or_else(|| "preflight denied batch operation".to_string());
-        return OperationResult {
-            id: operation.id,
-            status: OperationResultStatus::Error,
-            output: None,
-            error: Some(batch_error_from_host_error(HostError::PreflightFailed(
-                reason,
-            ))),
-            duration_ms: elapsed_millis(started_at),
-        };
-    }
-
-    match state.registry.invoke(request).await {
-        Ok(response) => {
-            let duration_ms = elapsed_millis(started_at);
-            record_invoke_budget_usage(
-                state.budget.as_ref(),
-                Some(&zone_id),
-                &connector_id,
-                &operation_name,
-                Some(&response),
-            )
-            .await;
-            record_invoke_receipt_summary(
-                state.lifecycle.as_ref(),
-                connector_id.as_str(),
-                &operation_name,
-                idempotency_key,
-                &response,
-                duration_ms,
-            )
-            .await;
-            OperationResult {
-                id: operation.id,
-                status: OperationResultStatus::Success,
-                output: Some(
-                    serde_json::to_value(&response)
-                        .unwrap_or_else(|_| json!({ "status": "serialization_error" })),
-                ),
-                error: None,
-                duration_ms,
-            }
-        }
-        Err(err) => {
-            record_invoke_budget_usage(
-                state.budget.as_ref(),
-                Some(&zone_id),
-                &connector_id,
-                &operation_name,
-                None,
-            )
-            .await;
+    // Each admitted member owns its result/finalization even if the batch's
+    // HTTP waiter disappears. Unstarted members remain with the scheduler.
+    let result = invoke_jobs::execute(
+        &state,
+        operation.request,
+        principal_override.as_deref().map(ToOwned::to_owned),
+        batch_deadline,
+    )
+    .await;
+    let duration_ms = elapsed_millis(started_at);
+    match result {
+        Ok(response) if matches!(response.status, InvokeStatus::Error) => {
+            let error = response.error.map_or_else(
+                || BatchOperationError {
+                    code: "CONNECTOR_ERROR".to_string(),
+                    message: "connector returned error status without error details".to_string(),
+                    retry_after_ms: None,
+                },
+                |error| {
+                    let response = error.to_response();
+                    BatchOperationError {
+                        code: response.code,
+                        message: response.message,
+                        retry_after_ms: response.retry_after_ms,
+                    }
+                },
+            );
             OperationResult {
                 id: operation.id,
                 status: OperationResultStatus::Error,
                 output: None,
-                error: Some(batch_error_from_host_error(err)),
-                duration_ms: elapsed_millis(started_at),
+                error: Some(error),
+                duration_ms,
             }
         }
+        Ok(response) => OperationResult {
+            id: operation.id,
+            status: OperationResultStatus::Success,
+            output: Some(
+                serde_json::to_value(&response)
+                    .unwrap_or_else(|_| json!({ "status": "serialization_error" })),
+            ),
+            error: None,
+            duration_ms,
+        },
+        Err(error) => OperationResult {
+            id: operation.id,
+            status: OperationResultStatus::Error,
+            output: None,
+            error: Some(batch_error_from_host_error(error)),
+            duration_ms,
+        },
     }
 }
 
@@ -15344,6 +15338,10 @@ async fn batch_invoke_handler(
     let schedule_report = matches!(request.options.scheduler.mode, BatchSchedulerMode::Adaptive)
         .then_some(schedule_report);
     let timeout = Duration::from_millis(request.options.timeout_ms);
+    // Preserve the original batch budget through every member's preflight,
+    // queue and IO. An unrepresentable huge timeout still uses the elapsed
+    // checks below; it must not become an already-expired Instant.
+    let batch_deadline = started_at.checked_add(timeout);
     let max_parallelism = usize::try_from(request.options.max_parallelism)
         .unwrap_or(usize::MAX)
         .max(1);
@@ -15415,7 +15413,12 @@ async fn batch_invoke_handler(
             }
 
             let chunk_results = join_all(ready.into_iter().map(|operation| {
-                execute_batch_operation(Arc::clone(&state), operation, asserted_principal.clone())
+                execute_batch_operation(
+                    Arc::clone(&state),
+                    operation,
+                    asserted_principal.clone(),
+                    batch_deadline,
+                )
             }))
             .await;
 
@@ -17305,7 +17308,7 @@ deny_ptrace = true
         let mcp_invokes = Arc::new(AtomicU64::new(0));
         let llm_invokes = Arc::new(AtomicU64::new(0));
         let ambiguous_llm_reply = Arc::new(AtomicBool::new(false));
-        let llm_request_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let llm_rpc_count = Arc::new(AtomicU64::new(0));
 
         let (mcp_tx, mut mcp_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let mcp_counter = Arc::clone(&mcp_invokes);
@@ -17366,9 +17369,11 @@ deny_ptrace = true
         let (llm_tx, mut llm_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let llm_counter = Arc::clone(&llm_invokes);
         let ambiguous_reply = Arc::clone(&ambiguous_llm_reply);
-        let observed_ids = Arc::clone(&llm_request_ids);
+        let child_lifecycle = Arc::clone(&lifecycle);
+        let child_rpc_count = Arc::clone(&llm_rpc_count);
         let llm_task = task::spawn(async move {
             while let Some(request) = llm_rx.recv().await {
+                child_rpc_count.fetch_add(1, Ordering::SeqCst);
                 match request.method.as_str() {
                     "introspect" => {
                         let _ = request.response_tx.send(Ok(json!({
@@ -17389,10 +17394,24 @@ deny_ptrace = true
                             OperationId::from_static("groq.chat.completions")
                         );
                         assert_eq!(invoke_request.input["max_tokens"], 64);
-                        observed_ids
-                            .lock()
-                            .expect("child ids")
-                            .push(invoke_request.id.to_string());
+                        let parent_id = invoke_request
+                            .context
+                            .as_ref()
+                            .expect("sampling child context")
+                            .request_tags
+                            .get("fcp.host.parent_request_id")
+                            .expect("sampling parent id");
+                        let parent = child_lifecycle
+                            .invocation_record(parent_id, None)
+                            .await
+                            .expect("parent record before child dispatch");
+                        let parent_finalization = parent.finalization.expect("parent linkage");
+                        assert_eq!(
+                            parent_finalization.sampling_operation_id.as_deref(),
+                            Some(invoke_request.id.0.as_str()),
+                            "the inspection link must persist before child dispatch"
+                        );
+                        assert_eq!(parent_finalization.sampling_completed, Some(false));
                         let response_id = if ambiguous_reply.load(Ordering::SeqCst) {
                             RequestId::new("reply-for-an-unrelated-invocation")
                         } else {
@@ -17546,6 +17565,15 @@ deny_ptrace = true
             .as_str()
             .expect("child request id");
         assert_ne!(child_id, request.id.0.as_str());
+        assert_eq!(
+            source_record
+                .finalization
+                .as_ref()
+                .expect("source finalization")
+                .sampling_operation_id
+                .as_deref(),
+            Some(child_id)
+        );
         let child_record = lifecycle
             .invocation_record(child_id, None)
             .await
@@ -17602,6 +17630,38 @@ deny_ptrace = true
                 .used,
             7
         );
+        let rpc_count_before_failed_link = llm_rpc_count.load(Ordering::SeqCst);
+        maybe_orchestrate_mcp_sampling(
+            &state,
+            None,
+            &request,
+            InvokeResponse::ok(
+                request.id.clone(),
+                json!({
+                    "event": MCP_SAMPLING_EVENT,
+                    "llm_connector": "groq",
+                    "request": {
+                        "params": {
+                            "messages": [{"role": "user", "content": "unadmitted child"}],
+                            "maxTokens": 64
+                        }
+                    }
+                }),
+            ),
+            &fcp_host::InvocationTicket {
+                operation_id: request.id.to_string(),
+                attempt_id: u64::MAX,
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a rejected parent link must block all child work");
+        assert_eq!(
+            llm_rpc_count.load(Ordering::SeqCst),
+            rpc_count_before_failed_link,
+            "failed linkage must not begin child preflight or dispatch"
+        );
+
         ambiguous_llm_reply.store(true, Ordering::SeqCst);
         let mut ambiguous_request = request;
         ambiguous_request.id = RequestId::random();
@@ -17613,24 +17673,25 @@ deny_ptrace = true
         )
         .await
         .expect_err("mismatched child reply leaves its effect unknown");
-        let ambiguous_child_id = llm_request_ids
-            .lock()
-            .expect("child ids")
-            .last()
-            .expect("ambiguous child was dispatched")
-            .clone();
+        let ambiguous_source = lifecycle
+            .invocation_record(&ambiguous_source_id, None)
+            .await
+            .expect("definite source and ambiguous child retained");
+        let ambiguous_child_id = ambiguous_source
+            .finalization
+            .as_ref()
+            .expect("parent finalization")
+            .sampling_operation_id
+            .as_ref()
+            .expect("parent evidence identifies the unresolved child");
         let ambiguous_child = lifecycle
-            .invocation_record(&ambiguous_child_id, None)
+            .invocation_record(ambiguous_child_id, None)
             .await
             .expect("ambiguous child retained");
         assert_eq!(
             ambiguous_child.terminal.expect("child terminal").outcome,
             fcp_host::InvocationOutcome::OutcomeUnknown
         );
-        let ambiguous_source = lifecycle
-            .invocation_record(&ambiguous_source_id, None)
-            .await
-            .expect("definite source and ambiguous child retained");
         assert_eq!(
             ambiguous_source.terminal.as_ref().expect("source terminal").outcome,
             fcp_host::InvocationOutcome::Succeeded
@@ -25656,6 +25717,327 @@ deny_ptrace = true
                 .contains("cancellation principal mismatch"),
             "expected cancellation owner mismatch, got: {error}"
         );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn batch_owned_members_preserve_errors_dependencies_and_disconnected_results() {
+        let lifecycle = Arc::new(HostAdminStateStore::new());
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        register_test_capability_issuer(
+            lifecycle.as_ref(),
+            &signing_key,
+            "batch-owned",
+            "batch.execute",
+            "batch.execute",
+            ZoneId::work().as_str(),
+        )
+        .await;
+        let introspection = serde_json::to_value(dispatcher_introspection(
+            "batch.execute",
+            "batch.execute",
+            SafetyTier::Safe,
+        ))
+        .expect("introspection");
+        let observed_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let actor_ids = Arc::clone(&observed_ids);
+        let actor_lifecycle = Arc::clone(&lifecycle);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            let mut release_rx = Some(release_rx);
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin(), "batch command is admitted");
+                let result = match rpc.method.as_str() {
+                    "introspect" => introspection.clone(),
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("batch invoke");
+                        actor_ids
+                            .lock()
+                            .expect("observed ids")
+                            .push(request.id.to_string());
+                        let response = match request.input["behavior"].as_str() {
+                            Some("rate_limit") => InvokeResponse::error(
+                                request.id,
+                                fcp_core::FcpError::RateLimited {
+                                    retry_after_ms: 5_000,
+                                    violation: None,
+                                },
+                            ),
+                            Some("missing_error") => {
+                                let mut response = InvokeResponse::ok(request.id, json!({}));
+                                response.status = InvokeStatus::Error;
+                                response.result = None;
+                                response
+                            }
+                            Some("blocked") => {
+                                assert_eq!(request.deadline_ms, Some(10_000));
+                                assert!(
+                                    rpc.rpc.remaining() <= Duration::from_secs(2),
+                                    "the original batch deadline caps physical IO"
+                                );
+                                let record = actor_lifecycle
+                                    .invocation_record(&request.id.to_string(), None)
+                                    .await
+                                    .expect("batch admission precedes dispatch");
+                                assert!(record.terminal.is_none());
+                                started_tx
+                                    .take()
+                                    .expect("one blocked member")
+                                    .send(record.ticket)
+                                    .expect("started observer");
+                                release_rx
+                                    .take()
+                                    .expect("one release")
+                                    .await
+                                    .expect("release owned member");
+                                InvokeResponse::ok(request.id, json!({ "finished": true }))
+                                    .with_receipt_id(ObjectId::from_bytes([42; 32]))
+                                    .with_usage_metrics(vec![UsageMetric::requests(4)])
+                            }
+                            Some("success") => {
+                                InvokeResponse::ok(request.id, json!({ "finished": true }))
+                                    .with_usage_metrics(vec![UsageMetric::requests(2)])
+                            }
+                            behavior => panic!("unexpected batch behavior {behavior:?}"),
+                        };
+                        serde_json::to_value(response).expect("batch response")
+                    }
+                    method => panic!("unexpected connector method {method}"),
+                };
+                assert!(
+                    rpc.rpc.try_settle_reply(),
+                    "dropping the batch waiter must preserve an admitted member"
+                );
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let registry = dispatcher_registry_with_connector(
+            "batch-owned",
+            dispatcher_test_connector("batch-owned", runner_tx, runner_task),
+            dispatcher_test_config("batch-owned"),
+        );
+        let state = dispatcher_app_state(
+            registry,
+            Arc::clone(&lifecycle),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        state
+            .budget
+            .upsert_policy(
+                ZoneId::work(),
+                UsageBudgetPolicy {
+                    enforcement: BudgetEnforcement::Deny,
+                    budgets: vec![UsageBudgetLimit {
+                        metric: UsageMetricKind::Requests,
+                        limit: 100,
+                        window_seconds: 60,
+                    }],
+                },
+            )
+            .await;
+        let capability_token = test_capability_token(
+            &signing_key,
+            "batch.execute",
+            "batch.execute",
+            ZoneId::work().as_str(),
+        );
+        let member = |id: &str, behavior: &str, depends_on: Vec<String>| HttpBatchOperation {
+            id: id.to_string(),
+            request: InvokeRequest {
+                r#type: "invoke".to_string(),
+                id: RequestId::new(id),
+                connector_id: ConnectorId::from_static("batch-owned"),
+                operation: OperationId::from_static("batch.execute"),
+                zone_id: ZoneId::work(),
+                input: json!({ "behavior": behavior }),
+                capability_token: capability_token.clone(),
+                holder_proof: None,
+                context: None,
+                idempotency_key: Some(format!("key-{id}")),
+                lease_seq: None,
+                deadline_ms: Some(10_000),
+                correlation_id: None,
+                provenance: None,
+                approval_tokens: Vec::new(),
+            },
+            depends_on,
+            scheduler: BatchScheduleHint::default(),
+        };
+
+        let stopped = batch_invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(HttpBatchInvokeRequest {
+                operations: vec![
+                    member("00-limit", "rate_limit", Vec::new()),
+                    member("01-unstarted", "success", Vec::new()),
+                    member("02-dependent", "success", vec!["00-limit".to_string()]),
+                ],
+                options: BatchOptions {
+                    max_parallelism: 1,
+                    stop_on_first_error: true,
+                    ..BatchOptions::default()
+                },
+            }),
+        )
+        .await
+        .expect("structured stopped batch")
+        .0;
+        assert_eq!(stopped.status, BatchStatus::Aborted);
+        assert_eq!((stopped.completed, stopped.failed, stopped.skipped), (0, 1, 2));
+        assert_eq!(stopped.results[0].status, OperationResultStatus::Error);
+        assert!(stopped.results[0].output.is_none());
+        let error = stopped.results[0].error.as_ref().expect("connector error");
+        assert_eq!(error.code, "FCP-3002");
+        assert_eq!(error.retry_after_ms, Some(5_000));
+        assert!(error.message.contains("5000"));
+        assert_eq!(stopped.results[1].status, OperationResultStatus::Skipped);
+        assert_eq!(stopped.results[2].status, OperationResultStatus::Skipped);
+
+        let continued = batch_invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(HttpBatchInvokeRequest {
+                operations: vec![
+                    member("10-limit", "rate_limit", Vec::new()),
+                    member("11-independent", "success", Vec::new()),
+                    member("12-dependent", "success", vec!["10-limit".to_string()]),
+                ],
+                options: BatchOptions {
+                    max_parallelism: 1,
+                    stop_on_first_error: false,
+                    ..BatchOptions::default()
+                },
+            }),
+        )
+        .await
+        .expect("structured continuing batch")
+        .0;
+        assert_eq!(continued.status, BatchStatus::PartialSuccess);
+        assert_eq!(
+            (continued.completed, continued.failed, continued.skipped),
+            (1, 1, 1)
+        );
+        assert_eq!(continued.results[1].status, OperationResultStatus::Success);
+        assert_eq!(
+            continued.results[1].output.as_ref().expect("successful output")["result"]["finished"],
+            true
+        );
+        assert_eq!(continued.results[2].status, OperationResultStatus::Skipped);
+        assert_eq!(
+            continued.results[2].error.as_ref().expect("dependency denial").code,
+            "DEP_FAILED"
+        );
+        let incomplete_error = batch_invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(HttpBatchInvokeRequest {
+                operations: vec![member("20-missing", "missing_error", Vec::new())],
+                options: BatchOptions::default(),
+            }),
+        )
+        .await
+        .expect("structured missing connector error")
+        .0;
+        assert_eq!(incomplete_error.failed, 1);
+        let error = incomplete_error.results[0].error.as_ref().expect("error");
+        assert_eq!(error.code, "CONNECTOR_ERROR");
+        assert_eq!(error.retry_after_ms, None);
+        let source_error = lifecycle
+            .invocation_record("20-missing", None)
+            .await
+            .expect("owned error outcome");
+        assert_eq!(
+            source_error.terminal.expect("terminal").outcome,
+            fcp_host::InvocationOutcome::ConnectorError
+        );
+
+        let disconnected_batch = HttpBatchInvokeRequest {
+            operations: vec![
+                member("30-blocked", "blocked", Vec::new()),
+                member("31-never-admitted", "success", Vec::new()),
+                member("32-dependent", "success", vec!["30-blocked".to_string()]),
+            ],
+            options: BatchOptions {
+                max_parallelism: 1,
+                timeout_ms: 2_000,
+                ..BatchOptions::default()
+            },
+        };
+        let http_state = Arc::clone(&state);
+        let waiter = task::spawn(async move {
+            batch_invoke_handler(
+                State(http_state),
+                HeaderMap::new(),
+                Json(disconnected_batch),
+            )
+            .await
+        });
+        let ticket = started_rx.await.expect("member admitted");
+        assert!(state.invoke_jobs.is_active(&ticket.operation_id));
+        waiter.abort();
+        assert!(waiter.await.is_err(), "batch HTTP waiter disconnected");
+        release_tx.send(()).expect("admitted member remains owned");
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("owned members finalized");
+
+        let completed = lifecycle
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .expect("completed owned member");
+        assert_eq!(
+            completed.terminal.expect("terminal").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        let finalization = completed.finalization.expect("finalization");
+        assert!(finalization.budget_recorded);
+        assert!(finalization.receipt_recorded);
+        assert!(finalization.audit_event_id.is_some());
+        assert_eq!(finalization.response_http_status, Some(200));
+        for never_admitted in [
+            "01-unstarted",
+            "02-dependent",
+            "12-dependent",
+            "31-never-admitted",
+            "32-dependent",
+        ] {
+            assert!(
+                lifecycle.invocation_record(never_admitted, None).await.is_none(),
+                "{never_admitted} must never acquire ownership or dispatch"
+            );
+        }
+        assert_eq!(
+            *observed_ids.lock().expect("observed ids"),
+            ["00-limit", "10-limit", "11-independent", "20-missing", "30-blocked"]
+        );
+        assert_eq!(
+            state
+                .budget
+                .snapshot(&ZoneId::work())
+                .await
+                .expect("budget")
+                .budgets[0]
+                .used,
+            9,
+            "each source request is accounted once, including disconnected members"
+        );
+        let receipts = lifecycle
+            .query_receipts(&ReceiptQueryRequest {
+                connector_id: "batch-owned".to_string(),
+                operation: None,
+                after: None,
+                limit: 10,
+            })
+            .await;
+        assert_eq!(receipts.receipts.len(), 1);
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
