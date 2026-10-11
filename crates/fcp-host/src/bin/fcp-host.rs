@@ -8312,6 +8312,9 @@ async fn route_connector_self_check(
     match local_connector_self_check(state, connector_id, zone_id).await {
         Ok(response) => return Ok(Some(response.report)),
         Err((StatusCode::NOT_FOUND, _)) => {}
+        Err((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, message)) => {
+            return Ok(Some(SelfCheckReport::failed("self_check_zone_denied", message)));
+        }
         Err((_, message)) => return Err(HostError::RegistryError(message)),
     }
     let Some(router) = state.mesh.clone() else {
@@ -8321,7 +8324,7 @@ async fn route_connector_self_check(
     if !decision.is_forward() {
         return Ok(None);
     }
-    let response: fcp_host::doctor::HostConnectorSelfCheckResponse = mesh_forward_query(
+    let response: fcp_host::HostConnectorSelfCheckResponse = match mesh_forward_query(
         &router,
         decision,
         fcp_mesh::invoke_route::MeshForwardBody::SelfCheck {
@@ -8330,7 +8333,13 @@ async fn route_connector_self_check(
         },
     )
     .await
-    .map_err(|(_, message)| HostError::RegistryError(message))?;
+    {
+        Ok(response) => response,
+        Err((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, message)) => {
+            return Ok(Some(SelfCheckReport::failed("self_check_zone_denied", message)));
+        }
+        Err((_, message)) => return Err(HostError::RegistryError(message)),
+    };
     if response.connector_id != *connector_id || response.zone_id != *zone_id {
         return Err(HostError::RegistryError(
             "mesh executor returned a self-check for a different connector or zone".to_string(),
@@ -8345,7 +8354,7 @@ async fn local_connector_self_check(
     state: &AppState,
     connector_id: &ConnectorId,
     zone_id: &ZoneId,
-) -> Result<fcp_host::doctor::HostConnectorSelfCheckResponse, (StatusCode, String)> {
+) -> Result<fcp_host::HostConnectorSelfCheckResponse, (StatusCode, String)> {
     let (connector, allowed_zones) = {
         let registry = state.registry.state.read().await;
         let entry = registry.connectors.get(connector_id).ok_or_else(|| {
@@ -8369,7 +8378,7 @@ async fn local_connector_self_check(
             format!("self_check exceeded {}ms", timeout.as_millis()),
         ),
     };
-    Ok(fcp_host::doctor::HostConnectorSelfCheckResponse {
+    Ok(fcp_host::HostConnectorSelfCheckResponse {
         connector_id: connector_id.clone(),
         zone_id: zone_id.clone(),
         report,

@@ -1414,3 +1414,193 @@ async fn simulation_prefers_the_local_connector_verdict_over_a_healthy_peer()
     assert_eq!(simulate_receipts(&peer).await?["total_receipts"], 0);
     Ok(())
 }
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn doctor_aggregates_real_local_and_remote_connector_self_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let local_id = ConnectorId::from_static("fcp.test.mesh-local:utility:1.0.0");
+    let mut remote_config = plain_test_connector_config(&remote_connector(), "Degraded remote");
+    remote_config["env"]["FCP_TEST_CONNECTOR_HEALTH"] = json!("degraded");
+    let _executor = mesh.spawn("node-b", vec![remote_config]).await?;
+    let entry = mesh
+        .spawn(
+            "node-a",
+            vec![plain_test_connector_config(&local_id, "Healthy local")],
+        )
+        .await?;
+    let baseline: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/doctor", entry.base_url),
+        json!({"zone_id": "z:work", "self_check": false}),
+    )
+    .await?;
+    let response: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/doctor", entry.base_url),
+        json!({
+            "zone_id": "z:work",
+            "connectors": [local_id.as_str(), REMOTE_CONNECTOR],
+            "self_check": true,
+        }),
+    )
+    .await?;
+    assert_eq!(response["overall_status"], "WARN", "{response}");
+    for field in [
+        "schema_version",
+        "zone_id",
+        "checkpoint",
+        "revocation",
+        "audit",
+        "transport_policy",
+        "store_coverage",
+        "degraded_mode",
+    ] {
+        assert_eq!(
+            response[field], baseline[field],
+            "peer diagnostics must not replace the entry host's {field}"
+        );
+    }
+    let checks = response["connector_self_checks"].as_array().expect("self-check results");
+    assert_eq!(checks.len(), 2);
+    let local = checks
+        .iter()
+        .find(|check| check["connector_id"] == local_id.as_str())
+        .expect("local diagnostic");
+    let remote = checks
+        .iter()
+        .find(|check| check["connector_id"] == REMOTE_CONNECTOR)
+        .expect("remote diagnostic");
+    assert_eq!(local["report"]["status"], "ok");
+    assert_eq!(remote["report"]["status"], "degraded");
+    assert_eq!(remote["report"]["reason_code"], "fixture_degraded");
+    assert!(local["report"]["details"]["handshake_count"].is_u64());
+    assert!(remote["report"]["details"]["handshake_count"].is_u64());
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn doctor_preserves_local_failures_and_denies_wrong_zone_before_runtime_diagnostics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let _peer = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Healthy remote")],
+        )
+        .await?;
+    let mut local_config = plain_test_connector_config(&remote_connector(), "Failing local");
+    local_config["env"]["FCP_TEST_CONNECTOR_HEALTH"] = json!("error");
+    let entry = mesh.spawn("node-a", vec![local_config]).await?;
+    for (zone, expected_reason) in [
+        ("z:work", "fixture_unavailable"),
+        ("z:private", "self_check_zone_denied"),
+    ] {
+        let response: Value = http_post_json(
+            entry.client.clone(),
+            format!("{}/doctor", entry.base_url),
+            json!({
+                "zone_id": zone,
+                "connectors": [REMOTE_CONNECTOR],
+                "self_check": true,
+            }),
+        )
+        .await?;
+        assert_eq!(response["overall_status"], "FAIL", "{response}");
+        let checks = response["connector_self_checks"].as_array().expect("self-check results");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["connector_id"], REMOTE_CONNECTOR);
+        assert_eq!(checks[0]["report"]["status"], "failed");
+        assert_eq!(checks[0]["report"]["reason_code"], expected_reason);
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn forwarded_self_check_is_zone_bound_authenticated_replay_guarded_and_local_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Remote diagnostics")],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let request = MeshForwardEnvelope::sign(
+        &mesh.node("node-a").key,
+        TailscaleNodeId::new("node-a"),
+        TailscaleNodeId::new("node-b"),
+        fcp_host::mesh_routing::unix_now_ms(),
+        MeshForwardBody::SelfCheck {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+            zone_id: "z:work".to_owned(),
+        },
+    )?;
+    let mut tampered = request.clone();
+    tampered.body = MeshForwardBody::SelfCheck {
+        connector_id: REMOTE_CONNECTOR.to_owned(),
+        zone_id: "z:private".to_owned(),
+    };
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &tampered).await?;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &request).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let reply: MeshForwardReply = serde_json::from_str(&body)?;
+    let directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+        TailscaleNodeId::new("node-a"),
+        &mesh.peers_json,
+    )?;
+    reply.verify_for(&request, &directory)?;
+    assert!(reply.is_success(), "{body}");
+    let report: Value = serde_json::from_str(&reply.body_json)?;
+    assert_eq!(report["connector_id"], REMOTE_CONNECTOR);
+    assert_eq!(report["zone_id"], "z:work");
+    assert_eq!(report["report"]["status"], "ok");
+    assert!(report["report"]["details"]["handshake_count"].is_u64());
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &request).await?;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+
+    let private_request = MeshForwardEnvelope::sign(
+        &mesh.node("node-a").key,
+        TailscaleNodeId::new("node-a"),
+        TailscaleNodeId::new("node-b"),
+        fcp_host::mesh_routing::unix_now_ms(),
+        MeshForwardBody::SelfCheck {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+            zone_id: "z:private".to_owned(),
+        },
+    )?;
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &private_request).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let denied: MeshForwardReply = serde_json::from_str(&body)?;
+    denied.verify_for(&private_request, &directory)?;
+    assert_eq!(denied.status, reqwest::StatusCode::FORBIDDEN.as_u16());
+
+    // This node can discover the remote connector, but a signed executor
+    // request must never bounce recursively to another peer.
+    let missing_local = MeshForwardEnvelope::sign(
+        &mesh.node("node-b").key,
+        TailscaleNodeId::new("node-b"),
+        TailscaleNodeId::new("node-a"),
+        fcp_host::mesh_routing::unix_now_ms(),
+        MeshForwardBody::SelfCheck {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+            zone_id: "z:work".to_owned(),
+        },
+    )?;
+    let (status, body) = post_raw(&entry, "/rpc/mesh/forward", &missing_local).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let absent: MeshForwardReply = serde_json::from_str(&body)?;
+    let peer_directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+        TailscaleNodeId::new("node-b"),
+        &mesh.peers_json,
+    )?;
+    absent.verify_for(&missing_local, &peer_directory)?;
+    assert_eq!(absent.status, reqwest::StatusCode::NOT_FOUND.as_u16());
+    Ok(())
+}
