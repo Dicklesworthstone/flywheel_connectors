@@ -16,6 +16,7 @@ use super::{McpClient, transport};
 use crate::error::{McpBridgeError, McpBridgeResult, check_tool_outcome};
 use crate::types::JsonRpcRequest;
 
+mod completion;
 mod discovery;
 
 pub(super) const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -55,6 +56,7 @@ impl McpSession {
             Some("tools") => "tools",
             Some("resources") => "resources",
             Some("prompts") => "prompts",
+            Some("completion") => "completions",
             _ => return true,
         };
         self.initialization["capabilities"]
@@ -199,6 +201,12 @@ impl McpClient {
                 "use managed initialization and object-valued RPC params",
             ));
         }
+        // Apply the completion contract to low-level rpc_call users too, not
+        // only the convenience method. Invalid input must not initialize or
+        // dispatch anything, nor consume a JSON-RPC request identifier.
+        if method == "completion/complete" {
+            completion::validate_request(&params)?;
+        }
         let replay_safe = matches!(
             method,
             "tools/list"
@@ -207,6 +215,7 @@ impl McpClient {
                 | "resources/read"
                 | "prompts/list"
                 | "prompts/get"
+                | "completion/complete"
                 | "ping"
         );
         let request = JsonRpcRequest {
@@ -261,7 +270,14 @@ impl McpClient {
                         // MCP can report a tool failure inside a successful
                         // JSON-RPC result. Do not release a dependent workflow
                         // or retry an already executed tool on that basis.
-                        match check_tool_outcome(method, value) {
+                        let checked = check_tool_outcome(method, value).and_then(|value| {
+                            if method == "completion/complete" {
+                                completion::validate_response(value)
+                            } else {
+                                Ok(value)
+                            }
+                        });
+                        match checked {
                             Ok(value) => AttemptOutcome::Success(value),
                             Err(error) => AttemptOutcome::Terminal(error),
                         }
