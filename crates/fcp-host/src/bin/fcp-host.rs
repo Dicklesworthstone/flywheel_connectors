@@ -150,6 +150,7 @@ use fcp_sandbox::{
 };
 use fcp_telemetry::{TelemetryConfig, TelemetryError, metrics, otlp_readiness};
 use futures_util::future::join_all;
+use futures_util::future::{AbortHandle, Abortable};
 use hyper::body::Incoming;
 use hyper_util::{
     server::conn::auto::Builder as HyperConnectionBuilder, service::TowerToHyperService,
@@ -790,6 +791,68 @@ impl WarmPoolTermination {
 
     fn is_cancel_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+}
+
+/// Completion marker changes to true on ANY departure from a WASI invocation
+/// future, including task cancellation / HTTP disconnect.
+struct WasiExecutionFinished(Arc<AtomicBool>);
+
+impl Drop for WasiExecutionFinished {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Cancellation target for one WASI invocation, NOT the shared Wasmtime
+/// engine. The sandbox executes with async fuel-yield intervals, so
+/// aborting its invocation future drops that invocation's Store.
+#[derive(Clone, Default)]
+struct WasiTermination {
+    stop_requested: Arc<AtomicBool>,
+    abort_handle: Arc<OnceLock<AbortHandle>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl WasiTermination {
+    fn terminator(&self) -> CancellationTerminator {
+        let stop = self.clone();
+        let done = self.clone();
+        CancellationTerminator::new(
+            move || {
+                stop.stop_requested.store(true, Ordering::SeqCst);
+                if let Some(handle) = stop.abort_handle.get() {
+                    handle.abort();
+                }
+            },
+            move || done.finished.load(Ordering::SeqCst),
+        )
+    }
+
+    async fn invoke<F>(&self, operation: F) -> HostResult<InvokeResponse>
+    where
+        F: std::future::Future<Output = HostResult<InvokeResponse>>,
+    {
+        let _finished = WasiExecutionFinished(Arc::clone(&self.finished));
+        let (handle, registration) = AbortHandle::new_pair();
+        let _ = self.abort_handle.set(handle);
+        // If the deadline expired while preparing this WASI call, abort
+        // immediately; no guest work should run after the cancellation.
+        if self.stop_requested.load(Ordering::SeqCst) {
+            if let Some(handle) = self.abort_handle.get() {
+                handle.abort();
+            }
+        }
+        let result = Abortable::new(operation, registration).await
+            .map_err(|_| HostError::RegistryError(
+                "WASI connector invocation cancelled by deadline".into(),
+            ))?;
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return Err(HostError::RegistryError(
+                "WASI connector invocation cancelled by deadline".into(),
+            ));
+        }
+        result
     }
 }
 
@@ -2099,7 +2162,12 @@ impl SubprocessRegistry {
     async fn cancellation_target(
         &self,
         connector_id: &ConnectorId,
-    ) -> HostResult<(CancellationScope, ConnectorRuntime, Option<WarmPoolTermination>)> {
+    ) -> HostResult<(
+        CancellationScope,
+        ConnectorRuntime,
+        Option<WarmPoolTermination>,
+        Option<WasiTermination>,
+    )> {
         let state = self.state.read().await;
         let entry = state.connectors.get(connector_id)
             .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
@@ -2118,6 +2186,7 @@ impl SubprocessRegistry {
         // Abort wakes the runner even during a blocked read and drops THAT
         // process; it never queues behind its invoke or scans the registry.
         let mut warm_pool = None;
+        let mut wasi_capture = None;
         match &runtime {
             ConnectorRuntime::Native(native) => {
                 let abort = Arc::clone(native);
@@ -2132,11 +2201,16 @@ impl SubprocessRegistry {
                 scope = scope.with_terminator(capture.terminator());
                 warm_pool = Some(capture);
             }
-            // WASI has no externally killable child, so it must not
-            // claim force-termination without a real sandbox abort path.
-            ConnectorRuntime::Wasi(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
+            ConnectorRuntime::Wasi(_) => {
+                // Wasmtime execution is an async future with bounded fuel
+                // yields. Abort only this invocation's Store/future.
+                let capture = WasiTermination::default();
+                scope = scope.with_terminator(capture.terminator());
+                wasi_capture = Some(capture);
+            }
+            ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
         }
-        Ok((scope, runtime, warm_pool))
+        Ok((scope, runtime, warm_pool, wasi_capture))
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -13640,7 +13714,7 @@ async fn execute_local_invoke(
     // header is only an equality check against the authenticated token
     // subject/principal_id claim; absent it, the request is still
     // authenticated and must not fall back to ownerless cancellation.
-    let (cancellation_scope, invoked_runtime, warm_pool_capture) = state
+    let (cancellation_scope, invoked_runtime, warm_pool_capture, wasi_capture) = state
         .registry
         .cancellation_target(&connector_id)
         .await
@@ -13659,6 +13733,13 @@ async fn execute_local_invoke(
     let invoke_result = match invoked_runtime {
         ConnectorRuntime::NativeWarmPool(pool) => {
             pool.invoke_with_termination(request, warm_pool_capture).await
+        }
+        ConnectorRuntime::Wasi(wasi) => {
+            if let Some(capture) = wasi_capture {
+                capture.invoke(wasi.invoke(request)).await
+            } else {
+                wasi.invoke(request).await
+            }
         }
         runtime => runtime.invoke(request).await,
     };

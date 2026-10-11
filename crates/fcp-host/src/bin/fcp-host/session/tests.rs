@@ -361,3 +361,51 @@ async fn warm_pool_termination_cannot_target_other_worker_or_control_process() {
         "ready",
     );
 }
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_abort_cancels_exact_pending_invocation_and_drops_its_future() {
+    use std::sync::atomic::AtomicBool;
+
+    struct MarkDropped(Arc<AtomicBool>);
+    impl Drop for MarkDropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let capture = WasiTermination::default();
+    let terminator = capture.terminator();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&dropped);
+    let task = task::spawn(async move {
+        capture.invoke(async {
+            let _drop = MarkDropped(observed);
+            std::future::pending::<HostResult<InvokeResponse>>().await
+        }).await
+    });
+    // Ensure the invocation was polled before cancellation. A poll of
+    // Abortable establishes the abort registration for the pending guest.
+    fcp_async_core::time::sleep(Duration::from_millis(50)).await;
+    terminator.abort();
+    let result = fcp_async_core::time::timeout(Duration::from_secs(2), task)
+        .await.unwrap().unwrap();
+    assert!(result.is_err());
+    assert!(terminator.is_finished());
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn wasi_deadline_before_invocation_start_fails_without_running_guest_code() {
+    let capture = WasiTermination::default();
+    let terminator = capture.terminator();
+    terminator.abort();
+    let invoked = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&invoked);
+    let result = capture.invoke(async move {
+        seen.store(true, Ordering::SeqCst);
+        std::future::pending::<HostResult<InvokeResponse>>().await
+    }).await;
+    assert!(result.is_err());
+    assert!(!invoked.load(Ordering::SeqCst));
+    assert!(terminator.is_finished());
+}
