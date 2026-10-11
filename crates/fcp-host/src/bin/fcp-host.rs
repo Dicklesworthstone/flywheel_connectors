@@ -158,6 +158,9 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tower::ServiceExt;
 
+#[path = "fcp-host/session.rs"]
+mod session;
+
 type ConnectorConfig = ManagedConnectorConfig;
 
 const CONNECTOR_STATE_DIR_ENV: &str = "FCP_CONNECTOR_STATE";
@@ -515,6 +518,11 @@ impl SubprocessConnector {
     }
 
     async fn configure(&self, config: serde_json::Value) -> HostResult<()> {
+        // Failed and cancelled reconfigurations invalidate process authority.
+        // The same lock guards handshake + invoke/health, so a configure
+        // cannot race with the use of an older cached zone-bound session.
+        let mut handshaken_zone = self.handshaken_zone.lock().await;
+        *handshaken_zone = None;
         let _ = self.rpc("configure", config).await?;
         Ok(())
     }
@@ -608,23 +616,29 @@ impl SubprocessConnector {
             return Ok(());
         }
 
+        // A failed attempt may rotate authority in the connector before
+        // returning an error. Clear the cache BEFORE any awaited work.
+        *handshaken_zone = None;
+        let catalog = self.introspect().await?;
+        let capabilities_requested = session::requested_capabilities(&catalog)?;
         let nonce = *blake3::hash(RequestId::random().0.as_bytes()).as_bytes();
         let request = HandshakeRequest {
-            protocol_version: "1.0.0".to_string(),
+            protocol_version: "2.0.0".to_string(),
             zone: zone.clone(),
             zone_dir: Some(self.zone_dir_for(zone)?),
             host_public_key,
             nonce,
-            capabilities_requested: Vec::new(),
+            capabilities_requested,
             host: None,
             transport_caps: None,
             requested_instance_id: None,
         };
-        let handshake_params = serde_json::to_value(request)
+        let handshake_params = serde_json::to_value(&request)
             .map_err(|err| HostError::RegistryError(format!("handshake encode error: {err}")))?;
         let response: HandshakeResponse =
             serde_json::from_value(self.rpc("handshake", handshake_params).await?)
                 .map_err(|err| HostError::RegistryError(format!("handshake parse error: {err}")))?;
+        session::validate_negotiated_grants(&request, &response, &catalog)?;
         if response.status != "accepted" {
             return Err(HostError::RegistryError(format!(
                 "handshake rejected by connector '{}': {}",
@@ -7675,6 +7689,10 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route(
             "/rpc/connectors/{connector_id}/config/revisions/{revision_id}",
             get(connector_config_revision_handler),
+        )
+        .route(
+            "/rpc/admin/connectors/{connector_id}/session",
+            post(session::prepare_handler),
         )
         .route(
             "/rpc/admin/connectors/{connector_id}/state/explain",
