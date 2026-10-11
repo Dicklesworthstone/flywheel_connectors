@@ -10,7 +10,7 @@
 //! Based on bead `flywheel_connectors-2653`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fcp_async_core::process::Child;
@@ -55,11 +55,46 @@ pub const fn default_cancellation_deadline(archetype: ConnectorArchetype) -> Dur
     }
 }
 
-/// Deadline policy recorded when a subprocess-backed operation is tracked.
+/// Out-of-band termination of one concrete runtime incarnation.
 ///
-/// Production invokes are backed by a connector subprocess that can be
-/// force-terminated when the operation ignores a cancellation request past
-/// its deadline. Registrations without a backing subprocess
+/// Callbacks retain exactly the runtime selected when the invocation starts,
+/// rather than looking up a connector ID that an administrator may replace.
+/// Termination is independent of the serialized connector RPC queue.
+#[derive(Clone)]
+pub struct CancellationTerminator {
+    abort: Arc<dyn Fn() + Send + Sync>,
+    finished: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for CancellationTerminator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancellationTerminator").finish_non_exhaustive()
+    }
+}
+
+impl CancellationTerminator {
+    #[must_use]
+    pub fn new(
+        abort: impl Fn() + Send + Sync + 'static,
+        finished: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self { abort: Arc::new(abort), finished: Arc::new(finished) }
+    }
+
+    /// Request termination without waiting for an RPC queue or subprocess IO.
+    pub fn abort(&self) {
+        (self.abort)();
+    }
+
+    /// The retained runtime incarnation's abortable task has exited.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        (self.finished)()
+    }
+}
+
+/// Deadline policy recorded when a subprocess-backed operation is tracked.
+/// Registrations without a backing subprocess
 /// ([`CancellationController::track_with_owner`]) never expire.
 #[derive(Debug, Clone)]
 pub struct CancellationScope {
@@ -72,6 +107,9 @@ pub struct CancellationScope {
     /// (`ManagedConnectorConfig::cancellation_deadline_ms`). Wins over the
     /// archetype default when present.
     pub deadline_override: Option<Duration>,
+    /// Optional concrete-runtime terminator. Unsupported runtimes must not
+    /// be falsely reported as force-terminated.
+    pub terminator: Option<CancellationTerminator>,
 }
 
 impl CancellationScope {
@@ -82,7 +120,15 @@ impl CancellationScope {
             connector_id: connector_id.into(),
             archetype,
             deadline_override: None,
+            terminator: None,
         }
+    }
+
+    /// Attach a concrete runtime termination path to this operation.
+    #[must_use]
+    pub fn with_terminator(mut self, terminator: CancellationTerminator) -> Self {
+        self.terminator = Some(terminator);
+        self
     }
 
     /// Attach an operator deadline override in milliseconds.
@@ -107,10 +153,12 @@ impl CancellationScope {
 pub struct ExpiredCancellation {
     /// Operation that ignored its cancellation past the deadline.
     pub operation_id: String,
-    /// Connector whose subprocess should be force-terminated.
+    /// Connector identifier for audit labeling ONLY, not target lookup.
     pub connector_id: String,
     /// The effective deadline that expired.
     pub deadline: Duration,
+    /// Captured runtime from the operation, not the current registry entry.
+    pub terminator: Option<CancellationTerminator>,
 }
 
 /// Force-terminates a connector subprocess (SIGTERM grace, then SIGKILL).
@@ -434,6 +482,7 @@ impl CancellationController {
                     operation_id: operation_id.clone(),
                     connector_id: scope.connector_id.clone(),
                     deadline,
+                    terminator: scope.terminator.clone(),
                 });
             }
         }
@@ -569,6 +618,50 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use fcp_kernel::OperationId;
+
+    #[test]
+    fn expired_cancel_retains_the_original_runtime_not_its_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let old_exited = Arc::new(AtomicBool::new(false));
+        let new_exited = Arc::new(AtomicBool::new(false));
+        let old_abort = Arc::clone(&old_exited);
+        let old_finished = Arc::clone(&old_exited);
+        let scope = CancellationScope::new("same-id", ConnectorArchetype::RequestResponse)
+            .with_deadline_override_ms(Some(1))
+            .with_terminator(CancellationTerminator::new(
+                move || old_abort.store(true, Ordering::SeqCst),
+                move || old_finished.load(Ordering::SeqCst),
+            ));
+        let controller = CancellationController::new();
+        controller.track_operation("old-operation", None, scope);
+        controller.cancel(
+            &CancellationRequest {
+                operation_id: "old-operation".into(),
+                reason: CancelReason::UserRequested,
+                cleanup: CleanupBehavior::default(),
+                return_partial: false,
+                capability_token: None,
+            },
+            None,
+            chrono::Utc::now(),
+        ).unwrap();
+        // Simulates replacing the registry entry with another incarnation
+        // carrying the SAME connector ID. The captured hook must stay old.
+        let replacement = Arc::clone(&new_exited);
+        let _new_terminator = CancellationTerminator::new(
+            move || replacement.store(true, Ordering::SeqCst),
+            || false,
+        );
+        let expired = controller.reap_expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!(expired.len(), 1);
+        let target = expired[0].terminator.as_ref().unwrap();
+        target.abort();
+        assert!(target.is_finished());
+        assert!(old_exited.load(Ordering::SeqCst));
+        assert!(!new_exited.load(Ordering::SeqCst));
+    }
+
+
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, 7, 12, 0, 0).unwrap()

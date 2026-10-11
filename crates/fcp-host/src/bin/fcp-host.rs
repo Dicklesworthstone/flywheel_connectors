@@ -62,6 +62,7 @@ use fcp_host::{
     BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
     BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
     CancellationController, CancellationRequest, CancellationResponse, CancellationScope,
+    CancellationTerminator,
     CapabilityTokenVerifyRequest, ConfigRevisionRecord, ConnectorAdminState, ConnectorAdminStatus,
     ConnectorArchetype, ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
@@ -374,12 +375,8 @@ struct SubprocessConnector {
     handshaken_zone: futures_util::lock::Mutex<Option<ZoneId>>,
 }
 
-/// Internal runner control method: force-terminate the connector
-/// subprocess (`flywheel_connectors-861lx`). Never dispatched to the
-/// connector itself; intercepted by the runner task before RPC dispatch.
-const CONNECTOR_RPC_FORCE_TERMINATE: &str = "fcp.internal.force_terminate";
-/// Grace window between SIGTERM and SIGKILL during force-termination.
-const CONNECTOR_FORCE_KILL_GRACE: Duration = Duration::from_millis(500);
+/// Runner termination is out-of-band: aborting its task drops the
+/// kill_on_drop child, even while a provider RPC is blocked on IO.
 /// Cancellation-deadline reaper sweep cadence.
 const CANCELLATION_REAPER_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -490,12 +487,7 @@ impl SubprocessConnector {
         let runner_task = task::spawn(async move {
             let mut runner = runner;
             while let Some(request) = runner_rx.recv().await {
-                let response = if request.method == CONNECTOR_RPC_FORCE_TERMINATE {
-                    runner.force_terminate().await;
-                    Ok(json!({ "force_terminated": true }))
-                } else {
-                    runner.request(&request.method, request.params).await
-                };
+                let response = runner.request(&request.method, request.params).await;
                 let _ = request.response_tx.send(response);
             }
         });
@@ -2035,70 +2027,43 @@ impl SubprocessRegistry {
         require_allowed_zones_configured(connector_id, &entry.config.allowed_zones)
     }
 
-    /// Resolve the cancellation scope for a connector: runtime archetype
-    /// plus the operator's deadline override, if any
-    /// (`flywheel_connectors-861lx`).
-    async fn cancellation_scope(
+    /// Select invocation runtime and cancellation target from ONE registry
+    /// snapshot. The runtime cloned here MUST be the one invoked below;
+    /// a subsequent configuration replacement cannot redirect its reaper
+    /// to a different process with the same connector ID.
+    async fn cancellation_target(
         &self,
         connector_id: &ConnectorId,
-    ) -> HostResult<CancellationScope> {
+    ) -> HostResult<(CancellationScope, ConnectorRuntime)> {
         let state = self.state.read().await;
-        let entry = state
-            .connectors
-            .get(connector_id)
+        let entry = state.connectors.get(connector_id)
             .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
         if entry.config.cancellation_deadline_ms == Some(0) {
             return Err(HostError::Internal(format!(
                 "connector {connector_id} has invalid cancellation_deadline_ms=0 (must be > 0)"
             )));
         }
-        Ok(CancellationScope::new(
+        let runtime = entry.connector.clone();
+        let mut scope = CancellationScope::new(
             connector_id.to_string(),
             configured_subprocess_archetype(&entry.config),
-        )
-        .with_deadline_override_ms(entry.config.cancellation_deadline_ms))
-    }
+        ).with_deadline_override_ms(entry.config.cancellation_deadline_ms);
 
-    /// Force-terminate a connector's subprocess: SIGTERM grace, then
-    /// SIGKILL (`flywheel_connectors-861lx`). Called by the cancellation
-    /// reaper when an operation ignores its cancellation deadline.
-    async fn force_terminate_connector(&self, connector_id: &ConnectorId) -> HostResult<()> {
-        let runner_tx = {
-            let state = self.state.read().await;
-            let entry = state
-                .connectors
-                .get(connector_id)
-                .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
-            match &entry.connector {
-                ConnectorRuntime::Native(subprocess) => subprocess.runner_tx.clone(),
-                _ => {
-                    return Err(HostError::Internal(format!(
-                        "force-terminate unsupported for connector {connector_id} runtime variant"
-                    )));
-                }
-            }
-        };
-        let (response_tx, response_rx) = oneshot::channel();
-        runner_tx
-            .send(ConnectorRpcRequest {
-                method: CONNECTOR_RPC_FORCE_TERMINATE.to_string(),
-                params: json!({}),
-                response_tx,
-            })
-            .await
-            .map_err(|_| {
-                HostError::RegistryError(
-                    "connector dispatcher unavailable for force-terminate".to_string(),
-                )
-            })?;
-        let response = response_rx.await.map_err(|_| {
-            HostError::RegistryError(
-                "connector dispatcher stopped before force-terminate reply".to_string(),
-            )
-        })?;
-        response.map(|_| ()).map_err(|err| {
-            HostError::RegistryError(format!("connector IO error during force-terminate: {err}"))
-        })
+        // The native runner's task owns a Child created with kill_on_drop.
+        // Abort wakes the runner even during a blocked read and drops THAT
+        // process; it never queues behind its invoke or scans the registry.
+        if let ConnectorRuntime::Native(native) = &runtime {
+            let abort = Arc::clone(native);
+            let finished = Arc::clone(native);
+            scope = scope.with_terminator(CancellationTerminator::new(
+                move || abort._runner_task.abort(),
+                move || finished._runner_task.is_finished(),
+            ));
+        }
+        // Warm pool and WASI currently lack a per-operation process abort
+        // handle here. They must NOT fall back to terminating the pool
+        // control process or reporting an unsupported kill as successful.
+        Ok((scope, runtime))
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -4147,14 +4112,6 @@ impl ConnectorProcessRunner {
             next_request_seq: 0,
         })
     }
-    /// Force-terminate the connector subprocess via the shared
-    /// cancellation-deadline kill sequence (SIGTERM grace, then SIGKILL;
-    /// `flywheel_connectors-861lx`). Runs on the connector's dedicated
-    /// runner task, so the child handle is only ever touched by one task.
-    async fn force_terminate(&mut self) {
-        fcp_host::force_terminate_child(&mut self._child, CONNECTOR_FORCE_KILL_GRACE).await;
-    }
-
     fn next_request_id(&mut self) -> String {
         let request_id = format!("{}:{}", self.epoch, self.next_request_seq);
         self.next_request_seq = self.next_request_seq.saturating_add(1);
@@ -7618,49 +7575,51 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             loop {
                 fcp_async_core::time::sleep(CANCELLATION_REAPER_INTERVAL).await;
                 for expired in reap_state.cancellation.reap_expired(Instant::now()) {
-                    let connector_id: Option<ConnectorId> = expired.connector_id.parse().ok();
-                    let Some(connector_id) = connector_id else {
-                        tracing::error!(
-                            event = "cancellation_force_terminate_invalid_id",
-                            operation_id = %expired.operation_id,
-                            connector_id = %expired.connector_id,
-                            "cancellation deadline expired; connector id unparseable"
-                        );
-                        continue;
-                    };
-                    let result = reap_state
-                        .registry
-                        .force_terminate_connector(&connector_id)
-                        .await;
-                    match result {
-                        Ok(()) => {
-                            reap_state
-                                .cancellation
-                                .record_forced_cancellation(&expired.operation_id, Utc::now());
+                    let state = Arc::clone(&reap_state);
+                    // Never let one overdue operation block the reaper from
+                    // signaling another. Each termination has its own bound.
+                    task::spawn_detached(async move {
+                        let Some(terminator) = expired.terminator.as_ref() else {
+                            tracing::error!(
+                                event = "cancellation_termination_unsupported",
+                                operation_id = %expired.operation_id,
+                                connector_id = %expired.connector_id,
+                                "runtime lacks a per-invocation termination handle"
+                            );
+                            // Do not claim forced=true for an unsupported
+                            // runtime, and do not spin on the same deadline.
+                            return;
+                        };
+                        terminator.abort();
+                        let completed = fcp_async_core::time::timeout(
+                            Duration::from_secs(2),
+                            async {
+                                while !terminator.is_finished() {
+                                    fcp_async_core::time::sleep(Duration::from_millis(20)).await;
+                                }
+                            },
+                        ).await.is_ok();
+                        if completed {
+                            state.cancellation.record_forced_cancellation(
+                                &expired.operation_id, Utc::now(),
+                            );
                             tracing::warn!(
                                 event = "cancellation_forced",
                                 operation_id = %expired.operation_id,
                                 connector_id = %expired.connector_id,
                                 deadline_ms = expired.deadline.as_millis() as u64,
-                                "cancellation deadline expired; connector subprocess force-terminated"
+                                "bound native runner was aborted out of band"
                             );
-                        }
-                        Err(err) => {
-                            // Re-arm so the next sweep retries the
-                            // force-terminate until the connector is gone.
-                            reap_state
-                                .cancellation
-                                .rearm_force_terminate(&expired.operation_id);
+                        } else {
+                            state.cancellation.rearm_force_terminate(&expired.operation_id);
                             tracing::error!(
-                                event = "cancellation_force_terminate_failed",
+                                event = "cancellation_force_terminate_timeout",
                                 operation_id = %expired.operation_id,
                                 connector_id = %expired.connector_id,
-                                deadline_ms = expired.deadline.as_millis() as u64,
-                                error = %err,
-                                "cancellation deadline expired; force-terminate failed, will retry"
+                                "bound native runner did not exit after abort signal"
                             );
                         }
-                    }
+                    });
                 }
             }
         });
@@ -13608,9 +13567,9 @@ async fn execute_local_invoke(
     // header is only an equality check against the authenticated token
     // subject/principal_id claim; absent it, the request is still
     // authenticated and must not fall back to ownerless cancellation.
-    let cancellation_scope = state
+    let (cancellation_scope, invoked_runtime) = state
         .registry
-        .cancellation_scope(&connector_id)
+        .cancellation_target(&connector_id)
         .await
         .map_err(map_host_error)?;
     track_verified_cancellation_owner(
@@ -13621,7 +13580,9 @@ async fn execute_local_invoke(
     )
     .map_err(map_host_error)?;
     let source_request = request.clone();
-    let invoke_result = state.registry.invoke(request).await;
+    // Use the precise runtime whose termination signal was captured above.
+    // A concurrent configuration update cannot redirect this invocation.
+    let invoke_result = invoked_runtime.invoke(request).await;
     state.cancellation.complete(&operation_id);
 
     match invoke_result {

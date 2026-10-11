@@ -262,3 +262,57 @@ async fn prepare_only_performs_introspection_handshake_and_health() {
         .map(|(method, _)| method.as_str()).collect::<Vec<_>>(),
         vec!["introspect", "handshake", "health"]);
 }
+
+#[cfg(unix)]
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn blocked_real_subprocess_rpc_can_be_aborted_without_its_queue() {
+    // The sh process execs sleep after reading the JSONL message. No
+    // reply is sent, so the runner remains in the production read loop.
+    // kill_on_drop(true) terminates the exec'd process on task abort.
+    let runner = ConnectorProcessRunner::spawn(
+        "/bin/sh",
+        &["-c".into(), "read line; exec sleep 30".into()],
+        &BTreeMap::new(),
+    ).await.unwrap();
+    let (tx, mut rx) = mpsc::channel::<ConnectorRpcRequest>(2);
+    let runner_task = task::spawn(async move {
+        let mut runner = runner;
+        while let Some(request) = rx.recv().await {
+            let response = runner.request(&request.method, request.params).await;
+            let _ = request.response_tx.send(response);
+        }
+    });
+    let (response_tx, response_rx) = oneshot::channel();
+    tx.send(ConnectorRpcRequest {
+        method: "invoke".into(),
+        params: json!({"test": "blocked"}),
+        response_tx,
+    }).await.unwrap();
+    // Ensure the runner has entered its blocking request. A queued
+    // force-terminate request would wait for its 10s IO timeout.
+    fcp_async_core::time::sleep(Duration::from_millis(80)).await;
+    let started = Instant::now();
+    runner_task.abort();
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !runner_task.is_finished() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("out-of-band abort must stop a blocked runner");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(response_rx.await.is_err(), "aborted runner must not invent success");
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn old_termination_target_does_not_abort_replacement_runtime() {
+    let old = dispatcher();
+    let replacement = dispatcher();
+    old.connector._runner_task.abort();
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !old.connector._runner_task.is_finished() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(!replacement.connector._runner_task.is_finished());
+    let response = replacement.connector.rpc("health", json!({})).await.unwrap();
+    assert_eq!(response["status"]["state"], "ready");
+}

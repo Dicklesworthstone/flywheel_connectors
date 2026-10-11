@@ -21406,7 +21406,9 @@ fn managed_connector_from_artifact(
     existing: Option<&ManagedConnectorConfig>,
 ) -> ManagedConnectorConfig {
     ManagedConnectorConfig {
-        cancellation_deadline_ms: None,
+        // An artifact update must not silently clear an operator's
+        // cancellation enforcement deadline (release blocker #59).
+        cancellation_deadline_ms: existing.and_then(|entry| entry.cancellation_deadline_ms),
         id: artifact.manifest.connector.id.to_string(),
         binary: artifact.package_output.binary_path.display().to_string(),
         name: Some(artifact.manifest.connector.name.clone()),
