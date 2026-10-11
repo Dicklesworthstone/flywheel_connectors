@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn configuration_and_nine_operation_catalog_survive_shared_framing() {
+    fn configuration_and_operation_catalog_survive_shared_framing() {
         // Configuration and FCP handshake are local; no upstream MCP call occurs.
         let input = encode_requests(&[
             json!({"id": 1, "method": "configure", "params": {"mcp_url": "http://127.0.0.1:1"}}),
@@ -174,8 +174,8 @@ mod tests {
         assert_eq!(responses[2]["result"]["configured"], true);
         assert_eq!(responses[2]["result"]["handshaken"], true);
         let operations = responses[3]["result"]["operations"].as_array().unwrap();
-        assert_eq!(operations.len(), 9);
-        for id in ["mcp.prompts.get", "mcp.resources.templates.list"] {
+        assert_eq!(operations.len(), 10);
+        for id in ["mcp.prompts.get", "mcp.resources.templates.list", "mcp.completion.complete"] {
             assert!(operations.iter().any(|operation| operation["id"] == id));
         }
     }

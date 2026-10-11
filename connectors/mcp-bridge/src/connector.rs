@@ -24,6 +24,8 @@ use crate::{
     },
 };
 
+mod probe;
+
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 const OP_TOOLS_LIST: &str = "mcp.tools.list";
@@ -35,7 +37,8 @@ const OP_PROMPTS_LIST: &str = "mcp.prompts.list";
 const OP_PROMPTS_GET: &str = "mcp.prompts.get";
 const OP_SAMPLING_HANDLE: &str = "mcp.sampling.handle";
 const OP_SERVER_METRICS: &str = "mcp.server.metrics";
-const OPERATION_ORDER: [&str; 9] = [
+const OP_COMPLETION_COMPLETE: &str = "mcp.completion.complete";
+const OPERATION_ORDER: [&str; 10] = [
     OP_TOOLS_LIST,
     OP_TOOLS_CALL,
     OP_RESOURCES_LIST,
@@ -45,6 +48,7 @@ const OPERATION_ORDER: [&str; 9] = [
     OP_SERVER_METRICS,
     OP_RESOURCE_TEMPLATES_LIST,
     OP_PROMPTS_GET,
+    OP_COMPLETION_COMPLETE,
 ];
 
 /// Parsed and validated MCP Bridge connector configuration.
@@ -312,7 +316,8 @@ impl McpBridgeConnector {
                 "mcp.resources.read",
                 "mcp.prompts.read",
                 "mcp.sampling.handle",
-                "mcp.server.metrics"
+                "mcp.server.metrics",
+                "mcp.completions.read"
             ]
         }))
     }
@@ -384,7 +389,8 @@ impl McpBridgeConnector {
         Ok(serde_json::to_value(result).unwrap_or_else(|_| json!({"status": "error"})))
     }
 
-    /// Handle the `self_check` method.
+    /// Handle the `self_check` method with a bounded live MCP probe.
+    /// This checks upstream initialization and ping, never a provider tool.
     pub async fn handle_self_check(&self) -> FcpResult<serde_json::Value> {
         let Some(config) = &self.config else {
             let report = SelfCheckReport::degraded("not_configured", "Connector is not configured");
@@ -401,7 +407,7 @@ impl McpBridgeConnector {
             return Self::serialize_self_check_report(report);
         }
 
-        let Some(_client) = &self.client else {
+        let Some(client) = &self.client else {
             let mut report = SelfCheckReport::failed(
                 "client_missing",
                 "MCP client not initialized; re-run configure",
@@ -410,9 +416,7 @@ impl McpBridgeConnector {
             return Self::serialize_self_check_report(report);
         };
 
-        let mut report = SelfCheckReport::ok();
-        report.details = Some(json!({ "provisioning": readiness }));
-        Self::serialize_self_check_report(report)
+        Self::serialize_self_check_report(probe::check(client, readiness).await)
     }
 
     /// Handle the `introspect` method.
@@ -459,6 +463,7 @@ impl McpBridgeConnector {
             OP_PROMPTS_GET => self.invoke_prompts_get(client, &input).await,
             OP_SAMPLING_HANDLE => self.invoke_sampling_handle(&input).await,
             OP_SERVER_METRICS => self.invoke_server_metrics(client).await,
+            OP_COMPLETION_COMPLETE => client.completion_complete(input).await,
             _ => {
                 return Err(FcpError::InvalidRequest {
                     code: 1002,
@@ -1054,6 +1059,9 @@ fn is_local_test_host(host: &str) -> bool {
 }
 
 #[cfg(test)]
+mod completion_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1204,10 +1212,10 @@ mod tests {
     }
 
     #[test]
-    fn operations_info_has_9_operations() {
+    fn operations_info_has_all_declared_operations() {
         let ops = operations_info();
         let arr = ops.as_array().unwrap();
-        assert_eq!(arr.len(), 9);
+        assert_eq!(arr.len(), OPERATION_ORDER.len());
     }
 
     #[test]

@@ -324,7 +324,7 @@ async fn shutdown_refuses_new_prompt_and_template_reads_before_network_io() {
 fn expanded_manifest_passes_strict_validation_and_uses_existing_read_capabilities() {
     let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../../manifest.toml"))
         .expect("strict validation must include the recalculated interface hash");
-    assert_eq!(manifest.provides.operations.len(), 9);
+    assert_eq!(manifest.provides.operations.len(), 10);
     for (id, capability) in [("mcp.prompts.get","mcp.prompts.read"),
         ("mcp.resources.templates.list","mcp.resources.read")] {
         let operation = &manifest.provides.operations[id];
@@ -347,7 +347,7 @@ async fn fcp_dispatch_and_introspection_expose_both_new_operations() {
     connector.handle_handshake(json!({"session_id":"fcp-test"})).await.unwrap();
     let introspection = connector.handle_introspect().await.unwrap();
     let operations = introspection["operations"].as_array().unwrap();
-    assert_eq!(operations.len(), 9);
+    assert_eq!(operations.len(), 10);
     for id in ["mcp.prompts.get", "mcp.resources.templates.list"] {
         assert!(operations.iter().any(|op| op["id"] == id));
         assert_eq!(connector.handle_simulate(json!({"operation_id":id})).await.unwrap()["allowed"], true);

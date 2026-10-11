@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:d35dd89d34b6ded7e47a5c115aec091bd05d1b374664ff21d1135d137ef79a22"
+interface_hash = "blake3-256:fcp.interface.v2:7a71b7509f466d71e72520bb2cd26e8e90f4d1d9cd9a087c7ab7ba15773c39be"
 
 [connector]
 id = "fcp.mcp-bridge"
@@ -51,6 +51,7 @@ optional = [
     "mcp.tools.read",
     "mcp.sampling.handle",
     "mcp.server.metrics",
+    "mcp.completions.read",
 ]
 forbidden = [
     "system.exec",
@@ -658,6 +659,7 @@ burst = 20
 scope = "instance"
 
 [rate_limits.operation_pools]
+"mcp.completion.complete" = ["mcp.completions.read"]
 "mcp.prompts.get" = ["mcp.prompts.read"]
 "mcp.resources.templates.list" = ["mcp.resources.read"]
 "mcp.sampling.handle" = ["mcp.sampling.handle"]
@@ -677,3 +679,75 @@ max_rpm = 10
 timeout_secs = 30
 max_tokens_cap = 4096
 max_tool_rounds = 5
+
+[[rate_limits.pools]]
+id = "mcp.completions.read"
+requests = 200
+window_ms = 60000
+burst = 20
+scope = "instance"
+
+[provides.operations."mcp.completion.complete"]
+description = "Complete a prompt argument or resource URI template argument using MCP suggestions"
+capability = "mcp.completions.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+revocation_freshness = "safe"
+
+[provides.operations."mcp.completion.complete".input_schema]
+type = "object"
+required = ["ref", "argument"]
+
+[provides.operations."mcp.completion.complete".input_schema.properties.ref]
+oneOf = [
+    { type = "object", required = ["type", "name"], properties = { type = { const = "ref/prompt" }, name = { type = "string", minLength = 1 } } },
+    { type = "object", required = ["type", "uri"], properties = { type = { const = "ref/resource" }, uri = { type = "string", minLength = 1 } } },
+]
+
+[provides.operations."mcp.completion.complete".input_schema.properties.argument]
+type = "object"
+required = ["name", "value"]
+properties = { name = { type = "string", minLength = 1 }, value = { type = "string" } }
+
+[provides.operations."mcp.completion.complete".input_schema.properties.context]
+type = "object"
+properties = { arguments = { type = "object", propertyNames = { minLength = 1 }, additionalProperties = { type = "string" } } }
+
+[provides.operations."mcp.completion.complete".output_schema]
+type = "object"
+required = ["completion"]
+
+[provides.operations."mcp.completion.complete".output_schema.properties.completion]
+type = "object"
+required = ["values"]
+properties = { values = { type = "array", maxItems = 100, items = { type = "string" } }, total = { type = "integer", minimum = 0 }, hasMore = { type = "boolean" } }
+
+[provides.operations."mcp.completion.complete".network_constraints]
+host_allow = ["localhost.localdomain"]
+port_allow = [3000, 8080, 8443]
+ip_allow = []
+cidr_deny = []
+deny_localhost = false
+deny_private_ranges = false
+deny_tailnet_ranges = true
+require_sni = false
+spki_pins = []
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 4
+max_redirects = 0
+connect_timeout_ms = 5000
+total_timeout_ms = 15000
+max_response_bytes = 10485760
+
+[provides.operations."mcp.completion.complete".ai_hints]
+when_to_use = "Request contextual suggestions for an argument of a known MCP prompt or resource URI template. The server must negotiate completions."
+common_mistakes = [
+    "Passing non-string argument values, or omitting already-resolved arguments from context.arguments.",
+    "Treating hasMore as a pagination cursor, expanding returned templates automatically, or following suggested URIs without a separately authorized resource read.",
+    "Using a resource-scoped token that does not cover the exact ref.uri template being completed.",
+]
+examples = ['{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"language","value":"py"}}', '{"ref":{"type":"ref/resource","uri":"file:///{path}"},"argument":{"name":"path","value":"src/"},"context":{"arguments":{"project":"demo"}}}']
+related = ["mcp.prompts.list", "mcp.prompts.get", "mcp.resources.templates.list"]

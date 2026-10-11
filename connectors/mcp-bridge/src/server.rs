@@ -279,14 +279,24 @@ fn validate_request(kind: &str, expected: &str, id: &RequestId, input: &Value) -
 }
 
 fn resource_uris(operation: &OperationId, input: &Value) -> FcpResult<Vec<String>> {
-    if operation.as_str() != "mcp.resources.read" {
-        return Ok(Vec::new());
-    }
-    let uri = input.get("uri").and_then(Value::as_str)
-        .filter(|uri| !uri.is_empty())
-        .ok_or_else(|| invalid("mcp.resources.read requires a non-empty uri"))?;
-    // Preserve the exact MCP resource identifier. This is not an egress URL,
-    // and no link is resolved or fetched by the authorization layer.
+    let uri = match operation.as_str() {
+        "mcp.resources.read" => input.get("uri"),
+        "mcp.completion.complete" => {
+            let reference = input.get("ref").and_then(Value::as_object)
+                .ok_or_else(|| invalid("Completion requires a prompt or resource reference"))?;
+            match reference.get("type").and_then(Value::as_str) {
+                Some("ref/resource") => reference.get("uri"),
+                Some("ref/prompt") => return Ok(Vec::new()),
+                _ => return Err(invalid("Completion requires a prompt or resource reference")),
+            }
+        }
+        _ => return Ok(Vec::new()),
+    };
+    let uri = uri.and_then(Value::as_str).filter(|uri| !uri.is_empty())
+        .ok_or_else(|| invalid("Resource operation requires a non-empty uri"))?;
+    // Authorize the exact resource/template identifier sent upstream, not an
+    // expanded suggestion or a caller-supplied resource_uris/uri decoy. The
+    // reference is data: no URL resolution, template expansion or fetch here.
     Ok(vec![uri.to_owned()])
 }
 
@@ -389,7 +399,7 @@ mod tests {
             let mut server = configured().await;
             let catalog = server.dispatch("introspect", json!({})).await.unwrap();
             let operations = catalog["operations"].as_array().unwrap();
-            assert_eq!(operations.len(), 9);
+            assert_eq!(operations.len(), 10);
             for operation in operations {
                 let id = operation["id"].as_str().unwrap();
                 assert!(server.dispatch("invoke", json!({"operation_id": id, "input": {}})).await.is_err());

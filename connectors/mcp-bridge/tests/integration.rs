@@ -134,9 +134,18 @@ async fn lifecycle_shutdown() {
 #[fcp_async_core::runtime::test]
 async fn lifecycle_self_check() {
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "ping"})))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": {}
+            }))
+        }).expect(1).mount(&server).await;
     let c = setup_connector(&server.uri()).await;
     let check = c.handle_self_check().await.unwrap();
     assert_eq!(check["status"], "ok");
+    assert_eq!(check["details"]["upstream"]["status"], "reachable");
     assert!(check.get("details").is_some());
     assert!(
         check["details"]["provisioning"]["network_ok"]
@@ -171,7 +180,8 @@ async fn lifecycle_introspect() {
     let server = MockServer::start().await;
     let c = setup_connector(&server.uri()).await;
     let intro = c.handle_introspect().await.unwrap();
-    assert_eq!(intro["operations"].as_array().unwrap().len(), 7);
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml")).unwrap();
+    assert_eq!(intro["operations"].as_array().unwrap().len(), manifest.provides.operations.len());
 }
 
 #[fcp_async_core::runtime::test]
@@ -1299,6 +1309,7 @@ async fn handshake_returns_capabilities() {
     assert!(caps.iter().any(|c| c == "mcp.tools.write"));
     assert!(caps.iter().any(|c| c == "mcp.resources.read"));
     assert!(caps.iter().any(|c| c == "mcp.prompts.read"));
+    assert!(caps.iter().any(|c| c == "mcp.completions.read"));
 }
 
 // -- Invoke before ready -----------------------------------------------------

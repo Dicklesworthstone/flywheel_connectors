@@ -143,7 +143,7 @@ fn host_control_plane_types_round_trip_without_invoking_the_provider() {
         let catalog: Introspection = serde_json::from_value(
             server.dispatch("introspect", json!({})).await.unwrap(),
         ).unwrap();
-        assert_eq!(catalog.operations.len(), 9);
+        assert_eq!(catalog.operations.len(), 10);
         let report: SelfCheckReport = serde_json::from_value(
             server.dispatch("self_check", json!({})).await.unwrap(),
         ).unwrap();
@@ -211,4 +211,34 @@ fn empty_grants_cannot_bypass_embedded_manifest_zone_veto() {
         assert_eq!(value["handshaken"], false);
         assert_eq!(value["requests"], 0);
     });
+}
+
+#[test]
+fn completion_resource_scope_uses_the_literal_reference_not_decoys_or_expansion() {
+    let operation = OperationId::from_static("mcp.completion.complete");
+    let input = json!({
+        "ref": {"type": "ref/resource", "uri": "file:///{path}?q={value}"},
+        "argument": {"name": "path", "value": "private"},
+        "uri": "urn:decoy", "resource_uris": ["urn:other"],
+    });
+    assert_eq!(resource_uris(&operation, &input).unwrap(), vec!["file:///{path}?q={value}".to_owned()]);
+}
+
+#[test]
+fn completion_prompt_references_do_not_authorize_an_extra_resource() {
+    let operation = OperationId::from_static("mcp.completion.complete");
+    let input = json!({"ref": {"type": "ref/prompt", "name": "review"},
+        "uri": "file:///secret", "resource_uris": ["file:///secret"]});
+    assert!(resource_uris(&operation, &input).unwrap().is_empty());
+}
+
+#[test]
+fn completion_missing_or_malformed_resource_references_fail_before_admission() {
+    let operation = OperationId::from_static("mcp.completion.complete");
+    for reference in [Value::Null, json!({"type": "ref/tool"}),
+        json!({"type": "ref/resource"}), json!({"type": "ref/resource", "uri": ""}),
+        json!({"type": "ref/resource", "uri": 42})]
+    {
+        assert!(resource_uris(&operation, &json!({"ref": reference, "uri": "urn:decoy"})).is_err());
+    }
 }
