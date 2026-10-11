@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path as FsPath;
 use std::path::{Path as StdPath, PathBuf};
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -753,6 +753,46 @@ impl SubprocessConnector {
     }
 }
 
+/// Per-invocation cancellation latch for a native warm-pool checkout.
+/// The pool control process is never a cancellation target. A deadline
+/// firing before checkout finishes is remembered, and immediately aborts
+/// whichever concrete worker the checkout ultimately selects.
+#[derive(Clone, Default)]
+struct WarmPoolTermination {
+    selected: Arc<OnceLock<Arc<SubprocessConnector>>>,
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl WarmPoolTermination {
+    fn terminator(&self) -> CancellationTerminator {
+        let stop = self.clone();
+        let finished = self.clone();
+        CancellationTerminator::new(
+            move || {
+                stop.stop_requested.store(true, Ordering::SeqCst);
+                if let Some(worker) = stop.selected.get() {
+                    worker._runner_task.abort();
+                }
+            },
+            move || finished.selected.get()
+                .is_some_and(|worker| worker._runner_task.is_finished()),
+        )
+    }
+
+    fn bind(&self, worker: &Arc<SubprocessConnector>) {
+        // Binding is immutable for this invocation. Replacing the global
+        // pool or connector cannot change the worker that cancellation kills.
+        let _ = self.selected.set(Arc::clone(worker));
+        if self.stop_requested.load(Ordering::SeqCst) {
+            worker._runner_task.abort();
+        }
+    }
+
+    fn is_cancel_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+}
+
 const NATIVE_WARM_POOL_ESTIMATED_RSS_BYTES: u64 = 96 * 1024 * 1024;
 const NATIVE_WARM_POOL_OPERATION: &str = "fcp.host.warm_pool/checkout";
 const NATIVE_WARM_POOL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
@@ -963,7 +1003,25 @@ impl NativeWarmPoolConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
+        self.invoke_with_termination(request, None).await
+    }
+
+    async fn invoke_with_termination(
+        &self,
+        request: InvokeRequest,
+        termination: Option<WarmPoolTermination>,
+    ) -> HostResult<InvokeResponse> {
         let checkout = self.checkout(&request.zone_id).await?;
+        if let Some(termination) = &termination {
+            termination.bind(&checkout.entry.connector);
+            if termination.is_cancel_requested() {
+                // Cancellation preceded checkout completion. Do not dispatch
+                // to or return this aborted worker to the reusable pool.
+                return Err(HostError::RegistryError(
+                    "warm-pool invocation cancelled before worker dispatch".into(),
+                ));
+            }
+        }
         tracing::info!(
             event = WARM_POOL_EVIDENCE_EVENT,
             action = if checkout.warm_checkout {
@@ -987,6 +1045,13 @@ impl NativeWarmPoolConnector {
 
         let mut entry = checkout.entry;
         let response = entry.connector.invoke(request).await;
+        if termination.as_ref().is_some_and(WarmPoolTermination::is_cancel_requested) {
+            // Never restore an aborted worker to a warm pool, even when
+            // its pending RPC happened to report a successful response.
+            return Err(HostError::RegistryError(
+                "warm-pool invocation cancelled; selected worker retired".into(),
+            ));
+        }
         match response {
             Ok(response) => {
                 entry.last_used_at = Instant::now();
@@ -2034,7 +2099,7 @@ impl SubprocessRegistry {
     async fn cancellation_target(
         &self,
         connector_id: &ConnectorId,
-    ) -> HostResult<(CancellationScope, ConnectorRuntime)> {
+    ) -> HostResult<(CancellationScope, ConnectorRuntime, Option<WarmPoolTermination>)> {
         let state = self.state.read().await;
         let entry = state.connectors.get(connector_id)
             .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
@@ -2052,18 +2117,26 @@ impl SubprocessRegistry {
         // The native runner's task owns a Child created with kill_on_drop.
         // Abort wakes the runner even during a blocked read and drops THAT
         // process; it never queues behind its invoke or scans the registry.
-        if let ConnectorRuntime::Native(native) = &runtime {
-            let abort = Arc::clone(native);
-            let finished = Arc::clone(native);
-            scope = scope.with_terminator(CancellationTerminator::new(
-                move || abort._runner_task.abort(),
-                move || finished._runner_task.is_finished(),
-            ));
+        let mut warm_pool = None;
+        match &runtime {
+            ConnectorRuntime::Native(native) => {
+                let abort = Arc::clone(native);
+                let finished = Arc::clone(native);
+                scope = scope.with_terminator(CancellationTerminator::new(
+                    move || abort._runner_task.abort(),
+                    move || finished._runner_task.is_finished(),
+                ));
+            }
+            ConnectorRuntime::NativeWarmPool(_) => {
+                let capture = WarmPoolTermination::default();
+                scope = scope.with_terminator(capture.terminator());
+                warm_pool = Some(capture);
+            }
+            // WASI has no externally killable child, so it must not
+            // claim force-termination without a real sandbox abort path.
+            ConnectorRuntime::Wasi(_) | ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
         }
-        // Warm pool and WASI currently lack a per-operation process abort
-        // handle here. They must NOT fall back to terminating the pool
-        // control process or reporting an unsupported kill as successful.
-        Ok((scope, runtime))
+        Ok((scope, runtime, warm_pool))
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -13567,7 +13640,7 @@ async fn execute_local_invoke(
     // header is only an equality check against the authenticated token
     // subject/principal_id claim; absent it, the request is still
     // authenticated and must not fall back to ownerless cancellation.
-    let (cancellation_scope, invoked_runtime) = state
+    let (cancellation_scope, invoked_runtime, warm_pool_capture) = state
         .registry
         .cancellation_target(&connector_id)
         .await
@@ -13581,8 +13654,14 @@ async fn execute_local_invoke(
     .map_err(map_host_error)?;
     let source_request = request.clone();
     // Use the precise runtime whose termination signal was captured above.
+    // Warm-pool checkout binds the actual WORKER, never its control process.
     // A concurrent configuration update cannot redirect this invocation.
-    let invoke_result = invoked_runtime.invoke(request).await;
+    let invoke_result = match invoked_runtime {
+        ConnectorRuntime::NativeWarmPool(pool) => {
+            pool.invoke_with_termination(request, warm_pool_capture).await
+        }
+        runtime => runtime.invoke(request).await,
+    };
     state.cancellation.complete(&operation_id);
 
     match invoke_result {

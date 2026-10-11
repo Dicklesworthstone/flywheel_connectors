@@ -316,3 +316,48 @@ async fn old_termination_target_does_not_abort_replacement_runtime() {
     let response = replacement.connector.rpc("health", json!({})).await.unwrap();
     assert_eq!(response["status"]["state"], "ready");
 }
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn warm_pool_cancellation_before_checkout_is_latched_and_kills_selected_worker() {
+    let capture = WarmPoolTermination::default();
+    let terminate = capture.terminator();
+    terminate.abort();
+    assert!(!terminate.is_finished(), "no worker yet");
+    let worker = Arc::new(dispatcher().connector);
+    capture.bind(&worker);
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !worker._runner_task.is_finished() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(capture.is_cancel_requested());
+    assert!(terminate.is_finished());
+    assert!(worker.rpc("health", json!({})).await.is_err());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn warm_pool_termination_cannot_target_other_worker_or_control_process() {
+    let selected = Arc::new(dispatcher().connector);
+    let replacement = Arc::new(dispatcher().connector);
+    let control = Arc::new(dispatcher().connector);
+    let capture = WarmPoolTermination::default();
+    capture.bind(&selected);
+    let terminate = capture.terminator();
+    terminate.abort();
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !terminate.is_finished() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(selected._runner_task.is_finished());
+    assert!(!replacement._runner_task.is_finished());
+    assert!(!control._runner_task.is_finished());
+    assert_eq!(
+        replacement.rpc("health", json!({})).await.unwrap()["status"]["state"],
+        "ready",
+    );
+    assert_eq!(
+        control.rpc("health", json!({})).await.unwrap()["status"]["state"],
+        "ready",
+    );
+}
