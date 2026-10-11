@@ -1078,6 +1078,10 @@ struct ConnectorStateExplainArgs {
     #[arg(long, value_name = "PATH")]
     state_root: Option<PathBuf>,
 
+    /// Inspect local cache and manifests without contacting a host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
     /// Fail unless the command resolves from at least this truth source.
     #[arg(long, value_enum)]
     require_source: Option<RequiredTruthSource>,
@@ -1105,6 +1109,10 @@ struct ConnectorLeaseStatusArgs {
     /// Optional zone override for the lease subject.
     #[arg(long)]
     zone: Option<String>,
+
+    /// Inspect the local HRW plan without contacting a host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
 
     /// Fail unless the command resolves from at least this truth source.
     #[arg(long, value_enum)]
@@ -8952,7 +8960,9 @@ fn connector_state_explain_dispatch(
     args: &ConnectorStateExplainArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
-    if let Some(host) = explicit_host.map(str::trim).filter(|host| !host.is_empty()) {
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
         if let Some(outcome) = enforce_required_truth_source_with_subcommand(
             "connector",
             "state explain",
@@ -8962,7 +8972,7 @@ fn connector_state_explain_dispatch(
             return Ok(outcome);
         }
 
-        let client = HostAdminClient::new(host)?;
+        let client = HostAdminClient::new(&host.endpoint)?;
         let (catalog, discovery) = client.catalog(None)?;
         let connector = match catalog.resolve_connector(&args.connector) {
             Ok(connector) => connector,
@@ -8976,8 +8986,13 @@ fn connector_state_explain_dispatch(
                 return Ok(outcome);
             }
         };
-        let mut payload =
-            client.connector_state_explain(connector.summary.id.as_str(), args.zone.as_deref())?;
+        let zone = args
+            .zone
+            .as_deref()
+            .map(str::trim)
+            .filter(|zone| !zone.is_empty())
+            .or(host.default_zone.as_deref());
+        let mut payload = client.connector_state_explain(connector.summary.id.as_str(), zone)?;
         let host_payload_source = payload
             .get("source")
             .cloned()
@@ -9022,7 +9037,7 @@ fn connector_state_explain_dispatch(
             if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
                 live_host.insert(
                     "endpoint_hash".to_owned(),
-                    Value::String(sha256_prefixed(host.as_bytes())),
+                    Value::String(sha256_prefixed(host.endpoint.as_bytes())),
                 );
             }
         }
@@ -9057,7 +9072,7 @@ fn connector_state_explain_dispatch(
         connector_selector: &args.connector,
         zone: args.zone.as_deref(),
         state_root: args.state_root.as_deref(),
-        explicit_host,
+        explicit_host: None,
     };
     let payload = connector_state::connector_state_explain_payload(connector, &request);
     Ok(DispatchOutcome {
@@ -9079,7 +9094,9 @@ fn connector_lease_status_dispatch(
     args: &ConnectorLeaseStatusArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
-    if let Some(host) = explicit_host.map(str::trim).filter(|host| !host.is_empty()) {
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
         if let Some(outcome) = enforce_required_truth_source_with_subcommand(
             "connector",
             "lease status",
@@ -9089,7 +9106,7 @@ fn connector_lease_status_dispatch(
             return Ok(outcome);
         }
 
-        let client = HostAdminClient::new(host)?;
+        let client = HostAdminClient::new(&host.endpoint)?;
         let (catalog, discovery) = client.catalog(None)?;
         let connector = match catalog.resolve_connector(&args.connector) {
             Ok(connector) => connector,
@@ -9157,7 +9174,7 @@ fn connector_lease_status_dispatch(
             if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
                 live_host.insert(
                     "endpoint_hash".to_owned(),
-                    Value::String(sha256_prefixed(host.as_bytes())),
+                    Value::String(sha256_prefixed(host.endpoint.as_bytes())),
                 );
             }
         }
@@ -39885,6 +39902,7 @@ deny_ptrace = true
             "explain",
             "--connector",
             "github",
+            "--offline",
             "--zone",
             "z:work",
             "--state-root",
@@ -39923,6 +39941,7 @@ deny_ptrace = true
             "explain",
             "--connector",
             "github",
+            "--offline",
             "--require-source",
             "any-live",
         ]);
@@ -39957,6 +39976,7 @@ deny_ptrace = true
             "explain",
             "--connector",
             "github",
+            "--offline",
             "--zone",
             "z:work",
             "--state-root",
@@ -39981,6 +40001,313 @@ deny_ptrace = true
                 .as_array()
                 .is_some_and(|handles| handles.len() == 3)
         );
+    }
+
+    #[test]
+    fn execute_connector_read_commands_offline_overrides_configured_and_explicit_hosts() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let state_root = tempdir.path().join("state").display().to_string();
+        let mut config = super::default_context_config();
+        let context = config
+            .contexts
+            .get_mut("local")
+            .expect("local context should exist");
+        context.endpoint = "http://127.0.0.1?invalid-context-endpoint=true".to_owned();
+        context.mesh_targets.active_node = Some("node-alpha".to_owned());
+        super::save_context_config(&path, &config).expect("context config should save");
+
+        for (family, action) in [("state", "explain"), ("lease", "status")] {
+            for explicit_host in [false, true] {
+                let mut args = vec!["fwc", "--json"];
+                if explicit_host {
+                    args.extend([
+                        "--host",
+                        "http://127.0.0.1?invalid-explicit-endpoint=true",
+                    ]);
+                }
+                args.extend([
+                    "connector",
+                    family,
+                    action,
+                    "--connector",
+                    "github",
+                    "--offline",
+                ]);
+                if family == "state" {
+                    args.extend(["--state-root", state_root.as_str()]);
+                }
+
+                let (exit_code, payload) = execute_json(&args);
+                assert_eq!(exit_code, CliExitCode::Success.into());
+                assert_eq!(payload["command"], "connector");
+                assert_eq!(payload["subcommand"], format!("{family} {action}"));
+                assert_eq!(payload["schema_version"], "1.0.0");
+                assert_eq!(payload["_truth_source"], "offline");
+                assert_eq!(payload["live_host"]["requested"], false);
+                assert_eq!(payload["live_host"]["route_available"], false);
+                assert_eq!(
+                    payload["source"],
+                    if family == "state" {
+                        "local-cache-markers"
+                    } else {
+                        "offline-mesh-context"
+                    }
+                );
+
+                args.extend(["--require-source", "any-live"]);
+                let (exit_code, payload) = execute_json(&args);
+                assert_eq!(exit_code, CliExitCode::Transport.into());
+                assert_eq!(payload["_truth_source"], "offline");
+                assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+                assert_eq!(payload["error"]["required"], "any-live");
+                assert_eq!(payload["error"]["actual"], "offline");
+            }
+        }
+    }
+
+    #[test]
+    fn execute_connector_state_explain_uses_context_default_zone_unless_explicit() {
+        for (explicit_zone, expected_zone) in [
+            (None, "z:community"),
+            (Some("   "), "z:community"),
+            (Some("  z:work  "), "z:work"),
+        ] {
+            let (_tempdir, path, _guard) = temp_context_config();
+            let (host, server) = spawn_mock_host(
+                StdBTreeMap::from([
+                    (
+                        "POST /rpc/discover".to_owned(),
+                        mock_discovery_response_json(),
+                    ),
+                    (
+                        format!(
+                            "GET /rpc/admin/connectors/fcp.github:enterprise:v1/state/explain?zone={}",
+                            expected_zone.replace(':', "%3A")
+                        ),
+                        json!({
+                            "status": "ok",
+                            "schema_version": "1.0.0",
+                            "source": "host-canonical-state",
+                            "connector_id": "fcp.github:enterprise:v1",
+                            "canonical_storage": "mesh",
+                            "last_canonical_seq": 17,
+                            "canonical_state": {
+                                "root_present": true,
+                                "zone_id": expected_zone,
+                                "status_source": "fcp-store",
+                            },
+                            "live_host": {
+                                "requested": true,
+                                "route_available": true,
+                            },
+                        }),
+                    ),
+                ]),
+                2,
+            );
+            let mut config = super::default_context_config();
+            let context = config
+                .contexts
+                .get_mut("local")
+                .expect("local context should exist");
+            context.endpoint = host;
+            context.default_zone = Some("z:community".to_owned());
+            super::save_context_config(&path, &config).expect("context config should save");
+
+            let mut args = vec![
+                "fwc",
+                "--json",
+                "connector",
+                "state",
+                "explain",
+                "--connector",
+                "github",
+                "--require-source",
+                "mesh-or-host",
+            ];
+            if let Some(zone) = explicit_zone {
+                args.extend(["--zone", zone]);
+            }
+            let (exit_code, payload) = execute_json(&args);
+
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into());
+            assert_eq!(payload["_truth_source"], "host");
+            assert_eq!(payload["host_payload_source"], "host-canonical-state");
+            assert_eq!(payload["last_canonical_seq"], 17);
+            assert_eq!(payload["canonical_state"]["root_present"], true);
+            assert_eq!(payload["canonical_state"]["zone_id"], expected_zone);
+        }
+    }
+
+    #[test]
+    fn execute_connector_read_commands_use_context_host_and_honor_explicit_override() {
+        for (family, action, evidence_field, evidence_value, host_source) in [
+            (
+                "state",
+                "explain",
+                "last_canonical_seq",
+                17_u64,
+                "host-canonical-state",
+            ),
+            (
+                "lease",
+                "status",
+                "fencing_token",
+                9_u64,
+                "host-hrw-routing",
+            ),
+        ] {
+            for explicit_override in [false, true] {
+                let (_tempdir, path, _guard) = temp_context_config();
+                let mut response = json!({
+                    "status": "ok",
+                    "schema_version": "1.0.0",
+                    "source": host_source,
+                    "connector_id": "fcp.github:enterprise:v1",
+                    "zone_id": "z:work",
+                    "live_host": {
+                        "requested": true,
+                        "route_available": true,
+                    },
+                });
+                response[evidence_field] = json!(evidence_value);
+                let (host, server) = spawn_mock_host(
+                    StdBTreeMap::from([
+                        (
+                            "POST /rpc/discover".to_owned(),
+                            mock_discovery_response_json(),
+                        ),
+                        (
+                            format!(
+                                "GET /rpc/admin/connectors/fcp.github:enterprise:v1/{family}/{action}?zone=z%3Awork"
+                            ),
+                            response,
+                        ),
+                    ]),
+                    2,
+                );
+                let mut config = super::default_context_config();
+                config
+                    .contexts
+                    .get_mut("local")
+                    .expect("local context should exist")
+                    .endpoint = if explicit_override {
+                    "http://127.0.0.1?invalid-context-endpoint=true".to_owned()
+                } else {
+                    host.clone()
+                };
+                super::save_context_config(&path, &config).expect("context config should save");
+
+                let mut args = vec!["fwc", "--json"];
+                if explicit_override {
+                    args.extend(["--host", host.as_str()]);
+                }
+                args.extend([
+                    "connector",
+                    family,
+                    action,
+                    "--connector",
+                    "github",
+                    "--zone",
+                    "z:work",
+                    "--require-source",
+                    "mesh-or-host",
+                ]);
+                let (exit_code, payload) = execute_json(&args);
+
+                server.join().expect("mock host thread should complete");
+                assert_eq!(exit_code, CliExitCode::Success.into());
+                assert_eq!(payload["command"], "connector");
+                assert_eq!(payload["subcommand"], format!("{family} {action}"));
+                assert_eq!(payload["schema_version"], "1.0.0");
+                assert_eq!(payload["_truth_source"], "host");
+                assert_eq!(payload["source"], "host-admin-api");
+                assert_eq!(payload["host_payload_source"], host_source);
+                assert_eq!(
+                    payload["connector"]["canonical_id"],
+                    "fcp.github:enterprise:v1"
+                );
+                assert_eq!(payload[evidence_field], evidence_value);
+                assert_eq!(
+                    payload["live_host"]["endpoint_hash"],
+                    super::sha256_prefixed(host.as_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn execute_connector_read_commands_context_host_require_mesh_refuses_before_network() {
+        let (_tempdir, path, _guard) = temp_context_config();
+        let mut config = super::default_context_config();
+        config
+            .contexts
+            .get_mut("local")
+            .expect("local context should exist")
+            .endpoint = "http://127.0.0.1?invalid-context-endpoint=true".to_owned();
+        super::save_context_config(&path, &config).expect("context config should save");
+
+        for (family, action) in [("state", "explain"), ("lease", "status")] {
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "connector",
+                family,
+                action,
+                "--connector",
+                "github",
+                "--require-source",
+                "mesh",
+            ]);
+
+            assert_eq!(exit_code, CliExitCode::Transport.into());
+            assert_eq!(payload["command"], "connector");
+            assert_eq!(payload["subcommand"], format!("{family} {action}"));
+            assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+            assert_eq!(payload["_truth_source"], "host");
+            assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+            assert_eq!(payload["error"]["required"], "mesh");
+            assert_eq!(payload["error"]["actual"], "host");
+        }
+    }
+
+    #[test]
+    fn execute_connector_read_commands_reject_invalid_context_host_without_offline_fallback() {
+        let (_tempdir, path, _guard) = temp_context_config();
+        let mut config = super::default_context_config();
+        config
+            .contexts
+            .get_mut("local")
+            .expect("local context should exist")
+            .endpoint = "http://127.0.0.1?invalid-context-endpoint=true".to_owned();
+        super::save_context_config(&path, &config).expect("context config should save");
+
+        for (family, action) in [("state", "explain"), ("lease", "status")] {
+            let args = [
+                "fwc",
+                "--json",
+                "connector",
+                family,
+                action,
+                "--connector",
+                "github",
+                "--zone",
+                "z:work",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+            match execute(&args) {
+                Ok(_) => panic!("a configured invalid host must not produce an offline answer"),
+                Err(error) => assert!(
+                    error
+                        .to_string()
+                        .contains("host endpoint must not include query or fragment components")
+                ),
+            }
+        }
     }
 
     #[test]
@@ -40230,6 +40557,7 @@ deny_ptrace = true
             "status",
             "--connector",
             "github",
+            "--offline",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
@@ -40282,6 +40610,7 @@ deny_ptrace = true
             "status",
             "--connector",
             "github",
+            "--offline",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
@@ -40298,6 +40627,7 @@ deny_ptrace = true
             "status",
             "--connector",
             "github",
+            "--offline",
             "--require-source",
             "any-live",
         ]);
@@ -40340,6 +40670,7 @@ deny_ptrace = true
             "status",
             "--connector",
             "github",
+            "--offline",
         ]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
