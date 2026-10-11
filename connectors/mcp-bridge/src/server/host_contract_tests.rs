@@ -153,3 +153,62 @@ fn host_control_plane_types_round_trip_without_invoking_the_provider() {
         assert_eq!(value["errors"], 0);
     });
 }
+
+#[test]
+fn embedded_manifest_forbidden_zones_cannot_establish_provider_authority() {
+    run(async {
+        let mut server = McpBridgeServer::new().unwrap();
+        configure(&mut server).await;
+        for zone in ["z:public", "z:community"] {
+            let mut request = handshake();
+            request["zone"] = json!(zone);
+            assert!(matches!(server.dispatch("handshake", request).await,
+                Err(FcpError::CapabilityDenied { .. })));
+            let (snapshot, value) = health(&mut server).await;
+            assert!(matches!(snapshot.status, HealthState::Degraded { .. }));
+            assert_eq!(value["configured"], true);
+            assert_eq!(value["handshaken"], false);
+            assert_eq!(value["requests"], 0);
+        }
+    });
+}
+
+#[test]
+fn forbidden_zone_rehandshake_revokes_old_health_identity_and_can_recover() {
+    run(async {
+        let mut server = McpBridgeServer::new().unwrap();
+        configure(&mut server).await;
+        let old = server.dispatch("handshake", handshake()).await.unwrap();
+        let mut request = handshake();
+        request["zone"] = json!("z:public");
+        request["requested_instance_id"] = old["instance_id"].clone();
+        assert!(server.dispatch("handshake", request).await.is_err());
+        let (snapshot, value) = health(&mut server).await;
+        assert!(!snapshot.is_ready());
+        assert_eq!(value["handshaken"], false);
+        assert_ne!(value["instance_id"], old["instance_id"]);
+        let recovered = server.dispatch("handshake", handshake()).await.unwrap();
+        let (snapshot, value) = health(&mut server).await;
+        assert!(snapshot.is_ready());
+        assert_eq!(value["instance_id"], recovered["instance_id"]);
+        assert_ne!(value["instance_id"], old["instance_id"]);
+        assert_eq!(value["requests"], 0);
+    });
+}
+
+#[test]
+fn empty_grants_cannot_bypass_embedded_manifest_zone_veto() {
+    run(async {
+        let mut server = McpBridgeServer::new().unwrap();
+        configure(&mut server).await;
+        let mut request = handshake();
+        request["zone"] = json!("z:community");
+        request["capabilities_requested"] = json!([]);
+        assert!(matches!(server.dispatch("handshake", request).await,
+            Err(FcpError::CapabilityDenied { .. })));
+        let (snapshot, value) = health(&mut server).await;
+        assert!(!snapshot.is_ready());
+        assert_eq!(value["handshaken"], false);
+        assert_eq!(value["requests"], 0);
+    });
+}

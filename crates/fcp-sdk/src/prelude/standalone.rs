@@ -37,6 +37,8 @@ pub struct StandaloneSession {
     instance_id: InstanceId,
     manifest_hash: String,
     operations: BTreeMap<String, CapabilityId>,
+    // Embedded manifest vetoes survive every session/usage-ledger reset.
+    forbidden_zones: BTreeSet<String>,
     authority: Option<Authority>,
 }
 
@@ -64,6 +66,8 @@ impl StandaloneSession {
             manifest_hash: manifest_hash(manifest_toml),
             operations: manifest.provides.operations.into_iter()
                 .map(|(id, operation)| (id, operation.capability)).collect(),
+            forbidden_zones: manifest.zones.forbidden.into_iter()
+                .map(|zone| zone.as_str().to_owned()).collect(),
             authority: None,
         })
     }
@@ -90,16 +94,26 @@ impl StandaloneSession {
     ///
     /// The host key is trusted only because this is a private control channel.
     /// No requested capabilities means no grants, not unrestricted access.
+    /// The embedded manifest's forbidden zones are an unconditional veto, even
+    /// for an empty grant set. Passing that veto does not replace host zone
+    /// policy, source/target routing, or per-invocation token verification.
     /// This is the existing FCP 2 JSONL handshake, not an FCP3 transport cutover.
     ///
     /// # Errors
-    /// Rejects unsupported protocol versions without retaining prior authority.
+    /// Rejects unsupported protocol versions and manifest-forbidden zones
+    /// without retaining prior authority or its instance-bound tokens.
     pub fn handshake(&mut self, request: HandshakeRequest) -> FcpResult<HandshakeResponse> {
         self.invalidate();
         if !matches!(request.protocol_version.as_str(), "2.0" | "2.0.0") {
             return Err(FcpError::InvalidRequest {
                 code: 1003,
                 message: "Standalone JSONL handshake requires protocol 2.0 or 2.0.0".into(),
+            });
+        }
+        if self.forbidden_zones.contains(request.zone.as_str()) {
+            return Err(FcpError::CapabilityDenied {
+                capability: "standalone.handshake".into(),
+                reason: "Connector manifest forbids the requested session zone".into(),
             });
         }
         let negotiated: BTreeMap<String, CapabilityId> = request.capabilities_requested.into_iter()
@@ -244,6 +258,7 @@ mod tests {
                 (GET.into(), CapabilityId::from_static(READ)),
                 (PUT.into(), CapabilityId::from_static(WRITE)),
             ]),
+            forbidden_zones: BTreeSet::new(),
             authority: None,
         }
     }
@@ -439,6 +454,85 @@ mod tests {
     #[test]
     fn invalid_embedded_manifest_fails_closed() {
         assert!(StandaloneSession::new("not a manifest").is_err());
+    }
+
+    #[test]
+    fn manifest_zone_veto_precedes_negotiation_even_with_no_requested_grants() {
+        for empty_grants in [false, true] {
+            let mut session = session();
+            session.forbidden_zones.insert("z:public".into());
+            let key = Ed25519SigningKey::generate();
+            let mut request = handshake(&key);
+            request.zone = "z:public".parse().unwrap();
+            if empty_grants {
+                request.capabilities_requested.clear();
+            }
+            let error = session.handshake(request).unwrap_err();
+            assert!(matches!(error, FcpError::CapabilityDenied { capability, .. }
+                if capability == "standalone.handshake"));
+            assert!(!session.is_established());
+            assert!(session.authority.is_none());
+        }
+    }
+
+    #[test]
+    fn forbidden_rehandshake_revokes_previous_instance_and_signed_grant() {
+        let (mut session, key) = established();
+        session.forbidden_zones.insert("z:public".into());
+        let old_instance = session.instance_id().clone();
+        let old_token = token(&session, &key, READ, GET, "z:work", 3600);
+        let mut request = handshake(&key);
+        request.zone = "z:public".parse().unwrap();
+        request.requested_instance_id = Some(old_instance.clone());
+        assert!(session.handshake(request).is_err());
+        assert_ne!(session.instance_id(), &old_instance);
+        assert!(matches!(authorize(&session, old_token.clone()), Err(FcpError::NotHandshaken)));
+        session.handshake(handshake(&key)).unwrap();
+        assert!(authorize(&session, old_token).is_err());
+        assert!(authorize(&session, token(&session, &key, READ, GET, "z:work", 3600)).is_ok());
+    }
+
+    #[test]
+    fn manifest_veto_survives_invalidation_and_successful_session_recovery() {
+        let mut session = session();
+        session.forbidden_zones = BTreeSet::from(["z:public".into(), "z:community".into()]);
+        let key = Ed25519SigningKey::generate();
+        for zone in ["z:public", "z:community", "z:public"] {
+            session.handshake(handshake(&key)).unwrap();
+            session.invalidate();
+            let mut request = handshake(&key);
+            request.zone = zone.parse().unwrap();
+            assert!(session.handshake(request).is_err());
+            assert!(!session.is_established());
+            assert_eq!(session.forbidden_zones.len(), 2);
+        }
+    }
+
+    #[test]
+    fn passing_zone_veto_does_not_grant_unnegotiated_capabilities() {
+        let mut session = session();
+        session.forbidden_zones.insert("z:public".into());
+        let key = Ed25519SigningKey::generate();
+        let mut request = handshake(&key);
+        request.capabilities_requested.clear();
+        let response = session.handshake(request).unwrap();
+        assert!(response.capabilities_granted.is_empty());
+        assert!(authorize(&session, token(&session, &key, READ, GET, "z:work", 3600)).is_err());
+    }
+
+    #[test]
+    fn repeated_forbidden_handshakes_cannot_establish_authority() {
+        let mut session = session();
+        session.forbidden_zones.insert("z:public".into());
+        let key = Ed25519SigningKey::generate();
+        for _ in 0..4 {
+            let before = session.instance_id().clone();
+            let mut request = handshake(&key);
+            request.zone = "z:public".parse().unwrap();
+            assert!(session.handshake(request).is_err());
+            assert_ne!(session.instance_id(), &before);
+            assert!(session.authority.is_none());
+        }
     }
 
     #[test]

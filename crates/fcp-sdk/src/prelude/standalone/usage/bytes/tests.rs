@@ -51,6 +51,7 @@ fn fixture(calls: Option<u32>, bytes: Option<u64>) -> (StandaloneSession, Ed2551
         connector_id: ConnectorId::from_static("fcp.fixture"),
         instance_id: InstanceId::new(), manifest_hash: "fixture".into(),
         operations: BTreeMap::from([("fixture.get".into(), CapabilityId::from_static("fixture.read"))]),
+        forbidden_zones: Default::default(),
         authority: None,
     };
     let key = Ed25519SigningKey::from_bytes(&[43; 32]).unwrap();
