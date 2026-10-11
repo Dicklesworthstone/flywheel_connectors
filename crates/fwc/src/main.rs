@@ -290,6 +290,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -450,6 +451,10 @@ Examples:
   fwc export-tools --offline --format claude github
   fwc export-tools --format openai --risk-max medium --output tools.json
   fwc serve-mcp --host http://127.0.0.1:8787 github --capability-token <token>
+
+Host read deadline:
+  FWC_HOST_READ_TIMEOUT_MS sets the deadline for each GET, discovery, or doctor
+  request, including its response body (default: 30000 milliseconds).
 ";
 
 #[derive(Parser, Debug)]
@@ -3848,6 +3853,10 @@ fn build_render_options(
 }
 
 fn internal_error_dispatch(args: &[String], error: &anyhow::Error) -> DispatchOutcome {
+    if let Some(timeout) = error.downcast_ref::<HostReadTimeout>() {
+        return host_read_timeout_dispatch(args, timeout);
+    }
+
     if let Some(error) = error.downcast_ref::<ResolutionError>() {
         let (command, subcommand) = truth_resolver_command_context(args);
         return truth_resolver_internal_error_dispatch(
@@ -3890,7 +3899,52 @@ fn internal_error_dispatch(args: &[String], error: &anyhow::Error) -> DispatchOu
     dispatch
 }
 
+fn host_read_timeout_dispatch(args: &[String], timeout: &HostReadTimeout) -> DispatchOutcome {
+    let (command, subcommand) = truth_resolver_command_context(args);
+    let envelope = CommandEnvelope::new(CommandAvailability::Unavailable, &command);
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+        "_truth_source": "unavailable",
+        "error": {
+            "type": "host-read-timeout",
+            "message": timeout.to_string(),
+            "recoverable": true,
+            "deadline_ms": timeout.timeout.as_millis(),
+        },
+        "next_actions": [
+            "Check that the configured host and its mesh peers are reachable, then retry.",
+            format!("Set {HOST_READ_TIMEOUT_ENV} to a larger positive millisecond value if this host needs more time to answer."),
+        ],
+    });
+    if let Some(subcommand) = subcommand {
+        payload["subcommand"] = Value::String(subcommand);
+    }
+    envelope.inject_into(&mut payload);
+    DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Transport,
+    }
+}
+
 fn truth_resolver_command_context(args: &[String]) -> (String, Option<String>) {
+    // Parsed subcommands preserve nested paths and cannot mistake a flag value
+    // such as `--host status` for the command whose read failed.
+    if let Ok(matches) = Cli::command().try_get_matches_from(args)
+        && let Some((command, mut nested)) = matches.subcommand()
+    {
+        let mut subcommands = Vec::new();
+        while let Some((subcommand, child)) = nested.subcommand() {
+            subcommands.push(subcommand);
+            nested = child;
+        }
+        return (
+            command.to_owned(),
+            (!subcommands.is_empty()).then(|| subcommands.join(" ")),
+        );
+    }
+
     let cli_command = Cli::command();
     let mut command = None::<String>;
     let mut subcommand = None::<String>;
@@ -5030,10 +5084,58 @@ fn resolved_zone(explicit_zone: Option<&str>, host: &ResolvedHostConfig) -> Stri
         .unwrap_or_else(|| ZoneId::work().to_string())
 }
 
+const HOST_READ_TIMEOUT_ENV: &str = "FWC_HOST_READ_TIMEOUT_MS";
+const DEFAULT_HOST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn parse_host_read_timeout(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_HOST_READ_TIMEOUT);
+    };
+    let milliseconds = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|milliseconds| *milliseconds > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{HOST_READ_TIMEOUT_ENV} must be a positive integer number of milliseconds"
+            )
+        })?;
+    let timeout = Duration::from_millis(milliseconds);
+    if std::time::Instant::now().checked_add(timeout).is_none() {
+        bail!("{HOST_READ_TIMEOUT_ENV} exceeds this platform's supported deadline range");
+    }
+    Ok(timeout)
+}
+
+#[derive(Debug)]
+struct HostReadTimeout {
+    method: &'static str,
+    path: String,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for HostReadTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} exceeded the host read deadline of {} milliseconds; live truth is unavailable.",
+            self.method,
+            self.path,
+            self.timeout.as_millis(),
+        )
+    }
+}
+
+impl std::error::Error for HostReadTimeout {}
+
 #[derive(Debug)]
 struct HostAdminClient {
     client: BlockingClient,
     base_url: String,
+    // Bound each read through body consumption, not a whole multi-read command
+    // or LiveTruthResolver source attempt. Keep invoke/mutation budgets separate.
+    read_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -5051,6 +5153,14 @@ struct HostConnectorCatalog {
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
+        let configured_timeout = match std::env::var(HOST_READ_TIMEOUT_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("{HOST_READ_TIMEOUT_ENV} must be a positive integer number of milliseconds");
+            }
+        };
+        let read_timeout = parse_host_read_timeout(configured_timeout.as_deref())?;
 
         #[cfg(unix)]
         {
@@ -5067,6 +5177,7 @@ impl HostAdminClient {
                 return Ok(Self {
                     client,
                     base_url: "http://localhost".to_owned(),
+                    read_timeout,
                 });
             }
         }
@@ -5077,6 +5188,7 @@ impl HostAdminClient {
         Ok(Self {
             client,
             base_url: endpoint,
+            read_timeout,
         })
     }
 
@@ -5093,7 +5205,7 @@ impl HostAdminClient {
     }
 
     fn discover(&self, filter: Option<&HostDiscoveryFilter>) -> Result<HostDiscoveryResponse> {
-        self.post_json("/rpc/discover", &json!({ "filter": filter }))
+        self.post_read_json("/rpc/discover", &json!({ "filter": filter }))
     }
 
     fn connector(&self, connector_id: &str) -> Result<HostConnectorInventoryResponse> {
@@ -5105,7 +5217,7 @@ impl HostAdminClient {
     }
 
     fn doctor(&self, request: &HostDoctorRequest) -> Result<HostDoctorReport> {
-        self.post_json("/doctor", request)
+        self.post_read_json("/doctor", request)
     }
 
     fn health(&self) -> Result<HostHealthResponse> {
@@ -5372,12 +5484,49 @@ impl HostAdminClient {
     }
 
     fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
+        self.read_json(
+            self.client.get(format!("{}{}", self.base_url, path)),
+            "GET",
+            path,
+        )
+    }
+
+    fn post_read_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        self.read_json(
+            self.client
+                .post(format!("{}{}", self.base_url, path))
+                .json(body),
+            "POST",
+            path,
+        )
+    }
+
+    fn read_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        method: &'static str,
+        path: &str,
+    ) -> Result<T> {
+        request
+            .timeout(self.read_timeout)
             .send()
-            .with_context(|| format!("GET {path} from host admin API failed"))?;
-        Self::decode_response(response, "GET", path)
+            .with_context(|| format!("{method} {path} from host admin API failed"))
+            .and_then(|response| Self::decode_response(response, method, path))
+            .map_err(|error| {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }) {
+                    error.context(HostReadTimeout {
+                        method,
+                        path: path.to_owned(),
+                        timeout: self.read_timeout,
+                    })
+                } else {
+                    error
+                }
+            })
     }
 
     fn post_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
@@ -31761,6 +31910,241 @@ mod tests {
         let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let outcome = execute(&owned_args).expect("execution should not fail internally");
         (outcome.exit_code, outcome.text)
+    }
+
+    #[test]
+    fn host_read_timeout_configuration_requires_positive_milliseconds() {
+        assert_eq!(
+            super::parse_host_read_timeout(None).unwrap(),
+            Duration::from_secs(30)
+        );
+        for (value, milliseconds) in [("1", 1), ("5000", 5_000), (" 75 ", 75)] {
+            assert_eq!(
+                super::parse_host_read_timeout(Some(value)).unwrap(),
+                Duration::from_millis(milliseconds)
+            );
+        }
+        for value in ["", "0", "-1", "1.5", "five", "18446744073709551616"] {
+            let error = super::parse_host_read_timeout(Some(value)).unwrap_err();
+            assert!(error.to_string().contains(super::HOST_READ_TIMEOUT_ENV));
+            assert!(error.to_string().contains("positive integer"));
+        }
+    }
+
+    struct HeldHostResponse {
+        client: super::HostAdminClient,
+        release: std::sync::mpsc::Sender<()>,
+        observed: std::sync::mpsc::Receiver<String>,
+        server: thread::JoinHandle<()>,
+    }
+
+    fn hold_host_response_body_or_headers(hold_body: bool) -> HeldHostResponse {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("held host should bind");
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let client = super::HostAdminClient {
+            client: super::BlockingClientBuilder::new()
+                .no_proxy()
+                .build()
+                .expect("held host client should build"),
+            base_url,
+            read_timeout: Duration::from_millis(250),
+        };
+        let (release, released) = std::sync::mpsc::channel();
+        let (observed_request, observed) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("held host failed to accept: {error}"),
+                }
+                // A client failing before connecting must also release the
+                // fixture. Wait on its cleanup channel instead of busy sleeping.
+                match released.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        assert!(
+                            Instant::now() < accept_deadline,
+                            "host client did not connect"
+                        );
+                    }
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("held host should bound request reads");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            if hold_body {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+            observed_request
+                .send(request_line.trim().to_owned())
+                .unwrap();
+            // The test releases the server after the client completes. The
+            // bounded fallback also cleans up when the deadline regresses.
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            if hold_body {
+                let _ = stream.write_all(b"}");
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            }
+        });
+        HeldHostResponse {
+            client,
+            release,
+            observed,
+            server,
+        }
+    }
+
+    fn assert_host_read_timeout_schema(error: &anyhow::Error, command: &[&str], schema: &str) {
+        // `status` as a host flag value must not become the command name.
+        let args = ["fwc", "--json", "--host", "status"]
+            .into_iter()
+            .chain(command.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let outcome = super::internal_error_dispatch(&args, error);
+        assert_eq!(outcome.exit_code, CliExitCode::Transport);
+        assert_eq!(outcome.payload["error"]["type"], "host-read-timeout");
+        assert_eq!(outcome.payload["error"]["recoverable"], true);
+        assert_eq!(outcome.payload["error"]["deadline_ms"], 250);
+        assert_eq!(outcome.payload["_truth_source"], "unavailable");
+        assert_eq!(outcome.payload["availability"]["authoritative"], false);
+        assert!(outcome.payload["error"].get("debug_chain").is_none());
+        assert!(!outcome.payload.to_string().contains("127.0.0.1"));
+        let schema: Value = serde_json::from_str(schema).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        validator
+            .validate(&outcome.payload)
+            .unwrap_or_else(|error| {
+                panic!("timeout response for {command:?} violates schema: {error}")
+            });
+    }
+
+    #[test]
+    fn host_read_deadlines_cover_stalled_headers_and_response_bodies() {
+        for (method, path, hold_body) in [
+            ("GET", "/rpc/health", true),
+            ("POST", "/rpc/discover", false),
+            ("POST", "/doctor", false),
+        ] {
+            let held = hold_host_response_body_or_headers(hold_body);
+            let result = match path {
+                "/rpc/health" => held.client.health().map(|_| ()),
+                "/rpc/discover" => held.client.discover(None).map(|_| ()),
+                "/doctor" => held
+                    .client
+                    .doctor(&super::HostDoctorRequest {
+                        zone_id: "z:work".to_owned(),
+                        connectors: Vec::new(),
+                        self_check: false,
+                    })
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            let _ = held.release.send(());
+            held.server.join().expect("held host should complete");
+            assert_eq!(
+                held.observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                format!("{method} {path} HTTP/1.1")
+            );
+            let error = result.expect_err("a stalled host read must time out");
+            let timeout = error
+                .downcast_ref::<super::HostReadTimeout>()
+                .expect("a host deadline must retain its typed cause");
+            assert_eq!(timeout.method, method);
+            assert_eq!(timeout.path, path);
+            assert_eq!(timeout.timeout, Duration::from_millis(250));
+
+            if path == "/doctor" {
+                assert_host_read_timeout_schema(
+                    &error,
+                    &["doctor"],
+                    include_str!("../schemas/doctor.schema.json"),
+                );
+            } else if path == "/rpc/health" {
+                assert_host_read_timeout_schema(
+                    &error,
+                    &["status"],
+                    include_str!("../schemas/status.schema.json"),
+                );
+            } else {
+                let commands: &[(&[&str], &str)] = &[
+                    (&["list"], include_str!("../schemas/list.schema.json")),
+                    (
+                        &["show", "test"],
+                        include_str!("../schemas/show.schema.json"),
+                    ),
+                    (
+                        &["schema", "test"],
+                        include_str!("../schemas/schema.schema.json"),
+                    ),
+                    (
+                        &["search", "test"],
+                        include_str!("../schemas/search.schema.json"),
+                    ),
+                    (
+                        &["connector", "state", "explain", "--connector", "test"],
+                        include_str!("../schemas/connector_state_explain.schema.json"),
+                    ),
+                    (
+                        &["connector", "lease", "status", "--connector", "test"],
+                        include_str!("../schemas/connector_lease_status.schema.json"),
+                    ),
+                ];
+                for (command, schema) in commands {
+                    assert_host_read_timeout_schema(&error, command, schema);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_read_deadline_does_not_shorten_invoke_post_budget() {
+        let held = hold_host_response_body_or_headers(false);
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let response: anyhow::Result<Value> = held
+                .client
+                .post_json("/rpc/invoke", &json!({ "fixture": "held-response" }));
+            completed.send(response).unwrap();
+        });
+        let observed = held.observed.recv_timeout(Duration::from_secs(5));
+        let early = result.recv_timeout(Duration::from_millis(750));
+        let completed_early = early.is_ok();
+        let _ = held.release.send(());
+        let response = early.or_else(|_| result.recv_timeout(Duration::from_secs(5)));
+        held.server.join().expect("held host should complete");
+        worker.join().expect("invoke request should complete");
+
+        assert_eq!(observed.unwrap(), "POST /rpc/invoke HTTP/1.1");
+        assert!(
+            !completed_early,
+            "invoke must retain its transport budget beyond the read deadline"
+        );
+        assert_eq!(response.unwrap().unwrap(), json!({}));
     }
 
     #[test]
