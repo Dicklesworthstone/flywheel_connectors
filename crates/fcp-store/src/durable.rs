@@ -25,6 +25,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+mod transaction;
+
 use crate::coverage::SymbolDistribution;
 use crate::error::{ObjectStoreError, SymbolStoreError};
 use crate::object_id_verifier::ObjectIdVerifier;
@@ -180,6 +182,9 @@ struct DurableObjectState {
     objects: HashMap<ObjectId, StoredObject>,
     zone_index: HashMap<ZoneId, Vec<ObjectId>>,
     used_bytes: u64,
+    // An unsuccessful append may already have changed the WAL. Refuse later
+    // writes until recovery rather than acknowledge data behind an uncertain tail.
+    write_fence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,12 +204,19 @@ enum ObjectWalOp {
     },
 }
 
+/// A durable object store with serialized, cancellation-safe transactions.
+///
+/// Once a mutation or checkpoint is admitted to its disk worker, dropping the
+/// caller stops waiting but does not cancel that transaction. Reads and later
+/// writes wait for its WAL, memory, and checkpoint work to finish. A failed WAL
+/// append fences subsequent mutations and checkpoints until the store is reopened
+/// and its durable state is recovered.
 pub struct DurableObjectStore {
-    state: Mutex<DurableObjectState>,
+    state: Arc<Mutex<DurableObjectState>>,
     config: DurableObjectStoreConfig,
-    write_guard: Mutex<()>,
-    next_seq: AtomicU64,
-    ops_since_checkpoint: AtomicU64,
+    write_guard: Arc<Mutex<()>>,
+    next_seq: Arc<AtomicU64>,
+    ops_since_checkpoint: Arc<AtomicU64>,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
     /// Optional content-id verifier. When set, every runtime `put`,
@@ -263,6 +275,15 @@ pub struct DurableSymbolStore {
 }
 
 impl DurableObjectState {
+    fn ensure_writable(&self) -> Result<(), ObjectStoreError> {
+        if let Some(reason) = &self.write_fence {
+            return Err(ObjectStoreError::Io(format!(
+                "durable object WAL requires recovery after a failed append; reopen the store before writing: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
     fn object_size(object: &StoredObject) -> u64 {
         // Keep durable quota accounting aligned with the in-memory object
         // store: charge the exact canonical object bytes rather than the old
@@ -759,11 +780,11 @@ impl DurableObjectStore {
         )?;
 
         Ok(Self {
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
             config,
-            write_guard: Mutex::new(()),
-            next_seq: AtomicU64::new(last_seq.saturating_add(1)),
-            ops_since_checkpoint: AtomicU64::new(0),
+            write_guard: Arc::new(Mutex::new(())),
+            next_seq: Arc::new(AtomicU64::new(last_seq.saturating_add(1))),
+            ops_since_checkpoint: Arc::new(AtomicU64::new(0)),
             snapshot_path,
             wal_path,
             verifier,
@@ -773,69 +794,102 @@ impl DurableObjectStore {
     /// Force an immediate checkpoint and WAL compaction.
     ///
     /// # Errors
-    /// Returns an error if the snapshot cannot be durably written.
+    /// Returns an error if the snapshot cannot be durably written or the WAL
+    /// requires recovery after a failed append.
     pub async fn checkpoint(&self) -> Result<(), ObjectStoreError> {
-        let _guard = self.write_guard.lock().await;
-        let last_seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
-        self.checkpoint_locked(last_seq).await?;
-        self.ops_since_checkpoint.store(0, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn checkpoint_locked(&self, last_seq: u64) -> Result<(), ObjectStoreError> {
-        let snapshot = self.state.lock().await.to_snapshot();
-        write_snapshot_blocking(
-            self.snapshot_path.clone(),
-            last_seq,
-            snapshot,
-            self.config.mac_key,
+        let snapshot_path = self.snapshot_path.clone();
+        let wal_path = self.wal_path.clone();
+        let next_seq = Arc::clone(&self.next_seq);
+        let ops_since_checkpoint = Arc::clone(&self.ops_since_checkpoint);
+        let mac_key = self.config.mac_key;
+        transaction::run(
+            Arc::clone(&self.state),
+            Arc::clone(&self.write_guard),
+            move |state| {
+                state.ensure_writable()?;
+                let last_seq = next_seq.load(Ordering::SeqCst).saturating_sub(1);
+                Self::checkpoint_state(
+                    state,
+                    &snapshot_path,
+                    &wal_path,
+                    last_seq,
+                    mac_key.as_ref(),
+                )?;
+                ops_since_checkpoint.store(0, Ordering::SeqCst);
+                Ok(())
+            },
         )
         .await
-        .map_err(object_io_durable)?;
-        clear_wal_blocking(self.wal_path.clone())
-            .await
-            .map_err(object_io_durable)?;
+        .map_err(|error| object_io(format!("durable object checkpoint task failed: {error}")))?
+    }
+
+    fn checkpoint_state(
+        state: &DurableObjectState,
+        snapshot_path: &Path,
+        wal_path: &Path,
+        last_seq: u64,
+        mac_key: Option<&[u8; 32]>,
+    ) -> Result<(), ObjectStoreError> {
+        let snapshot = state.to_snapshot();
+        write_snapshot(snapshot_path, last_seq, &snapshot, mac_key).map_err(object_io_durable)?;
+        clear_wal(wal_path).map_err(object_io)?;
         Ok(())
     }
 
     async fn record_mutation(&self, op: ObjectWalOp) -> Result<(), ObjectStoreError> {
-        let _guard = self.write_guard.lock().await;
-        {
-            // When a verifier is installed, enforce the content-id
-            // binding at the runtime write boundary BEFORE structural
-            // or duplicate-id checks. A forged `object_id` from an
-            // in-process caller must surface as `ContentIdMismatch`,
-            // not as `AlreadyExists` when the id happens to collide
-            // with a legit record (flywheel_connectors-4g0qr).
-            if let (Some(verifier), ObjectWalOp::Put(object)) = (self.verifier.as_ref(), &op) {
-                verifier.verify(object)?;
-            }
-            self.state
-                .lock()
-                .await
-                .validate_mutation(&op, self.config.max_bytes)?;
-            // Reserve the seq but do not publish until the WAL append succeeds.
-            // Advancing next_seq on a failed append leaves an irrecoverable gap
-            // in the WAL sequence (load_wal_records rejects the gap at startup).
-            let seq = self.next_seq.load(Ordering::SeqCst);
-            append_wal_record_blocking(self.wal_path.clone(), seq, op.clone(), self.config.mac_key)
-                .await
-                .map_err(object_io_durable)?;
-            self.next_seq.store(seq.saturating_add(1), Ordering::SeqCst);
-            self.state.lock().await.apply_loaded_mutation(op)?;
+        let config = self.config.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        let wal_path = self.wal_path.clone();
+        let next_seq = Arc::clone(&self.next_seq);
+        let ops_since_checkpoint = Arc::clone(&self.ops_since_checkpoint);
+        let verifier = self.verifier.clone();
+        transaction::run(
+            Arc::clone(&self.state),
+            Arc::clone(&self.write_guard),
+            move |state| {
+                state.ensure_writable()?;
+                // Preserve content-ID verification before duplicate/structural
+                // checks, and finish the complete transaction in this worker.
+                if let (Some(verifier), ObjectWalOp::Put(object)) = (verifier.as_ref(), &op) {
+                    verifier.verify(object)?;
+                }
+                state.validate_mutation(&op, config.max_bytes)?;
+                let seq = next_seq.load(Ordering::SeqCst);
+                let following_seq = seq.checked_add(1).ok_or_else(|| {
+                    ObjectStoreError::Io("durable object WAL sequence is exhausted".to_string())
+                })?;
+                if let Err(error) = append_wal_record(&wal_path, seq, &op, config.mac_key.as_ref()) {
+                    let error = object_io_durable(error);
+                    state.write_fence = Some(error.to_string());
+                    return Err(error);
+                }
+                next_seq.store(following_seq, Ordering::SeqCst);
+                state.apply_loaded_mutation(op)?;
 
-            if self.config.checkpoint_after_ops > 0 {
-                let ops = self.ops_since_checkpoint.fetch_add(1, Ordering::SeqCst) + 1;
-                if ops >= self.config.checkpoint_after_ops {
-                    if let Err(error) = self.checkpoint_locked(seq).await {
-                        tracing::warn!(error = %error, "durable object checkpoint failed after WAL sync");
-                    } else {
-                        self.ops_since_checkpoint.store(0, Ordering::SeqCst);
+                if config.checkpoint_after_ops > 0 {
+                    let ops = ops_since_checkpoint
+                        .load(Ordering::SeqCst)
+                        .saturating_add(1);
+                    ops_since_checkpoint.store(ops, Ordering::SeqCst);
+                    if ops >= config.checkpoint_after_ops {
+                        if let Err(error) = Self::checkpoint_state(
+                            state,
+                            &snapshot_path,
+                            &wal_path,
+                            seq,
+                            config.mac_key.as_ref(),
+                        ) {
+                            tracing::warn!(error = %error, "durable object checkpoint failed after WAL sync");
+                        } else {
+                            ops_since_checkpoint.store(0, Ordering::SeqCst);
+                        }
                     }
                 }
-            }
-        }
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| object_io(format!("durable object mutation task failed: {error}")))?
     }
 }
 
@@ -1636,21 +1690,6 @@ where
     Ok(())
 }
 
-async fn append_wal_record_blocking<T>(
-    path: PathBuf,
-    seq: u64,
-    op: T,
-    mac_key: Option<[u8; 32]>,
-) -> Result<(), DurableIoError>
-where
-    T: Serialize + Send + 'static,
-{
-    run_blocking_io("append durable object WAL record", move || {
-        append_wal_record(&path, seq, &op, mac_key.as_ref())
-    })
-    .await
-}
-
 fn write_snapshot<T>(
     path: &Path,
     last_seq: u64,
@@ -1703,21 +1742,6 @@ where
     Ok(())
 }
 
-async fn write_snapshot_blocking<T>(
-    path: PathBuf,
-    last_seq: u64,
-    payload: T,
-    mac_key: Option<[u8; 32]>,
-) -> Result<(), DurableIoError>
-where
-    T: Serialize + Clone + Send + 'static,
-{
-    run_blocking_io("write durable object snapshot", move || {
-        write_snapshot(&path, last_seq, &payload, mac_key.as_ref())
-    })
-    .await
-}
-
 fn open_unique_snapshot_temp_file(path: &Path, base_name: &str) -> Result<(PathBuf, File), String> {
     const MAX_TEMP_FILE_RETRIES: u32 = 32;
 
@@ -1757,24 +1781,6 @@ fn clear_wal(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("sync cleared wal {}: {error}", path.display()))?;
     sync_parent_dir(path).map_err(|error| format!("sync wal dir {}: {error}", path.display()))?;
     Ok(())
-}
-
-async fn clear_wal_blocking(path: PathBuf) -> Result<(), DurableIoError> {
-    run_blocking_io("clear durable object WAL", move || {
-        clear_wal(&path).map_err(DurableIoError::Other)
-    })
-    .await
-}
-
-async fn run_blocking_io<T, E, F>(operation: &'static str, f: F) -> Result<T, E>
-where
-    T: Send + 'static,
-    E: From<String> + Send + 'static,
-    F: FnOnce() -> Result<T, E> + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|error| E::from(format!("{operation} task failed: {error}")))?
 }
 
 fn checksum_json<T: Serialize>(value: &T) -> Result<[u8; 32], serde_json::Error> {
@@ -1906,6 +1912,179 @@ mod tests {
             },
             data: Bytes::from(vec![seed.wrapping_add(esi as u8); 128]),
         }
+    }
+
+    #[derive(Debug)]
+    struct PausedFirstVerification {
+        entered: ParkingMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume: ParkingMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ObjectIdVerifier for PausedFirstVerification {
+        fn verify(&self, _object: &StoredObject) -> Result<(), ObjectStoreError> {
+            if let Some(entered) = self.entered.lock().take() {
+                entered.send(()).expect("signal admitted write");
+                self.resume
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release admitted write");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_object_put_finishes_before_reads_and_later_writes() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        for checkpoint_after_ops in [0, 1] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp_dir.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x39; 32]);
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            let store = Arc::new(
+                DurableObjectStore::open_with_verifier(
+                    config.clone(),
+                    Some(Arc::new(PausedFirstVerification {
+                        entered: ParkingMutex::new(Some(entered)),
+                        resume: ParkingMutex::new(resume),
+                    })),
+                )
+                .expect("open store"),
+            );
+            let first_store = Arc::clone(&store);
+            let waiter = tokio::spawn(async move { first_store.put(test_object(1)).await });
+            tokio::time::timeout(Duration::from_secs(5), started)
+                .await
+                .expect("write must be admitted")
+                .expect("writer started");
+            waiter.abort();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), waiter)
+                    .await
+                    .expect("caller cancellation must not wait for disk work")
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+
+            let first_id = test_object_id(1);
+            let mut read = Box::pin(store.get(&first_id));
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            let mut next = Box::pin(store.put(test_object(2)));
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+
+            release.send(()).expect("release disk worker");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), read)
+                    .await
+                    .expect("reader follows admitted write")
+                    .expect("first object committed")
+                    .body,
+                test_object(1).body
+            );
+            tokio::time::timeout(Duration::from_secs(5), next)
+                .await
+                .expect("later writer can proceed")
+                .expect("second object committed");
+            assert_eq!(store.next_seq.load(Ordering::SeqCst), 3);
+            let used = store.storage_used().await;
+            drop(store);
+
+            let reopened = DurableObjectStore::open(config).expect("reopen store");
+            assert_eq!(
+                reopened.get(&first_id).await.unwrap().body,
+                test_object(1).body
+            );
+            assert_eq!(
+                reopened.get(&test_object_id(2)).await.unwrap().body,
+                test_object(2).body
+            );
+            assert_eq!(reopened.storage_used().await, used);
+            assert_eq!(reopened.list_zone(&test_zone()).await.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_object_wal_append_fences_mutations_and_checkpoint_until_reopen() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut config = DurableObjectStoreConfig::new(temp_dir.path().join("objects"));
+        config.checkpoint_after_ops = 0;
+        config.mac_key = Some([0x47; 32]);
+        let store = DurableObjectStore::open(config.clone()).expect("open store");
+        store.put(test_object(1)).await.unwrap();
+
+        let wal_before = fs::read(&store.wal_path).expect("read committed WAL");
+        let parked_wal = config.root_dir.join("saved.wal.jsonl");
+        fs::rename(&store.wal_path, &parked_wal).expect("preserve committed WAL");
+        fs::create_dir(&store.wal_path).expect("make WAL path unwritable");
+        assert!(matches!(
+            store.put(test_object(2)).await,
+            Err(ObjectStoreError::Io(_))
+        ));
+        assert_eq!(store.next_seq.load(Ordering::SeqCst), 2);
+
+        // Restoring the path does not establish whether a failed append wrote
+        // a complete or partial record. Only replay may clear the write fence.
+        fs::rename(&store.wal_path, config.root_dir.join("blocked-wal-path"))
+            .expect("preserve blocking directory");
+        fs::rename(&parked_wal, &store.wal_path).expect("restore WAL path");
+        for result in [
+            store.put(test_object(2)).await,
+            store.delete(&test_object_id(1)).await,
+            store
+                .set_retention(&test_object_id(1), RetentionClass::Ephemeral)
+                .await,
+            store.checkpoint().await,
+        ] {
+            assert!(
+                matches!(result, Err(ObjectStoreError::Io(reason)) if reason.contains("requires recovery"))
+            );
+        }
+        assert_eq!(fs::read(&store.wal_path).unwrap(), wal_before);
+        assert_eq!(
+            store.get(&test_object_id(1)).await.unwrap().body,
+            test_object(1).body
+        );
+        drop(store);
+
+        let reopened = DurableObjectStore::open(config.clone()).expect("recover WAL");
+        reopened
+            .put(test_object(2))
+            .await
+            .expect("write after recovery");
+        reopened
+            .checkpoint()
+            .await
+            .expect("checkpoint after recovery");
+        drop(reopened);
+        let recovered = DurableObjectStore::open(config).expect("recover checkpoint");
+        assert_eq!(recovered.list_zone(&test_zone()).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn object_validation_rejection_does_not_fence_later_writes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = DurableObjectStore::open(DurableObjectStoreConfig::new(temp_dir.path()))
+            .expect("open store");
+        store.put(test_object(1)).await.unwrap();
+        assert!(matches!(
+            store.put(test_object(1)).await,
+            Err(ObjectStoreError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            store.delete(&test_object_id(9)).await,
+            Err(ObjectStoreError::NotFound(_))
+        ));
+        store
+            .put(test_object(2))
+            .await
+            .expect("valid write after rejection");
+        assert_eq!(store.next_seq.load(Ordering::SeqCst), 3);
+        assert!(store.state.lock().await.write_fence.is_none());
     }
 
     #[fcp_async_core::runtime::test]
