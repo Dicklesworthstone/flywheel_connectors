@@ -534,6 +534,387 @@ fn cursor_store_forwards_explicit_snapshot_signer_after_canonical_commit() {
 }
 
 #[cfg(feature = "cursor-store-object-store")]
+fn commit_snapshot_recovery_cursor(
+    store: &mut CursorStore<ObjectStoreCursorBackend>,
+    connector_id: &ConnectorId,
+    zone_id: &ZoneId,
+    signing_key: &Ed25519SigningKey,
+    seq: u64,
+    cursor: &CursorState,
+) -> ObjectId {
+    let lease = CursorLease {
+        lease_seq: seq + 10,
+        lease_object_id: ObjectId::from_bytes([u8::try_from(seq + 0x30).unwrap(); 32]),
+    };
+    let mut header = object_store_header(1_700_200_000 + seq, zone_id.clone());
+    header.refs.push(lease.lease_object_id);
+    let mut state = ConnectorStateObject {
+        header: header.clone(),
+        connector_id: connector_id.clone(),
+        instance_id: None,
+        zone_id: zone_id.clone(),
+        prev: store.head(),
+        seq,
+        state_cbor: cursor.to_cbor().unwrap(),
+        updated_at: header.created_at,
+        lease_seq: lease.lease_seq,
+        lease_object_id: lease.lease_object_id,
+        writer_public_key: signing_key.verifying_key().to_bytes(),
+        signature: Signature::zero(),
+    };
+    state.sign_with(signing_key).unwrap();
+    store
+        .commit_cursor(cursor.clone(), header, lease, state.signature)
+        .unwrap()
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+struct CursorSnapshotReplayFixture {
+    object_store: Arc<dyn ObjectStore>,
+    backend: ObjectStoreCursorBackend,
+    canonical: fcp_store::FcpStoreConnectorStateStore,
+    connector_id: ConnectorId,
+    zone_id: ZoneId,
+    signing_key: Arc<Ed25519SigningKey>,
+    heads: Vec<ObjectId>,
+    roots: Vec<ObjectId>,
+    cursors: Vec<CursorState>,
+    snapshot_id: ObjectId,
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+impl CursorSnapshotReplayFixture {
+    fn new() -> Self {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        let object_id_key = ObjectIdKey::from_bytes([0xB7; 32]);
+        let connector_id = ConnectorId::from_static("test:recovery:1.0");
+        let zone_id = ZoneId::work();
+        let (authorization, signing_key) =
+            connector_state_write_authorization_with_key(&connector_id, &zone_id);
+        let signing_key = Arc::new(signing_key);
+        let backend = ObjectStoreCursorBackend::new(
+            Arc::clone(&object_store),
+            object_id_key,
+            connector_id.clone(),
+            zone_id.clone(),
+        )
+        .with_write_authorization(authorization);
+        let canonical = fcp_store::FcpStoreConnectorStateStore::new(
+            Arc::clone(&object_store),
+            object_id_key,
+            connector_id.clone(),
+            zone_id.clone(),
+        )
+        .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()])
+        .with_snapshot_signing_key(Arc::clone(&signing_key))
+        .with_snapshot_every_entries(0)
+        .with_snapshot_every_secs(0);
+        let mut writer = CursorStore::new(backend.clone(), connector_id.clone(), zone_id.clone())
+            .with_writer_public_key(signing_key.verifying_key().to_bytes());
+        let mut heads = Vec::new();
+        let mut roots = Vec::new();
+        let mut cursors = Vec::new();
+        let mut snapshot_id = None;
+        for seq in 0_u64..4 {
+            let cursor = CursorState {
+                offset: Some(i64::try_from(seq + 1).unwrap() * 10),
+                last_seen_id: Some(format!("event-{}", seq + 1)),
+                watermark: Some((seq + 1) * 100),
+            };
+            heads.push(commit_snapshot_recovery_cursor(
+                &mut writer,
+                &connector_id,
+                &zone_id,
+                &signing_key,
+                seq,
+                &cursor,
+            ));
+            roots.push(
+                fcp_async_core::runtime::block_on_sync(canonical.read_root())
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .0,
+            );
+            cursors.push(cursor);
+            if seq == 1 {
+                snapshot_id = fcp_async_core::runtime::block_on_sync(canonical.snapshot_head())
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        Self {
+            object_store,
+            backend,
+            canonical,
+            connector_id,
+            zone_id,
+            signing_key,
+            heads,
+            roots,
+            cursors,
+            snapshot_id: snapshot_id.unwrap(),
+        }
+    }
+
+    fn reader(&self) -> CursorStore<ObjectStoreCursorBackend> {
+        CursorStore::new(
+            self.backend.clone(),
+            self.connector_id.clone(),
+            self.zone_id.clone(),
+        )
+        .with_writer_public_key(self.signing_key.verifying_key().to_bytes())
+    }
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn cursor_snapshot_recovery_restores_progress_after_collected_prefix() {
+    let fixture = CursorSnapshotReplayFixture::new();
+    assert_eq!(
+        fcp_async_core::runtime::block_on_sync(fixture.canonical.compact(2))
+            .unwrap()
+            .unwrap(),
+        1,
+    );
+    let collected = fcp_async_core::runtime::block_on_sync(
+        fcp_store::GarbageCollector::new(fcp_store::GcConfig::default()).collect(
+            &fixture.zone_id,
+            &fcp_store::GcRoots::new(),
+            fixture.object_store.as_ref(),
+            1_800_000_000,
+        ),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(collected.evicted, 1);
+    assert!(
+        !fcp_async_core::runtime::block_on_sync(fixture.object_store.exists(&fixture.heads[0]))
+            .unwrap()
+    );
+
+    let mut reader = fixture.reader();
+    assert!(reader.load_cursor().is_err());
+    assert_eq!(reader.head(), None);
+    let recovered = reader
+        .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+        .unwrap();
+    assert_eq!(recovered, fixture.cursors[3]);
+    assert_eq!(reader.head(), Some(fixture.heads[3]));
+    let replay = fixture
+        .backend
+        .replay_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+        .unwrap();
+    assert_eq!(replay.covered_head().0, fixture.heads[1]);
+    assert_eq!(
+        replay
+            .tail()
+            .iter()
+            .map(|(_, state)| state.seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+    );
+
+    // Explicit recovery does not make this old, selected root authoritative
+    // for normal latest-root discovery.
+    assert!(fixture.reader().load_cursor().is_err());
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn cursor_snapshot_recovery_preserves_loaded_state_on_budget_or_rollback_failure() {
+    let fixture = CursorSnapshotReplayFixture::new();
+    let mut reader = fixture.reader();
+    reader
+        .recover_cursor_from_snapshot(fixture.roots[2], fixture.snapshot_id, 1)
+        .unwrap();
+    assert_eq!(reader.head(), Some(fixture.heads[2]));
+
+    assert!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 1)
+            .is_err()
+    );
+    assert_eq!(reader.head(), Some(fixture.heads[2]));
+    assert_eq!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[2], fixture.snapshot_id, 1)
+            .unwrap(),
+        fixture.cursors[2],
+    );
+
+    reader
+        .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+        .unwrap();
+    assert!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[1], fixture.snapshot_id, 0)
+            .is_err()
+    );
+    assert_eq!(reader.head(), Some(fixture.heads[3]));
+    assert_eq!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+            .unwrap(),
+        fixture.cursors[3],
+    );
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn cursor_snapshot_recovery_refuses_progress_erasure_without_changing_loaded_fields() {
+    for field in ["offset", "watermark"] {
+        let fixture = CursorSnapshotReplayFixture::new();
+        let mut reader = fixture.reader();
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+            .unwrap();
+        let mut writer = fixture.reader();
+        writer.load_cursor().unwrap().unwrap();
+        let mut erased = fixture.cursors[3].clone();
+        match field {
+            "offset" => erased.offset = None,
+            "watermark" => erased.watermark = None,
+            _ => unreachable!(),
+        }
+        commit_snapshot_recovery_cursor(
+            &mut writer,
+            &fixture.connector_id,
+            &fixture.zone_id,
+            &fixture.signing_key,
+            4,
+            &erased,
+        );
+        let root = fcp_async_core::runtime::block_on_sync(fixture.canonical.read_root())
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .0;
+        let error = reader
+            .recover_cursor_from_snapshot(root, fixture.snapshot_id, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("clear the loaded cursor {field}")),
+            "unexpected recovery failure: {error}",
+        );
+        assert_eq!(reader.head(), Some(fixture.heads[3]));
+        // Reapplying the original root also checks the private sequence,
+        // lease and cursor fields: none may have advanced on the failed read.
+        assert_eq!(
+            reader
+                .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+                .unwrap(),
+            fixture.cursors[3],
+        );
+    }
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn cursor_snapshot_recovery_rejects_a_signed_fork_of_loaded_history() {
+    let fixture = CursorSnapshotReplayFixture::new();
+    let mut reader = fixture.reader();
+    reader
+        .recover_cursor_from_snapshot(fixture.roots[2], fixture.snapshot_id, 1)
+        .unwrap();
+
+    // A trusted writer can sign two histories. Signature validity alone must
+    // not replace this reader's already loaded state at sequence two.
+    let object_id_key = ObjectIdKey::from_bytes([0xB7; 32]);
+    let mut fork_head = fixture.heads[1];
+    for seq in 2_u64..=3 {
+        let lease_id = ObjectId::from_bytes([u8::try_from(seq + 0x60).unwrap(); 32]);
+        let mut header = object_store_header(1_700_200_100 + seq, fixture.zone_id.clone());
+        header.refs.push(lease_id);
+        let mut state = ConnectorStateObject {
+            updated_at: header.created_at,
+            header,
+            connector_id: fixture.connector_id.clone(),
+            instance_id: None,
+            zone_id: fixture.zone_id.clone(),
+            prev: Some(fork_head),
+            seq,
+            state_cbor: CursorState {
+                offset: Some(i64::try_from(seq).unwrap() * 100),
+                last_seen_id: Some(format!("fork-{seq}")),
+                watermark: Some(seq * 1_000),
+            }
+            .to_cbor()
+            .unwrap(),
+            lease_seq: seq + 10,
+            lease_object_id: lease_id,
+            writer_public_key: fixture.signing_key.verifying_key().to_bytes(),
+            signature: Signature::zero(),
+        };
+        state.sign_with(&fixture.signing_key).unwrap();
+        let body = fcp_cbor::CanonicalSerializer::serialize(&state, &state.header.schema).unwrap();
+        fork_head = StoredObject::derive_id(&state.header, &body, &object_id_key).unwrap();
+        fcp_async_core::runtime::block_on_sync(fixture.object_store.put(StoredObject {
+            object_id: fork_head,
+            header: state.header,
+            body,
+            storage: StorageMeta {
+                retention: RetentionClass::Pinned,
+            },
+        }))
+        .unwrap()
+        .unwrap();
+    }
+    let mut root = fcp_async_core::runtime::block_on_sync(fixture.canonical.read_root())
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .1;
+    root.head = Some(fork_head);
+    root.header.refs = vec![fork_head];
+    let body = fcp_cbor::CanonicalSerializer::serialize(&root, &root.header.schema).unwrap();
+    let fork_root = StoredObject::derive_id(&root.header, &body, &object_id_key).unwrap();
+    fcp_async_core::runtime::block_on_sync(fixture.object_store.put(StoredObject {
+        object_id: fork_root,
+        header: root.header,
+        body,
+        storage: StorageMeta {
+            retention: RetentionClass::Pinned,
+        },
+    }))
+    .unwrap()
+    .unwrap();
+
+    fixture
+        .backend
+        .replay_from_snapshot(fork_root, fixture.snapshot_id, 2)
+        .expect("the alternate history has valid signatures and a valid boundary");
+    let error = reader
+        .recover_cursor_from_snapshot(fork_root, fixture.snapshot_id, 2)
+        .unwrap_err();
+    assert!(error.to_string().contains("conflicts with the loaded cursor history"));
+    assert_eq!(reader.head(), Some(fixture.heads[2]));
+    assert_eq!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[2], fixture.snapshot_id, 1)
+            .unwrap(),
+        fixture.cursors[2],
+    );
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn cursor_snapshot_recovery_requires_explicit_verified_writer_trust() {
+    let fixture = CursorSnapshotReplayFixture::new();
+    let raw_backend = ObjectStoreCursorBackend::new(
+        Arc::clone(&fixture.object_store),
+        ObjectIdKey::from_bytes([0xB7; 32]),
+        fixture.connector_id,
+        fixture.zone_id,
+    );
+    let error = raw_backend
+        .replay_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+        .unwrap_err();
+    assert!(error.to_string().contains("verified canonical writer authorization"));
+}
+
+#[cfg(feature = "cursor-store-object-store")]
 #[test]
 fn cursor_store_object_store_rejects_tampered_recovery_state() {
     let object_store: Arc<dyn ObjectStore> =

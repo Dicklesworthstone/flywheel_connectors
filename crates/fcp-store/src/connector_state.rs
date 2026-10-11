@@ -149,6 +149,24 @@ pub enum ConnectorStateStoreError {
         field: &'static str,
     },
 
+    /// The selected snapshot does not cover an ancestor of the exact root head.
+    #[error(
+        "connector state snapshot {snapshot_object_id} is not an ancestor of root {root_object_id}"
+    )]
+    SnapshotNotAncestor {
+        /// Caller-selected root whose history must be recovered.
+        root_object_id: ObjectId,
+        /// Caller-selected snapshot that failed to join that history.
+        snapshot_object_id: ObjectId,
+    },
+
+    /// Recovering the complete tail would exceed the caller's work budget.
+    #[error("connector state snapshot replay exceeds tail limit {limit}")]
+    ReplayLimitExceeded {
+        /// Maximum number of state objects permitted after the snapshot.
+        limit: usize,
+    },
+
     /// A state object used a sequence number that does not follow the head.
     #[error("connector state sequence mismatch: expected {expected}, got {got}")]
     SequenceMismatch {
@@ -237,6 +255,80 @@ impl ConnectorStateLeaseYieldFlush {
             lease_seq: None,
             lease_object_id: None,
         }
+    }
+}
+
+/// An authenticated snapshot and the complete state tail to one exact root.
+///
+/// Instances are produced by [`FcpStoreConnectorStateStore::replay_from_snapshot`].
+/// The snapshot's covered state is retained separately because its signed writer
+/// identity authenticates the snapshot. Tail entries are in ascending sequence
+/// order and exclude that covered state.
+///
+/// This proves the selected history, not that its root is the latest root.
+/// Selecting sufficiently fresh, trusted anchor IDs remains the caller's job.
+#[derive(Debug, Clone)]
+pub struct ConnectorStateReplay {
+    root_object_id: ObjectId,
+    root: ConnectorStateRoot,
+    snapshot_object_id: ObjectId,
+    snapshot: ConnectorStateSnapshot,
+    covered_state: ConnectorStateObject,
+    tail: Vec<(ObjectId, ConnectorStateObject)>,
+}
+
+impl ConnectorStateReplay {
+    /// Exact root object requested by the caller.
+    #[must_use]
+    pub const fn root_object_id(&self) -> ObjectId {
+        self.root_object_id
+    }
+
+    /// Verified root envelope and connector identity.
+    #[must_use]
+    pub const fn root(&self) -> &ConnectorStateRoot {
+        &self.root
+    }
+
+    /// Exact snapshot object requested by the caller.
+    #[must_use]
+    pub const fn snapshot_object_id(&self) -> ObjectId {
+        self.snapshot_object_id
+    }
+
+    /// Independently signed snapshot with its covered-state projection checked.
+    #[must_use]
+    pub const fn snapshot(&self) -> &ConnectorStateSnapshot {
+        &self.snapshot
+    }
+
+    /// Authenticated boundary state; its predecessor need not remain available.
+    #[must_use]
+    pub const fn covered_head(&self) -> (ObjectId, &ConnectorStateObject) {
+        (self.snapshot.covers_head, &self.covered_state)
+    }
+
+    /// Complete ascending tail after the snapshot, ending at the requested root.
+    #[must_use]
+    pub const fn tail(&self) -> &[(ObjectId, ConnectorStateObject)] {
+        self.tail.as_slice()
+    }
+
+    /// Authenticated state at the requested root, including a snapshot-only root.
+    #[must_use]
+    pub fn head(&self) -> (ObjectId, &ConnectorStateObject) {
+        self.tail.last().map_or_else(
+            || self.covered_head(),
+            |(object_id, state)| (*object_id, state),
+        )
+    }
+
+    /// Consume the replay and return the state at the requested root.
+    #[must_use]
+    pub fn into_head(mut self) -> (ObjectId, ConnectorStateObject) {
+        self.tail
+            .pop()
+            .unwrap_or((self.snapshot.covers_head, self.covered_state))
     }
 }
 
@@ -768,6 +860,142 @@ impl FcpStoreConnectorStateStore {
         states.retain(|(_object_id, state)| after_seq.is_none_or(|min_seq| state.seq > min_seq));
         states.truncate(limit);
         Ok(states)
+    }
+
+    /// Recover one exact root from an authenticated snapshot and its state tail.
+    ///
+    /// Both IDs must come from a checkpoint or other context the caller already
+    /// trusts. This method does not discover the latest root, establish anchor
+    /// freshness, update the canonical-root cache, or authorize a write. It
+    /// verifies keyed content IDs, envelopes, identities, signatures, configured
+    /// writer pins, sequence continuity, and singleton lease monotonicity.
+    ///
+    /// The covered state must remain available to authenticate the snapshot.
+    /// Its predecessor is never loaded, so a collected prefix is permitted.
+    /// At most `max_tail_entries` later states are loaded; exceeding that budget
+    /// returns an error instead of a partial replay. Zero permits a root exactly
+    /// at the snapshot boundary. Snapshot and boundary validation add fixed work.
+    ///
+    /// # Errors
+    /// Returns an error if either anchor is missing or malformed, the snapshot
+    /// is not an ancestor of the requested root, a retained transition fails
+    /// validation, or the complete tail exceeds the caller's budget.
+    pub async fn replay_from_snapshot(
+        &self,
+        root_object_id: ObjectId,
+        snapshot_object_id: ObjectId,
+        max_tail_entries: usize,
+    ) -> Result<ConnectorStateReplay> {
+        let started = Instant::now();
+        let result = self
+            .replay_from_snapshot_inner(root_object_id, snapshot_object_id, max_tail_entries)
+            .await;
+        self.record_operation_telemetry(
+            CONNECTOR_STATE_READ_EVENT,
+            "replay_from_snapshot",
+            if result.is_ok() { "hit" } else { "error" },
+            started,
+        );
+        result
+    }
+
+    async fn replay_from_snapshot_inner(
+        &self,
+        root_object_id: ObjectId,
+        snapshot_object_id: ObjectId,
+        max_tail_entries: usize,
+    ) -> Result<ConnectorStateReplay> {
+        let stored = self.object_store.get(&root_object_id).await?;
+        let root: ConnectorStateRoot =
+            self.decode_stored(&stored, &Self::root_schema_id(), "connector state root")?;
+        self.validate_root(&root)?;
+        if !headers_match(&stored.header, &root.header)? {
+            return Err(ConnectorStateStoreError::HeaderBodyMismatch);
+        }
+        let computed = StoredObject::derive_id(&stored.header, &stored.body, &self.object_id_key)?;
+        if computed != root_object_id {
+            return Err(ConnectorStateStoreError::ContentIdMismatch {
+                claimed: root_object_id,
+                computed,
+            });
+        }
+        if root.model != self.state_model {
+            return Err(ConnectorStateStoreError::IdentityMismatch {
+                field: "state_model",
+                expected: self.state_model.to_string(),
+                got: root.model.to_string(),
+            });
+        }
+
+        let boundary_error = || ConnectorStateStoreError::SnapshotNotAncestor {
+            root_object_id,
+            snapshot_object_id,
+        };
+        let mut next = root.head.ok_or_else(boundary_error)?;
+        let snapshot = self.load_snapshot(&snapshot_object_id).await?;
+        let (_covered_id, covered_state) = self.load_state_object(&snapshot.covers_head).await?;
+        let mut tail = Vec::new();
+        let mut visited = HashSet::new();
+
+        loop {
+            if next == snapshot.covers_head {
+                if let Some((_newer_id, newer)) = tail.last() {
+                    Self::validate_replay_transition(&root.model, &covered_state, newer)?;
+                }
+                break;
+            }
+            if tail.len() == max_tail_entries {
+                return Err(ConnectorStateStoreError::ReplayLimitExceeded {
+                    limit: max_tail_entries,
+                });
+            }
+            if !visited.insert(next) {
+                return Err(ConnectorStateStoreError::ChainCycle(next));
+            }
+            let (object_id, state) = self.load_state_object(&next).await?;
+            if state.seq <= snapshot.covers_seq {
+                return Err(boundary_error());
+            }
+            if let Some((_newer_id, newer)) = tail.last() {
+                Self::validate_replay_transition(&root.model, &state, newer)?;
+            }
+            next = state.prev.ok_or_else(boundary_error)?;
+            tail.push((object_id, state));
+        }
+
+        tail.reverse();
+        Ok(ConnectorStateReplay {
+            root_object_id,
+            root,
+            snapshot_object_id,
+            snapshot,
+            covered_state,
+            tail,
+        })
+    }
+
+    fn validate_replay_transition(
+        model: &ConnectorStateModel,
+        older: &ConnectorStateObject,
+        newer: &ConnectorStateObject,
+    ) -> Result<()> {
+        let expected = older
+            .seq
+            .checked_add(1)
+            .ok_or(ConnectorStateStoreError::SequenceOverflow(older.seq))?;
+        if newer.seq != expected {
+            return Err(ConnectorStateStoreError::SequenceMismatch {
+                expected,
+                got: newer.seq,
+            });
+        }
+        if model.is_singleton_writer() && newer.lease_seq < older.lease_seq {
+            return Err(ConnectorStateStoreError::StaleLease {
+                held_seq: newer.lease_seq,
+                current_seq: older.lease_seq,
+            });
+        }
+        Ok(())
     }
 
     /// Return canonical root/head/sequence status for operator explain routes.
@@ -1750,6 +1978,9 @@ impl FcpStoreConnectorStateStore {
                     reason,
                 }
             }
+            ConnectorStateStoreError::ReplayLimitExceeded { limit } => {
+                ConnectorStateError::InvalidLimit { limit }
+            }
             ConnectorStateStoreError::StaleLease {
                 held_seq,
                 current_seq,
@@ -1768,6 +1999,7 @@ impl FcpStoreConnectorStateStore {
             | ConnectorStateStoreError::InvalidStateSignature(_)
             | ConnectorStateStoreError::InvalidSnapshotSignature(_)
             | ConnectorStateStoreError::SnapshotStateMismatch { .. }
+            | ConnectorStateStoreError::SnapshotNotAncestor { .. }
             | ConnectorStateStoreError::SequenceMismatch { .. }
             | ConnectorStateStoreError::SequenceOverflow(_)
             | ConnectorStateStoreError::ChainCycle(_)
@@ -4047,6 +4279,324 @@ mod tests {
             run_async(state_store.latest_snapshot()).unwrap().unwrap().0,
             snapshot_id
         );
+    }
+
+    struct SnapshotReplayFixture {
+        object_store: Arc<MemoryObjectStore>,
+        state_store: FcpStoreConnectorStateStore,
+        heads: Vec<ObjectId>,
+        roots: Vec<ObjectId>,
+        snapshot_id: ObjectId,
+    }
+
+    impl SnapshotReplayFixture {
+        fn new() -> Self {
+            let object_store = store();
+            let state_store = test_store(object_store.clone())
+                .with_trusted_writer_keys([test_state_signing_key().verifying_key().to_bytes()])
+                .with_snapshot_every_entries(0)
+                .with_snapshot_every_secs(0);
+            let mut heads = Vec::new();
+            let mut roots = Vec::new();
+            let mut snapshot_id = None;
+            for seq in 0_u64..=4 {
+                let previous = heads.last().copied();
+                let (head, _) = append_ok(
+                    &state_store,
+                    state(seq, previous, lease_id(u8::try_from(seq + 1).unwrap())),
+                );
+                heads.push(head);
+                roots.push(run_async(state_store.read_root()).unwrap().unwrap().0);
+                if seq == 2 {
+                    snapshot_id = run_async(state_store.snapshot_head()).unwrap();
+                }
+            }
+            Self {
+                object_store,
+                state_store,
+                heads,
+                roots,
+                snapshot_id: snapshot_id.unwrap(),
+            }
+        }
+
+        fn reader(&self) -> FcpStoreConnectorStateStore {
+            FcpStoreConnectorStateStore::new(
+                self.object_store.clone(),
+                object_id_key(),
+                connector_id(),
+                zone_id(),
+            )
+            .with_trusted_writer_keys([test_state_signing_key().verifying_key().to_bytes()])
+        }
+
+        fn store_root_for(&self, head: ObjectId) -> ObjectId {
+            run_async(
+                self.state_store
+                    .store_root(root_with_head(Some(head), 1_700_000_100)),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_recovers_after_gc_without_promoting_an_anchor_to_latest() {
+        let fixture = SnapshotReplayFixture::new();
+        assert_eq!(run_async(fixture.state_store.compact(3)).unwrap(), 2);
+        let collected = run_async(crate::GarbageCollector::new(crate::GcConfig::default()).collect(
+            &zone_id(),
+            &crate::GcRoots::new(),
+            fixture.object_store.as_ref(),
+            1_800_000_000,
+        ))
+        .unwrap();
+        assert_eq!(collected.evicted, 2);
+        for old_head in &fixture.heads[..2] {
+            assert!(!run_async(fixture.object_store.exists(old_head)));
+        }
+        for retained_root in &fixture.roots {
+            assert!(run_async(fixture.object_store.exists(retained_root)));
+        }
+
+        // A fresh adapter has no cached root. Historical roots still point at
+        // the collected prefix, and general discovery must continue to fail.
+        let reader = fixture.reader();
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        let replay = run_async(reader.replay_from_snapshot(
+            fixture.roots[4],
+            fixture.snapshot_id,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(replay.root_object_id(), fixture.roots[4]);
+        assert_eq!(replay.root().head, Some(fixture.heads[4]));
+        assert_eq!(replay.snapshot_object_id(), fixture.snapshot_id);
+        assert_eq!(replay.snapshot().covers_seq, 2);
+        assert_eq!(replay.covered_head().0, fixture.heads[2]);
+        assert_eq!(replay.covered_head().1.prev, Some(fixture.heads[1]));
+        assert_eq!(
+            replay
+                .tail()
+                .iter()
+                .map(|(_, state)| state.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+        );
+        assert_eq!(replay.head().0, fixture.heads[4]);
+        assert_eq!(replay.head().1.seq, 4);
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::MissingHead(_))
+        ));
+        assert_eq!(replay.into_head().0, fixture.heads[4]);
+    }
+
+    #[test]
+    fn snapshot_replay_requires_the_covered_state_and_every_retained_tail_object() {
+        for removed_index in [2, 3] {
+            let fixture = SnapshotReplayFixture::new();
+            let missing = fixture.heads[removed_index];
+            run_async(
+                fixture
+                    .object_store
+                    .set_retention(&missing, RetentionClass::Ephemeral),
+            )
+            .unwrap();
+            let collected = run_async(
+                crate::GarbageCollector::new(crate::GcConfig::default()).collect(
+                    &zone_id(),
+                    &crate::GcRoots::new(),
+                    fixture.object_store.as_ref(),
+                    1_800_000_000,
+                ),
+            )
+            .unwrap();
+            assert_eq!(collected.evicted, 1);
+            assert!(!run_async(fixture.object_store.exists(&missing)));
+            assert!(matches!(
+                run_async(fixture.reader().replay_from_snapshot(
+                    fixture.roots[4],
+                    fixture.snapshot_id,
+                    2,
+                )),
+                Err(ConnectorStateStoreError::MissingHead(object_id)) if object_id == missing
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_budget_is_complete_or_error_and_allows_zero_tail() {
+        let fixture = SnapshotReplayFixture::new();
+        let reader = fixture.reader();
+        for limit in [0, 1] {
+            assert!(matches!(
+                run_async(reader.replay_from_snapshot(
+                    fixture.roots[4],
+                    fixture.snapshot_id,
+                    limit,
+                )),
+                Err(ConnectorStateStoreError::ReplayLimitExceeded { limit: rejected })
+                    if rejected == limit
+            ));
+        }
+        let complete = run_async(reader.replay_from_snapshot(
+            fixture.roots[4],
+            fixture.snapshot_id,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(complete.tail().len(), 2);
+        let boundary = run_async(reader.replay_from_snapshot(
+            fixture.roots[2],
+            fixture.snapshot_id,
+            0,
+        ))
+        .unwrap();
+        assert!(boundary.tail().is_empty());
+        assert_eq!(boundary.head().0, fixture.heads[2]);
+        assert_eq!(boundary.into_head().1.seq, 2);
+    }
+
+    #[test]
+    fn snapshot_replay_rejects_an_independently_signed_unrelated_snapshot() {
+        let fixture = SnapshotReplayFixture::new();
+        let alternate = state(2, Some(fixture.heads[1]), lease_id(99));
+        let alternate_head = run_async(fixture.state_store.store_state_object(alternate)).unwrap();
+        let unrelated = run_async(fixture.state_store.emit_snapshot(alternate_head)).unwrap();
+        assert!(run_async(fixture.state_store.load_snapshot(&unrelated)).is_ok());
+
+        let reader = fixture.reader();
+        for (root_object_id, snapshot_object_id) in [
+            (fixture.roots[4], unrelated),
+            (fixture.roots[1], fixture.snapshot_id),
+        ] {
+            assert!(matches!(
+                run_async(reader.replay_from_snapshot(root_object_id, snapshot_object_id, 5)),
+                Err(ConnectorStateStoreError::SnapshotNotAncestor {
+                    root_object_id: rejected_root,
+                    snapshot_object_id: rejected_snapshot,
+                }) if rejected_root == root_object_id && rejected_snapshot == snapshot_object_id
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_rejects_tampered_snapshot_boundary_and_tail_signatures() {
+        let fixture = SnapshotReplayFixture::new();
+        let reader = fixture.reader();
+        let snapshot =
+            run_async(fixture.state_store.load_snapshot(&fixture.snapshot_id)).unwrap();
+
+        let mut bad_snapshot = snapshot.clone();
+        bad_snapshot.signature = Signature::zero();
+        let bad_snapshot_id = store_snapshot_for_test(&fixture.state_store, &bad_snapshot);
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(fixture.roots[4], bad_snapshot_id, 2)),
+            Err(ConnectorStateStoreError::InvalidSnapshotSignature(_))
+        ));
+
+        let mut bad_boundary = state(2, Some(fixture.heads[1]), lease_id(99));
+        bad_boundary.signature = Signature::zero();
+        let bad_boundary_id =
+            run_async(fixture.state_store.store_state_object(bad_boundary)).unwrap();
+        let mut signed_snapshot = snapshot;
+        signed_snapshot.covers_head = bad_boundary_id;
+        signed_snapshot.header.refs = vec![bad_boundary_id];
+        signed_snapshot.sign_with(&test_state_signing_key()).unwrap();
+        let signed_snapshot_id = store_snapshot_for_test(&fixture.state_store, &signed_snapshot);
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(fixture.roots[4], signed_snapshot_id, 2)),
+            Err(ConnectorStateStoreError::InvalidStateSignature(_))
+        ));
+
+        let mut bad_tail = state(3, Some(fixture.heads[2]), lease_id(98));
+        bad_tail.signature = Signature::zero();
+        let bad_tail_id = run_async(fixture.state_store.store_state_object(bad_tail)).unwrap();
+        let successor = state(4, Some(bad_tail_id), lease_id(97));
+        let successor_id = run_async(fixture.state_store.store_state_object(successor)).unwrap();
+        let bad_root = fixture.store_root_for(successor_id);
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(bad_root, fixture.snapshot_id, 2)),
+            Err(ConnectorStateStoreError::InvalidStateSignature(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_replay_checks_signed_sequence_and_singleton_fencing_edges() {
+        let fixture = SnapshotReplayFixture::new();
+        let reader = fixture.reader();
+        let gap = state(4, Some(fixture.heads[2]), lease_id(90));
+        let gap_head = run_async(fixture.state_store.store_state_object(gap)).unwrap();
+        let gap_root = fixture.store_root_for(gap_head);
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(gap_root, fixture.snapshot_id, 1)),
+            Err(ConnectorStateStoreError::SequenceMismatch { expected: 3, got: 4 })
+        ));
+
+        let mut stale = state(3, Some(fixture.heads[2]), lease_id(91));
+        stale.lease_seq = 11;
+        stale.sign_with(&test_state_signing_key()).unwrap();
+        let stale_head = run_async(fixture.state_store.store_state_object(stale)).unwrap();
+        let stale_root = fixture.store_root_for(stale_head);
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(stale_root, fixture.snapshot_id, 1)),
+            Err(ConnectorStateStoreError::StaleLease {
+                held_seq: 11,
+                current_seq: 12,
+            })
+        ));
+    }
+
+    #[test]
+    fn snapshot_replay_applies_writer_pins_to_every_tail_object() {
+        let fixture = SnapshotReplayFixture::new();
+        let outsider_key = Ed25519SigningKey::from_bytes(&[0x77; 32]).unwrap();
+        let outsider = signed_state(3, Some(fixture.heads[2]), lease_id(92), &outsider_key);
+        let outsider_head = run_async(fixture.state_store.store_state_object(outsider)).unwrap();
+        let outsider_root = fixture.store_root_for(outsider_head);
+        assert!(matches!(
+            run_async(fixture.reader().replay_from_snapshot(
+                outsider_root,
+                fixture.snapshot_id,
+                1,
+            )),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_replay_checks_exact_root_envelope_and_model() {
+        let fixture = SnapshotReplayFixture::new();
+        let reader = fixture.reader();
+        let root = root_with_head(Some(fixture.heads[4]), 1_700_000_200);
+        let mut mismatched = fixture
+            .state_store
+            .stored_object(&root.header, &root, RetentionClass::Pinned)
+            .unwrap();
+        mismatched.header.created_at += 1;
+        mismatched.object_id = StoredObject::derive_id(
+            &mismatched.header,
+            &mismatched.body,
+            &object_id_key(),
+        )
+        .unwrap();
+        let mismatched_id = mismatched.object_id;
+        run_async(fixture.object_store.put(mismatched)).unwrap();
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(mismatched_id, fixture.snapshot_id, 2)),
+            Err(ConnectorStateStoreError::HeaderBodyMismatch)
+        ));
+
+        let mut wrong_model = root;
+        wrong_model.model = ConnectorStateModel::Stateless;
+        let wrong_model_id = run_async(fixture.state_store.store_root(wrong_model)).unwrap();
+        assert!(matches!(
+            run_async(reader.replay_from_snapshot(wrong_model_id, fixture.snapshot_id, 2)),
+            Err(ConnectorStateStoreError::IdentityMismatch { field: "state_model", .. })
+        ));
     }
 
     #[test]

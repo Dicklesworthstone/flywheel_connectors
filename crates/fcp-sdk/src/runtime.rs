@@ -1377,6 +1377,39 @@ impl ObjectStoreCursorBackend {
         self
     }
 
+    /// Authenticate a snapshot and its complete tail to a caller-selected root.
+    ///
+    /// The IDs must come from a trusted checkpoint or equivalent caller context.
+    /// They are not discovered from local files or promoted to the latest root.
+    /// The verified authorization configured by [`Self::with_write_authorization`]
+    /// supplies the trusted writer key; no private snapshot key is needed.
+    ///
+    /// `max_tail_entries` bounds the number of later states, and excess work
+    /// fails without returning a partial replay. The snapshot's covered state
+    /// must remain stored, but its predecessor may have been collected.
+    ///
+    /// # Errors
+    /// Returns [`CursorStoreError`] if writer trust is not configured, either
+    /// anchor is invalid, the retained history fails authentication, or the
+    /// complete replay exceeds its budget.
+    pub fn replay_from_snapshot(
+        &self,
+        root_object_id: ObjectId,
+        snapshot_object_id: ObjectId,
+        max_tail_entries: usize,
+    ) -> Result<fcp_store::ConnectorStateReplay, CursorStoreError> {
+        if self.write_authorization.is_none() {
+            return Err(CursorStoreError::Storage(
+                "snapshot recovery requires a verified canonical writer authorization".into(),
+            ));
+        }
+        Self::block_on_connector_state(self.connector_state_store().replay_from_snapshot(
+            root_object_id,
+            snapshot_object_id,
+            max_tail_entries,
+        ))
+    }
+
     fn connector_state_store(&self) -> fcp_store::FcpStoreConnectorStateStore {
         let mut store = fcp_store::FcpStoreConnectorStateStore::new(
             Arc::clone(&self.object_store),
@@ -1630,6 +1663,90 @@ impl ObjectStoreCursorBackend {
                 canonical_seq.map_or_else(|| "<none>".to_string(), |seq| seq.to_string())
             ))),
         }
+    }
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+impl CursorStore<ObjectStoreCursorBackend> {
+    /// Restore cursor, sequence, and lease state from explicit recovery anchors.
+    ///
+    /// The caller must obtain the root and snapshot IDs from a trusted recovery
+    /// context and decide whether that root is sufficiently current. Every
+    /// retained transition is authenticated before this cursor is changed.
+    /// A previously loaded cursor cannot move backwards or switch to a different
+    /// retained state at the same sequence.
+    ///
+    /// This does not promote the root to canonical latest or bypass normal
+    /// append fencing. If ordinary root discovery is unavailable after prefix
+    /// collection, later writes remain unavailable until its authority is
+    /// restored; recovering bytes alone does not authorize publishing a root.
+    ///
+    /// # Errors
+    /// Returns [`CursorStoreError`] on invalid anchors, insufficient replay
+    /// budget, unsupported state schema, cursor regression, or decoding failure.
+    pub fn recover_cursor_from_snapshot(
+        &mut self,
+        root_object_id: ObjectId,
+        snapshot_object_id: ObjectId,
+        max_tail_entries: usize,
+    ) -> Result<CursorState, CursorStoreError> {
+        let replay = self.backend.replay_from_snapshot(
+            root_object_id,
+            snapshot_object_id,
+            max_tail_entries,
+        )?;
+        if replay.root().state_schema_version != 1 {
+            return Err(CursorStoreError::Storage(format!(
+                "unsupported cursor recovery state schema version {}",
+                replay.root().state_schema_version,
+            )));
+        }
+        let (head_id, head) = replay.head();
+        self.validate_state_identity(head)?;
+        if let Some(previous_head) = self.head {
+            if head.seq < self.seq {
+                return Err(CursorStoreError::Storage(
+                    "snapshot recovery would regress the loaded cursor sequence".into(),
+                ));
+            }
+            if self.seq >= replay.snapshot().covers_seq {
+                let retained_head = if self.seq == replay.snapshot().covers_seq {
+                    Some(replay.covered_head().0)
+                } else {
+                    replay
+                        .tail()
+                        .iter()
+                        .find(|(_object_id, state)| state.seq == self.seq)
+                        .map(|(object_id, _state)| *object_id)
+                };
+                if retained_head != Some(previous_head) {
+                    return Err(CursorStoreError::Storage(
+                        "snapshot recovery conflicts with the loaded cursor history".into(),
+                    ));
+                }
+            }
+        }
+        let cursor = CursorState::from_cbor(&head.state_cbor)
+            .map_err(|err| CursorStoreError::CursorDecoding(err.to_string()))?;
+        if let Some(previous) = &self.last_cursor {
+            if previous.offset.is_some() && cursor.offset.is_none() {
+                return Err(CursorStoreError::Storage(
+                    "snapshot recovery would clear the loaded cursor offset".into(),
+                ));
+            }
+            if previous.watermark.is_some() && cursor.watermark.is_none() {
+                return Err(CursorStoreError::Storage(
+                    "snapshot recovery would clear the loaded cursor watermark".into(),
+                ));
+            }
+        }
+        self.validate_commit(&cursor, head.lease_seq)?;
+
+        self.head = Some(head_id);
+        self.seq = head.seq;
+        self.last_cursor = Some(cursor.clone());
+        self.last_lease_seq = head.lease_seq;
+        Ok(cursor)
     }
 }
 
