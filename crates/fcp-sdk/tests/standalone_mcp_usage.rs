@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use fcp_core::{CapabilityConstraints, CapabilityToken};
+use fcp_core::{CapabilityConstraints, CapabilityToken, InvokeRequest, InvokeResponse, RequestId};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use serde_json::{Value, json};
 
@@ -119,13 +119,24 @@ fn request(
     calls: u32,
     scoped_key: Option<&str>,
 ) -> Value {
+    request_with_bytes(key, instance, operation, Some(calls), scoped_key, None)
+}
+
+fn request_with_bytes(
+    key: &Ed25519SigningKey,
+    instance: &str,
+    operation: &str,
+    calls: Option<u32>,
+    scoped_key: Option<&str>,
+    bytes: Option<u64>,
+) -> Value {
     let capability = if operation == "mcp.server.metrics" {
         "mcp.server.metrics"
     } else {
         "mcp.prompts.read"
     };
     let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()], max_calls: Some(calls),
+        resource_allow: vec!["*".into()], max_calls: calls, max_bytes: bytes,
         idempotency_key: scoped_key.map(str::to_owned), ..Default::default()
     };
     let mut cbor = Vec::new();
@@ -223,7 +234,11 @@ fn admitted_provider_errors_do_not_refund_the_signed_allowance() {
     // The real provider validates this before any MCP network request. It is
     // still an admitted FCP invocation and must not earn a usage refund.
     invoke["input"] = json!({"name": "", "arguments": {}});
-    assert!(process.call("invoke", invoke.clone()).get("error").is_some());
+    let failure = process.result("invoke", invoke.clone());
+    assert_eq!(failure["status"], "error");
+    assert_eq!(failure["id"], invoke["id"]);
+    assert!(failure.get("error").is_some());
+    assert!(failure.get("result").is_none());
     assert_eq!(process.requests(), 1);
     assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
     assert_eq!(process.requests(), 1);
@@ -241,4 +256,113 @@ fn resetting_process_authority_cannot_revive_a_spent_old_token() {
     let fresh = request(&key, &next, "mcp.server.metrics", 1, None);
     assert_eq!(process.result("invoke", fresh)["status"], "ok");
     assert_eq!(process.requests(), 2);
+}
+
+/// Match production metering of the complete typed request, including omitted
+/// optional fields, rather than the caller's original JSON object or estimates.
+fn invoke_bytes(value: &Value) -> u64 {
+    let request: InvokeRequest = serde_json::from_value(value.clone()).unwrap();
+    u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap()
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn signed_byte_only_budget_settles_success_and_exhausts_across_real_invocations() {
+    const BYTES: u64 = 16 * 1024;
+    let (mut process, key, instance) = established();
+    let invoke = request_with_bytes(&key, &instance, "mcp.server.metrics", None, None, Some(BYTES));
+    for _ in 0..3 {
+        assert_eq!(process.result("simulate", simulation(&invoke))["would_succeed"], true);
+    }
+    assert_eq!(process.requests(), 0);
+    let request_bytes = invoke_bytes(&invoke);
+    let mut succeeded = 0_u64;
+    let mut charged = 0_u64;
+    let mut exhausted = false;
+    // This is a finite byte-only grant: call-count enforcement cannot make the
+    // test pass. Bound the loop so an ignored byte ceiling fails deterministically.
+    for _ in 0..64 {
+        let reply = process.call("invoke", invoke.clone());
+        if reply.get("error").is_some() {
+            // The last response may be too large for the final reservation, or
+            // admission may lack room for a complete request/response envelope.
+            exhausted = true;
+            break;
+        }
+        let response: InvokeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(reply["result"]["status"], "ok");
+        let response_bytes = u64::try_from(serde_json::to_vec(&response).unwrap().len()).unwrap();
+        charged += request_bytes + response_bytes;
+        assert!(charged <= BYTES, "released FCP messages exceeded the signed byte grant");
+        succeeded += 1;
+    }
+    assert!(exhausted, "the finite byte grant never exhausted");
+    assert!(succeeded >= 2, "successful settlement did not release unused response reservations");
+    let dispatched = process.requests();
+    assert!((succeeded..=succeeded + 1).contains(&dispatched));
+    assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+    assert_eq!(process.requests(), dispatched);
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn oversized_actual_request_cannot_spend_a_call_or_use_fake_byte_counters() {
+    const BYTES: u64 = 8 * 1024;
+    let (mut process, key, instance) = established();
+    let invoke = request_with_bytes(&key, &instance, "mcp.server.metrics", Some(1), None, Some(BYTES));
+    let mut too_large = invoke.clone();
+    too_large["input"] = json!({
+        "payload": "x".repeat(8 * 1024), "request_bytes": 0, "observed_bytes": 0,
+    });
+    assert!(invoke_bytes(&too_large) > BYTES);
+    assert_eq!(process.call("invoke", too_large)["error"]["code"], "FCP-3001");
+    assert_eq!(process.requests(), 0);
+    assert_eq!(process.result("invoke", invoke.clone())["status"], "ok");
+    assert_eq!(process.requests(), 1);
+    assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn provider_failure_returns_canonical_error_and_retains_its_byte_reservation() {
+    let (mut process, key, instance) = established();
+    let mut invoke = request_with_bytes(&key, &instance, "mcp.prompts.get", None, None, Some(8 * 1024));
+    // Invalid provider parameters fail locally after admission, with no network.
+    invoke["input"] = json!({"name": "", "arguments": {}});
+    let response = process.result("invoke", invoke.clone());
+    assert_eq!(response["type"], "response");
+    assert_eq!(response["id"], invoke["id"]);
+    assert_eq!(response["status"], "error");
+    assert!(response.get("error").is_some());
+    assert!(response.get("result").is_none());
+    assert_eq!(process.requests(), 1);
+    // No max_calls exists in this token. Denial proves the error did not give
+    // back its pessimistic response reservation, not merely that calls ran out.
+    assert_eq!(process.result("simulate", simulation(&invoke))["would_succeed"], false);
+    assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+    assert_eq!(process.requests(), 1);
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn oversized_provider_result_is_withheld_at_the_actual_stdio_response_boundary() {
+    const BYTES: u64 = 8 * 1024;
+    let (mut process, key, instance) = established();
+    let mut invoke = request_with_bytes(&key, &instance, "mcp.server.metrics", None, None, Some(BYTES));
+    invoke["input"] = json!({"padding": ""});
+    let minimum_response = InvokeResponse::ok(RequestId::new("inner-first"), json!(0));
+    let minimum_bytes = u64::try_from(serde_json::to_vec(&minimum_response).unwrap().len()).unwrap();
+    let padding = BYTES.checked_sub(invoke_bytes(&invoke) + minimum_bytes).unwrap();
+    invoke["input"]["padding"] = json!("x".repeat(usize::try_from(padding).unwrap()));
+    // The request leaves exactly enough bytes for the smallest legal response.
+    // Metrics returns an object, not the digit 0, so the real provider executes
+    // but its larger result must never be emitted or advertised as replay-safe.
+    assert_eq!(invoke_bytes(&invoke) + minimum_bytes, BYTES);
+    let reply = process.call("invoke", invoke.clone());
+    assert!(reply.get("result").is_none());
+    assert!(reply["error"]["message"].as_str().unwrap().contains("outcome is unknown"));
+    assert!(!reply.to_string().contains("injection_scans"));
+    assert_eq!(process.requests(), 1);
+    assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+    assert_eq!(process.requests(), 1);
 }

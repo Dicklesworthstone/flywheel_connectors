@@ -21,6 +21,9 @@ use crate::connector::McpBridgeConnector;
 
 const MANIFEST: &str = include_str!("../manifest.toml");
 const MAX_INVOKE_TIMEOUT: Duration = Duration::from_secs(120);
+// Complete FCP response cap, including metadata; separate from provider HTTP
+// transfer limits and the outer JSONL frame. Signed grants can only narrow it.
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Owns the provider and its private-channel capability authority.
 ///
@@ -158,7 +161,9 @@ impl McpBridgeServer {
         // Verification and the signed usage charge precede every provider
         // operation. Changes to request IDs or input cannot refill a grant.
         // Once admitted, errors, interruption and dropped futures do not refund.
-        let witness = self.session.admit(&request, &resource_uris)?;
+        let witness = self.session.admit_bounded(
+            &request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES,
+        )?;
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(invalid("Invocation deadline elapsed before MCP dispatch"));
@@ -169,17 +174,28 @@ impl McpBridgeServer {
     /// The only process-boundary path that can execute a provider operation.
     async fn invoke_verified(
         &self,
-        _witness: StandaloneInvocation,
+        witness: StandaloneInvocation,
         id: RequestId,
         operation: OperationId,
         input: Value,
         budget: Duration,
     ) -> FcpResult<Value> {
-        let result = await_invocation(self.connector.handle_invoke(json!({
+        let outcome = await_invocation(self.connector.handle_invoke(json!({
             "operation_id": operation.as_str(),
             "input": input,
-        })), budget).await?;
-        encode(&InvokeResponse::ok(id, result))
+        })), budget).await;
+        // Admitted provider failures are canonical error responses too. Letting
+        // them escape via `?` would bypass the byte boundary for error payloads.
+        let response = match outcome {
+            Ok(result) => InvokeResponse::ok(id, result),
+            Err(error) => InvokeResponse::error(id, error),
+        };
+        let encoded = encode(&response)?;
+        // No response leaves this function until its complete envelope fits.
+        // Only a successful response releases unused response capacity; failure
+        // or interruption retains the reservation and never restores a call.
+        witness.finish_response(&response)?;
+        Ok(encoded)
     }
 
     fn simulate(&self, params: Value) -> FcpResult<Value> {
@@ -194,9 +210,10 @@ impl McpBridgeServer {
             Ok(_) => SimulateResponse::allowed(request.id),
             Err(error) => SimulateResponse::denied(request.id, error.to_string(), error.error_code()),
         };
-        // Authorization simulation checks remaining call quota without charging
-        // or reserving it. It is local; it neither invokes a provider nor
-        // fabricates availability, cost estimates or guarantees of API success.
+        // Authorization simulation checks remaining call/byte quota without
+        // charging or reserving it. It does not predict the complete invocation
+        // message size or provider output, and cannot guarantee later admission
+        // or API success. No provider work occurs during this local preview.
         encode(&response)
     }
 }
