@@ -1306,6 +1306,7 @@ pub struct ObjectStoreCursorBackend {
     instance_id: Option<InstanceId>,
     retention: RetentionClass,
     write_authorization: Option<ConnectorStateWriteAuthorization>,
+    snapshot_signing_key: Option<Arc<fcp_crypto::Ed25519SigningKey>>,
 }
 
 #[cfg(feature = "cursor-store-object-store")]
@@ -1326,6 +1327,7 @@ impl ObjectStoreCursorBackend {
             instance_id: None,
             retention: RetentionClass::Pinned,
             write_authorization: None,
+            snapshot_signing_key: None,
         }
     }
 
@@ -1358,6 +1360,23 @@ impl ObjectStoreCursorBackend {
         self
     }
 
+    /// Supply the private writer key for canonical snapshots after cursor commits.
+    ///
+    /// This applies to canonical writes enabled by [`Self::with_write_authorization`].
+    /// The key must match the authenticated covered state and writer pin; this
+    /// builder does not create or replace an authorization witness.
+    ///
+    /// Without a matching key, cursor commits still advance canonical state,
+    /// while due automatic snapshots are skipped with a warning.
+    #[must_use]
+    pub fn with_snapshot_signing_key(
+        mut self,
+        signing_key: Arc<fcp_crypto::Ed25519SigningKey>,
+    ) -> Self {
+        self.snapshot_signing_key = Some(signing_key);
+        self
+    }
+
     fn connector_state_store(&self) -> fcp_store::FcpStoreConnectorStateStore {
         let mut store = fcp_store::FcpStoreConnectorStateStore::new(
             Arc::clone(&self.object_store),
@@ -1372,6 +1391,9 @@ impl ObjectStoreCursorBackend {
         // that this backend would then trust as canonical state.
         if let Some(authorization) = &self.write_authorization {
             store = store.with_trusted_writer_keys([authorization.writer_public_key()]);
+        }
+        if let Some(signing_key) = &self.snapshot_signing_key {
+            store = store.with_snapshot_signing_key(Arc::clone(signing_key));
         }
 
         if let Some(instance_id) = &self.instance_id {

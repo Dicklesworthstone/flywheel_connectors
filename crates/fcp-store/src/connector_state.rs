@@ -16,7 +16,7 @@ use fcp_cbor::{
     CanonicalSerializer, MAX_CANONICALIZATION_DEPTH, MAX_DESERIALIZATION_RECURSION_LIMIT, SchemaId,
     SerializationError,
 };
-use fcp_crypto::Ed25519VerifyingKey;
+use fcp_crypto::{Ed25519SigningKey, Ed25519VerifyingKey};
 use fcp_prelude::{
     BackoffPolicy, ConnectorId, ConnectorStateAppendOutcome, ConnectorStateCanonicalStatus,
     ConnectorStateChange, ConnectorStateChangeKind, ConnectorStateChangeStream,
@@ -129,6 +129,26 @@ pub enum ConnectorStateStoreError {
     #[error("connector state object signature verification failed: {0}")]
     InvalidStateSignature(String),
 
+    /// No configured snapshot signer can authenticate the covered state.
+    #[error("connector state snapshot signing unavailable: {reason}")]
+    SnapshotSigningUnavailable {
+        /// Missing key or mismatch with the authenticated covered writer.
+        reason: String,
+    },
+
+    /// A snapshot signature does not verify against the covered state writer.
+    #[error("connector state snapshot signature verification failed: {0}")]
+    InvalidSnapshotSignature(String),
+
+    /// A snapshot does not contain the state declared by its covered head.
+    #[error("connector state snapshot {field} does not match covered state {covers_head}")]
+    SnapshotStateMismatch {
+        /// Authenticated state object the snapshot claims to cover.
+        covers_head: ObjectId,
+        /// Projection field that differs from the covered state.
+        field: &'static str,
+    },
+
     /// A state object used a sequence number that does not follow the head.
     #[error("connector state sequence mismatch: expected {expected}, got {got}")]
     SequenceMismatch {
@@ -237,6 +257,7 @@ pub struct FcpStoreConnectorStateStore {
     change_bus: Arc<ConnectorStateChangeBus>,
     root_cache: Arc<RwLock<Option<CachedConnectorStateRoot>>>,
     trusted_writer_keys: Option<Arc<HashSet<[u8; 32]>>>,
+    snapshot_signing_key: Option<Arc<Ed25519SigningKey>>,
 }
 
 impl FcpStoreConnectorStateStore {
@@ -269,6 +290,7 @@ impl FcpStoreConnectorStateStore {
             change_bus,
             root_cache: Arc::new(RwLock::new(None)),
             trusted_writer_keys: None,
+            snapshot_signing_key: None,
         }
     }
 
@@ -290,6 +312,22 @@ impl FcpStoreConnectorStateStore {
         I: IntoIterator<Item = [u8; 32]>,
     {
         self.trusted_writer_keys = Some(Arc::new(keys.into_iter().collect()));
+        self
+    }
+
+    /// Supply the private key used to sign canonical snapshots.
+    ///
+    /// The key must match the authenticated covered state writer and any
+    /// configured writer pin. This does not grant append authorization.
+    /// Readers need only the verified covered state, not this private key.
+    ///
+    /// Without a matching key, explicit snapshots return
+    /// [`ConnectorStateStoreError::SnapshotSigningUnavailable`]. Automatic
+    /// snapshots are skipped with a warning after the append has committed;
+    /// a state-object signature is never reused as a snapshot signature.
+    #[must_use]
+    pub fn with_snapshot_signing_key(mut self, signing_key: Arc<Ed25519SigningKey>) -> Self {
+        self.snapshot_signing_key = Some(signing_key);
         self
     }
 
@@ -829,12 +867,14 @@ impl FcpStoreConnectorStateStore {
     /// Emit a snapshot for the current head, if any.
     ///
     /// # Errors
-    /// Returns an error if the root/head is missing or storage fails.
+    /// Returns an error if the head cannot be authenticated, no matching
+    /// snapshot signing key is configured, or storage fails.
     pub async fn snapshot_head(&self) -> Result<Option<ObjectId>> {
+        let _append_guard = self.change_bus.append_guard.lock().await;
         let Some((head_id, head)) = self.current_head().await? else {
             return Ok(None);
         };
-        let snapshot_id = self.emit_snapshot(head_id, &head).await?;
+        let snapshot_id = self.emit_snapshot(head_id).await?;
         self.publish_change(
             ConnectorStateChangeKind::SnapshotEmitted,
             Some(snapshot_id),
@@ -846,7 +886,9 @@ impl FcpStoreConnectorStateStore {
     /// Return the latest snapshot for this connector, if any.
     ///
     /// # Errors
-    /// Returns an error if a matching snapshot is malformed.
+    /// Returns an error if a matching snapshot is malformed, its own signature
+    /// is invalid, or its covered state cannot be authenticated. Legacy objects
+    /// that copied a state signature are rejected.
     pub async fn latest_snapshot(&self) -> Result<Option<(ObjectId, ConnectorStateSnapshot)>> {
         let mut best: Option<(ObjectId, ConnectorStateSnapshot)> = None;
 
@@ -864,7 +906,8 @@ impl FcpStoreConnectorStateStore {
             if !self.snapshot_belongs_to_store(&snapshot) {
                 continue;
             }
-            self.validate_snapshot(&snapshot)?;
+            self.validate_stored_snapshot(object_id, &stored, &snapshot)
+                .await?;
 
             let replace = best.as_ref().is_none_or(|(best_id, best_snapshot)| {
                 snapshot
@@ -882,14 +925,27 @@ impl FcpStoreConnectorStateStore {
         Ok(best)
     }
 
+    async fn load_snapshot(&self, object_id: &ObjectId) -> Result<ConnectorStateSnapshot> {
+        let stored = self.object_store.get(object_id).await?;
+        let snapshot = self.decode_stored(
+            &stored,
+            &Self::snapshot_schema_id(),
+            "connector state snapshot",
+        )?;
+        self.validate_stored_snapshot(*object_id, &stored, &snapshot)
+            .await?;
+        Ok(snapshot)
+    }
+
     /// Mark state objects older than `before_seq` as ephemeral for later GC.
     ///
     /// This method intentionally does not delete objects; it only relaxes
     /// retention on non-head chain entries so the GC layer can make the final
-    /// reachability decision under its own policy.
+    /// reachability decision under its own policy. Retention is not relaxed for
+    /// a retained snapshot's covered head, which authenticates that snapshot.
     ///
     /// # Errors
-    /// Returns an error if state loading or retention updates fail.
+    /// Returns an error if state/snapshot validation or retention updates fail.
     pub async fn compact(&self, before_seq: u64) -> Result<usize> {
         let started = Instant::now();
         let result = self.compact_inner(before_seq).await;
@@ -918,9 +974,31 @@ impl FcpStoreConnectorStateStore {
             None => return Ok(0),
         };
         let states = self.read_chain(None, usize::MAX).await?;
+        let mut snapshot_heads = HashSet::new();
+        for object_id in self.object_store.list_zone(&self.zone_id).await {
+            let stored = self.object_store.get(&object_id).await?;
+            if stored.header.schema != Self::snapshot_schema_id() {
+                continue;
+            }
+            let snapshot: ConnectorStateSnapshot = self.decode_stored(
+                &stored,
+                &Self::snapshot_schema_id(),
+                "connector state snapshot",
+            )?;
+            if !self.snapshot_belongs_to_store(&snapshot) {
+                continue;
+            }
+            self.validate_stored_snapshot(object_id, &stored, &snapshot)
+                .await?;
+            snapshot_heads.insert(snapshot.covers_head);
+        }
+
         let mut updated = 0;
         for (object_id, state) in states {
-            if head_object_id.as_ref() == Some(&object_id) {
+            // A retention-only sweep does not follow refs from every retained
+            // object. Keep the covered state available for snapshot signature
+            // and projection verification, even after newer heads commit.
+            if head_object_id.as_ref() == Some(&object_id) || snapshot_heads.contains(&object_id) {
                 continue;
             }
             if state.seq < before_seq {
@@ -1025,7 +1103,7 @@ impl FcpStoreConnectorStateStore {
         if !entries_due && !self.elapsed_snapshot_due(state_obj).await? {
             return Ok(None);
         }
-        self.emit_snapshot(object_id, state_obj).await.map(Some)
+        self.emit_snapshot(object_id).await.map(Some)
     }
 
     async fn maybe_emit_snapshot_after_root_commit(
@@ -1064,13 +1142,9 @@ impl FcpStoreConnectorStateStore {
                 >= self.snapshot_every_secs)
     }
 
-    async fn emit_snapshot(
-        &self,
-        covers_head: ObjectId,
-        state_obj: &ConnectorStateObject,
-    ) -> Result<ObjectId> {
+    async fn emit_snapshot(&self, covers_head: ObjectId) -> Result<ObjectId> {
         let started = Instant::now();
-        let result = self.emit_snapshot_inner(covers_head, state_obj).await;
+        let result = self.emit_snapshot_inner(covers_head).await;
         let telemetry_result = if result.is_ok() { "emitted" } else { "error" };
         self.record_operation_telemetry(
             CONNECTOR_STATE_SNAPSHOT_EVENT,
@@ -1081,11 +1155,21 @@ impl FcpStoreConnectorStateStore {
         result
     }
 
-    async fn emit_snapshot_inner(
-        &self,
-        covers_head: ObjectId,
-        state_obj: &ConnectorStateObject,
-    ) -> Result<ObjectId> {
+    async fn emit_snapshot_inner(&self, covers_head: ObjectId) -> Result<ObjectId> {
+        let signing_key = self.snapshot_signing_key.as_ref().ok_or_else(|| {
+            ConnectorStateStoreError::SnapshotSigningUnavailable {
+                reason: "configure with_snapshot_signing_key with the covered writer's key"
+                    .to_string(),
+            }
+        })?;
+        let (_head_id, state_obj) = self.load_state_object(&covers_head).await?;
+        if signing_key.verifying_key().to_bytes() != state_obj.writer_public_key {
+            return Err(ConnectorStateStoreError::SnapshotSigningUnavailable {
+                reason: "configured snapshot key does not match the authenticated covered writer"
+                    .to_string(),
+            });
+        }
+
         let mut header = self.derived_header(
             Self::snapshot_schema_id(),
             state_obj.header.created_at,
@@ -1094,7 +1178,7 @@ impl FcpStoreConnectorStateStore {
         header.refs.push(covers_head);
         header.placement.clone_from(&state_obj.header.placement);
 
-        let snapshot = ConnectorStateSnapshot {
+        let mut snapshot = ConnectorStateSnapshot {
             header,
             connector_id: self.connector_id.clone(),
             instance_id: self.instance_id.clone(),
@@ -1103,10 +1187,11 @@ impl FcpStoreConnectorStateStore {
             covers_seq: state_obj.seq,
             state_cbor: state_obj.state_cbor.clone(),
             snapshotted_at: state_obj.updated_at,
-            signature: state_obj.signature,
+            signature: fcp_prelude::Signature::zero(),
         };
 
         self.validate_snapshot(&snapshot)?;
+        snapshot.sign_with(signing_key)?;
         let stored = self.stored_object(&snapshot.header, &snapshot, self.retention)?;
         let object_id = stored.object_id;
         self.put_idempotent(stored).await?;
@@ -1196,6 +1281,49 @@ impl FcpStoreConnectorStateStore {
             return Err(ConnectorStateStoreError::MissingHead(snapshot.covers_head));
         }
         Ok(())
+    }
+
+    async fn validate_stored_snapshot(
+        &self,
+        object_id: ObjectId,
+        stored: &StoredObject,
+        snapshot: &ConnectorStateSnapshot,
+    ) -> Result<()> {
+        self.validate_snapshot(snapshot)?;
+        if !headers_match(&stored.header, &snapshot.header)? {
+            return Err(ConnectorStateStoreError::HeaderBodyMismatch);
+        }
+        let computed = StoredObject::derive_id(&stored.header, &stored.body, &self.object_id_key)?;
+        if computed != object_id {
+            return Err(ConnectorStateStoreError::ContentIdMismatch {
+                claimed: object_id,
+                computed,
+            });
+        }
+
+        // The covered state supplies the authenticated writer key and passes
+        // the same identity, canonical encoding, signature, and pin checks as
+        // every other canonical state read.
+        let (_head_id, covered) = self.load_state_object(&snapshot.covers_head).await?;
+        if snapshot.covers_seq != covered.seq {
+            return Err(ConnectorStateStoreError::SnapshotStateMismatch {
+                covers_head: snapshot.covers_head,
+                field: "covers_seq",
+            });
+        }
+        if snapshot.state_cbor != covered.state_cbor {
+            return Err(ConnectorStateStoreError::SnapshotStateMismatch {
+                covers_head: snapshot.covers_head,
+                field: "state_cbor",
+            });
+        }
+        let verifying_key =
+            Ed25519VerifyingKey::from_bytes(&covered.writer_public_key).map_err(|err| {
+                ConnectorStateStoreError::InvalidSnapshotSignature(err.to_string())
+            })?;
+        snapshot
+            .verify_signature_with(&verifying_key)
+            .map_err(|err| ConnectorStateStoreError::InvalidSnapshotSignature(err.to_string()))
     }
 
     fn validate_incoming_state_object(&self, state: &ConnectorStateObject) -> Result<()> {
@@ -1616,6 +1744,12 @@ impl FcpStoreConnectorStateStore {
                     reason: format!("root references missing state object {head}"),
                 }
             }
+            ConnectorStateStoreError::SnapshotSigningUnavailable { reason } => {
+                ConnectorStateError::SnapshotUnavailable {
+                    connector_id: self.connector_id.clone(),
+                    reason,
+                }
+            }
             ConnectorStateStoreError::StaleLease {
                 held_seq,
                 current_seq,
@@ -1632,6 +1766,8 @@ impl FcpStoreConnectorStateStore {
             | ConnectorStateStoreError::EmptyStateCbor
             | ConnectorStateStoreError::InvalidStateCbor(_)
             | ConnectorStateStoreError::InvalidStateSignature(_)
+            | ConnectorStateStoreError::InvalidSnapshotSignature(_)
+            | ConnectorStateStoreError::SnapshotStateMismatch { .. }
             | ConnectorStateStoreError::SequenceMismatch { .. }
             | ConnectorStateStoreError::SequenceOverflow(_)
             | ConnectorStateStoreError::ChainCycle(_)
@@ -1713,22 +1849,9 @@ impl ConnectorStateStore for FcpStoreConnectorStateStore {
                 connector_id: connector_id.clone(),
                 reason: "no connector state head exists".to_string(),
             })?;
-        let Some((latest_id, snapshot)) = Self::latest_snapshot(self)
+        self.load_snapshot(&snapshot_id)
             .await
-            .map_err(|err| self.to_connector_state_error(err))?
-        else {
-            return Err(ConnectorStateError::SnapshotUnavailable {
-                connector_id: connector_id.clone(),
-                reason: "snapshot was emitted but could not be reloaded".to_string(),
-            });
-        };
-        if latest_id != snapshot_id {
-            return Err(ConnectorStateError::SnapshotUnavailable {
-                connector_id: connector_id.clone(),
-                reason: format!("latest snapshot {latest_id} did not match emitted {snapshot_id}"),
-            });
-        }
-        Ok(snapshot)
+            .map_err(|err| self.to_connector_state_error(err))
     }
 
     async fn compact(
@@ -1932,6 +2055,19 @@ mod tests {
 
     fn test_store(object_store: Arc<dyn ObjectStore>) -> FcpStoreConnectorStateStore {
         FcpStoreConnectorStateStore::new(object_store, object_id_key(), connector_id(), zone_id())
+            .with_snapshot_signing_key(Arc::new(test_state_signing_key()))
+    }
+
+    fn store_snapshot_for_test(
+        state_store: &FcpStoreConnectorStateStore,
+        snapshot: &ConnectorStateSnapshot,
+    ) -> ObjectId {
+        let stored = state_store
+            .stored_object(&snapshot.header, snapshot, RetentionClass::Pinned)
+            .unwrap();
+        let object_id = stored.object_id;
+        run_async(state_store.object_store.put(stored)).unwrap();
+        object_id
     }
 
     struct FailNthPutObjectStore {
@@ -2016,7 +2152,9 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
         pause_on_put: usize,
         pause_after_write: bool,
+        pause_on_snapshot_get: bool,
         puts: AtomicUsize,
+        snapshot_gets: AtomicUsize,
         release: parking_lot::Mutex<(bool, Option<std::task::Waker>)>,
     }
 
@@ -2026,9 +2164,16 @@ mod tests {
                 inner: store(),
                 pause_on_put,
                 pause_after_write,
+                pause_on_snapshot_get: false,
                 puts: AtomicUsize::new(0),
+                snapshot_gets: AtomicUsize::new(0),
                 release: parking_lot::Mutex::new((false, None)),
             }
+        }
+
+        fn pause_first_snapshot_get(mut self) -> Self {
+            self.pause_on_snapshot_get = true;
+            self
         }
 
         async fn pause(&self) {
@@ -2071,7 +2216,14 @@ mod tests {
         }
 
         async fn get(&self, id: &ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
-            self.inner.get(id).await
+            let stored = self.inner.get(id).await?;
+            if self.pause_on_snapshot_get
+                && stored.header.schema == FcpStoreConnectorStateStore::snapshot_schema_id()
+                && self.snapshot_gets.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                self.pause().await;
+            }
+            Ok(stored)
         }
 
         async fn exists(&self, id: &ObjectId) -> bool {
@@ -3612,6 +3764,337 @@ mod tests {
     }
 
     #[test]
+    fn missing_snapshot_signer_preserves_committed_append() {
+        let object_store = store();
+        let (authorization, signing_key) = write_authorization_with_key();
+        let state_store = FcpStoreConnectorStateStore::new(
+            object_store.clone(),
+            object_id_key(),
+            connector_id(),
+            zone_id(),
+        )
+        .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()])
+        .with_snapshot_every_entries(1);
+        let outcome = run_async(ConnectorStateStore::append_object(
+            &state_store,
+            &connector_id(),
+            &authorization,
+            signed_state(0, None, lease_id(1), &signing_key),
+        ))
+        .unwrap();
+        let ConnectorStateAppendOutcome::Committed {
+            object_id,
+            snapshot_object_id,
+            ..
+        } = outcome
+        else {
+            panic!("authorized state must commit without a snapshot signer");
+        };
+        assert!(snapshot_object_id.is_none());
+        assert_eq!(run_async(state_store.current_head()).unwrap().unwrap().0, object_id);
+        assert_eq!(run_async(object_store.list_zone(&zone_id())).len(), 2);
+
+        let err = run_async(state_store.snapshot_head()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConnectorStateStoreError::SnapshotSigningUnavailable { .. }
+        ));
+        let err = run_async(ConnectorStateStore::snapshot(&state_store, &connector_id()))
+            .unwrap_err();
+        match err {
+            ConnectorStateError::SnapshotUnavailable { reason, .. } => {
+                assert!(reason.contains("with_snapshot_signing_key"));
+            }
+            other => panic!("unexpected snapshot error: {other}"),
+        }
+        assert_eq!(run_async(object_store.list_zone(&zone_id())).len(), 2);
+    }
+
+    #[test]
+    fn snapshot_signer_must_match_authenticated_covered_writer() {
+        let object_store = store();
+        let (authorization, signing_key) = write_authorization_with_key();
+        let state_store = test_store(object_store.clone())
+            .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()])
+            .with_snapshot_every_entries(1);
+        let outcome = run_async(ConnectorStateStore::append_object(
+            &state_store,
+            &connector_id(),
+            &authorization,
+            signed_state(0, None, lease_id(1), &signing_key),
+        ))
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectorStateAppendOutcome::Committed {
+                snapshot_object_id: None,
+                ..
+            }
+        ));
+        match run_async(state_store.snapshot_head()).unwrap_err() {
+            ConnectorStateStoreError::SnapshotSigningUnavailable { reason } => {
+                assert!(reason.contains("does not match"));
+            }
+            other => panic!("unexpected snapshot error: {other}"),
+        }
+        assert_eq!(run_async(object_store.list_zone(&zone_id())).len(), 2);
+    }
+
+    #[test]
+    fn snapshots_are_signed_and_readers_need_no_private_key() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone()).with_snapshot_every_entries(0);
+        let covered = state(0, None, lease_id(1));
+        let (head, _) = append_ok(&state_store, covered.clone());
+        let snapshot = run_async(ConnectorStateStore::snapshot(&state_store, &connector_id()))
+            .unwrap();
+        assert_eq!(snapshot.covers_head, head);
+        assert_eq!(snapshot.state_cbor, covered.state_cbor);
+        assert_ne!(snapshot.signature, covered.signature);
+        snapshot
+            .verify_signature_with(&test_state_signing_key().verifying_key())
+            .unwrap();
+
+        let reader = FcpStoreConnectorStateStore::new(
+            object_store,
+            object_id_key(),
+            connector_id(),
+            zone_id(),
+        )
+        .with_trusted_writer_keys([test_state_signing_key().verifying_key().to_bytes()]);
+        let latest = run_async(reader.latest_snapshot()).unwrap().unwrap();
+        assert_eq!(latest.1.covers_head, head);
+
+        // Creation metadata has its own signature and need not equal the
+        // covered state's update time.
+        let mut later = snapshot;
+        later.header.created_at += 60;
+        later.snapshotted_at += 60;
+        later.sign_with(&test_state_signing_key()).unwrap();
+        let later_id = store_snapshot_for_test(&state_store, &later);
+        let latest = run_async(reader.latest_snapshot()).unwrap().unwrap();
+        assert_eq!(latest.0, later_id);
+        assert_eq!(latest.1.snapshotted_at, covered.updated_at + 60);
+    }
+
+    #[test]
+    fn snapshot_reads_reject_copied_state_signatures() {
+        let state_store = test_store(store()).with_snapshot_every_entries(0);
+        let covered = state(0, None, lease_id(1));
+        append_ok(&state_store, covered.clone());
+        let mut forged =
+            run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
+        forged.signature = covered.signature;
+        let forged_id = store_snapshot_for_test(&state_store, &forged);
+
+        assert!(matches!(
+            run_async(state_store.load_snapshot(&forged_id)),
+            Err(ConnectorStateStoreError::InvalidSnapshotSignature(_))
+        ));
+        assert!(matches!(
+            run_async(state_store.latest_snapshot()),
+            Err(ConnectorStateStoreError::InvalidSnapshotSignature(_))
+        ));
+
+        // An explicit new snapshot reloads its own authenticated object even
+        // when a legacy copied-signature snapshot makes latest-scan fail closed.
+        let repaired =
+            run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
+        repaired
+            .verify_signature_with(&test_state_signing_key().verifying_key())
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_reads_reject_signed_projection_mismatches() {
+        for field in ["covers_seq", "state_cbor"] {
+            let state_store = test_store(store()).with_snapshot_every_entries(0);
+            append_ok(&state_store, state(0, None, lease_id(1)));
+            let mut forged =
+                run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
+            match field {
+                "covers_seq" => forged.covers_seq += 1,
+                "state_cbor" => forged.state_cbor = vec![0x00],
+                _ => unreachable!(),
+            }
+            forged.sign_with(&test_state_signing_key()).unwrap();
+            let forged_id = store_snapshot_for_test(&state_store, &forged);
+            for err in [
+                run_async(state_store.load_snapshot(&forged_id)).unwrap_err(),
+                run_async(state_store.latest_snapshot()).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(
+                        err,
+                        ConnectorStateStoreError::SnapshotStateMismatch {
+                            field: rejected_field,
+                            ..
+                        } if rejected_field == field
+                    ),
+                    "signed {field} mismatch must fail covered-state validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_authenticate_creation_metadata() {
+        for field in ["header.created_at", "snapshotted_at"] {
+            let state_store = test_store(store()).with_snapshot_every_entries(0);
+            append_ok(&state_store, state(0, None, lease_id(1)));
+            let mut forged =
+                run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
+            match field {
+                "header.created_at" => forged.header.created_at += 1,
+                "snapshotted_at" => forged.snapshotted_at += 1,
+                _ => unreachable!(),
+            }
+            store_snapshot_for_test(&state_store, &forged);
+            assert!(matches!(
+                run_async(state_store.latest_snapshot()),
+                Err(ConnectorStateStoreError::InvalidSnapshotSignature(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_check_envelope_and_requested_id() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone()).with_snapshot_every_entries(0);
+        append_ok(&state_store, state(0, None, lease_id(1)));
+        let snapshot =
+            run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
+        let mut stored = state_store
+            .stored_object(&snapshot.header, &snapshot, RetentionClass::Pinned)
+            .unwrap();
+        let wrong_id = ObjectId::from_bytes([0xee; 32]);
+        assert!(matches!(
+            run_async(state_store.validate_stored_snapshot(wrong_id, &stored, &snapshot)),
+            Err(ConnectorStateStoreError::ContentIdMismatch { claimed, .. })
+                if claimed == wrong_id
+        ));
+
+        stored.header.created_at += 1;
+        stored.object_id =
+            StoredObject::derive_id(&stored.header, &stored.body, &object_id_key()).unwrap();
+        let mismatched_id = stored.object_id;
+        run_async(object_store.put(stored)).unwrap();
+        assert!(matches!(
+            run_async(state_store.load_snapshot(&mismatched_id)),
+            Err(ConnectorStateStoreError::HeaderBodyMismatch)
+        ));
+        assert!(matches!(
+            run_async(state_store.latest_snapshot()),
+            Err(ConnectorStateStoreError::HeaderBodyMismatch)
+        ));
+    }
+
+    #[test]
+    fn snapshot_signer_does_not_bypass_covered_writer_pin() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone()).with_snapshot_every_entries(0);
+        append_ok(&state_store, state(0, None, lease_id(1)));
+        run_async(state_store.snapshot_head()).unwrap().unwrap();
+
+        let untrusted_reader = test_store(object_store)
+            .with_trusted_writer_keys([Ed25519SigningKey::generate().verifying_key().to_bytes()]);
+        assert!(matches!(
+            run_async(untrusted_reader.latest_snapshot()),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+        assert!(matches!(
+            run_async(untrusted_reader.snapshot_head()),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+    }
+
+    #[test]
+    fn compaction_preserves_retained_snapshot_authentication_state() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&state_store, state(1, Some(head0), lease_id(2)));
+        let snapshot_id = run_async(state_store.snapshot_head()).unwrap().unwrap();
+        let (head2, _) = append_ok(&state_store, state(2, Some(head1), lease_id(3)));
+
+        assert_eq!(run_async(state_store.compact(3)).unwrap(), 1);
+        assert_eq!(
+            run_async(object_store.get_storage_meta(&head0)).unwrap().retention,
+            RetentionClass::Ephemeral
+        );
+        for protected in [head1, head2] {
+            assert_eq!(
+                run_async(object_store.get_storage_meta(&protected)).unwrap().retention,
+                RetentionClass::Pinned
+            );
+        }
+
+        let gc = crate::GarbageCollector::new(crate::GcConfig::default());
+        let collected = run_async(gc.collect(
+            &zone_id(),
+            &crate::GcRoots::new(),
+            object_store.as_ref(),
+            1_800_000_000,
+        ))
+        .unwrap();
+        assert_eq!(collected.evicted, 1);
+        assert!(!run_async(object_store.exists(&head0)));
+        let snapshot = run_async(state_store.load_snapshot(&snapshot_id)).unwrap();
+        assert_eq!(snapshot.covers_head, head1);
+        assert_eq!(
+            run_async(state_store.latest_snapshot()).unwrap().unwrap().0,
+            snapshot_id
+        );
+    }
+
+    #[test]
+    fn snapshot_reloads_emitted_id_when_newer_snapshot_wins_race() {
+        let object_store = Arc::new(
+            PausedPutObjectStore::new(usize::MAX, false).pause_first_snapshot_get(),
+        );
+        let state_store = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+
+        run_async(async {
+            let requested_connector = connector_id();
+            let mut first_snapshot =
+                ConnectorStateStore::snapshot(&state_store, &requested_connector);
+            assert!(futures_util::poll!(first_snapshot.as_mut()).is_pending());
+            assert_eq!(object_store.puts.load(Ordering::SeqCst), 3);
+            assert_eq!(object_store.snapshot_gets.load(Ordering::SeqCst), 1);
+
+            let outcome = state_store
+                .append_object(state(1, Some(head0), lease_id(2)))
+                .await
+                .unwrap();
+            let ConnectorStateAppendOutcome::Committed {
+                object_id: head1, ..
+            } = outcome
+            else {
+                panic!("concurrent append must commit");
+            };
+            let newer_id = state_store.snapshot_head().await.unwrap().unwrap();
+
+            object_store.release();
+            let requested = first_snapshot.await.unwrap();
+            assert_eq!(requested.covers_head, head0);
+            assert_eq!(requested.covers_seq, 0);
+            requested
+                .verify_signature_with(&test_state_signing_key().verifying_key())
+                .unwrap();
+
+            let latest = state_store.latest_snapshot().await.unwrap().unwrap();
+            assert_eq!(latest.0, newer_id);
+            assert_eq!(latest.1.covers_head, head1);
+            assert_eq!(latest.1.covers_seq, 1);
+        });
+    }
+
+    #[test]
     fn latest_snapshot_empty_store_returns_none() {
         let state_store = test_store(store());
         assert!(run_async(state_store.latest_snapshot()).unwrap().is_none());
@@ -3646,6 +4129,7 @@ mod tests {
 
         let mut stale_state = state(1, Some(head0), lease_id(2));
         stale_state.updated_at = first_snapshot.1.snapshotted_at + DEFAULT_SNAPSHOT_EVERY_SECS;
+        stale_state.sign_with(&test_state_signing_key()).unwrap();
         let (_head1, second_snapshot) = append_ok(&state_store, stale_state);
 
         assert!(second_snapshot.is_some());
@@ -3663,6 +4147,7 @@ mod tests {
 
         let mut stale_state = state(1, Some(head0), lease_id(2));
         stale_state.updated_at += DEFAULT_SNAPSHOT_EVERY_SECS * 2;
+        stale_state.sign_with(&test_state_signing_key()).unwrap();
         let (_head1, second_snapshot) = append_ok(&state_store, stale_state);
 
         assert!(second_snapshot.is_none());

@@ -417,6 +417,124 @@ fn cursor_store_object_store_authorized_commit_advances_canonical_root() {
 
 #[cfg(feature = "cursor-store-object-store")]
 #[test]
+fn cursor_store_forwards_explicit_snapshot_signer_after_canonical_commit() {
+    for configure_snapshot_signer in [false, true] {
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        let object_id_key = ObjectIdKey::from_bytes([0xA8; 32]);
+        let connector_id = ConnectorId::from_static("test:operational:1.0");
+        let zone_id = ZoneId::work();
+        let (authorization, signing_key) =
+            connector_state_write_authorization_with_key(&connector_id, &zone_id);
+        let signing_key = Arc::new(signing_key);
+        let mut backend = ObjectStoreCursorBackend::new(
+            Arc::clone(&object_store),
+            object_id_key,
+            connector_id.clone(),
+            zone_id.clone(),
+        )
+        .with_write_authorization(authorization);
+        if configure_snapshot_signer {
+            backend = backend.with_snapshot_signing_key(Arc::clone(&signing_key));
+        }
+        let mut cursor_store = CursorStore::new(backend, connector_id.clone(), zone_id.clone())
+            .with_writer_public_key(signing_key.verifying_key().to_bytes());
+        let lease = CursorLease {
+            lease_seq: 1,
+            lease_object_id: ObjectId::from_bytes([0x13; 32]),
+        };
+        let initial_cursor = CursorState {
+            offset: Some(1),
+            last_seen_id: Some("id-1".to_string()),
+            watermark: Some(100),
+        };
+        let initial_header = object_store_header(1_700_150_000, zone_id.clone());
+        let signature = signature_for_object_store_cursor_commit(
+            &connector_id,
+            &zone_id,
+            initial_header.clone(),
+            lease,
+            &initial_cursor,
+            &signing_key,
+        );
+        let initial_head = cursor_store
+            .commit_cursor(initial_cursor, initial_header, lease, signature)
+            .expect("initial authorized cursor should commit");
+
+        // Seed a valid snapshot, then exercise the SDK's normal elapsed-time
+        // policy with one later commit instead of generating 1,000 writes.
+        let canonical_store = fcp_store::FcpStoreConnectorStateStore::new(
+            object_store,
+            object_id_key,
+            connector_id.clone(),
+            zone_id.clone(),
+        )
+        .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()])
+        .with_snapshot_signing_key(Arc::clone(&signing_key));
+        fcp_async_core::runtime::block_on_sync(canonical_store.snapshot_head())
+            .expect("runtime")
+            .expect("initial snapshot should sign")
+            .expect("initial head exists");
+
+        let later_cursor = CursorState {
+            offset: Some(2),
+            last_seen_id: Some("id-2".to_string()),
+            watermark: Some(200),
+        };
+        let mut later_header = object_store_header(1_700_150_000 + 86_400, zone_id.clone());
+        later_header.refs.push(lease.lease_object_id);
+        let mut later_state = ConnectorStateObject {
+            header: later_header.clone(),
+            connector_id,
+            instance_id: None,
+            zone_id,
+            prev: Some(initial_head),
+            seq: 1,
+            state_cbor: later_cursor.to_cbor().expect("later cursor should encode"),
+            updated_at: later_header.created_at,
+            lease_seq: lease.lease_seq,
+            lease_object_id: lease.lease_object_id,
+            writer_public_key: signing_key.verifying_key().to_bytes(),
+            signature: Signature::zero(),
+        };
+        later_state.sign_with(&signing_key).expect("later state should sign");
+        let later_head = cursor_store
+            .commit_cursor(
+                later_cursor.clone(),
+                later_header,
+                lease,
+                later_state.signature,
+            )
+            .expect("later cursor must commit with or without a snapshot key");
+        assert_eq!(cursor_store.head(), Some(later_head));
+        assert_eq!(cursor_store.load_cursor().unwrap(), Some(later_cursor));
+
+        let (_snapshot_id, latest) =
+            fcp_async_core::runtime::block_on_sync(canonical_store.latest_snapshot())
+                .expect("runtime")
+                .expect("snapshot read should authenticate")
+                .expect("snapshot exists");
+        latest
+            .verify_signature_with(&signing_key.verifying_key())
+            .expect("snapshot must carry its own signature");
+        assert_eq!(
+            latest.covers_seq,
+            u64::from(configure_snapshot_signer),
+            "the SDK must forward only an explicitly configured snapshot key"
+        );
+        assert_eq!(
+            latest.covers_head,
+            if configure_snapshot_signer {
+                later_head
+            } else {
+                initial_head
+            }
+        );
+    }
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
 fn cursor_store_object_store_rejects_tampered_recovery_state() {
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));

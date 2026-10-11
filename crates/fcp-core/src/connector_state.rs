@@ -74,6 +74,13 @@ pub const CONNECTOR_STATE_APPEND_OPERATION_ID: &str = "fcp.connector-state.appen
 pub const CONNECTOR_STATE_OBJECT_SIGNING_SCHEMA_ID: &str =
     "fcp.connector-state.state-object-signing.v1";
 
+/// Domain-separated schema identifier for `ConnectorStateSnapshot` signatures.
+///
+/// Snapshot signatures cover their own unsigned payload, never the covered
+/// state object's signing transcript.
+pub const CONNECTOR_STATE_SNAPSHOT_SIGNING_SCHEMA_ID: &str =
+    "fcp.connector-state.state-snapshot-signing.v1";
+
 /// Canonical connector-state write capability identifier.
 #[must_use]
 pub fn connector_state_write_capability_id() -> CapabilityId {
@@ -806,6 +813,77 @@ pub struct ConnectorStateSnapshot {
 
     /// Ed25519 signature over the canonical snapshot.
     pub signature: Signature,
+}
+
+#[derive(Serialize)]
+struct ConnectorStateSnapshotSigningPayload<'a> {
+    header: &'a ObjectHeader,
+    connector_id: &'a ConnectorId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: &'a Option<InstanceId>,
+    zone_id: &'a ZoneId,
+    covers_head: &'a ObjectId,
+    covers_seq: u64,
+    state_cbor: &'a [u8],
+    snapshotted_at: u64,
+}
+
+impl ConnectorStateSnapshot {
+    /// Build the domain-separated signing bytes for this snapshot.
+    ///
+    /// Every snapshot field except [`Self::signature`] is included. The
+    /// distinct snapshot domain prevents reusing a covered state signature.
+    ///
+    /// # Errors
+    /// Returns a [`SerializationError`] if canonical CBOR encoding fails.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, SerializationError> {
+        let payload = ConnectorStateSnapshotSigningPayload {
+            header: &self.header,
+            connector_id: &self.connector_id,
+            instance_id: &self.instance_id,
+            zone_id: &self.zone_id,
+            covers_head: &self.covers_head,
+            covers_seq: self.covers_seq,
+            state_cbor: &self.state_cbor,
+            snapshotted_at: self.snapshotted_at,
+        };
+        let cbor = to_canonical_cbor(&payload)?;
+        Ok(canonical_signing_bytes(
+            CONNECTOR_STATE_SNAPSHOT_SIGNING_SCHEMA_ID,
+            &cbor,
+        ))
+    }
+
+    /// Sign this snapshot with an explicitly supplied Ed25519 key.
+    ///
+    /// Storage must separately bind this key to the authenticated covered
+    /// state writer and any configured writer trust policy.
+    ///
+    /// # Errors
+    /// Returns a [`SerializationError`] if canonical signing bytes cannot be
+    /// constructed.
+    pub fn sign_with(&mut self, signing_key: &Ed25519SigningKey) -> Result<(), SerializationError> {
+        let signature = signing_key.sign(&self.signing_bytes()?);
+        self.signature = Signature::from_bytes(signature.to_bytes());
+        Ok(())
+    }
+
+    /// Verify this snapshot's own signature with the supplied Ed25519 key.
+    ///
+    /// Callers must obtain this key from authenticated authority, such as the
+    /// verified covered state object; the snapshot carries no new key grant.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStateSignatureError`] when transcript construction
+    /// fails or the signature does not verify.
+    pub fn verify_signature_with(
+        &self,
+        verifying_key: &Ed25519VerifyingKey,
+    ) -> Result<(), ConnectorStateSignatureError> {
+        let signature = Ed25519Signature::from_bytes(self.signature.as_bytes());
+        verifying_key.verify(&self.signing_bytes()?, &signature)?;
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3708,6 +3786,86 @@ mod tests {
         let mut tampered = state_obj.clone();
         tampered.seq += 1;
         assert!(tampered.verify_signature_with(&verifying_key).is_err());
+    }
+
+    #[test]
+    fn connector_state_snapshot_signature_binds_every_unsigned_field() {
+        use ciborium::value::Value;
+
+        let signing_key = Ed25519SigningKey::generate();
+        let verifying_key = signing_key.verifying_key();
+        let wrong_key = Ed25519SigningKey::generate().verifying_key();
+
+        for instance_id in [None, Some(InstanceId::new())] {
+            let mut snapshot = ConnectorStateSnapshot {
+                header: test_header(),
+                connector_id: test_connector_id(),
+                instance_id,
+                zone_id: ZoneId::work(),
+                covers_head: test_object_id("covered-head"),
+                covers_seq: 7,
+                state_cbor: vec![0xa1, 0x61, b'n', 0x07],
+                snapshotted_at: 1_700_000_123,
+                signature: Signature::zero(),
+            };
+            snapshot.header.refs.push(snapshot.covers_head);
+
+            // Compare with the complete serialized object with only its
+            // signature removed, independently of the signing payload struct.
+            let serialized = to_canonical_cbor(&snapshot).unwrap();
+            let Value::Map(mut unsigned_fields) =
+                ciborium::from_reader::<Value, _>(serialized.as_slice()).unwrap()
+            else {
+                panic!("snapshot must encode as a map");
+            };
+            let signature_index = unsigned_fields
+                .iter()
+                .position(|(key, _)| matches!(key, Value::Text(name) if name == "signature"))
+                .expect("serialized signature field");
+            unsigned_fields.remove(signature_index);
+            let unsigned_cbor = to_canonical_cbor(&Value::Map(unsigned_fields)).unwrap();
+            let signing_bytes = canonical_signing_bytes(
+                CONNECTOR_STATE_SNAPSHOT_SIGNING_SCHEMA_ID,
+                &unsigned_cbor,
+            );
+            assert_eq!(snapshot.signing_bytes().unwrap(), signing_bytes);
+
+            snapshot.sign_with(&signing_key).unwrap();
+            assert_eq!(snapshot.signing_bytes().unwrap(), signing_bytes);
+            snapshot.verify_signature_with(&verifying_key).unwrap();
+            assert!(snapshot.verify_signature_with(&wrong_key).is_err());
+
+            for field in 0..8 {
+                let mut tampered = snapshot.clone();
+                match field {
+                    0 => tampered.header.created_at += 1,
+                    1 => tampered.connector_id = ConnectorId::from_static("other:chat:v1"),
+                    2 => {
+                        tampered.instance_id = if tampered.instance_id.is_some() {
+                            None
+                        } else {
+                            Some(InstanceId::new())
+                        };
+                    }
+                    3 => tampered.zone_id = ZoneId::private(),
+                    4 => tampered.covers_head = test_object_id("another-head"),
+                    5 => tampered.covers_seq += 1,
+                    6 => tampered.state_cbor = vec![0x00],
+                    7 => tampered.snapshotted_at += 1,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    tampered.verify_signature_with(&verifying_key).is_err(),
+                    "unsigned snapshot field {field} must be authenticated"
+                );
+            }
+
+            let state_domain_bytes =
+                canonical_signing_bytes(CONNECTOR_STATE_OBJECT_SIGNING_SCHEMA_ID, &unsigned_cbor);
+            snapshot.signature =
+                Signature::from_bytes(signing_key.sign(&state_domain_bytes).to_bytes());
+            assert!(snapshot.verify_signature_with(&verifying_key).is_err());
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
