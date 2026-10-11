@@ -1,16 +1,18 @@
-//! Session-local accounting for authenticated capability call ceilings.
+//! Session-local accounting for authenticated capability call and message-byte ceilings.
 //!
 //! Entries are never evicted while their instance authority is valid. In
 //! particular, neither a clock change nor cache pressure can refill a spent
 //! grant. The containing session drops this ledger when it rotates authority.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fcp_core::{BoundVerified, CapabilityConstraints, CapabilityToken, FcpError, FcpResult};
 use fcp_crypto::cose::fcp2_claims;
 use fcp_policy::{CapabilityConstraintEnforcer, DefaultConstraintEnforcer};
 use sha2::{Digest, Sha256};
+
+mod bytes;
 
 const MAX_TRACKED_GRANTS: usize = 4096;
 
@@ -18,10 +20,14 @@ const MAX_TRACKED_GRANTS: usize = 4096;
 ///
 /// This witness is deliberately not `Clone`. Dropping it never refunds the
 /// allowance: a cancelled or failed operation may already have caused effects.
-/// It proves process-bound admission, not mesh-wide quota accounting, byte
-/// accounting, revocation, holder proof, approval, or lease enforcement.
+/// Bounded admission also reserves the complete FCP request and a response
+/// allowance. Only successful [`Self::finish_response`] releases unused response
+/// capacity; calls and request bytes are never refunded. This is not provider
+/// HTTP-byte accounting, mesh-wide quota, revocation, holder proof, approval,
+/// or lease enforcement.
 pub struct StandaloneInvocation {
     token: CapabilityToken<BoundVerified>,
+    completion: Option<bytes::Completion>,
 }
 
 impl StandaloneInvocation {
@@ -41,13 +47,15 @@ impl std::fmt::Debug for StandaloneInvocation {
 }
 
 pub(super) struct UsageLedger {
-    entries: Mutex<BTreeMap<[u8; 32], Account>>,
+    entries: Arc<Mutex<BTreeMap<[u8; 32], Account>>>,
     capacity: usize,
 }
 
 struct Account {
     grant: [u8; 32],
     spent: u32,
+    // Includes pessimistically charged in-flight response reservations.
+    bytes: u64,
 }
 
 struct Scope {
@@ -59,7 +67,7 @@ struct Scope {
 impl Default for UsageLedger {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(BTreeMap::new()),
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
             capacity: MAX_TRACKED_GRANTS,
         }
     }
@@ -84,8 +92,8 @@ impl Scope {
             hasher.update(id);
             hasher.finalize().into()
         });
-        if constraints.max_calls.is_some() && key.is_none() {
-            return Err(denied("A call-limited capability requires a non-empty signed token ID"));
+        if (constraints.max_calls.is_some() || constraints.max_bytes.is_some()) && key.is_none() {
+            return Err(denied("A usage-limited capability requires a non-empty signed token ID"));
         }
         // Bind an account to the canonical SIGNED claims, not a mutable COSE
         // envelope, signature encoding, request ID, operation, or input. A
@@ -129,11 +137,22 @@ impl UsageLedger {
             {
                 return Err(denied("Signed capability call budget exhausted"));
             }
-            if account.is_none() && entries.len() >= self.capacity {
-                return Err(FcpError::ResourceExhausted {
-                    resource: "standalone capability usage ledger capacity".into(),
-                });
+        }
+        if let Some(limit) = scope.constraints.max_bytes {
+            let next = account.map_or(0, |account| account.bytes).checked_add(1)
+                .ok_or_else(|| denied("Signed capability byte budget exhausted"))?;
+            if DefaultConstraintEnforcer::new()
+                .enforce_scope_ceiling(None, Some(limit), 0, next).is_deny()
+            {
+                return Err(denied("Signed capability byte budget exhausted"));
             }
+        }
+        if (scope.constraints.max_calls.is_some() || scope.constraints.max_bytes.is_some())
+            && account.is_none() && entries.len() >= self.capacity
+        {
+            return Err(FcpError::ResourceExhausted {
+                resource: "standalone capability usage ledger capacity".into(),
+            });
         }
         Ok(())
     }
@@ -153,16 +172,21 @@ impl UsageLedger {
     ) -> FcpResult<StandaloneInvocation> {
         let scope = Scope::from_verified(&token)?;
         scope.check_key(idempotency_key)?;
+        // The legacy admission API has no response boundary to meter. Never
+        // silently ignore a finite byte grant; require bounded admission.
+        if scope.constraints.max_bytes.is_some() {
+            return Err(denied("Byte-limited capabilities require bounded admission"));
+        }
         let mut entries = self.lock()?;
         self.check_scope(&entries, &scope)?;
         if scope.constraints.max_calls.is_some() {
             let key = scope.key.ok_or_else(|| denied("Call-limited capability has no token ID"))?;
-            let account = entries.entry(key).or_insert(Account { grant: scope.grant, spent: 0 });
+            let account = entries.entry(key).or_insert(Account { grant: scope.grant, spent: 0, bytes: 0 });
             // check_scope proved this increment fits and is within the signed
             // ceiling. Retain it on every subsequent outcome, including Drop.
             account.spent += 1;
         }
-        Ok(StandaloneInvocation { token })
+        Ok(StandaloneInvocation { token, completion: None })
     }
 }
 
@@ -318,7 +342,7 @@ mod tests {
         let ledger = UsageLedger::default();
         let token = token(Some(u32::MAX), b"last", None);
         let scope = Scope::from_verified(&token).unwrap();
-        ledger.lock().unwrap().insert(scope.key.unwrap(), Account { grant: scope.grant, spent: u32::MAX - 1 });
+        ledger.lock().unwrap().insert(scope.key.unwrap(), Account { grant: scope.grant, spent: u32::MAX - 1, bytes: 0 });
         ledger.admit(token.clone(), None).unwrap();
         assert!(ledger.admit(token, None).is_err());
     }
