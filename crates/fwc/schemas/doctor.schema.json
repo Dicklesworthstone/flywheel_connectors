@@ -296,7 +296,7 @@
         "availability"
       ],
       "properties": {
-        "status": { "const": "ok" },
+        "status": { "enum": ["ok", "error"] },
         "command": { "const": "doctor" },
         "source": { "const": "host-admin-api" },
         "message": { "$ref": "#/$defs/non_empty_string" },

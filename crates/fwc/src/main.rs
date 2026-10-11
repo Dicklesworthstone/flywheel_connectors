@@ -324,9 +324,10 @@ use fcp_host::{
     DoctorReport as HostDoctorReport, DoctorRequest as HostDoctorRequest,
     EventQueryRequest as HostEventQueryRequest, EventQueryResponse as HostEventQueryResponse,
     HostEvent as HostAdminEvent, HostEventKind, HostHealthResponse, HostPreflightRequest,
+    HostSimulateRequest, HostSimulateResponse,
     IntrospectionResponse as HostIntrospectionResponse, LifecycleTransitionRequest,
     LifecycleTransitionResponse, ManagedConnectorConfig,
-    PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement,
+    PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement, SimulatePhase,
     ToolDescriptor as HostToolDescriptor,
 };
 use fcp_kernel::{
@@ -667,8 +668,8 @@ enum Commands {
     /// Execute a connector operation.
     Invoke(InvokeArgs),
 
-    /// Preflight or dry-run a connector operation.
-    Simulate(InvokeArgs),
+    /// Ask a connector to simulate an operation without executing it.
+    Simulate(SimulateArgs),
 
     /// Preflight check: analyze risk, approval requirements, and capabilities without executing.
     ///
@@ -2612,6 +2613,20 @@ struct InvokeArgs {
 }
 
 #[derive(Args, Debug, Serialize)]
+struct SimulateArgs {
+    #[command(flatten)]
+    request: InvokeArgs,
+
+    /// Ask the connector for an estimate of execution cost.
+    #[arg(long)]
+    estimate_cost: bool,
+
+    /// Ask the connector to check resource availability.
+    #[arg(long)]
+    check_availability: bool,
+}
+
+#[derive(Args, Debug, Serialize)]
 struct PreflightArgs {
     /// Connector id, alias, or family name.
     connector: String,
@@ -3490,6 +3505,7 @@ fn mcp_tool_call_response(
         "invoke",
         &invoke_args,
         host.map(|config| config.endpoint.as_str()),
+        None,
     ) {
         Ok(dispatch) => {
             let mut structured_content = dispatch.payload;
@@ -4238,8 +4254,10 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Rollout(args) => rollout_dispatch(args, cli.host.as_deref())?,
         Commands::Auth(args) => auth_dispatch(args, cli.host.as_deref())?,
         Commands::Config(args) => config_dispatch(args, cli.host.as_deref())?,
-        Commands::Invoke(args) => invoke_dispatch("invoke", args, cli.host.as_deref())?,
-        Commands::Simulate(args) => invoke_dispatch("simulate", args, cli.host.as_deref())?,
+        Commands::Invoke(args) => invoke_dispatch("invoke", args, cli.host.as_deref(), None)?,
+        Commands::Simulate(args) => {
+            invoke_dispatch("simulate", &args.request, cli.host.as_deref(), Some(args))?
+        }
         Commands::Preflight(args) => preflight_dispatch(&args, cli.host.as_deref())?,
         Commands::Cancel(args) => cancel_dispatch(args, cli.host.as_deref())?,
         Commands::ExportTools(args) => export_tools_dispatch(args, cli.host.as_deref())?,
@@ -5328,6 +5346,38 @@ impl HostAdminClient {
 
     fn preflight(&self, request: &HostPreflightRequest) -> Result<HostPreflightResponse> {
         self.post_json("/rpc/preflight", request)
+    }
+
+    fn simulate(&self, request: &HostSimulateRequest) -> Result<HostSimulateResponse> {
+        let response: HostSimulateResponse = self.post_json("/rpc/simulate", request)?;
+        anyhow::ensure!(
+            response.request_id == request.request_id
+                && response.receipt.connector_id == request.connector_id
+                && response.receipt.operation == request.operation,
+            "host returned a simulation response for a different request"
+        );
+        anyhow::ensure!(
+            response.receipt.phase == response.phase
+                && response.receipt.would_succeed == response.would_succeed
+                && response.receipt.duration_ms == response.duration_ms,
+            "host returned a simulation receipt inconsistent with its verdict"
+        );
+        let input_digest = blake3::hash(&to_deterministic_cbor(
+            request.input.as_ref().unwrap_or(&Value::Null),
+        )?)
+        .to_hex()
+        .to_string();
+        anyhow::ensure!(
+            response.receipt.input_digest.as_deref() == Some(input_digest.as_str()),
+            "host returned a simulation receipt for different input"
+        );
+        anyhow::ensure!(
+            response.preflight_allowed == (response.phase != SimulatePhase::PreflightOnly)
+                && (!response.would_succeed
+                    || response.phase == SimulatePhase::ConnectorReached),
+            "host returned a simulation verdict inconsistent with its admission phase"
+        );
+        Ok(response)
     }
 
     fn budget_report(&self, request: &HostBudgetReportRequest) -> Result<HostBudgetReportResponse> {
@@ -14111,8 +14161,9 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
     }
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "doctor");
+    let failed = report.overall_status == fcp_host::OverallStatus::Fail;
     let mut payload = json!({
-        "status": "ok",
+        "status": if failed { "error" } else { "ok" },
         "command": "doctor",
         "source": "host-admin-api",
         "message": format!("Loaded a live doctor report for `{}` from `fcp-host`.", report.zone_id),
@@ -14152,7 +14203,11 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
     inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: if failed {
+            CliExitCode::Connector
+        } else {
+            CliExitCode::Success
+        },
     })
 }
 
@@ -23702,9 +23757,10 @@ fn invoke_dispatch(
     command: &str,
     args: &InvokeArgs,
     explicit_host: Option<&str>,
+    simulation: Option<&SimulateArgs>,
 ) -> Result<DispatchOutcome> {
     if let Some(host) = resolve_host_config(explicit_host)? {
-        return invoke_dispatch_host(command, args, &host);
+        return invoke_dispatch_host(command, args, &host, simulation);
     }
     invoke_dispatch_without_host(command, args)
 }
@@ -23714,6 +23770,7 @@ fn invoke_dispatch_host(
     command: &str,
     args: &InvokeArgs,
     host: &ResolvedHostConfig,
+    simulation: Option<&SimulateArgs>,
 ) -> Result<DispatchOutcome> {
     let auth = match resolve_live_auth(&args.auth) {
         Ok(auth) => auth,
@@ -23902,40 +23959,75 @@ fn invoke_dispatch_host(
         });
     }
 
-    let preflight_request = HostPreflightRequest {
-        request_id: request_id.clone(),
-        connector_id: connector_id.clone(),
-        operation: operation.name.clone(),
-        params: Some(prepared_payload.clone()),
-        principal: effective_principal,
-        zone_id: Some(zone_id.clone()),
-        capability_token: Some(auth.capability_token.clone()),
-        approval_tokens: auth.approval_tokens.clone(),
-    };
-    let preflight = client.preflight(&preflight_request)?;
-    payload["preflight"] = serde_json::to_value(&preflight)?;
-
-    if command == "simulate" {
-        let history_status = if preflight.allowed {
-            history::OpStatus::Simulated
-        } else {
-            history::OpStatus::Denied
+    if let Some(simulation) = simulation {
+        let request = HostSimulateRequest {
+            request_id: request_id.to_string(),
+            connector_id: connector_id.to_string(),
+            operation: operation.name.clone(),
+            input: Some(prepared_payload.clone()),
+            zone_id: Some(zone_id.to_string()),
+            principal: effective_principal,
+            capability_token: Some(auth.capability_token),
+            approval_tokens: auth.approval_tokens,
+            estimate_cost: simulation.estimate_cost,
+            check_availability: simulation.check_availability,
+            deadline_ms: args.deadline_ms.unwrap_or(5000),
         };
-        let latency_ms = 0;
-        payload["status"] = json!(if preflight.allowed { "ok" } else { "denied" });
-        payload["phase"] = json!("preflight");
-        payload["message"] = json!(if preflight.allowed {
-            format!(
-                "Evaluated a real preflight for `{}.{}` against live host policy and current connector state.",
-                connector.slug, operation.name
-            )
-        } else {
-            format!(
-                "Live preflight denied `{}.{}` before execution.",
-                connector.slug, operation.name
-            )
-        });
-        payload["next_actions"] = json!(if preflight.allowed {
+        // The simulation endpoint performs admission before asking the
+        // connector. A separate preflight could observe different state.
+        let started_at = std::time::Instant::now();
+        let response = client.simulate(&request)?;
+        let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (status, exit_code, error_type, message) = match response.phase {
+            SimulatePhase::PreflightOnly => (
+                "denied",
+                CliExitCode::PolicyDenied,
+                Some("policy-denied"),
+                "Live host policy denied the simulation before reaching the connector.",
+            ),
+            SimulatePhase::ConnectorUnsupported => (
+                "unsupported",
+                CliExitCode::Connector,
+                Some("simulation-unsupported"),
+                "The connector does not support simulation for this operation.",
+            ),
+            SimulatePhase::TimedOut => (
+                "timed_out",
+                CliExitCode::Connector,
+                Some("simulation-timed-out"),
+                "The connector did not complete simulation within the deadline.",
+            ),
+            SimulatePhase::ConnectorReached if response.would_succeed => (
+                "ok",
+                CliExitCode::Success,
+                None,
+                "The connector completed simulation and predicts the operation would succeed.",
+            ),
+            SimulatePhase::ConnectorReached => (
+                "denied",
+                CliExitCode::Connector,
+                Some("simulation-denied"),
+                "Host policy allowed simulation, but the connector predicts the operation would fail.",
+            ),
+        };
+        let response_value = serde_json::to_value(&response)?;
+        payload["status"] = json!(status);
+        payload["phase"] = serde_json::to_value(response.phase)?;
+        payload["message"] = json!(message);
+        payload["would_succeed"] = json!(response.would_succeed);
+        payload["preflight"] = json!({ "allowed": response.preflight_allowed });
+        payload["simulation"] = response_value.clone();
+        payload["request"]["deadline_ms"] = json!(request.deadline_ms);
+        payload["request"]["estimate_cost"] = json!(request.estimate_cost);
+        payload["request"]["check_availability"] = json!(request.check_availability);
+        if let Some(error_type) = error_type {
+            payload["error"] = json!({
+                "type": error_type,
+                "message": response.failure_reason.as_deref().unwrap_or(message),
+                "recoverable": true,
+            });
+        }
+        payload["next_actions"] = json!(if exit_code == CliExitCode::Success {
             vec![format!(
                 "fwc invoke {} {} --host {} --zone {} --input '{}'",
                 connector.slug, operation.name, host.endpoint, zone, payload_json
@@ -23949,33 +24041,46 @@ fn invoke_dispatch_host(
                 ),
             ]
         });
+        let history_status = if exit_code == CliExitCode::Success {
+            history::OpStatus::Simulated
+        } else if response.preflight_allowed {
+            history::OpStatus::Error
+        } else {
+            history::OpStatus::Denied
+        };
         let _ = append_history_entry(
             history_status,
             connector.summary.id.as_str(),
             &operation.name,
             Some(zone.as_str()),
             &prepared_payload,
-            Some(&serde_json::to_value(&preflight)?),
-            preflight.reason.clone(),
+            Some(&response_value),
+            response.failure_reason.clone(),
             args.idempotency_key.as_deref(),
             latency_ms,
         );
-        let envelope = if preflight.allowed {
+        let envelope = if response.preflight_allowed {
             CommandEnvelope::new(CommandAvailability::LiveRuntime, command)
         } else {
             CommandEnvelope::new(CommandAvailability::Denied, command)
         };
         envelope.inject_into(&mut payload);
         inject_simulated_truth_source_metadata(&mut payload);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: if preflight.allowed {
-                CliExitCode::Success
-            } else {
-                CliExitCode::PolicyDenied
-            },
-        });
+        return Ok(DispatchOutcome { payload, exit_code });
     }
+
+    let preflight_request = HostPreflightRequest {
+        request_id: request_id.clone(),
+        connector_id: connector_id.clone(),
+        operation: operation.name.clone(),
+        params: Some(prepared_payload.clone()),
+        principal: effective_principal,
+        zone_id: Some(zone_id.clone()),
+        capability_token: Some(auth.capability_token.clone()),
+        approval_tokens: auth.approval_tokens.clone(),
+    };
+    let preflight = client.preflight(&preflight_request)?;
+    payload["preflight"] = serde_json::to_value(&preflight)?;
 
     if !preflight.allowed {
         let reason = preflight
@@ -33959,6 +34064,44 @@ max_state_replication_staleness_secs = 120
         .expect("preflight response should serialize")
     }
 
+    fn mock_simulate_response_json(
+        input: &Value,
+        phase: SimulatePhase,
+        would_succeed: bool,
+    ) -> Value {
+        let request_id = derive_live_request_id(
+            "fcp.github:enterprise:v1",
+            "issues.create",
+            "z:work",
+            input,
+            None,
+            None,
+        )
+        .expect("simulation request ID");
+        let input_digest =
+            blake3::hash(&to_deterministic_cbor(input).expect("canonical simulation input"))
+                .to_hex()
+                .to_string();
+        json!({
+            "request_id": request_id.to_string(),
+            "would_succeed": would_succeed,
+            "phase": phase,
+            "preflight_allowed": phase != SimulatePhase::PreflightOnly,
+            "failure_reason": (!would_succeed).then_some("fixture simulation refusal"),
+            "duration_ms": 42,
+            "receipt": {
+                "receipt_id": "sim-test-receipt",
+                "connector_id": "fcp.github:enterprise:v1",
+                "operation": "issues.create",
+                "phase": phase,
+                "would_succeed": would_succeed,
+                "input_digest": input_digest,
+                "duration_ms": 42,
+                "simulated_at": "2026-05-07T00:00:00Z",
+            },
+        })
+    }
+
     fn mock_doctor_report_json() -> Value {
         serde_json::to_value(HostDoctorReport::baseline("z:work"))
             .expect("doctor report should serialize")
@@ -37076,8 +37219,12 @@ deny_ptrace = true
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
             mock_github_host_routes(StdBTreeMap::from([(
-                "POST /rpc/preflight".to_owned(),
-                mock_preflight_response_json(true),
+                "POST /rpc/simulate".to_owned(),
+                mock_simulate_response_json(
+                    &json!({ "owner": "octocat", "repo": "hello-world", "title": "Bug report" }),
+                    SimulatePhase::ConnectorReached,
+                    true,
+                ),
             )])),
             3,
         );
@@ -37098,7 +37245,7 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "simulate");
-        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["phase"], "connector_reached");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
         assert_eq!(payload["_truth_source"], "simulated");
     }
@@ -37121,6 +37268,38 @@ deny_ptrace = true
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["error"]["type"], "missing-capability-token");
         assert!(payload.get("schema_version").is_none());
+    }
+
+    #[test]
+    fn execute_doctor_critical_failures_exit_nonzero_and_preserve_the_report() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/doctor.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+
+        for (overall_status, expected_status, expected_exit) in [
+            ("FAIL", "error", CliExitCode::Connector),
+            ("WARN", "ok", CliExitCode::Success),
+        ] {
+            let mut report = mock_doctor_report_json();
+            report["overall_status"] = json!(overall_status);
+            let (host, server) = spawn_mock_host(
+                StdBTreeMap::from([("POST /doctor".to_owned(), report.clone())]),
+                1,
+            );
+
+            let (exit_code, payload) = execute_json(&[
+                "fwc", "--json", "--host", &host, "doctor", "--zone", "z:work",
+            ]);
+            server.join().expect("mock host thread should complete");
+
+            assert_eq!(exit_code, expected_exit.into(), "{overall_status}");
+            assert_eq!(payload["status"], expected_status);
+            assert_eq!(payload["summary"]["overall_status"], overall_status);
+            assert_eq!(payload["report"], report);
+            validator.validate(&payload).unwrap_or_else(|error| {
+                panic!("doctor {overall_status} response violates schema: {error}")
+            });
+        }
     }
 
     #[test]
@@ -45667,8 +45846,12 @@ depends_on = ["missing"]
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
             mock_github_host_routes(StdBTreeMap::from([(
-                "POST /rpc/preflight".to_owned(),
-                mock_preflight_response_json(false),
+                "POST /rpc/simulate".to_owned(),
+                mock_simulate_response_json(
+                    &json!({ "owner": "octocat", "repo": "hello-world", "title": "Sim denied" }),
+                    SimulatePhase::PreflightOnly,
+                    false,
+                ),
             )])),
             3,
         );
@@ -45691,17 +45874,21 @@ depends_on = ["missing"]
         assert_eq!(payload["status"], "denied");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
         assert_eq!(payload["_truth_source"], "simulated");
-        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["phase"], "preflight_only");
         assert_eq!(payload["command"], "simulate");
     }
 
     #[test]
-    fn simulate_host_preflight_allowed_returns_ok() {
+    fn simulate_host_connector_success_returns_ok() {
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
             mock_github_host_routes(StdBTreeMap::from([(
-                "POST /rpc/preflight".to_owned(),
-                mock_preflight_response_json(true),
+                "POST /rpc/simulate".to_owned(),
+                mock_simulate_response_json(
+                    &json!({ "owner": "octocat", "repo": "hello-world", "title": "Sim ok" }),
+                    SimulatePhase::ConnectorReached,
+                    true,
+                ),
             )])),
             3,
         );
@@ -45724,9 +45911,259 @@ depends_on = ["missing"]
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
         assert_eq!(payload["_truth_source"], "simulated");
-        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["phase"], "connector_reached");
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["preflight"]["allowed"], true);
+        assert_eq!(payload["simulation"]["receipt"]["receipt_id"], "sim-test-receipt");
+        assert_eq!(payload["simulation"]["duration_ms"], 42);
+    }
+
+    #[test]
+    fn simulate_host_forwards_options_and_reports_connector_cost_and_availability() {
+        let capability_token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Cost estimate",
+        });
+        let input_text = input.to_string();
+        let mut response =
+            mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true);
+        response["cost_estimate"] = json!({
+            "api_credits": 5,
+            "estimated_duration_ms": 250,
+            "estimated_bytes": 1024,
+            "confidence": "high",
+        });
+        response["availability"] = json!({
+            "available": true,
+            "rate_limit_remaining": 450,
+            "rate_limit_reset_at": 1_700_000_000,
+        });
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            ("POST /rpc/simulate".to_owned(), response.clone()),
+        ]);
+
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "simulate",
+            "github",
+            "issues.create",
+            "--input",
+            &input_text,
+            "--estimate-cost",
+            "--check-availability",
+            "--deadline-ms",
+            "1200",
+            "--capability-token",
+            &capability_token,
+        ]);
+        server.join().expect("mock host thread should complete");
+
+        assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["phase"], "connector_reached");
+        assert_eq!(payload["would_succeed"], true);
+        assert_eq!(payload["_truth_source"], "simulated");
+        assert_eq!(payload["simulation"]["cost_estimate"], response["cost_estimate"]);
+        assert_eq!(payload["simulation"]["availability"], response["availability"]);
+        assert_eq!(payload["simulation"]["receipt"], response["receipt"]);
+
+        let requests = request_log.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].0, "POST /rpc/simulate");
+        let sent: Value = serde_json::from_str(&requests[2].1).expect("simulation request body");
+        assert_eq!(sent["connector_id"], "fcp.github:enterprise:v1");
+        assert_eq!(sent["operation"], "issues.create");
+        assert_eq!(sent["zone_id"], "z:work");
+        assert_eq!(sent["input"], input);
+        assert_eq!(sent["request_id"], response["request_id"]);
+        assert_eq!(sent["estimate_cost"], true);
+        assert_eq!(sent["check_availability"], true);
+        assert_eq!(sent["deadline_ms"], 1200);
+        assert!(!sent["capability_token"].is_null());
+    }
+
+    #[test]
+    fn simulate_host_connector_refusal_unsupported_and_timeout_are_not_success() {
+        let capability_token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Simulation outcomes",
+        });
+        let input_text = input.to_string();
+
+        for (phase, expected_phase, expected_status, expected_error) in [
+            (
+                SimulatePhase::ConnectorReached,
+                "connector_reached",
+                "denied",
+                "simulation-denied",
+            ),
+            (
+                SimulatePhase::ConnectorUnsupported,
+                "connector_unsupported",
+                "unsupported",
+                "simulation-unsupported",
+            ),
+            (
+                SimulatePhase::TimedOut,
+                "timed_out",
+                "timed_out",
+                "simulation-timed-out",
+            ),
+        ] {
+            let mut response = mock_simulate_response_json(&input, phase, false);
+            if phase == SimulatePhase::ConnectorReached {
+                response["denial_code"] = json!("FCP-3001");
+                response["missing_capabilities"] = json!(["github.issue.write"]);
+            }
+            let (host, server) = spawn_mock_host(
+                mock_github_host_routes(StdBTreeMap::from([(
+                    "POST /rpc/simulate".to_owned(),
+                    response,
+                )])),
+                3,
+            );
+
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "simulate",
+                "github",
+                "issues.create",
+                "--input",
+                &input_text,
+                "--capability-token",
+                &capability_token,
+            ]);
+            server.join().expect("mock host thread should complete");
+
+            assert_eq!(exit_code, CliExitCode::Connector.into(), "{expected_phase}");
+            assert_eq!(payload["phase"], expected_phase);
+            assert_eq!(payload["status"], expected_status);
+            assert_eq!(payload["error"]["type"], expected_error);
+            assert_eq!(payload["preflight"]["allowed"], true);
+            assert_eq!(payload["would_succeed"], false);
+            assert_eq!(payload["_truth_source"], "simulated");
+            assert_eq!(
+                payload["simulation"]["failure_reason"],
+                "fixture simulation refusal"
+            );
+            assert_eq!(payload["simulation"]["receipt"]["would_succeed"], false);
+            if phase == SimulatePhase::ConnectorReached {
+                assert_eq!(payload["simulation"]["denial_code"], "FCP-3001");
+                assert_eq!(
+                    payload["simulation"]["missing_capabilities"],
+                    json!(["github.issue.write"])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simulate_host_rejects_unrelated_or_inconsistent_simulation_receipts() {
+        let capability_token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Receipt binding",
+        });
+        let input_text = input.to_string();
+
+        for (label, mutations) in [
+            (
+                "request ID",
+                vec![("/request_id", json!("req_someone_else"))],
+            ),
+            (
+                "connector ID",
+                vec![("/receipt/connector_id", json!("fcp.slack:enterprise:v1"))],
+            ),
+            (
+                "operation",
+                vec![("/receipt/operation", json!("issues.delete"))],
+            ),
+            (
+                "input digest",
+                vec![("/receipt/input_digest", json!("00".repeat(32)))],
+            ),
+            (
+                "missing input digest",
+                vec![("/receipt/input_digest", Value::Null)],
+            ),
+            (
+                "receipt phase",
+                vec![("/receipt/phase", json!("timed_out"))],
+            ),
+            (
+                "receipt verdict",
+                vec![("/receipt/would_succeed", json!(false))],
+            ),
+            (
+                "receipt duration",
+                vec![("/receipt/duration_ms", json!(43))],
+            ),
+            (
+                "denied preflight",
+                vec![("/preflight_allowed", json!(false))],
+            ),
+            (
+                "unsupported success",
+                vec![
+                    ("/phase", json!("connector_unsupported")),
+                    ("/receipt/phase", json!("connector_unsupported")),
+                ],
+            ),
+        ] {
+            let mut response =
+                mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true);
+            for (path, replacement) in mutations {
+                *response.pointer_mut(path).expect("simulation fixture field") = replacement;
+            }
+            let (host, server) = spawn_mock_host(
+                mock_github_host_routes(StdBTreeMap::from([(
+                    "POST /rpc/simulate".to_owned(),
+                    response,
+                )])),
+                3,
+            );
+
+            let args = [
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "simulate",
+                "github",
+                "issues.create",
+                "--input",
+                &input_text,
+                "--capability-token",
+                &capability_token,
+            ]
+            .map(str::to_owned);
+            let result = execute(&args);
+            server.join().expect("mock host thread should complete");
+
+            let error = result
+                .err()
+                .expect("an invalid simulation must be rejected before producing a CLI outcome");
+            assert!(
+                error.to_string().contains("host returned a simulation"),
+                "{label}: {error}"
+            );
+        }
     }
 
     // ── invoke with connector resolution error ─────────────────────
@@ -47032,8 +47469,12 @@ depends_on = ["missing"]
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
             mock_github_host_routes(StdBTreeMap::from([(
-                "POST /rpc/preflight".to_owned(),
-                mock_preflight_response_json(true),
+                "POST /rpc/simulate".to_owned(),
+                mock_simulate_response_json(
+                    &json!({ "owner": "octocat", "repo": "hello-world", "title": "Simulate test" }),
+                    SimulatePhase::ConnectorReached,
+                    true,
+                ),
             )])),
             3,
         );
@@ -47054,9 +47495,10 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["status"], "ok");
-        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["phase"], "connector_reached");
         assert_eq!(payload["command"], "simulate");
-        // Simulate does NOT produce a response field (no execution happened).
+        assert_eq!(payload["simulation"]["would_succeed"], true);
+        // The simulation response is separate from an invoke response.
         assert!(payload.get("response").is_none() || payload["response"].is_null());
     }
 
@@ -47065,8 +47507,12 @@ depends_on = ["missing"]
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
             mock_github_host_routes(StdBTreeMap::from([(
-                "POST /rpc/preflight".to_owned(),
-                mock_preflight_response_json(false),
+                "POST /rpc/simulate".to_owned(),
+                mock_simulate_response_json(
+                    &json!({ "owner": "octocat", "repo": "hello-world", "title": "Simulate denied test" }),
+                    SimulatePhase::PreflightOnly,
+                    false,
+                ),
             )])),
             3,
         );
@@ -47087,7 +47533,7 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::PolicyDenied.into());
         assert_eq!(payload["status"], "denied");
-        assert_eq!(payload["phase"], "preflight");
+        assert_eq!(payload["phase"], "preflight_only");
         assert_eq!(payload["command"], "simulate");
     }
 
