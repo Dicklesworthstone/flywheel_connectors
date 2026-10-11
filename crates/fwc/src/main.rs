@@ -194,6 +194,7 @@ mod host_integration_streaming;
 #[allow(dead_code)] // Discovery types wired into host-backed commands in later beads.
 mod identifier;
 mod intent;
+mod invocation_cmd;
 #[allow(dead_code)]
 mod json_diff;
 #[allow(dead_code)] // Install, verify, update, pin, unpin, rollback with supply-chain evidence.
@@ -438,6 +439,7 @@ Examples:
   fwc config schema github
   fwc simulate github issues.create --file payload.json
   fwc invoke github issues.create --file payload.json
+  fwc invocation <request-id> --host http://127.0.0.1:8787 --admin-token-file admin-token
   fwc invoke github issues.create --template-file issue_summary.hbs
   fwc show github --json --extract '.connector.slug'
   fwc pipeline list
@@ -667,6 +669,9 @@ enum Commands {
 
     /// Execute a connector operation.
     Invoke(InvokeArgs),
+
+    /// Inspect one retained local host invocation attempt without repeating it.
+    Invocation(invocation_cmd::InvocationArgs),
 
     /// Ask a connector to simulate an operation without executing it.
     Simulate(SimulateArgs),
@@ -3877,6 +3882,15 @@ fn build_render_options(
 }
 
 fn internal_error_dispatch(args: &[String], error: &anyhow::Error) -> DispatchOutcome {
+    if let Some(unknown) = error.downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>() {
+        let (command, subcommand) = truth_resolver_command_context(args);
+        let mut dispatch = unknown.dispatch(&command);
+        if let Some(subcommand) = subcommand {
+            dispatch.payload["subcommand"] = Value::String(subcommand);
+        }
+        return dispatch;
+    }
+
     if let Some(timeout) = error.downcast_ref::<HostReadTimeout>() {
         return host_read_timeout_dispatch(args, timeout);
     }
@@ -4255,6 +4269,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Auth(args) => auth_dispatch(args, cli.host.as_deref())?,
         Commands::Config(args) => config_dispatch(args, cli.host.as_deref())?,
         Commands::Invoke(args) => invoke_dispatch("invoke", args, cli.host.as_deref(), None)?,
+        Commands::Invocation(args) => invocation_cmd::dispatch(args, cli.host.as_deref())?,
         Commands::Simulate(args) => {
             invoke_dispatch("simulate", &args.request, cli.host.as_deref(), Some(args))?
         }
@@ -5159,6 +5174,8 @@ impl std::error::Error for HostReadTimeout {}
 struct HostAdminClient {
     client: BlockingClient,
     base_url: String,
+    // Keep the real socket endpoint when HTTP requests use localhost internally.
+    endpoint: String,
     // Bound each read through body consumption, not a whole multi-read command
     // or LiveTruthResolver source attempt. Keep invoke/mutation budgets separate.
     read_timeout: Duration,
@@ -5178,6 +5195,14 @@ struct HostConnectorCatalog {
 
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
+        Self::with_redirects(endpoint, true)
+    }
+
+    fn without_redirects(endpoint: &str) -> Result<Self> {
+        Self::with_redirects(endpoint, false)
+    }
+
+    fn with_redirects(endpoint: &str, follow_redirects: bool) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
         let configured_timeout = match std::env::var(HOST_READ_TIMEOUT_ENV) {
             Ok(value) => Some(value),
@@ -5187,12 +5212,18 @@ impl HostAdminClient {
             }
         };
         let read_timeout = parse_host_read_timeout(configured_timeout.as_deref())?;
+        let builder = BlockingClientBuilder::new();
+        let builder = if follow_redirects {
+            builder
+        } else {
+            builder.redirect(reqwest::redirect::Policy::none())
+        };
 
         #[cfg(unix)]
         {
             if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
                 let socket_path = endpoint.strip_prefix("unix://").unwrap_or(&endpoint);
-                let client = BlockingClientBuilder::new()
+                let client = builder
                     .unix_socket(socket_path)
                     .build()
                     .with_context(|| {
@@ -5203,17 +5234,19 @@ impl HostAdminClient {
                 return Ok(Self {
                     client,
                     base_url: "http://localhost".to_owned(),
+                    endpoint,
                     read_timeout,
                 });
             }
         }
 
-        let client = BlockingClientBuilder::new()
+        let client = builder
             .build()
             .context("failed to build HTTP host client")?;
         Ok(Self {
             client,
-            base_url: endpoint,
+            base_url: endpoint.clone(),
+            endpoint,
             read_timeout,
         })
     }
@@ -5393,6 +5426,19 @@ impl HostAdminClient {
 
     fn invoke(&self, request: &InvokeRequest) -> Result<InvokeResponse> {
         self.post_json("/rpc/invoke", request)
+            .and_then(|response: InvokeResponse| {
+                anyhow::ensure!(
+                    response.id == request.id,
+                    "host returned an invoke response for a different request"
+                );
+                Ok(response)
+            })
+            .map_err(|error| {
+                // Drop raw bodies and transport diagnostics: either can echo request
+                // secrets. The stable identity is sufficient for safe inspection.
+                invocation_cmd::InvokeOutcomeUnknown::from_request(request, &self.endpoint, &error)
+                    .into()
+            })
     }
 
     fn cancel(&self, request: &HostCancellationRequest) -> Result<HostCancellationResponse> {
@@ -24142,7 +24188,17 @@ fn invoke_dispatch_host(
         approval_tokens: auth.approval_tokens,
     };
     let started_at = std::time::Instant::now();
-    let response = client.invoke(&invoke_request)?;
+    let response = match client.invoke(&invoke_request) {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(unknown) = error.downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>() {
+                // Retain request identity and host context without echoing the
+                // authored payload, capability tokens, or a raw error body.
+                return Ok(unknown.dispatch(command));
+            }
+            return Err(error);
+        }
+    };
     let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let response_value = serde_json::to_value(&response)?;
     let history_status = match response.status {
@@ -31698,7 +31754,7 @@ fn annotate_with_corrections(
     normalized_args: &[String],
     corrections: &[InputCorrection],
 ) {
-    if corrections.is_empty() {
+    if corrections.is_empty() || invocation_cmd::withhold_argument_echo(payload) {
         return;
     }
 
@@ -32023,6 +32079,7 @@ mod tests {
                 .no_proxy()
                 .build()
                 .expect("held host client should build"),
+            endpoint: base_url.clone(),
             base_url,
             read_timeout: Duration::from_millis(250),
         };
@@ -33383,6 +33440,22 @@ max_state_replication_staleness_secs = 120
         );
     }
 
+    fn bind_mock_invoke_response(key: &str, body: &str, request_body: &str) -> String {
+        if key != "POST /rpc/invoke" {
+            return body.to_owned();
+        }
+        let mut response: Value = serde_json::from_str(body).expect("mock response is JSON");
+        if response.get("id").is_none() {
+            return body.to_owned();
+        }
+        // A real host echoes the request ID. Deliberate mismatched-response
+        // regressions use their own server rather than this valid-host fixture.
+        let request: Value = serde_json::from_str(request_body).expect("invoke request is JSON");
+        assert!(request["id"].is_string());
+        response["id"] = request["id"].clone();
+        serde_json::to_string(&response).expect("bound response is JSON")
+    }
+
     fn spawn_mock_host(
         routes: StdBTreeMap<String, Value>,
         expected_requests: usize,
@@ -33454,12 +33527,11 @@ max_state_replication_staleness_secs = 120
                     }
                 }
 
-                if content_length > 0 {
-                    let mut body = vec![0u8; content_length];
-                    reader
-                        .read_exact(&mut body)
-                        .expect("mock host should read request body");
-                }
+                let mut request_body = vec![0u8; content_length];
+                reader
+                    .read_exact(&mut request_body)
+                    .expect("mock host should read request body");
+                let request_body = String::from_utf8(request_body).expect("request body is UTF-8");
 
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().expect("request method should exist");
@@ -33471,6 +33543,7 @@ max_state_replication_staleness_secs = 120
                         responses.keys().collect::<Vec<_>>()
                     )
                 });
+                let body = bind_mock_invoke_response(&key, body, &request_body);
 
                 write!(
                     stream,
@@ -33559,12 +33632,11 @@ max_state_replication_staleness_secs = 120
                     }
                 }
 
-                if content_length > 0 {
-                    let mut body = vec![0u8; content_length];
-                    reader
-                        .read_exact(&mut body)
-                        .expect("mock host should read request body");
-                }
+                let mut request_body = vec![0u8; content_length];
+                reader
+                    .read_exact(&mut request_body)
+                    .expect("mock host should read request body");
+                let request_body = String::from_utf8(request_body).expect("request body is UTF-8");
 
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().expect("request method should exist");
@@ -33579,6 +33651,7 @@ max_state_replication_staleness_secs = 120
                     "unexpected mock host request order at position {}",
                     served + 1
                 );
+                let body = bind_mock_invoke_response(&key, body, &request_body);
 
                 write!(
                     stream,
@@ -33696,6 +33769,7 @@ max_state_replication_staleness_secs = 120
                     "unexpected mock host request order at position {}",
                     served + 1
                 );
+                let body = bind_mock_invoke_response(&key, body, &body_text);
                 thread_log
                     .lock()
                     .expect("mock host request log lock")
@@ -46939,6 +47013,72 @@ depends_on = ["missing"]
     }
 
     #[test]
+    fn invoke_unusable_response_preserves_inspection_handle_without_echoing_input() {
+        let capability_token = test_capability_token_arg();
+        let private_input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "private-issue-payload",
+        });
+        let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
+            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_json(),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                json!({
+                    "unusable_proxy_response": private_input,
+                    "reflected_credential": capability_token,
+                }),
+            ),
+        ]);
+        let input = private_input.to_string();
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--extract",
+            ".response",
+            "--host",
+            &host,
+            "invoke",
+            "github",
+            "issues.create",
+            "--input",
+            &input,
+            "--capability-token",
+            &capability_token,
+        ]);
+        server.join().expect("mock host completed");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4, "the uncertain invoke must not be repeated");
+        let sent: Value = serde_json::from_str(&requests[3].1).unwrap();
+        assert_eq!(sent["input"], private_input);
+        assert_eq!(payload["request_id"], sent["id"]);
+        assert_eq!(payload["request"]["request_id"], sent["id"]);
+        assert_eq!(payload["inspection"]["operation_id"], sent["id"]);
+        assert_eq!(payload["host"]["endpoint"], host);
+        assert_eq!(exit_code, CliExitCode::Transport.into());
+        assert_eq!(payload["phase"], "execution");
+        assert_eq!(payload["outcome"], "outcome_unknown");
+        assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+        assert_eq!(payload["_truth_source"], "unavailable");
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert!(payload.get("input_authoring").is_none());
+        assert!(payload.get("response").is_none());
+        assert!(payload["error"].get("debug_chain").is_none());
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("private-issue-payload"));
+        assert!(!rendered.contains(&capability_token));
+    }
+
+    #[test]
     fn invoke_host_missing_capability_token_returns_auth_error() {
         let (exit_code, payload) = execute_json(&[
             "fwc",
@@ -51286,11 +51426,7 @@ require_attestation_types = ["in-toto"]"#,
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
         );
-        assert!(
-            payload["response"]["id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty())
-        );
+        assert_eq!(payload["response"]["id"], payload["request"]["request_id"]);
     }
 
     // ── 1g7z0.10.4  Invoke UX: streaming, log-tail, watch, resume ───────

@@ -426,6 +426,15 @@ pub const COMMAND_CLASSIFICATIONS: &[CommandClassification] = &[
         transport_note: "POST /rpc/invoke — requires live host, capability token, may need approvals",
     },
     CommandClassification {
+        command: "invocation",
+        truth_source: CommandTruthSource::LiveHost,
+        execution_mode: CommandExecutionMode::ReadOnly,
+        host_absent: HostAbsentBehavior::FailFast,
+        requires_capability_token: false,
+        may_need_approval: false,
+        transport_note: "POST /rpc/admin/invocations — selected host's retained local attempts; explicit admin bearer and owner-zone access",
+    },
+    CommandClassification {
         command: "simulate",
         truth_source: CommandTruthSource::LiveHost,
         execution_mode: CommandExecutionMode::Simulate,
@@ -3571,6 +3580,7 @@ pub const COMMANDS: &[&str] = &[
     "rollout",
     "config",
     "invoke",
+    "invocation",
     "simulate",
     "preflight",
     "cancel",
@@ -3710,7 +3720,7 @@ pub fn guide_payload(command: Option<&str>) -> Value {
                     },
                     {
                         "name": "execution",
-                        "commands": ["simulate", "invoke", "preflight", "cancel", "export-tools", "serve-mcp", "suggest", "template", "validate", "history", "replay", "compare", "undo", "approvals", "pipe", "pipeline", "recipe", "map", "batch-file", "tail", "watch"],
+                        "commands": ["simulate", "invoke", "invocation", "preflight", "cancel", "export-tools", "serve-mcp", "suggest", "template", "validate", "history", "replay", "compare", "undo", "approvals", "pipe", "pipeline", "recipe", "map", "batch-file", "tail", "watch"],
                     },
                 ],
                 "phase": {
@@ -4035,6 +4045,16 @@ fn command_contract(command: &str) -> Option<Value> {
             "Execute a connector operation with explicit payload routing, risk context, and result rendering.",
             "Result view that stays concise by default while preserving full JSON fidelity.",
         )),
+        "invocation" => Some(json!({
+            "family": "execution",
+            "summary": "Inspect a retained local host invocation attempt by its stable request ID.",
+            "intended_shape": "Read-only admin lookup that keeps the observed source outcome, host-job liveness and response finalization separate. Missing local history never proves absence of effects.",
+            "workflow_handoff": [
+                "Use fwc invocation <request-id> --host <executor-host> --admin-token-file <path> after an uncertain invoke response.",
+                "Supply --attempt-id to inspect one exact attempt; a mesh gateway may not retain the executor's record.",
+                "Establish the prior attempt's effects before deciding whether to repeat an invocation."
+            ],
+        })),
         "simulate" => Some(execution_contract(
             "Preflight or dry-run a connector operation before side effects.",
             "Explain-first execution path for risky or destructive operations.",
