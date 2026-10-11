@@ -160,8 +160,12 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tower::ServiceExt;
 
+#[path = "fcp-host/native_rpc.rs"]
+mod native_rpc;
 #[path = "fcp-host/session.rs"]
 mod session;
+
+use native_rpc::{NativeInvocationTermination, NativeRpc, invocation_deadline};
 
 type ConnectorConfig = ManagedConnectorConfig;
 
@@ -456,6 +460,7 @@ struct ConnectorRpcRequest {
     method: String,
     params: serde_json::Value,
     response_tx: oneshot::Sender<std::io::Result<serde_json::Value>>,
+    rpc: NativeRpc,
 }
 
 fn connector_placement_request(
@@ -532,6 +537,28 @@ impl SubprocessConnector {
         capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
         placement_operation_class: PlacementOperationClass,
     ) -> HostResult<Self> {
+        Self::spawn_with_placement_and_termination(
+            config,
+            resilience,
+            capability_verifying_key,
+            placement_operation_class,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_placement_and_termination(
+        config: ConnectorConfig,
+        resilience: Arc<ResilienceLayer>,
+        capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+        placement_operation_class: PlacementOperationClass,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<Self> {
+        if termination.is_some_and(NativeInvocationTermination::is_cancel_requested) {
+            return Err(HostError::RegistryError(
+                "native worker creation cancelled before spawn".to_string(),
+            ));
+        }
         let summary = connector_summary_from_config(&config)?;
         resilience.ensure_connector(&summary.id);
         let placement_request = connector_placement_request(&config, placement_operation_class);
@@ -553,15 +580,12 @@ impl SubprocessConnector {
             .await
             .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
         let state_root = configured_connector_state_root(&config);
-        let (runner_tx, mut runner_rx) =
+        let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
-        let runner_task = task::spawn(async move {
-            let mut runner = runner;
-            while let Some(request) = runner_rx.recv().await {
-                let response = runner.request(&request.method, request.params).await;
-                let _ = request.response_tx.send(response);
-            }
-        });
+        let runner_task = task::try_spawn(native_rpc::run_dispatcher(runner, runner_rx))
+            .map_err(|error| {
+                HostError::Internal(format!("connector dispatcher admission failed: {error}"))
+            })?;
 
         let connector = Self {
             summary,
@@ -574,52 +598,87 @@ impl SubprocessConnector {
         };
 
         if let Some(config_payload) = config.config {
-            connector.configure(config_payload).await?;
+            if let Some(termination) = termination {
+                connector
+                    .configure_with_termination(config_payload, Some(termination))
+                    .await?;
+            } else {
+                connector.configure(config_payload).await?;
+            }
         }
 
         Ok(connector)
     }
 
     async fn configure(&self, config: serde_json::Value) -> HostResult<()> {
+        self.configure_with_termination(config, None).await
+    }
+
+    async fn configure_with_termination(
+        &self,
+        config: serde_json::Value,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<()> {
         // Failed and cancelled reconfigurations invalidate process authority.
         // The same lock guards handshake + invoke/health, so a configure
         // cannot race with the use of an older cached zone-bound session.
         let mut handshaken_zone = self.handshaken_zone.lock().await;
         *handshaken_zone = None;
-        let _ = self.rpc("configure", config).await?;
+        let _ = self
+            .rpc_with_termination("configure", config, termination)
+            .await?;
         Ok(())
     }
 
     async fn rpc(&self, method: &str, params: serde_json::Value) -> HostResult<serde_json::Value> {
+        self.rpc_with_termination(method, params, None).await
+    }
+
+    async fn rpc_with_termination(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<serde_json::Value> {
+        let rpc =
+            termination.map_or_else(NativeRpc::for_io, NativeInvocationTermination::register_rpc);
+        let _waiter = rpc.waiter();
+        if rpc.is_cancelled() {
+            return Err(HostError::RegistryError(
+                "connector RPC cancelled before queue admission".to_string(),
+            ));
+        }
         let connector_id = self.summary.id.clone();
-        self.resilience
+        let result = self
+            .resilience
             .execute(&connector_id, operation_priority(method), method, async {
                 let (response_tx, response_rx) = oneshot::channel();
                 fcp_async_core::time::timeout(
-                    CONNECTOR_RPC_IO_TIMEOUT,
+                    rpc.remaining(),
                     self.runner_tx.send(ConnectorRpcRequest {
                         method: method.to_string(),
                         params,
                         response_tx,
+                        rpc: rpc.clone(),
                     }),
                 )
                 .await
                 .map_err(|_| {
-                    HostError::RegistryError(format!(
-                        "connector dispatcher queue timed out after {}s",
-                        CONNECTOR_RPC_IO_TIMEOUT.as_secs()
-                    ))
+                    HostError::RegistryError(
+                        "connector dispatcher queue timed out before the RPC deadline".to_string(),
+                    )
                 })?
                 .map_err(|_| {
                     HostError::RegistryError("connector dispatcher unavailable".to_string())
                 })?;
-                let response = fcp_async_core::time::timeout(CONNECTOR_RPC_IO_TIMEOUT, response_rx)
+                // The queue and response share one deadline. Dropping this
+                // waiter on timeout also revokes its exact queued/active ticket.
+                let response = fcp_async_core::time::timeout(rpc.remaining(), response_rx)
                     .await
                     .map_err(|_| {
-                        HostError::RegistryError(format!(
-                            "connector dispatcher response timed out after {}s",
-                            CONNECTOR_RPC_IO_TIMEOUT.as_secs()
-                        ))
+                        HostError::RegistryError(
+                            "connector dispatcher response exceeded the RPC deadline".to_string(),
+                        )
                     })?
                     .map_err(|_| {
                         HostError::RegistryError(
@@ -637,22 +696,58 @@ impl SubprocessConnector {
                 Ok(response.get("result").cloned().unwrap_or(json!({})))
             })
             .await
-            .map_err(|error| map_resilience_error(&connector_id, method, error))
+            .map_err(|error| map_resilience_error(&connector_id, method, error));
+        if let Err(error) = result {
+            rpc.cancel();
+            if !rpc.is_settled() || rpc.transport_retired() {
+                return Err(HostError::RegistryError(format!(
+                    "connector RPC transport retired after interruption: {error}"
+                )));
+            }
+            return Err(error);
+        }
+        result
     }
 
     async fn introspect(&self) -> HostResult<Introspection> {
-        let result = self.rpc("introspect", json!({})).await?;
+        self.introspect_with_termination(None).await
+    }
+
+    async fn introspect_with_termination(
+        &self,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<Introspection> {
+        let result = self
+            .rpc_with_termination("introspect", json!({}), termination)
+            .await?;
         serde_json::from_value(result)
             .map_err(|err| HostError::RegistryError(format!("introspection parse error: {err}")))
     }
 
     async fn health(&self) -> HostResult<HealthSnapshot> {
-        let result = self.rpc("health", json!({})).await?;
+        self.health_with_termination(None).await
+    }
+
+    async fn health_with_termination(
+        &self,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<HealthSnapshot> {
+        let result = self
+            .rpc_with_termination("health", json!({}), termination)
+            .await?;
         serde_json::from_value(result)
             .map_err(|err| HostError::RegistryError(format!("health parse error: {err}")))
     }
 
     async fn ensure_handshake(&self, zone: &ZoneId) -> HostResult<()> {
+        self.ensure_handshake_with_termination(zone, None).await
+    }
+
+    async fn ensure_handshake_with_termination(
+        &self,
+        zone: &ZoneId,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<()> {
         if self.capability_verifying_key.is_none() {
             return Ok(());
         }
@@ -663,13 +758,15 @@ impl SubprocessConnector {
             acquired_at: Instant::now(),
             threshold: HANDSHAKEN_ZONE_LOCK_HOLD_WARN_THRESHOLD,
         };
-        self.handshake_if_needed(zone, &mut handshaken_zone).await
+        self.handshake_if_needed(zone, &mut handshaken_zone, termination)
+            .await
     }
 
     async fn handshake_if_needed(
         &self,
         zone: &ZoneId,
         handshaken_zone: &mut Option<ZoneId>,
+        termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<()> {
         let Some(host_public_key) = self.capability_verifying_key else {
             return Ok(());
@@ -682,7 +779,7 @@ impl SubprocessConnector {
         // A failed attempt may rotate authority in the connector before
         // returning an error. Clear the cache BEFORE any awaited work.
         *handshaken_zone = None;
-        let catalog = self.introspect().await?;
+        let catalog = self.introspect_with_termination(termination).await?;
         let capabilities_requested = session::requested_capabilities(&catalog)?;
         let nonce = *blake3::hash(RequestId::random().0.as_bytes()).as_bytes();
         let request = HandshakeRequest {
@@ -698,9 +795,11 @@ impl SubprocessConnector {
         };
         let handshake_params = serde_json::to_value(&request)
             .map_err(|err| HostError::RegistryError(format!("handshake encode error: {err}")))?;
-        let response: HandshakeResponse =
-            serde_json::from_value(self.rpc("handshake", handshake_params).await?)
-                .map_err(|err| HostError::RegistryError(format!("handshake parse error: {err}")))?;
+        let response: HandshakeResponse = serde_json::from_value(
+            self.rpc_with_termination("handshake", handshake_params, termination)
+                .await?,
+        )
+        .map_err(|err| HostError::RegistryError(format!("handshake parse error: {err}")))?;
         session::validate_negotiated_grants(&request, &response, &catalog)?;
         if response.status != "accepted" {
             return Err(HostError::RegistryError(format!(
@@ -724,8 +823,19 @@ impl SubprocessConnector {
         method: &str,
         params: serde_json::Value,
     ) -> HostResult<serde_json::Value> {
+        self.rpc_in_handshaken_zone_with_termination(zone, method, params, None)
+            .await
+    }
+
+    async fn rpc_in_handshaken_zone_with_termination(
+        &self,
+        zone: &ZoneId,
+        method: &str,
+        params: serde_json::Value,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<serde_json::Value> {
         if self.capability_verifying_key.is_none() {
-            return self.rpc(method, params).await;
+            return self.rpc_with_termination(method, params, termination).await;
         }
 
         // br-j1pjg serialized same-zone handshakes, but the lock still
@@ -753,9 +863,10 @@ impl SubprocessConnector {
             acquired_at: Instant::now(),
             threshold: HANDSHAKEN_ZONE_LOCK_HOLD_WARN_THRESHOLD,
         };
-        self.handshake_if_needed(zone, &mut handshaken_zone).await?;
+        self.handshake_if_needed(zone, &mut handshaken_zone, termination)
+            .await?;
 
-        self.rpc(method, params).await
+        self.rpc_with_termination(method, params, termination).await
     }
 
     fn zone_dir_for(&self, zone: &ZoneId) -> HostResult<String> {
@@ -774,10 +885,37 @@ impl SubprocessConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
+        let termination = NativeInvocationTermination::new(invocation_deadline(
+            Instant::now(),
+            request.deadline_ms,
+        ));
+        self.invoke_with_termination(request, termination).await
+    }
+
+    async fn invoke_with_termination(
+        &self,
+        request: InvokeRequest,
+        termination: NativeInvocationTermination,
+    ) -> HostResult<InvokeResponse> {
+        termination
+            .invoke(self.invoke_rpc(request, &termination))
+            .await
+    }
+
+    async fn invoke_rpc(
+        &self,
+        request: InvokeRequest,
+        termination: &NativeInvocationTermination,
+    ) -> HostResult<InvokeResponse> {
         let params = serde_json::to_value(&request)
             .map_err(|err| HostError::RegistryError(format!("invoke encode error: {err}")))?;
         let result = self
-            .rpc_in_handshaken_zone(&request.zone_id, "invoke", params)
+            .rpc_in_handshaken_zone_with_termination(
+                &request.zone_id,
+                "invoke",
+                params,
+                Some(termination),
+            )
             .await?;
         serde_json::from_value(result)
             .map_err(|err| HostError::RegistryError(format!("invoke parse error: {err}")))
@@ -824,61 +962,37 @@ impl SubprocessConnector {
     }
 }
 
-/// Per-invocation cancellation latch for a native warm-pool checkout.
-/// The pool control process is never a cancellation target. A deadline
-/// firing before checkout finishes is remembered, and immediately aborts
-/// whichever concrete worker the checkout ultimately selects.
+/// One cancellation capture spans warm checkout, worker initialization,
+/// invocation and pool return. It retains physical tickets from rejected
+/// candidates as well as a later cold worker; the control process is excluded.
 #[derive(Clone)]
 struct WarmPoolTermination {
-    selected: Arc<OnceLock<Arc<SubprocessConnector>>>,
-    stop_requested: Arc<AtomicBool>,
+    invocation: NativeInvocationTermination,
     termination: CancellationTerminator,
 }
 
 impl Default for WarmPoolTermination {
     fn default() -> Self {
-        let selected: Arc<OnceLock<Arc<SubprocessConnector>>> = Arc::default();
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let abort_worker = Arc::clone(&selected);
-        let abort_requested = Arc::clone(&stop_requested);
-        let finished_worker = Arc::clone(&selected);
-        let termination = CancellationTerminator::new(
-            move || {
-                abort_requested.store(true, Ordering::SeqCst);
-                if let Some(worker) = abort_worker.get() {
-                    worker._runner_task.abort();
-                }
-            },
-            move || {
-                finished_worker
-                    .get()
-                    .is_some_and(|worker| worker._runner_task.is_finished())
-            },
-        );
-        Self {
-            selected,
-            stop_requested,
-            termination,
-        }
+        Self::new(invocation_deadline(Instant::now(), None))
     }
 }
 
 impl WarmPoolTermination {
+    fn new(deadline: Instant) -> Self {
+        let invocation = NativeInvocationTermination::new(deadline);
+        let termination = invocation.terminator();
+        Self {
+            invocation,
+            termination,
+        }
+    }
+
     fn terminator(&self) -> CancellationTerminator {
         self.termination.clone()
     }
 
-    fn bind(&self, worker: &Arc<SubprocessConnector>) {
-        // Binding is immutable for this invocation. Replacing the global
-        // pool or connector cannot change the worker that cancellation kills.
-        let _ = self.selected.set(Arc::clone(worker));
-        if self.stop_requested.load(Ordering::SeqCst) {
-            worker._runner_task.abort();
-        }
-    }
-
     fn is_cancel_requested(&self) -> bool {
-        self.stop_requested.load(Ordering::SeqCst)
+        self.invocation.is_cancel_requested()
     }
 
     fn disarm_before_reuse(&self) -> bool {
@@ -1119,6 +1233,13 @@ impl NativeWarmPoolConnector {
     /// retention, so the pressure/RSS controller keeps final say over whether the
     /// replacement is actually retained.
     async fn maintain_min_idle(&self) -> HostResult<()> {
+        self.maintain_min_idle_with_termination(None).await
+    }
+
+    async fn maintain_min_idle_with_termination(
+        &self,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<()> {
         let zones = self
             .config
             .allowed_zones
@@ -1135,7 +1256,7 @@ impl NativeWarmPoolConnector {
             return Ok(());
         };
         for zone in zones.iter().cycle().take(deficit) {
-            let entry = self.spawn_pool_entry(zone).await?;
+            let entry = self.spawn_pool_entry(zone, termination).await?;
             self.insert_pool_entry(entry).await;
         }
         Ok(())
@@ -1145,7 +1266,14 @@ impl NativeWarmPoolConnector {
     /// respawn failure must never mask the original invoke/simulate error, so
     /// this swallows and logs the error rather than propagating it.
     async fn replenish_after_fatal_drop(&self) {
-        if let Err(error) = self.maintain_min_idle().await {
+        self.replenish_after_fatal_drop_with_termination(None).await;
+    }
+
+    async fn replenish_after_fatal_drop_with_termination(
+        &self,
+        termination: Option<&NativeInvocationTermination>,
+    ) {
+        if let Err(error) = self.maintain_min_idle_with_termination(termination).await {
             tracing::warn!(
                 event = WARM_POOL_EVIDENCE_EVENT,
                 action = "replenish_failed",
@@ -1165,16 +1293,27 @@ impl NativeWarmPoolConnector {
         request: InvokeRequest,
         termination: Option<WarmPoolTermination>,
     ) -> HostResult<InvokeResponse> {
-        let checkout = self.checkout(&request.zone_id).await?;
-        if let Some(termination) = &termination {
-            termination.bind(&checkout.entry.connector);
-            if termination.is_cancel_requested() {
-                // Cancellation preceded checkout completion. Do not dispatch
-                // to or return this aborted worker to the reusable pool.
-                return Err(HostError::RegistryError(
-                    "warm-pool invocation cancelled before worker dispatch".into(),
-                ));
-            }
+        let termination = termination.unwrap_or_else(|| {
+            WarmPoolTermination::new(invocation_deadline(Instant::now(), request.deadline_ms))
+        });
+        termination
+            .invocation
+            .invoke(self.invoke_checked_out(request, &termination))
+            .await
+    }
+
+    async fn invoke_checked_out(
+        &self,
+        request: InvokeRequest,
+        termination: &WarmPoolTermination,
+    ) -> HostResult<InvokeResponse> {
+        let checkout = self
+            .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
+            .await?;
+        if termination.is_cancel_requested() {
+            return Err(HostError::RegistryError(
+                "warm-pool invocation cancelled before worker dispatch".into(),
+            ));
         }
         tracing::info!(
             event = WARM_POOL_EVIDENCE_EVENT,
@@ -1198,16 +1337,20 @@ impl NativeWarmPoolConnector {
         );
 
         let mut entry = checkout.entry;
-        let response = entry.connector.invoke(request).await;
-        if termination
+        let response = entry
+            .connector
+            .invoke_rpc(request, &termination.invocation)
+            .await;
+        termination.invocation.ensure_settled().await?;
+        let reusable = response
             .as_ref()
-            .is_some_and(|termination| !termination.disarm_before_reuse())
-        {
-            // Abort and disarm share one lock. If abort won, retire the worker;
-            // if disarm won, every stale reaper handle is inert BEFORE either
-            // insertion await can publish this worker to another invocation.
+            .map_or_else(warm_entry_survives_error, |_| true);
+        if reusable && !termination.disarm_before_reuse() {
+            // Disarm remains BEFORE either insertion await. Every captured
+            // physical ticket has also settled, so neither a stale reaper nor
+            // waiter abandonment can affect the worker's next invocation.
             return Err(HostError::RegistryError(
-                "warm-pool invocation cancelled; selected worker retired".into(),
+                "warm-pool invocation cancelled before worker reuse".into(),
             ));
         }
         match response {
@@ -1244,7 +1387,8 @@ impl NativeWarmPoolConnector {
                         rss_bytes = entry.rss_bytes,
                         "dropping native warm-pool entry after fatal invoke error"
                     );
-                    self.replenish_after_fatal_drop().await;
+                    self.replenish_after_fatal_drop_with_termination(Some(&termination.invocation))
+                        .await;
                 }
                 Err(error)
             }
@@ -1294,16 +1438,24 @@ impl NativeWarmPoolConnector {
     }
 
     async fn checkout(&self, zone: &ZoneId) -> HostResult<NativeWarmPoolCheckout> {
+        self.checkout_with_termination(zone, None).await
+    }
+
+    async fn checkout_with_termination(
+        &self,
+        zone: &ZoneId,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<NativeWarmPoolCheckout> {
         let key = self.warm_pool_key(zone);
         self.apply_retention().await;
         if let Some(entry) = self.take_pool_entry(&key).await
-            && let Some(checkout) = self.try_admit_entry(entry, zone).await?
+            && let Some(checkout) = self.try_admit_entry(entry, zone, termination).await?
         {
             return Ok(checkout);
         }
 
         let started_at = Instant::now();
-        let entry = self.spawn_pool_entry(zone).await?;
+        let entry = self.spawn_pool_entry(zone, termination).await?;
         Ok(NativeWarmPoolCheckout {
             entry,
             warm_checkout: false,
@@ -1315,8 +1467,9 @@ impl NativeWarmPoolConnector {
         &self,
         mut entry: NativeWarmPoolEntry,
         zone: &ZoneId,
+        termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<Option<NativeWarmPoolCheckout>> {
-        let health = match entry.connector.health().await {
+        let health = match entry.connector.health_with_termination(termination).await {
             Ok(snapshot) => prewarm_health_state(&snapshot),
             Err(_) => PrewarmHealthState::Failed,
         };
@@ -1334,7 +1487,10 @@ impl NativeWarmPoolConnector {
 
         match self.config.prewarm.decide_checkout(&observation) {
             PrewarmCheckoutDecision::AdmitWarm { .. } => {
-                entry.connector.ensure_handshake(zone).await?;
+                entry
+                    .connector
+                    .ensure_handshake_with_termination(zone, termination)
+                    .await?;
                 Ok(Some(NativeWarmPoolCheckout {
                     entry,
                     warm_checkout: true,
@@ -1358,17 +1514,28 @@ impl NativeWarmPoolConnector {
         }
     }
 
-    async fn spawn_pool_entry(&self, zone: &ZoneId) -> HostResult<NativeWarmPoolEntry> {
+    async fn spawn_pool_entry(
+        &self,
+        zone: &ZoneId,
+        termination: Option<&NativeInvocationTermination>,
+    ) -> HostResult<NativeWarmPoolEntry> {
         let connector = Arc::new(
-            SubprocessConnector::spawn_with_placement(
+            SubprocessConnector::spawn_with_placement_and_termination(
                 self.config.clone(),
                 Arc::clone(&self.resilience),
                 self.capability_verifying_key,
                 PlacementOperationClass::BulkPrewarm,
+                termination,
             )
             .await?,
         );
-        connector.ensure_handshake(zone).await?;
+        if let Some(termination) = termination {
+            connector
+                .ensure_handshake_with_termination(zone, Some(termination))
+                .await?;
+        } else {
+            connector.ensure_handshake(zone).await?;
+        }
         let now = Instant::now();
         Ok(NativeWarmPoolEntry {
             key: self.warm_pool_key(zone),
@@ -2258,11 +2425,13 @@ impl SubprocessRegistry {
     async fn cancellation_target(
         &self,
         connector_id: &ConnectorId,
+        native_deadline: Instant,
     ) -> HostResult<(
         CancellationScope,
         ConnectorRuntime,
         Option<WarmPoolTermination>,
         Option<WasiTermination>,
+        Option<NativeInvocationTermination>,
     )> {
         let state = self.state.read().await;
         let entry = state
@@ -2281,23 +2450,21 @@ impl SubprocessRegistry {
         )
         .with_deadline_override_ms(entry.config.cancellation_deadline_ms);
 
-        // The native runner's task owns a Child created with kill_on_drop.
-        // Abort wakes the runner even during a blocked read and drops THAT
-        // process; it never queues behind its invoke or scans the registry.
         let mut warm_pool = None;
         let mut wasi_capture = None;
+        let mut native_capture = None;
         match &runtime {
-            ConnectorRuntime::Native(native) => {
-                let abort = Arc::clone(native);
-                let finished = Arc::clone(native);
-                scope = scope.with_terminator(CancellationTerminator::new(
-                    move || abort._runner_task.abort(),
-                    move || finished._runner_task.is_finished(),
-                ));
+            ConnectorRuntime::Native(_) => {
+                // Cancel only commands registered by this logical invocation.
+                // A queued caller must never abort another active native RPC.
+                let capture = NativeInvocationTermination::new(native_deadline);
+                scope = scope.with_terminator(capture.terminator());
+                native_capture = Some(capture);
             }
             ConnectorRuntime::NativeWarmPool(_) => {
-                let capture = WarmPoolTermination::default();
+                let capture = WarmPoolTermination::new(native_deadline);
                 scope = scope.with_terminator(capture.terminator());
+                native_capture = Some(capture.invocation.clone());
                 warm_pool = Some(capture);
             }
             ConnectorRuntime::Wasi(_) => {
@@ -2309,7 +2476,7 @@ impl SubprocessRegistry {
             }
             ConnectorRuntime::UnavailableNativeProxyOnly(_) => {}
         }
-        Ok((scope, runtime, warm_pool, wasi_capture))
+        Ok((scope, runtime, warm_pool, wasi_capture, native_capture))
     }
 
     async fn first_zone_envelope_error(&self) -> Option<HostError> {
@@ -4183,13 +4350,26 @@ fn connector_config_declares_singleton_writer(config: &ConnectorConfig) -> bool 
 }
 
 struct ConnectorProcessRunner {
-    _child: Child,
+    child: Option<Child>,
+    active_rpc: Option<NativeRpc>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     _stderr_task: JoinHandle<()>,
     poisoned: bool,
     epoch: u64,
     next_request_seq: u64,
+}
+
+impl Drop for ConnectorProcessRunner {
+    fn drop(&mut self) {
+        if let Some(rpc) = self.active_rpc.take()
+            && let Some(child) = self.child.take()
+        {
+            // Task abortion must preserve the active command's child custody.
+            // Its invocation/controller will probe for confirmed process exit.
+            rpc.retire(child);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4313,7 +4493,7 @@ impl ConnectorProcessRunner {
             .stderr()
             .ok_or_else(|| std::io::Error::other("connector stderr unavailable"))?;
 
-        let stderr_task = task::spawn(async move {
+        let stderr_task = task::try_spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut line = Vec::with_capacity(1024);
             let mut truncated = false;
@@ -4339,10 +4519,14 @@ impl ConnectorProcessRunner {
                     Err(_) => break,
                 }
             }
-        });
+        })
+        .map_err(|error| {
+            std::io::Error::other(format!("connector stderr task admission failed: {error}"))
+        })?;
 
         Ok(Self {
-            _child: child,
+            child: Some(child),
+            active_rpc: None,
             stdin,
             stdout: BufReader::new(stdout),
             _stderr_task: stderr_task,
@@ -14079,9 +14263,12 @@ async fn execute_local_invoke(
     // header is only an equality check against the authenticated token
     // subject/principal_id claim; absent it, the request is still
     // authenticated and must not fall back to ownerless cancellation.
-    let (cancellation_scope, invoked_runtime, warm_pool_capture, wasi_capture) = state
+    let (cancellation_scope, invoked_runtime, warm_pool_capture, wasi_capture, native_capture) = state
         .registry
-        .cancellation_target(&connector_id)
+        .cancellation_target(
+            &connector_id,
+            invocation_deadline(started_at, request.deadline_ms),
+        )
         .await
         .map_err(map_host_error)?;
     let cancellation_registration = track_verified_cancellation_owner(
@@ -14091,11 +14278,24 @@ async fn execute_local_invoke(
         cancellation_scope,
     )
     .map_err(map_host_error)?;
+    let native_completion_is_deferred = native_capture.is_some();
+    if let Some(capture) = native_capture.as_ref() {
+        capture.bind_registration(&state.cancellation, cancellation_registration.clone());
+    }
     let source_request = request.clone();
     // Use the precise runtime whose termination signal was captured above.
     // Warm-pool checkout binds the actual WORKER, never its control process.
     // A concurrent configuration update cannot redirect this invocation.
     let invoke_result = match invoked_runtime {
+        ConnectorRuntime::Native(native) => {
+            if let Some(capture) = native_capture {
+                native.invoke_with_termination(request, capture).await
+            } else {
+                Err(HostError::Internal(
+                    "native invocation cancellation capture is missing".to_string(),
+                ))
+            }
+        }
         ConnectorRuntime::NativeWarmPool(pool) => {
             pool.invoke_with_termination(request, warm_pool_capture)
                 .await
@@ -14109,9 +14309,11 @@ async fn execute_local_invoke(
         }
         runtime => runtime.invoke(request).await,
     };
-    state
-        .cancellation
-        .complete_registration(&cancellation_registration);
+    if !native_completion_is_deferred {
+        state
+            .cancellation
+            .complete_registration(&cancellation_registration);
+    }
 
     match invoke_result {
         Ok(response) => {
@@ -25800,7 +26002,11 @@ done"#
             let runner = ConnectorProcessRunner::spawn("sh", &args, &BTreeMap::new())
                 .await
                 .expect("spawn long-running process");
-            runner._child.id().expect("child pid should be available")
+            runner
+                .child
+                .as_ref()
+                .and_then(Child::id)
+                .expect("child pid should be available")
         };
 
         let mut reaped = false;
@@ -25906,6 +26112,7 @@ done"#
                 method: "health".to_string(),
                 params: json!({}),
                 response_tx,
+                rpc: NativeRpc::for_io(),
             })
             .await
             .unwrap_or_else(|_| panic!("queue fill should succeed"));
@@ -27879,6 +28086,9 @@ done"#;
                     .await
                 {
                     Ok(Some(request)) => {
+                        if !request.rpc.try_begin() {
+                            continue;
+                        }
                         let response = {
                             let mut connector = telegram_for_runner.lock().await;
                             match request.method.as_str() {
@@ -27937,7 +28147,9 @@ done"#;
                                 })),
                             }
                         };
-                        let _ = request.response_tx.send(response);
+                        if request.rpc.try_settle_reply() {
+                            let _ = request.response_tx.send(response);
+                        }
                     }
                     Ok(None) => break,
                     Err(_) if handler_done_for_runner.load(Ordering::SeqCst) => break,

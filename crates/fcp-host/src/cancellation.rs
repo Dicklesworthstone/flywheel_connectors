@@ -162,6 +162,9 @@ struct TrackedOperation {
     registration: Arc<()>,
     /// Whether the operation has been completed.
     completed: bool,
+    /// The request waiter ended, but its owned runtime may still be retiring.
+    /// Such registrations keep their ID and termination target until settlement.
+    completion_pending: bool,
     /// Whether a cancellation has been requested.
     cancel_requested: bool,
     /// Principal that initiated this operation (from the invoke-time
@@ -244,6 +247,7 @@ impl CancellationController {
                 TrackedOperation {
                     registration: Arc::new(()),
                     completed: false,
+                    completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
                     scope: None,
@@ -301,6 +305,7 @@ impl CancellationController {
                 TrackedOperation {
                     registration: Arc::clone(&registration.identity),
                     completed: false,
+                    completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
                     scope: Some(scope),
@@ -333,6 +338,63 @@ impl CancellationController {
         self.complete_matching(&registration.operation_id, Some(&registration.identity));
     }
 
+    /// Release an ended request only after its owned runtime confirms settlement.
+    /// A dropped HTTP waiter can leave an active native command behind. Keep the
+    /// registration and captured runtime until the host reaper observes exit.
+    ///
+    /// The runtime callback is always invoked outside the operation map lock.
+    /// Callers must signal their own cancellation/retirement before using this
+    /// method; this method neither guesses a shared process nor invents an audit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn complete_registration_when_settled(&self, registration: &CancellationRegistration) {
+        let terminator = {
+            let mut ops = self.operations.lock().expect("operations lock");
+            let Some(op) = ops.get_mut(&registration.operation_id) else {
+                return;
+            };
+            if op.completed || !Arc::ptr_eq(&registration.identity, &op.registration) {
+                return;
+            }
+            op.completion_pending = true;
+            op.scope.as_ref().and_then(|scope| scope.terminator.clone())
+        };
+        if terminator
+            .as_ref()
+            .is_none_or(CancellationTerminator::is_finished)
+        {
+            self.complete_registration(registration);
+        }
+    }
+
+    fn complete_settled_registrations(&self) {
+        let pending: Vec<_> = {
+            let ops = self.operations.lock().expect("operations lock");
+            ops.iter()
+                .filter(|(_, op)| op.completion_pending && !op.completed)
+                .map(|(operation_id, op)| {
+                    (
+                        CancellationRegistration {
+                            operation_id: operation_id.clone(),
+                            identity: Arc::clone(&op.registration),
+                        },
+                        op.scope.as_ref().and_then(|scope| scope.terminator.clone()),
+                    )
+                })
+                .collect()
+        };
+        for (registration, terminator) in pending {
+            if terminator
+                .as_ref()
+                .is_none_or(CancellationTerminator::is_finished)
+            {
+                self.complete_registration(&registration);
+            }
+        }
+    }
+
     fn complete_matching(&self, operation_id: &str, identity: Option<&Arc<()>>) {
         let scope = {
             let mut ops = self.operations.lock().expect("operations lock");
@@ -343,6 +405,7 @@ impl CancellationController {
                 return;
             }
             op.completed = true;
+            op.completion_pending = false;
             op.scope.take()
         };
         // Completed tombstones retain ownership/audit metadata, not processes.
@@ -498,6 +561,10 @@ impl CancellationController {
     /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn reap_expired(&self, now: Instant) -> Vec<ExpiredCancellation> {
+        // Sweep orphaned waiter completions even without an explicit /cancel.
+        // Settled queued work must not acquire a forced-child-exit audit merely
+        // because its cancellation deadline also elapsed before this sweep.
+        self.complete_settled_registrations();
         let mut ops = self.operations.lock().expect("operations lock");
         let mut expired = Vec::new();
         for (operation_id, op) in ops.iter_mut() {
@@ -699,6 +766,140 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use fcp_kernel::OperationId;
+
+    #[test]
+    fn abandoned_waiter_keeps_registration_until_runtime_settles_without_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let controller = Arc::new(CancellationController::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let probe_controller = Arc::downgrade(&controller);
+        let registration = controller
+            .track_operation(
+                "abandoned",
+                Some("owner"),
+                CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(
+                        || {},
+                        move || {
+                            // A completion probe may re-enter controller reads.
+                            // Calling it under the operations lock would deadlock.
+                            let controller = probe_controller.upgrade().unwrap();
+                            assert!(!controller.is_cancel_requested("abandoned"));
+                            observed.load(Ordering::SeqCst)
+                        },
+                    )),
+            )
+            .unwrap();
+
+        controller.complete_registration_when_settled(&registration);
+        assert!(
+            controller
+                .track_operation(
+                    "abandoned",
+                    Some("other"),
+                    CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+                )
+                .is_err()
+        );
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        finished.store(true, Ordering::SeqCst);
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        controller
+            .track_operation(
+                "abandoned",
+                Some("other"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn settled_pending_completion_precedes_forced_expiration_sweep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let controller = CancellationController::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let registration = controller
+            .track_operation(
+                "queued-only",
+                None,
+                CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(1))
+                    .with_terminator(CancellationTerminator::new(
+                        || panic!("settled queued work must not be force-terminated"),
+                        move || observed.load(Ordering::SeqCst),
+                    )),
+            )
+            .unwrap();
+        controller
+            .cancel(
+                &CancellationRequest {
+                    operation_id: "queued-only".into(),
+                    reason: CancelReason::UserRequested,
+                    cleanup: CleanupBehavior::default(),
+                    return_partial: false,
+                    capability_token: None,
+                },
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        controller.complete_registration_when_settled(&registration);
+        finished.store(true, Ordering::SeqCst);
+
+        assert!(
+            controller
+                .reap_expired(Instant::now() + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+        controller
+            .track_operation(
+                "queued-only",
+                None,
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_deferred_completion_cannot_release_a_reused_operation_id() {
+        let controller = CancellationController::new();
+        let old = controller
+            .track_operation(
+                "reused-pending",
+                Some("old-owner"),
+                CancellationScope::new("old", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(|| {}, || false)),
+            )
+            .unwrap();
+        controller.complete_registration_when_settled(&old);
+        controller.complete_registration(&old);
+        let replacement = controller
+            .track_operation(
+                "reused-pending",
+                Some("new-owner"),
+                CancellationScope::new("new", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(|| {}, || false)),
+            )
+            .unwrap();
+
+        controller.complete_registration_when_settled(&old);
+        assert!(controller.reap_expired(Instant::now()).is_empty());
+        assert!(
+            controller
+                .track_operation(
+                    "reused-pending",
+                    None,
+                    CancellationScope::new("third", ConnectorArchetype::RequestResponse),
+                )
+                .is_err()
+        );
+        controller.complete_registration(&replacement);
+    }
 
     #[test]
     fn expired_cancel_retains_the_original_runtime_not_its_replacement() {

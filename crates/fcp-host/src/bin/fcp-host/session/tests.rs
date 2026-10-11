@@ -234,25 +234,25 @@ fn dispatcher() -> Dispatcher {
     let reject_c = Arc::clone(&reject_configure);
     let runner_task = task::spawn(async move {
         while let Some(request) = runner_rx.recv().await {
+            if !request.rpc.try_begin() {
+                continue;
+            }
             seen.lock()
                 .unwrap()
                 .push((request.method.clone(), request.params.clone()));
-            let result = match request.method.as_str() {
-                "introspect" => serde_json::to_value(catalog()).unwrap(),
+            let response = match request.method.as_str() {
+                "introspect" => json!({"result": catalog()}),
                 "handshake" if !reject_h.load(Ordering::SeqCst) => {
                     let value: HandshakeRequest = serde_json::from_value(request.params).unwrap();
-                    serde_json::to_value(reply(&value)).unwrap()
+                    json!({"result": reply(&value)})
                 }
-                "health" => health_value(),
-                "configure" if !reject_c.load(Ordering::SeqCst) => json!({}),
-                _ => {
-                    let _ = request.response_tx.send(Ok(json!({
-                        "error": {"message": "fixture rejection"}
-                    })));
-                    continue;
-                }
+                "health" => json!({"result": health_value()}),
+                "configure" if !reject_c.load(Ordering::SeqCst) => json!({"result": {}}),
+                _ => json!({"error": {"message": "fixture rejection"}}),
             };
-            let _ = request.response_tx.send(Ok(json!({"result": result})));
+            if request.rpc.try_settle_reply() {
+                let _ = request.response_tx.send(Ok(response));
+            }
         }
     });
     let summary = ConnectorSummary {
@@ -393,9 +393,8 @@ async fn prepare_only_performs_introspection_handshake_and_health() {
 #[cfg(unix)]
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn blocked_real_subprocess_rpc_can_be_aborted_without_its_queue() {
-    // The sh process execs sleep after reading the JSONL message. No
-    // reply is sent, so the runner remains in the production read loop.
-    // kill_on_drop(true) terminates the exec'd process on task abort.
+    // The selected command retains its Child after runner-task abortion.
+    // Join completion alone must not stand in for observing process exit.
     let runner = ConnectorProcessRunner::spawn(
         "/bin/sh",
         &["-c".into(), "read line; exec sleep 30".into()],
@@ -403,25 +402,26 @@ async fn blocked_real_subprocess_rpc_can_be_aborted_without_its_queue() {
     )
     .await
     .unwrap();
-    let (tx, mut rx) = mpsc::channel::<ConnectorRpcRequest>(2);
-    let runner_task = task::spawn(async move {
-        let mut runner = runner;
-        while let Some(request) = rx.recv().await {
-            let response = runner.request(&request.method, request.params).await;
-            let _ = request.response_tx.send(response);
-        }
-    });
+    let (tx, rx) = mpsc::channel::<ConnectorRpcRequest>(2);
+    let runner_task = task::try_spawn(native_rpc::run_dispatcher(runner, rx)).unwrap();
+    let rpc = NativeRpc::for_io();
+    let _waiter = rpc.waiter();
     let (response_tx, response_rx) = oneshot::channel();
     tx.send(ConnectorRpcRequest {
         method: "invoke".into(),
         params: json!({"test": "blocked"}),
         response_tx,
+        rpc: rpc.clone(),
     })
     .await
     .unwrap();
-    // Ensure the runner has entered its blocking request. A queued
-    // force-terminate request would wait for its 10s IO timeout.
-    fcp_async_core::time::sleep(Duration::from_millis(80)).await;
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !rpc.is_active() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runner must select the command");
     let started = Instant::now();
     runner_task.abort();
     fcp_async_core::time::timeout(Duration::from_secs(2), async {
@@ -436,6 +436,14 @@ async fn blocked_real_subprocess_rpc_can_be_aborted_without_its_queue() {
         response_rx.await.is_err(),
         "aborted runner must not invent success"
     );
+    fcp_async_core::time::timeout(Duration::from_secs(2), async {
+        while !rpc.is_settled() {
+            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retirement ticket must observe child exit after task abort");
+    assert!(rpc.transport_retired());
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -460,85 +468,135 @@ async fn old_termination_target_does_not_abort_replacement_runtime() {
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn warm_pool_cancellation_before_checkout_is_latched_and_kills_selected_worker() {
+async fn warm_pool_cancellation_before_checkout_prevents_worker_initialization() {
+    let fixture = dispatcher();
     let capture = WarmPoolTermination::default();
     let terminate = capture.terminator();
     assert!(terminate.abort());
-    assert!(!terminate.is_finished(), "no worker yet");
-    let worker = Arc::new(dispatcher().connector);
-    capture.bind(&worker);
-    fcp_async_core::time::timeout(Duration::from_secs(2), async {
-        while !worker._runner_task.is_finished() {
-            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    assert!(!terminate.is_finished(), "checkout waiter has not ended");
+    let initialized = AtomicBool::new(false);
+    let result = capture
+        .invocation
+        .invoke(async {
+            initialized.store(true, Ordering::SeqCst);
+            fixture
+                .connector
+                .configure_with_termination(json!({}), Some(&capture.invocation))
+                .await?;
+            Ok(InvokeResponse::ok(RequestId::random(), json!({})))
+        })
+        .await;
+    assert!(result.is_err());
+    assert!(!initialized.load(Ordering::SeqCst));
+    assert!(fixture.calls.lock().unwrap().is_empty());
     assert!(capture.is_cancel_requested());
     assert!(terminate.is_finished());
-    assert!(worker.rpc("health", json!({})).await.is_err());
+    assert_eq!(
+        fixture.connector.rpc("health", json!({})).await.unwrap()["status"]["state"],
+        "ready"
+    );
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
-async fn warm_pool_termination_cannot_target_other_worker_or_control_process() {
+async fn warm_pool_cancellation_during_session_lock_wait_preserves_unrelated_work() {
     let selected = Arc::new(dispatcher().connector);
     let replacement = Arc::new(dispatcher().connector);
     let control = Arc::new(dispatcher().connector);
     let capture = WarmPoolTermination::default();
-    capture.bind(&selected);
     let terminate = capture.terminator();
-    assert!(terminate.abort());
-    fcp_async_core::time::timeout(Duration::from_secs(2), async {
-        while !terminate.is_finished() {
-            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
-        }
+    let held_zone = selected.handshaken_zone.lock().await;
+    let worker = Arc::clone(&selected);
+    let invocation = capture.invocation.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let running = task::try_spawn(async move {
+        invocation
+            .invoke(async {
+                let _ = started_tx.send(());
+                let result = worker
+                    .rpc_in_handshaken_zone_with_termination(
+                        &ZoneId::work(),
+                        "health",
+                        json!({}),
+                        Some(&invocation),
+                    )
+                    .await?;
+                Ok(InvokeResponse::ok(RequestId::random(), result))
+            })
+            .await
     })
-    .await
     .unwrap();
-    assert!(selected._runner_task.is_finished());
-    assert!(!replacement._runner_task.is_finished());
-    assert!(!control._runner_task.is_finished());
-    assert_eq!(
-        replacement.rpc("health", json!({})).await.unwrap()["status"]["state"],
-        "ready",
-    );
-    assert_eq!(
-        control.rpc("health", json!({})).await.unwrap()["status"]["state"],
-        "ready",
-    );
+    started_rx.await.unwrap();
+    assert!(terminate.abort());
+    let result = fcp_async_core::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
+    assert!(terminate.is_finished());
+    drop(held_zone);
+
+    for worker in [&selected, &replacement, &control] {
+        assert!(!worker._runner_task.is_finished());
+        assert_eq!(
+            worker.rpc("health", json!({})).await.unwrap()["status"]["state"],
+            "ready",
+        );
+    }
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn completed_warm_pool_checkout_cannot_abort_the_workers_next_invocation() {
     let worker = Arc::new(dispatcher().connector);
     let completed = WarmPoolTermination::default();
-    completed.bind(&worker);
+    completed
+        .invocation
+        .invoke(async {
+            let result = worker
+                .rpc_with_termination("health", json!({}), Some(&completed.invocation))
+                .await?;
+            Ok(InvokeResponse::ok(RequestId::random(), result))
+        })
+        .await
+        .unwrap();
     let stale_reaper = completed.terminator();
     assert!(completed.disarm_before_reuse());
 
-    // The same physical worker now belongs to a different checkout. The old
-    // reaper ticket must be harmless while the new ticket remains effective.
     let next = WarmPoolTermination::default();
-    next.bind(&worker);
+    let next_termination = next.terminator();
+    let invocation = next.invocation.clone();
+    let selected = Arc::clone(&worker);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let running = task::try_spawn(async move {
+        invocation
+            .invoke(async {
+                selected
+                    .rpc_with_termination("health", json!({}), Some(&invocation))
+                    .await?;
+                let _ = ready_tx.send(());
+                std::future::pending::<HostResult<InvokeResponse>>().await
+            })
+            .await
+    })
+    .unwrap();
+    ready_rx.await.unwrap();
     assert!(!stale_reaper.abort());
     assert!(!worker._runner_task.is_finished());
     assert_eq!(
         worker.rpc("health", json!({})).await.unwrap()["status"]["state"],
         "ready"
     );
-    let next_termination = next.terminator();
     assert!(next_termination.abort());
+    let result = fcp_async_core::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
     assert!(
         !next.disarm_before_reuse(),
-        "aborted worker must be retired"
+        "cancelled checkout cannot be reused"
     );
-    fcp_async_core::time::timeout(Duration::from_secs(2), async {
-        while !next_termination.is_finished() {
-            fcp_async_core::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    assert!(next_termination.is_finished());
+    assert!(!worker._runner_task.is_finished());
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
