@@ -1974,6 +1974,7 @@ struct RegistryEntry {
 struct AllowListSnapshot {
     allowed_zones: Vec<String>,
     allowed_operations: Vec<String>,
+    singleton_writer: bool,
     enforce_operation_network_constraints: bool,
     enforce_empty_allow_lists: bool,
     manifest_constraints: ManifestOperationConstraintCatalog,
@@ -2473,19 +2474,12 @@ impl SubprocessRegistry {
             AllowListSnapshot {
                 allowed_zones: cfg.allowed_zones.clone(),
                 allowed_operations: cfg.allowed_operations.clone(),
+                singleton_writer: connector_config_declares_singleton_writer(cfg),
                 enforce_operation_network_constraints: cfg.enforce_operation_network_constraints,
                 enforce_empty_allow_lists: cfg.enforce_empty_allow_lists,
                 manifest_constraints: entry.manifest_constraints.clone(),
             }
         })
-    }
-
-    async fn connector_requires_singleton_writer(&self, connector_id: &ConnectorId) -> bool {
-        let state = self.state.read().await;
-        state
-            .connectors
-            .get(connector_id)
-            .is_some_and(|entry| connector_config_declares_singleton_writer(&entry.config))
     }
 
     async fn runtime_network_policy_snapshot(
@@ -6318,6 +6312,7 @@ async fn enforce_hrw_lease_route(
     request: &InvokeRequest,
     routing: Option<&HrwLeaseRoutingConfig>,
     connector_declares_singleton_writer: bool,
+    execution_target: Option<&TailscaleNodeId>,
 ) -> HostResult<()> {
     let subject_id = singleton_writer_lease_subject_id(request);
     let Some(routing) = routing else {
@@ -6328,6 +6323,23 @@ async fn enforce_hrw_lease_route(
         return Err(missing_hrw_lease_routing_config_error("invoke"));
     };
     enforce_hrw_singleton_writer_quorum_config("invoke", routing)?;
+    if let Some(target) = execution_target {
+        fcp_mesh::planner::admit_lease_holder(
+            &request.zone_id,
+            &subject_id,
+            CoreLeasePurpose::ConnectorStateWrite,
+            &routing.eligible_nodes,
+            target,
+        )
+        .map_err(|reason| {
+            HostError::PreflightFailed(hrw_lease_refusal_message(
+                &HrwLeaseRouteRefusal::NotSelectedCoordinator {
+                    reason: &reason,
+                    yield_flush: None,
+                },
+            ))
+        })?;
+    }
 
     let selection = fcp_mesh::planner::admit_lease_holder(
         &request.zone_id,
@@ -6337,14 +6349,16 @@ async fn enforce_hrw_lease_route(
         &routing.local_node,
     )
     .map_err(|reason| {
-        tracing::warn!(
-            event = "hrw_lease_route_refused",
-            connector_id = %request.connector_id,
-            operation = %request.operation,
-            zone_id = %request.zone_id,
-            reason = ?reason,
-            "singleton_writer invoke refused by HRW lease routing"
-        );
+        if execution_target.is_none() {
+            tracing::warn!(
+                event = "hrw_lease_route_refused",
+                connector_id = %request.connector_id,
+                operation = %request.operation,
+                zone_id = %request.zone_id,
+                reason = ?reason,
+                "singleton_writer invoke refused by HRW lease routing"
+            );
+        }
         reason
     });
     let selection = match selection {
@@ -6396,6 +6410,18 @@ async fn enforce_hrw_lease_route(
                 return Err(HostError::PreflightFailed(hrw_lease_refusal_message(
                     &refusal,
                 )));
+            }
+            if let Some(target) = execution_target {
+                tracing::debug!(
+                    event = "hrw_lease_forward_admitted",
+                    connector_id = %request.connector_id,
+                    operation = %request.operation,
+                    zone_id = %request.zone_id,
+                    holder = target.as_str(),
+                    current_lease_seq = ?routing.current_lease_seq,
+                    "singleton_writer forward admitted after lease-yield fencing"
+                );
+                return Ok(());
             }
             metrics::record_lease_fenced(
                 CONNECTOR_STATE_WRITE_LEASE_PURPOSE_LABEL,
@@ -6553,6 +6579,17 @@ async fn verify_live_request(
     request: &InvokeRequest,
     principal_override: Option<&str>,
 ) -> HostResult<VerifiedLiveRequest> {
+    verify_live_request_for_target(state, request, principal_override, None).await
+}
+
+/// Verify entry policy while allowing the elected peer to execute.
+/// The receiving peer independently runs the complete local pipeline.
+async fn verify_live_request_for_target(
+    state: &AppState,
+    request: &InvokeRequest,
+    principal_override: Option<&str>,
+    execution_target: Option<&TailscaleNodeId>,
+) -> HostResult<VerifiedLiveRequest> {
     // Connector home-zone binding (br-flywheel_connectors-by4vu).
     //
     // Without this gate, a structurally-valid capability token signed for
@@ -6706,10 +6743,9 @@ async fn verify_live_request(
 
     enforce_live_deployment_tier(request, tool.safety_tier)?;
 
-    let connector_declares_singleton_writer = state
-        .registry
-        .connector_requires_singleton_writer(&request.connector_id)
-        .await;
+    let connector_declares_singleton_writer = allow_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.singleton_writer);
     if operation_requires_hrw_lease(tool, connector_declares_singleton_writer) {
         let routing = current_hrw_lease_routing_config()?;
         enforce_hrw_lease_route(
@@ -6717,6 +6753,7 @@ async fn verify_live_request(
             request,
             routing.as_ref(),
             connector_declares_singleton_writer,
+            execution_target,
         )
         .await?;
     }
@@ -6928,6 +6965,15 @@ async fn evaluate_live_preflight(
     request: &InvokeRequest,
     principal_override: Option<&str>,
 ) -> PreflightResponse {
+    evaluate_live_preflight_for_target(state, request, principal_override, None).await
+}
+
+async fn evaluate_live_preflight_for_target(
+    state: &AppState,
+    request: &InvokeRequest,
+    principal_override: Option<&str>,
+    execution_target: Option<&TailscaleNodeId>,
+) -> PreflightResponse {
     let mut response = state
         .discovery
         .preflight(PreflightRequest {
@@ -6942,7 +6988,13 @@ async fn evaluate_live_preflight(
         return response;
     }
 
-    match verify_live_request(state, request, principal_override).await {
+    let verified = match execution_target {
+        Some(target) => {
+            verify_live_request_for_target(state, request, principal_override, Some(target)).await
+        }
+        None => verify_live_request(state, request, principal_override).await,
+    };
+    match verified {
         Ok(verified) => {
             tracing::debug!(
                 event = "live_request_verified",
@@ -8320,7 +8372,8 @@ async fn route_connector_self_check(
     let Some(router) = state.mesh.clone() else {
         return Ok(None);
     };
-    let decision = mesh_route_decision(state, &router, connector_id, Some(zone_id)).await;
+    let decision =
+        mesh_route_decision(state, &router, connector_id, Some(zone_id), None).await?;
     if !decision.is_forward() {
         return Ok(None);
     }
@@ -9869,7 +9922,9 @@ async fn introspect_handler(
 ) -> Result<(HeaderMap, Json<IntrospectionResponse>), (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
     if let Some(router) = state.mesh.clone() {
-        let decision = mesh_route_decision(&state, &router, &connector_id, None).await;
+        let decision = mesh_route_decision(&state, &router, &connector_id, None, None)
+            .await
+            .map_err(map_host_error)?;
         if decision.is_forward() {
             let response: IntrospectionResponse = mesh_forward_query(
                 &router,
@@ -9947,7 +10002,9 @@ async fn connector_handler(
 ) -> Result<(HeaderMap, Json<ConnectorInventoryResponse>), (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
     if let Some(router) = state.mesh.clone() {
-        let decision = mesh_route_decision(&state, &router, &connector_id, None).await;
+        let decision = mesh_route_decision(&state, &router, &connector_id, None, None)
+            .await
+            .map_err(map_host_error)?;
         if decision.is_forward() {
             let response: ConnectorInventoryResponse = mesh_forward_query(
                 &router,
@@ -10028,7 +10085,9 @@ async fn connector_status_handler(
         Err(error) => return Err(error),
     };
     if let Some(router) = state.mesh.clone() {
-        let decision = mesh_route_decision(&state, &router, &connector_id, None).await;
+        let decision = mesh_route_decision(&state, &router, &connector_id, None, None)
+            .await
+            .map_err(map_host_error)?;
         if decision.is_forward() {
             let response: ConnectorAdminStatus = mesh_forward_query(
                 &router,
@@ -11111,14 +11170,40 @@ async fn preflight_handler(
     let asserted_principal =
         extract_principal_header(&headers).or_else(|| request.principal.clone());
     if let Some(router) = state.mesh.clone() {
-        let decision = mesh_route_decision(
+        let decision = match mesh_route_decision(
             &state,
             &router,
             &request.connector_id,
             request.zone_id.as_ref(),
+            Some(request.operation.as_str()),
         )
-        .await;
-        if decision.is_forward() {
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return Json(preflight_response_from_error(error)),
+        };
+        if let fcp_mesh::invoke_route::InvokeRouteDecision::Forward { target, .. } = &decision {
+            if state
+                .registry
+                .allow_list_snapshot(&request.connector_id)
+                .await
+                .is_some()
+            {
+                let invoke_request = match invoke_request_from_preflight(&request) {
+                    Ok(invoke_request) => invoke_request,
+                    Err(error) => return Json(preflight_response_from_error(error)),
+                };
+                let preflight = evaluate_live_preflight_for_target(
+                    &state,
+                    &invoke_request,
+                    asserted_principal.as_deref(),
+                    Some(target),
+                )
+                .await;
+                if !preflight.allowed {
+                    return Json(preflight);
+                }
+            }
             let forwarded = match serde_json::to_string(&request) {
                 Ok(request_json) => {
                     mesh_forward_query::<PreflightResponse>(
@@ -11177,19 +11262,60 @@ async fn simulate_handler(
     headers: HeaderMap,
     Json(request): Json<HostSimulateRequest>,
 ) -> Result<Json<HostSimulateResponse>, (StatusCode, String)> {
+    let started_at = Instant::now();
     let asserted_principal =
         extract_principal_header(&headers).or_else(|| request.principal.clone());
     if let Some(router) = state.mesh.clone()
         && let Ok(invoke_request) = invoke_request_from_simulate(&request)
     {
-        let decision = mesh_route_decision(
+        let decision = match mesh_route_decision(
             &state,
             &router,
             &invoke_request.connector_id,
             Some(&invoke_request.zone_id),
+            Some(invoke_request.operation.as_str()),
         )
-        .await;
-        if decision.is_forward() {
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                return simulate_preflight_denial(
+                    &state,
+                    &request,
+                    started_at,
+                    error.to_string(),
+                )
+                .await
+                .map(Json);
+            }
+        };
+        if let fcp_mesh::invoke_route::InvokeRouteDecision::Forward { target, .. } = &decision {
+            if state
+                .registry
+                .allow_list_snapshot(&invoke_request.connector_id)
+                .await
+                .is_some()
+            {
+                let preflight = evaluate_live_preflight_for_target(
+                    &state,
+                    &invoke_request,
+                    asserted_principal.as_deref(),
+                    Some(target),
+                )
+                .await;
+                if !preflight.allowed {
+                    return simulate_preflight_denial(
+                        &state,
+                        &request,
+                        started_at,
+                        preflight.reason.unwrap_or_else(|| {
+                            "preflight denied live simulate request".to_string()
+                        }),
+                    )
+                    .await
+                    .map(Json);
+                }
+            }
             let request_json = serde_json::to_string(&request).map_err(|error| {
                 map_host_error(HostError::Internal(format!(
                     "simulation request could not be encoded for mesh forwarding: {error}"
@@ -11210,6 +11336,50 @@ async fn simulate_handler(
     local_simulate(&state, &request, asserted_principal.as_deref())
         .await
         .map(Json)
+}
+
+async fn simulate_preflight_denial(
+    state: &AppState,
+    request: &HostSimulateRequest,
+    started_at: Instant,
+    reason: String,
+) -> Result<HostSimulateResponse, (StatusCode, String)> {
+    let input = request.input.clone().unwrap_or(serde_json::Value::Null);
+    let duration_ms = elapsed_millis(started_at);
+    let response = HostSimulateResponse {
+        request_id: request.request_id.clone(),
+        would_succeed: false,
+        phase: SimulatePhase::PreflightOnly,
+        preflight_allowed: false,
+        failure_reason: Some(reason),
+        denial_code: None,
+        missing_capabilities: Vec::new(),
+        cost_estimate: None,
+        availability: None,
+        duration_ms,
+        receipt: simulate_receipt_for_request(
+            request,
+            &input,
+            SimulatePhase::PreflightOnly,
+            false,
+            duration_ms,
+        )
+        .map_err(map_host_error)?,
+    };
+    record_simulate_receipt_summary(state.lifecycle.as_ref(), &response.receipt).await;
+    tracing::info!(
+        event = "simulate_response",
+        connector_id = %request.connector_id,
+        operation = %request.operation,
+        request_id = %request.request_id,
+        phase = ?response.phase,
+        preflight_allowed = response.preflight_allowed,
+        would_succeed = response.would_succeed,
+        receipt_id = %response.receipt.receipt_id,
+        duration_ms = response.duration_ms,
+        "simulate request complete"
+    );
+    Ok(response)
 }
 
 /// Execute locally even when reached through a mesh forward. Admission and
@@ -11240,88 +11410,22 @@ async fn local_simulate(
     let preflight_request = match invoke_request_from_simulate(request) {
         Ok(preflight_request) => preflight_request,
         Err(error) => {
-            let input = request.input.clone().unwrap_or(serde_json::Value::Null);
-            let duration_ms = elapsed_millis(started_at);
-            let response = HostSimulateResponse {
-                request_id: request_id.clone(),
-                would_succeed: false,
-                phase: SimulatePhase::PreflightOnly,
-                preflight_allowed: false,
-                failure_reason: Some(error.to_string()),
-                denial_code: None,
-                missing_capabilities: Vec::new(),
-                cost_estimate: None,
-                availability: None,
-                duration_ms,
-                receipt: simulate_receipt_for_request(
-                    request,
-                    &input,
-                    SimulatePhase::PreflightOnly,
-                    false,
-                    duration_ms,
-                )
-                .map_err(map_host_error)?,
-            };
-            record_simulate_receipt_summary(state.lifecycle.as_ref(), &response.receipt).await;
-            tracing::info!(
-                event = "simulate_response",
-                connector_id = %connector_id,
-                operation = %operation,
-                request_id = %request_id,
-                phase = ?response.phase,
-                preflight_allowed = response.preflight_allowed,
-                would_succeed = response.would_succeed,
-                receipt_id = %response.receipt.receipt_id,
-                duration_ms = response.duration_ms,
-                "simulate request complete"
-            );
-            return Ok(response);
+            return simulate_preflight_denial(state, request, started_at, error.to_string()).await;
         }
     };
 
     let preflight =
         evaluate_live_preflight(state, &preflight_request, asserted_principal).await;
     if !preflight.allowed {
-        let input = request.input.clone().unwrap_or(serde_json::Value::Null);
-        let duration_ms = elapsed_millis(started_at);
-        let response = HostSimulateResponse {
-            request_id: request_id.clone(),
-            would_succeed: false,
-            phase: SimulatePhase::PreflightOnly,
-            preflight_allowed: false,
-            failure_reason: Some(
-                preflight
-                    .reason
-                    .unwrap_or_else(|| "preflight denied live simulate request".to_string()),
-            ),
-            denial_code: None,
-            missing_capabilities: Vec::new(),
-            cost_estimate: None,
-            availability: None,
-            duration_ms,
-            receipt: simulate_receipt_for_request(
-                request,
-                &input,
-                SimulatePhase::PreflightOnly,
-                false,
-                duration_ms,
-            )
-            .map_err(map_host_error)?,
-        };
-        record_simulate_receipt_summary(state.lifecycle.as_ref(), &response.receipt).await;
-        tracing::info!(
-            event = "simulate_response",
-            connector_id = %connector_id,
-            operation = %operation,
-            request_id = %request_id,
-            phase = ?response.phase,
-            preflight_allowed = response.preflight_allowed,
-            would_succeed = response.would_succeed,
-            receipt_id = %response.receipt.receipt_id,
-            duration_ms = response.duration_ms,
-            "simulate request complete"
-        );
-        return Ok(response);
+        return simulate_preflight_denial(
+            state,
+            request,
+            started_at,
+            preflight
+                .reason
+                .unwrap_or_else(|| "preflight denied live simulate request".to_string()),
+        )
+        .await;
     }
 
     let simulate_request = simulate_request_from_host(request).map_err(map_host_error)?;
@@ -13809,9 +13913,9 @@ async fn invoke_handler(
 /// Mesh-aware invoke entry point (bridge plan A.2).
 ///
 /// Without a mesh peer directory this is exactly the host-first pipeline.
-/// With one, connectors installed on this host still execute locally (answer
-/// stamped `host-backed`), and connectors this host does not run are
-/// forwarded to the advertising peer (answer stamped `mesh-backed`).
+/// With one, ordinary operations execute locally when installed (answer
+/// stamped `host-backed`), while singleton writers follow the elected holder.
+/// Other requests use verified peer advertisements (answer stamped `mesh-backed`).
 async fn route_invoke(
     state: &Arc<AppState>,
     request: InvokeRequest,
@@ -13825,13 +13929,27 @@ async fn route_invoke(
             "invalid invoke request: {err}"
         )))
     })?;
-    let decision = mesh_route_decision(
+    let decision = match mesh_route_decision(
         state,
         &router,
         &request.connector_id,
         Some(&request.zone_id),
+        Some(request.operation.as_str()),
     )
-    .await;
+    .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            let reason = error.to_string();
+            append_mesh_preflight_denial(
+                state,
+                &request,
+                asserted_principal.as_deref(),
+                &reason,
+            );
+            return Err(map_host_error(HostError::PreflightFailed(reason)));
+        }
+    };
     if decision.is_forward() {
         return mesh_forward_invoke(
             state,
@@ -14110,61 +14228,121 @@ fn stamp_invoke_route(response: &mut InvokeResponse, route: InvokeRouteProvenanc
 
 /// Decide where a request for `connector_id` executes (bridge plan A.2).
 ///
-/// Local-first: a connector in this host's inventory always executes here.
-/// Otherwise the request goes to a peer whose verified advertisement offers
-/// the connector (in `zone_id` when given). For `singleton_writer`
-/// connectors, a node that knows the HRW eligible set targets the elected
-/// holder itself rather than any advertiser, so the forward lands on the node
-/// whose admission gate will accept it.
+/// Singleton-writer execution follows the lease election even for local
+/// registrations. Ordinary operations and diagnostic reads stay local when
+/// available. A known election never falls through to a different advertiser.
 async fn mesh_route_decision(
     state: &AppState,
     router: &fcp_host::mesh_routing::MeshRouter,
     connector_id: &ConnectorId,
     zone_id: Option<&ZoneId>,
-) -> fcp_mesh::invoke_route::InvokeRouteDecision {
+    operation: Option<&str>,
+) -> HostResult<fcp_mesh::invoke_route::InvokeRouteDecision> {
     use fcp_mesh::invoke_route::{
         InvokeRouteDecision, decide_advertised_connector_route, decide_singleton_writer_route,
         decision_codes,
     };
 
-    if state
-        .registry
-        .allow_list_snapshot(connector_id)
-        .await
-        .is_some()
-    {
-        return InvokeRouteDecision::Local {
-            code: decision_codes::LOCAL_CONNECTOR,
-        };
-    }
-    let advertisements = router.peer_advertisements().await;
-    let singleton_writer = advertisements
-        .iter()
-        .filter_map(|advertisement| advertisement.connector(connector_id.as_str()))
-        .any(|connector| connector.singleton_writer);
-    if singleton_writer
-        && let Some(zone_id) = zone_id
-        && let Ok(Some(routing)) = current_hrw_lease_routing_config()
-    {
-        let subject_id = singleton_writer_connector_lease_subject_id(connector_id, zone_id);
-        let elected = decide_singleton_writer_route(
-            router.directory(),
-            zone_id,
-            &subject_id,
-            &routing.eligible_nodes,
-            0,
-        );
-        if elected.is_forward() {
-            return elected;
+    let local = state.registry.allow_list_snapshot(connector_id).await;
+    let mut singleton_writer = local
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.singleton_writer);
+    if let Some(snapshot) = &local {
+        if zone_id.is_none() || operation.is_none() {
+            return Ok(InvokeRouteDecision::Local {
+                code: decision_codes::LOCAL_CONNECTOR,
+            });
+        }
+        // Check the same atomic allow-list snapshot before consulting runtime
+        // schemas. Full authorization is repeated before any actual forward.
+        if let Some(zone) = zone_id {
+            require_allowed_zones_configured(connector_id, &snapshot.allowed_zones)?;
+            if !snapshot
+                .allowed_zones
+                .iter()
+                .any(|value| value == zone.as_str())
+            {
+                return Err(HostError::PreflightFailed(format!(
+                    "connector `{connector_id}` is not bound to zone `{}` (allowed: [{}])",
+                    zone.as_str(),
+                    snapshot.allowed_zones.join(", ")
+                )));
+            }
+        }
+        if let Some(operation) = operation {
+            if snapshot.allowed_operations.is_empty() {
+                if snapshot.enforce_empty_allow_lists {
+                    return Err(HostError::PreflightFailed(format!(
+                        "connector `{connector_id}` has no `allowed_operations` and is configured \
+                         enforce_empty_allow_lists=true; deny-all (br-v2kt4)"
+                    )));
+                }
+            } else if !snapshot
+                .allowed_operations
+                .iter()
+                .any(|allowed| allowed == operation)
+            {
+                return Err(HostError::PreflightFailed(format!(
+                    "connector `{connector_id}` does not allow operation `{operation}` (allowed: [{}])",
+                    snapshot.allowed_operations.join(", ")
+                )));
+            }
+            if !singleton_writer {
+                let introspection = state.discovery.introspect(connector_id).await?;
+                singleton_writer = introspection.tools.iter().any(|tool| {
+                    tool.name == operation && operation_requires_hrw_lease(tool, false)
+                });
+            }
+        }
+        if !singleton_writer {
+            return Ok(InvokeRouteDecision::Local {
+                code: decision_codes::LOCAL_CONNECTOR,
+            });
         }
     }
-    decide_advertised_connector_route(
+    let advertisements = if local.is_none() {
+        router.peer_advertisements().await
+    } else {
+        Vec::new()
+    };
+    singleton_writer |= advertisements
+        .iter()
+        .filter_map(|advertisement| advertisement.connector(connector_id.as_str()))
+        .filter(|connector| {
+            zone_id.is_none_or(|zone| connector.zones.iter().any(|value| value == zone.as_str()))
+        })
+        .any(|connector| connector.singleton_writer);
+    if singleton_writer
+        && operation.is_some()
+        && let Some(zone_id) = zone_id
+    {
+        if let Some(routing) = current_hrw_lease_routing_config()? {
+            if &routing.local_node != router.local_node() {
+                return Err(HostError::InvalidFilter(
+                    "mesh routing and HRW lease routing must use the same local node id".to_string(),
+                ));
+            }
+            enforce_hrw_singleton_writer_quorum_config("route", &routing)?;
+            let subject_id = singleton_writer_connector_lease_subject_id(connector_id, zone_id);
+            return Ok(decide_singleton_writer_route(
+                router.directory(),
+                zone_id,
+                &subject_id,
+                &routing.eligible_nodes,
+                0,
+            ));
+        }
+        if local.is_some() {
+            return Err(missing_hrw_lease_routing_config_error("route"));
+        }
+    }
+    Ok(decide_advertised_connector_route(
         router.directory(),
         connector_id.as_str(),
         zone_id,
         &advertisements,
         0,
-    )
+    ))
 }
 
 fn mesh_forward_audit_context(
@@ -14182,6 +14360,28 @@ fn mesh_forward_audit_context(
             .as_ref()
             .map(std::string::ToString::to_string),
         occurred_at: current_unix_secs_u64(),
+    }
+}
+
+fn append_mesh_preflight_denial(
+    state: &AppState,
+    request: &InvokeRequest,
+    asserted_principal: Option<&str>,
+    reason: &str,
+) {
+    let audit_ctx = mesh_forward_audit_context(request, asserted_principal);
+    if let Err(error) = state.invoke_audit.append(
+        &audit_ctx,
+        fcp_host::InvokePhase::PreflightDeny {
+            reason: reason.to_string(),
+        },
+    ) {
+        tracing::warn!(
+            event = "invoke_audit_append_error",
+            phase = "deny",
+            error = %error,
+            "failed to append invoke deny audit event"
+        );
     }
 }
 
@@ -14209,6 +14409,38 @@ async fn mesh_forward_invoke(
             "mesh_forward_invoke called without a forward decision".to_string(),
         )));
     };
+    let registered_locally = state
+        .registry
+        .allow_list_snapshot(&request.connector_id)
+        .await
+        .is_some();
+    if registered_locally {
+        let preflight = evaluate_live_preflight_for_target(
+            state,
+            request,
+            asserted_principal,
+            Some(&target),
+        )
+        .await;
+        if !preflight.allowed {
+            let reason = preflight
+                .reason
+                .unwrap_or_else(|| "preflight denied invoke request".to_string());
+            append_mesh_preflight_denial(state, request, asserted_principal, &reason);
+            return Err(map_host_error(HostError::PreflightFailed(reason)));
+        }
+        if let Err(error) = state.invoke_audit.append(
+            &mesh_forward_audit_context(request, asserted_principal),
+            fcp_host::InvokePhase::PreflightAllow,
+        ) {
+            tracing::warn!(
+                event = "invoke_audit_append_error",
+                phase = "allow",
+                error = %error,
+                "failed to append invoke allow audit event"
+            );
+        }
+    }
     let started_at = Instant::now();
     let request_json = serde_json::to_string(request).map_err(|error| {
         map_host_error(HostError::Internal(format!(
@@ -14260,14 +14492,25 @@ async fn mesh_forward_invoke(
                     duration_ms = elapsed_millis(started_at),
                     "invoke executed by mesh peer"
                 );
-                return mesh_reply_into_invoke_response(
+                let response = mesh_reply_into_invoke_response(
                     router,
                     request,
                     &candidate,
                     code,
                     failed_attempts,
                     &reply,
-                );
+                )?;
+                if registered_locally {
+                    record_invoke_budget_usage(
+                        state.budget.as_ref(),
+                        Some(&request.zone_id),
+                        &request.connector_id,
+                        request.operation.as_str(),
+                        Some(&response),
+                    )
+                    .await;
+                }
+                return Ok(response);
             }
             Err(failure) if failure.safe_to_retry() => {
                 tracing::warn!(
@@ -16265,6 +16508,7 @@ deny_ptrace = true
         AllowListSnapshot {
             allowed_zones: vec![ZoneId::work().as_str().to_string()],
             allowed_operations: Vec::new(),
+            singleton_writer: false,
             enforce_operation_network_constraints: enforce,
             enforce_empty_allow_lists: false,
             manifest_constraints,
@@ -17585,6 +17829,640 @@ deny_ptrace = true
             started_at: Instant::now(),
             mesh: None,
         })
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_local_singleton_forwards_only_after_entry_authorization_and_fencing() {
+        use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings};
+        use fcp_mesh::invoke_route::{
+            InvokeRouteDecision, MeshForwardBody, MeshForwardEnvelope, MeshForwardReply,
+            decision_codes,
+        };
+
+        const CONNECTOR: &str = "fcp.test.mesh-singleton:utility:1.0.0";
+        const OPERATION: &str = "test.singleton";
+        const CAPABILITY: &str = "cap.test.singleton";
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let zone_id = ZoneId::work();
+        let eligible_nodes = vec![
+            TailscaleNodeId::new("node-a"),
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-c"),
+        ];
+        let subject = singleton_writer_connector_lease_subject_id(&connector_id, &zone_id);
+        let holder = fcp_mesh::planner::select_lease_holder(&zone_id, &subject, &eligible_nodes)
+            .expect("elected holder");
+        let local_node = eligible_nodes
+            .iter()
+            .find(|node| *node != &holder)
+            .expect("non-holder entry node")
+            .clone();
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let local_invokes = Arc::new(AtomicU64::new(0));
+        let observed_local_invokes = Arc::clone(&local_invokes);
+        let introspection = dispatcher_introspection_with_input_schema(
+            OPERATION,
+            CAPABILITY,
+            SafetyTier::Safe,
+            json!({ "type": "object", "x-fcp-state-model": "singleton_writer" }),
+        );
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(request) = runner_rx.recv().await {
+                let result = match request.method.as_str() {
+                    "introspect" => json!({ "result": introspection }),
+                    "health" => json!({ "result": dispatcher_health_result() }),
+                    "invoke" => {
+                        observed_local_invokes.fetch_add(1, Ordering::SeqCst);
+                        let request: InvokeRequest = serde_json::from_value(request.params.clone())
+                            .expect("local invoke request");
+                        json!({ "result": InvokeResponse::ok(request.id, json!({})) })
+                    }
+                    method => panic!("unexpected local RPC {method}"),
+                };
+                let _ = request.response_tx.send(Ok(result));
+            }
+        });
+        let connector = dispatcher_test_connector(CONNECTOR, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            connector,
+            dispatcher_test_config(CONNECTOR),
+        );
+        let base_state = dispatcher_app_state(
+            registry,
+            Arc::new(HostAdminStateStore::new()),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(zone_id.clone(), host_runtime_policy(zone_id.clone()))]),
+        );
+
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind holder");
+        let peers_json = json!([{
+            "node_id": holder.as_str(),
+            "endpoint": format!("http://{}", listener.local_addr().expect("holder address")),
+            "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+        }])
+        .to_string();
+        let forwards = Arc::new(AtomicU64::new(0));
+        let observed_forwards = Arc::clone(&forwards);
+        let reply_node = holder.clone();
+        let app = Router::new().route(
+            MESH_FORWARD_ROUTE,
+            post(move |Json(envelope): Json<MeshForwardEnvelope>| {
+                observed_forwards.fetch_add(1, Ordering::SeqCst);
+                let body_json = match &envelope.body {
+                    MeshForwardBody::Invoke { request_json, .. } => {
+                        let request: InvokeRequest =
+                            serde_json::from_str(request_json).expect("forwarded invoke");
+                        assert_eq!(request.connector_id.as_str(), CONNECTOR);
+                        assert_eq!(request.operation.as_str(), OPERATION);
+                        serde_json::to_string(&InvokeResponse::ok(
+                            request.id,
+                            json!({ "executed_on_holder": true }),
+                        ))
+                        .expect("invoke response")
+                    }
+                    MeshForwardBody::Preflight { .. } => {
+                        let mut response = PreflightResponse::denied("test fixture");
+                        response.allowed = true;
+                        response.reason = None;
+                        serde_json::to_string(&response).expect("preflight response")
+                    }
+                    other => panic!("unexpected forwarded method: {}", other.method()),
+                };
+                let reply = MeshForwardReply::sign(
+                    &peer_key,
+                    reply_node.clone(),
+                    &envelope,
+                    StatusCode::OK.as_u16(),
+                    body_json,
+                );
+                async move { Json(reply) }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
+        let state = Arc::new(AppState {
+            mesh: Some(Arc::new(
+                MeshRouter::new(MeshRoutingSettings {
+                    node_id: local_node.clone(),
+                    signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                    peers_json,
+                    forward_timeout: Duration::from_secs(5),
+                })
+                .expect("entry router"),
+            )),
+            ..(*base_state).clone()
+        });
+        let router = state.mesh.as_ref().expect("router");
+        let guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node: local_node.clone(),
+            eligible_nodes: eligible_nodes.clone(),
+            current_lease_seq: None,
+        }));
+        let mut request = InvokeRequest {
+            r#type: "invoke".to_string(),
+            id: RequestId::random(),
+            connector_id: connector_id.clone(),
+            operation: OperationId::from_static(OPERATION),
+            zone_id: zone_id.clone(),
+            input: json!({}),
+            capability_token: test_capability_token(
+                &signing_key,
+                CAPABILITY,
+                OPERATION,
+                zone_id.as_str(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: None,
+            lease_seq: Some(7),
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+
+        // Both declaration forms must override local-first invocation.
+        for (connector_wide, expected_forwards) in [(true, 1_u64), (false, 2)] {
+            state
+                .registry
+                .state
+                .write()
+                .await
+                .connectors
+                .get_mut(&connector_id)
+                .expect("local registration")
+                .config
+                .config =
+                connector_wide.then(|| json!({ "state": { "model": "singleton_writer" } }));
+            let decision = mesh_route_decision(
+                &state,
+                router,
+                &connector_id,
+                Some(&zone_id),
+                Some(OPERATION),
+            )
+            .await
+            .expect("singleton route");
+            assert_eq!(
+                decision,
+                InvokeRouteDecision::Forward {
+                    target: holder.clone(),
+                    alternates: Vec::new(),
+                    code: decision_codes::HRW_HOLDER_FORWARD,
+                }
+            );
+            request.id = RequestId::random();
+            let Json(response) = invoke_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(request.clone()),
+            )
+            .await
+            .expect("registered non-holder must forward");
+            assert_eq!(response.status, InvokeStatus::Ok);
+            let route = response
+                .response_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.route.as_ref())
+                .expect("route provenance");
+            assert_eq!(route.decision, decision_codes::HRW_HOLDER_FORWARD);
+            assert_eq!(route.served_by.as_deref(), Some(holder.as_str()));
+            assert_eq!(forwards.load(Ordering::SeqCst), expected_forwards);
+            assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            mesh_route_decision(&state, router, &connector_id, None, None)
+                .await
+                .expect("zone-less read"),
+            InvokeRouteDecision::Local {
+                code: decision_codes::LOCAL_CONNECTOR,
+            }
+        );
+        let preflight = HostPreflightRequest {
+            request_id: RequestId::random(),
+            connector_id: connector_id.clone(),
+            operation: OPERATION.to_string(),
+            params: Some(json!({})),
+            principal: Some("user:test".to_string()),
+            zone_id: Some(zone_id.clone()),
+            capability_token: Some(request.capability_token.clone()),
+            approval_tokens: Vec::new(),
+        };
+        assert!(
+            preflight_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(preflight.clone()))
+                .await
+                .0
+                .allowed
+        );
+        assert_eq!(forwards.load(Ordering::SeqCst), 3);
+
+        let simulation_token = request.capability_token.clone();
+        let simulation_request = |request_id: &str| HostSimulateRequest {
+            request_id: request_id.to_string(),
+            connector_id: CONNECTOR.to_string(),
+            operation: OPERATION.to_string(),
+            input: Some(json!({})),
+            zone_id: Some(zone_id.to_string()),
+            principal: Some("user:test".to_string()),
+            capability_token: Some(simulation_token.clone()),
+            approval_tokens: Vec::new(),
+            estimate_cost: false,
+            check_availability: false,
+            deadline_ms: 5_000,
+        };
+        let mut denial_receipt_ids = Vec::new();
+        for (request_id, deny_operation, expected_reason) in [
+            ("mesh-simulate-route-denied", true, "does not allow operation"),
+            ("mesh-simulate-principal-denied", false, "request principal"),
+        ] {
+            state
+                .registry
+                .state
+                .write()
+                .await
+                .connectors
+                .get_mut(&connector_id)
+                .expect("local registration")
+                .config
+                .allowed_operations = if deny_operation {
+                vec!["test.other".to_string()]
+            } else {
+                Vec::new()
+            };
+            let mut headers = HeaderMap::new();
+            if !deny_operation {
+                headers.insert(PRINCIPAL_HEADER, HeaderValue::from_static("user:other"));
+            }
+            let response = simulate_handler(
+                State(Arc::clone(&state)),
+                headers,
+                Json(simulation_request(request_id)),
+            )
+            .await
+            .expect("entry denial must remain a structured simulation response")
+            .0;
+            assert_eq!(response.request_id, request_id);
+            assert!(!response.preflight_allowed);
+            assert!(!response.would_succeed);
+            assert_eq!(response.phase, SimulatePhase::PreflightOnly);
+            assert!(
+                response
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected_reason))
+            );
+            assert_eq!(response.receipt.connector_id, CONNECTOR);
+            assert_eq!(response.receipt.operation, OPERATION);
+            assert_eq!(response.receipt.phase, SimulatePhase::PreflightOnly);
+            assert!(!response.receipt.would_succeed);
+            denial_receipt_ids.push(response.receipt.receipt_id);
+            assert_eq!(forwards.load(Ordering::SeqCst), 3);
+            assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+        }
+        let receipts = state
+            .lifecycle
+            .query_simulate_receipts(&SimulateReceiptQueryRequest {
+                connector_id: CONNECTOR.to_string(),
+                operation: Some(OPERATION.to_string()),
+                after: None,
+                limit: 10,
+            })
+            .await;
+        assert_eq!(receipts.receipts.len(), 2);
+        for receipt_id in denial_receipt_ids {
+            assert!(
+                receipts
+                    .receipts
+                    .iter()
+                    .any(|receipt| receipt.receipt_id == receipt_id)
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(PRINCIPAL_HEADER, HeaderValue::from_static("user:other"));
+        let denied = invoke_handler(State(Arc::clone(&state)), headers, Json(request.clone()))
+            .await
+            .expect_err("entry principal binding must remain enforced");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+        let wrong_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let mut forged = request.clone();
+        forged.capability_token =
+            test_capability_token(&wrong_key, CAPABILITY, OPERATION, zone_id.as_str());
+        assert!(
+            invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(forged))
+                .await
+                .is_err()
+        );
+        state
+            .registry
+            .state
+            .write()
+            .await
+            .connectors
+            .get_mut(&connector_id)
+            .expect("local registration")
+            .config
+            .allowed_operations = vec!["test.other".to_string()];
+        let denied = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("forwarding must retain the local operation allow-list");
+        assert!(denied.1.contains("does not allow operation"));
+        state
+            .registry
+            .state
+            .write()
+            .await
+            .connectors
+            .get_mut(&connector_id)
+            .expect("local registration")
+            .config
+            .allowed_operations
+            .clear();
+        assert_eq!(forwards.load(Ordering::SeqCst), 3);
+
+        drop(guard);
+        let _guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node,
+            eligible_nodes,
+            current_lease_seq: Some(8),
+        }));
+        // Schema-only leases do not require connector-state flush fixtures.
+        for lease_seq in [Some(7), None] {
+            request.lease_seq = lease_seq;
+            let denied = invoke_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(request.clone()),
+            )
+            .await
+            .expect_err("stale or missing lease must not reach the peer");
+            assert!(denied.1.contains("LeaseFenced"));
+        }
+        assert_eq!(forwards.load(Ordering::SeqCst), 3);
+        request.lease_seq = Some(8);
+        invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request.clone()))
+            .await
+            .expect("current lease boundary forwards");
+        assert_eq!(forwards.load(Ordering::SeqCst), 4);
+        assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+
+        state
+            .budget
+            .upsert_policy(
+                zone_id.clone(),
+                UsageBudgetPolicy {
+                    enforcement: BudgetEnforcement::Deny,
+                    budgets: vec![UsageBudgetLimit {
+                        metric: UsageMetricKind::Requests,
+                        limit: 1,
+                        window_seconds: 3_600,
+                    }],
+                },
+            )
+            .await;
+        // Existing budget semantics deny once observed usage exceeds the limit.
+        for used in 1_u64..=2 {
+            request.id = RequestId::random();
+            invoke_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(request.clone()),
+            )
+            .await
+            .expect("forward admitted before budget is exceeded");
+            let snapshot = state
+                .budget
+                .snapshot(&zone_id)
+                .await
+                .expect("entry budget snapshot");
+            assert_eq!(
+                snapshot.budgets[0].used,
+                used,
+                "charge each forwarded invoke exactly once"
+            );
+            assert_eq!(forwards.load(Ordering::SeqCst), 4 + used);
+        }
+        request.id = RequestId::random();
+        let denied = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect_err("exhausted entry budget must refuse forwarding");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+        assert!(denied.1.contains("usage budget exceeded"));
+        let mut budget_preflight = preflight.clone();
+        budget_preflight.request_id = RequestId::random();
+        let denied_preflight = preflight_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(budget_preflight),
+        )
+        .await
+        .0;
+        assert!(!denied_preflight.allowed);
+        assert!(
+            denied_preflight
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("usage budget exceeded"))
+        );
+        assert_eq!(
+            denied_preflight
+                .budget_status
+                .expect("retain budget evidence")
+                .budgets[0]
+                .used,
+            2
+        );
+        let denied_simulation = simulate_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(simulation_request("mesh-simulate-budget-denied")),
+        )
+        .await
+        .expect("budget denial must carry a simulation receipt")
+        .0;
+        assert!(!denied_simulation.preflight_allowed);
+        assert!(!denied_simulation.would_succeed);
+        assert_eq!(denied_simulation.phase, SimulatePhase::PreflightOnly);
+        assert!(
+            denied_simulation
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("usage budget exceeded"))
+        );
+        assert_eq!(denied_simulation.receipt.phase, SimulatePhase::PreflightOnly);
+        assert!(!denied_simulation.receipt.would_succeed);
+        let receipts = state
+            .lifecycle
+            .query_simulate_receipts(&SimulateReceiptQueryRequest {
+                connector_id: CONNECTOR.to_string(),
+                operation: Some(OPERATION.to_string()),
+                after: None,
+                limit: 10,
+            })
+            .await;
+        assert!(receipts.receipts.iter().any(|receipt| {
+            receipt.receipt_id == denied_simulation.receipt.receipt_id
+        }));
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            6,
+            "denials must stay on entry node"
+        );
+        assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .budget
+                .snapshot(&zone_id)
+                .await
+                .expect("entry budget")
+                .budgets[0]
+                .used,
+            2,
+            "denied requests and read-only checks must not charge another invocation"
+        );
+        shutdown_tx.send(true).expect("stop holder");
+        server.await.expect("holder task").expect("holder shutdown");
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_singleton_election_never_falls_through_to_another_advertiser() {
+        use fcp_host::mesh_routing::{MESH_ADVERTISEMENT_ROUTE, MeshRouter, MeshRoutingSettings};
+        use fcp_mesh::invoke_route::{
+            AdvertisedConnector, InvokeRouteDecision, MeshPeerAdvertisement, decision_codes,
+        };
+
+        let connector_id = ConnectorId::from_static("fcp.test.mesh-missing-holder:utility:1.0.0");
+        let zone_id = ZoneId::work();
+        let eligible_nodes = vec![
+            TailscaleNodeId::new("node-a"),
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-c"),
+        ];
+        let subject = singleton_writer_connector_lease_subject_id(&connector_id, &zone_id);
+        let holder = fcp_mesh::planner::select_lease_holder(&zone_id, &subject, &eligible_nodes)
+            .expect("elected holder");
+        let local_node = eligible_nodes
+            .iter()
+            .find(|node| *node != &holder)
+            .expect("entry node")
+            .clone();
+        let advertiser = eligible_nodes
+            .iter()
+            .find(|node| *node != &holder && *node != &local_node)
+            .expect("non-holder advertiser")
+            .clone();
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind advertiser");
+        let peers_json = json!([{
+            "node_id": advertiser.as_str(),
+            "endpoint": format!("http://{}", listener.local_addr().expect("peer address")),
+            "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+        }])
+        .to_string();
+        let advertisement = MeshPeerAdvertisement::sign(
+            &peer_key,
+            advertiser,
+            fcp_host::mesh_routing::unix_now_ms(),
+            vec![AdvertisedConnector {
+                connector_id: connector_id.to_string(),
+                zones: vec![zone_id.to_string()],
+                singleton_writer: true,
+                summary_json: None,
+            }],
+        );
+        let app = Router::new().route(
+            MESH_ADVERTISEMENT_ROUTE,
+            get(move || {
+                let advertisement = advertisement.clone();
+                async move { Json(advertisement) }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
+        let state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: local_node.clone(),
+            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            peers_json: peers_json.clone(),
+            forward_timeout: Duration::from_secs(5),
+        })
+        .expect("entry router");
+        let guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node,
+            eligible_nodes: eligible_nodes.clone(),
+            current_lease_seq: None,
+        }));
+        assert_eq!(
+            mesh_route_decision(
+                &state,
+                &router,
+                &connector_id,
+                Some(&zone_id),
+                Some("test.singleton"),
+            )
+            .await
+            .expect("missing holder route"),
+            InvokeRouteDecision::Local {
+                code: decision_codes::HRW_HOLDER_NOT_IN_DIRECTORY,
+            }
+        );
+        assert!(
+            mesh_route_decision(&state, &router, &connector_id, None, None)
+                .await
+                .expect("inventory may still use advertiser")
+                .is_forward()
+        );
+        drop(guard);
+
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: holder.clone(),
+            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            peers_json,
+            forward_timeout: Duration::from_secs(5),
+        })
+        .expect("holder router");
+        let _guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node: holder,
+            eligible_nodes,
+            current_lease_seq: None,
+        }));
+        assert_eq!(
+            mesh_route_decision(
+                &state,
+                &router,
+                &connector_id,
+                Some(&zone_id),
+                Some("test.singleton"),
+            )
+            .await
+            .expect("local holder route"),
+            InvokeRouteDecision::Local {
+                code: decision_codes::LOCAL_IS_HRW_HOLDER,
+            }
+        );
+        shutdown_tx.send(true).expect("stop advertiser");
+        server
+            .await
+            .expect("advertiser task")
+            .expect("advertiser shutdown");
     }
 
     #[fcp_async_core::runtime::test]
@@ -22241,6 +23119,35 @@ deny_ptrace = true
             eligible_nodes,
             current_lease_seq: Some(10),
         }));
+
+        let routing = current_hrw_lease_routing_config().expect("routing config");
+        enforce_hrw_lease_route(&state, &request, routing.as_ref(), true, Some(&expected))
+            .await
+            .expect("forward to elected holder must flush durable state before yielding");
+        let mut stale = request.clone();
+        stale.lease_seq = Some(9);
+        let fenced = enforce_hrw_lease_route(
+            &state,
+            &stale,
+            routing.as_ref(),
+            true,
+            Some(&expected),
+        )
+        .await
+        .expect_err("forwarding must not bypass the old holder's lease fence");
+        assert!(fenced.to_string().contains("LeaseFenced"));
+        assert!(fenced.to_string().contains("yield_flush"));
+        assert!(
+            enforce_hrw_lease_route(
+                &state,
+                &request,
+                routing.as_ref(),
+                true,
+                Some(&local_node),
+            )
+            .await
+            .is_err()
+        );
 
         let (status, message) = invoke_handler(State(state), HeaderMap::new(), Json(request))
             .await
