@@ -61,8 +61,8 @@ use fcp_host::{
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
     BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
     BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
-    CancellationController, CancellationRequest, CancellationResponse, CancellationScope,
-    CancellationTerminator, CapabilityTokenVerifyRequest, ConfigRevisionRecord,
+    CancellationController, CancellationRegistration, CancellationRequest, CancellationResponse,
+    CancellationScope, CancellationTerminator, CapabilityTokenVerifyRequest, ConfigRevisionRecord,
     ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
     ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
@@ -380,6 +380,76 @@ struct SubprocessConnector {
 /// kill_on_drop child, even while a provider RPC is blocked on IO.
 /// Cancellation-deadline reaper sweep cadence.
 const CANCELLATION_REAPER_INTERVAL: Duration = Duration::from_millis(200);
+
+fn spawn_cancellation_reaper(
+    cancellation: Arc<CancellationController>,
+) -> HostResult<JoinHandle<()>> {
+    task::try_spawn(async move {
+        loop {
+            fcp_async_core::time::sleep(CANCELLATION_REAPER_INTERVAL).await;
+            for expired in cancellation.reap_expired(Instant::now()) {
+                let retry_expiration = expired.clone();
+                let operation_cancellation = Arc::clone(&cancellation);
+                // Each target has an independent bound. Admission failure must
+                // leave its deadline eligible for a later sweep.
+                match task::try_spawn(async move {
+                    let Some(terminator) = expired.terminator.as_ref() else {
+                        tracing::error!(
+                            event = "cancellation_termination_unsupported",
+                            operation_id = %expired.operation_id,
+                            connector_id = %expired.connector_id,
+                            "runtime lacks a per-invocation termination handle"
+                        );
+                        return;
+                    };
+                    if !terminator.abort() {
+                        // Completion won after the sweep extracted this handle.
+                        return;
+                    }
+                    let completed = fcp_async_core::time::timeout(Duration::from_secs(2), async {
+                        while !terminator.is_finished() {
+                            fcp_async_core::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    if completed {
+                        if operation_cancellation.record_forced_expiration(&expired, Utc::now()) {
+                            tracing::warn!(
+                                event = "cancellation_forced",
+                                operation_id = %expired.operation_id,
+                                connector_id = %expired.connector_id,
+                                deadline_ms = expired.deadline.as_millis() as u64,
+                                "bound invocation termination completed"
+                            );
+                        }
+                    } else {
+                        operation_cancellation.rearm_expiration(&expired);
+                        tracing::error!(
+                            event = "cancellation_force_terminate_timeout",
+                            operation_id = %expired.operation_id,
+                            connector_id = %expired.connector_id,
+                            "bound invocation did not exit after abort signal"
+                        );
+                    }
+                }) {
+                    Ok(attempt) => attempt.detach(),
+                    Err(error) => {
+                        cancellation.rearm_expiration(&retry_expiration);
+                        tracing::error!(
+                            event = "cancellation_termination_admission_failed",
+                            operation_id = %retry_expiration.operation_id,
+                            connector_id = %retry_expiration.connector_id,
+                            error = %error,
+                            "termination task admission failed; deadline rearmed"
+                        );
+                    }
+                }
+            }
+        }
+    })
+    .map_err(|error| HostError::Internal(format!("cancellation reaper admission failed: {error}")))
+}
 
 #[derive(Debug)]
 struct ConnectorRpcRequest {
@@ -758,30 +828,44 @@ impl SubprocessConnector {
 /// The pool control process is never a cancellation target. A deadline
 /// firing before checkout finishes is remembered, and immediately aborts
 /// whichever concrete worker the checkout ultimately selects.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct WarmPoolTermination {
     selected: Arc<OnceLock<Arc<SubprocessConnector>>>,
     stop_requested: Arc<AtomicBool>,
+    termination: CancellationTerminator,
 }
 
-impl WarmPoolTermination {
-    fn terminator(&self) -> CancellationTerminator {
-        let stop = self.clone();
-        let finished = self.clone();
-        CancellationTerminator::new(
+impl Default for WarmPoolTermination {
+    fn default() -> Self {
+        let selected: Arc<OnceLock<Arc<SubprocessConnector>>> = Arc::default();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let abort_worker = Arc::clone(&selected);
+        let abort_requested = Arc::clone(&stop_requested);
+        let finished_worker = Arc::clone(&selected);
+        let termination = CancellationTerminator::new(
             move || {
-                stop.stop_requested.store(true, Ordering::SeqCst);
-                if let Some(worker) = stop.selected.get() {
+                abort_requested.store(true, Ordering::SeqCst);
+                if let Some(worker) = abort_worker.get() {
                     worker._runner_task.abort();
                 }
             },
             move || {
-                finished
-                    .selected
+                finished_worker
                     .get()
                     .is_some_and(|worker| worker._runner_task.is_finished())
             },
-        )
+        );
+        Self {
+            selected,
+            stop_requested,
+            termination,
+        }
+    }
+}
+
+impl WarmPoolTermination {
+    fn terminator(&self) -> CancellationTerminator {
+        self.termination.clone()
     }
 
     fn bind(&self, worker: &Arc<SubprocessConnector>) {
@@ -795,6 +879,10 @@ impl WarmPoolTermination {
 
     fn is_cancel_requested(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    fn disarm_before_reuse(&self) -> bool {
+        self.termination.disarm()
     }
 }
 
@@ -1113,10 +1201,11 @@ impl NativeWarmPoolConnector {
         let response = entry.connector.invoke(request).await;
         if termination
             .as_ref()
-            .is_some_and(WarmPoolTermination::is_cancel_requested)
+            .is_some_and(|termination| !termination.disarm_before_reuse())
         {
-            // Never restore an aborted worker to a warm pool, even when
-            // its pending RPC happened to report a successful response.
+            // Abort and disarm share one lock. If abort won, retire the worker;
+            // if disarm won, every stale reaper handle is inert BEFORE either
+            // insertion await can publish this worker to another invocation.
             return Err(HostError::RegistryError(
                 "warm-pool invocation cancelled; selected worker retired".into(),
             ));
@@ -6754,7 +6843,7 @@ fn track_verified_cancellation_owner(
     operation_id: &str,
     request: &InvokeRequest,
     scope: CancellationScope,
-) -> HostResult<()> {
+) -> HostResult<CancellationRegistration> {
     let verified_claims = request
         .capability_token
         .raw()
@@ -6770,8 +6859,7 @@ fn track_verified_cancellation_owner(
                 .to_string(),
         )
     })?;
-    cancellation.track_operation(operation_id, Some(cancellation_owner), scope);
-    Ok(())
+    Ok(cancellation.track_operation(operation_id, Some(cancellation_owner), scope))
 }
 
 async fn verified_cancellation_principal(
@@ -7722,66 +7810,9 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         mesh: mesh_router,
     });
 
-    // flywheel_connectors-861lx: cancellation-deadline reaper. Sweeps
-    // tracked operations whose cancellation deadline expired without
-    // completion and force-terminates the backing connector subprocess.
-    {
-        let reap_state = Arc::clone(&state);
-        task::spawn(async move {
-            loop {
-                fcp_async_core::time::sleep(CANCELLATION_REAPER_INTERVAL).await;
-                for expired in reap_state.cancellation.reap_expired(Instant::now()) {
-                    let state = Arc::clone(&reap_state);
-                    // Never let one overdue operation block the reaper from
-                    // signaling another. Each termination has its own bound.
-                    task::spawn_detached(async move {
-                        let Some(terminator) = expired.terminator.as_ref() else {
-                            tracing::error!(
-                                event = "cancellation_termination_unsupported",
-                                operation_id = %expired.operation_id,
-                                connector_id = %expired.connector_id,
-                                "runtime lacks a per-invocation termination handle"
-                            );
-                            // Do not claim forced=true for an unsupported
-                            // runtime, and do not spin on the same deadline.
-                            return;
-                        };
-                        terminator.abort();
-                        let completed =
-                            fcp_async_core::time::timeout(Duration::from_secs(2), async {
-                                while !terminator.is_finished() {
-                                    fcp_async_core::time::sleep(Duration::from_millis(20)).await;
-                                }
-                            })
-                            .await
-                            .is_ok();
-                        if completed {
-                            state
-                                .cancellation
-                                .record_forced_cancellation(&expired.operation_id, Utc::now());
-                            tracing::warn!(
-                                event = "cancellation_forced",
-                                operation_id = %expired.operation_id,
-                                connector_id = %expired.connector_id,
-                                deadline_ms = expired.deadline.as_millis() as u64,
-                                "bound native runner was aborted out of band"
-                            );
-                        } else {
-                            state
-                                .cancellation
-                                .rearm_force_terminate(&expired.operation_id);
-                            tracing::error!(
-                                event = "cancellation_force_terminate_timeout",
-                                operation_id = %expired.operation_id,
-                                connector_id = %expired.connector_id,
-                                "bound native runner did not exit after abort signal"
-                            );
-                        }
-                    });
-                }
-            }
-        });
-    }
+    // fcp_async_core aborts tasks when their handles are dropped. Keep the
+    // reaper owned by async_main for the entire server lifetime.
+    let _cancellation_reaper = spawn_cancellation_reaper(Arc::clone(&state.cancellation))?;
 
     let protected_routes = Router::new()
         .route(
@@ -13798,7 +13829,7 @@ async fn execute_local_invoke(
         .cancellation_target(&connector_id)
         .await
         .map_err(map_host_error)?;
-    track_verified_cancellation_owner(
+    let cancellation_registration = track_verified_cancellation_owner(
         state.cancellation.as_ref(),
         &operation_id,
         &request,
@@ -13823,7 +13854,9 @@ async fn execute_local_invoke(
         }
         runtime => runtime.invoke(request).await,
     };
-    state.cancellation.complete(&operation_id);
+    state
+        .cancellation
+        .complete_registration(&cancellation_registration);
 
     match invoke_result {
         Ok(response) => {
