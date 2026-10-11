@@ -30,10 +30,13 @@
 //! 2. The ephemeral point is published in compressed Edwards form (not
 //!    bare Montgomery u-coordinates) so participants can compute
 //!    unclamped contributions; it is still exactly 32 bytes.
-//! 3. The KEM/key schedule follows RFC 9180 DHKEM(X25519,
-//!    HKDF-SHA256) + base-mode key schedule implemented explicitly so
-//!    the combiner can inject the partially-assembled DH value; the
-//!    `hpke` crate's context API cannot do that.
+//! 3. The KEM HKDF and base-mode key schedule follow RFC 9180's labeled
+//!    extraction/expansion, implemented explicitly so the combiner can
+//!    inject the assembled DH value. The compressed Edwards ephemeral
+//!    encoding and unclamped FROST scalars make this a THRESHOLD-SPECIFIC
+//!    wire format, NOT interoperable with the standard RFC 9180
+//!    DHKEM(X25519) ciphertext encoding (which uses a Montgomery point).
+//!    Do not parse or advertise threshold ciphertexts as ordinary HPKE.
 //!
 //! # Byzantine tolerance
 //!
@@ -204,6 +207,9 @@ fn hex_short(bytes: &[u8]) -> String {
 /// [`CryptoError::ThresholdHpke`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ThresholdHpkeError {
+    /// A threshold of zero does not designate any decapsulating quorum.
+    #[error("threshold must be at least one")]
+    InvalidThreshold,
     /// Fewer decap shares than the threshold.
     #[error("insufficient decap shares: got {got}, need {required}")]
     InsufficientShares {
@@ -248,6 +254,7 @@ pub fn decap_share(
 ///
 /// # Errors
 ///
+/// - [`ThresholdHpkeError::InvalidThreshold`] for a zero threshold.
 /// - [`ThresholdHpkeError::InsufficientShares`] when
 ///   `shares.len() < threshold`.
 /// - [`ThresholdHpkeError::InconsistentShares`] when shares disagree on
@@ -262,6 +269,10 @@ pub fn combine_decap(
     info: &[u8],
     aad: &[u8],
 ) -> CryptoResult<Vec<u8>> {
+    // Check before indexing shares[0], including when both inputs are empty.
+    if threshold == 0 {
+        return Err(ThresholdHpkeError::InvalidThreshold.into());
+    }
     if shares.len() < threshold {
         return Err(ThresholdHpkeError::InsufficientShares {
             got: shares.len(),
@@ -280,7 +291,7 @@ pub fn combine_decap(
     }
     let mut seen = std::collections::BTreeSet::new();
     for share in shares {
-        if !seen.insert(share.participant) {
+        if share.participant == 0 || !seen.insert(share.participant) {
             return Err(ThresholdHpkeError::InconsistentShares.into());
         }
     }
@@ -442,7 +453,13 @@ fn key_schedule(shared_secret: &[u8; N_SECRET], info: &[u8]) -> ([u8; N_KEY], [u
     context.extend_from_slice(&psk_id_hash);
     context.extend_from_slice(&info_hash);
 
-    let secret = labeled_extract_bytes(&suite, b"secret", shared_secret);
+    // RFC 9180 §5.1: LabeledExtract(shared_secret, "secret", psk).
+    // Base mode has an empty PSK; the DH-derived shared secret is the
+    // EXTRACT SALT, not the input key material.
+    let secret = hkdf_extract_to_prk_bytes(
+        Some(shared_secret),
+        &labeled_ikm(&suite, b"secret", &[]),
+    );
     let secret_hk = Hkdf::<Sha256>::from_prk(&secret).expect("secret is 32 bytes of Hash output");
 
     let mut key = [0u8; N_KEY];
@@ -458,14 +475,12 @@ fn key_schedule(shared_secret: &[u8; N_SECRET], info: &[u8]) -> ([u8; N_KEY], [u
     (key, base_nonce)
 }
 
-/// RFC 9180 §4 LabeledExtract IKM:
-/// `"HPKE-v1" || suite_id || I2OSP(len(label),1) || label || ikm`
-/// under an empty salt.
+/// RFC 9180 §4 LabeledExtract input:
+/// `"HPKE-v1" || suite_id || label || ikm`. No label-length byte.
 fn labeled_ikm(suite_id: &[u8], label: &[u8], ikm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(7 + suite_id.len() + 1 + label.len() + ikm.len());
+    let mut out = Vec::with_capacity(7 + suite_id.len() + label.len() + ikm.len());
     out.extend_from_slice(b"HPKE-v1");
     out.extend_from_slice(suite_id);
-    out.push(label.len() as u8);
     out.extend_from_slice(label);
     out.extend_from_slice(ikm);
     out
@@ -485,16 +500,14 @@ fn labeled_extract_bytes(suite_id: &[u8], label: &[u8], ikm: &[u8]) -> [u8; N_SE
 }
 
 /// RFC 9180 §4 LabeledExpand info:
-/// `I2OSP(L,2) || "HPKE-v1" || suite_id || I2OSP(len(label),1) || label
-/// || I2OSP(len(context),2) || context`.
+/// `I2OSP(L,2) || "HPKE-v1" || suite_id || label || info`.
+/// Neither the label nor info is length-prefixed.
 fn labeled_expand_info<const N: usize>(suite_id: &[u8], label: &[u8], context: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 7 + suite_id.len() + 1 + label.len() + 2 + context.len());
+    let mut out = Vec::with_capacity(2 + 7 + suite_id.len() + label.len() + context.len());
     out.extend_from_slice(&(N as u16).to_be_bytes());
     out.extend_from_slice(b"HPKE-v1");
     out.extend_from_slice(suite_id);
-    out.push(label.len() as u8);
     out.extend_from_slice(label);
-    out.extend_from_slice(&(context.len() as u16).to_be_bytes());
     out.extend_from_slice(context);
     out
 }
@@ -504,17 +517,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labeled_ikm_matches_rfc_layout_shape() {
-        let ikm = labeled_ikm(b"KEM\x00\x20", b"eae_prk", &[0xAA]);
-        assert!(ikm.starts_with(b"HPKE-v1KEM\x00\x20"));
-        assert_eq!(ikm[7 + 5], 7); // "eae_prk".len()
-        assert_eq!(*ikm.last().unwrap(), 0xAA);
+    fn labeled_extract_and_expand_have_exact_rfc_9180_layouts() {
+        let ikm = labeled_ikm(b"KEM\x00\x20", b"eae_prk", &[0xaa]);
+        assert_eq!(ikm, b"HPKE-v1KEM\x00\x20eae_prk\xaa");
+        let info = labeled_expand_info::<32>(b"KEM\x00\x20", b"shared_secret", b"context");
+        assert_eq!(
+            info,
+            b"\x00\x20HPKE-v1KEM\x00\x20shared_secretcontext"
+        );
     }
 
     #[test]
-    fn labeled_expand_info_carries_output_length() {
-        let info = labeled_expand_info::<32>(b"KEM\x00\x20", b"shared_secret", b"context");
-        assert_eq!(&info[..2], &[0u8, 32]);
-        assert!(info[2..].starts_with(b"HPKE-v1KEM\x00\x20"));
+    fn independently_calculated_rfc_9180_schedule_intermediates() {
+        // Expected values calculated independently with Python stdlib
+        // HMAC-SHA256/HKDF (not using either Rust helper or seal/open).
+        // DH = 00..1f, KEM context = 20..5f. The intermediate values
+        // catch both extra-length-byte and reversed Extract-salt defects.
+        let dh: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let kem_context: Vec<u8> = (32u8..96).collect();
+        let kem_suite = b"KEM\x00\x20";
+        let eae_prk = labeled_extract_bytes(kem_suite, b"eae_prk", &dh);
+        assert_eq!(
+            hex::encode(eae_prk),
+            "09c24e50fe25c4d58d533b9e4ca2331ff60d3b2b97ec3c893014ab9b8ef2134b"
+        );
+        let shared_secret = extract_and_expand(&dh, &kem_context);
+        assert_eq!(
+            hex::encode(shared_secret),
+            "38e81c116415c86566dc21f3d99d5a395acae6aa8e187fdc052d40502a581a7a"
+        );
+
+        let suite = b"HPKE\x00\x20\x00\x01\x00\x03";
+        let info = b"FCP threshold HPKE independent RFC schedule test";
+        let psk_id_hash = labeled_extract_bytes(suite, b"psk_id_hash", b"");
+        assert_eq!(
+            hex::encode(psk_id_hash),
+            "431df6cd95e11ff49d7013563baf7f11588c75a6611ee2a4404a49306ae4cfc5"
+        );
+        let info_hash = labeled_extract_bytes(suite, b"info_hash", info);
+        assert_eq!(
+            hex::encode(info_hash),
+            "9e65c73cb8a26de07c5b5a304ae3441968d2be51ea1801a739b57e45bad390b4"
+        );
+        let secret = hkdf_extract_to_prk_bytes(
+            Some(&shared_secret),
+            &labeled_ikm(suite, b"secret", b""),
+        );
+        assert_eq!(
+            hex::encode(secret),
+            "f42474629ca273df3c095c777df8229321002b0e565ba48fa7eb11fea41bfdea"
+        );
+        let (key, nonce) = key_schedule(&shared_secret, info);
+        assert_eq!(
+            hex::encode(key),
+            "26e279a1f50e65bc6b82a27f0956f868a8a65bc2becdfb23eff898bb22ca20da"
+        );
+        assert_eq!(hex::encode(nonce), "d8e8964f71113d581648b346");
+    }
+
+    #[test]
+    fn zero_threshold_and_empty_shares_fail_as_typed_errors_not_panics() {
+        let ct = ThresholdHpkeCiphertext {
+            ephemeral_pk: [0; POINT_SIZE],
+            aead_body: vec![0; 16],
+        };
+        for threshold in [0, 1, 2] {
+            let error = combine_decap(&[], threshold, &ct, b"", b"").unwrap_err();
+            match threshold {
+                0 => assert!(matches!(
+                    error,
+                    CryptoError::ThresholdHpke(ThresholdHpkeError::InvalidThreshold)
+                )),
+                n => assert!(matches!(
+                    error,
+                    CryptoError::ThresholdHpke(ThresholdHpkeError::InsufficientShares {
+                        got: 0, required
+                    }) if required == n
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_and_zero_participant_ids_fail_closed() {
+        let ct = ThresholdHpkeCiphertext {
+            ephemeral_pk: [0; POINT_SIZE],
+            aead_body: vec![0; 16],
+        };
+        let group = [3u8; POINT_SIZE];
+        let mut share = DecapShare {
+            participant: 1,
+            contribution: [0; POINT_SIZE],
+            group_x25519: group,
+            binding: ct.binding(&group),
+        };
+        let error = combine_decap(&[share.clone(), share.clone()], 2, &ct, b"", b"")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CryptoError::ThresholdHpke(ThresholdHpkeError::InconsistentShares)
+        ));
+        share.participant = 0;
+        let error = combine_decap(&[share], 1, &ct, b"", b"").unwrap_err();
+        assert!(matches!(
+            error,
+            CryptoError::ThresholdHpke(ThresholdHpkeError::InconsistentShares)
+        ));
+    }
+
+    #[test]
+    fn malformed_ciphertext_boundaries_are_rejected() {
+        assert!(ThresholdHpkeCiphertext::from_bytes(&[0; POINT_SIZE + 15]).is_err());
+        assert!(ThresholdHpkeCiphertext::from_bytes(
+            &vec![0; POINT_SIZE + MAX_AEAD_BODY + 1]
+        ).is_err());
     }
 }
