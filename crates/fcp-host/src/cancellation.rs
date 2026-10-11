@@ -264,22 +264,38 @@ impl CancellationController {
     /// reports it via [`Self::reap_expired`] so the host can force-terminate
     /// `scope.connector_id`'s subprocess and audit `forced = true`.
     ///
+    /// An active registration reserves its operation ID until completion.
+    /// Reusing that ID must not replace its owner or revoke its cancellation
+    /// target while the original invocation can still execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::PreflightFailed`] if the operation ID is active.
+    /// Completed operation IDs may be registered for a new invocation.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    #[must_use]
     pub fn track_operation(
         &self,
         operation_id: &str,
         owner: Option<&str>,
         scope: CancellationScope,
-    ) -> CancellationRegistration {
+    ) -> HostResult<CancellationRegistration> {
         let registration = CancellationRegistration {
             operation_id: operation_id.to_string(),
             identity: Arc::new(()),
         };
         let previous = {
             let mut ops = self.operations.lock().expect("operations lock");
+            if ops
+                .get(operation_id)
+                .is_some_and(|operation| !operation.completed)
+            {
+                return Err(HostError::PreflightFailed(format!(
+                    "operation ID is already active: {operation_id}"
+                )));
+            }
             ops.insert(
                 operation_id.to_string(),
                 TrackedOperation {
@@ -295,7 +311,7 @@ impl CancellationController {
             )
         };
         disarm_scope(previous.and_then(|operation| operation.scope));
-        registration
+        Ok(registration)
     }
 
     /// Mark an operation as completed.
@@ -698,7 +714,9 @@ mod tests {
                 move || old_finished.load(Ordering::SeqCst),
             ));
         let controller = CancellationController::new();
-        let _ = controller.track_operation("old-operation", None, scope);
+        controller
+            .track_operation("old-operation", None, scope)
+            .unwrap();
         controller
             .cancel(
                 &CancellationRequest {
@@ -736,16 +754,18 @@ mod tests {
         let weak_runtime = Arc::downgrade(&runtime);
         let finished = Arc::clone(&runtime);
         let controller = CancellationController::new();
-        let registration = controller.track_operation(
-            "completed",
-            Some("owner"),
-            CancellationScope::new("connector", ConnectorArchetype::RequestResponse)
-                .with_deadline_override_ms(Some(1))
-                .with_terminator(CancellationTerminator::new(
-                    move || runtime.store(true, Ordering::SeqCst),
-                    move || finished.load(Ordering::SeqCst),
-                )),
-        );
+        let registration = controller
+            .track_operation(
+                "completed",
+                Some("owner"),
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(1))
+                    .with_terminator(CancellationTerminator::new(
+                        move || runtime.store(true, Ordering::SeqCst),
+                        move || finished.load(Ordering::SeqCst),
+                    )),
+            )
+            .unwrap();
         controller
             .cancel(
                 &cancel_request("completed", CancelReason::UserRequested),
@@ -779,7 +799,9 @@ mod tests {
                 .with_deadline_override_ms(Some(1))
                 .with_terminator(CancellationTerminator::new(|| {}, || true))
         };
-        let old_registration = controller.track_operation("reused", None, scope());
+        let old_registration = controller
+            .track_operation("reused", None, scope())
+            .unwrap();
         controller
             .cancel(
                 &cancel_request("reused", CancelReason::UserRequested),
@@ -790,7 +812,10 @@ mod tests {
         let old_expired = controller.reap_expired(Instant::now() + Duration::from_secs(1));
         assert_eq!(old_expired.len(), 1);
 
-        let replacement = controller.track_operation("reused", None, scope());
+        controller.complete_registration(&old_registration);
+        let replacement = controller
+            .track_operation("reused", None, scope())
+            .unwrap();
         assert!(!old_expired[0].terminator.as_ref().unwrap().abort());
         controller.complete_registration(&old_registration);
         assert_eq!(
@@ -822,18 +847,125 @@ mod tests {
     }
 
     #[test]
+    fn active_operation_id_cannot_replace_its_owner_or_termination_target() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let controller = CancellationController::new();
+        let original_aborted = Arc::new(AtomicBool::new(false));
+        let abort = Arc::clone(&original_aborted);
+        let original = controller
+            .track_operation(
+                "shared-id",
+                Some("original-owner"),
+                CancellationScope::new("original", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(1))
+                    .with_terminator(CancellationTerminator::new(
+                        move || abort.store(true, Ordering::SeqCst),
+                        || true,
+                    )),
+            )
+            .unwrap();
+        let replacement_runtime = Arc::new(());
+        let replacement_weak = Arc::downgrade(&replacement_runtime);
+        let error = controller
+            .track_operation(
+                "shared-id",
+                Some("replacement-owner"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse)
+                    .with_terminator(CancellationTerminator::new(
+                        move || {
+                            let _ = &replacement_runtime;
+                        },
+                        || false,
+                    )),
+            )
+            .unwrap_err();
+        assert!(matches!(error, HostError::PreflightFailed(_)));
+        assert!(replacement_weak.upgrade().is_none());
+        assert_eq!(controller.tracked_count(), 1);
+        assert!(
+            controller
+                .cancel(
+                    &cancel_request("shared-id", CancelReason::UserRequested),
+                    Some("replacement-owner"),
+                    fixed_now(),
+                )
+                .is_err()
+        );
+        controller
+            .cancel(
+                &cancel_request("shared-id", CancelReason::UserRequested),
+                Some("original-owner"),
+                fixed_now(),
+            )
+            .unwrap();
+        let expired = controller.reap_expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].connector_id, "original");
+        assert!(expired[0].terminator.as_ref().unwrap().abort());
+        assert!(original_aborted.load(Ordering::SeqCst));
+
+        controller.complete_registration(&original);
+        let replacement = controller
+            .track_operation(
+                "shared-id",
+                Some("replacement-owner"),
+                CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+            )
+            .expect("completed IDs remain reusable");
+        controller.complete_registration(&original);
+        assert_eq!(
+            controller
+                .cancel(
+                    &cancel_request("shared-id", CancelReason::UserRequested),
+                    Some("replacement-owner"),
+                    fixed_now(),
+                )
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled,
+        );
+        controller.complete_registration(&replacement);
+    }
+
+    #[test]
+    fn concurrent_registration_admits_exactly_one_active_owner() {
+        let controller = Arc::new(CancellationController::new());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let contenders = ["owner-a", "owner-b"].map(|owner| {
+            let controller = Arc::clone(&controller);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                controller.track_operation(
+                    "contended-id",
+                    Some(owner),
+                    CancellationScope::new(owner, ConnectorArchetype::RequestResponse),
+                )
+            })
+        });
+        barrier.wait();
+        let results = contenders.map(|contender| contender.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(controller.tracked_count(), 1);
+    }
+
+    #[test]
     fn removing_tracking_revokes_already_extracted_termination_handles() {
         let controller = CancellationController::new();
-        let _ = controller.track_operation(
-            "removed",
-            None,
-            CancellationScope::new("connector", ConnectorArchetype::RequestResponse)
-                .with_deadline_override_ms(Some(1))
-                .with_terminator(CancellationTerminator::new(
-                    || panic!("removed operation must not abort a runtime"),
-                    || false,
-                )),
-        );
+        controller
+            .track_operation(
+                "removed",
+                None,
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(1))
+                    .with_terminator(CancellationTerminator::new(
+                        || panic!("removed operation must not abort a runtime"),
+                        || false,
+                    )),
+            )
+            .unwrap();
         controller
             .cancel(
                 &cancel_request("removed", CancelReason::UserRequested),
@@ -3424,24 +3556,27 @@ mod tests {
     #[test]
     fn deadline_expiry_reaps_only_overdue_uncompleted_ops() {
         let ctrl = CancellationController::new();
-        let _ = ctrl.track_operation(
+        ctrl.track_operation(
             "op_overdue",
             Some("user:alice"),
             CancellationScope::new("c:slow:1.0", ConnectorArchetype::RequestResponse)
                 .with_deadline_override_ms(Some(100)),
-        );
-        let _ = ctrl.track_operation(
+        )
+        .unwrap();
+        ctrl.track_operation(
             "op_completed",
             Some("user:alice"),
             CancellationScope::new("c:fast:1.0", ConnectorArchetype::RequestResponse)
                 .with_deadline_override_ms(Some(100)),
-        );
-        let _ = ctrl.track_operation(
+        )
+        .unwrap();
+        ctrl.track_operation(
             "op_not_cancelled",
             Some("user:alice"),
             CancellationScope::new("c:idle:1.0", ConnectorArchetype::RequestResponse)
                 .with_deadline_override_ms(Some(100)),
-        );
+        )
+        .unwrap();
         let start = Instant::now();
         for id in ["op_overdue", "op_completed"] {
             let req = cancel_request(id, CancelReason::UserRequested);
@@ -3477,12 +3612,13 @@ mod tests {
     #[test]
     fn forced_cancellation_records_forced_audit_event() {
         let ctrl = CancellationController::new();
-        let _ = ctrl.track_operation(
+        ctrl.track_operation(
             "op_forced",
             Some("user:alice"),
             CancellationScope::new("c:stuck:1.0", ConnectorArchetype::Streaming)
                 .with_deadline_override_ms(Some(50)),
-        );
+        )
+        .unwrap();
         let req = cancel_request(
             "op_forced",
             CancelReason::AgentAbort {

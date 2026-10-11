@@ -547,16 +547,18 @@ async fn retained_production_reaper_enforces_a_cancelled_operations_deadline() {
     let abort = Arc::clone(&cancelled);
     let finished = Arc::clone(&cancelled);
     let controller = Arc::new(CancellationController::new());
-    let _ = controller.track_operation(
-        "reaper-test",
-        None,
-        CancellationScope::new("fixture", ConnectorArchetype::RequestResponse)
-            .with_deadline_override_ms(Some(1))
-            .with_terminator(CancellationTerminator::new(
-                move || abort.store(true, Ordering::SeqCst),
-                move || finished.load(Ordering::SeqCst),
-            )),
-    );
+    controller
+        .track_operation(
+            "reaper-test",
+            None,
+            CancellationScope::new("fixture", ConnectorArchetype::RequestResponse)
+                .with_deadline_override_ms(Some(1))
+                .with_terminator(CancellationTerminator::new(
+                    move || abort.store(true, Ordering::SeqCst),
+                    move || finished.load(Ordering::SeqCst),
+                )),
+        )
+        .unwrap();
     controller
         .cancel(
             &CancellationRequest {

@@ -6859,7 +6859,7 @@ fn track_verified_cancellation_owner(
                 .to_string(),
         )
     })?;
-    Ok(cancellation.track_operation(operation_id, Some(cancellation_owner), scope))
+    cancellation.track_operation(operation_id, Some(cancellation_owner), scope)
 }
 
 async fn verified_cancellation_principal(

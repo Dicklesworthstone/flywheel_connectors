@@ -40,12 +40,13 @@ fn request(operation_id: &str, reason: CancelReason) -> CancellationRequest {
 #[test]
 fn unresponsive_operation_is_reaped_within_deadline_plus_epsilon() {
     let ctrl = CancellationController::new();
-    let _ = ctrl.track_operation(
+    ctrl.track_operation(
         "op-unresponsive",
         Some("user:alice"),
         CancellationScope::new("c:slow:1.0", ConnectorArchetype::RequestResponse)
             .with_deadline_override_ms(Some(100)),
-    );
+    )
+    .unwrap();
 
     let start = Instant::now();
     let cancel = request("op-unresponsive", CancelReason::UserRequested);
@@ -87,12 +88,13 @@ fn unresponsive_operation_is_reaped_within_deadline_plus_epsilon() {
 #[test]
 fn responsive_operation_is_never_force_terminated() {
     let ctrl = CancellationController::new();
-    let _ = ctrl.track_operation(
+    ctrl.track_operation(
         "op-responsive",
         Some("user:alice"),
         CancellationScope::new("c:fast:1.0", ConnectorArchetype::Streaming)
             .with_deadline_override_ms(Some(100)),
-    );
+    )
+    .unwrap();
     let start = Instant::now();
     let cancel = request(
         "op-responsive",
@@ -180,12 +182,13 @@ fn forced_cancellation_does_not_release_the_tracked_operation() {
     // subprocess termination. The tracking entry stays until the regular
     // invoke path completes, and no intent is released here.
     let ctrl = CancellationController::new();
-    let _ = ctrl.track_operation(
+    ctrl.track_operation(
         "op-intent",
         Some("user:alice"),
         CancellationScope::new("c:stuck:1.0", ConnectorArchetype::Polling)
             .with_deadline_override_ms(Some(50)),
-    );
+    )
+    .unwrap();
     let cancel = request(
         "op-intent",
         CancelReason::TimeoutApproaching { remaining_ms: 0 },
@@ -207,12 +210,13 @@ fn forced_cancellation_does_not_release_the_tracked_operation() {
 #[test]
 fn failed_force_terminate_is_rearmed_and_retried() {
     let ctrl = CancellationController::new();
-    let _ = ctrl.track_operation(
+    ctrl.track_operation(
         "op-retry",
         Some("user:alice"),
         CancellationScope::new("c:gone:1.0", ConnectorArchetype::RequestResponse)
             .with_deadline_override_ms(Some(50)),
-    );
+    )
+    .unwrap();
     let cancel = request("op-retry", CancelReason::UserRequested);
     ctrl.cancel(&cancel, Some("user:alice"), Utc::now())
         .unwrap();
