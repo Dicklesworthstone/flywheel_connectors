@@ -8273,7 +8273,14 @@ async fn doctor_handler(
         self_check = request.self_check,
         "processing doctor request"
     );
-    match state.doctor.handle(request).await {
+    let result = state
+        .doctor
+        .handle_with_self_check(request, |connector_id, zone_id| {
+            let state = Arc::clone(&state);
+            async move { route_connector_self_check(&state, &connector_id, &zone_id).await }
+        })
+        .await;
+    match result {
         Ok(report) => {
             tracing::debug!(
                 event = "doctor_response",
@@ -8293,6 +8300,80 @@ async fn doctor_handler(
             Err(map_host_error(err))
         }
     }
+}
+
+/// Prefer an installed local connector, including its failures. Only an absent
+/// local installation may be resolved through a peer advertisement.
+async fn route_connector_self_check(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    zone_id: &ZoneId,
+) -> HostResult<Option<SelfCheckReport>> {
+    match local_connector_self_check(state, connector_id, zone_id).await {
+        Ok(response) => return Ok(Some(response.report)),
+        Err((StatusCode::NOT_FOUND, _)) => {}
+        Err((_, message)) => return Err(HostError::RegistryError(message)),
+    }
+    let Some(router) = state.mesh.clone() else {
+        return Ok(None);
+    };
+    let decision = mesh_route_decision(state, &router, connector_id, Some(zone_id)).await;
+    if !decision.is_forward() {
+        return Ok(None);
+    }
+    let response: fcp_host::doctor::HostConnectorSelfCheckResponse = mesh_forward_query(
+        &router,
+        decision,
+        fcp_mesh::invoke_route::MeshForwardBody::SelfCheck {
+            connector_id: connector_id.to_string(),
+            zone_id: zone_id.to_string(),
+        },
+    )
+    .await
+    .map_err(|(_, message)| HostError::RegistryError(message))?;
+    if response.connector_id != *connector_id || response.zone_id != *zone_id {
+        return Err(HostError::RegistryError(
+            "mesh executor returned a self-check for a different connector or zone".to_string(),
+        ));
+    }
+    Ok(Some(response.report))
+}
+
+/// Capture the runtime and its zone policy together, then bound the diagnostic
+/// call. This executor-local path never forwards a peer's request again.
+async fn local_connector_self_check(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    zone_id: &ZoneId,
+) -> Result<fcp_host::doctor::HostConnectorSelfCheckResponse, (StatusCode, String)> {
+    let (connector, allowed_zones) = {
+        let registry = state.registry.state.read().await;
+        let entry = registry.connectors.get(connector_id).ok_or_else(|| {
+            map_host_error(HostError::ConnectorNotFound(connector_id.to_string()))
+        })?;
+        (entry.connector.clone(), entry.config.allowed_zones.clone())
+    };
+    require_allowed_zones_configured(connector_id, &allowed_zones).map_err(map_host_error)?;
+    if !allowed_zones.iter().any(|allowed| allowed == zone_id.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("self-check denied: connector `{connector_id}` is not admitted to zone `{zone_id}`"),
+        ));
+    }
+    let timeout = state.doctor.self_check_timeout();
+    let report = match fcp_async_core::time::timeout(timeout, connector.self_check()).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => runtime_self_check_failure_report(&error),
+        Err(_) => SelfCheckReport::failed(
+            "self_check_timeout",
+            format!("self_check exceeded {}ms", timeout.as_millis()),
+        ),
+    };
+    Ok(fcp_host::doctor::HostConnectorSelfCheckResponse {
+        connector_id: connector_id.clone(),
+        zone_id: zone_id.clone(),
+        report,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -11087,11 +11168,52 @@ async fn simulate_handler(
     headers: HeaderMap,
     Json(request): Json<HostSimulateRequest>,
 ) -> Result<Json<HostSimulateResponse>, (StatusCode, String)> {
+    let asserted_principal =
+        extract_principal_header(&headers).or_else(|| request.principal.clone());
+    if let Some(router) = state.mesh.clone()
+        && let Ok(invoke_request) = invoke_request_from_simulate(&request)
+    {
+        let decision = mesh_route_decision(
+            &state,
+            &router,
+            &invoke_request.connector_id,
+            Some(&invoke_request.zone_id),
+        )
+        .await;
+        if decision.is_forward() {
+            let request_json = serde_json::to_string(&request).map_err(|error| {
+                map_host_error(HostError::Internal(format!(
+                    "simulation request could not be encoded for mesh forwarding: {error}"
+                )))
+            })?;
+            return mesh_forward_query(
+                &router,
+                decision,
+                fcp_mesh::invoke_route::MeshForwardBody::Simulate {
+                    request_json,
+                    asserted_principal,
+                },
+            )
+            .await
+            .map(Json);
+        }
+    }
+    local_simulate(&state, &request, asserted_principal.as_deref())
+        .await
+        .map(Json)
+}
+
+/// Execute locally even when reached through a mesh forward. Admission and
+/// connector simulation run on the same host, and only that executor records
+/// the resulting simulation receipt.
+async fn local_simulate(
+    state: &AppState,
+    request: &HostSimulateRequest,
+    asserted_principal: Option<&str>,
+) -> Result<HostSimulateResponse, (StatusCode, String)> {
     let connector_id = request.connector_id.clone();
     let operation = request.operation.clone();
     let request_id = request.request_id.clone();
-    let asserted_principal =
-        extract_principal_header(&headers).or_else(|| request.principal.clone());
     let started_at = Instant::now();
 
     tracing::debug!(
@@ -11099,14 +11221,14 @@ async fn simulate_handler(
         connector_id = %connector_id,
         operation = %operation,
         request_id = %request_id,
-        asserted_principal = asserted_principal.as_deref(),
+        asserted_principal,
         estimate_cost = request.estimate_cost,
         check_availability = request.check_availability,
         deadline_ms = request.deadline_ms,
         "processing simulate request"
     );
 
-    let preflight_request = match invoke_request_from_simulate(&request) {
+    let preflight_request = match invoke_request_from_simulate(request) {
         Ok(preflight_request) => preflight_request,
         Err(error) => {
             let input = request.input.clone().unwrap_or(serde_json::Value::Null);
@@ -11123,7 +11245,7 @@ async fn simulate_handler(
                 availability: None,
                 duration_ms,
                 receipt: simulate_receipt_for_request(
-                    &request,
+                    request,
                     &input,
                     SimulatePhase::PreflightOnly,
                     false,
@@ -11144,12 +11266,12 @@ async fn simulate_handler(
                 duration_ms = response.duration_ms,
                 "simulate request complete"
             );
-            return Ok(Json(response));
+            return Ok(response);
         }
     };
 
     let preflight =
-        evaluate_live_preflight(&state, &preflight_request, asserted_principal.as_deref()).await;
+        evaluate_live_preflight(state, &preflight_request, asserted_principal).await;
     if !preflight.allowed {
         let input = request.input.clone().unwrap_or(serde_json::Value::Null);
         let duration_ms = elapsed_millis(started_at);
@@ -11169,7 +11291,7 @@ async fn simulate_handler(
             availability: None,
             duration_ms,
             receipt: simulate_receipt_for_request(
-                &request,
+                request,
                 &input,
                 SimulatePhase::PreflightOnly,
                 false,
@@ -11190,10 +11312,10 @@ async fn simulate_handler(
             duration_ms = response.duration_ms,
             "simulate request complete"
         );
-        return Ok(Json(response));
+        return Ok(response);
     }
 
-    let simulate_request = simulate_request_from_host(&request).map_err(map_host_error)?;
+    let simulate_request = simulate_request_from_host(request).map_err(map_host_error)?;
     let simulate_input = simulate_request.input.clone();
     let simulate_result = fcp_async_core::time::timeout(
         Duration::from_millis(request.deadline_ms),
@@ -11203,6 +11325,12 @@ async fn simulate_handler(
     let duration_ms = elapsed_millis(started_at);
 
     let response = match simulate_result {
+        Ok(Ok(simulate_response)) if simulate_response.id != preflight_request.id => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "connector returned a simulation response for a different request".to_string(),
+            ));
+        }
         Ok(Ok(simulate_response)) => HostSimulateResponse {
             request_id: request_id.clone(),
             would_succeed: simulate_response.would_succeed,
@@ -11219,7 +11347,7 @@ async fn simulate_handler(
                 .map(map_simulate_resource_availability),
             duration_ms,
             receipt: simulate_receipt_for_request(
-                &request,
+                request,
                 &simulate_input,
                 SimulatePhase::ConnectorReached,
                 simulate_response.would_succeed,
@@ -11241,7 +11369,7 @@ async fn simulate_handler(
             availability: None,
             duration_ms,
             receipt: simulate_receipt_for_request(
-                &request,
+                request,
                 &simulate_input,
                 SimulatePhase::ConnectorUnsupported,
                 false,
@@ -11273,7 +11401,7 @@ async fn simulate_handler(
             availability: None,
             duration_ms,
             receipt: simulate_receipt_for_request(
-                &request,
+                request,
                 &simulate_input,
                 SimulatePhase::TimedOut,
                 false,
@@ -11297,7 +11425,7 @@ async fn simulate_handler(
         "simulate request complete"
     );
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 const MCP_SAMPLING_HANDLE_OPERATION: &str = "mcp.sampling.handle";
@@ -14222,8 +14350,8 @@ fn mesh_reply_into_invoke_response(
     Ok(response)
 }
 
-/// Relay a read-only query (inventory, status, introspection, preflight) to the chosen peer,
-/// trying ranked alternates on any failure (nothing executes).
+/// Relay a read-only query to a ranked peer, retaining authoritative denials.
+/// Transport, availability, and invalid-response failures may use an alternate.
 async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
     router: &fcp_host::mesh_routing::MeshRouter,
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
@@ -14239,40 +14367,242 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
             "mesh_forward_query called without a forward decision".to_string(),
         )));
     };
+    let bindings = mesh_query_response_bindings(&body)?;
     let method = body.method();
     let mut failures = Vec::new();
+    let mut failure_status = StatusCode::SERVICE_UNAVAILABLE;
     for candidate in std::iter::once(target).chain(alternates) {
-        match router.forward(&candidate, body.clone()).await {
+        let failure = match router.forward(&candidate, body.clone()).await {
             Ok(reply) if reply.is_success() => {
-                return serde_json::from_str(&reply.body_json).map_err(|error| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "mesh executor `{}` returned an undecodable {method} response: {error}",
-                            candidate.as_str()
-                        ),
-                    )
-                });
+                let decoded = serde_json::from_str::<Value>(&reply.body_json)
+                    .map_err(|_| "response is not valid JSON")
+                    .and_then(|value| {
+                        validate_mesh_query_response(&body, &bindings, &value)?;
+                        serde_json::from_value::<T>(value)
+                            .map_err(|_| "response does not match the expected schema")
+                    });
+                match decoded {
+                    Ok(response) => {
+                        tracing::info!(
+                            event = "mesh_query_forwarded",
+                            method,
+                            peer = candidate.as_str(),
+                            route_code = code,
+                            failed_attempts = failures.len(),
+                            "read-only query answered by a mesh peer"
+                        );
+                        // A valid preflight or simulation denial is authoritative.
+                        // Never retry it to search for a more permissive executor.
+                        return Ok(response);
+                    }
+                    Err(reason) => {
+                        failure_status = StatusCode::BAD_GATEWAY;
+                        format!("{}: {reason}", candidate.as_str())
+                    }
+                }
             }
             Ok(reply) => {
-                let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
-                let message = serde_json::from_str::<String>(&reply.body_json)
-                    .unwrap_or_else(|_| reply.body_json.clone());
-                return Err((
-                    status,
-                    format!("mesh executor `{}`: {message}", candidate.as_str()),
-                ));
+                let status = StatusCode::from_u16(reply.status)
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                if !mesh_query_status_allows_failover(status) {
+                    tracing::warn!(
+                        event = "mesh_query_denied",
+                        method,
+                        peer = candidate.as_str(),
+                        status = status.as_u16(),
+                        "mesh peer returned an authoritative request denial"
+                    );
+                    return Err((
+                        status,
+                        format!(
+                            "mesh executor `{}` denied {method} (HTTP {})",
+                            candidate.as_str(),
+                            status.as_u16()
+                        ),
+                    ));
+                }
+                failure_status = status;
+                format!("{}: HTTP {}", candidate.as_str(), status.as_u16())
             }
-            Err(failure) => failures.push(failure.summary()),
-        }
+            Err(failure) => failure.summary(),
+        };
+        tracing::warn!(
+            event = "mesh_query_forward_attempt_failed",
+            method,
+            peer = candidate.as_str(),
+            failure = %failure,
+            "read-only query will try the next ranked mesh peer"
+        );
+        failures.push(failure);
     }
     Err((
-        StatusCode::SERVICE_UNAVAILABLE,
+        failure_status,
         format!(
             "no mesh peer answered {method} ({code}); attempts: {}",
             failures.join("; ")
         ),
     ))
+}
+
+/// A signed request or authorization denial must not be bypassed on another
+/// executor. Missing/stale advertisements and transient capacity failures can.
+fn mesh_query_status_allows_failover(status: StatusCode) -> bool {
+    !status.is_client_error()
+        || matches!(
+            status,
+            StatusCode::NOT_FOUND
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::GONE
+                | StatusCode::MISDIRECTED_REQUEST
+                | StatusCode::TOO_EARLY
+                | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+struct MeshQueryResponseBinding {
+    pointer: &'static str,
+    expected: Value,
+    mismatch: &'static str,
+}
+
+/// Capture response identities once so a stale replica cannot prevent the next
+/// candidate from answering the requested connector, zone, or simulation.
+fn mesh_query_response_bindings(
+    body: &fcp_mesh::invoke_route::MeshForwardBody,
+) -> Result<Vec<MeshQueryResponseBinding>, (StatusCode, String)> {
+    use fcp_mesh::invoke_route::MeshForwardBody;
+    let binding = |pointer, expected, mismatch| MeshQueryResponseBinding {
+        pointer,
+        expected,
+        mismatch,
+    };
+    match body {
+        MeshForwardBody::Introspect { connector_id } => Ok(vec![binding(
+            "/connector/id",
+            Value::String(connector_id.clone()),
+            "introspection response names a different connector",
+        )]),
+        MeshForwardBody::Inventory { connector_id } => Ok(vec![binding(
+            "/connector/id",
+            Value::String(connector_id.clone()),
+            "inventory response names a different connector",
+        )]),
+        MeshForwardBody::Status { connector_id } => Ok(vec![binding(
+            "/connector_id",
+            Value::String(connector_id.clone()),
+            "status response names a different connector",
+        )]),
+        MeshForwardBody::SelfCheck {
+            connector_id,
+            zone_id,
+        } => Ok(vec![
+            binding(
+                "/connector_id",
+                Value::String(connector_id.clone()),
+                "self-check response names a different connector",
+            ),
+            binding(
+                "/zone_id",
+                Value::String(zone_id.clone()),
+                "self-check response names a different zone",
+            ),
+        ]),
+        MeshForwardBody::Simulate { request_json, .. } => {
+            let request: HostSimulateRequest = serde_json::from_str(request_json).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "cannot forward an invalid simulation request".to_string(),
+                )
+            })?;
+            let input_digest = hex::encode(
+                request_input_hash(request.input.as_ref().unwrap_or(&Value::Null))
+                    .map_err(map_host_error)?,
+            );
+            Ok(vec![
+                binding(
+                    "/request_id",
+                    Value::String(request.request_id),
+                    "simulation response names a different request",
+                ),
+                binding(
+                    "/receipt/connector_id",
+                    Value::String(request.connector_id),
+                    "simulation receipt names a different connector",
+                ),
+                binding(
+                    "/receipt/operation",
+                    Value::String(request.operation),
+                    "simulation receipt names a different operation",
+                ),
+                binding(
+                    "/receipt/input_digest",
+                    Value::String(input_digest),
+                    "simulation receipt names different input",
+                ),
+            ])
+        }
+        MeshForwardBody::Preflight { .. } => Ok(Vec::new()),
+        MeshForwardBody::Invoke { .. } => Err(map_host_error(HostError::Internal(
+            "invoke must not use read-only mesh failover".to_string(),
+        ))),
+    }
+}
+
+/// Validate inside the attempt loop, before accepting a peer's answer. Callers
+/// may retain their own typed guards as defense in depth.
+fn validate_mesh_query_response(
+    body: &fcp_mesh::invoke_route::MeshForwardBody,
+    bindings: &[MeshQueryResponseBinding],
+    value: &Value,
+) -> Result<(), &'static str> {
+    for binding in bindings {
+        if value.pointer(binding.pointer) != Some(&binding.expected) {
+            return Err(binding.mismatch);
+        }
+    }
+    if matches!(body, fcp_mesh::invoke_route::MeshForwardBody::Simulate { .. }) {
+        for (response_pointer, receipt_pointer, mismatch) in [
+            (
+                "/phase",
+                "/receipt/phase",
+                "simulation receipt disagrees with the response phase",
+            ),
+            (
+                "/would_succeed",
+                "/receipt/would_succeed",
+                "simulation receipt disagrees with the response verdict",
+            ),
+            (
+                "/duration_ms",
+                "/receipt/duration_ms",
+                "simulation receipt disagrees with the response duration",
+            ),
+        ] {
+            let response_value = value.pointer(response_pointer);
+            if response_value.is_none() || response_value != value.pointer(receipt_pointer) {
+                return Err(mismatch);
+            }
+        }
+        let preflight_allowed = value.get("preflight_allowed").and_then(Value::as_bool);
+        let would_succeed = value.get("would_succeed").and_then(Value::as_bool);
+        let phase = value.get("phase").and_then(Value::as_str);
+        let consistent = match phase {
+            Some("preflight_only") => {
+                preflight_allowed == Some(false) && would_succeed == Some(false)
+            }
+            Some("connector_reached") => {
+                preflight_allowed == Some(true) && would_succeed.is_some()
+            }
+            Some("connector_unsupported" | "timed_out") => {
+                preflight_allowed == Some(true) && would_succeed == Some(false)
+            }
+            _ => false,
+        };
+        if !consistent {
+            return Err("simulation phase is inconsistent with its preflight or verdict");
+        }
+    }
+    Ok(())
 }
 
 fn mesh_forward_error_status(error: &fcp_mesh::invoke_route::MeshForwardError) -> StatusCode {
@@ -14370,6 +14700,18 @@ async fn mesh_forward_handler(
                 format!("forwarded preflight request is not valid: {error}"),
             ))),
         },
+        MeshForwardBody::Simulate {
+            request_json,
+            asserted_principal,
+        } => match serde_json::from_str::<HostSimulateRequest>(request_json) {
+            Ok(request) => mesh_reply_body(
+                local_simulate(&state, &request, asserted_principal.as_deref()).await,
+            ),
+            Err(error) => mesh_reply_body::<()>(Err((
+                StatusCode::BAD_REQUEST,
+                format!("forwarded simulation request is not valid: {error}"),
+            ))),
+        },
         MeshForwardBody::Introspect { connector_id } => match parse_connector_id(connector_id) {
             Ok(connector_id) => mesh_reply_body(
                 local_introspection(&state, &connector_id, None)
@@ -14391,6 +14733,18 @@ async fn mesh_forward_handler(
                 mesh_reply_body(local_connector_status(&state, &connector_id).await)
             }
             Err(error) => mesh_reply_body::<()>(Err(error)),
+        },
+        MeshForwardBody::SelfCheck {
+            connector_id,
+            zone_id,
+        } => match (parse_connector_id(connector_id), zone_id.parse::<ZoneId>()) {
+            (Ok(connector_id), Ok(zone_id)) => {
+                mesh_reply_body(local_connector_self_check(&state, &connector_id, &zone_id).await)
+            }
+            (Err(error), _) => mesh_reply_body::<()>(Err(error)),
+            (_, Err(error)) => mesh_reply_body::<()>(Err(map_host_error(HostError::InvalidFilter(
+                format!("invalid self-check zone_id: {error}"),
+            )))),
         },
     };
     tracing::info!(

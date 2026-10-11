@@ -643,3 +643,774 @@ async fn every_advertiser_unreachable_fails_closed_with_attempts()
     );
     Ok(())
 }
+
+// A real signed mesh peer whose reply can be changed between requests. The
+// entry node remains a real host process; only failing replica behavior is
+// controlled here.
+struct SignedReadPeer {
+    bind: SocketAddr,
+    reply: std::sync::Arc<std::sync::Mutex<Option<(u16, String)>>>,
+    forwards: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SignedReadPeer {
+    fn spawn(
+        mesh: &MeshFixture,
+        id: &str,
+        status: u16,
+        body: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        use fcp_mesh::invoke_route::{
+            AdvertisedConnector, MeshForwardReplayGuard, MeshPeerAdvertisement, MeshPeerDirectory,
+        };
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let node = mesh.node(id);
+        let bind = node.bind;
+        let key = Ed25519SigningKey::from_bytes(&node.key.to_bytes())?;
+        let node_id = TailscaleNodeId::new(node.id);
+        let directory = MeshPeerDirectory::from_json(node_id.clone(), &mesh.peers_json)?;
+        let listener = std::net::TcpListener::bind(bind)?;
+        let reply = Arc::new(std::sync::Mutex::new(Some((status, body))));
+        let forwards = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_reply = Arc::clone(&reply);
+        let thread_forwards = Arc::clone(&forwards);
+        let thread_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut replay = MeshForwardReplayGuard::new(60_000, 128);
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("accept signed peer connection");
+                if thread_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("peer read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("peer write timeout");
+                let (path, body) = read_signed_peer_request(&mut stream);
+                let response = match path.as_str() {
+                    "/rpc/mesh/advertisement" => {
+                        let advertisement = MeshPeerAdvertisement::sign(
+                            &key,
+                            node_id.clone(),
+                            fcp_host::mesh_routing::unix_now_ms(),
+                            vec![AdvertisedConnector {
+                                connector_id: REMOTE_CONNECTOR.to_owned(),
+                                zones: vec!["z:work".to_owned(), "z:owner".to_owned()],
+                                singleton_writer: false,
+                                summary_json: None,
+                            }],
+                        );
+                        serde_json::to_vec(&advertisement).expect("serialize advertisement")
+                    }
+                    "/rpc/mesh/forward" => {
+                        let envelope: MeshForwardEnvelope =
+                            serde_json::from_slice(&body).expect("decode signed forward");
+                        let now = fcp_host::mesh_routing::unix_now_ms();
+                        envelope
+                            .verify(&directory, now, 60_000)
+                            .expect("entry forward must authenticate");
+                        replay
+                            .check_and_record(&envelope, now)
+                            .expect("entry must use a fresh nonce for each attempt");
+                        thread_forwards.fetch_add(1, Ordering::SeqCst);
+                        let selected = thread_reply.lock().expect("reply lock").clone();
+                        let Some((status, body)) = selected else {
+                            // Received and authenticated, then disconnected before a reply.
+                            continue;
+                        };
+                        let reply = MeshForwardReply::sign(
+                            &key,
+                            node_id.clone(),
+                            &envelope,
+                            status,
+                            body,
+                        );
+                        serde_json::to_vec(&reply).expect("serialize signed reply")
+                    }
+                    unexpected => panic!("unexpected peer request: {unexpected}"),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .expect("write peer response headers");
+                stream.write_all(&response).expect("write peer response");
+            }
+        });
+        Ok(Self {
+            bind,
+            reply,
+            forwards,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn set_reply(&self, status: u16, body: String) {
+        *self.reply.lock().expect("reply lock") = Some((status, body));
+    }
+
+    fn disconnect_after_receipt(&self) {
+        *self.reply.lock().expect("reply lock") = None;
+    }
+
+    fn forwards(&self) -> usize {
+        self.forwards.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for SignedReadPeer {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.bind);
+        if let Some(worker) = self.worker.take() {
+            let joined = worker.join();
+            if !std::thread::panicking() {
+                joined.expect("signed read peer should finish without panicking");
+            }
+        }
+    }
+}
+
+fn read_signed_peer_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read request line");
+    let path = line
+        .split_whitespace()
+        .nth(1)
+        .expect("request path")
+        .to_owned();
+    let mut header_bytes = line.len();
+    let mut content_length = 0;
+    loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).expect("read header") > 0);
+        header_bytes += line.len();
+        assert!(header_bytes <= 16_384, "bounded peer request headers");
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().expect("content length");
+        }
+    }
+    assert!(content_length <= 2 * 1024 * 1024, "bounded peer request body");
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).expect("read request body");
+    (path, body)
+}
+
+fn ranked_read_nodes(zone: &ZoneId) -> Vec<TailscaleNodeId> {
+    fcp_mesh::planner::rank_lease_holders_by_hrw(
+        zone,
+        &advertised_connector_route_subject(REMOTE_CONNECTOR, zone),
+        &[
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-c"),
+        ],
+    )
+}
+
+async fn valid_mesh_read_responses() -> Result<(Value, Value), Box<dyn std::error::Error>> {
+    let connector = fcp_host::ConnectorSummary {
+        id: remote_connector(),
+        name: "Valid Read Replica".to_owned(),
+        description: None,
+        version: semver::Version::new(1, 0, 0),
+        categories: Vec::new(),
+        tool_count: 0,
+        max_safety_tier: fcp_core::SafetyTier::Safe,
+        enabled: true,
+        health: fcp_kernel::ConnectorHealth::Healthy,
+        last_health_check: None,
+    };
+    let state = fcp_host::HostAdminStateStore::new();
+    state
+        .reconcile_registered_connectors(std::slice::from_ref(&connector))
+        .await?;
+    let status = state.connector_status(&connector.id).await?;
+    let inventory = fcp_host::ConnectorInventoryResponse {
+        connector,
+        registry_version: 1,
+        cache: None,
+        meta: None,
+    };
+    Ok((serde_json::to_value(inventory)?, serde_json::to_value(status)?))
+}
+
+fn live_simulate_request(mesh: &MeshFixture, request_id: &str) -> Value {
+    let (source, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    json!({
+        "request_id": request_id,
+        "connector_id": REMOTE_CONNECTOR,
+        "operation": "test.echo",
+        "zone_id": "z:work",
+        "principal": "agent:test",
+        "input": {"message": "read-only simulation"},
+        "capability_token": source.capability_token,
+        "estimate_cost": false,
+        "check_availability": false,
+        "deadline_ms": 5000,
+    })
+}
+
+async fn simulate_receipts(
+    host: &HttpHostProcess,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    http_post_json(
+        host.client.clone(),
+        format!("{}/rpc/admin/simulate-receipts", host.base_url),
+        json!({"connector_id": REMOTE_CONNECTOR, "limit": 100}),
+    )
+    .await
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn read_queries_fail_over_unavailable_malformed_and_wrong_identity_replicas()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b", "node-c"])?;
+    let ranked = ranked_read_nodes(&ZoneId::owner());
+    let (inventory, status_response) = valid_mesh_read_responses().await?;
+    let first = SignedReadPeer::spawn(&mesh, ranked[0].as_str(), 503, "\"busy\"".to_owned())?;
+    let second = SignedReadPeer::spawn(&mesh, ranked[1].as_str(), 200, inventory.to_string())?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let mut wrong_inventory = inventory.clone();
+    wrong_inventory["connector"]["id"] = json!("fcp.test.wrong:utility:1.0.0");
+    let cases = [
+        (404, "\"advertisement is stale\"".to_owned()),
+        (503, "\"replica unavailable\"".to_owned()),
+        (200, "{".to_owned()),
+        (200, json!({"connector": {"id": REMOTE_CONNECTOR}}).to_string()),
+        (200, wrong_inventory.to_string()),
+    ];
+    for (status, body) in cases {
+        first.set_reply(status, body);
+        let previous_first = first.forwards();
+        let previous_second = second.forwards();
+        let response: Value = http_get_json(
+            entry.client.clone(),
+            format!("{}/rpc/connectors/{REMOTE_CONNECTOR}", entry.base_url),
+        )
+        .await?;
+        assert_eq!(response["connector"]["id"], REMOTE_CONNECTOR);
+        assert_eq!(response["connector"]["name"], "Valid Read Replica");
+        assert_eq!(first.forwards(), previous_first + 1);
+        assert_eq!(second.forwards(), previous_second + 1);
+    }
+
+    first.disconnect_after_receipt();
+    let previous_second = second.forwards();
+    let response: Value = http_get_json(
+        entry.client.clone(),
+        format!("{}/rpc/connectors/{REMOTE_CONNECTOR}", entry.base_url),
+    )
+    .await?;
+    assert_eq!(response["connector"]["id"], REMOTE_CONNECTOR);
+    assert_eq!(second.forwards(), previous_second + 1);
+
+    let mut wrong_status = status_response.clone();
+    wrong_status["connector_id"] = json!("fcp.test.wrong:utility:1.0.0");
+    first.set_reply(200, wrong_status.to_string());
+    second.set_reply(200, status_response.to_string());
+    let previous_second = second.forwards();
+    let status: Value = http_get_json(
+        entry.client.clone(),
+        format!("{}/rpc/connectors/{REMOTE_CONNECTOR}/status", entry.base_url),
+    )
+    .await?;
+    assert_eq!(status["connector_id"], REMOTE_CONNECTOR);
+    assert_eq!(second.forwards(), previous_second + 1);
+
+    // Exhaustion still rejects wrong identities and never reflects peer data.
+    wrong_inventory["connector"]["description"] = json!("private-replica-payload");
+    first.set_reply(200, wrong_inventory.to_string());
+    second.set_reply(200, wrong_inventory.to_string());
+    let response = entry
+        .client
+        .get(format!("{}/rpc/connectors/{REMOTE_CONNECTOR}", entry.base_url))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body = response.text().await?;
+    assert!(body.contains(ranked[0].as_str()) && body.contains(ranked[1].as_str()), "{body}");
+    assert!(body.contains("different connector"), "{body}");
+    assert!(!body.contains("private-replica-payload"), "{body}");
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn read_query_denials_do_not_probe_a_more_permissive_replica()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b", "node-c"])?;
+    let ranked = ranked_read_nodes(&ZoneId::owner());
+    let (inventory, _) = valid_mesh_read_responses().await?;
+    let first = SignedReadPeer::spawn(&mesh, ranked[0].as_str(), 403, "\"denied\"".to_owned())?;
+    let second = SignedReadPeer::spawn(&mesh, ranked[1].as_str(), 200, inventory.to_string())?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    for status in [400, 401, 403, 409, 422] {
+        first.set_reply(status, "\"private-policy-denial-details\"".to_owned());
+        let response = entry
+            .client
+            .get(format!("{}/rpc/connectors/{REMOTE_CONNECTOR}", entry.base_url))
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), status);
+        let body = response.text().await?;
+        assert!(body.contains(ranked[0].as_str()), "{body}");
+        assert!(!body.contains("private-policy-denial-details"), "{body}");
+        assert_eq!(second.forwards(), 0, "a denial must not search another executor");
+    }
+
+    first.set_reply(
+        200,
+        serde_json::to_string(&fcp_host::PreflightResponse::denied("policy denied"))?,
+    );
+    second.set_reply(
+        200,
+        serde_json::to_string(&fcp_host::PreflightResponse::allowed())?,
+    );
+    let response: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/preflight", entry.base_url),
+        json!({
+            "request_id": "authoritative-preflight-denial",
+            "connector_id": REMOTE_CONNECTOR,
+            "operation": "test.echo",
+            "zone_id": "z:owner",
+        }),
+    )
+    .await?;
+    assert_eq!(response["allowed"], false);
+    assert_eq!(response["reason"], "policy denied");
+    assert_eq!(second.forwards(), 0);
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn doctor_retries_self_check_replies_for_the_wrong_connector_or_zone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b", "node-c"])?;
+    let ranked = ranked_read_nodes(&ZoneId::work());
+    let valid = json!({
+        "connector_id": REMOTE_CONNECTOR,
+        "zone_id": "z:work",
+        "report": fcp_kernel::SelfCheckReport::ok(),
+    });
+    let first = SignedReadPeer::spawn(&mesh, ranked[0].as_str(), 200, valid.to_string())?;
+    let second = SignedReadPeer::spawn(&mesh, ranked[1].as_str(), 200, valid.to_string())?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    for (field, wrong) in [
+        ("connector_id", "fcp.test.wrong:utility:1.0.0"),
+        ("zone_id", "z:private"),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = json!(wrong);
+        first.set_reply(200, invalid.to_string());
+        let previous_second = second.forwards();
+        let response: Value = http_post_json(
+            entry.client.clone(),
+            format!("{}/doctor", entry.base_url),
+            json!({
+                "zone_id": "z:work",
+                "connectors": [REMOTE_CONNECTOR],
+                "self_check": true,
+            }),
+        )
+        .await?;
+        assert_eq!(response["overall_status"], "OK", "{response}");
+        assert_eq!(response["connector_self_checks"].as_array().unwrap().len(), 1);
+        assert_eq!(response["connector_self_checks"][0]["connector_id"], REMOTE_CONNECTOR);
+        assert_eq!(response["connector_self_checks"][0]["report"]["status"], "ok");
+        assert_eq!(second.forwards(), previous_second + 1);
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn simulations_fail_over_wrong_request_receipts_but_preserve_negative_verdicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b", "node-c"])?;
+    let ranked = ranked_read_nodes(&ZoneId::work());
+    let request = live_simulate_request(&mesh, "bound-mesh-simulation");
+    let input_cbor = fcp_crypto::canonicalize::to_deterministic_cbor(&request["input"])?;
+    let valid = json!({
+        "request_id": request["request_id"],
+        "would_succeed": true,
+        "phase": "connector_reached",
+        "preflight_allowed": true,
+        "duration_ms": 1,
+        "receipt": {
+            "receipt_id": "executor-simulation-receipt",
+            "connector_id": REMOTE_CONNECTOR,
+            "operation": "test.echo",
+            "phase": "connector_reached",
+            "would_succeed": true,
+            "input_digest": hex::encode(blake3::hash(&input_cbor).as_bytes()),
+            "duration_ms": 1,
+            "simulated_at": chrono::Utc::now(),
+        },
+    });
+    let first = SignedReadPeer::spawn(&mesh, ranked[0].as_str(), 200, valid.to_string())?;
+    let second = SignedReadPeer::spawn(&mesh, ranked[1].as_str(), 200, valid.to_string())?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    for (pointer, wrong) in [
+        ("/request_id", json!("different-request")),
+        ("/receipt/connector_id", json!("fcp.test.wrong:utility:1.0.0")),
+        ("/receipt/operation", json!("test.other")),
+        ("/receipt/input_digest", json!("wrong-input-digest")),
+        ("/receipt/phase", json!("preflight_only")),
+        ("/receipt/would_succeed", json!(false)),
+        ("/receipt/duration_ms", json!(99)),
+        ("/preflight_allowed", json!(false)),
+    ] {
+        let mut invalid = valid.clone();
+        *invalid.pointer_mut(pointer).expect("known simulation field") = wrong;
+        first.set_reply(200, invalid.to_string());
+        let previous_second = second.forwards();
+        let response: Value = http_post_json(
+            entry.client.clone(),
+            format!("{}/rpc/simulate", entry.base_url),
+            request.clone(),
+        )
+        .await?;
+        let typed: fcp_host::HostSimulateResponse = serde_json::from_value(response)?;
+        assert_eq!(typed.request_id, "bound-mesh-simulation");
+        assert!(typed.would_succeed);
+        assert_eq!(typed.receipt.receipt_id, "executor-simulation-receipt");
+        assert_eq!(second.forwards(), previous_second + 1);
+    }
+
+    let mut denied = valid;
+    denied["would_succeed"] = json!(false);
+    denied["preflight_allowed"] = json!(false);
+    denied["phase"] = json!("preflight_only");
+    denied["failure_reason"] = json!("authoritative executor policy denial");
+    denied["receipt"]["would_succeed"] = json!(false);
+    denied["receipt"]["phase"] = json!("preflight_only");
+    first.set_reply(200, denied.to_string());
+    let previous_second = second.forwards();
+    let response: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        request,
+    )
+    .await?;
+    assert_eq!(response["would_succeed"], false);
+    assert_eq!(response["preflight_allowed"], false);
+    assert_eq!(response["failure_reason"], "authoritative executor policy denial");
+    assert_eq!(second.forwards(), previous_second);
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn remote_simulate_returns_connector_details_and_keeps_receipts_on_the_executor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Remote simulation")],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let mut request = live_simulate_request(&mesh, "remote-simulate-basic");
+    let basic: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        request.clone(),
+    )
+    .await?;
+    assert_eq!(basic["request_id"], request["request_id"]);
+    assert_eq!(basic["phase"], "connector_reached", "{basic}");
+    assert_eq!(basic["preflight_allowed"], true);
+    assert_eq!(basic["would_succeed"], true);
+    assert!(basic.get("cost_estimate").is_none());
+    assert!(basic.get("availability").is_none());
+
+    request["request_id"] = json!("remote-simulate-details");
+    request["estimate_cost"] = json!(true);
+    request["check_availability"] = json!(true);
+    let detailed: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        request.clone(),
+    )
+    .await?;
+    assert_eq!(detailed["request_id"], request["request_id"]);
+    assert_eq!(detailed["phase"], "connector_reached", "{detailed}");
+    assert_eq!(detailed["preflight_allowed"], true);
+    assert_eq!(detailed["would_succeed"], true);
+    assert_eq!(detailed["cost_estimate"]["api_credits"], 7);
+    assert_eq!(detailed["cost_estimate"]["estimated_duration_ms"], 25);
+    assert_eq!(detailed["cost_estimate"]["estimated_bytes"], 128);
+    assert_eq!(detailed["cost_estimate"]["confidence"], "high");
+    assert_eq!(detailed["availability"]["available"], true);
+    assert_eq!(detailed["availability"]["rate_limit_remaining"], 42);
+    let input_cbor = fcp_crypto::canonicalize::to_deterministic_cbor(&request["input"])?;
+    assert_eq!(
+        detailed["receipt"]["input_digest"],
+        hex::encode(blake3::hash(&input_cbor).as_bytes())
+    );
+    assert_eq!(detailed["receipt"]["connector_id"], REMOTE_CONNECTOR);
+    assert_eq!(detailed["receipt"]["operation"], "test.echo");
+    assert_eq!(detailed["receipt"]["phase"], detailed["phase"]);
+    assert_eq!(detailed["receipt"]["would_succeed"], detailed["would_succeed"]);
+    assert_eq!(detailed["receipt"]["duration_ms"], detailed["duration_ms"]);
+
+    let receipts = simulate_receipts(&executor).await?;
+    assert_eq!(receipts["total_receipts"], 2, "{receipts}");
+    let records = receipts["receipts"].as_array().expect("executor simulation receipts");
+    assert!(records.iter().any(|receipt| receipt == &basic["receipt"]));
+    assert!(records.iter().any(|receipt| receipt == &detailed["receipt"]));
+    assert_eq!(
+        simulate_receipts(&entry).await?["total_receipts"],
+        0,
+        "the origin must return the executor's receipt without inventing a local simulation"
+    );
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn remote_simulate_distinguishes_connector_denial_unsupported_and_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let unsupported_id = ConnectorId::from_static("fcp.test.sim-unsupported:utility:1.0.0");
+    let slow_id = ConnectorId::from_static("fcp.test.sim-slow:utility:1.0.0");
+    let mut denied_config = plain_test_connector_config(&remote_connector(), "Denied simulation");
+    denied_config["env"]["FCP_TEST_CONNECTOR_SIMULATE_MODE"] = json!("denied");
+    let mut unsupported_config = plain_test_connector_config(&unsupported_id, "Unsupported simulation");
+    unsupported_config["env"]["FCP_TEST_CONNECTOR_SIMULATE_MODE"] = json!("unsupported");
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![
+                denied_config,
+                unsupported_config,
+                plain_test_connector_config(&slow_id, "Slow simulation"),
+            ],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+
+    let denied: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        live_simulate_request(&mesh, "connector-predicts-failure"),
+    )
+    .await?;
+    assert_eq!(denied["preflight_allowed"], true, "{denied}");
+    assert_eq!(denied["phase"], "connector_reached");
+    assert_eq!(denied["would_succeed"], false);
+    assert_eq!(denied["denial_code"], "FCP-TEST-SIMULATE");
+    assert_eq!(denied["receipt"]["would_succeed"], false);
+
+    let mut unsupported_request = live_simulate_request(&mesh, "connector-cannot-simulate");
+    unsupported_request["connector_id"] = json!(unsupported_id.as_str());
+    let unsupported: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        unsupported_request,
+    )
+    .await?;
+    assert_eq!(unsupported["preflight_allowed"], true, "{unsupported}");
+    assert_eq!(unsupported["phase"], "connector_unsupported");
+    assert_eq!(unsupported["would_succeed"], false);
+    assert!(unsupported["failure_reason"].as_str().is_some_and(|reason| !reason.is_empty()));
+
+    // Warm the real connector and signed advertisement cache before exercising
+    // its execution deadline, so startup latency is not the property tested.
+    let mut slow_request = live_simulate_request(&mesh, "warm-slow-connector");
+    slow_request["connector_id"] = json!(slow_id.as_str());
+    let warmed: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        slow_request.clone(),
+    )
+    .await?;
+    assert_eq!(warmed["would_succeed"], true, "{warmed}");
+    slow_request["request_id"] = json!("bounded-remote-simulation");
+    slow_request["input"]["delay_ms"] = json!(300);
+    slow_request["deadline_ms"] = json!(50);
+    let timed_out: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        slow_request,
+    )
+    .await?;
+    assert_eq!(timed_out["preflight_allowed"], true, "{timed_out}");
+    assert_eq!(timed_out["phase"], "timed_out");
+    assert_eq!(timed_out["would_succeed"], false);
+    assert_eq!(timed_out["receipt"]["phase"], "timed_out");
+
+    for response in [&denied, &unsupported, &timed_out] {
+        let query = json!({"connector_id": response["receipt"]["connector_id"], "limit": 100});
+        let executor_receipts: Value = http_post_json(
+            executor.client.clone(),
+            format!("{}/rpc/admin/simulate-receipts", executor.base_url),
+            query.clone(),
+        )
+        .await?;
+        assert!(
+            executor_receipts["receipts"]
+                .as_array()
+                .expect("executor receipts")
+                .iter()
+                .any(|receipt| receipt == &response["receipt"]),
+            "the executor must journal the exact terminal simulation outcome"
+        );
+        let entry_receipts: Value = http_post_json(
+            entry.client.clone(),
+            format!("{}/rpc/admin/simulate-receipts", entry.base_url),
+            query,
+        )
+        .await?;
+        assert_eq!(entry_receipts["total_receipts"], 0);
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn remote_simulate_rechecks_capability_principal_and_signed_zone_on_the_executor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Authorized simulation")],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+
+    let mut invalid_token_request = live_simulate_request(&mesh, "wrong-simulation-key");
+    let (untrusted, _) = build_invoke_request(remote_connector(), &Ed25519SigningKey::generate());
+    invalid_token_request["capability_token"] = serde_json::to_value(untrusted.capability_token)?;
+    let bad_token: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        invalid_token_request,
+    )
+    .await?;
+    assert_eq!(bad_token["phase"], "preflight_only", "{bad_token}");
+    assert_eq!(bad_token["preflight_allowed"], false);
+    assert_eq!(bad_token["would_succeed"], false);
+
+    let principal_response = entry
+        .client
+        .post(format!("{}/rpc/simulate", entry.base_url))
+        .header("x-principal", "agent:other")
+        .json(&live_simulate_request(&mesh, "wrong-simulation-principal"))
+        .send()
+        .await?;
+    assert!(principal_response.status().is_success());
+    let bad_principal: Value = principal_response.json().await?;
+    assert_eq!(bad_principal["phase"], "preflight_only", "{bad_principal}");
+    assert_eq!(bad_principal["preflight_allowed"], false);
+    assert_eq!(bad_principal["would_succeed"], false);
+    assert!(
+        bad_principal["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.to_lowercase().contains("principal")),
+        "{bad_principal}"
+    );
+
+    // Bypass advertisement filtering with an authenticated peer request: the
+    // executor itself must reject a connector outside its configured zone.
+    let mut wrong_zone = live_simulate_request(&mesh, "wrong-simulation-zone");
+    wrong_zone["zone_id"] = json!("z:private");
+    let envelope = MeshForwardEnvelope::sign(
+        &mesh.node("node-a").key,
+        TailscaleNodeId::new("node-a"),
+        TailscaleNodeId::new("node-b"),
+        fcp_host::mesh_routing::unix_now_ms(),
+        MeshForwardBody::Simulate {
+            request_json: serde_json::to_string(&wrong_zone)?,
+            asserted_principal: Some("agent:test".to_owned()),
+        },
+    )?;
+    let mut tampered = envelope.clone();
+    wrong_zone["zone_id"] = json!("z:work");
+    tampered.body = MeshForwardBody::Simulate {
+        request_json: serde_json::to_string(&wrong_zone)?,
+        asserted_principal: Some("agent:test".to_owned()),
+    };
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &tampered).await?;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let reply: MeshForwardReply = serde_json::from_str(&body)?;
+    let directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+        TailscaleNodeId::new("node-a"),
+        &mesh.peers_json,
+    )?;
+    reply.verify_for(&envelope, &directory)?;
+    assert!(reply.is_success(), "{body}");
+    let bad_zone: Value = serde_json::from_str(&reply.body_json)?;
+    assert_eq!(bad_zone["phase"], "preflight_only", "{bad_zone}");
+    assert_eq!(bad_zone["preflight_allowed"], false);
+    assert_eq!(bad_zone["would_succeed"], false);
+    let (status, body) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+
+    let receipts = simulate_receipts(&executor).await?;
+    assert_eq!(receipts["total_receipts"], 3, "{receipts}");
+    let records = receipts["receipts"].as_array().expect("executor denial receipts");
+    for response in [&bad_token, &bad_principal, &bad_zone] {
+        assert!(records.iter().any(|receipt| receipt == &response["receipt"]));
+    }
+    assert_eq!(simulate_receipts(&entry).await?["total_receipts"], 0);
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn simulation_prefers_the_local_connector_verdict_over_a_healthy_peer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let peer = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Permissive remote")],
+        )
+        .await?;
+    let mut local_config = plain_test_connector_config(&remote_connector(), "Authoritative local");
+    local_config["env"]["FCP_TEST_CONNECTOR_SIMULATE_MODE"] = json!("denied");
+    let entry = mesh.spawn("node-a", vec![local_config]).await?;
+    let response: Value = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/simulate", entry.base_url),
+        live_simulate_request(&mesh, "prefer-local-simulation"),
+    )
+    .await?;
+    assert_eq!(response["preflight_allowed"], true, "{response}");
+    assert_eq!(response["phase"], "connector_reached");
+    assert_eq!(response["would_succeed"], false);
+    assert_eq!(response["denial_code"], "FCP-TEST-SIMULATE");
+    let local_receipts = simulate_receipts(&entry).await?;
+    assert_eq!(local_receipts["total_receipts"], 1);
+    assert_eq!(local_receipts["receipts"][0], response["receipt"]);
+    assert_eq!(simulate_receipts(&peer).await?["total_receipts"], 0);
+    Ok(())
+}

@@ -1,5 +1,6 @@
 //! Doctor report service for mesh health and connector self-checks.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,20 @@ pub struct ConnectorSelfCheck {
     pub connector_id: ConnectorId,
 
     /// Self-check report from connector.
+    pub report: SelfCheckReport,
+}
+
+/// Identity-bound connector report returned by a host self-check query.
+///
+/// Remote reports contribute connector evidence only; they cannot replace the
+/// requesting host's local zone-health baseline.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HostConnectorSelfCheckResponse {
+    /// Connector whose implementation produced the report.
+    pub connector_id: ConnectorId,
+    /// Zone whose admission policy was checked before invoking the connector.
+    pub zone_id: ZoneId,
+    /// Result of the connector's bounded self-check.
     pub report: SelfCheckReport,
 }
 
@@ -278,11 +293,41 @@ where
         }
     }
 
-    /// Build a doctor report for the given request.
+    /// Maximum time allowed for each connector self-check, including routing.
+    #[must_use]
+    pub const fn self_check_timeout(&self) -> Duration {
+        self.self_check_timeout
+    }
+
+    /// Build a doctor report using the local connector registry.
     ///
     /// # Errors
-    /// Returns a `HostError` when inputs are invalid or connectors are missing.
+    /// Returns a `HostError` when the zone or a connector identifier is invalid.
     pub async fn handle(&self, request: DoctorRequest) -> HostResult<DoctorReport> {
+        self.handle_with_self_check(request, |connector_id, _zone_id| async move {
+            Ok(self.registry.self_check(&connector_id).await)
+        })
+        .await
+    }
+
+    /// Build a doctor report using a resolver for connector self-check evidence.
+    ///
+    /// Each resolver receives the requested connector and zone, and its entire
+    /// operation is bounded by the configured self-check timeout. Individual
+    /// routing failures become failed connector reports so other results remain
+    /// available. The zone-health baseline always belongs to the requesting host.
+    ///
+    /// # Errors
+    /// Returns a `HostError` when the zone or a connector identifier is invalid.
+    pub async fn handle_with_self_check<F, Fut>(
+        &self,
+        request: DoctorRequest,
+        resolve: F,
+    ) -> HostResult<DoctorReport>
+    where
+        F: Fn(ConnectorId, ZoneId) -> Fut,
+        Fut: Future<Output = HostResult<Option<SelfCheckReport>>>,
+    {
         let zone: ZoneId = request.zone_id.parse().map_err(|err| {
             HostError::InvalidFilter(format!("invalid zone_id '{}': {err}", request.zone_id))
         })?;
@@ -296,16 +341,24 @@ where
                     HostError::InvalidFilter(format!("invalid connector id '{connector}': {err}"))
                 })?;
 
-                let registry = Arc::clone(&self.registry);
+                let resolve = &resolve;
+                let connector_zone = zone.clone();
                 let timeout = self.self_check_timeout;
 
                 futures.push(async move {
                     let context = ExecutionContext::request_scoped(timeout);
-                    let report = match context.run(registry.self_check(&connector_id)).await {
-                        Ok(Some(report)) => report,
-                        Ok(None) => SelfCheckReport::failed(
+                    let report = match context
+                        .run(resolve(connector_id.clone(), connector_zone))
+                        .await
+                    {
+                        Ok(Ok(Some(report))) => report,
+                        Ok(Ok(None)) => SelfCheckReport::failed(
                             "not_found",
                             "connector not found in registry".to_string(),
+                        ),
+                        Ok(Err(error)) => SelfCheckReport::failed(
+                            "self_check_runtime",
+                            format!("connector self_check failed: {error}"),
                         ),
                         Err(AsyncError::Timeout { .. }) => SelfCheckReport::failed(
                             "self_check_timeout",
@@ -320,16 +373,16 @@ where
                             format!("self_check runtime failure: {error}"),
                         ),
                     };
-                    Ok(ConnectorSelfCheck {
+                    ConnectorSelfCheck {
                         connector_id,
                         report,
-                    })
+                    }
                 });
             }
 
             let mut stream = futures_util::stream::iter(futures).buffer_unordered(16);
-            while let Some(result) = stream.next().await {
-                self_checks.push(result?);
+            while let Some(check) = stream.next().await {
+                self_checks.push(check);
             }
         }
 
@@ -345,10 +398,12 @@ fn overall_status_from_self_checks(checks: &[ConnectorSelfCheck]) -> OverallStat
         return OverallStatus::Fail;
     }
 
-    if checks
-        .iter()
-        .any(|check| check.report.status == SelfCheckStatus::Degraded)
-    {
+    if checks.iter().any(|check| {
+        matches!(
+            check.report.status,
+            SelfCheckStatus::Degraded | SelfCheckStatus::Unsupported
+        )
+    }) {
         return OverallStatus::Warn;
     }
 
@@ -877,6 +932,154 @@ mod tests {
 
         let report = service.handle(request).await.unwrap();
         assert_eq!(report.overall_status, OverallStatus::Ok);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn doctor_routed_self_checks_keep_zone_baseline_and_aggregate_missing_evidence() {
+        let service = DoctorService::new(Arc::new(TestRegistry::always_fail()));
+        let request = DoctorRequest {
+            zone_id: "z:work".to_string(),
+            connectors: vec![
+                fixture_connector_id("ready").to_string(),
+                fixture_connector_id("unsupported").to_string(),
+            ],
+            self_check: true,
+        };
+
+        let report = service
+            .handle_with_self_check(request, |connector_id, zone_id| async move {
+                assert_eq!(zone_id.as_str(), "z:work");
+                if connector_id == fixture_connector_id("ready") {
+                    Ok(Some(SelfCheckReport::ok()))
+                } else {
+                    assert_eq!(connector_id, fixture_connector_id("unsupported"));
+                    Ok(Some(SelfCheckReport::unsupported()))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.connector_self_checks.len(), 2);
+        assert_eq!(report.overall_status, OverallStatus::Warn);
+        assert!(report.connector_self_checks.iter().any(|check| {
+            check.connector_id == fixture_connector_id("ready")
+                && check.report.status == SelfCheckStatus::Ok
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.connector_id.as_ref() == Some(&fixture_connector_id("unsupported"))
+                && check.status == CheckStatus::Warn
+                && check
+                    .repair_hints
+                    .iter()
+                    .any(|hint| hint.contains("missing runtime evidence"))
+        }));
+        assert!(
+            report
+                .recommended_actions
+                .iter()
+                .any(|hint| hint.contains("missing runtime evidence"))
+        );
+
+        let baseline = DoctorReport::baseline("z:work");
+        assert_eq!(report.zone_id, baseline.zone_id);
+        assert_eq!(report.checkpoint.freshness, baseline.checkpoint.freshness);
+        assert_eq!(report.revocation.freshness, baseline.revocation.freshness);
+        assert_eq!(report.audit.freshness, baseline.audit.freshness);
+        assert_eq!(
+            report.store_coverage.store_healthy,
+            baseline.store_coverage.store_healthy
+        );
+        assert_eq!(
+            report.transport_policy.allow_lan,
+            baseline.transport_policy.allow_lan
+        );
+        assert_eq!(
+            report.transport_policy.allow_derp,
+            baseline.transport_policy.allow_derp
+        );
+        assert_eq!(
+            report.transport_policy.allow_funnel,
+            baseline.transport_policy.allow_funnel
+        );
+        assert_eq!(
+            report.degraded_mode.is_degraded,
+            baseline.degraded_mode.is_degraded
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn doctor_routing_errors_preserve_every_requested_connector() {
+        let service = DoctorService::new(Arc::new(TestRegistry::always_fail()));
+        let request = DoctorRequest {
+            zone_id: "z:work".to_string(),
+            connectors: vec![
+                fixture_connector_id("ready").to_string(),
+                fixture_connector_id("unreachable").to_string(),
+            ],
+            self_check: true,
+        };
+
+        let report = service
+            .handle_with_self_check(request, |connector_id, _zone_id| async move {
+                if connector_id == fixture_connector_id("ready") {
+                    Ok(Some(SelfCheckReport::ok()))
+                } else {
+                    Err(HostError::Unavailable("peer unavailable".to_string()))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.connector_self_checks.len(), 2);
+        assert_eq!(report.overall_status, OverallStatus::Fail);
+        assert!(report.connector_self_checks.iter().any(|check| {
+            check.connector_id == fixture_connector_id("ready")
+                && check.report.status == SelfCheckStatus::Ok
+        }));
+        let failed = report
+            .connector_self_checks
+            .iter()
+            .find(|check| check.connector_id == fixture_connector_id("unreachable"))
+            .expect("routing failures must retain the requested connector");
+        assert_eq!(failed.report.status, SelfCheckStatus::Failed);
+        assert_eq!(
+            failed.report.reason_code.as_deref(),
+            Some("self_check_runtime")
+        );
+        assert!(
+            failed
+                .report
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("peer unavailable"))
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn doctor_routing_deadline_covers_an_unresponsive_resolver() {
+        let service = DoctorService::with_timeout(
+            Arc::new(TestRegistry::always_ok()),
+            Duration::from_millis(20),
+        );
+        let request = DoctorRequest {
+            zone_id: "z:work".to_string(),
+            connectors: vec![fixture_connector_id("unresponsive").to_string()],
+            self_check: true,
+        };
+
+        let report = service
+            .handle_with_self_check(request, |_, _| {
+                std::future::pending::<HostResult<Option<SelfCheckReport>>>()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(report.connector_self_checks.len(), 1);
+        assert_eq!(report.overall_status, OverallStatus::Fail);
+        assert_eq!(
+            report.connector_self_checks[0].report.reason_code.as_deref(),
+            Some("self_check_timeout")
+        );
     }
 
     // ── FreshnessLevel tests ──
@@ -2291,13 +2494,15 @@ mod tests {
     }
 
     #[test]
-    fn overall_status_unsupported_treated_as_ok() {
+    fn overall_status_unsupported_is_missing_health_evidence() {
         let checks = [ConnectorSelfCheck {
             connector_id: fixture_connector_id("unsup"),
             report: SelfCheckReport::unsupported(),
         }];
-        // Unsupported is neither Failed nor Degraded, so overall should be Ok
-        assert_eq!(overall_status_from_self_checks(&checks), OverallStatus::Ok);
+        assert_eq!(
+            overall_status_from_self_checks(&checks),
+            OverallStatus::Warn
+        );
     }
 
     #[test]

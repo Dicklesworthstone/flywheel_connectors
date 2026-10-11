@@ -426,6 +426,14 @@ pub enum MeshForwardBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         asserted_principal: Option<String>,
     },
+    /// Run the connector's bounded simulation after executor-local admission.
+    Simulate {
+        /// JSON-encoded host simulation request, exactly as signed.
+        request_json: String,
+        /// Principal the client asserted to the entry node.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asserted_principal: Option<String>,
+    },
     /// Return the connector's introspection document.
     Introspect {
         /// Canonical connector id.
@@ -441,6 +449,13 @@ pub enum MeshForwardBody {
         /// Canonical connector id.
         connector_id: String,
     },
+    /// Run a bounded self-check for a connector admitted to the requested zone.
+    SelfCheck {
+        /// Canonical connector id.
+        connector_id: String,
+        /// Zone whose connector installation is being diagnosed.
+        zone_id: String,
+    },
 }
 
 impl MeshForwardBody {
@@ -450,9 +465,11 @@ impl MeshForwardBody {
         match self {
             Self::Invoke { .. } => "invoke",
             Self::Preflight { .. } => "preflight",
+            Self::Simulate { .. } => "simulate",
             Self::Introspect { .. } => "introspect",
             Self::Inventory { .. } => "inventory",
             Self::Status { .. } => "status",
+            Self::SelfCheck { .. } => "self_check",
         }
     }
 
@@ -466,6 +483,10 @@ impl MeshForwardBody {
             | Self::Preflight {
                 request_json,
                 asserted_principal,
+            }
+            | Self::Simulate {
+                request_json,
+                asserted_principal,
             } => {
                 out.field(request_json.as_bytes())
                     .opt_field(asserted_principal.as_deref().map(str::as_bytes));
@@ -474,6 +495,12 @@ impl MeshForwardBody {
             | Self::Inventory { connector_id }
             | Self::Status { connector_id } => {
                 out.field(connector_id.as_bytes());
+            }
+            Self::SelfCheck {
+                connector_id,
+                zone_id,
+            } => {
+                out.field(connector_id.as_bytes()).field(zone_id.as_bytes());
             }
         }
     }
@@ -487,10 +514,18 @@ impl MeshForwardBody {
             | Self::Preflight {
                 request_json,
                 asserted_principal,
+            }
+            | Self::Simulate {
+                request_json,
+                asserted_principal,
             } => request_json.len() + asserted_principal.as_ref().map_or(0, String::len),
             Self::Introspect { connector_id }
             | Self::Inventory { connector_id }
             | Self::Status { connector_id } => connector_id.len(),
+            Self::SelfCheck {
+                connector_id,
+                zone_id,
+            } => connector_id.len().saturating_add(zone_id.len()),
         }
     }
 }
@@ -1373,7 +1408,7 @@ mod tests {
             .expect("untampered preflight forward verifies");
     }
 
-    fn connector_query_bodies(connector_id: &str) -> [MeshForwardBody; 3] {
+    fn connector_query_bodies(connector_id: &str) -> [MeshForwardBody; 4] {
         [
             MeshForwardBody::Introspect {
                 connector_id: connector_id.to_owned(),
@@ -1384,7 +1419,126 @@ mod tests {
             MeshForwardBody::Status {
                 connector_id: connector_id.to_owned(),
             },
+            MeshForwardBody::SelfCheck {
+                connector_id: connector_id.to_owned(),
+                zone_id: "z:work".to_owned(),
+            },
         ]
+    }
+
+    #[test]
+    fn self_check_forward_binds_zone_and_counts_it_toward_body_limit() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let envelope = MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            NOW,
+            MeshForwardBody::SelfCheck {
+                connector_id: "fcp.test.remote:utility:1.0.0".to_owned(),
+                zone_id: "z:work".to_owned(),
+            },
+        )
+        .unwrap();
+        let mut changed_zone = envelope.clone();
+        if let MeshForwardBody::SelfCheck { zone_id, .. } = &mut changed_zone.body {
+            *zone_id = "z:private".to_owned();
+        }
+        assert!(matches!(
+            changed_zone.verify(&mesh.directory("node-b"), NOW, 30_000),
+            Err(MeshForwardError::SignatureInvalid { .. })
+        ));
+        envelope
+            .verify(&mesh.directory("node-b"), NOW, 30_000)
+            .expect("untampered zone-bound self-check verifies");
+
+        let oversized = MeshForwardBody::SelfCheck {
+            connector_id: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES - 1),
+            zone_id: "zz".to_owned(),
+        };
+        assert!(matches!(
+            MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                oversized,
+            ),
+            Err(MeshForwardError::BodyTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn simulation_forward_binds_request_principal_and_method() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        let request_json =
+            r#"{"request_id":"req_sim","zone_id":"z:work","estimate_cost":true,"deadline_ms":50}"#
+                .to_owned();
+        let envelope = MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            NOW,
+            MeshForwardBody::Simulate {
+                request_json: request_json.clone(),
+                asserted_principal: Some("user:alice".to_owned()),
+            },
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(wire["body"]["method"], "simulate");
+        let decoded: MeshForwardEnvelope = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, envelope);
+        decoded
+            .verify(&directory, NOW, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)
+            .unwrap();
+
+        let changed_bodies = [
+            MeshForwardBody::Simulate {
+                request_json: r#"{"request_id":"req_sim","zone_id":"z:private"}"#.to_owned(),
+                asserted_principal: Some("user:alice".to_owned()),
+            },
+            MeshForwardBody::Simulate {
+                request_json: request_json.clone(),
+                asserted_principal: Some("user:bob".to_owned()),
+            },
+            MeshForwardBody::Simulate {
+                request_json: request_json.clone(),
+                asserted_principal: None,
+            },
+            MeshForwardBody::Invoke {
+                request_json: request_json.clone(),
+                asserted_principal: Some("user:alice".to_owned()),
+            },
+            MeshForwardBody::Preflight {
+                request_json,
+                asserted_principal: Some("user:alice".to_owned()),
+            },
+        ];
+        for body in changed_bodies {
+            let mut changed = envelope.clone();
+            changed.body = body;
+            assert!(matches!(
+                changed.verify(&directory, NOW, DEFAULT_MESH_FORWARD_MAX_SKEW_MS),
+                Err(MeshForwardError::SignatureInvalid { .. })
+            ));
+        }
+
+        let oversized = MeshForwardBody::Simulate {
+            request_json: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES),
+            asserted_principal: Some("a".to_owned()),
+        };
+        assert!(matches!(
+            MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                oversized,
+            ),
+            Err(MeshForwardError::BodyTooLarge { .. })
+        ));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fcp_core::{CostEstimate, CostEstimateConfidence, ResourceAvailability};
 use fcp_host::ConnectorArchetype;
 use fcp_kernel::{
     AgentHint, ApprovalMode, AuthCaps, ConnectorId, EventCaps, FcpError, HandshakeRequest,
@@ -318,6 +319,7 @@ impl FixtureOperationMode {
 enum FixtureSimulateMode {
     Allowed,
     Denied,
+    Unsupported,
 }
 
 impl FixtureSimulateMode {
@@ -327,6 +329,7 @@ impl FixtureSimulateMode {
             .as_deref()
         {
             Some("denied") => Self::Denied,
+            Some("unsupported") => Self::Unsupported,
             _ => Self::Allowed,
         }
     }
@@ -335,6 +338,7 @@ impl FixtureSimulateMode {
         match self {
             Self::Allowed => "allowed",
             Self::Denied => "denied",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -689,14 +693,39 @@ impl TestConnector {
             });
         }
 
-        let response = match self.profile.simulate_mode {
+        if let Some(delay_ms) = req.input.get("delay_ms").and_then(serde_json::Value::as_u64) {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+
+        let mut response = match self.profile.simulate_mode {
             FixtureSimulateMode::Allowed => SimulateResponse::allowed(req.id),
             FixtureSimulateMode::Denied => SimulateResponse::denied(
                 req.id,
                 "simulate disabled by fixture profile",
                 "FCP-TEST-SIMULATE",
             ),
+            FixtureSimulateMode::Unsupported => {
+                return Err(FcpError::InvalidRequest {
+                    code: 1002,
+                    message: "Unknown method: simulate".to_string(),
+                });
+            }
         };
+        if req.estimate_cost {
+            response.estimated_cost = Some(
+                CostEstimate::with_credits(7)
+                    .and_duration_ms(25)
+                    .and_bytes(128)
+                    .and_confidence(CostEstimateConfidence::High),
+            );
+        }
+        if req.check_availability {
+            response.availability = Some(
+                ResourceAvailability::available()
+                    .with_rate_limit(42, None)
+                    .with_details("fixture resource is available"),
+            );
+        }
         serde_json::to_value(response).map_err(|err| FcpError::Internal {
             message: format!("Failed to serialize simulate response: {err}"),
         })
