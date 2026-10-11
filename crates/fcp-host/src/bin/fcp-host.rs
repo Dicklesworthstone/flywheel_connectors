@@ -160,6 +160,8 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tower::ServiceExt;
 
+#[path = "fcp-host/invoke_jobs.rs"]
+mod invoke_jobs;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
@@ -4840,6 +4842,8 @@ struct AppState {
     /// literally true even when the connector returns no `receipt_id`
     /// or fails before producing a receipt.
     invoke_audit: Arc<fcp_host::InvokeAuditChain>,
+    /// Runtime-root task handles retained through local invocation finalization.
+    invoke_jobs: Arc<invoke_jobs::InvocationJobs>,
     started_at: Instant,
     /// Mesh-backed invoke routing (bridge plan A.2). `None` on a
     /// host-first deployment without a mesh peer directory.
@@ -8042,6 +8046,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         zone_policies: Arc::new(RwLock::new(zone_policies)),
         telemetry_config,
         invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+        invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
         started_at: Instant::now(),
         mesh: mesh_router,
     });
@@ -8132,6 +8137,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
             post(lifecycle_transition_handler).get(lifecycle_record_handler),
         )
         .route("/rpc/admin/journal", post(journal_query_handler))
+        .route("/rpc/admin/invocations", post(invocation_query_handler))
         .route(
             "/rpc/admin/journal/{connector_id}",
             get(journal_connector_handler),
@@ -8305,35 +8311,46 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
 
     let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
 
-    // Spawn signal handler task.
+    // Retain signal ownership so startup or serve errors cannot leave a
+    // signal task holding the host alive after the main job has returned.
     let signal_state = Arc::clone(&state);
-    task::spawn_detached(async move {
+    let _signal_handler = task::try_spawn(async move {
         signal_handler_loop(signal_state, shutdown_tx).await;
-    });
+    })
+    .map_err(|error| {
+        HostError::Unavailable(format!("signal handler task admission failed: {error}"))
+    })?;
 
-    match bind_target {
-        BindTarget::Tcp(addr) => {
-            let listener = TcpListener::bind(addr)
-                .await
-                .map_err(|err| HostError::Internal(format!("tcp bind error: {err}")))?;
-            tracing::info!(transport = "tcp", %addr, "fcp-host listening");
-            serve_tcp(listener, app, shutdown_rx).await?;
-        }
-        #[cfg(unix)]
-        BindTarget::Unix(path) => {
-            prepare_unix_socket_path(&path)?;
-            let listener = UnixListener::bind(&path)
-                .await
-                .map_err(|err| HostError::Internal(format!("unix bind error: {err}")))?;
-            tracing::info!(
-                transport = "unix",
-                socket_path = %path.display(),
-                "fcp-host listening"
-            );
-            serve_unix(listener, app, shutdown_rx).await?;
+    let serve_result = async {
+        match bind_target {
+            BindTarget::Tcp(addr) => {
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|err| HostError::Internal(format!("tcp bind error: {err}")))?;
+                tracing::info!(transport = "tcp", %addr, "fcp-host listening");
+                serve_tcp(listener, app, shutdown_rx).await
+            }
+            #[cfg(unix)]
+            BindTarget::Unix(path) => {
+                prepare_unix_socket_path(&path)?;
+                let listener = UnixListener::bind(&path)
+                    .await
+                    .map_err(|err| HostError::Internal(format!("unix bind error: {err}")))?;
+                tracing::info!(
+                    transport = "unix",
+                    socket_path = %path.display(),
+                    "fcp-host listening"
+                );
+                serve_unix(listener, app, shutdown_rx).await
+            }
         }
     }
+    .await;
 
+    state.invoke_jobs.stop_accepting();
+    let drain_result = state.invoke_jobs.shutdown(invoke_jobs::SHUTDOWN_GRACE).await;
+    serve_result?;
+    drain_result?;
     tracing::info!(event = "host_shutdown_complete", "fcp-host exiting cleanly");
     Ok(())
 }
@@ -8341,6 +8358,14 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Signal handling
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn request_host_shutdown(
+    state: &AppState,
+    shutdown_tx: &fcp_async_core::channel::watch::Sender<bool>,
+) {
+    state.invoke_jobs.stop_accepting();
+    let _ = shutdown_tx.send(true);
+}
 
 #[cfg(unix)]
 async fn signal_handler_loop(
@@ -8359,7 +8384,7 @@ async fn signal_handler_loop(
                 error = %err,
                 "failed to register SIGHUP handler; initiating shutdown"
             );
-            let _ = shutdown_tx.send(true);
+            request_host_shutdown(&state, &shutdown_tx);
             return;
         }
     };
@@ -8372,7 +8397,7 @@ async fn signal_handler_loop(
                 error = %err,
                 "failed to register SIGTERM handler; initiating shutdown"
             );
-            let _ = shutdown_tx.send(true);
+            request_host_shutdown(&state, &shutdown_tx);
             return;
         }
     };
@@ -8385,7 +8410,7 @@ async fn signal_handler_loop(
                 error = %err,
                 "failed to register SIGINT handler; initiating shutdown"
             );
-            let _ = shutdown_tx.send(true);
+            request_host_shutdown(&state, &shutdown_tx);
             return;
         }
     };
@@ -8427,7 +8452,7 @@ async fn signal_handler_loop(
                     break;
                 }
                 tracing::info!(event = "sigterm_received", "initiating graceful shutdown");
-                let _ = shutdown_tx.send(true);
+                request_host_shutdown(&state, &shutdown_tx);
                 break;
             }
             delivered = sigint_recv => {
@@ -8435,7 +8460,7 @@ async fn signal_handler_loop(
                     break;
                 }
                 tracing::info!(event = "sigint_received", "initiating graceful shutdown");
-                let _ = shutdown_tx.send(true);
+                request_host_shutdown(&state, &shutdown_tx);
                 break;
             }
         }
@@ -8444,7 +8469,7 @@ async fn signal_handler_loop(
 
 #[cfg(not(unix))]
 async fn signal_handler_loop(
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     shutdown_tx: fcp_async_core::channel::watch::Sender<bool>,
 ) {
     // On non-Unix platforms, wait for Ctrl+C through the native asupersync
@@ -8456,11 +8481,11 @@ async fn signal_handler_loop(
             error = %err,
             "failed to register Ctrl+C handler; initiating shutdown"
         );
-        let _ = shutdown_tx.send(true);
+        request_host_shutdown(&state, &shutdown_tx);
         return;
     }
     tracing::info!(event = "ctrl_c_received", "initiating graceful shutdown");
-    let _ = shutdown_tx.send(true);
+    request_host_shutdown(&state, &shutdown_tx);
 }
 
 /// Reload connector configuration from disk without restarting the host.
@@ -11959,31 +11984,26 @@ fn mcp_sampling_host_response(
 }
 
 async fn maybe_orchestrate_mcp_sampling(
-    state: &AppState,
+    state: &Arc<AppState>,
     asserted_principal: Option<&str>,
     source: &InvokeRequest,
     response: InvokeResponse,
-) -> HostResult<InvokeResponse> {
+    deadline: Instant,
+) -> HostResult<(InvokeResponse, Option<bool>)> {
     if source.operation.as_str() != MCP_SAMPLING_HANDLE_OPERATION {
-        return Ok(response);
+        return Ok((response, None));
     }
     let Some(event) = mcp_sampling_event_result(&response) else {
-        return Ok(response);
+        return Ok((response, None));
     };
     let Some(dispatch) = mcp_sampling_host_dispatch(source)? else {
-        return Ok(response);
+        return Ok((response, None));
     };
     let downstream_request = mcp_sampling_downstream_request(source, event, dispatch)?;
-    let preflight = evaluate_live_preflight(state, &downstream_request, asserted_principal).await;
-    if !preflight.allowed {
-        return Err(HostError::PreflightFailed(format!(
-            "MCP sampling host dispatch denied for connector `{}` operation `{}`: {}",
-            downstream_request.connector_id,
-            downstream_request.operation,
-            preflight
-                .reason
-                .unwrap_or_else(|| "preflight denied downstream LLM request".to_string())
-        )));
+    if downstream_request.id == source.id {
+        return Err(HostError::Internal(
+            "MCP sampling child request must have a distinct invocation id".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -11998,12 +12018,24 @@ async fn maybe_orchestrate_mcp_sampling(
         response_logged = false,
         "dispatching MCP sampling request through configured LLM connector"
     );
-    let downstream_response = state.registry.invoke(downstream_request.clone()).await?;
-    Ok(mcp_sampling_host_response(
-        source.id.clone(),
-        response,
-        &downstream_request,
-        downstream_response,
+    // Cross-connector work receives its own verified, durably owned local
+    // invocation. It shares the parent's absolute execution deadline and is
+    // accounted independently, before response enrichment combines the data.
+    let downstream_response = invoke_jobs::execute(
+        state,
+        downstream_request.clone(),
+        asserted_principal.map(ToOwned::to_owned),
+        Some(deadline),
+    )
+    .await?;
+    Ok((
+        mcp_sampling_host_response(
+            source.id.clone(),
+            response,
+            &downstream_request,
+            downstream_response,
+        ),
+        Some(true),
     ))
 }
 
@@ -14155,265 +14187,16 @@ async fn route_invoke(
     Ok(response)
 }
 
-/// The host-first invoke pipeline: preflight, audit, dispatch to the local
-/// connector subprocess. Mesh-forwarded requests arriving from a peer run
-/// exactly this pipeline on the executor, so every capability, zone, HRW,
-/// and policy gate applies unchanged.
-#[allow(clippy::too_many_lines)]
+/// Execute the local pipeline under retained host ownership. Mesh peers use
+/// this same admission boundary; the transport retains only a response waiter.
 async fn execute_local_invoke(
     state: &Arc<AppState>,
     request: InvokeRequest,
     asserted_principal: Option<String>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    request.validate_idempotency_key().map_err(|err| {
-        map_host_error(HostError::InvalidFilter(format!(
-            "invalid invoke request: {err}"
-        )))
-    })?;
-
-    let connector_id = request.connector_id.clone();
-    let operation = request.operation.clone();
-    let operation_name = operation.to_string();
-    let correlation_id = request
-        .correlation_id
-        .as_ref()
-        .map(std::string::ToString::to_string);
-    let operation_id = request.id.to_string();
-    let idempotency_key = request.idempotency_key.clone();
-    let zone_id = request.zone_id.clone();
-    let started_at = Instant::now();
-
-    tracing::debug!(
-        event = "invoke_request",
-        connector_id = %connector_id,
-        operation = %operation,
-        operation_id = %operation_id,
-        correlation_id,
-        asserted_principal = asserted_principal.as_deref(),
-        "processing invoke request"
-    );
-
-    // br-mvax3: build an audit context once so every phase append for
-    // this request shares zone/actor/connector/operation/correlation.
-    let audit_ctx = fcp_host::InvokeAuditContext {
-        zone_id: zone_id.to_string(),
-        actor: asserted_principal
-            .clone()
-            .unwrap_or_else(|| "anonymous".to_string()),
-        connector_id: connector_id.to_string(),
-        operation: operation_name.clone(),
-        operation_id: operation_id.clone(),
-        correlation_id: correlation_id.clone(),
-        occurred_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
-
-    let preflight = evaluate_live_preflight(state, &request, asserted_principal.as_deref()).await;
-    if !preflight.allowed {
-        let reason = preflight
-            .reason
-            .unwrap_or_else(|| "preflight denied invoke request".to_string());
-        // br-mvax3: deny path MUST append a hash-linked audit event so
-        // the README "every operation produces an audit event" claim is
-        // literally true even for denied requests.
-        if let Err(err) = state.invoke_audit.append(
-            &audit_ctx,
-            fcp_host::InvokePhase::PreflightDeny {
-                reason: reason.clone(),
-            },
-        ) {
-            tracing::warn!(
-                event = "invoke_audit_append_error",
-                phase = "deny",
-                error = %err,
-                "failed to append invoke deny audit event"
-            );
-        }
-        tracing::warn!(
-            event = "invoke_error",
-            connector_id = %connector_id,
-            operation = %operation,
-            operation_id = %operation_id,
-            correlation_id,
-            reason = %reason,
-            duration_ms = started_at.elapsed().as_millis() as u64,
-            "invoke request failed preflight"
-        );
-        return Err(map_host_error(HostError::PreflightFailed(reason)));
-    }
-
-    // br-mvax3: preflight allow → append hash-linked audit event before
-    // dispatch (matches README's End-to-End Request Flow §11).
-    if let Err(err) = state
-        .invoke_audit
-        .append(&audit_ctx, fcp_host::InvokePhase::PreflightAllow)
-    {
-        tracing::warn!(
-            event = "invoke_audit_append_error",
-            phase = "allow",
-            error = %err,
-            "failed to append invoke allow audit event"
-        );
-    }
-
-    // br-ug5fk: cancellation ownership must follow the verified token
-    // principal, not the optional X-Principal override header. The
-    // header is only an equality check against the authenticated token
-    // subject/principal_id claim; absent it, the request is still
-    // authenticated and must not fall back to ownerless cancellation.
-    let (cancellation_scope, invoked_runtime, warm_pool_capture, wasi_capture, native_capture) = state
-        .registry
-        .cancellation_target(
-            &connector_id,
-            invocation_deadline(started_at, request.deadline_ms),
-        )
+    invoke_jobs::execute(state, request, asserted_principal, None)
         .await
-        .map_err(map_host_error)?;
-    let cancellation_registration = track_verified_cancellation_owner(
-        state.cancellation.as_ref(),
-        &operation_id,
-        &request,
-        cancellation_scope,
-    )
-    .map_err(map_host_error)?;
-    let native_completion_is_deferred = native_capture.is_some();
-    if let Some(capture) = native_capture.as_ref() {
-        capture.bind_registration(&state.cancellation, cancellation_registration.clone());
-    }
-    let source_request = request.clone();
-    // Use the precise runtime whose termination signal was captured above.
-    // Warm-pool checkout binds the actual WORKER, never its control process.
-    // A concurrent configuration update cannot redirect this invocation.
-    let invoke_result = match invoked_runtime {
-        ConnectorRuntime::Native(native) => {
-            if let Some(capture) = native_capture {
-                native.invoke_with_termination(request, capture).await
-            } else {
-                Err(HostError::Internal(
-                    "native invocation cancellation capture is missing".to_string(),
-                ))
-            }
-        }
-        ConnectorRuntime::NativeWarmPool(pool) => {
-            pool.invoke_with_termination(request, warm_pool_capture)
-                .await
-        }
-        ConnectorRuntime::Wasi(wasi) => {
-            if let Some(capture) = wasi_capture {
-                capture.invoke(wasi.invoke(request)).await
-            } else {
-                wasi.invoke(request).await
-            }
-        }
-        runtime => runtime.invoke(request).await,
-    };
-    if !native_completion_is_deferred {
-        state
-            .cancellation
-            .complete_registration(&cancellation_registration);
-    }
-
-    match invoke_result {
-        Ok(response) => {
-            let response = maybe_orchestrate_mcp_sampling(
-                state.as_ref(),
-                asserted_principal.as_deref(),
-                &source_request,
-                response,
-            )
-            .await
-            .map_err(map_host_error)?;
-            let duration_ms = elapsed_millis(started_at);
-            record_invoke_budget_usage(
-                state.budget.as_ref(),
-                Some(&zone_id),
-                &connector_id,
-                &operation_name,
-                Some(&response),
-            )
-            .await;
-            record_invoke_receipt_summary(
-                state.lifecycle.as_ref(),
-                connector_id.as_str(),
-                &operation_name,
-                idempotency_key,
-                &response,
-                duration_ms,
-            )
-            .await;
-            // br-mvax3: append hash-linked audit event AFTER dispatch.
-            // Fires whether or not the connector returned a receipt_id —
-            // this is the failure mode the bead called out (the old
-            // ReceiptSummary path silently produced zero events for
-            // receipt-less connector returns).
-            if let Err(err) = state.invoke_audit.append(
-                &audit_ctx,
-                fcp_host::InvokePhase::DispatchResult {
-                    receipt_id: response.receipt_id.as_ref().map(ToString::to_string),
-                    success: matches!(response.status, InvokeStatus::Ok),
-                    duration_ms,
-                },
-            ) {
-                tracing::warn!(
-                    event = "invoke_audit_append_error",
-                    phase = "result",
-                    error = %err,
-                    "failed to append invoke result audit event"
-                );
-            }
-            tracing::info!(
-                event = "invoke_response",
-                connector_id = %connector_id,
-                operation = %operation,
-                operation_id = %operation_id,
-                correlation_id,
-                status = ?response.status,
-                duration_ms,
-                "invoke request complete"
-            );
-            Ok(response)
-        }
-        Err(err) => {
-            let duration_ms = started_at.elapsed().as_millis() as u64;
-            record_invoke_budget_usage(
-                state.budget.as_ref(),
-                Some(&zone_id),
-                &connector_id,
-                &operation_name,
-                None,
-            )
-            .await;
-            // br-mvax3: dispatch error path also appends — the invoke
-            // chain is exhaustive across all four phases.
-            if let Err(audit_err) = state.invoke_audit.append(
-                &audit_ctx,
-                fcp_host::InvokePhase::DispatchError {
-                    error: err.to_string(),
-                    duration_ms,
-                },
-            ) {
-                tracing::warn!(
-                    event = "invoke_audit_append_error",
-                    phase = "error",
-                    error = %audit_err,
-                    "failed to append invoke error audit event"
-                );
-            }
-            tracing::warn!(
-                event = "invoke_error",
-                connector_id = %connector_id,
-                operation = %operation,
-                operation_id = %operation_id,
-                correlation_id,
-                error = %err,
-                duration_ms,
-                "invoke request failed"
-            );
-            Err(map_host_error(err))
-        }
-    }
+        .map_err(map_host_error)
 }
 
 /// Body limit for `/rpc/mesh/forward` (forward envelope cap plus JSON
@@ -15264,9 +15047,9 @@ async fn record_invoke_receipt_summary(
     idempotency_key: Option<String>,
     response: &InvokeResponse,
     duration_ms: u64,
-) {
+) -> bool {
     let Some(receipt_id) = response.receipt_id.as_ref() else {
-        return;
+        return false;
     };
 
     let summary = ReceiptSummary {
@@ -15288,7 +15071,9 @@ async fn record_invoke_receipt_summary(
             error = %err,
             "failed to persist invoke receipt summary"
         );
+        return false;
     }
+    true
 }
 
 async fn record_invoke_budget_usage(
@@ -15297,9 +15082,9 @@ async fn record_invoke_budget_usage(
     connector_id: &ConnectorId,
     operation: &str,
     response: Option<&InvokeResponse>,
-) {
+) -> bool {
     let Some(zone_id) = zone_id else {
-        return;
+        return false;
     };
     let mut metrics = response
         .and_then(|response| response.usage_metrics.clone())
@@ -15311,7 +15096,7 @@ async fn record_invoke_budget_usage(
         metrics.push(UsageMetric::requests(1));
     }
     let Some(evaluation) = budget.record_usage(zone_id, metrics.as_slice()).await else {
-        return;
+        return false;
     };
     match evaluation.action {
         BudgetAction::Allow => {}
@@ -15326,6 +15111,7 @@ async fn record_invoke_budget_usage(
             );
         }
     }
+    true
 }
 
 fn batch_timeout_error() -> BatchOperationError {
@@ -16196,6 +15982,30 @@ async fn lifecycle_record_handler(
     }
 }
 
+async fn invocation_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<fcp_host::InvocationQueryRequest>,
+) -> Result<Json<fcp_host::InvocationQueryResponse>, (StatusCode, String)> {
+    if request.operation_id.trim().is_empty()
+        || request.operation_id.len() > 512
+        || request.operation_id.chars().any(char::is_control)
+        || request.attempt_id == Some(0)
+    {
+        return Err(map_host_error(HostError::InvalidFilter(
+            "invocation lookup requires a nonempty operation_id of at most 512 bytes without control characters and a positive attempt_id when supplied"
+                .to_string(),
+        )));
+    }
+    let invocation = state
+        .lifecycle
+        .invocation_record(&request.operation_id, request.attempt_id)
+        .await;
+    Ok(Json(fcp_host::InvocationQueryResponse {
+        invocation,
+        host_job_active: state.invoke_jobs.is_active(&request.operation_id),
+    }))
+}
+
 async fn journal_query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<JournalQueryRequest>,
@@ -16436,20 +16246,18 @@ fn map_lifecycle_host_error(error: LifecycleError) -> HostError {
     }
 }
 
-fn map_host_error(err: HostError) -> (StatusCode, String) {
+const fn host_error_status(err: &HostError) -> StatusCode {
     match err {
-        HostError::ConnectorNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
-        HostError::InvalidFilter(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        HostError::PreflightFailed(_) | HostError::ZoneEnvelopeRequired(_) => {
-            (StatusCode::FORBIDDEN, err.to_string())
-        }
-        HostError::CacheError(_) | HostError::Unavailable(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
-        }
-        HostError::RegistryError(_) | HostError::Internal(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-        }
+        HostError::ConnectorNotFound(_) => StatusCode::NOT_FOUND,
+        HostError::InvalidFilter(_) => StatusCode::BAD_REQUEST,
+        HostError::PreflightFailed(_) | HostError::ZoneEnvelopeRequired(_) => StatusCode::FORBIDDEN,
+        HostError::CacheError(_) | HostError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        HostError::RegistryError(_) | HostError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+fn map_host_error(err: HostError) -> (StatusCode, String) {
+    (host_error_status(&err), err.to_string())
 }
 
 fn zone_envelope_required_error(connector_id: &ConnectorId) -> HostError {
@@ -16959,6 +16767,7 @@ deny_ptrace = true
             zone_policies: Arc::new(RwLock::new(zone_policies)),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         })
@@ -17265,6 +17074,200 @@ deny_ptrace = true
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn disconnected_invoke_waiter_preserves_durable_result_and_finalization() {
+        let directory = tempfile::tempdir().expect("temporary admin state");
+        let state_path = directory.path().join("owned-invocations.json");
+        let lifecycle = Arc::new(
+            HostAdminStateStore::with_state_path(state_path.clone()).expect("admin store"),
+        );
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        register_test_capability_issuer(
+            lifecycle.as_ref(),
+            &signing_key,
+            "owned-test",
+            "owned.execute",
+            "owned.execute",
+            ZoneId::work().as_str(),
+        )
+        .await;
+        let introspection = serde_json::to_value(dispatcher_introspection(
+            "owned.execute",
+            "owned.execute",
+            SafetyTier::Safe,
+        ))
+        .expect("introspection");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let observed_lifecycle = Arc::clone(&lifecycle);
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            let mut release_rx = Some(release_rx);
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin(), "owned command remains admitted");
+                let result = match rpc.method.as_str() {
+                    "introspect" => introspection.clone(),
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("invoke request");
+                        let admission = observed_lifecycle
+                            .invocation_record(&request.id.to_string(), None)
+                            .await
+                            .expect("admission precedes connector dispatch");
+                        assert!(admission.terminal.is_none());
+                        started_tx
+                            .take()
+                            .expect("one invoke")
+                            .send(admission.ticket)
+                            .expect("admission observer");
+                        release_rx
+                            .take()
+                            .expect("one release")
+                            .await
+                            .expect("release connector");
+                        serde_json::to_value(
+                            InvokeResponse::ok(
+                                request.id,
+                                json!({ "private_result": "not persisted in ownership record" }),
+                            )
+                            .with_receipt_id(ObjectId::from_bytes([41; 32]))
+                            .with_usage_metrics(vec![UsageMetric::requests(3)]),
+                        )
+                        .expect("invoke response")
+                    }
+                    method => panic!("unexpected connector method {method}"),
+                };
+                assert!(
+                    rpc.rpc.try_settle_reply(),
+                    "disconnecting the HTTP waiter must not cancel the host-owned command"
+                );
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let registry = dispatcher_registry_with_connector(
+            "owned-test",
+            dispatcher_test_connector("owned-test", runner_tx, runner_task),
+            dispatcher_test_config("owned-test"),
+        );
+        let state = dispatcher_app_state(
+            registry,
+            Arc::clone(&lifecycle),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        state
+            .budget
+            .upsert_policy(
+                ZoneId::work(),
+                fcp_kernel::UsageBudgetPolicy {
+                    enforcement: fcp_kernel::BudgetEnforcement::Deny,
+                    budgets: vec![fcp_kernel::UsageBudgetLimit {
+                        metric: UsageMetricKind::Requests,
+                        limit: 100,
+                        window_seconds: 60,
+                    }],
+                },
+            )
+            .await;
+        let request = InvokeRequest {
+            r#type: "invoke".to_string(),
+            id: RequestId::new("owned-disconnect"),
+            connector_id: ConnectorId::from_static("owned-test"),
+            operation: OperationId::from_static("owned.execute"),
+            zone_id: ZoneId::work(),
+            input: json!({ "private_input": "not persisted in ownership record" }),
+            capability_token: test_capability_token(
+                &signing_key,
+                "owned.execute",
+                "owned.execute",
+                ZoneId::work().as_str(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("owned-disconnect-key".to_string()),
+            lease_seq: None,
+            deadline_ms: Some(10_000),
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        let http_state = Arc::clone(&state);
+        let http_waiter = task::spawn(async move {
+            invoke_handler(State(http_state), HeaderMap::new(), Json(request)).await
+        });
+        let ticket = started_rx.await.expect("connector dispatched");
+        assert!(state.invoke_jobs.is_active(&ticket.operation_id));
+        http_waiter.abort();
+        assert!(http_waiter.await.is_err(), "HTTP waiter was disconnected");
+        assert!(state.invoke_jobs.is_active(&ticket.operation_id));
+        release_tx.send(()).expect("host still owns connector work");
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("finalization drains");
+        assert!(!state.invoke_jobs.is_active(&ticket.operation_id));
+
+        let record = lifecycle
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .expect("retained invocation");
+        assert_eq!(record.admission.principal, "user:test");
+        assert_eq!(record.durable, cfg!(unix));
+        let terminal = record.terminal.as_ref().expect("persisted terminal");
+        assert_eq!(terminal.outcome, fcp_host::InvocationOutcome::Succeeded);
+        assert_eq!(
+            terminal.receipt_id,
+            Some(ObjectId::from_bytes([41; 32]).to_string())
+        );
+        let finalization = record.finalization.as_ref().expect("finalization");
+        assert!(finalization.budget_recorded);
+        assert!(finalization.receipt_recorded);
+        assert_eq!(finalization.sampling_completed, None);
+        assert_eq!(finalization.response_http_status, Some(200));
+        let audit_id = finalization.audit_event_id.as_ref().expect("terminal audit");
+        assert!(
+            state
+                .invoke_audit
+                .entries_for_zone(ZoneId::work().as_str())
+                .iter()
+                .any(|entry| &entry.id == audit_id)
+        );
+        assert_eq!(
+            state
+                .budget
+                .snapshot(&ZoneId::work())
+                .await
+                .expect("budget")
+                .budgets[0]
+                .used,
+            3
+        );
+        let receipts = lifecycle
+            .query_receipts(&ReceiptQueryRequest {
+                connector_id: "owned-test".to_string(),
+                operation: Some("owned.execute".to_string()),
+                after: None,
+                limit: 10,
+            })
+            .await;
+        assert_eq!(receipts.receipts.len(), 1);
+        let metadata = serde_json::to_string(&record).expect("ownership metadata");
+        assert!(!metadata.contains("private_input"));
+        assert!(!metadata.contains("private_result"));
+        assert!(!metadata.contains("capability_token"));
+
+        let reopened = HostAdminStateStore::with_state_path(state_path).expect("reopen store");
+        let recovered = reopened
+            .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+            .await
+            .expect("durable record survived reopen");
+        assert_eq!(recovered.terminal, record.terminal);
+        assert_eq!(recovered.finalization, record.finalization);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_handler_orchestrates_mcp_sampling_through_llm_connector() {
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let lifecycle = Arc::new(HostAdminStateStore::new());
@@ -17301,6 +17304,8 @@ deny_ptrace = true
         .expect("llm introspection serializes");
         let mcp_invokes = Arc::new(AtomicU64::new(0));
         let llm_invokes = Arc::new(AtomicU64::new(0));
+        let ambiguous_llm_reply = Arc::new(AtomicBool::new(false));
+        let llm_request_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let (mcp_tx, mut mcp_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let mcp_counter = Arc::clone(&mcp_invokes);
@@ -17345,7 +17350,8 @@ deny_ptrace = true
                                         "metadata_logged": false
                                     }
                                 }),
-                            ),
+                            )
+                            .with_usage_metrics(vec![UsageMetric::requests(2)]),
                         })));
                     }
                     method => {
@@ -17359,6 +17365,8 @@ deny_ptrace = true
 
         let (llm_tx, mut llm_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let llm_counter = Arc::clone(&llm_invokes);
+        let ambiguous_reply = Arc::clone(&ambiguous_llm_reply);
+        let observed_ids = Arc::clone(&llm_request_ids);
         let llm_task = task::spawn(async move {
             while let Some(request) = llm_rx.recv().await {
                 match request.method.as_str() {
@@ -17381,16 +17389,26 @@ deny_ptrace = true
                             OperationId::from_static("groq.chat.completions")
                         );
                         assert_eq!(invoke_request.input["max_tokens"], 64);
+                        observed_ids
+                            .lock()
+                            .expect("child ids")
+                            .push(invoke_request.id.to_string());
+                        let response_id = if ambiguous_reply.load(Ordering::SeqCst) {
+                            RequestId::new("reply-for-an-unrelated-invocation")
+                        } else {
+                            invoke_request.id
+                        };
                         let _ = request.response_tx.send(Ok(json!({
                             "result": InvokeResponse::ok(
-                                invoke_request.id,
+                                response_id,
                                 json!({
                                     "choices": [{
                                         "message": {"role": "assistant", "content": "ok"}
                                     }],
                                     "usage": {"prompt_tokens": 2, "completion_tokens": 1}
                                 }),
-                            ),
+                            )
+                            .with_usage_metrics(vec![UsageMetric::requests(3)]),
                         })));
                     }
                     method => {
@@ -17422,6 +17440,21 @@ deny_ptrace = true
             Some(signing_key.verifying_key()),
             policies,
         );
+
+        state
+            .budget
+            .upsert_policy(
+                ZoneId::work(),
+                fcp_kernel::UsageBudgetPolicy {
+                    enforcement: fcp_kernel::BudgetEnforcement::Deny,
+                    budgets: vec![fcp_kernel::UsageBudgetLimit {
+                        metric: UsageMetricKind::Requests,
+                        limit: 100,
+                        window_seconds: 60,
+                    }],
+                },
+            )
+            .await;
 
         let llm_token = test_capability_token(
             &signing_key,
@@ -17463,7 +17496,11 @@ deny_ptrace = true
             approval_tokens: Vec::new(),
         };
 
-        let response = invoke_handler(State(state), HeaderMap::new(), Json(request))
+        let response = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
             .await
             .expect("host-orchestrated sampling invoke should succeed")
             .0;
@@ -17488,6 +17525,143 @@ deny_ptrace = true
         );
         assert_eq!(mcp_invokes.load(Ordering::SeqCst), 1);
         assert_eq!(llm_invokes.load(Ordering::SeqCst), 1);
+
+        let source_record = lifecycle
+            .invocation_record(&request.id.to_string(), None)
+            .await
+            .expect("source ownership record");
+        assert_eq!(
+            source_record.terminal.as_ref().expect("source terminal").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        assert_eq!(
+            source_record
+                .finalization
+                .as_ref()
+                .expect("source finalization")
+                .sampling_completed,
+            Some(true)
+        );
+        let child_id = result["host_dispatch"]["request_id"]
+            .as_str()
+            .expect("child request id");
+        assert_ne!(child_id, request.id.0.as_str());
+        let child_record = lifecycle
+            .invocation_record(child_id, None)
+            .await
+            .expect("separate child ownership record");
+        assert_eq!(child_record.admission.connector_id, "groq");
+        assert_eq!(
+            child_record.terminal.as_ref().expect("child terminal").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        assert_eq!(
+            state
+                .budget
+                .snapshot(&ZoneId::work())
+                .await
+                .expect("budget")
+                .budgets[0]
+                .used,
+            5,
+            "source usage and child usage are each counted once"
+        );
+
+        let mut invalid_dispatch = request.clone();
+        invalid_dispatch.id = RequestId::random();
+        invalid_dispatch.input["host_dispatch"]["connector_id"] = json!("unconfigured");
+        let failed_source_id = invalid_dispatch.id.to_string();
+        let error = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(invalid_dispatch),
+        )
+        .await
+        .expect_err("source result must survive enrichment failure");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let failed_source = lifecycle
+            .invocation_record(&failed_source_id, None)
+            .await
+            .expect("source observed before failed sampling");
+        assert_eq!(
+            failed_source.terminal.as_ref().expect("source terminal").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        let finalization = failed_source.finalization.expect("failed enrichment metadata");
+        assert_eq!(finalization.sampling_completed, Some(false));
+        assert_eq!(finalization.response_http_status, None);
+        assert_eq!(mcp_invokes.load(Ordering::SeqCst), 2);
+        assert_eq!(llm_invokes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .budget
+                .snapshot(&ZoneId::work())
+                .await
+                .expect("budget")
+                .budgets[0]
+                .used,
+            7
+        );
+        ambiguous_llm_reply.store(true, Ordering::SeqCst);
+        let mut ambiguous_request = request;
+        ambiguous_request.id = RequestId::random();
+        let ambiguous_source_id = ambiguous_request.id.to_string();
+        invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(ambiguous_request.clone()),
+        )
+        .await
+        .expect_err("mismatched child reply leaves its effect unknown");
+        let ambiguous_child_id = llm_request_ids
+            .lock()
+            .expect("child ids")
+            .last()
+            .expect("ambiguous child was dispatched")
+            .clone();
+        let ambiguous_child = lifecycle
+            .invocation_record(&ambiguous_child_id, None)
+            .await
+            .expect("ambiguous child retained");
+        assert_eq!(
+            ambiguous_child.terminal.expect("child terminal").outcome,
+            fcp_host::InvocationOutcome::OutcomeUnknown
+        );
+        let ambiguous_source = lifecycle
+            .invocation_record(&ambiguous_source_id, None)
+            .await
+            .expect("definite source and ambiguous child retained");
+        assert_eq!(
+            ambiguous_source.terminal.as_ref().expect("source terminal").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        let finalization = ambiguous_source
+            .finalization
+            .as_ref()
+            .expect("sampling ambiguity retained");
+        assert_eq!(finalization.sampling_completed, Some(false));
+        assert_eq!(finalization.response_http_status, None);
+        assert!(
+            lifecycle
+                .admit_invocation(ambiguous_source.admission)
+                .await
+                .is_err(),
+            "durable parent fence must prevent creating another random child id"
+        );
+        invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(ambiguous_request),
+        )
+        .await
+        .expect_err("same parent id cannot retry an unresolved child");
+        assert_eq!(mcp_invokes.load(Ordering::SeqCst), 3);
+        assert_eq!(llm_invokes.load(Ordering::SeqCst), 2);
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("sampling jobs drained");
     }
 
     fn constraints_cbor(constraints: &fcp_core::CapabilityConstraints) -> Vec<u8> {
@@ -18028,6 +18202,7 @@ deny_ptrace = true
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         })
@@ -23946,6 +24121,7 @@ deny_ptrace = true
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         });
@@ -24358,6 +24534,7 @@ deny_ptrace = true
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         });
@@ -29103,6 +29280,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29142,6 +29320,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29186,6 +29365,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29230,6 +29410,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29291,6 +29472,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29339,6 +29521,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29452,6 +29635,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         };
@@ -29506,6 +29690,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         });
@@ -29906,6 +30091,7 @@ done"#;
             zone_policies: Arc::new(RwLock::new(HashMap::new())),
             telemetry_config: default_host_telemetry_config(),
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
             mesh: None,
         })

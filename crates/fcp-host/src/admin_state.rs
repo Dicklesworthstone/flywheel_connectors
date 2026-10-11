@@ -632,6 +632,13 @@ pub struct InvocationQueryRequest {
 pub struct InvocationQueryResponse {
     /// Locally retained attempt metadata, if present.
     pub invocation: Option<InvocationRecord>,
+    /// Whether this host still owns an unfinished job with this invocation ID.
+    ///
+    /// This is a current process observation, not durable completion evidence.
+    /// A record without a terminal observation and without an active owner has
+    /// an unknown outcome; clients must not keep presenting it as running.
+    #[serde(default)]
+    pub host_job_active: bool,
 }
 
 const MAX_RETAINED_INVOCATIONS: usize = 10_000;
@@ -4733,9 +4740,12 @@ impl HostAdminStateStore {
             }
             if snapshot.invocations.iter().any(|record| {
                 record.ticket.operation_id == admission.operation_id
-                    && record.terminal.as_ref().is_none_or(|terminal| {
+                    && (record.terminal.as_ref().is_none_or(|terminal| {
                         terminal.outcome == InvocationOutcome::OutcomeUnknown
-                    })
+                    }) || record.finalization.as_ref().is_none_or(|finalization| {
+                        finalization.response_http_status.is_none()
+                            || finalization.sampling_completed == Some(false)
+                    }))
             }) {
                 return Err(invocation_state_error(
                     "invocation identifier has an unresolved attempt; inspect its outcome before retrying",
@@ -4747,6 +4757,7 @@ impl HostAdminStateStore {
                         terminal.outcome != InvocationOutcome::OutcomeUnknown
                     }) && record.finalization.as_ref().is_some_and(|finalization| {
                         finalization.response_http_status.is_some()
+                            && finalization.sampling_completed != Some(false)
                     })
                 });
                 let Some(index) = completed else {
@@ -4879,13 +4890,11 @@ impl HostAdminStateStore {
             if finalization.audit_event_id.is_some() {
                 previous.audit_event_id = finalization.audit_event_id;
             }
-            previous.sampling_completed = match (
-                previous.sampling_completed,
-                finalization.sampling_completed,
-            ) {
-                (Some(left), Some(right)) => Some(left || right),
-                (left, right) => left.or(right),
-            };
+            previous.sampling_completed =
+                match (previous.sampling_completed, finalization.sampling_completed) {
+                    (Some(left), Some(right)) => Some(left || right),
+                    (left, right) => left.or(right),
+                };
             if finalization.response_http_status.is_some() {
                 previous.response_http_status = finalization.response_http_status;
             }
@@ -5670,12 +5679,46 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn invocation_attempts_reject_overlap_and_preserve_old_finalization_identity() {
         let store = HostAdminStateStore::new();
-        let first = store.admit_invocation(invocation_admission("op")).await.unwrap();
-        assert!(store.admit_invocation(invocation_admission("op")).await.is_err());
-        store.finish_invocation(&first, successful_invocation()).await.unwrap();
+        let first = store
+            .admit_invocation(invocation_admission("op"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .admit_invocation(invocation_admission("op"))
+                .await
+                .is_err()
+        );
+        store
+            .finish_invocation(&first, successful_invocation())
+            .await
+            .unwrap();
         // Repeating an identical terminal observation is idempotent.
-        store.finish_invocation(&first, successful_invocation()).await.unwrap();
-        let second = store.admit_invocation(invocation_admission("op")).await.unwrap();
+        store
+            .finish_invocation(&first, successful_invocation())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .admit_invocation(invocation_admission("op"))
+                .await
+                .is_err(),
+            "a source response alone must not release unfinished sampling or finalization",
+        );
+        store
+            .record_invocation_finalization(
+                &first,
+                InvocationFinalization {
+                    response_http_status: Some(200),
+                    ..InvocationFinalization::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second = store
+            .admit_invocation(invocation_admission("op"))
+            .await
+            .unwrap();
         assert!(second.attempt_id > first.attempt_id);
         store
             .record_invocation_finalization(
@@ -5710,7 +5753,12 @@ mod tests {
             operation_id: "different".to_string(),
             attempt_id: second.attempt_id,
         };
-        assert!(store.finish_invocation(&wrong_ticket, successful_invocation()).await.is_err());
+        assert!(
+            store
+                .finish_invocation(&wrong_ticket, successful_invocation())
+                .await
+                .is_err()
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -5718,13 +5766,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("state.json");
         let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let interrupted = store.admit_invocation(invocation_admission("interrupted")).await.unwrap();
-        let completed = store.admit_invocation(invocation_admission("completed")).await.unwrap();
-        store.finish_invocation(&completed, successful_invocation()).await.unwrap();
+        let interrupted = store
+            .admit_invocation(invocation_admission("interrupted"))
+            .await
+            .unwrap();
+        let completed = store
+            .admit_invocation(invocation_admission("completed"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&completed, successful_invocation())
+            .await
+            .unwrap();
         drop(store);
 
         let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let unknown = reopened.invocation_record("interrupted", None).await.unwrap();
+        let unknown = reopened
+            .invocation_record("interrupted", None)
+            .await
+            .unwrap();
         assert_eq!(unknown.ticket, interrupted);
         assert_eq!(
             unknown.terminal.unwrap().outcome,
@@ -5732,49 +5792,109 @@ mod tests {
         );
         assert_eq!(unknown.durable, cfg!(unix));
         assert!(unknown.finalization.is_none());
-        assert!(reopened.admit_invocation(invocation_admission("interrupted")).await.is_err());
+        assert!(
+            reopened
+                .admit_invocation(invocation_admission("interrupted"))
+                .await
+                .is_err()
+        );
         let known = reopened.invocation_record("completed", None).await.unwrap();
         assert_eq!(known.terminal, Some(successful_invocation()));
-        assert!(known.finalization.is_none(), "restart must not invent completed audit work");
-        let next = reopened.admit_invocation(invocation_admission("new")).await.unwrap();
+        assert!(
+            known.finalization.is_none(),
+            "restart must not invent completed audit work"
+        );
+        assert!(
+            reopened
+                .admit_invocation(invocation_admission("completed"))
+                .await
+                .is_err(),
+            "a known source outcome does not prove its enrichment and finalization completed",
+        );
+        let next = reopened
+            .admit_invocation(invocation_admission("new"))
+            .await
+            .unwrap();
         assert!(next.attempt_id > completed.attempt_id);
         drop(reopened);
 
         // The recovery classification itself is persisted.
         let again = HostAdminStateStore::with_state_path(path).unwrap();
         assert_eq!(
-            again.invocation_record("interrupted", None).await.unwrap().terminal.unwrap().outcome,
+            again
+                .invocation_record("interrupted", None)
+                .await
+                .unwrap()
+                .terminal
+                .unwrap()
+                .outcome,
             InvocationOutcome::OutcomeUnknown
         );
-        assert!(again.admit_invocation(invocation_admission("interrupted")).await.is_err());
+        assert!(
+            again
+                .admit_invocation(invocation_admission("interrupted"))
+                .await
+                .is_err()
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn invocation_unknown_and_conflicting_observations_never_authorize_reuse() {
         let store = HostAdminStateStore::new();
-        let ticket = store.admit_invocation(invocation_admission("uncertain")).await.unwrap();
+        let ticket = store
+            .admit_invocation(invocation_admission("uncertain"))
+            .await
+            .unwrap();
         let unknown = InvocationTerminal {
             outcome: InvocationOutcome::OutcomeUnknown,
             receipt_id: None,
             duration_ms: 60_000,
             http_status: 504,
         };
-        store.finish_invocation(&ticket, unknown.clone()).await.unwrap();
-        assert!(store.admit_invocation(invocation_admission("uncertain")).await.is_err());
-        assert!(store.finish_invocation(&ticket, successful_invocation()).await.is_err());
+        store
+            .finish_invocation(&ticket, unknown.clone())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .admit_invocation(invocation_admission("uncertain"))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_invocation(&ticket, successful_invocation())
+                .await
+                .is_err()
+        );
         assert_eq!(
-            store.invocation_record("uncertain", None).await.unwrap().terminal,
+            store
+                .invocation_record("uncertain", None)
+                .await
+                .unwrap()
+                .terminal,
             Some(unknown)
         );
         // Semantic rejection must not fence unrelated new work.
-        assert!(store.admit_invocation(invocation_admission("independent")).await.is_ok());
+        assert!(
+            store
+                .admit_invocation(invocation_admission("independent"))
+                .await
+                .is_ok()
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn invocation_finalization_keeps_source_success_when_sampling_fails() {
         let store = HostAdminStateStore::new();
-        let ticket = store.admit_invocation(invocation_admission("source")).await.unwrap();
-        store.finish_invocation(&ticket, successful_invocation()).await.unwrap();
+        let ticket = store
+            .admit_invocation(invocation_admission("source"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
         store
             .record_invocation_finalization(
                 &ticket,
@@ -5821,8 +5941,19 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            store.invocation_record("source", None).await.unwrap().finalization,
+            store
+                .invocation_record("source", None)
+                .await
+                .unwrap()
+                .finalization,
             Some(finalization)
+        );
+        assert!(
+            store
+                .admit_invocation(invocation_admission("source"))
+                .await
+                .is_err(),
+            "a final HTTP error does not resolve an ambiguous sampling child",
         );
     }
 
@@ -5831,8 +5962,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let obstruction = dir.path().join("not-a-directory");
         std::fs::write(&obstruction, b"occupied").unwrap();
-        let mut store = HostAdminStateStore::with_state_path(obstruction.join("state.json")).unwrap();
-        assert!(store.admit_invocation(invocation_admission("blocked")).await.is_err());
+        let mut store =
+            HostAdminStateStore::with_state_path(obstruction.join("state.json")).unwrap();
+        assert!(
+            store
+                .admit_invocation(invocation_admission("blocked"))
+                .await
+                .is_err()
+        );
         assert!(store.invocation_record("blocked", None).await.is_none());
         assert_eq!(store.state.read().await.next_invocation_attempt_id, 1);
 
@@ -5840,9 +5977,19 @@ mod tests {
         // an older RAM image over a possibly committed snapshot.
         let repaired_path = dir.path().join("reopened.json");
         store.state_path = Some(repaired_path.clone());
-        assert!(store.admit_invocation(invocation_admission("still-blocked")).await.is_err());
+        assert!(
+            store
+                .admit_invocation(invocation_admission("still-blocked"))
+                .await
+                .is_err()
+        );
         let reopened = HostAdminStateStore::with_state_path(repaired_path).unwrap();
-        assert!(reopened.admit_invocation(invocation_admission("fresh")).await.is_ok());
+        assert!(
+            reopened
+                .admit_invocation(invocation_admission("fresh"))
+                .await
+                .is_ok()
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -5858,56 +6005,102 @@ mod tests {
             let mut snapshot = store.state.write().await;
             snapshot.next_invocation_attempt_id = u64::MAX;
         }
-        assert!(store.admit_invocation(invocation_admission("overflow")).await.is_err());
+        assert!(
+            store
+                .admit_invocation(invocation_admission("overflow"))
+                .await
+                .is_err()
+        );
         assert!(store.invocation_record("overflow", None).await.is_none());
 
         let full = HostAdminStateStore::new();
-        let first = full.admit_invocation(invocation_admission("retained")).await.unwrap();
+        let first = full
+            .admit_invocation(invocation_admission("retained"))
+            .await
+            .unwrap();
         let record = full.invocation_record("retained", None).await.unwrap();
         {
             let mut snapshot = full.state.write().await;
             for index in 1..MAX_RETAINED_INVOCATIONS {
                 let mut next = record.clone();
                 next.ticket.operation_id = format!("retained-{index}");
-                next.admission.operation_id.clone_from(&next.ticket.operation_id);
+                next.admission
+                    .operation_id
+                    .clone_from(&next.ticket.operation_id);
                 next.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
                 snapshot.invocations.push(next);
             }
-            snapshot.next_invocation_attempt_id = u64::try_from(MAX_RETAINED_INVOCATIONS).unwrap() + 1;
+            snapshot.next_invocation_attempt_id =
+                u64::try_from(MAX_RETAINED_INVOCATIONS).unwrap() + 1;
         }
-        assert!(full.admit_invocation(invocation_admission("over-capacity")).await.is_err());
-        assert_eq!(full.invocation_record("retained", None).await.unwrap().ticket, first);
-        assert_eq!(full.state.read().await.invocations.len(), MAX_RETAINED_INVOCATIONS);
+        assert!(
+            full.admit_invocation(invocation_admission("over-capacity"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            full.invocation_record("retained", None)
+                .await
+                .unwrap()
+                .ticket,
+            first
+        );
+        assert_eq!(
+            full.state.read().await.invocations.len(),
+            MAX_RETAINED_INVOCATIONS
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn invocation_history_reclaims_completed_attempts_but_keeps_uncertain_work() {
         let store = HostAdminStateStore::new();
-        let uncertain = store.admit_invocation(invocation_admission("uncertain")).await.unwrap();
+        let uncertain = store
+            .admit_invocation(invocation_admission("uncertain"))
+            .await
+            .unwrap();
         let template = store.invocation_record("uncertain", None).await.unwrap();
         {
             let mut snapshot = store.state.write().await;
             for index in 1..MAX_RETAINED_INVOCATIONS {
                 let mut record = template.clone();
                 record.ticket.operation_id = format!("completed-{index}");
-                record.admission.operation_id.clone_from(&record.ticket.operation_id);
+                record
+                    .admission
+                    .operation_id
+                    .clone_from(&record.ticket.operation_id);
                 record.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
                 record.terminal = Some(successful_invocation());
                 record.finished_at = Some(Utc::now());
                 record.finalization = Some(InvocationFinalization {
-                    response_http_status: Some(200),
+                    sampling_completed: (index == 1).then_some(false),
+                    response_http_status: Some(if index == 1 { 502 } else { 200 }),
                     ..InvocationFinalization::default()
                 });
                 snapshot.invocations.push(record);
             }
-            snapshot.next_invocation_attempt_id = u64::try_from(MAX_RETAINED_INVOCATIONS).unwrap() + 1;
+            snapshot.next_invocation_attempt_id =
+                u64::try_from(MAX_RETAINED_INVOCATIONS).unwrap() + 1;
         }
-        let admitted = store.admit_invocation(invocation_admission("new")).await.unwrap();
+        let admitted = store
+            .admit_invocation(invocation_admission("new"))
+            .await
+            .unwrap();
         assert!(admitted.attempt_id > u64::try_from(MAX_RETAINED_INVOCATIONS).unwrap());
-        assert_eq!(store.invocation_record("uncertain", None).await.unwrap().ticket, uncertain);
-        assert!(store.invocation_record("completed-1", None).await.is_none());
-        assert!(store.invocation_record("completed-2", None).await.is_some());
-        assert_eq!(store.state.read().await.invocations.len(), MAX_RETAINED_INVOCATIONS);
+        assert_eq!(
+            store
+                .invocation_record("uncertain", None)
+                .await
+                .unwrap()
+                .ticket,
+            uncertain
+        );
+        assert!(store.invocation_record("completed-1", None).await.is_some());
+        assert!(store.invocation_record("completed-2", None).await.is_none());
+        assert!(store.invocation_record("completed-3", None).await.is_some());
+        assert_eq!(
+            store.state.read().await.invocations.len(),
+            MAX_RETAINED_INVOCATIONS
+        );
     }
 
     #[test]
@@ -5926,7 +6119,11 @@ mod tests {
             finalization: None,
             durable: true,
         });
-        assert!(snapshot.recover_invocations_after_restart(Utc::now()).is_err());
+        assert!(
+            snapshot
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
     }
 
     fn canonicalize_json(value: Value) -> Value {
