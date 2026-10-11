@@ -6757,21 +6757,10 @@ impl InstallContractProvenance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum LiveTruthKnowledgeState {
-    Offline,
-    NodeLocal,
-    MeshBacked,
-    Degraded,
-    FallbackDerived,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
 enum LiveTruthResolverBranch {
     OfflineManifest,
     OfflineMirror,
     InstallVerification,
-    LivePlacementPolicy,
     LiveArtifactOnly,
     LiveRuntimeOnly,
     LiveRuntimeDegraded,
@@ -6780,7 +6769,7 @@ enum LiveTruthResolverBranch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct LiveTruthResolution {
-    knowledge_state: LiveTruthKnowledgeState,
+    knowledge_state: KnowledgeState,
     resolver_branch: LiveTruthResolverBranch,
     authoritative_scope: &'static str,
     mesh_backed: bool,
@@ -6796,7 +6785,7 @@ impl LiveTruthResolution {
         reason: impl Into<String>,
     ) -> Self {
         Self {
-            knowledge_state: LiveTruthKnowledgeState::Offline,
+            knowledge_state: KnowledgeState::Offline,
             resolver_branch,
             authoritative_scope,
             mesh_backed: false,
@@ -6806,32 +6795,16 @@ impl LiveTruthResolution {
         }
     }
 
-    fn node_local(
+    fn host_backed(
         authoritative_scope: &'static str,
         resolver_branch: LiveTruthResolverBranch,
         reason: impl Into<String>,
     ) -> Self {
         Self {
-            knowledge_state: LiveTruthKnowledgeState::NodeLocal,
+            knowledge_state: KnowledgeState::HostBacked,
             resolver_branch,
             authoritative_scope,
             mesh_backed: false,
-            degraded: false,
-            fallback_derived: false,
-            reason: reason.into(),
-        }
-    }
-
-    fn mesh_backed(
-        authoritative_scope: &'static str,
-        resolver_branch: LiveTruthResolverBranch,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            knowledge_state: LiveTruthKnowledgeState::MeshBacked,
-            resolver_branch,
-            authoritative_scope,
-            mesh_backed: true,
             degraded: false,
             fallback_derived: false,
             reason: reason.into(),
@@ -6845,7 +6818,7 @@ impl LiveTruthResolution {
         reason: impl Into<String>,
     ) -> Self {
         Self {
-            knowledge_state: LiveTruthKnowledgeState::Degraded,
+            knowledge_state: KnowledgeState::Degraded,
             resolver_branch,
             authoritative_scope,
             mesh_backed,
@@ -6862,7 +6835,7 @@ impl LiveTruthResolution {
         reason: impl Into<String>,
     ) -> Self {
         Self {
-            knowledge_state: LiveTruthKnowledgeState::FallbackDerived,
+            knowledge_state: KnowledgeState::FallbackDerived,
             resolver_branch,
             authoritative_scope,
             mesh_backed: false,
@@ -6873,13 +6846,7 @@ impl LiveTruthResolution {
     }
 
     fn operator_knowledge_state(&self) -> KnowledgeState {
-        match self.knowledge_state {
-            LiveTruthKnowledgeState::Offline => KnowledgeState::Offline,
-            LiveTruthKnowledgeState::NodeLocal => KnowledgeState::NodeLocal,
-            LiveTruthKnowledgeState::MeshBacked => KnowledgeState::MeshBacked,
-            LiveTruthKnowledgeState::Degraded => KnowledgeState::Degraded,
-            LiveTruthKnowledgeState::FallbackDerived => KnowledgeState::FallbackDerived,
-        }
+        self.knowledge_state
     }
 }
 
@@ -10321,14 +10288,9 @@ fn mesh_live_availability_fact(status: &HostConnectorAdminStatus) -> Value {
 
 fn resolve_mesh_live_truth(status: &HostConnectorAdminStatus) -> LiveTruthResolution {
     let has_artifact = status.artifact.is_some();
-    let mesh_backed = status
-        .artifact
-        .as_ref()
-        .and_then(|artifact| artifact.placement.as_ref())
-        .is_some();
-    let authoritative_scope = if mesh_backed {
-        "mesh-placement-policy"
-    } else if has_artifact {
+    // A recorded placement policy describes intent. This host status route
+    // does not query replica health or establish mesh-wide availability.
+    let authoritative_scope = if has_artifact {
         "host-artifact-provenance"
     } else {
         "host-admin-status"
@@ -10342,7 +10304,7 @@ fn resolve_mesh_live_truth(status: &HostConnectorAdminStatus) -> LiveTruthResolu
         return LiveTruthResolution::degraded(
             authoritative_scope,
             LiveTruthResolverBranch::LiveRuntimeDegraded,
-            mesh_backed,
+            false,
             match status.observed_state {
                 fcp_host::ObservedRuntimeState::Starting => {
                     "Live host status shows the connector is still converging, so truth is currently degraded until runtime settles."
@@ -10357,23 +10319,15 @@ fn resolve_mesh_live_truth(status: &HostConnectorAdminStatus) -> LiveTruthResolu
         );
     }
 
-    if mesh_backed {
-        return LiveTruthResolution::mesh_backed(
-            "mesh-placement-policy",
-            LiveTruthResolverBranch::LivePlacementPolicy,
-            "Live host status plus recorded placement policy make this answer mesh-backed rather than merely node-local.",
-        );
-    }
-
     if has_artifact {
-        return LiveTruthResolution::node_local(
+        return LiveTruthResolution::host_backed(
             "host-artifact-provenance",
             LiveTruthResolverBranch::LiveArtifactOnly,
-            "Live host status is backed by recorded artifact provenance, but no placement policy proves mesh-wide coverage yet.",
+            "Live host status is backed by recorded artifact provenance. Placement policy, when recorded, does not establish live replica health or mesh-wide coverage.",
         );
     }
 
-    LiveTruthResolution::node_local(
+    LiveTruthResolution::host_backed(
         "host-admin-status",
         LiveTruthResolverBranch::LiveRuntimeOnly,
         match status.observed_state {
@@ -10390,7 +10344,7 @@ fn resolve_mesh_live_truth(status: &HostConnectorAdminStatus) -> LiveTruthResolu
                 "Live host status is the only available truth source, and it cannot currently prove a more specific runtime state."
             }
             fcp_host::ObservedRuntimeState::Starting | fcp_host::ObservedRuntimeState::Degraded => {
-                unreachable!("degraded live states are handled before the node-local branch")
+                unreachable!("degraded live states are handled before the host-backed branch")
             }
         },
     )
@@ -31852,9 +31806,9 @@ mod tests {
     use super::{
         ApprovalMode, Cli, CliExitCode, Commands, ConnectorManifest, DoctorLocalCheck, DoctorProbe,
         FwcMetadataCacheKey, HostConnectorCatalog, KnowledgeState, LiveAuthArgs,
-        LiveTruthKnowledgeState, LiveTruthResolverBranch, MetadataField, PACKAGE_OUTPUT_FILENAME,
-        PackageBuildMetadata, PackageOutput, PrepareCliError, ResolvedHostConfig,
-        ResolvedHostOperation, TRUTH_SOURCE_SCHEMA_VERSION, catalog, doctor_hlc_probe_warnings,
+        LiveTruthResolverBranch, MetadataField, PACKAGE_OUTPUT_FILENAME, PackageBuildMetadata,
+        PackageOutput, PrepareCliError, ResolvedHostConfig, ResolvedHostOperation,
+        TRUTH_SOURCE_SCHEMA_VERSION, catalog, doctor_hlc_probe_warnings,
         doctor_iblt_probe_warnings, doctor_migration_probe_warnings, doctor_reality_cadence_report,
         execute, host_discovered_connector, host_discovered_operation, host_mcp_tool_definitions,
         host_tool_summary_entry, host_tool_when_to_use, live_pipeline_operation_metadata,
@@ -38242,7 +38196,7 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["command"], "install");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "mesh");
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
         assert_install_contract(
             &payload,
@@ -38272,10 +38226,10 @@ deny_ptrace = true
         );
         assert_live_truth_resolution(
             &payload,
-            "mesh-backed",
-            "live-placement-policy",
-            "mesh-placement-policy",
-            true,
+            "host-backed",
+            "live-artifact-only",
+            "host-artifact-provenance",
+            false,
             false,
             false,
         );
@@ -41067,7 +41021,7 @@ deny_ptrace = true
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "explain-availability");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "mesh");
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
         assert_discovery_provenance(&payload, "live_host_inventory", true, "live-inventory");
         assert_eq!(
@@ -41100,10 +41054,10 @@ deny_ptrace = true
         );
         assert_live_truth_resolution(
             &payload,
-            "mesh-backed",
-            "live-placement-policy",
-            "mesh-placement-policy",
-            true,
+            "host-backed",
+            "live-artifact-only",
+            "host-artifact-provenance",
+            false,
             false,
             false,
         );
@@ -41118,7 +41072,7 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_mesh_explain_availability_host_node_local_text_footer_reports_answer_source() {
+    fn execute_mesh_explain_availability_host_backed_text_footer_reports_answer_source() {
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -41148,7 +41102,7 @@ deny_ptrace = true
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
-        assert!(output.ends_with("(answer source: node-local)\n"));
+        assert!(output.ends_with("(answer source: host)\n"));
     }
 
     #[test]
@@ -41184,7 +41138,7 @@ deny_ptrace = true
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "node-local");
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["source"], "host-admin-api");
         assert_eq!(payload["source_selection"]["source_kind"], "local-path");
         assert_eq!(
@@ -41209,7 +41163,7 @@ deny_ptrace = true
         );
         assert_live_truth_resolution(
             &payload,
-            "node-local",
+            "host-backed",
             "live-artifact-only",
             "host-artifact-provenance",
             false,
@@ -41221,7 +41175,54 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_mesh_explain_availability_node_local_require_any_live_fails() {
+    fn execute_mesh_explain_availability_host_status_satisfies_live_source_requirements() {
+        for required in ["any-live", "mesh-or-host"] {
+            for status in [
+                mock_connector_admin_status_json(),
+                mock_connector_admin_status_with_artifact(
+                    "local_path",
+                    "/opt/fcp/cache/github-enterprise",
+                    Value::Null,
+                ),
+            ] {
+                let (host, server) = spawn_mock_host(
+                    StdBTreeMap::from([
+                        (
+                            "POST /rpc/discover".to_owned(),
+                            mock_discovery_response_json(),
+                        ),
+                        (
+                            "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
+                            status,
+                        ),
+                    ]),
+                    2,
+                );
+
+                let (exit_code, payload) = execute_json(&[
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    "mesh",
+                    "explain-availability",
+                    "github",
+                    "--require-source",
+                    required,
+                ]);
+
+                server.join().expect("mock host thread should complete");
+                assert_eq!(exit_code, CliExitCode::Success.into());
+                assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+                assert_eq!(payload["_truth_source"], "host");
+                assert_eq!(payload["source"], "host-admin-api");
+                assert!(payload.get("error").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn execute_mesh_explain_availability_recorded_placement_cannot_satisfy_mesh_requirement() {
         let (host, server) = spawn_mock_host(
             StdBTreeMap::from([
                 (
@@ -41230,11 +41231,7 @@ deny_ptrace = true
                 ),
                 (
                     "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
-                    mock_connector_admin_status_with_artifact(
-                        "local_path",
-                        "/opt/fcp/cache/github-enterprise",
-                        Value::Null,
-                    ),
+                    mock_connector_admin_status_json(),
                 ),
             ]),
             2,
@@ -41249,7 +41246,7 @@ deny_ptrace = true
             "explain-availability",
             "github",
             "--require-source",
-            "any-live",
+            "mesh",
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -41257,10 +41254,10 @@ deny_ptrace = true
         assert_eq!(payload["command"], "mesh");
         assert_eq!(payload["subcommand"], "explain-availability");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
-        assert_eq!(payload["_truth_source"], "node-local");
+        assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["error"]["type"], "truth-source-unavailable");
-        assert_eq!(payload["error"]["required"], "any-live");
-        assert_eq!(payload["error"]["actual"], "node-local");
+        assert_eq!(payload["error"]["required"], "mesh");
+        assert_eq!(payload["error"]["actual"], "host");
     }
 
     #[test]
@@ -53083,29 +53080,31 @@ require_attestation_types = ["in-toto"]"#,
     }
 
     #[test]
-    fn live_truth_resolution_prefers_mesh_backed_when_placement_is_recorded() {
+    fn live_truth_resolution_keeps_recorded_placement_host_backed() {
         let status: HostConnectorAdminStatus =
             serde_json::from_value(mock_connector_admin_status_json())
                 .expect("mock admin status should deserialize");
 
         let resolution = resolve_mesh_live_truth(&status);
 
-        assert_eq!(
-            resolution.knowledge_state,
-            LiveTruthKnowledgeState::MeshBacked
-        );
+        assert_eq!(resolution.knowledge_state, KnowledgeState::HostBacked);
         assert_eq!(
             resolution.resolver_branch,
-            LiveTruthResolverBranch::LivePlacementPolicy
+            LiveTruthResolverBranch::LiveArtifactOnly
         );
-        assert_eq!(resolution.authoritative_scope, "mesh-placement-policy");
-        assert!(resolution.mesh_backed);
+        assert_eq!(resolution.authoritative_scope, "host-artifact-provenance");
+        assert!(!resolution.mesh_backed);
         assert!(!resolution.degraded);
         assert!(!resolution.fallback_derived);
+        assert!(
+            RequiredTruthSource::Mesh
+                .validate(resolution.operator_knowledge_state())
+                .is_err()
+        );
     }
 
     #[test]
-    fn live_truth_resolution_falls_back_to_node_local_without_placement() {
+    fn live_truth_resolution_remains_host_backed_without_placement() {
         let status: HostConnectorAdminStatus =
             serde_json::from_value(mock_connector_admin_status_with_artifact(
                 "local_path",
@@ -53116,10 +53115,7 @@ require_attestation_types = ["in-toto"]"#,
 
         let resolution = resolve_mesh_live_truth(&status);
 
-        assert_eq!(
-            resolution.knowledge_state,
-            LiveTruthKnowledgeState::NodeLocal
-        );
+        assert_eq!(resolution.knowledge_state, KnowledgeState::HostBacked);
         assert_eq!(
             resolution.resolver_branch,
             LiveTruthResolverBranch::LiveArtifactOnly
@@ -53131,6 +53127,67 @@ require_attestation_types = ["in-toto"]"#,
     }
 
     #[test]
+    fn live_truth_resolution_uses_host_runtime_without_artifact_provenance() {
+        let mut status: HostConnectorAdminStatus =
+            serde_json::from_value(mock_connector_admin_status_json())
+                .expect("mock admin status should deserialize");
+        status.artifact = None;
+
+        let resolution = resolve_mesh_live_truth(&status);
+
+        assert_eq!(resolution.knowledge_state, KnowledgeState::HostBacked);
+        assert_eq!(
+            resolution.resolver_branch,
+            LiveTruthResolverBranch::LiveRuntimeOnly
+        );
+        assert_eq!(resolution.authoritative_scope, "host-admin-status");
+        assert!(!resolution.mesh_backed);
+        for required in [RequiredTruthSource::AnyLive, RequiredTruthSource::MeshOrHost] {
+            assert!(required.validate(resolution.operator_knowledge_state()).is_ok());
+        }
+    }
+
+    #[test]
+    fn recorded_placement_never_establishes_mesh_truth_for_any_runtime_state() {
+        let mut status: HostConnectorAdminStatus =
+            serde_json::from_value(mock_connector_admin_status_json())
+                .expect("mock admin status should deserialize");
+        assert!(
+            status
+                .artifact
+                .as_ref()
+                .and_then(|artifact| artifact.placement.as_ref())
+                .is_some()
+        );
+        for observed_state in [
+            fcp_host::ObservedRuntimeState::Running,
+            fcp_host::ObservedRuntimeState::Starting,
+            fcp_host::ObservedRuntimeState::Stopped,
+            fcp_host::ObservedRuntimeState::Degraded,
+            fcp_host::ObservedRuntimeState::Missing,
+            fcp_host::ObservedRuntimeState::Unknown,
+        ] {
+            status.observed_state = observed_state;
+            let resolution = resolve_mesh_live_truth(&status);
+
+            assert!(!resolution.mesh_backed);
+            assert_ne!(resolution.knowledge_state, KnowledgeState::MeshBacked);
+            assert!(
+                RequiredTruthSource::Mesh
+                    .validate(resolution.operator_knowledge_state())
+                    .is_err()
+            );
+            if matches!(
+                observed_state,
+                fcp_host::ObservedRuntimeState::Starting | fcp_host::ObservedRuntimeState::Degraded
+            ) {
+                assert_eq!(resolution.knowledge_state, KnowledgeState::Degraded);
+                assert!(resolution.degraded);
+            }
+        }
+    }
+
+    #[test]
     fn live_truth_resolution_marks_degraded_status_explicitly() {
         let status: HostConnectorAdminStatus =
             serde_json::from_value(mock_connector_degraded_status_json())
@@ -53138,10 +53195,7 @@ require_attestation_types = ["in-toto"]"#,
 
         let resolution = resolve_mesh_live_truth(&status);
 
-        assert_eq!(
-            resolution.knowledge_state,
-            LiveTruthKnowledgeState::Degraded
-        );
+        assert_eq!(resolution.knowledge_state, KnowledgeState::Degraded);
         assert_eq!(
             resolution.resolver_branch,
             LiveTruthResolverBranch::LiveRuntimeDegraded
@@ -53156,10 +53210,7 @@ require_attestation_types = ["in-toto"]"#,
     fn live_truth_resolution_marks_post_install_status_gaps_as_fallback() {
         let resolution = resolve_install_activation_truth(None);
 
-        assert_eq!(
-            resolution.knowledge_state,
-            LiveTruthKnowledgeState::FallbackDerived
-        );
+        assert_eq!(resolution.knowledge_state, KnowledgeState::FallbackDerived);
         assert_eq!(
             resolution.resolver_branch,
             LiveTruthResolverBranch::PostInstallStatusUnavailable
