@@ -97,6 +97,30 @@ mod tests {
     }
 
     #[test]
+    fn real_jsonl_health_matches_the_host_health_snapshot_schema() {
+        let input = encode_requests(&[
+            json!({"id": 1, "method": "health"}),
+            json!({"id": 2, "method": "configure", "params": {"mcp_url": "http://127.0.0.1:1"}}),
+            json!({"id": 3, "method": "health"}),
+            handshake_request(4),
+            json!({"id": 5, "method": "health"}),
+            json!({"id": 6, "method": "shutdown"}),
+        ]);
+        let mut output = Vec::new();
+        run_fcp_loop_with_io(Cursor::new(input), &mut output, JsonlConfig::default()).unwrap();
+        let responses = replies(&output);
+        assert_eq!(responses.len(), 6);
+        for (index, expected_state) in [(0, "starting"), (2, "degraded"), (4, "ready")] {
+            let snapshot: fcp_core::HealthSnapshot =
+                serde_json::from_value(responses[index]["result"].clone()).unwrap();
+            assert_eq!(responses[index]["result"]["status"]["state"], expected_state);
+            assert_eq!(snapshot.is_ready(), expected_state == "ready");
+            assert_eq!(responses[index]["result"]["requests"], 0);
+        }
+        assert_eq!(responses[4]["result"]["details"]["instance_id"], responses[3]["result"]["instance_id"]);
+    }
+
+    #[test]
     fn shutdown_flushes_ack_and_leaves_following_request_unread() {
         let shutdown = b"{\"id\":7,\"method\":\"shutdown\"}\n";
         let mut input = shutdown.to_vec();

@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use fcp_core::{FcpError, FcpResult, HandshakeRequest,
+use fcp_core::{FcpError, FcpResult, HandshakeRequest, HealthSnapshot, HealthState,
     InvokeRequest, InvokeResponse, OperationId, RequestId, SimulateRequest, SimulateResponse};
 use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use serde::{Serialize, de::DeserializeOwned};
@@ -34,6 +34,8 @@ pub struct McpBridgeServer {
     connector: McpBridgeConnector,
     session: StandaloneSession,
     configured: bool,
+    started_at: Instant,
+    stopping: bool,
 }
 
 impl McpBridgeServer {
@@ -43,6 +45,8 @@ impl McpBridgeServer {
             connector: McpBridgeConnector::new(),
             session: StandaloneSession::new(MANIFEST)?,
             configured: false,
+            started_at: Instant::now(),
+            stopping: false,
         })
     }
 
@@ -52,6 +56,7 @@ impl McpBridgeServer {
             "configure" => {
                 self.session.invalidate();
                 self.configured = false;
+                self.stopping = false;
                 // Cancel and release the old client's runtime before replacing
                 // credentials. A failed configure leaves no old live authority.
                 self.connector.handle_shutdown(json!({})).await?;
@@ -65,22 +70,10 @@ impl McpBridgeServer {
             "shutdown" => {
                 self.session.invalidate();
                 self.configured = false;
+                self.stopping = true;
                 self.connector.handle_shutdown(params).await
             }
-            "health" => {
-                let mut result = self.connector.handle_health().await?;
-                result["configured"] = json!(self.configured);
-                result["handshaken"] = json!(self.session.is_established());
-                result["instance_id"] = json!(self.session.instance_id());
-                result["status"] = json!(if !self.configured {
-                    "unconfigured"
-                } else if self.session.is_established() {
-                    "healthy"
-                } else {
-                    "degraded"
-                });
-                Ok(result)
-            }
+            "health" => self.health().await,
             "doctor" => {
                 let mut result = self.connector.handle_doctor().await?;
                 if let Some(checks) = result.get_mut("checks").and_then(Value::as_array_mut) {
@@ -111,6 +104,51 @@ impl McpBridgeServer {
                 message: "Unknown standalone FCP method".into(),
             }),
         }
+    }
+
+    /// Report local process readiness in the same typed shape that fcp-host
+    /// deserializes. This is not a probe of the upstream MCP server and never
+    /// establishes authority or consumes an invocation's signed allowance.
+    async fn health(&self) -> FcpResult<Value> {
+        let provider = self.connector.handle_health().await?;
+        let handshaken = self.session.is_established();
+        let status = if self.stopping {
+            HealthState::Stopping
+        } else if !self.configured {
+            HealthState::Starting
+        } else if !handshaken {
+            HealthState::Degraded {
+                reason: "No negotiated capability authority".into(),
+            }
+        } else {
+            HealthState::Ready
+        };
+        let snapshot = HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(json!({
+                "configured": self.configured,
+                "handshaken": handshaken,
+                "instance_id": self.session.instance_id(),
+            })),
+            rate_limit: None,
+        };
+        let mut result = encode(&snapshot)?;
+        // Keep the existing diagnostic extensions, but construct the canonical
+        // envelope from the authoritative server state, not the provider's
+        // legacy string-valued status or retained session_id.
+        result["configured"] = json!(self.configured);
+        result["handshaken"] = json!(handshaken);
+        result["instance_id"] = json!(self.session.instance_id());
+        for name in [
+            "requests", "errors", "injection_scans", "injection_findings", "sampling_requests",
+        ] {
+            if let Some(value) = provider.get(name) {
+                result[name] = value.clone();
+            }
+        }
+        Ok(result)
     }
 
     async fn handshake(&mut self, params: Value) -> FcpResult<Value> {
@@ -270,6 +308,9 @@ async fn await_invocation(
 }
 
 #[cfg(test)]
+mod host_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use fcp_async_core::runtime::Builder;
     use fcp_core::CapabilityToken;
@@ -336,7 +377,7 @@ mod tests {
             assert!(server.dispatch("handshake", json!({"session_id": "claimed"})).await.is_err());
             let health = server.dispatch("health", json!({})).await.unwrap();
             assert_eq!(health["handshaken"], false);
-            assert_eq!(health["status"], "degraded");
+            assert_eq!(health["status"]["state"], "degraded");
             assert!(matches!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await,
                 Err(FcpError::NotHandshaken)));
         });
@@ -367,7 +408,7 @@ mod tests {
             let health = server.dispatch("health", json!({})).await.unwrap();
             assert_eq!(health["configured"], false);
             assert_eq!(health["handshaken"], false);
-            assert_eq!(health["status"], "unconfigured");
+            assert_eq!(health["status"]["state"], "starting");
             assert!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await.is_err());
         });
     }
