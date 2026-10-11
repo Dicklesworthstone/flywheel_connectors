@@ -431,6 +431,16 @@ pub enum MeshForwardBody {
         /// Canonical connector id.
         connector_id: String,
     },
+    /// Return the connector's public inventory summary from the executor.
+    Inventory {
+        /// Canonical connector id.
+        connector_id: String,
+    },
+    /// Return the connector's public runtime status from the executor.
+    Status {
+        /// Canonical connector id.
+        connector_id: String,
+    },
 }
 
 impl MeshForwardBody {
@@ -441,6 +451,8 @@ impl MeshForwardBody {
             Self::Invoke { .. } => "invoke",
             Self::Preflight { .. } => "preflight",
             Self::Introspect { .. } => "introspect",
+            Self::Inventory { .. } => "inventory",
+            Self::Status { .. } => "status",
         }
     }
 
@@ -458,7 +470,9 @@ impl MeshForwardBody {
                 out.field(request_json.as_bytes())
                     .opt_field(asserted_principal.as_deref().map(str::as_bytes));
             }
-            Self::Introspect { connector_id } => {
+            Self::Introspect { connector_id }
+            | Self::Inventory { connector_id }
+            | Self::Status { connector_id } => {
                 out.field(connector_id.as_bytes());
             }
         }
@@ -474,7 +488,9 @@ impl MeshForwardBody {
                 request_json,
                 asserted_principal,
             } => request_json.len() + asserted_principal.as_ref().map_or(0, String::len),
-            Self::Introspect { connector_id } => connector_id.len(),
+            Self::Introspect { connector_id }
+            | Self::Inventory { connector_id }
+            | Self::Status { connector_id } => connector_id.len(),
         }
     }
 }
@@ -1357,6 +1373,90 @@ mod tests {
             .expect("untampered preflight forward verifies");
     }
 
+    fn connector_query_bodies(connector_id: &str) -> [MeshForwardBody; 3] {
+        [
+            MeshForwardBody::Introspect {
+                connector_id: connector_id.to_owned(),
+            },
+            MeshForwardBody::Inventory {
+                connector_id: connector_id.to_owned(),
+            },
+            MeshForwardBody::Status {
+                connector_id: connector_id.to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn connector_query_forwards_round_trip_and_bind_method_and_connector() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        let connector_id = "fcp.test.remote:utility:1.0.0";
+        let bodies = connector_query_bodies(connector_id);
+        let changed_bodies = connector_query_bodies("fcp.test.other:utility:1.0.0");
+
+        for (index, body) in bodies.iter().enumerate() {
+            let envelope = MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                body.clone(),
+            )
+            .unwrap();
+            let wire = serde_json::to_value(&envelope).unwrap();
+            assert_eq!(wire["body"]["method"], body.method());
+            assert_eq!(wire["body"]["connector_id"], connector_id);
+            let decoded: MeshForwardEnvelope = serde_json::from_value(wire).unwrap();
+            assert_eq!(decoded, envelope);
+            decoded
+                .verify(&directory, NOW, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)
+                .expect("a signed connector query must survive serialization");
+
+            let mut changed_connector = envelope.clone();
+            changed_connector.body = changed_bodies[index].clone();
+            assert!(matches!(
+                changed_connector.verify(&directory, NOW, DEFAULT_MESH_FORWARD_MAX_SKEW_MS),
+                Err(MeshForwardError::SignatureInvalid { .. })
+            ));
+
+            for alternative in &bodies {
+                if alternative.method() == body.method() {
+                    continue;
+                }
+                let mut changed_method = envelope.clone();
+                changed_method.body = alternative.clone();
+                assert!(
+                    matches!(
+                        changed_method.verify(&directory, NOW, DEFAULT_MESH_FORWARD_MAX_SKEW_MS),
+                        Err(MeshForwardError::SignatureInvalid { .. })
+                    ),
+                    "{} must not authorize {} for the same connector",
+                    body.method(),
+                    alternative.method(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connector_query_forwards_enforce_the_shared_body_limit() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let connector_id = "x".repeat(MAX_MESH_FORWARD_BODY_BYTES + 1);
+        for body in connector_query_bodies(&connector_id) {
+            assert!(matches!(
+                MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    body,
+                ),
+                Err(MeshForwardError::BodyTooLarge { .. })
+            ));
+        }
+    }
+
     #[test]
     fn forward_rejects_wrong_target_unknown_peer_hops_and_staleness() {
         let mesh = Mesh::new(&["node-a", "node-b", "node-c"]);
@@ -1879,19 +1979,29 @@ mod tests {
         let subject = ObjectId::from_bytes([17; 32]);
         assert_eq!(
             decide_singleton_writer_route(
-                std::sync::Arc::clone(&snapshot), &zone, &subject, &eligible, 0,
+                std::sync::Arc::clone(&snapshot),
+                &zone,
+                &subject,
+                &eligible,
+                0,
             ),
             decide_singleton_writer_route(snapshot.as_ref(), &zone, &subject, &eligible, 0),
         );
         let advertisements = vec![offering(&mesh, "node-b", &["z:work"], false)];
         assert_eq!(
             decide_advertised_connector_route(
-                std::sync::Arc::clone(&snapshot), "fcp.remote:utility:1.0.0",
-                Some(&zone), &advertisements, 0,
+                std::sync::Arc::clone(&snapshot),
+                "fcp.remote:utility:1.0.0",
+                Some(&zone),
+                &advertisements,
+                0,
             ),
             decide_advertised_connector_route(
-                snapshot.as_ref(), "fcp.remote:utility:1.0.0",
-                Some(&zone), &advertisements, 0,
+                snapshot.as_ref(),
+                "fcp.remote:utility:1.0.0",
+                Some(&zone),
+                &advertisements,
+                0,
             ),
         );
     }

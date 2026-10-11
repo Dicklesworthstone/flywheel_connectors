@@ -1291,23 +1291,9 @@ fn mock_host_health_json(status: &str) -> Value {
     })
 }
 
-fn mock_pin_status_json(pinned: bool, version: Option<&str>) -> Value {
+fn mock_lifecycle_status_json(connector_id: &str, state: &str, version: &str) -> Value {
     json!({
-        "connector_id": "fcp.github:enterprise:v1",
-        "pinned": pinned,
-        "version": version,
-    })
-}
-
-fn mock_rollout_status_json(
-    state: &str,
-    version: &str,
-    pinned: bool,
-    pinned_version: Option<&str>,
-    canary_percent: u8,
-) -> Value {
-    json!({
-        "connector_id": "fcp.github:enterprise:v1",
+        "connector_id": connector_id,
         "state": state,
         "version": version,
         "health": {
@@ -1323,9 +1309,6 @@ fn mock_rollout_status_json(
         "auto_promote_pending": false,
         "auto_rollback_pending": false,
         "crash_loop_detected": false,
-        "pinned": pinned,
-        "pinned_version": pinned_version,
-        "canary_percent": canary_percent,
     })
 }
 
@@ -4850,6 +4833,13 @@ fn operator_truth_fixture_node_local_status_matches_cli_contract() {
     let fixture = load_operator_truth_fixture("node_local_status_host_admin");
     let github_connector =
         mock_connector_summary_json("fcp.github:enterprise:v1", "GitHub Enterprise", 1, "risky");
+    let mut admin = mock_connector_admin_status_json(
+        "registry",
+        "registry://fcp/github-enterprise/1.2.3",
+        &Value::Null,
+    );
+    admin["lifecycle"] =
+        mock_lifecycle_status_json("fcp.github:enterprise:v1", "production", "1.2.3");
     let routes = vec![
         (
             "POST /rpc/discover".to_owned(),
@@ -4861,19 +4851,7 @@ fn operator_truth_fixture_node_local_status_matches_cli_contract() {
         ),
         (
             "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
-            mock_connector_admin_status_json(
-                "registry",
-                "registry://fcp/github-enterprise/1.2.3",
-                &Value::Null,
-            ),
-        ),
-        (
-            "GET /rpc/rollout/pin/fcp.github:enterprise:v1".to_owned(),
-            mock_pin_status_json(false, None),
-        ),
-        (
-            "GET /rpc/rollout/fcp.github:enterprise:v1".to_owned(),
-            mock_rollout_status_json("production", "1.2.3", false, None, 0),
+            admin,
         ),
     ];
     let (host, server) = spawn_mock_host_sequence(routes.clone());
@@ -4888,6 +4866,153 @@ fn operator_truth_fixture_node_local_status_matches_cli_contract() {
     assert_eq!(payload["scope"], "connector");
     assert_eq!(payload["admin"]["observed_state"], "running");
     assert_eq!(payload["pin"]["pinned"], false);
+}
+
+/// A connector advertised by a gateway may have no local workspace manifest.
+/// Live detail and schema lookup must use its canonical host inventory id.
+#[test]
+fn remote_connector_show_and_schema_use_the_live_catalog() {
+    let connector_id = "fcp.test.mesh-remote:utility:1.0.0";
+    let connector = mock_connector_summary_json(connector_id, "Mesh Remote", 1, "safe");
+    let input_schema = json!({
+        "type": "object",
+        "properties": { "message": { "type": "string" } },
+        "required": ["message"],
+    });
+    let tool = mock_tool_descriptor_json(
+        "mesh.echo",
+        "mesh.echo",
+        "low",
+        "safe",
+        "strict",
+        None,
+        &input_schema,
+        &json!({ "type": "object" }),
+    );
+    assert!(
+        !repo_root().join("connectors/test.mesh-remote").exists(),
+        "the regression requires a connector absent from workspace manifests"
+    );
+
+    for command in [
+        vec!["show", connector_id],
+        vec!["schema", "test.mesh-remote", "mesh.echo"],
+    ] {
+        let (host, server) = spawn_mock_host_sequence(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(std::slice::from_ref(&connector)),
+            ),
+            (
+                format!("GET /rpc/connectors/{connector_id}"),
+                json!({ "connector": connector, "registry_version": 7 }),
+            ),
+            (
+                format!("GET /rpc/introspect/{connector_id}"),
+                mock_introspection_response_json(&connector, std::slice::from_ref(&tool)),
+            ),
+        ]);
+        let mut args = vec!["--json", "--host", &host];
+        args.extend(command);
+        args.extend(["--require-source", "mesh-or-host"]);
+        let payload = run_json_ok(&args);
+        server.join().expect("mock host thread should complete");
+
+        assert_eq!(payload["connector"]["canonical_id"], connector_id);
+        assert_eq!(payload["connector"]["slug"], "test.mesh-remote");
+        assert_eq!(payload["source"], "host-admin-api");
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["availability"]["availability"], "live-runtime");
+        if payload["command"] == "show" {
+            assert!(payload["connector"]["manifest_path"].is_null());
+            assert_eq!(
+                payload["operations"]["preview"][0]["canonical_id"],
+                "mesh.echo"
+            );
+        } else {
+            assert_eq!(payload["operation"]["canonical_id"], "mesh.echo");
+            assert_eq!(payload["input_schema"], input_schema);
+        }
+    }
+}
+
+/// Runtime status, pin state, and lifecycle must come from one public
+/// executor snapshot. The entry host has no connector in its health map and
+/// does not expose privileged pin or rollout routes to this CLI process.
+#[test]
+fn remote_connector_status_uses_one_public_executor_snapshot() {
+    let connector_id = "fcp.test.mesh-remote:utility:1.0.0";
+    let connector = mock_connector_summary_json(connector_id, "Mesh Remote", 1, "safe");
+    let lifecycle = mock_lifecycle_status_json(connector_id, "canary", "2.4.0");
+    for has_lifecycle in [true, false] {
+        let mut admin = json!({
+            "connector_id": connector_id,
+            "desired_state": "enabled",
+            "observed_state": "running",
+            "config_revision_count": 1,
+            "last_journal_sequence": 9,
+            "evaluated_at": "2026-03-12T00:00:00Z",
+        });
+        if has_lifecycle {
+            admin["pinned_version"] = json!("2.4.0");
+            admin["lifecycle"] = lifecycle.clone();
+        }
+        let (host, server) = spawn_mock_host_sequence(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(std::slice::from_ref(&connector)),
+            ),
+            (
+                "GET /rpc/health".to_owned(),
+                mock_host_health_json("healthy"),
+            ),
+            (format!("GET /rpc/connectors/{connector_id}/status"), admin),
+        ]);
+        let mut payload = run_json_ok(&[
+            "--json",
+            "--host",
+            &host,
+            "status",
+            "test.mesh-remote",
+            "--require-source",
+            "mesh-or-host",
+        ]);
+        server.join().expect("mock host thread should complete");
+
+        assert_eq!(payload["connector"]["canonical_id"], connector_id);
+        assert_eq!(payload["admin"]["observed_state"], "running");
+        assert_eq!(payload["pin"]["connector_id"], connector_id);
+        assert_eq!(payload["pin"]["pinned"], has_lifecycle);
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["provenance"]["mesh_backed"], false);
+        if has_lifecycle {
+            assert_eq!(payload["pin"]["version"], "2.4.0");
+            assert_eq!(payload["rollout"]["state"], "canary");
+            assert_eq!(payload["rollout"], payload["admin"]["lifecycle"]);
+            assert!(payload["rollout"].get("canary_percent").is_none());
+        } else {
+            assert!(payload["pin"].get("version").is_none());
+            assert!(payload.get("rollout").is_none());
+            assert!(payload["warnings"].as_array().is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning.as_str().is_some_and(|warning| {
+                        warning.contains("lifecycle") && warning.contains("unknown")
+                    })
+                })
+            }));
+        }
+        let schema: Value = serde_json::from_str(include_str!("../schemas/status.schema.json"))
+            .expect("status schema should parse");
+        let validator = jsonschema::validator_for(&schema).expect("status schema should compile");
+        // Per-command schemas describe the dispatch body; `_output` is the
+        // shared renderer envelope added after every command dispatch.
+        payload
+            .as_object_mut()
+            .expect("status should be an object")
+            .remove("_output");
+        let errors: Vec<_> = validator.iter_errors(&payload).collect();
+        assert!(errors.is_empty(), "status schema violations: {errors:?}");
+    }
 }
 
 #[test]
@@ -4934,6 +5059,13 @@ fn operator_truth_fixture_node_local_status_exports_replayable_bundle_manifest()
     let fixture = load_operator_truth_fixture("node_local_status_host_admin");
     let github_connector =
         mock_connector_summary_json("fcp.github:enterprise:v1", "GitHub Enterprise", 1, "risky");
+    let mut admin = mock_connector_admin_status_json(
+        "registry",
+        "registry://fcp/github-enterprise/1.2.3",
+        &Value::Null,
+    );
+    admin["lifecycle"] =
+        mock_lifecycle_status_json("fcp.github:enterprise:v1", "production", "1.2.3");
     let routes = vec![
         (
             "POST /rpc/discover".to_owned(),
@@ -4945,19 +5077,7 @@ fn operator_truth_fixture_node_local_status_exports_replayable_bundle_manifest()
         ),
         (
             "GET /rpc/connectors/fcp.github:enterprise:v1/status".to_owned(),
-            mock_connector_admin_status_json(
-                "registry",
-                "registry://fcp/github-enterprise/1.2.3",
-                &Value::Null,
-            ),
-        ),
-        (
-            "GET /rpc/rollout/pin/fcp.github:enterprise:v1".to_owned(),
-            mock_pin_status_json(false, None),
-        ),
-        (
-            "GET /rpc/rollout/fcp.github:enterprise:v1".to_owned(),
-            mock_rollout_status_json("production", "1.2.3", false, None, 0),
+            admin,
         ),
     ];
     let (host, server) = spawn_mock_host_sequence(routes);

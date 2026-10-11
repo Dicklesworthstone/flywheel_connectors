@@ -249,7 +249,8 @@
     "rollout_status": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["connector_id", "state", "version", "pinned", "canary_percent"],
+      "description": "Lifecycle snapshot from the same public connector status response; canary traffic allocation is not available on this surface.",
+      "required": ["connector_id", "state", "version"],
       "properties": {
         "connector_id": { "$ref": "#/$defs/non_empty_string" },
         "state": { "$ref": "#/$defs/non_empty_string" },
@@ -348,6 +349,10 @@
         "admin": { "$ref": "#/$defs/admin_status" },
         "pin": { "$ref": "#/$defs/pin_status" },
         "rollout": { "$ref": "#/$defs/rollout_status" },
+        "warnings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" }
+        },
         "host_health": { "$ref": "#/$defs/connector_host_health" },
         "registry_version": { "$ref": "#/$defs/non_negative_integer" },
         "next_actions": { "$ref": "#/$defs/next_actions" },

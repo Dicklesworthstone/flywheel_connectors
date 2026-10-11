@@ -6767,7 +6767,9 @@ struct OperatorTruthStatusPayload {
     admin: HostConnectorAdminStatus,
     pin: HostPinState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rollout: Option<HostRolloutStatus>,
+    rollout: Option<LifecycleStatus>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     host_health: Value,
     registry_version: u64,
     next_actions: Vec<String>,
@@ -6969,12 +6971,28 @@ fn build_connector_status_operator_contract(
     endpoint: &str,
     connector: &HostConnectorRecord,
     admin: HostConnectorAdminStatus,
-    pin: HostPinState,
-    rollout: Option<HostRolloutStatus>,
     host_health: &HostHealthResponse,
     registry_version: u64,
 ) -> OperatorTruthStatusPayload {
     let degraded = !connector.summary.health.is_healthy();
+    // Pin and lifecycle data must describe the same executor snapshot as
+    // `admin`. Separate rollout requests are privileged and node-local, so
+    // querying them on an entry host can fail or mix in unrelated stale state
+    // when this connector is served by a mesh peer.
+    let pin = HostPinState {
+        connector_id: admin.connector_id.to_string(),
+        pinned: admin.pinned_version.is_some(),
+        version: admin.pinned_version.clone(),
+    };
+    let rollout = admin.lifecycle.clone();
+    let warnings = if rollout.is_none() {
+        vec![
+            "The connector status snapshot does not include lifecycle details; rollout state and canary traffic are unknown."
+                .to_owned(),
+        ]
+    } else {
+        Vec::new()
+    };
     OperatorTruthStatusPayload {
         status: "ok",
         command: "status",
@@ -6995,6 +7013,7 @@ fn build_connector_status_operator_contract(
         admin: admin.clone(),
         pin,
         rollout,
+        warnings,
         host_health: json!({
             "status": host_health.status,
             "timestamp": host_health.timestamp,
@@ -15346,16 +15365,12 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
             }
         };
         let admin = client.connector_status(connector.summary.id.as_str())?;
-        let pin = client.pin_status(connector.summary.id.as_str())?;
-        let rollout = client.rollout_status(connector.summary.id.as_str()).ok();
 
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "status");
         let mut payload = serde_json::to_value(build_connector_status_operator_contract(
             &host.endpoint,
             connector,
             admin,
-            pin,
-            rollout,
             &health,
             discovery.registry_version,
         ))?;
@@ -46893,43 +46908,32 @@ depends_on = ["missing"]
                         "connector_id": cid,
                         "desired_state": "enabled",
                         "observed_state": "running",
+                        "pinned_version": "1.2.3",
+                        "lifecycle": {
+                            "connector_id": cid,
+                            "state": "production",
+                            "version": "1.2.3",
+                            "health": {
+                                "successes": 100,
+                                "failures": 0,
+                                "samples": 100,
+                                "success_rate": 100,
+                                "total_latency_ms": 500,
+                                "latency_samples": 100,
+                                "max_latency_ms": 10,
+                                "last_updated": "2026-03-12T00:00:00Z",
+                            },
+                            "auto_promote_pending": false,
+                            "auto_rollback_pending": false,
+                            "crash_loop_detected": false,
+                        },
                         "config_revision_count": 1,
                         "last_journal_sequence": 9,
                         "evaluated_at": "2026-03-12T00:00:00Z",
                     }),
                 ),
-                (
-                    format!("GET /rpc/rollout/pin/{cid}"),
-                    json!({
-                        "connector_id": cid,
-                        "pinned": false,
-                    }),
-                ),
-                (
-                    format!("GET /rpc/rollout/{cid}"),
-                    json!({
-                        "connector_id": cid,
-                        "state": "production",
-                        "version": "1.2.3",
-                        "health": {
-                            "successes": 100,
-                            "failures": 0,
-                            "samples": 100,
-                            "success_rate": 100,
-                            "total_latency_ms": 500,
-                            "latency_samples": 100,
-                            "max_latency_ms": 10,
-                            "last_updated": "2026-03-12T00:00:00Z",
-                        },
-                        "auto_promote_pending": false,
-                        "auto_rollback_pending": false,
-                        "crash_loop_detected": false,
-                        "pinned": false,
-                        "canary_percent": 0,
-                    }),
-                ),
             ]),
-            5,
+            3,
         );
 
         let (exit_code, payload) =
@@ -46946,8 +46950,12 @@ depends_on = ["missing"]
         assert_eq!(payload["connector"]["slug"], "github");
         assert_eq!(payload["connector"]["canonical_id"], cid);
         assert!(!payload["admin"].is_null());
-        assert!(!payload["pin"].is_null());
+        assert_eq!(payload["pin"]["pinned"], true);
+        assert_eq!(payload["pin"]["version"], "1.2.3");
         assert!(!payload["rollout"].is_null());
+        assert_eq!(payload["rollout"], payload["admin"]["lifecycle"]);
+        assert!(payload["rollout"].get("canary_percent").is_none());
+        assert!(payload.get("warnings").is_none());
         assert_eq!(payload["host_health"]["status"], "healthy");
     }
 
@@ -49823,24 +49831,8 @@ require_attestation_types = ["in-toto"]"#,
                         "evaluated_at": chrono::Utc::now(),
                     }),
                 ),
-                (
-                    "GET /rpc/rollout/pin/fcp.github:enterprise:v1".to_owned(),
-                    json!({
-                        "connector_id": "fcp.github:enterprise:v1",
-                        "pinned": false,
-                    }),
-                ),
-                (
-                    "GET /rpc/rollout/fcp.github:enterprise:v1".to_owned(),
-                    json!({
-                        "version": "1.0.0",
-                        "state": "active",
-                        "pinned": false,
-                        "canary_percent": 0,
-                    }),
-                ),
             ]),
-            5,
+            3,
         );
 
         let (exit_code, payload) =

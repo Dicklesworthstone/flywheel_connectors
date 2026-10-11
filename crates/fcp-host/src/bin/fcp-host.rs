@@ -62,9 +62,9 @@ use fcp_host::{
     BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
     BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
     CancellationController, CancellationRequest, CancellationResponse, CancellationScope,
-    CancellationTerminator,
-    CapabilityTokenVerifyRequest, ConfigRevisionRecord, ConnectorAdminState, ConnectorAdminStatus,
-    ConnectorArchetype, ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
+    CancellationTerminator, CapabilityTokenVerifyRequest, ConfigRevisionRecord,
+    ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
+    ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
     ConnectorConfigApplyResponse, ConnectorConfigDiffRequest, ConnectorConfigDiffResponse,
     ConnectorConfigRevisionsResponse, ConnectorConfigRollbackRequest, ConnectorConfigSnapshot,
@@ -775,8 +775,12 @@ impl WarmPoolTermination {
                     worker._runner_task.abort();
                 }
             },
-            move || finished.selected.get()
-                .is_some_and(|worker| worker._runner_task.is_finished()),
+            move || {
+                finished
+                    .selected
+                    .get()
+                    .is_some_and(|worker| worker._runner_task.is_finished())
+            },
         )
     }
 
@@ -843,10 +847,9 @@ impl WasiTermination {
                 handle.abort();
             }
         }
-        let result = Abortable::new(operation, registration).await
-            .map_err(|_| HostError::RegistryError(
-                "WASI connector invocation cancelled by deadline".into(),
-            ))?;
+        let result = Abortable::new(operation, registration).await.map_err(|_| {
+            HostError::RegistryError("WASI connector invocation cancelled by deadline".into())
+        })?;
         if self.stop_requested.load(Ordering::SeqCst) {
             return Err(HostError::RegistryError(
                 "WASI connector invocation cancelled by deadline".into(),
@@ -1108,7 +1111,10 @@ impl NativeWarmPoolConnector {
 
         let mut entry = checkout.entry;
         let response = entry.connector.invoke(request).await;
-        if termination.as_ref().is_some_and(WarmPoolTermination::is_cancel_requested) {
+        if termination
+            .as_ref()
+            .is_some_and(WarmPoolTermination::is_cancel_requested)
+        {
             // Never restore an aborted worker to a warm pool, even when
             // its pending RPC happened to report a successful response.
             return Err(HostError::RegistryError(
@@ -2169,7 +2175,9 @@ impl SubprocessRegistry {
         Option<WasiTermination>,
     )> {
         let state = self.state.read().await;
-        let entry = state.connectors.get(connector_id)
+        let entry = state
+            .connectors
+            .get(connector_id)
             .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
         if entry.config.cancellation_deadline_ms == Some(0) {
             return Err(HostError::Internal(format!(
@@ -2180,7 +2188,8 @@ impl SubprocessRegistry {
         let mut scope = CancellationScope::new(
             connector_id.to_string(),
             configured_subprocess_archetype(&entry.config),
-        ).with_deadline_override_ms(entry.config.cancellation_deadline_ms);
+        )
+        .with_deadline_override_ms(entry.config.cancellation_deadline_ms);
 
         // The native runner's task owns a Child created with kill_on_drop.
         // Abort wakes the runner even during a blocked read and drops THAT
@@ -7738,18 +7747,18 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
                             return;
                         };
                         terminator.abort();
-                        let completed = fcp_async_core::time::timeout(
-                            Duration::from_secs(2),
-                            async {
+                        let completed =
+                            fcp_async_core::time::timeout(Duration::from_secs(2), async {
                                 while !terminator.is_finished() {
                                     fcp_async_core::time::sleep(Duration::from_millis(20)).await;
                                 }
-                            },
-                        ).await.is_ok();
+                            })
+                            .await
+                            .is_ok();
                         if completed {
-                            state.cancellation.record_forced_cancellation(
-                                &expired.operation_id, Utc::now(),
-                            );
+                            state
+                                .cancellation
+                                .record_forced_cancellation(&expired.operation_id, Utc::now());
                             tracing::warn!(
                                 event = "cancellation_forced",
                                 operation_id = %expired.operation_id,
@@ -7758,7 +7767,9 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
                                 "bound native runner was aborted out of band"
                             );
                         } else {
-                            state.cancellation.rearm_force_terminate(&expired.operation_id);
+                            state
+                                .cancellation
+                                .rearm_force_terminate(&expired.operation_id);
                             tracing::error!(
                                 event = "cancellation_force_terminate_timeout",
                                 operation_id = %expired.operation_id,
@@ -9814,7 +9825,39 @@ async fn connector_handler(
     Path(connector_id): Path<String>,
 ) -> Result<(HeaderMap, Json<ConnectorInventoryResponse>), (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
+    if let Some(router) = state.mesh.clone() {
+        let decision = mesh_route_decision(&state, &router, &connector_id, None).await;
+        if decision.is_forward() {
+            let response: ConnectorInventoryResponse = mesh_forward_query(
+                &router,
+                decision,
+                fcp_mesh::invoke_route::MeshForwardBody::Inventory {
+                    connector_id: connector_id.to_string(),
+                },
+            )
+            .await?;
+            if response.connector.id != connector_id {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "mesh executor returned inventory for a different connector".to_string(),
+                ));
+            }
+            let response_headers = cache_headers(response.cache.as_ref());
+            return Ok((response_headers, Json(response)));
+        }
+    }
     let cache_validator = cache_validator_from_headers(&headers);
+    local_connector_inventory(&state, &connector_id, cache_validator)
+        .await
+        .map(|(response_headers, response)| (response_headers, Json(response)))
+}
+
+/// Inventory served from this host's own registry, without another mesh hop.
+async fn local_connector_inventory(
+    state: &AppState,
+    connector_id: &ConnectorId,
+    cache_validator: Option<CacheValidator>,
+) -> Result<(HeaderMap, ConnectorInventoryResponse), (StatusCode, String)> {
     let started_at = Instant::now();
     tracing::debug!(
         event = "connector_request",
@@ -9823,7 +9866,7 @@ async fn connector_handler(
     );
     match state
         .discovery
-        .connector_with_cache(&connector_id, cache_validator)
+        .connector_with_cache(connector_id, cache_validator)
         .await
     {
         Ok(response) => {
@@ -9835,7 +9878,7 @@ async fn connector_handler(
                 "connector inventory request complete"
             );
             let response_headers = cache_headers(response.cache.as_ref());
-            Ok((response_headers, Json(response)))
+            Ok((response_headers, response))
         }
         Err(err) => {
             tracing::warn!(
@@ -9855,6 +9898,42 @@ async fn connector_status_handler(
     Path(connector_id): Path<String>,
 ) -> Result<Json<ConnectorAdminStatus>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
+    // Admin state outlives registration so operators can still inspect a
+    // removed connector's stopped/missing state and recovery diagnosis.
+    // A remote advertisement must not hide that existing local record.
+    let local_not_found = match local_connector_status(&state, &connector_id).await {
+        Ok(status) => return Ok(Json(status)),
+        Err(error) if error.0 == StatusCode::NOT_FOUND => error,
+        Err(error) => return Err(error),
+    };
+    if let Some(router) = state.mesh.clone() {
+        let decision = mesh_route_decision(&state, &router, &connector_id, None).await;
+        if decision.is_forward() {
+            let response: ConnectorAdminStatus = mesh_forward_query(
+                &router,
+                decision,
+                fcp_mesh::invoke_route::MeshForwardBody::Status {
+                    connector_id: connector_id.to_string(),
+                },
+            )
+            .await?;
+            if response.connector_id != connector_id {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "mesh executor returned status for a different connector".to_string(),
+                ));
+            }
+            return Ok(Json(response));
+        }
+    }
+    Err(local_not_found)
+}
+
+/// Public runtime status from this host's own lifecycle state only.
+async fn local_connector_status(
+    state: &AppState,
+    connector_id: &ConnectorId,
+) -> Result<ConnectorAdminStatus, (StatusCode, String)> {
     let started_at = Instant::now();
     tracing::debug!(
         event = "connector_status_request",
@@ -9862,7 +9941,7 @@ async fn connector_status_handler(
         "processing connector admin status request"
     );
 
-    match state.lifecycle.connector_status(&connector_id).await {
+    match state.lifecycle.connector_status(connector_id).await {
         Ok(status) => {
             tracing::debug!(
                 event = "connector_status_response",
@@ -9873,7 +9952,7 @@ async fn connector_status_handler(
                 duration_ms = started_at.elapsed().as_millis() as u64,
                 "connector admin status request complete"
             );
-            Ok(Json(status))
+            Ok(status)
         }
         Err(err) => {
             let host_error = map_lifecycle_host_error(err);
@@ -13732,7 +13811,8 @@ async fn execute_local_invoke(
     // A concurrent configuration update cannot redirect this invocation.
     let invoke_result = match invoked_runtime {
         ConnectorRuntime::NativeWarmPool(pool) => {
-            pool.invoke_with_termination(request, warm_pool_capture).await
+            pool.invoke_with_termination(request, warm_pool_capture)
+                .await
         }
         ConnectorRuntime::Wasi(wasi) => {
             if let Some(capture) = wasi_capture {
@@ -14109,7 +14189,7 @@ fn mesh_reply_into_invoke_response(
     Ok(response)
 }
 
-/// Relay a read-only query (introspection, preflight) to the chosen peer,
+/// Relay a read-only query (inventory, status, introspection, preflight) to the chosen peer,
 /// trying ranked alternates on any failure (nothing executes).
 async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
     router: &fcp_host::mesh_routing::MeshRouter,
@@ -14263,6 +14343,20 @@ async fn mesh_forward_handler(
                     .await
                     .map(|(_, response)| response),
             ),
+            Err(error) => mesh_reply_body::<()>(Err(error)),
+        },
+        MeshForwardBody::Inventory { connector_id } => match parse_connector_id(connector_id) {
+            Ok(connector_id) => mesh_reply_body(
+                local_connector_inventory(&state, &connector_id, None)
+                    .await
+                    .map(|(_, response)| response),
+            ),
+            Err(error) => mesh_reply_body::<()>(Err(error)),
+        },
+        MeshForwardBody::Status { connector_id } => match parse_connector_id(connector_id) {
+            Ok(connector_id) => {
+                mesh_reply_body(local_connector_status(&state, &connector_id).await)
+            }
             Err(error) => mesh_reply_body::<()>(Err(error)),
         },
     };
@@ -17095,6 +17189,176 @@ deny_ptrace = true
             started_at: Instant::now(),
             mesh: None,
         })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mesh_connector_reads_reject_wrong_ids_and_preserve_unregistered_local_status() {
+        use fcp_host::mesh_routing::{
+            MESH_ADVERTISEMENT_ROUTE, MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings,
+        };
+        use fcp_mesh::invoke_route::{
+            AdvertisedConnector, MeshForwardBody, MeshForwardEnvelope, MeshForwardReply,
+            MeshPeerAdvertisement,
+        };
+
+        const REQUESTED: &str = "fcp.test.remote-read:utility:1.0.0";
+        const OTHER: &str = "fcp.test.wrong-read:utility:1.0.0";
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let peer_node = fcp_core::TailscaleNodeId::new("peer-reader");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signed read peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("peer address"));
+        let peers_json = json!([{
+            "node_id": peer_node.as_str(),
+            "endpoint": endpoint,
+            "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+        }])
+        .to_string();
+        let advertisement = MeshPeerAdvertisement::sign(
+            &peer_key,
+            peer_node.clone(),
+            fcp_host::mesh_routing::unix_now_ms(),
+            vec![AdvertisedConnector {
+                connector_id: REQUESTED.to_string(),
+                zones: vec![ZoneId::work().to_string()],
+                singleton_writer: false,
+                summary_json: None,
+            }],
+        );
+        let wrong_summary = connector_summary_from_config(&dispatcher_test_config(OTHER))
+            .expect("wrong connector summary");
+        let peer_lifecycle = HostAdminStateStore::new();
+        peer_lifecycle
+            .reconcile_registered_connectors(std::slice::from_ref(&wrong_summary))
+            .await
+            .expect("seed peer status");
+        let inventory_json = serde_json::to_string(&ConnectorInventoryResponse {
+            connector: wrong_summary,
+            registry_version: 1,
+            cache: None,
+            meta: None,
+        })
+        .expect("inventory JSON");
+        let status_json = serde_json::to_string(
+            &peer_lifecycle
+                .connector_status(&ConnectorId::from_static(OTHER))
+                .await
+                .expect("peer status"),
+        )
+        .expect("status JSON");
+        let forwards = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_forwards = Arc::clone(&forwards);
+        let app = Router::new()
+            .route(
+                MESH_ADVERTISEMENT_ROUTE,
+                get(move || {
+                    let advertisement = advertisement.clone();
+                    async move { Json(advertisement) }
+                }),
+            )
+            .route(
+                MESH_FORWARD_ROUTE,
+                post(move |Json(envelope): Json<MeshForwardEnvelope>| {
+                    observed_forwards.fetch_add(1, Ordering::SeqCst);
+                    let body_json = match &envelope.body {
+                        MeshForwardBody::Inventory { connector_id } => {
+                            assert_eq!(connector_id, REQUESTED);
+                            inventory_json.clone()
+                        }
+                        MeshForwardBody::Status { connector_id } => {
+                            assert_eq!(connector_id, REQUESTED);
+                            status_json.clone()
+                        }
+                        other => panic!("unexpected forwarded method: {}", other.method()),
+                    };
+                    let reply = MeshForwardReply::sign(
+                        &peer_key,
+                        peer_node.clone(),
+                        &envelope,
+                        StatusCode::OK.as_u16(),
+                        body_json,
+                    );
+                    async move { Json(reply) }
+                }),
+            );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
+        let tempdir = tempfile::tempdir().expect("test directory");
+        let lifecycle = Arc::new(HostAdminStateStore::new());
+        let base_state = test_app_state_with_connectors_file(
+            Vec::new(),
+            tempdir.path().join("connectors.json"),
+            Arc::clone(&lifecycle),
+        )
+        .await;
+        let state = Arc::new(AppState {
+            mesh: Some(Arc::new(
+                MeshRouter::new(MeshRoutingSettings {
+                    node_id: fcp_core::TailscaleNodeId::new("entry-reader"),
+                    signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                    peers_json,
+                    forward_timeout: Duration::from_secs(5),
+                })
+                .expect("mesh router"),
+            )),
+            ..(*base_state).clone()
+        });
+
+        let inventory_error = connector_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(REQUESTED.to_string()),
+        )
+        .await
+        .expect_err("a valid signature must not authorize a different inventory ID");
+        assert_eq!(inventory_error.0, StatusCode::BAD_GATEWAY);
+        assert!(inventory_error.1.contains("different connector"));
+        let status_error =
+            connector_status_handler(State(Arc::clone(&state)), Path(REQUESTED.to_string()))
+                .await
+                .expect_err("a valid signature must not authorize a different status ID");
+        assert_eq!(status_error.0, StatusCode::BAD_GATEWAY);
+        assert!(status_error.1.contains("different connector"));
+        assert_eq!(forwards.load(Ordering::SeqCst), 2);
+
+        let summary = connector_summary_from_config(&dispatcher_test_config(REQUESTED))
+            .expect("local summary");
+        lifecycle
+            .reconcile_registered_connectors(&[summary])
+            .await
+            .expect("seed local admin record");
+        lifecycle
+            .reconcile_registered_connectors(&[])
+            .await
+            .expect("observe removal from local inventory");
+        assert!(
+            state
+                .registry
+                .get(&ConnectorId::from_static(REQUESTED))
+                .await
+                .is_none()
+        );
+        let Json(status) = connector_status_handler(State(state), Path(REQUESTED.to_string()))
+            .await
+            .expect("retained local status remains readable");
+        assert_eq!(status.connector_id.as_str(), REQUESTED);
+        assert_eq!(
+            status.observed_state,
+            fcp_host::ObservedRuntimeState::Missing
+        );
+        assert!(status.drift.is_some());
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            2,
+            "local status must not forward"
+        );
+
+        shutdown_tx.send(true).expect("stop read peer");
+        server
+            .await
+            .expect("peer server task")
+            .expect("peer shutdown");
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]

@@ -250,6 +250,188 @@ async fn entry_node_forwards_invoke_to_advertising_peer_and_labels_answer_mesh_b
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn remote_connector_inventory_and_status_are_available_without_admin_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Remote Inventory",
+            )],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+
+    // These are public read endpoints. The entry's admin credential must not
+    // be needed or forwarded to the executor to inspect a remote connector.
+    for suffix in ["", "/status"] {
+        let path = format!("/rpc/connectors/{REMOTE_CONNECTOR}{suffix}");
+        let direct: Value = executor
+            .client
+            .get(format!("{}{path}", executor.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let forwarded: Value = entry
+            .client
+            .get(format!("{}{path}", entry.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if suffix.is_empty() {
+            assert_eq!(forwarded["connector"]["id"], REMOTE_CONNECTOR);
+            assert_eq!(forwarded["connector"]["name"], "Remote Inventory");
+            for field in ["id", "name", "version", "enabled", "tool_count"] {
+                assert_eq!(forwarded["connector"][field], direct["connector"][field]);
+            }
+            assert_eq!(forwarded["registry_version"], direct["registry_version"]);
+        } else {
+            assert_eq!(forwarded["connector_id"], REMOTE_CONNECTOR);
+            for field in [
+                "desired_state",
+                "observed_state",
+                "lifecycle",
+                "pinned_version",
+            ] {
+                assert_eq!(
+                    forwarded[field], direct[field],
+                    "remote status field {field}"
+                );
+            }
+        }
+    }
+
+    // Protected admin reads retain their original authorization boundary.
+    for path in [
+        format!("/rpc/rollout/pin/{REMOTE_CONNECTOR}"),
+        format!("/rpc/rollout/{REMOTE_CONNECTOR}"),
+    ] {
+        let response = entry
+            .client
+            .get(format!("{}{path}", entry.base_url))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn forwarded_connector_reads_are_authenticated_replay_guarded_and_local_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Remote Inventory",
+            )],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let origin_directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+        TailscaleNodeId::new("node-a"),
+        &mesh.peers_json,
+    )?;
+    let bodies = [
+        MeshForwardBody::Inventory {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+        },
+        MeshForwardBody::Status {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+        },
+    ];
+    for body in bodies {
+        let envelope = MeshForwardEnvelope::sign(
+            &mesh.node("node-a").key,
+            TailscaleNodeId::new("node-a"),
+            TailscaleNodeId::new("node-b"),
+            fcp_host::mesh_routing::unix_now_ms(),
+            body.clone(),
+        )?;
+        let mut tampered = envelope.clone();
+        tampered.body = MeshForwardBody::Introspect {
+            connector_id: REMOTE_CONNECTOR.to_owned(),
+        };
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &tampered).await?;
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{text}");
+
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+        let reply: MeshForwardReply = serde_json::from_str(&text)?;
+        reply.verify_for(&envelope, &origin_directory)?;
+        assert!(reply.is_success(), "{text}");
+        let (status, text) = post_raw(&executor, "/rpc/mesh/forward", &envelope).await?;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{text}");
+
+        // node-a can discover the connector on node-b, but a signed forward
+        // addressed to node-a must never recurse back through peer routing.
+        let wrong_executor = MeshForwardEnvelope::sign(
+            &mesh.node("node-b").key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            fcp_host::mesh_routing::unix_now_ms(),
+            body,
+        )?;
+        let (status, text) = post_raw(&entry, "/rpc/mesh/forward", &wrong_executor).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+        let reply: MeshForwardReply = serde_json::from_str(&text)?;
+        let directory = fcp_mesh::invoke_route::MeshPeerDirectory::from_json(
+            TailscaleNodeId::new("node-b"),
+            &mesh.peers_json,
+        )?;
+        reply.verify_for(&wrong_executor, &directory)?;
+        assert_eq!(
+            reply.status,
+            reqwest::StatusCode::NOT_FOUND.as_u16(),
+            "{text}"
+        );
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn connector_inventory_prefers_local_registration_over_peer_advertisements()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let _peer = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Peer Copy",
+            )],
+        )
+        .await?;
+    let entry = mesh
+        .spawn(
+            "node-a",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Local Copy",
+            )],
+        )
+        .await?;
+    let inventory: Value = http_get_json(
+        entry.client.clone(),
+        format!("{}/rpc/connectors/{REMOTE_CONNECTOR}", entry.base_url),
+    )
+    .await?;
+    assert_eq!(inventory["connector"]["name"], "Local Copy");
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn forwarded_invoke_is_still_authorized_by_the_executor()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = host_e2e_lock().await;
