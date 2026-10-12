@@ -6,13 +6,15 @@
 //! - checkpoints are written to a temp file in the target directory, `sync_all()`ed,
 //!   atomically renamed into place, and the containing directory is fsynced on
 //!   platforms that support directory sync;
-//! - startup replays only checksum-valid WAL records and truncates any torn or
-//!   corrupt tail so a partial append cannot poison later recovery.
+//! - writable startup replays only checksum-valid WAL records and truncates any
+//!   torn or corrupt tail so a partial append cannot poison later recovery;
+//! - observational opens never create, repair, or checkpoint files, and writable
+//!   object-store handles retain exclusive OS ownership through admitted work.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +55,13 @@ const SNAPSHOT_VERSION_V2: u32 = 2;
 const WAL_VERSION_V2: u32 = 2;
 
 const DEFAULT_CHECKPOINT_AFTER_OPS: u64 = 64;
+const OBJECT_WRITER_LOCK_FILE: &str = "objects.writer.lock";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DurableAccess {
+    ReadOnly,
+    ReadWrite,
+}
 
 /// Maximum bytes the WAL recovery loop will buffer for a single record.
 ///
@@ -185,6 +194,10 @@ struct DurableObjectState {
     // An unsuccessful append may already have changed the WAL. Refuse later
     // writes until recovery rather than acknowledge data behind an uncertain tail.
     write_fence: Option<String>,
+    // The disk worker owns a state guard until the complete transaction exits.
+    // Keeping the OS lock here therefore outlives a cancelled waiter and the
+    // last external store handle. The stable lock file is never replaced.
+    _writer_lock: Option<File>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +238,7 @@ pub struct DurableObjectStore {
     /// in-memory state. Closes the attacker-chosen-id injection vector
     /// documented in bead flywheel_connectors-4g0qr.
     verifier: Option<Arc<dyn ObjectIdVerifier>>,
+    access: DurableAccess,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +286,7 @@ pub struct DurableSymbolStore {
     ops_since_checkpoint: AtomicU64,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
+    access: DurableAccess,
 }
 
 impl DurableObjectState {
@@ -736,10 +751,15 @@ impl DurableSymbolState {
 }
 
 impl DurableObjectStore {
-    /// Open or create a crash-safe durable object store.
+    /// Open or create a crash-safe durable object store with exclusive ownership.
+    ///
+    /// Other writable opens of the same directory fail until this handle and
+    /// all its admitted disk workers finish. Share one `Arc` within a process;
+    /// use [`Self::open_read_only`] for independent observational access.
     ///
     /// # Errors
-    /// Returns an error if the snapshot/WAL cannot be read or synced.
+    /// Returns an error if exclusive ownership is unavailable or the
+    /// snapshot/WAL cannot be read or synced.
     pub fn open(config: DurableObjectStoreConfig) -> Result<Self, ObjectStoreError> {
         Self::open_with_verifier(config, None)
     }
@@ -766,18 +786,65 @@ impl DurableObjectStore {
         config: DurableObjectStoreConfig,
         verifier: Option<Arc<dyn ObjectIdVerifier>>,
     ) -> Result<Self, ObjectStoreError> {
-        fs::create_dir_all(&config.root_dir).map_err(object_io)?;
-        sync_parent_dir(&config.root_dir).map_err(object_io)?;
+        Self::open_with_access(config, verifier, DurableAccess::ReadWrite)
+    }
+
+    /// Read a fixed, validated view of an existing durable object store.
+    ///
+    /// This never creates directories or files, acquires writer ownership,
+    /// truncates a WAL, or checkpoints. An incomplete final WAL record is
+    /// rejected without repair. Concurrent checkpointing can yield an older
+    /// valid prefix or an error; this is not a freshness or fsync barrier.
+    /// Reopen to observe later commits, and select trusted exact object IDs
+    /// when using this view to export state.
+    ///
+    /// Every mutation and explicit checkpoint on the returned handle is refused.
+    ///
+    /// # Errors
+    /// Returns an error for a missing directory, unreadable files, invalid
+    /// authenticated data, or a snapshot/WAL sequence that cannot be reconciled.
+    pub fn open_read_only(config: DurableObjectStoreConfig) -> Result<Self, ObjectStoreError> {
+        Self::open_read_only_with_verifier(config, None)
+    }
+
+    /// Open an observational view and verify every recovered object's content ID.
+    ///
+    /// This has the no-write and fixed-view semantics of [`Self::open_read_only`].
+    ///
+    /// # Errors
+    /// Returns the observational-open errors or a verifier rejection.
+    pub fn open_read_only_with_verifier(
+        config: DurableObjectStoreConfig,
+        verifier: Option<Arc<dyn ObjectIdVerifier>>,
+    ) -> Result<Self, ObjectStoreError> {
+        Self::open_with_access(config, verifier, DurableAccess::ReadOnly)
+    }
+
+    fn open_with_access(
+        config: DurableObjectStoreConfig,
+        verifier: Option<Arc<dyn ObjectIdVerifier>>,
+        access: DurableAccess,
+    ) -> Result<Self, ObjectStoreError> {
+        let writer_lock = if access == DurableAccess::ReadWrite {
+            fs::create_dir_all(&config.root_dir).map_err(object_io)?;
+            sync_parent_dir(&config.root_dir).map_err(object_io)?;
+            Some(acquire_object_writer_lock(&config.root_dir)?)
+        } else {
+            require_store_directory(&config.root_dir).map_err(object_io)?;
+            None
+        };
 
         let snapshot_path = config.root_dir.join("objects.snapshot.json");
         let wal_path = config.root_dir.join("objects.wal.jsonl");
-        let (state, last_seq) = load_durable_object_state(
+        let (mut state, last_seq) = load_durable_object_state(
             &snapshot_path,
             &wal_path,
             verifier.as_deref(),
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
+            access,
         )?;
+        state._writer_lock = writer_lock;
 
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
@@ -788,6 +855,7 @@ impl DurableObjectStore {
             snapshot_path,
             wal_path,
             verifier,
+            access,
         })
     }
 
@@ -797,6 +865,7 @@ impl DurableObjectStore {
     /// Returns an error if the snapshot cannot be durably written or the WAL
     /// requires recovery after a failed append.
     pub async fn checkpoint(&self) -> Result<(), ObjectStoreError> {
+        self.require_writable()?;
         let snapshot_path = self.snapshot_path.clone();
         let wal_path = self.wal_path.clone();
         let next_seq = Arc::clone(&self.next_seq);
@@ -837,6 +906,7 @@ impl DurableObjectStore {
     }
 
     async fn record_mutation(&self, op: ObjectWalOp) -> Result<(), ObjectStoreError> {
+        self.require_writable()?;
         let config = self.config.clone();
         let snapshot_path = self.snapshot_path.clone();
         let wal_path = self.wal_path.clone();
@@ -890,6 +960,15 @@ impl DurableObjectStore {
         )
         .await
         .map_err(|error| object_io(format!("durable object mutation task failed: {error}")))?
+    }
+
+    fn require_writable(&self) -> Result<(), ObjectStoreError> {
+        if self.access == DurableAccess::ReadOnly {
+            return Err(ObjectStoreError::Io(
+                "durable object store was opened read-only".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -983,8 +1062,32 @@ impl DurableSymbolStore {
     /// # Errors
     /// Returns an error if the snapshot/WAL cannot be read or synced.
     pub fn open(config: DurableSymbolStoreConfig) -> Result<Self, SymbolStoreError> {
-        fs::create_dir_all(&config.root_dir).map_err(symbol_io)?;
-        sync_parent_dir(&config.root_dir).map_err(symbol_io)?;
+        Self::open_with_access(config, DurableAccess::ReadWrite)
+    }
+
+    /// Read an existing symbol-store prefix without changing its files.
+    ///
+    /// An incomplete WAL tail is rejected without truncation. This fixed view
+    /// may be older than concurrent writes; reopen to observe later state.
+    /// Mutations and checkpoints are refused, including through `SymbolStore`.
+    ///
+    /// # Errors
+    /// Returns an error for missing directories, invalid authenticated data,
+    /// unreadable files, or inconsistent snapshot/WAL sequences.
+    pub fn open_read_only(config: DurableSymbolStoreConfig) -> Result<Self, SymbolStoreError> {
+        Self::open_with_access(config, DurableAccess::ReadOnly)
+    }
+
+    fn open_with_access(
+        config: DurableSymbolStoreConfig,
+        access: DurableAccess,
+    ) -> Result<Self, SymbolStoreError> {
+        if access == DurableAccess::ReadWrite {
+            fs::create_dir_all(&config.root_dir).map_err(symbol_io)?;
+            sync_parent_dir(&config.root_dir).map_err(symbol_io)?;
+        } else {
+            require_store_directory(&config.root_dir).map_err(symbol_io)?;
+        }
 
         let snapshot_path = config.root_dir.join("symbols.snapshot.json");
         let wal_path = config.root_dir.join("symbols.wal.jsonl");
@@ -993,6 +1096,7 @@ impl DurableSymbolStore {
             &wal_path,
             config.mac_key.as_ref(),
             config.allow_legacy_unauth,
+            access,
         )?;
 
         Ok(Self {
@@ -1003,6 +1107,7 @@ impl DurableSymbolStore {
             ops_since_checkpoint: AtomicU64::new(0),
             snapshot_path,
             wal_path,
+            access,
         })
     }
 
@@ -1011,6 +1116,7 @@ impl DurableSymbolStore {
     /// # Errors
     /// Returns an error if the snapshot cannot be durably written.
     pub fn checkpoint(&self) -> Result<(), SymbolStoreError> {
+        self.require_writable()?;
         let _guard = self.write_guard.lock();
         let last_seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
         self.checkpoint_locked(last_seq)?;
@@ -1032,6 +1138,7 @@ impl DurableSymbolStore {
     }
 
     fn record_mutation(&self, op: SymbolWalOp) -> Result<(), SymbolStoreError> {
+        self.require_writable()?;
         let _guard = self.write_guard.lock();
         {
             let state = self.state.read();
@@ -1061,6 +1168,15 @@ impl DurableSymbolStore {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn require_writable(&self) -> Result<(), SymbolStoreError> {
+        if self.access == DurableAccess::ReadOnly {
+            return Err(SymbolStoreError::Io(
+                "durable symbol store was opened read-only".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1224,12 +1340,81 @@ impl SymbolStore for DurableSymbolStore {
     }
 }
 
+fn require_store_directory(root: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(root)
+        .map_err(|error| format!("read store directory {}: {error}", root.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("store path {} is not a directory", root.display()));
+    }
+    Ok(())
+}
+
+fn acquire_object_writer_lock(root: &Path) -> Result<File, ObjectStoreError> {
+    let path = root.join(OBJECT_WRITER_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (file, created) = match options.open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&path).map_err(object_io)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(object_io("object-store writer lock must be a regular file"));
+            }
+            (
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(object_io)?,
+                false,
+            )
+        }
+        Err(error) => return Err(object_io(error)),
+    };
+    let opened = file.metadata().map_err(object_io)?;
+    if !opened.is_file() {
+        return Err(object_io("object-store writer lock must be a regular file"));
+    }
+    file.try_lock().map_err(|error| {
+        object_io(format!(
+            "exclusive object-store ownership unavailable for {}: {error}",
+            root.display()
+        ))
+    })?;
+    let named = fs::symlink_metadata(&path).map_err(object_io)?;
+    if !named.is_file() || named.file_type().is_symlink() {
+        return Err(object_io(
+            "object-store writer lock path changed during open",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err(object_io(
+                "object-store writer lock was replaced during open",
+            ));
+        }
+    }
+    if created {
+        file.sync_all().map_err(object_io)?;
+        sync_parent_dir(&path).map_err(object_io)?;
+    }
+    Ok(file)
+}
+
 fn load_durable_object_state(
     snapshot_path: &Path,
     wal_path: &Path,
     verifier: Option<&dyn ObjectIdVerifier>,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
+    access: DurableAccess,
 ) -> Result<(DurableObjectState, u64), ObjectStoreError> {
     let (mut state, last_snapshot_seq) =
         match read_snapshot::<ObjectSnapshot>(snapshot_path, mac_key, allow_legacy_unauth)
@@ -1239,9 +1424,14 @@ fn load_durable_object_state(
             None => (DurableObjectState::default(), 0),
         };
 
-    let records =
-        read_wal_records::<ObjectWalOp>(wal_path, last_snapshot_seq, mac_key, allow_legacy_unauth)
-            .map_err(object_io_durable)?;
+    let records = read_wal_records::<ObjectWalOp>(
+        wal_path,
+        last_snapshot_seq,
+        mac_key,
+        allow_legacy_unauth,
+        access,
+    )
+    .map_err(object_io_durable)?;
     let mut last_seq = last_snapshot_seq;
     for record in records {
         last_seq = record.seq;
@@ -1274,6 +1464,7 @@ fn load_durable_symbol_state(
     wal_path: &Path,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
+    access: DurableAccess,
 ) -> Result<(DurableSymbolState, u64), SymbolStoreError> {
     let (mut state, last_snapshot_seq) =
         match read_snapshot::<SymbolSnapshot>(snapshot_path, mac_key, allow_legacy_unauth)
@@ -1283,9 +1474,14 @@ fn load_durable_symbol_state(
             None => (DurableSymbolState::default(), 0),
         };
 
-    let records =
-        read_wal_records::<SymbolWalOp>(wal_path, last_snapshot_seq, mac_key, allow_legacy_unauth)
-            .map_err(symbol_io_durable)?;
+    let records = read_wal_records::<SymbolWalOp>(
+        wal_path,
+        last_snapshot_seq,
+        mac_key,
+        allow_legacy_unauth,
+        access,
+    )
+    .map_err(symbol_io_durable)?;
     let mut last_seq = last_snapshot_seq;
     for record in records {
         last_seq = record.seq;
@@ -1391,14 +1587,17 @@ fn read_snapshot<T>(
 where
     T: Serialize + DeserializeOwned,
 {
-    if !path.exists() {
-        return Ok(None);
-    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open snapshot {}: {error}", path.display()).into()),
+    };
 
     // Reject snapshot files larger than `MAX_SNAPSHOT_BYTES` before
     // allocating to avoid OOM on a corrupted or adversarial file.
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("stat snapshot {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat snapshot {}: {error}", path.display()))?;
     if metadata.len() > MAX_SNAPSHOT_BYTES {
         return Err(DurableIoError::Other(format!(
             "snapshot {} exceeds {} bytes (got {})",
@@ -1408,8 +1607,20 @@ where
         )));
     }
 
-    let bytes =
-        fs::read(path).map_err(|error| format!("read snapshot {}: {error}", path.display()))?;
+    // Read the opened inode, not a second path lookup that may observe a
+    // concurrent checkpoint replacement. Bound the actual read as well as the
+    // metadata check so concurrent growth cannot bypass the allocation limit.
+    let mut bytes = Vec::new();
+    file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read snapshot {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return Err(DurableIoError::Other(format!(
+            "snapshot {} grew beyond {} bytes",
+            path.display(),
+            MAX_SNAPSHOT_BYTES
+        )));
+    }
     let envelope: SnapshotEnvelope<T> = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse snapshot {}: {error}", path.display()))?;
 
@@ -1474,16 +1685,23 @@ fn read_wal_records<T>(
     min_seq: u64,
     mac_key: Option<&[u8; 32]>,
     allow_legacy_unauth: bool,
+    access: DurableAccess,
 ) -> Result<Vec<WalEnvelope<T>>, DurableIoError>
 where
     T: Serialize + DeserializeOwned,
 {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let file = File::open(path).map_err(|error| format!("open wal {}: {error}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("open wal {}: {error}", path.display()).into()),
+    };
+    let observed_len = file
+        .metadata()
+        .map_err(|error| format!("stat wal {}: {error}", path.display()))?
+        .len();
+    // A live writer may keep appending. Observe at most this opened file's
+    // captured length rather than chasing an unbounded moving EOF.
+    let mut reader = BufReader::new(file.take(observed_len));
     let mut raw = Vec::new();
     let mut valid_prefix_len = 0_u64;
     let mut last_seq_in_file = 0_u64;
@@ -1499,7 +1717,7 @@ where
         if bytes_read == 0 {
             break;
         }
-        if hit_cap {
+        if hit_cap || raw.last() != Some(&b'\n') {
             // Adversarial or torn record larger than `MAX_WAL_RECORD_BYTES`
             // — treat as a truncation point so recovery cannot be made to
             // OOM by a single oversized line. The on-disk file is then
@@ -1634,6 +1852,13 @@ where
     }
 
     if truncated {
+        if access == DurableAccess::ReadOnly {
+            return Err(DurableIoError::Other(format!(
+                "read-only WAL view has an incomplete or invalid tail at {} byte {}; retry after the writer completes or recovers",
+                path.display(),
+                valid_prefix_len
+            )));
+        }
         let file = OpenOptions::new()
             .write(true)
             .open(path)
@@ -1930,6 +2155,280 @@ mod tests {
                     .expect("release admitted write");
             }
             Ok(())
+        }
+    }
+
+    fn stored_file_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fs::read_dir(root)
+            .expect("list store files")
+            .map(|entry| {
+                let path = entry.expect("store entry").path();
+                let bytes = fs::read(&path).expect("read store file");
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_object_store_never_creates_files_or_accepts_mutations() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("missing");
+        assert!(
+            DurableObjectStore::open_read_only(DurableObjectStoreConfig::new(&missing)).is_err()
+        );
+        assert!(!missing.exists());
+
+        let config = DurableObjectStoreConfig::new(temp_dir.path());
+        let reader = DurableObjectStore::open_read_only(config).unwrap();
+        let before = stored_file_bytes(temp_dir.path());
+        assert!(before.is_empty());
+        for result in [
+            reader.put(test_object(1)).await,
+            reader.delete(&test_object_id(1)).await,
+            reader
+                .set_retention(&test_object_id(1), RetentionClass::Ephemeral)
+                .await,
+            reader.checkpoint().await,
+        ] {
+            assert!(
+                matches!(result, Err(ObjectStoreError::Io(reason)) if reason.contains("read-only"))
+            );
+        }
+        assert_eq!(reader.storage_used().await, 0);
+        assert!(reader.list_zone(&test_zone()).await.is_empty());
+        assert_eq!(stored_file_bytes(temp_dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn read_only_object_store_observes_live_writer_without_changing_snapshot_or_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        for checkpoint_after_ops in [0, 1] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp_dir.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x62; 32]);
+            let writer = DurableObjectStore::open(config.clone()).unwrap();
+            writer.put(test_object(1)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            assert!(DurableObjectStore::open(config.clone()).is_err());
+            let reader = DurableObjectStore::open_read_only(config.clone()).unwrap();
+            assert_eq!(
+                reader.get(&test_object_id(1)).await.unwrap(),
+                test_object(1)
+            );
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+
+            writer.put(test_object(2)).await.unwrap();
+            assert!(
+                !reader.exists(&test_object_id(2)).await,
+                "observational views are fixed"
+            );
+            let fresh = DurableObjectStore::open_read_only(config.clone()).unwrap();
+            assert!(fresh.exists(&test_object_id(2)).await);
+            let before = stored_file_bytes(&config.root_dir);
+            for result in [
+                fresh.put(test_object(3)).await,
+                fresh.delete(&test_object_id(1)).await,
+                fresh
+                    .set_retention(&test_object_id(1), RetentionClass::Ephemeral)
+                    .await,
+                fresh.checkpoint().await,
+            ] {
+                assert!(
+                    matches!(result, Err(ObjectStoreError::Io(reason)) if reason.contains("read-only"))
+                );
+            }
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+            assert_eq!(fresh.get(&test_object_id(1)).await.unwrap(), test_object(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_object_store_rejects_unfinished_record_without_repairing_live_wal() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = DurableObjectStoreConfig::new(temp_dir.path());
+        config.checkpoint_after_ops = 0;
+        let writer = DurableObjectStore::open(config.clone()).unwrap();
+        writer.put(test_object(1)).await.unwrap();
+        let op = ObjectWalOp::Put(Box::new(test_object(2)));
+        let record = WalEnvelope {
+            version: WAL_VERSION_V1,
+            seq: 2,
+            checksum: checksum_json(&(WAL_VERSION_V1, 2_u64, &op)).unwrap(),
+            op,
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(&writer.wal_path)
+            .unwrap();
+        // A complete JSON value without its record terminator is still an
+        // unfinished append. An observer must not accept or truncate it.
+        wal.write_all(&bytes).unwrap();
+        wal.sync_all().unwrap();
+        let before = stored_file_bytes(temp_dir.path());
+        assert!(DurableObjectStore::open_read_only(config.clone()).is_err());
+        assert!(DurableObjectStore::open(config.clone()).is_err());
+        assert_eq!(stored_file_bytes(temp_dir.path()), before);
+        wal.write_all(b"\n").unwrap();
+        wal.sync_all().unwrap();
+        let complete = stored_file_bytes(temp_dir.path());
+        let reader = DurableObjectStore::open_read_only(config).unwrap();
+        assert!(reader.exists(&test_object_id(2)).await);
+        assert_eq!(stored_file_bytes(temp_dir.path()), complete);
+    }
+
+    #[tokio::test]
+    async fn read_only_object_store_preserves_authentication_and_content_id_checks() {
+        use crate::object_id_verifier::KeyedObjectIdVerifier;
+        use fcp_prelude::ObjectIdKey;
+
+        let temp_dir = TempDir::new().unwrap();
+        for checkpoint_after_ops in [0, 1] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp_dir.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x6A; 32]);
+            let writer = DurableObjectStore::open(config.clone()).unwrap();
+            writer.put(test_object(1)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            let mut wrong_key = config.clone();
+            wrong_key.mac_key = Some([0x6B; 32]);
+            assert!(matches!(
+                DurableObjectStore::open_read_only(wrong_key),
+                Err(ObjectStoreError::TamperedAuditEnvelope { .. })
+            ));
+            let verifier = KeyedObjectIdVerifier::new(HashMap::from([(
+                test_zone(),
+                ObjectIdKey::from_bytes([0x6C; 32]),
+            )]));
+            assert!(matches!(
+                DurableObjectStore::open_read_only_with_verifier(
+                    config.clone(),
+                    Some(Arc::new(verifier))
+                ),
+                Err(ObjectStoreError::ContentIdMismatch { .. })
+            ));
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_object_worker_retains_exclusive_ownership_until_complete() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = DurableObjectStoreConfig::new(temp_dir.path());
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let store = Arc::new(
+            DurableObjectStore::open_with_verifier(
+                config.clone(),
+                Some(Arc::new(PausedFirstVerification {
+                    entered: ParkingMutex::new(Some(entered)),
+                    resume: ParkingMutex::new(resume),
+                })),
+            )
+            .unwrap(),
+        );
+        let weak_state = Arc::downgrade(&store.state);
+        let writer = Arc::clone(&store);
+        let waiter = tokio::spawn(async move { writer.put(test_object(1)).await });
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(store);
+        assert!(matches!(
+            DurableObjectStore::open(config.clone()),
+            Err(ObjectStoreError::Io(reason)) if reason.contains("exclusive")
+        ));
+        let retained = weak_state
+            .upgrade()
+            .expect("disk worker owns state and OS lock");
+        release.send(()).unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(5), retained.lock())
+            .await
+            .unwrap();
+        assert!(finished.objects.contains_key(&test_object_id(1)));
+        drop(finished);
+        drop(retained);
+        // Waking this reader can precede the worker's final owned-guard drop.
+        // Wait for actual OS ownership release, not a scheduling coincidence.
+        let reopened = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match DurableObjectStore::open(config.clone()) {
+                    Ok(store) => break store,
+                    Err(ObjectStoreError::Io(reason)) if reason.contains("exclusive") => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("reopen failed after worker completion: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reopened.exists(&test_object_id(1)).await);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn object_writer_lock_rejects_symlinks_without_touching_the_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("unrelated");
+        fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, temp_dir.path().join(OBJECT_WRITER_LOCK_FILE)).unwrap();
+        assert!(DurableObjectStore::open(DurableObjectStoreConfig::new(temp_dir.path())).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+    }
+
+    #[tokio::test]
+    async fn read_only_symbol_store_preserves_files_and_rejects_all_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("missing");
+        assert!(
+            DurableSymbolStore::open_read_only(DurableSymbolStoreConfig::new(&missing)).is_err()
+        );
+        assert!(!missing.exists());
+        for checkpoint_after_ops in [0, 1] {
+            let mut config = DurableSymbolStoreConfig::new(
+                temp_dir.path().join(checkpoint_after_ops.to_string()),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            let writer = DurableSymbolStore::open(config.clone()).unwrap();
+            writer.put_object_meta(test_symbol_meta(1)).await.unwrap();
+            writer.put_symbol(test_symbol(1, 0, 2)).await.unwrap();
+            let before = stored_file_bytes(&config.root_dir);
+            let reader = DurableSymbolStore::open_read_only(config.clone()).unwrap();
+            assert_eq!(
+                reader.get_symbol(&test_object_id(1), 0).await.unwrap().data,
+                test_symbol(1, 0, 2).data
+            );
+            for result in [
+                reader.put_object_meta(test_symbol_meta(2)).await,
+                reader.put_symbol(test_symbol(1, 1, 2)).await,
+                reader.delete_symbol(&test_object_id(1), 0).await,
+                reader.delete_object(&test_object_id(1)).await,
+                reader.checkpoint(),
+            ] {
+                assert!(
+                    matches!(result, Err(SymbolStoreError::Io(reason)) if reason.contains("read-only"))
+                );
+            }
+            assert_eq!(stored_file_bytes(&config.root_dir), before);
+            let mut wal = OpenOptions::new()
+                .append(true)
+                .open(&writer.wal_path)
+                .unwrap();
+            wal.write_all(b"{\"partial\":").unwrap();
+            wal.sync_all().unwrap();
+            let torn = stored_file_bytes(&config.root_dir);
+            assert!(DurableSymbolStore::open_read_only(config.clone()).is_err());
+            assert_eq!(stored_file_bytes(&config.root_dir), torn);
         }
     }
 
@@ -2540,6 +3039,7 @@ mod tests {
             "checkpoint should still materialize the durable snapshot"
         );
 
+        drop(store);
         let reopened = DurableObjectStore::open(config).expect("reopen store");
         let recovered = reopened.get(&object_id).await.expect("recover object");
         assert_eq!(recovered.body, object.body);

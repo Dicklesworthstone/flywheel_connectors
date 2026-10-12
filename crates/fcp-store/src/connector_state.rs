@@ -27,8 +27,8 @@ use fcp_prelude::{
 use futures_util::{lock::Mutex as AsyncMutex, stream};
 use parking_lot::RwLock;
 use semver::Version;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ObjectStore, ObjectStoreError, SymbolStore};
@@ -534,6 +534,35 @@ impl FcpStoreConnectorStateStore {
         self
     }
 
+    /// Whether canonical reads require at least one explicitly trusted writer.
+    ///
+    /// Network replication must not treat a self-signed chain or possession of
+    /// the zone's object-ID key as writer authority.
+    #[must_use]
+    pub fn has_trusted_writer_keys(&self) -> bool {
+        self.trusted_writer_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.is_empty())
+    }
+
+    /// Connector identity bound to every canonical object in this adapter.
+    #[must_use]
+    pub const fn connector_id(&self) -> &ConnectorId {
+        &self.connector_id
+    }
+
+    /// Zone identity bound to every canonical object in this adapter.
+    #[must_use]
+    pub const fn zone_id(&self) -> &ZoneId {
+        &self.zone_id
+    }
+
+    /// Optional connector-instance identity bound to this adapter.
+    #[must_use]
+    pub const fn instance_id(&self) -> Option<&InstanceId> {
+        self.instance_id.as_ref()
+    }
+
     /// Supply the private key used to sign canonical snapshots.
     ///
     /// The key must match the authenticated covered state writer and any
@@ -795,8 +824,37 @@ impl FcpStoreConnectorStateStore {
         bundle: ConnectorStateReplicaBundle,
         limits: ConnectorStateReplicaLimits,
     ) -> Result<Option<ConnectorStateChange>> {
+        self.import_replica_checked(bundle, limits, || Ok(())).await
+    }
+
+    /// Adopt a replica while rechecking the caller's current transfer authority.
+    ///
+    /// The synchronous callback runs before validation, after waiting for the
+    /// append gate, before dependency publication, and immediately before root
+    /// publication or a no-op cache refresh. Callers can bind it to an expiring
+    /// transfer grant and current peer authorization. Rejection never publishes
+    /// a new root, though earlier verified dependency writes may remain.
+    ///
+    /// Authorization is checked at root-put admission. Once the backing store
+    /// has admitted that write, later expiry or caller cancellation does not
+    /// interrupt its durable transaction. All validation, ancestry, and storage
+    /// semantics of [`Self::import_replica`] otherwise apply.
+    ///
+    /// # Errors
+    /// Returns a replica validation/storage error or the callback's rejection.
+    pub async fn import_replica_checked<F>(
+        &self,
+        bundle: ConnectorStateReplicaBundle,
+        limits: ConnectorStateReplicaLimits,
+        authorize: F,
+    ) -> Result<Option<ConnectorStateChange>>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        authorize()?;
         let replica = self.validate_replica(bundle, limits)?;
         let _append_guard = self.change_bus.append_guard.lock().await;
+        authorize()?;
 
         // Do not invalidate other readers merely because an untrusted bundle
         // arrived. A private cache still forces a fresh scan at the commit gate.
@@ -809,15 +867,23 @@ impl FcpStoreConnectorStateStore {
                 let newer = replica
                     .head_seq
                     .cmp(&current_seq)
-                    .then(replica.root.header.created_at.cmp(&current.header.created_at))
+                    .then(
+                        replica
+                            .root
+                            .header
+                            .created_at
+                            .cmp(&current.header.created_at),
+                    )
                     .then(replica.root_object.object_id.cmp(&current_id))
                     .is_gt();
                 if !newer {
+                    authorize()?;
                     self.change_bus.mark_root_updated();
                     return Ok(None);
                 }
             } else if let Some(current_head) = current.head {
                 let Some(incoming_head) = replica.root.head else {
+                    authorize()?;
                     self.change_bus.mark_root_updated();
                     return Ok(None);
                 };
@@ -833,6 +899,7 @@ impl FcpStoreConnectorStateStore {
                         let mut next = Some(current_head);
                         while let Some(object_id) = next {
                             if object_id == incoming_head {
+                                authorize()?;
                                 self.change_bus.mark_root_updated();
                                 return Ok(None);
                             }
@@ -868,9 +935,11 @@ impl FcpStoreConnectorStateStore {
             }
         }
         for object in &replica.states {
+            authorize()?;
             self.put_replica_object(object).await?;
         }
 
+        authorize()?;
         let mut root_write = PendingRootWrite::new(&self.change_bus);
         self.put_replica_object(&replica.root_object).await?;
         let change = self.publish_change(
@@ -2117,10 +2186,8 @@ impl FcpStoreConnectorStateStore {
                 field: "state_cbor",
             });
         }
-        let verifying_key =
-            Ed25519VerifyingKey::from_bytes(&covered.writer_public_key).map_err(|err| {
-                ConnectorStateStoreError::InvalidSnapshotSignature(err.to_string())
-            })?;
+        let verifying_key = Ed25519VerifyingKey::from_bytes(&covered.writer_public_key)
+            .map_err(|err| ConnectorStateStoreError::InvalidSnapshotSignature(err.to_string()))?;
         snapshot
             .verify_signature_with(&verifying_key)
             .map_err(|err| ConnectorStateStoreError::InvalidSnapshotSignature(err.to_string()))
@@ -4980,7 +5047,10 @@ mod tests {
             panic!("authorized state must commit without a snapshot signer");
         };
         assert!(snapshot_object_id.is_none());
-        assert_eq!(run_async(state_store.current_head()).unwrap().unwrap().0, object_id);
+        assert_eq!(
+            run_async(state_store.current_head()).unwrap().unwrap().0,
+            object_id
+        );
         assert_eq!(run_async(object_store.list_zone(&zone_id())).len(), 2);
 
         let err = run_async(state_store.snapshot_head()).unwrap_err();
@@ -4988,8 +5058,8 @@ mod tests {
             err,
             ConnectorStateStoreError::SnapshotSigningUnavailable { .. }
         ));
-        let err = run_async(ConnectorStateStore::snapshot(&state_store, &connector_id()))
-            .unwrap_err();
+        let err =
+            run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap_err();
         match err {
             ConnectorStateError::SnapshotUnavailable { reason, .. } => {
                 assert!(reason.contains("with_snapshot_signing_key"));
@@ -5035,8 +5105,8 @@ mod tests {
         let state_store = test_store(object_store.clone()).with_snapshot_every_entries(0);
         let covered = state(0, None, lease_id(1));
         let (head, _) = append_ok(&state_store, covered.clone());
-        let snapshot = run_async(ConnectorStateStore::snapshot(&state_store, &connector_id()))
-            .unwrap();
+        let snapshot =
+            run_async(ConnectorStateStore::snapshot(&state_store, &connector_id())).unwrap();
         assert_eq!(snapshot.covers_head, head);
         assert_eq!(snapshot.state_cbor, covered.state_cbor);
         assert_ne!(snapshot.signature, covered.signature);
@@ -5210,12 +5280,16 @@ mod tests {
 
         assert_eq!(run_async(state_store.compact(3)).unwrap(), 1);
         assert_eq!(
-            run_async(object_store.get_storage_meta(&head0)).unwrap().retention,
+            run_async(object_store.get_storage_meta(&head0))
+                .unwrap()
+                .retention,
             RetentionClass::Ephemeral
         );
         for protected in [head1, head2] {
             assert_eq!(
-                run_async(object_store.get_storage_meta(&protected)).unwrap().retention,
+                run_async(object_store.get_storage_meta(&protected))
+                    .unwrap()
+                    .retention,
                 RetentionClass::Pinned
             );
         }
@@ -5300,12 +5374,14 @@ mod tests {
     fn snapshot_replay_recovers_after_gc_without_promoting_an_anchor_to_latest() {
         let fixture = SnapshotReplayFixture::new();
         assert_eq!(run_async(fixture.state_store.compact(3)).unwrap(), 2);
-        let collected = run_async(crate::GarbageCollector::new(crate::GcConfig::default()).collect(
-            &zone_id(),
-            &crate::GcRoots::new(),
-            fixture.object_store.as_ref(),
-            1_800_000_000,
-        ))
+        let collected = run_async(
+            crate::GarbageCollector::new(crate::GcConfig::default()).collect(
+                &zone_id(),
+                &crate::GcRoots::new(),
+                fixture.object_store.as_ref(),
+                1_800_000_000,
+            ),
+        )
         .unwrap();
         assert_eq!(collected.evicted, 2);
         for old_head in &fixture.heads[..2] {
@@ -5322,12 +5398,9 @@ mod tests {
             run_async(reader.read_root()),
             Err(ConnectorStateStoreError::MissingHead(_))
         ));
-        let replay = run_async(reader.replay_from_snapshot(
-            fixture.roots[4],
-            fixture.snapshot_id,
-            2,
-        ))
-        .unwrap();
+        let replay =
+            run_async(reader.replay_from_snapshot(fixture.roots[4], fixture.snapshot_id, 2))
+                .unwrap();
         assert_eq!(replay.root_object_id(), fixture.roots[4]);
         assert_eq!(replay.root().head, Some(fixture.heads[4]));
         assert_eq!(replay.snapshot_object_id(), fixture.snapshot_id);
@@ -5399,19 +5472,13 @@ mod tests {
                     if rejected == limit
             ));
         }
-        let complete = run_async(reader.replay_from_snapshot(
-            fixture.roots[4],
-            fixture.snapshot_id,
-            2,
-        ))
-        .unwrap();
+        let complete =
+            run_async(reader.replay_from_snapshot(fixture.roots[4], fixture.snapshot_id, 2))
+                .unwrap();
         assert_eq!(complete.tail().len(), 2);
-        let boundary = run_async(reader.replay_from_snapshot(
-            fixture.roots[2],
-            fixture.snapshot_id,
-            0,
-        ))
-        .unwrap();
+        let boundary =
+            run_async(reader.replay_from_snapshot(fixture.roots[2], fixture.snapshot_id, 0))
+                .unwrap();
         assert!(boundary.tail().is_empty());
         assert_eq!(boundary.head().0, fixture.heads[2]);
         assert_eq!(boundary.into_head().1.seq, 2);
@@ -5444,8 +5511,7 @@ mod tests {
     fn snapshot_replay_rejects_tampered_snapshot_boundary_and_tail_signatures() {
         let fixture = SnapshotReplayFixture::new();
         let reader = fixture.reader();
-        let snapshot =
-            run_async(fixture.state_store.load_snapshot(&fixture.snapshot_id)).unwrap();
+        let snapshot = run_async(fixture.state_store.load_snapshot(&fixture.snapshot_id)).unwrap();
 
         let mut bad_snapshot = snapshot.clone();
         bad_snapshot.signature = Signature::zero();
@@ -5462,7 +5528,9 @@ mod tests {
         let mut signed_snapshot = snapshot;
         signed_snapshot.covers_head = bad_boundary_id;
         signed_snapshot.header.refs = vec![bad_boundary_id];
-        signed_snapshot.sign_with(&test_state_signing_key()).unwrap();
+        signed_snapshot
+            .sign_with(&test_state_signing_key())
+            .unwrap();
         let signed_snapshot_id = store_snapshot_for_test(&fixture.state_store, &signed_snapshot);
         assert!(matches!(
             run_async(reader.replay_from_snapshot(fixture.roots[4], signed_snapshot_id, 2)),
@@ -5490,7 +5558,10 @@ mod tests {
         let gap_root = fixture.store_root_for(gap_head);
         assert!(matches!(
             run_async(reader.replay_from_snapshot(gap_root, fixture.snapshot_id, 1)),
-            Err(ConnectorStateStoreError::SequenceMismatch { expected: 3, got: 4 })
+            Err(ConnectorStateStoreError::SequenceMismatch {
+                expected: 3,
+                got: 4
+            })
         ));
 
         let mut stale = state(3, Some(fixture.heads[2]), lease_id(91));
@@ -5515,11 +5586,11 @@ mod tests {
         let outsider_head = run_async(fixture.state_store.store_state_object(outsider)).unwrap();
         let outsider_root = fixture.store_root_for(outsider_head);
         assert!(matches!(
-            run_async(fixture.reader().replay_from_snapshot(
-                outsider_root,
-                fixture.snapshot_id,
-                1,
-            )),
+            run_async(
+                fixture
+                    .reader()
+                    .replay_from_snapshot(outsider_root, fixture.snapshot_id, 1,)
+            ),
             Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
         ));
     }
@@ -5534,12 +5605,9 @@ mod tests {
             .stored_object(&root.header, &root, RetentionClass::Pinned)
             .unwrap();
         mismatched.header.created_at += 1;
-        mismatched.object_id = StoredObject::derive_id(
-            &mismatched.header,
-            &mismatched.body,
-            &object_id_key(),
-        )
-        .unwrap();
+        mismatched.object_id =
+            StoredObject::derive_id(&mismatched.header, &mismatched.body, &object_id_key())
+                .unwrap();
         let mismatched_id = mismatched.object_id;
         run_async(fixture.object_store.put(mismatched)).unwrap();
         assert!(matches!(
@@ -5552,15 +5620,17 @@ mod tests {
         let wrong_model_id = run_async(fixture.state_store.store_root(wrong_model)).unwrap();
         assert!(matches!(
             run_async(reader.replay_from_snapshot(wrong_model_id, fixture.snapshot_id, 2)),
-            Err(ConnectorStateStoreError::IdentityMismatch { field: "state_model", .. })
+            Err(ConnectorStateStoreError::IdentityMismatch {
+                field: "state_model",
+                ..
+            })
         ));
     }
 
     #[test]
     fn snapshot_reloads_emitted_id_when_newer_snapshot_wins_race() {
-        let object_store = Arc::new(
-            PausedPutObjectStore::new(usize::MAX, false).pause_first_snapshot_get(),
-        );
+        let object_store =
+            Arc::new(PausedPutObjectStore::new(usize::MAX, false).pause_first_snapshot_get());
         let state_store = test_store(object_store.clone())
             .with_snapshot_every_entries(0)
             .with_snapshot_every_secs(0);
@@ -5775,6 +5845,90 @@ mod tests {
             .sum()
     }
 
+    fn require_test_transfer_authority(allowed: &std::sync::atomic::AtomicBool) -> Result<()> {
+        if allowed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(ConnectorStateStoreError::InvalidReplica {
+                reason: "transfer authorization expired".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn replica_transfer_rechecks_authority_after_waiting_for_append_gate() {
+        let source = test_store(store());
+        append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        run_async(async {
+            let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
+            let target = test_store(objects.clone());
+            let allowed = std::sync::atomic::AtomicBool::new(true);
+            let held = target.change_bus.append_guard.lock().await;
+            let generation = target.change_bus.generation();
+            let mut transfer =
+                Box::pin(target.import_replica_checked(bundle, replica_limits(), || {
+                    require_test_transfer_authority(&allowed)
+                }));
+            assert!(futures_util::poll!(transfer.as_mut()).is_pending());
+            allowed.store(false, Ordering::SeqCst);
+            drop(held);
+            assert!(matches!(
+                transfer.await,
+                Err(ConnectorStateStoreError::InvalidReplica { reason })
+                    if reason.contains("authorization expired")
+            ));
+            assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+            assert_eq!(target.change_bus.generation(), generation);
+            assert!(target.read_root().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn replica_transfer_rechecks_authority_before_root_publication() {
+        let source = test_store(store());
+        let (head, _) = append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        run_async(async {
+            let objects = Arc::new(PausedPutObjectStore::new(1, true));
+            let target = test_store(objects.clone());
+            let allowed = std::sync::atomic::AtomicBool::new(true);
+            let generation = target.change_bus.generation();
+            let mut transfer = Box::pin(target.import_replica_checked(
+                bundle.clone(),
+                replica_limits(),
+                || require_test_transfer_authority(&allowed),
+            ));
+            assert!(futures_util::poll!(transfer.as_mut()).is_pending());
+            assert!(
+                objects.exists(&head).await,
+                "verified dependency was persisted"
+            );
+            allowed.store(false, Ordering::SeqCst);
+            objects.release();
+            assert!(matches!(
+                transfer.await,
+                Err(ConnectorStateStoreError::InvalidReplica { reason })
+                    if reason.contains("authorization expired")
+            ));
+            assert!(!objects.exists(&bundle.root_object_id).await);
+            assert_eq!(target.change_bus.generation(), generation);
+            assert!(target.read_root().await.unwrap().is_none());
+            allowed.store(true, Ordering::SeqCst);
+            target
+                .import_replica_checked(bundle, replica_limits(), || {
+                    require_test_transfer_authority(&allowed)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                target.read_root().await.unwrap().unwrap().1.head,
+                Some(head)
+            );
+        });
+    }
+
     #[test]
     fn replica_moves_complete_state_between_independent_stores() {
         let source = test_store(store());
@@ -5865,7 +6019,9 @@ mod tests {
         bad_signature.signature = Signature::zero();
         let mut wrong_connector = valid_state.clone();
         wrong_connector.connector_id = other_connector_id();
-        wrong_connector.sign_with(&test_state_signing_key()).unwrap();
+        wrong_connector
+            .sign_with(&test_state_signing_key())
+            .unwrap();
         let mut wrong_zone = valid_state;
         wrong_zone.zone_id = other_zone_id();
         wrong_zone.header.zone_id = other_zone_id();
@@ -5927,8 +6083,7 @@ mod tests {
     #[test]
     fn replica_requires_genesis_continuity_and_monotonic_fencing() {
         let genesis = state(0, None, lease_id(1));
-        let genesis_id =
-            replica_with_states(std::slice::from_ref(&genesis)).objects[0].object_id;
+        let genesis_id = replica_with_states(std::slice::from_ref(&genesis)).objects[0].object_id;
         let skipped = state(2, Some(genesis_id), lease_id(2));
         let mut stale = state(1, Some(genesis_id), lease_id(2));
         stale.lease_seq = 9;
@@ -5940,10 +6095,9 @@ mod tests {
         ] {
             let objects = Arc::new(FailNthPutObjectStore::new(store(), usize::MAX));
             let target = test_store(objects.clone());
-            let error = run_async(
-                target.import_replica(replica_with_states(&states), replica_limits()),
-            )
-            .unwrap_err();
+            let error =
+                run_async(target.import_replica(replica_with_states(&states), replica_limits()))
+                    .unwrap_err();
             assert!(matches!(
                 error,
                 ConnectorStateStoreError::SequenceMismatch { .. }
@@ -6189,7 +6343,9 @@ mod tests {
             let previous = run_async(target.read_root()).unwrap().unwrap().0;
             assert!(matches!(
                 run_async(target.import_replica(bundle.clone(), replica_limits())),
-                Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::Io(_)))
+                Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::Io(
+                    _
+                )))
             ));
             assert!(!run_async(objects.exists(&bundle.root_object_id)));
             assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, previous);
@@ -6223,8 +6379,7 @@ mod tests {
                 reader.read_root().await.unwrap().unwrap().1.head,
                 Some(head0)
             );
-            let mut transfer =
-                Box::pin(target.import_replica(bundle.clone(), replica_limits()));
+            let mut transfer = Box::pin(target.import_replica(bundle.clone(), replica_limits()));
             assert!(futures_util::poll!(transfer.as_mut()).is_pending());
             assert_eq!(objects.puts.load(Ordering::SeqCst), 5);
             assert!(objects.exists(&bundle.root_object_id).await);
@@ -6253,8 +6408,7 @@ mod tests {
             let objects = Arc::new(PausedPutObjectStore::new(3, false));
             let target = test_store(objects.clone());
             let competing_adapter = test_store(objects.clone());
-            let mut transfer =
-                Box::pin(target.import_replica(bundle.clone(), replica_limits()));
+            let mut transfer = Box::pin(target.import_replica(bundle.clone(), replica_limits()));
             assert!(futures_util::poll!(transfer.as_mut()).is_pending());
             assert!(!objects.exists(&bundle.root_object_id).await);
 
@@ -6286,12 +6440,16 @@ mod tests {
         let directory = tempfile::TempDir::new().unwrap();
         for checkpoint_after_ops in [0, 2] {
             let mut source_config = DurableObjectStoreConfig::new(
-                directory.path().join(format!("source-{checkpoint_after_ops}")),
+                directory
+                    .path()
+                    .join(format!("source-{checkpoint_after_ops}")),
             );
             source_config.checkpoint_after_ops = checkpoint_after_ops;
             source_config.mac_key = Some([0x31; 32]);
             let mut target_config = DurableObjectStoreConfig::new(
-                directory.path().join(format!("target-{checkpoint_after_ops}")),
+                directory
+                    .path()
+                    .join(format!("target-{checkpoint_after_ops}")),
             );
             target_config.checkpoint_after_ops = checkpoint_after_ops;
             target_config.mac_key = Some([0x32; 32]);
@@ -6310,10 +6468,8 @@ mod tests {
                     .unwrap();
                 (bundle.root_object_id, head1, bundle)
             };
-            let source =
-                test_store(Arc::new(DurableObjectStore::open(source_config).unwrap()));
-            let target =
-                test_store(Arc::new(DurableObjectStore::open(target_config).unwrap()));
+            let source = test_store(Arc::new(DurableObjectStore::open(source_config).unwrap()));
+            let target = test_store(Arc::new(DurableObjectStore::open(target_config).unwrap()));
             assert_eq!(run_async(target.read_root()).unwrap().unwrap().0, root_id);
             assert_eq!(
                 run_async(target.read_root()).unwrap().unwrap().1.head,

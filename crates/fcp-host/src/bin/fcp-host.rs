@@ -3676,7 +3676,7 @@ async fn connector_state_canonical_status_from_config(
             CONNECTOR_STATE_OBJECT_ID_KEY_ENV
         )
     })?;
-    let object_store = fcp_store::DurableObjectStore::open(
+    let object_store = fcp_store::DurableObjectStore::open_read_only(
         fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
     )
     .map_err(|error| {
@@ -3694,7 +3694,7 @@ async fn connector_state_canonical_status_from_config(
     );
     let symbol_store_dir = connector_state_canonical_symbol_store_dir(state_root, connector_id);
     if symbol_store_dir.exists() {
-        let symbol_store = fcp_store::DurableSymbolStore::open(
+        let symbol_store = fcp_store::DurableSymbolStore::open_read_only(
             fcp_store::DurableSymbolStoreConfig::new(&symbol_store_dir),
         )
         .map_err(|error| {
@@ -3768,7 +3768,7 @@ async fn connector_lease_durable_evidence_from_config(
         }
     };
 
-    let object_store = match fcp_store::DurableObjectStore::open(
+    let object_store = match fcp_store::DurableObjectStore::open_read_only(
         fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
     ) {
         Ok(store) => store,
@@ -3970,7 +3970,7 @@ async fn connector_lease_yield_flush_context_for_registered_connector(
             FCP_HOST_CONNECTOR_STATE_OBJECT_ID_KEY_ENV, CONNECTOR_STATE_OBJECT_ID_KEY_ENV
         )
     })?;
-    let object_store = fcp_store::DurableObjectStore::open(
+    let object_store = fcp_store::DurableObjectStore::open_read_only(
         fcp_store::DurableObjectStoreConfig::new(&object_store_dir),
     )
     .map_err(|error| {
