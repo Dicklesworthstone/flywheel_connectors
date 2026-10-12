@@ -25,6 +25,9 @@ pub struct BatchOp {
     /// Optional zone override for this operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Expected singleton-writer fencing sequence for this operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_seq: Option<u64>,
     /// IDs of operations that must complete before this one starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
@@ -795,12 +798,14 @@ mod tests {
             operation: "list_issues".to_owned(),
             input: json!({"owner": "o", "repo": "r"}),
             zone: None,
+            lease_seq: Some(42),
             depends_on: vec!["step0".to_owned()],
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: BatchOp = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "step1");
         assert_eq!(back.depends_on, vec!["step0"]);
+        assert_eq!(back.lease_seq, Some(42));
     }
 
     #[test]
@@ -811,10 +816,40 @@ mod tests {
             operation: "o".to_owned(),
             input: json!({}),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
         assert!(!json.contains("depends_on"));
+    }
+
+    #[test]
+    fn parse_preserves_per_operation_lease_sequences() {
+        let content = r#"{"id":"a","connector":"g","operation":"o","input":{},"lease_seq":0}
+{"id":"b","connector":"g","operation":"o","input":{},"lease_seq":18446744073709551615}
+{"id":"c","connector":"g","operation":"o","input":{}}"#;
+        let batch = BatchFile::parse(content).expect("explicit lease sequences should parse");
+        assert_eq!(batch.operations[0].lease_seq, Some(0));
+        assert_eq!(batch.operations[1].lease_seq, Some(u64::MAX));
+        assert_eq!(batch.operations[2].lease_seq, None);
+        let serialized = serde_json::to_value(&batch.operations[2]).unwrap();
+        assert!(serialized.get("lease_seq").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_lease_sequences() {
+        for invalid in ["-1", "1.5", "\"latest\"", "true", "18446744073709551616"] {
+            let content = format!(
+                r#"{{"id":"s1","connector":"g","operation":"o","input":{{}},"lease_seq":{invalid}}}"#
+            );
+            assert!(
+                matches!(
+                    BatchFile::parse(&content),
+                    Err(BatchFileError::InvalidJson { .. })
+                ),
+                "invalid fencing evidence must fail parsing: {invalid}"
+            );
+        }
     }
 
     // ── BatchFileError Display ─────────────────────────────────────
@@ -1051,6 +1086,7 @@ mod tests {
             operation: "create_issue".to_owned(),
             input: json!({"title": "Bug", "body": "Details", "labels": ["bug", "priority"]}),
             zone: None,
+            lease_seq: None,
             depends_on: vec!["step0".to_owned(), "step-1".to_owned()],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1067,6 +1103,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!({"x": 1}),
             zone: None,
+            lease_seq: None,
             depends_on: vec!["dep".to_owned()],
         };
         let cloned = op.clone();
@@ -1348,6 +1385,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!({}),
             zone: Some("us-east-1".to_owned()),
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1362,6 +1400,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!({}),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1376,6 +1415,7 @@ mod tests {
             operation: "deploy".to_owned(),
             input: json!({"region": "eu"}),
             zone: Some("eu-west-1".to_owned()),
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1391,6 +1431,7 @@ mod tests {
             operation: "send".to_owned(),
             input: json!({}),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let debug = format!("{op:?}");
@@ -1404,6 +1445,7 @@ mod tests {
         let json = r#"{"id":"s1","connector":"g","operation":"o","input":{}}"#;
         let op: BatchOp = serde_json::from_str(json).unwrap();
         assert!(op.zone.is_none());
+        assert!(op.lease_seq.is_none());
         assert!(op.depends_on.is_empty());
     }
 
@@ -1423,6 +1465,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!("plain string"),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1438,6 +1481,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!(99),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1453,6 +1497,7 @@ mod tests {
             operation: "o".to_owned(),
             input: json!(true),
             zone: None,
+            lease_seq: None,
             depends_on: vec![],
         };
         let json = serde_json::to_string(&op).unwrap();

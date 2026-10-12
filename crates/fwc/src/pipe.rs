@@ -271,6 +271,9 @@ pub struct PipelineMetadata {
 pub struct PipelineStep {
     pub id: String,
     pub operation: String,
+    /// Expected singleton-writer fencing sequence for this operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_seq: Option<u64>,
     #[serde(default = "default_pipeline_input")]
     pub input: toml::Value,
     #[serde(default)]
@@ -319,6 +322,9 @@ pub struct PipelineParamBinding {
 pub struct PlannedPipelineStep {
     pub id: String,
     pub operation: String,
+    /// Explicit lease evidence preserved from the step definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_seq: Option<u64>,
     pub depends_on: Vec<String>,
     pub input: Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1387,6 +1393,7 @@ pub fn build_pipeline_plan(
         steps.push(PlannedPipelineStep {
             id: step.id.clone(),
             operation: step.operation.clone(),
+            lease_seq: step.lease_seq,
             depends_on: step.depends_on.clone(),
             input: rendered_input.value,
             unresolved_templates: rendered_input.unresolved,
@@ -2551,6 +2558,53 @@ default = "#general"
         let validation = validate_pipeline_definition(&definition);
         assert!(validation.valid);
         assert_eq!(validation.execution_order, vec!["fetch", "notify"]);
+    }
+
+    #[test]
+    fn pipeline_plan_preserves_per_step_lease_evidence() {
+        let definition = parse_pipeline_definition(
+            r#"
+[pipeline]
+name = "fenced-steps"
+
+[[steps]]
+id = "first"
+operation = "github.create_issue"
+lease_seq = 42
+
+[[steps]]
+id = "second"
+operation = "slack.send_message"
+lease_seq = 0
+depends_on = ["first"]
+
+[[steps]]
+id = "third"
+operation = "github.get_issue"
+depends_on = ["second"]
+"#,
+        )
+        .expect("pipeline with per-step lease evidence should parse");
+        let plan = build_pipeline_plan(&definition, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.steps[0].lease_seq, Some(42));
+        assert_eq!(plan.steps[1].lease_seq, Some(0));
+        assert_eq!(plan.steps[2].lease_seq, None);
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert_eq!(serialized["steps"][0]["lease_seq"], 42);
+        assert!(serialized["steps"][2].get("lease_seq").is_none());
+    }
+
+    #[test]
+    fn pipeline_definition_rejects_invalid_lease_evidence() {
+        for invalid in ["-1", "1.5", "\"latest\"", "true"] {
+            let content = format!(
+                "[pipeline]\nname = \"fenced\"\n[[steps]]\nid = \"first\"\noperation = \"github.create_issue\"\nlease_seq = {invalid}\n"
+            );
+            assert!(
+                parse_pipeline_definition(&content).is_err(),
+                "invalid fencing evidence must fail parsing: {invalid}"
+            );
+        }
     }
 
     #[test]

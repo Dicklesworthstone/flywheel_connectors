@@ -3155,6 +3155,10 @@ struct MapArgs {
     #[arg(long)]
     zone: Option<String>,
 
+    /// Expected singleton-writer lease sequence for every mapped invocation.
+    #[arg(long)]
+    lease_seq: Option<u64>,
+
     #[command(flatten)]
     auth: LiveAuthArgs,
 }
@@ -25503,6 +25507,7 @@ fn build_live_invoke_request(
     capability_token: CapabilityToken,
     approval_tokens: Vec<ApprovalToken>,
     idempotency_key: Option<String>,
+    lease_seq: Option<u64>,
     deadline_ms: Option<u64>,
 ) -> Result<InvokeRequest> {
     let zone_id: ZoneId = zone
@@ -25526,7 +25531,7 @@ fn build_live_invoke_request(
         holder_proof: None,
         context: None,
         idempotency_key,
-        lease_seq: None,
+        lease_seq,
         deadline_ms,
         correlation_id: None,
         provenance: None,
@@ -27801,7 +27806,7 @@ fn execute_live_pipeline_plan(
             params: Some(rendered_input.clone()),
             principal: auth.principal_hint.clone(),
             zone_id: Some(zone_id.clone()),
-            lease_seq: None,
+            lease_seq: step.lease_seq,
             capability_token: Some(auth.capability_token.clone()),
             approval_tokens: auth.approval_tokens.clone(),
         };
@@ -27909,6 +27914,7 @@ fn execute_live_pipeline_plan(
             auth.capability_token.clone(),
             auth.approval_tokens.clone(),
             idempotency_key.clone(),
+            step.lease_seq,
             None,
         )?;
         let started_at = std::time::Instant::now();
@@ -29275,6 +29281,7 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
             auth.capability_token.clone(),
             auth.approval_tokens.clone(),
             None,
+            args.lease_seq,
             None,
         )?;
         operations.push(HostBatchOperation {
@@ -29483,7 +29490,7 @@ fn batch_file_dispatch(
                 zone_id: Some(zone.parse().map_err(|error| {
                     anyhow::anyhow!("`{zone}` is not a valid FCP zone for `batch-file`: {error}")
                 })?),
-                lease_seq: None,
+                lease_seq: op.lease_seq,
                 capability_token: Some(auth.capability_token.clone()),
                 approval_tokens: auth.approval_tokens.clone(),
             };
@@ -29519,6 +29526,7 @@ fn batch_file_dispatch(
             auth.capability_token.clone(),
             auth.approval_tokens.clone(),
             None,
+            op.lease_seq,
             None,
         )?;
         request_operations.push(HostBatchOperation {
@@ -43732,6 +43740,63 @@ deny_ptrace = true
     // ── Map (batch) integration tests ──────────────────────────────
 
     #[test]
+    fn execute_map_preserves_lease_sequence_for_all_items() {
+        let capability_token = test_capability_token_arg();
+        for lease_seq in [None, Some(0), Some(u64::MAX)] {
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+                (
+                    "POST /rpc/batch".to_owned(),
+                    mock_batch_response_json(&["item-1", "item-2"]),
+                ),
+            ]);
+            let mut arguments = vec![
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "map",
+                "github.get_issue",
+                "--inputs",
+                r#"[{"owner":"octocat","repo":"hello-world","number":1},{"owner":"octocat","repo":"hello-world","number":2}]"#,
+                "--capability-token",
+                &capability_token,
+            ];
+            let sequence_text = lease_seq.map(|sequence| sequence.to_string());
+            if let Some(sequence) = sequence_text.as_deref() {
+                arguments.extend(["--lease-seq", sequence]);
+            }
+            let (exit_code, payload) = execute_json(&arguments);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            let requests = request_log.lock().expect("request log should lock");
+            let batch: Value = serde_json::from_str(&requests[2].1).unwrap();
+            let operations = batch["operations"].as_array().unwrap();
+            assert_eq!(operations.len(), 2);
+            for operation in operations {
+                let request = &operation["request"];
+                assert_eq!(request["lease_seq"].as_u64(), lease_seq);
+                if lease_seq.is_none() {
+                    assert!(request.get("lease_seq").is_none());
+                }
+            }
+        }
+        for invalid in ["-1", "18446744073709551616", "latest"] {
+            assert!(
+                Cli::try_parse_from(["fwc", "map", "github.get_issue", "--lease-seq", invalid])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn execute_map_inline_json_array() {
         let capability_token = test_capability_token_arg();
         let (host, server) = spawn_mock_host(
@@ -44011,6 +44076,87 @@ default = "#general"
         assert_eq!(payload["validation"]["valid"], true);
         assert_eq!(payload["validation"]["execution_order"][0], "fetch");
         assert_eq!(payload["validation"]["execution_order"][1], "notify");
+    }
+
+    #[test]
+    fn execute_pipeline_preserves_step_lease_evidence_for_dry_run_and_invoke() {
+        let capability_token = test_capability_token_arg();
+        let temp_dir = tempfile::tempdir().expect("pipeline tempdir");
+        let path = temp_dir.path().join("fenced-pipeline.toml");
+        fs::write(
+            &path,
+            r#"
+[pipeline]
+name = "fenced-pipeline"
+
+[[steps]]
+id = "first"
+operation = "github.issues.create"
+lease_seq = 42
+input = { owner = "octocat", repo = "hello-world", title = "First" }
+
+[[steps]]
+id = "second"
+operation = "github.issues.create"
+lease_seq = 7
+depends_on = ["first"]
+input = { owner = "octocat", repo = "hello-world", title = "Second" }
+"#,
+        )
+        .expect("write pipeline fixture");
+        let path_text = path.display().to_string();
+        for mode in ["dry-run", "run"] {
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ];
+            for _ in 0..2 {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+                if mode == "run" {
+                    routes.push((
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({ "created": true })),
+                    ));
+                }
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                mode,
+                &path_text,
+                "--capability-token",
+                &capability_token,
+            ]);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["plan"]["steps"][0]["lease_seq"], 42);
+            assert_eq!(payload["plan"]["steps"][1]["lease_seq"], 7);
+            let requests = request_log.lock().expect("request log should lock");
+            let step_request_count = if mode == "run" { 2 } else { 1 };
+            assert_eq!(requests.len(), 2 + 2 * step_request_count);
+            for (step_requests, sequence) in requests[2..].chunks(step_request_count).zip([42, 7]) {
+                let preflight: Value = serde_json::from_str(&step_requests[0].1).unwrap();
+                assert_eq!(preflight["lease_seq"], sequence);
+                if mode == "run" {
+                    let invocation: Value = serde_json::from_str(&step_requests[1].1).unwrap();
+                    assert_eq!(invocation["lease_seq"], sequence);
+                    assert_eq!(preflight["request_id"], invocation["id"]);
+                }
+            }
+        }
     }
 
     #[test]
@@ -48020,6 +48166,89 @@ depends_on = ["missing"]
         assert_eq!(payload["response"]["completed"], 2);
         assert_eq!(payload["response"]["failed"], 0);
         assert_eq!(payload["plan"]["input_count"], 2);
+    }
+
+    #[test]
+    fn execute_batch_file_preserves_each_operations_lease_evidence() {
+        let capability_token = test_capability_token_arg();
+        let temp_dir = tempfile::tempdir().expect("batch file tempdir");
+        let path = temp_dir.path().join("fenced-batch.jsonl");
+        fs::write(
+            &path,
+            [
+                r#"{"id":"a","connector":"github","operation":"get_issue","lease_seq":42,"input":{"owner":"octocat","repo":"hello-world","number":1}}"#,
+                r#"{"id":"b","connector":"github","operation":"get_issue","lease_seq":7,"input":{"owner":"octocat","repo":"hello-world","number":2}}"#,
+                r#"{"id":"c","connector":"github","operation":"get_issue","input":{"owner":"octocat","repo":"hello-world","number":3}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write batch fixture");
+        let path_text = path.display().to_string();
+
+        for dry_run in [true, false] {
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ];
+            if dry_run {
+                for _ in 0..3 {
+                    routes.push((
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ));
+                }
+            } else {
+                routes.push((
+                    "POST /rpc/batch".to_owned(),
+                    mock_batch_response_json(&["a", "b", "c"]),
+                ));
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut arguments = vec![
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "batch-file",
+                &path_text,
+                "--capability-token",
+                &capability_token,
+            ];
+            if dry_run {
+                arguments.push("--dry-run");
+            }
+            let (exit_code, payload) = execute_json(&arguments);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            let requests = request_log.lock().expect("request log should lock");
+            let sent_operations = if dry_run {
+                requests
+                    .iter()
+                    .skip(2)
+                    .map(|(_, body)| {
+                        serde_json::from_str::<Value>(body).expect("preflight request")
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let batch: Value = serde_json::from_str(&requests[2].1).unwrap();
+                batch["operations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|operation| operation["request"].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(sent_operations.len(), 3);
+            assert_eq!(sent_operations[0]["lease_seq"], 42);
+            assert_eq!(sent_operations[1]["lease_seq"], 7);
+            assert!(sent_operations[2].get("lease_seq").is_none());
+        }
     }
 
     #[test]
