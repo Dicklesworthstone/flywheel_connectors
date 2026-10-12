@@ -990,6 +990,25 @@ pub enum ConnectorStateError {
         /// Fencing token on the current canonical head.
         current_seq: u64,
     },
+    /// Committed singleton roots describe incomparable state histories.
+    ///
+    /// Neither head may be selected automatically. Restore and append remain
+    /// unavailable until the competing histories are explicitly resolved.
+    #[error(
+        "connector state fork detected for {connector_id}: roots {root_a} and {root_b} have incompatible heads {head_a} and {head_b}"
+    )]
+    ForkDetected {
+        /// Connector whose committed histories diverged.
+        connector_id: ConnectorId,
+        /// First conflicting committed root.
+        root_a: ObjectId,
+        /// Second conflicting committed root.
+        root_b: ObjectId,
+        /// Authenticated head referenced by the first root.
+        head_a: Box<ObjectId>,
+        /// Authenticated head referenced by the second root.
+        head_b: Box<ObjectId>,
+    },
     /// The state payload or object envelope was malformed.
     #[error("malformed connector state for {connector_id}: {reason}")]
     MalformedState {

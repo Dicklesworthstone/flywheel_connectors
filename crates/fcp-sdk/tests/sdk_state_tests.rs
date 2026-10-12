@@ -881,10 +881,21 @@ fn cursor_snapshot_recovery_rejects_a_signed_fork_of_loaded_history() {
     .unwrap()
     .unwrap();
 
+    // Ordinary canonical restore cannot choose either committed branch, even
+    // for a new reader that has never cached a cursor. An already loaded reader
+    // must preserve its previous fields when that restore is refused.
+    let mut fresh_reader = fixture.reader();
+    let fresh_error = fresh_reader.load_cursor().unwrap_err();
+    assert!(fresh_error.to_string().contains("fork detected"));
+    assert_eq!(fresh_reader.head(), None);
+    let loaded_error = reader.load_cursor().unwrap_err();
+    assert!(loaded_error.to_string().contains("fork detected"));
+    assert_eq!(reader.head(), Some(fixture.heads[2]));
+
     fixture
         .backend
         .replay_from_snapshot(fork_root, fixture.snapshot_id, 2)
-        .expect("the alternate history has valid signatures and a valid boundary");
+        .expect("explicit recovery still authenticates the selected alternate history");
     let error = reader
         .recover_cursor_from_snapshot(fork_root, fixture.snapshot_id, 2)
         .unwrap_err();
@@ -896,6 +907,86 @@ fn cursor_snapshot_recovery_rejects_a_signed_fork_of_loaded_history() {
             .unwrap(),
         fixture.cursors[2],
     );
+}
+
+#[cfg(feature = "cursor-store-object-store")]
+#[test]
+fn canonical_cursor_restore_refuses_a_signed_sequence_gap_without_replacing_loaded_state() {
+    let fixture = CursorSnapshotReplayFixture::new();
+    let mut reader = fixture.reader();
+    assert_eq!(
+        reader.load_cursor().unwrap(),
+        Some(fixture.cursors[3].clone())
+    );
+    let retained_head = reader.head();
+
+    let stored_head =
+        fcp_async_core::runtime::block_on_sync(fixture.object_store.get(&fixture.heads[3]))
+            .unwrap()
+            .unwrap();
+    let mut state: ConnectorStateObject =
+        fcp_cbor::CanonicalSerializer::deserialize(&stored_head.body, &stored_head.header.schema)
+            .unwrap();
+    state.prev = Some(fixture.heads[3]);
+    state.seq = 5;
+    state.updated_at += 1;
+    state.header.created_at += 1;
+    state.sign_with(&fixture.signing_key).unwrap();
+    let object_id_key = ObjectIdKey::from_bytes([0xB7; 32]);
+    let body = fcp_cbor::CanonicalSerializer::serialize(&state, &state.header.schema).unwrap();
+    let invalid_head = StoredObject::derive_id(&state.header, &body, &object_id_key).unwrap();
+    fcp_async_core::runtime::block_on_sync(fixture.object_store.put(StoredObject {
+        object_id: invalid_head,
+        header: state.header,
+        body,
+        storage: StorageMeta {
+            retention: RetentionClass::Pinned,
+        },
+    }))
+    .unwrap()
+    .unwrap();
+
+    let mut root = fcp_async_core::runtime::block_on_sync(fixture.canonical.read_root())
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .1;
+    root.head = Some(invalid_head);
+    root.header.refs = vec![invalid_head];
+    let body = fcp_cbor::CanonicalSerializer::serialize(&root, &root.header.schema).unwrap();
+    let invalid_root = StoredObject::derive_id(&root.header, &body, &object_id_key).unwrap();
+    fcp_async_core::runtime::block_on_sync(fixture.object_store.put(StoredObject {
+        object_id: invalid_root,
+        header: root.header,
+        body,
+        storage: StorageMeta {
+            retention: RetentionClass::Pinned,
+        },
+    }))
+    .unwrap()
+    .unwrap();
+
+    let error = reader.load_cursor().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sequence mismatch: expected 4, got 5")
+    );
+    assert_eq!(reader.head(), retained_head);
+    let mut fresh_reader = fixture.reader();
+    assert!(fresh_reader.load_cursor().is_err());
+    assert_eq!(fresh_reader.head(), None);
+
+    // A deliberate recovery from the existing trusted anchors remains useful
+    // for inspection and must not promote the malformed root to canonical.
+    assert_eq!(
+        reader
+            .recover_cursor_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
+            .unwrap(),
+        fixture.cursors[3],
+    );
+    assert!(reader.load_cursor().is_err());
+    assert_eq!(reader.head(), retained_head);
 }
 
 #[cfg(feature = "cursor-store-object-store")]

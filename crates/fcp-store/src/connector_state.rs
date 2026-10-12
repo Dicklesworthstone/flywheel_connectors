@@ -185,6 +185,21 @@ pub enum ConnectorStateStoreError {
         current_seq: u64,
     },
 
+    /// Committed singleton roots have incomparable authenticated heads.
+    #[error(
+        "connector state fork detected: roots {root_a} and {root_b} have incompatible heads {head_a} and {head_b}"
+    )]
+    ForkDetected {
+        /// First conflicting committed root.
+        root_a: ObjectId,
+        /// Second conflicting committed root.
+        root_b: ObjectId,
+        /// Authenticated head referenced by the first root.
+        head_a: Box<ObjectId>,
+        /// Authenticated head referenced by the second root.
+        head_b: Box<ObjectId>,
+    },
+
     /// The root points at an object that cannot be loaded.
     #[error("connector state root references missing state object {0}")]
     MissingHead(ObjectId),
@@ -404,6 +419,9 @@ impl FcpStoreConnectorStateStore {
         I: IntoIterator<Item = [u8; 32]>,
     {
         self.trusted_writer_keys = Some(Arc::new(keys.into_iter().collect()));
+        // A cloned adapter may already share a root accepted under different
+        // writer trust. Revalidate under this policy without clearing its peers.
+        self.root_cache = Arc::new(RwLock::new(None));
         self
     }
 
@@ -427,6 +445,7 @@ impl FcpStoreConnectorStateStore {
     #[must_use]
     pub fn with_instance_id(mut self, instance_id: InstanceId) -> Self {
         self.instance_id = Some(instance_id);
+        self.root_cache = Arc::new(RwLock::new(None));
         self
     }
 
@@ -511,8 +530,9 @@ impl FcpStoreConnectorStateStore {
     /// Return the latest state root for this connector, if present.
     ///
     /// # Errors
-    /// Returns an error if a matching root object is malformed or fails
-    /// content-id verification.
+    /// Returns an error if a matching root object is malformed, its history
+    /// fails authentication or sequence/fencing validation, or committed
+    /// singleton roots describe incomparable histories.
     pub async fn read_root(&self) -> Result<Option<(ObjectId, ConnectorStateRoot)>> {
         let started = Instant::now();
         let result = self.read_root_inner().await;
@@ -545,11 +565,17 @@ impl FcpStoreConnectorStateStore {
         &self,
         root_object_id: ObjectId,
     ) -> Result<ConnectorStateChange> {
+        // A rejected announcement must not leave the previously cached branch
+        // usable. Invalidate before any fallible object or history validation.
+        self.change_bus.mark_root_updated();
         let stored = self.object_store.get(&root_object_id).await?;
         let root: ConnectorStateRoot =
             self.decode_stored(&stored, &Self::root_schema_id(), "connector state root")?;
-        self.validate_root(&root)?;
+        self.validate_stored_root(root_object_id, &stored, &root)?;
         let seq = self.root_head_seq(&root).await?;
+        // Validate against every locally committed root. Authentication of the
+        // announced head alone cannot establish that it extends this history.
+        self.read_root().await?;
 
         Ok(self.publish_change(
             ConnectorStateChangeKind::RootUpdated,
@@ -573,6 +599,7 @@ impl FcpStoreConnectorStateStore {
         let generation = self.change_bus.generation();
 
         let mut best: Option<(ObjectId, ConnectorStateRoot, Option<u64>)> = None;
+        let mut roots: Vec<(ObjectId, ConnectorStateRoot)> = Vec::new();
 
         for object_id in self.object_store.list_zone(&self.zone_id).await {
             let stored = self.object_store.get(&object_id).await?;
@@ -585,8 +612,18 @@ impl FcpStoreConnectorStateStore {
             if !self.root_belongs_to_store(&root) {
                 continue;
             }
-            self.validate_root(&root)?;
+            self.validate_stored_root(object_id, &stored, &root)?;
+            if let Some((_known_id, known_root)) = roots.first()
+                && root.model != known_root.model
+            {
+                return Err(ConnectorStateStoreError::IdentityMismatch {
+                    field: "model",
+                    expected: format!("{:?}", known_root.model),
+                    got: format!("{:?}", root.model),
+                });
+            }
             let head_seq = self.root_head_seq(&root).await?;
+            roots.push((object_id, root.clone()));
 
             let replace = best
                 .as_ref()
@@ -604,9 +641,80 @@ impl FcpStoreConnectorStateStore {
 
         let root = best.map(|(object_id, root, _head_seq)| (object_id, root));
         if let Some((object_id, root)) = &root {
+            self.validate_singleton_root_history(*object_id, root, &roots)
+                .await?;
             self.cache_root(generation, *object_id, root.clone());
         }
         Ok(root)
+    }
+
+    async fn validate_singleton_root_history(
+        &self,
+        root_object_id: ObjectId,
+        root: &ConnectorStateRoot,
+        roots: &[(ObjectId, ConnectorStateRoot)],
+    ) -> Result<()> {
+        if !root.model.is_singleton_writer() {
+            return Ok(());
+        }
+        let Some(head_object_id) = root.head else {
+            return Ok(());
+        };
+
+        // Sequence/time ordering only selects a candidate to inspect. It does
+        // not resolve a fork: every committed root must lie on this one fully
+        // authenticated lineage before the candidate can enter the cache.
+        let mut lineage = HashSet::new();
+        let mut next = Some(head_object_id);
+        let mut newer: Option<ConnectorStateObject> = None;
+        while let Some(object_id) = next {
+            if !lineage.insert(object_id) {
+                return Err(ConnectorStateStoreError::ChainCycle(object_id));
+            }
+            let (_, state) = self.load_state_object(&object_id).await?;
+            if let Some(newer) = &newer {
+                Self::validate_replay_transition(&root.model, &state, newer)?;
+            }
+            if state.prev.is_none() && state.seq != 0 {
+                return Err(ConnectorStateStoreError::SequenceMismatch {
+                    expected: 0,
+                    got: state.seq,
+                });
+            }
+            next = state.prev;
+            newer = Some(state);
+        }
+
+        // Choose a deterministic conflicting root only for the error evidence.
+        // No conflicting branch is accepted based on timestamp, length or ID.
+        let conflicting = roots
+            .iter()
+            .filter_map(|(other_id, other)| {
+                other
+                    .head
+                    .and_then(|head| (!lineage.contains(&head)).then_some((*other_id, head)))
+            })
+            .min_by_key(|(other_id, _)| *other_id);
+        if let Some((root_b, head_b)) = conflicting {
+            tracing::error!(
+                target: CONNECTOR_STATE_TRACING_TARGET,
+                event_type = "fcp.connector_state.fork",
+                connector_id = %self.connector_id,
+                zone_id = %self.zone_id,
+                root_a = %root_object_id,
+                root_b = %root_b,
+                head_a = %head_object_id,
+                head_b = %head_b,
+                "refusing canonical singleton state with competing committed histories"
+            );
+            return Err(ConnectorStateStoreError::ForkDetected {
+                root_a: root_object_id,
+                root_b,
+                head_a: Box::new(head_object_id),
+                head_b: Box::new(head_b),
+            });
+        }
+        Ok(())
     }
 
     fn cached_root(&self) -> Option<(ObjectId, ConnectorStateRoot)> {
@@ -716,6 +824,9 @@ impl FcpStoreConnectorStateStore {
         // local serialization; replicated stores still need distributed lease
         // validation and fork detection at their admission boundary.
         let _append_guard = self.change_bus.append_guard.lock().await;
+        // Recheck storage at the mutation boundary even when an external
+        // writer's root announcement has not reached this adapter yet.
+        self.change_bus.mark_root_updated();
         let root = self.read_root().await?;
         if let Some((_root_id, root)) = &root
             && root.model != self.state_model
@@ -852,6 +963,15 @@ impl FcpStoreConnectorStateStore {
                 return Err(ConnectorStateStoreError::ChainCycle(object_id));
             }
             let (_loaded_id, state) = self.load_state_object(&object_id).await?;
+            if let Some((_, newer)) = states.last() {
+                Self::validate_replay_transition(&root.model, &state, newer)?;
+            }
+            if state.prev.is_none() && state.seq != 0 {
+                return Err(ConnectorStateStoreError::SequenceMismatch {
+                    expected: 0,
+                    got: state.seq,
+                });
+            }
             next = state.prev;
             states.push((object_id, state));
         }
@@ -908,17 +1028,7 @@ impl FcpStoreConnectorStateStore {
         let stored = self.object_store.get(&root_object_id).await?;
         let root: ConnectorStateRoot =
             self.decode_stored(&stored, &Self::root_schema_id(), "connector state root")?;
-        self.validate_root(&root)?;
-        if !headers_match(&stored.header, &root.header)? {
-            return Err(ConnectorStateStoreError::HeaderBodyMismatch);
-        }
-        let computed = StoredObject::derive_id(&stored.header, &stored.body, &self.object_id_key)?;
-        if computed != root_object_id {
-            return Err(ConnectorStateStoreError::ContentIdMismatch {
-                claimed: root_object_id,
-                computed,
-            });
-        }
+        self.validate_stored_root(root_object_id, &stored, &root)?;
         if root.model != self.state_model {
             return Err(ConnectorStateStoreError::IdentityMismatch {
                 field: "state_model",
@@ -1062,6 +1172,7 @@ impl FcpStoreConnectorStateStore {
 
     async fn flush_before_lease_yield_inner(&self) -> Result<ConnectorStateLeaseYieldFlush> {
         let _append_guard = self.change_bus.append_guard.lock().await;
+        self.change_bus.mark_root_updated();
         let Some((root_object_id, root)) = self.read_root().await? else {
             return Ok(ConnectorStateLeaseYieldFlush::missing(self));
         };
@@ -1099,6 +1210,7 @@ impl FcpStoreConnectorStateStore {
     /// snapshot signing key is configured, or storage fails.
     pub async fn snapshot_head(&self) -> Result<Option<ObjectId>> {
         let _append_guard = self.change_bus.append_guard.lock().await;
+        self.change_bus.mark_root_updated();
         let Some((head_id, head)) = self.current_head().await? else {
             return Ok(None);
         };
@@ -1192,6 +1304,7 @@ impl FcpStoreConnectorStateStore {
 
     async fn compact_inner(&self, before_seq: u64) -> Result<usize> {
         let _append_guard = self.change_bus.append_guard.lock().await;
+        self.change_bus.mark_root_updated();
         // The current head is still referenced by the root, so relaxing its
         // retention would let a retention-only GC strand the live chain
         // (`read_root`/`current_head` would then fail with `MissingHead`).
@@ -1475,6 +1588,26 @@ impl FcpStoreConnectorStateStore {
             &stored.body,
             expected_schema,
         )?)
+    }
+
+    fn validate_stored_root(
+        &self,
+        object_id: ObjectId,
+        stored: &StoredObject,
+        root: &ConnectorStateRoot,
+    ) -> Result<()> {
+        self.validate_root(root)?;
+        if !headers_match(&stored.header, &root.header)? {
+            return Err(ConnectorStateStoreError::HeaderBodyMismatch);
+        }
+        let computed = StoredObject::derive_id(&stored.header, &stored.body, &self.object_id_key)?;
+        if computed != object_id {
+            return Err(ConnectorStateStoreError::ContentIdMismatch {
+                claimed: object_id,
+                computed,
+            });
+        }
+        Ok(())
     }
 
     fn validate_root(&self, root: &ConnectorStateRoot) -> Result<()> {
@@ -1965,6 +2098,18 @@ impl FcpStoreConnectorStateStore {
             ConnectorStateStoreError::ObjectStore(err) => ConnectorStateError::StorageUnavailable {
                 connector_id: self.connector_id.clone(),
                 reason: err.to_string(),
+            },
+            ConnectorStateStoreError::ForkDetected {
+                root_a,
+                root_b,
+                head_a,
+                head_b,
+            } => ConnectorStateError::ForkDetected {
+                connector_id: self.connector_id.clone(),
+                root_a,
+                root_b,
+                head_a,
+                head_b,
             },
             ConnectorStateStoreError::MissingHead(head) => {
                 ConnectorStateError::SnapshotUnavailable {
@@ -2645,6 +2790,18 @@ mod tests {
         }
     }
 
+    fn store_replicated_state_and_root(
+        state_store: &FcpStoreConnectorStateStore,
+        state_obj: ConnectorStateObject,
+    ) -> (ObjectId, ObjectId) {
+        // Reproduce object replication: immutable objects can arrive without
+        // passing through this adapter's local append or change bus.
+        let head = run_async(state_store.store_state_object(state_obj.clone())).unwrap();
+        let root = state_store.root_for_head(&state_obj, head);
+        let root_id = run_async(state_store.store_root(root)).unwrap();
+        (head, root_id)
+    }
+
     fn store_root_symbols(symbol_store: &MemorySymbolStore, root_id: ObjectId) {
         let meta = ObjectSymbolMeta {
             object_id: root_id,
@@ -2889,11 +3046,11 @@ mod tests {
         let unpinned = test_store(object_store.clone());
         let (legit_head, _) = append_ok(&unpinned, state(0, None, lease_id(1)));
 
-        // A zone insider holding the shared object-id key plants a
-        // self-signed higher-seq chain: valid schema, valid content-id,
-        // valid self-signature, but a foreign writer key.
+        // A zone insider holding the shared object-id key plants an otherwise
+        // valid continuation: matching sequence and parent, valid content-id
+        // and self-signature, but a foreign writer key.
         let insider_key = Ed25519SigningKey::from_bytes(&[0x77; 32]).unwrap();
-        let forged = signed_state(5, None, lease_id(9), &insider_key);
+        let forged = signed_state(1, Some(legit_head), lease_id(9), &insider_key);
         let stored = unpinned
             .stored_object(&forged.header, &forged, RetentionClass::Pinned)
             .unwrap();
@@ -2901,8 +3058,8 @@ mod tests {
         run_async(object_store.put(stored)).unwrap();
         run_async(unpinned.store_root(root_with_head(Some(forged_head), 1_700_000_500))).unwrap();
 
-        // Without a pin the forged chain outranks the legitimate head — this
-        // is the nr4cq insider gap the pin exists to close.
+        // Lineage validation cannot establish writer authority. Without a pin
+        // this foreign writer's continuation is accepted; the pin closes that gap.
         let unpinned_root = run_async(unpinned.read_root()).unwrap().unwrap().1;
         assert_eq!(unpinned_root.head, Some(forged_head));
         assert_ne!(unpinned_root.head, Some(legit_head));
@@ -3363,6 +3520,363 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].1.seq, 0);
         assert_eq!(chain[1].1.seq, 1);
+    }
+
+    #[test]
+    fn singleton_fork_blocks_public_reads_and_cached_append() {
+        let object_store = store();
+        let (authorization, signing_key) = write_authorization_with_key();
+        let state_store = test_store(object_store.clone())
+            .with_trusted_writer_keys([signing_key.verifying_key().to_bytes()])
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let connector = connector_id();
+        let initial = run_async(ConnectorStateStore::append_object(
+            &state_store,
+            &connector,
+            &authorization,
+            signed_state(0, None, lease_id(1), &signing_key),
+        ))
+        .unwrap();
+        let ConnectorStateAppendOutcome::Committed {
+            object_id: head0, ..
+        } = initial
+        else {
+            panic!("genesis must commit");
+        };
+        let committed = run_async(ConnectorStateStore::append_object(
+            &state_store,
+            &connector,
+            &authorization,
+            signed_state(1, Some(head0), lease_id(2), &signing_key),
+        ))
+        .unwrap();
+        let ConnectorStateAppendOutcome::Committed {
+            object_id: head1,
+            root_object_id: root1,
+            ..
+        } = committed
+        else {
+            panic!("first branch must commit");
+        };
+        assert_eq!(
+            run_async(state_store.read_root()).unwrap().unwrap().0,
+            root1
+        );
+
+        let (other_head, other_root) = store_replicated_state_and_root(
+            &state_store,
+            signed_state(1, Some(head0), lease_id(3), &signing_key),
+        );
+        let object_count = run_async(object_store.list_zone(&zone_id())).len();
+
+        // No announcement was delivered. The mutation boundary must bypass the
+        // formerly valid cached root and discover the replicated competing root.
+        let error = run_async(ConnectorStateStore::append_object(
+            &state_store,
+            &connector,
+            &authorization,
+            signed_state(2, Some(head1), lease_id(4), &signing_key),
+        ))
+        .unwrap_err();
+        let ConnectorStateError::ForkDetected {
+            root_a,
+            root_b,
+            head_a,
+            head_b,
+            ..
+        } = &error
+        else {
+            panic!("expected a typed fork refusal, got {error:?}");
+        };
+        assert_eq!(
+            HashSet::from([*root_a, *root_b]),
+            HashSet::from([root1, other_root])
+        );
+        assert_eq!(
+            HashSet::from([**head_a, **head_b]),
+            HashSet::from([head1, other_head])
+        );
+        assert_eq!(
+            run_async(object_store.list_zone(&zone_id())).len(),
+            object_count
+        );
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["error"], "fork_detected");
+        assert_eq!(
+            serde_json::from_value::<ConnectorStateError>(json).unwrap(),
+            error
+        );
+        assert!(matches!(
+            run_async(ConnectorStateStore::read_root(&state_store, &connector)),
+            Err(ConnectorStateError::ForkDetected { .. })
+        ));
+        assert!(matches!(
+            run_async(ConnectorStateStore::read_chain(
+                &state_store,
+                &connector,
+                None,
+                10
+            )),
+            Err(ConnectorStateError::ForkDetected { .. })
+        ));
+        assert!(matches!(
+            run_async(state_store.canonical_status(None)),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+    }
+
+    #[test]
+    fn singleton_longer_higher_fence_branch_does_not_resolve_fork() {
+        let state_store = test_store(store())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (head0, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&state_store, state(1, Some(head0), lease_id(2)));
+        let (fork1, _) =
+            store_replicated_state_and_root(&state_store, state(1, Some(head0), lease_id(3)));
+        let mut longer = state(2, Some(fork1), lease_id(4));
+        longer.lease_seq = 1_000;
+        longer.sign_with(&test_state_signing_key()).unwrap();
+        let (_, fork_root) = store_replicated_state_and_root(&state_store, longer);
+        let error = run_async(state_store.observe_replicated_root(fork_root)).unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorStateStoreError::ForkDetected { .. }
+        ));
+        assert!(matches!(
+            run_async(state_store.flush_before_lease_yield()),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+        assert!(matches!(
+            run_async(state_store.append_object(state(2, Some(head1), lease_id(5)))),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+    }
+
+    #[test]
+    fn singleton_distinct_genesis_roots_are_a_fork() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        append_ok(&state_store, state(0, None, lease_id(1)));
+        store_replicated_state_and_root(&state_store, state(0, None, lease_id(2)));
+        let reader = test_store(object_store);
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+    }
+
+    #[test]
+    fn rejected_fork_announcement_invalidates_cached_branch() {
+        let object_store = store();
+        let writer = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let reader = test_store(object_store);
+        let (head0, _) = append_ok(&writer, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&writer, state(1, Some(head0), lease_id(2)));
+        assert_eq!(
+            run_async(reader.read_root()).unwrap().unwrap().1.head,
+            Some(head1)
+        );
+        assert!(reader.cached_root().is_some());
+
+        let (_, fork_root) =
+            store_replicated_state_and_root(&writer, state(1, Some(head0), lease_id(3)));
+        assert!(matches!(
+            run_async(reader.observe_replicated_root(fork_root)),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+        assert!(reader.cached_root().is_none());
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+        assert!(matches!(
+            run_async(reader.snapshot_head()),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+        assert!(matches!(
+            run_async(reader.compact(10)),
+            Err(ConnectorStateStoreError::ForkDetected { .. })
+        ));
+    }
+
+    #[test]
+    fn singleton_restore_validates_sequences_and_lease_progression() {
+        for sequence_gap in [true, false] {
+            let object_store = store();
+            let writer = test_store(object_store.clone())
+                .with_snapshot_every_entries(0)
+                .with_snapshot_every_secs(0);
+            let (head0, _) = append_ok(&writer, state(0, None, lease_id(1)));
+            let mut invalid = state(if sequence_gap { 2 } else { 1 }, Some(head0), lease_id(2));
+            if !sequence_gap {
+                invalid.lease_seq = 9;
+                invalid.sign_with(&test_state_signing_key()).unwrap();
+            }
+            store_replicated_state_and_root(&writer, invalid);
+            let reader = test_store(object_store);
+            let error = run_async(reader.read_root()).unwrap_err();
+            if sequence_gap {
+                assert!(matches!(
+                    error,
+                    ConnectorStateStoreError::SequenceMismatch {
+                        expected: 1,
+                        got: 2
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    ConnectorStateStoreError::StaleLease {
+                        held_seq: 9,
+                        current_seq: 10
+                    }
+                ));
+            }
+            assert!(reader.cached_root().is_none());
+        }
+    }
+
+    #[test]
+    fn singleton_restore_rejects_nonzero_genesis() {
+        let state_store = test_store(store());
+        store_replicated_state_and_root(&state_store, state(3, None, lease_id(1)));
+        assert!(matches!(
+            run_async(state_store.read_root()),
+            Err(ConnectorStateStoreError::SequenceMismatch {
+                expected: 0,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn mixed_root_models_cannot_bypass_singleton_fork_validation() {
+        let object_store = store();
+        let singleton = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        append_ok(&singleton, state(0, None, lease_id(1)));
+        let crdt = test_store(object_store.clone()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::ConnectorCrdtType::LwwMap,
+        });
+        store_replicated_state_and_root(&crdt, state(0, None, lease_id(2)));
+        let reader = test_store(object_store);
+        assert!(matches!(
+            run_async(reader.read_root()),
+            Err(ConnectorStateStoreError::IdentityMismatch { field: "model", .. })
+        ));
+    }
+
+    #[test]
+    fn root_envelope_mismatch_invalidates_a_cached_reader() {
+        let object_store = store();
+        let state_store = test_store(object_store.clone())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (head, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        run_async(state_store.read_root()).unwrap().unwrap();
+        assert!(state_store.cached_root().is_some());
+        let root = root_with_head(Some(head), 1_700_000_100);
+        let mut envelope = root.header.clone();
+        envelope.created_at += 1;
+        let stored = state_store
+            .stored_object(&envelope, &root, RetentionClass::Pinned)
+            .unwrap();
+        let root_id = stored.object_id;
+        run_async(object_store.put(stored)).unwrap();
+
+        assert!(matches!(
+            run_async(state_store.observe_replicated_root(root_id)),
+            Err(ConnectorStateStoreError::HeaderBodyMismatch)
+        ));
+        assert!(state_store.cached_root().is_none());
+        assert!(matches!(
+            run_async(state_store.read_root()),
+            Err(ConnectorStateStoreError::HeaderBodyMismatch)
+        ));
+    }
+
+    #[test]
+    fn ordinary_crdt_chain_reads_reject_sequence_gaps_before_returning_a_prefix() {
+        let state_store = test_store(store()).with_state_model(ConnectorStateModel::Crdt {
+            crdt_type: fcp_core::ConnectorCrdtType::LwwMap,
+        });
+        let head0 = run_async(state_store.store_state_object(state(0, None, lease_id(1)))).unwrap();
+        store_replicated_state_and_root(&state_store, state(2, Some(head0), lease_id(2)));
+        // CRDT roots do not use the singleton fork validator; this exercises
+        // the ordinary chain reader's own validation despite a one-item limit.
+        assert!(run_async(state_store.read_root()).unwrap().is_some());
+        assert!(matches!(
+            run_async(state_store.read_chain(None, 1)),
+            Err(ConnectorStateStoreError::SequenceMismatch {
+                expected: 1,
+                got: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn singleton_fork_refusal_survives_wal_and_checkpoint_reopen() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for checkpoint_after_ops in [0, 2] {
+            let mut config = DurableObjectStoreConfig::new(
+                temp.path().join(format!("fork-{checkpoint_after_ops}")),
+            );
+            config.checkpoint_after_ops = checkpoint_after_ops;
+            config.mac_key = Some([0x73; 32]);
+            {
+                let writer =
+                    test_store(Arc::new(DurableObjectStore::open(config.clone()).unwrap()))
+                        .with_snapshot_every_entries(0)
+                        .with_snapshot_every_secs(0);
+                let (head0, _) = append_ok(&writer, state(0, None, lease_id(1)));
+                append_ok(&writer, state(1, Some(head0), lease_id(2)));
+                store_replicated_state_and_root(&writer, state(1, Some(head0), lease_id(3)));
+            }
+            let restored = test_store(Arc::new(DurableObjectStore::open(config).unwrap()));
+            assert!(matches!(
+                run_async(ConnectorStateStore::read_root(&restored, &connector_id())),
+                Err(ConnectorStateError::ForkDetected { .. })
+            ));
+            assert!(matches!(
+                run_async(restored.flush_before_lease_yield()),
+                Err(ConnectorStateStoreError::ForkDetected { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn cloned_reader_revalidates_cached_root_after_trust_or_instance_changes() {
+        let state_store = test_store(store())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let (head, _) = append_ok(&state_store, state(0, None, lease_id(1)));
+        assert_eq!(
+            run_async(state_store.read_root()).unwrap().unwrap().1.head,
+            Some(head)
+        );
+
+        let differently_pinned = state_store.clone().with_trusted_writer_keys([[0xee; 32]]);
+        assert!(matches!(
+            run_async(differently_pinned.read_root()),
+            Err(ConnectorStateStoreError::UntrustedWriterKey { .. })
+        ));
+        let different_instance = state_store.clone().with_instance_id(InstanceId::new());
+        assert!(run_async(different_instance.read_root()).unwrap().is_none());
+
+        // Reconfiguring a clone does not discard the original adapter's valid
+        // cache or change its trust and identity.
+        assert!(state_store.cached_root().is_some());
+        assert_eq!(
+            run_async(state_store.read_root()).unwrap().unwrap().1.head,
+            Some(head)
+        );
     }
 
     #[test]
