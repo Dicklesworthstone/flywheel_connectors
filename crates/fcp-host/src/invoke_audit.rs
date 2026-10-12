@@ -29,11 +29,26 @@
 //!
 //! ## Storage
 //!
-//! In-memory only for now (per-process). The shape is intentionally
-//! retainable behind a trait so a future durable backend can be
-//! swapped in without touching the call sites.
+//! Production hosts open a bounded, exclusively locked local journal with
+//! [`InvokeAuditChain::open_with_journal`]. Each full entry is synced before
+//! publishing the in-memory chain head or exporting OTLP. Startup validates
+//! every retained entry and its hash linkage; corruption and incomplete
+//! writes refuse recovery without discarding evidence.
+//!
+//! Durable entries contain bounded identity metadata and coarse failure
+//! categories. Free-form denial, provider-error, and relay-failure text is
+//! projected before canonical hashing. The append API contains no request
+//! input, result-body, or credential-token field.
+//!
+//! This remains a local, unsigned chain. Persistence and hash consistency do
+//! not establish quorum, signature authenticity, or rollback resistance.
+//! [`InvokeAuditChain::new`] is an explicit in-memory option for tests and
+//! intentionally ephemeral hosts.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use fcp_audit::{
@@ -70,6 +85,16 @@ pub const SERIALIZED_COMMIT_FALLBACK_ATTEMPTS: usize = 8;
 /// Stable schema for host-backed invoke audit-chain status snapshots.
 pub const INVOKE_AUDIT_CHAIN_STATUS_SCHEMA_VERSION: &str = "fcp.host.invoke_audit_chain_status.v1";
 
+/// Maximum encoded audit entry size accepted by the local journal.
+pub const INVOKE_AUDIT_MAX_RECORD_BYTES: usize = 64 * 1024;
+/// Maximum journal size; reaching it refuses further appends without eviction.
+pub const INVOKE_AUDIT_MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum retained journal entries, bounding startup and resident memory.
+pub const INVOKE_AUDIT_MAX_ENTRIES: u64 = 262_144;
+const INVOKE_AUDIT_MAX_IDENTITY_BYTES: usize = 512;
+const INVOKE_AUDIT_MAX_RELAY_FAILURES: usize = 256;
+const INVOKE_AUDIT_JOURNAL_MAGIC: &[u8; 8] = b"FCPAUD1\n";
+
 /// Event type strings for invoke-chain audit entries.
 pub mod event_types {
     /// Emitted after preflight (zone, capability, revocation) PASSES,
@@ -86,6 +111,8 @@ pub mod event_types {
     /// Emitted by the entry node when it relays the request to a mesh peer
     /// (the executing peer appends its own allow/result events).
     pub const INVOKE_MESH_FORWARDED: &str = "invoke.mesh_forwarded";
+    /// Emitted before relay IO without asserting local capability verification.
+    pub const INVOKE_MESH_FORWARD_ATTEMPT: &str = "invoke.mesh_forward_attempt";
 }
 
 /// Phase-specific payload for an invoke audit append.
@@ -114,6 +141,14 @@ pub enum InvokePhase {
         /// Wall-clock duration from request enter to dispatch failure.
         duration_ms: u64,
     },
+    /// The entry node is about to relay the request to a mesh peer.
+    /// This records routing custody, not an authorization decision.
+    MeshForwardAttempt {
+        /// Peer selected for this delivery attempt.
+        target_node: String,
+        /// Stable routing decision code.
+        decision: String,
+    },
     /// The entry node relayed the request to a mesh peer.
     MeshForwarded {
         /// Peer that answered (or the last peer attempted).
@@ -136,13 +171,14 @@ impl InvokePhase {
             Self::PreflightDeny { .. } => event_types::INVOKE_DENY,
             Self::DispatchResult { .. } => event_types::INVOKE_RESULT,
             Self::DispatchError { .. } => event_types::INVOKE_ERROR,
+            Self::MeshForwardAttempt { .. } => event_types::INVOKE_MESH_FORWARD_ATTEMPT,
             Self::MeshForwarded { .. } => event_types::INVOKE_MESH_FORWARDED,
         }
     }
 
     const fn severity(&self) -> Severity {
         match self {
-            Self::PreflightAllow => Severity::Info,
+            Self::PreflightAllow | Self::MeshForwardAttempt { .. } => Severity::Info,
             Self::PreflightDeny { .. } => Severity::Warning,
             Self::DispatchResult { success, .. } => {
                 if *success {
@@ -183,6 +219,10 @@ impl InvokePhase {
             Self::DispatchError { error, duration_ms } => vec![
                 ("error".into(), json!(error)),
                 ("duration_ms".into(), json!(duration_ms)),
+            ],
+            Self::MeshForwardAttempt { target_node, decision } => vec![
+                ("target_node".into(), json!(target_node)),
+                ("decision".into(), json!(decision)),
             ],
             Self::MeshForwarded {
                 target_node,
@@ -476,6 +516,9 @@ pub struct InvokeAuditChainStatusSnapshot {
     pub live_quorum_checkpoint_snapshot: LiveQuorumCheckpointSnapshot,
     /// Append-path counters for the queried zone.
     pub append_metrics: InvokeAuditChainMetrics,
+    /// Local persistence evidence; this does not imply a signed quorum.
+    #[serde(default)]
+    pub durability: InvokeAuditDurabilityStatus,
     /// Redaction-safe warnings explaining degraded or missing states.
     pub warnings: Vec<String>,
 }
@@ -521,6 +564,9 @@ pub struct InvokeAuditChain {
     /// Optional fire-and-forget OTLP exporter. The audit chain remains
     /// canonical; exporter failure never affects append success.
     otlp_exporter: Option<Arc<FireAndForgetExporter>>,
+    /// The retained file owns the exclusive OS lock for this chain's lifetime.
+    /// Commit lock ordering is always zone mutex, then journal mutex.
+    journal: Option<Mutex<InvokeAuditJournal>>,
 }
 
 impl InvokeAuditChain {
@@ -536,7 +582,72 @@ impl InvokeAuditChain {
         Self {
             chains: RwLock::new(HashMap::new()),
             otlp_exporter: Some(exporter),
+            journal: None,
         }
+    }
+
+    /// Open a local journal and recover every complete, verified audit entry.
+    ///
+    /// New files and directories are synced before this returns. Existing
+    /// journals require exclusive ownership and a valid complete history.
+    /// Recovery never truncates a damaged tail or starts a new genesis over it.
+    /// On Unix, successful appends include file and directory durability.
+    /// Other platforms retain and verify entries but report `durable: false`
+    /// because portable directory synchronization is not available here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an audit error on lock contention, IO failure, unsupported or
+    /// incomplete framing, invalid entry linkage, or configured capacity limits.
+    pub fn open_with_journal(path: impl AsRef<Path>) -> Result<Self, AuditError> {
+        let (journal, chains) = InvokeAuditJournal::open(path.as_ref())?;
+        Ok(Self {
+            chains: RwLock::new(
+                chains
+                    .into_iter()
+                    .map(|(zone, chain)| (zone, Arc::new(Mutex::new(chain))))
+                    .collect(),
+            ),
+            otlp_exporter: None,
+            journal: Some(Mutex::new(journal)),
+        })
+    }
+
+    /// Report local persistence and write availability without exposing paths.
+    #[must_use]
+    pub fn durability_status(&self) -> InvokeAuditDurabilityStatus {
+        self.journal.as_ref().map_or_else(
+            InvokeAuditDurabilityStatus::default,
+            |journal| match journal.lock() {
+                Ok(journal) => journal.status(),
+                Err(_) => InvokeAuditDurabilityStatus {
+                    storage: "local_journal".to_string(),
+                    writable: false,
+                    unavailable_reason: Some("journal_lock_poisoned".to_string()),
+                    ..InvokeAuditDurabilityStatus::default()
+                },
+            },
+        )
+    }
+
+    fn persist_entry(&self, entry: &AuditEntry) -> Result<(), AuditError> {
+        if let Some(journal) = &self.journal {
+            journal
+                .lock()
+                .map_err(|_| AuditError::ChainUnavailable(entry.zone_id.clone()))?
+                .append(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Attach an exporter to either a memory or durable chain.
+    ///
+    /// Recovered history is not re-exported. New entries reach the exporter
+    /// only after the journal has synchronized them successfully.
+    #[must_use]
+    pub fn with_otlp_exporter(mut self, exporter: Arc<FireAndForgetExporter>) -> Self {
+        self.otlp_exporter = Some(exporter);
+        self
     }
 
     /// Return the attached exporter, if any.
@@ -640,6 +751,20 @@ impl InvokeAuditChain {
         retry_budget: usize,
         serialized_fallback_after: Option<usize>,
     ) -> Result<AuditEntry, AuditError> {
+        let phase = if let Some(journal) = &self.journal {
+            if journal
+                .lock()
+                .map_err(|_| AuditError::ChainUnavailable(ctx.zone_id.clone()))?
+                .unavailable_reason
+                .is_some()
+            {
+                return Err(AuditError::ChainUnavailable(ctx.zone_id.clone()));
+            }
+            validate_durable_context(ctx)?;
+            durable_phase(phase)?
+        } else {
+            phase
+        };
         let template = InvokeAuditEntryTemplate::new(ctx, phase);
         let zone = self.zone_handle(&ctx.zone_id);
 
@@ -655,14 +780,14 @@ impl InvokeAuditChain {
             let (next_seq, prev_snapshot, last_occurred_at, last_hlc) = {
                 let z = zone.lock().expect("InvokeAuditChain zone mutex poisoned");
                 (
-                    z.last_seq.map_or(0u64, |s| s.saturating_add(1)),
+                    next_audit_sequence(z.last_seq)?,
                     z.last_id.clone(),
                     z.last_occurred_at,
                     z.last_hlc.clone(),
                 )
             };
             let occurred_at = monotonic_occurred_at(ctx.occurred_at, last_occurred_at);
-            let hlc = next_audit_hlc(&template.actor, occurred_at, last_hlc.as_ref());
+            let hlc = next_audit_hlc(&template.actor, occurred_at, last_hlc.as_ref())?;
             let clock_anomaly = ClockAnomaly::detect(ctx.occurred_at, last_occurred_at);
             let metadata_override =
                 clock_anomaly.map(|anomaly| template.metadata_with_clock_anomaly(anomaly));
@@ -697,6 +822,7 @@ impl InvokeAuditChain {
                         real_id,
                         metadata_override,
                     );
+                    self.persist_entry(&entry)?;
                     z.last_seq = Some(next_seq);
                     z.last_id = Some(entry.id.clone());
                     z.last_occurred_at = Some(occurred_at);
@@ -726,7 +852,7 @@ impl InvokeAuditChain {
             // whose snapshot cannot go stale because the snapshot and
             // commit happen in the same critical section.
             if serialized_fallback_after.is_some_and(|fallback_after| attempts >= fallback_after) {
-                return Self::append_serialized(&zone, &template, ctx.occurred_at);
+                return self.append_serialized(&zone, &template, ctx.occurred_at);
             }
 
             // Defence in depth against pathological retry storms
@@ -755,14 +881,15 @@ impl InvokeAuditChain {
     }
 
     fn append_serialized(
+        &self,
         zone: &Arc<Mutex<ZoneChain>>,
         template: &InvokeAuditEntryTemplate,
         requested_occurred_at: u64,
     ) -> Result<AuditEntry, AuditError> {
         let mut z = zone.lock().expect("InvokeAuditChain zone mutex poisoned");
-        let next_seq = z.last_seq.map_or(0u64, |s| s.saturating_add(1));
+        let next_seq = next_audit_sequence(z.last_seq)?;
         let occurred_at = monotonic_occurred_at(requested_occurred_at, z.last_occurred_at);
-        let hlc = next_audit_hlc(&template.actor, occurred_at, z.last_hlc.as_ref());
+        let hlc = next_audit_hlc(&template.actor, occurred_at, z.last_hlc.as_ref())?;
         let clock_anomaly = ClockAnomaly::detect(requested_occurred_at, z.last_occurred_at);
         let metadata_override =
             clock_anomaly.map(|anomaly| template.metadata_with_clock_anomaly(anomaly));
@@ -770,6 +897,7 @@ impl InvokeAuditChain {
         let prev = z.last_id.clone();
         let id = template.compute_id(next_seq, occurred_at, &hlc, prev.as_deref(), metadata)?;
         let entry = template.materialize(next_seq, occurred_at, hlc, prev, id, metadata_override);
+        self.persist_entry(&entry)?;
         z.last_seq = Some(next_seq);
         z.last_id = Some(entry.id.clone());
         z.last_occurred_at = Some(occurred_at);
@@ -870,8 +998,25 @@ impl InvokeAuditChain {
     ) -> InvokeAuditChainStatusSnapshot {
         let entries = self.entries_for_zone(zone_id);
         let append_metrics = self.metrics_for_zone(zone_id);
+        let durability = self.durability_status();
         let tip_entry = entries.last();
         let mut warnings = Vec::new();
+        if durability.storage == "memory" {
+            warnings.push(
+                "invoke audit history is in memory and will not survive restart".to_string(),
+            );
+        } else {
+            warnings.push(
+                "local audit history is persisted and hash-verified; it is unsigned and cannot prove quorum or prevent rollback"
+                    .to_string(),
+            );
+        }
+        if !durability.writable {
+            warnings.push(
+                "local audit journal is unavailable for new evidence; invocation admission must remain closed"
+                    .to_string(),
+            );
+        }
 
         if tip_entry.is_none() {
             warnings.push(format!(
@@ -937,9 +1082,635 @@ impl InvokeAuditChain {
                     .to_owned(),
             },
             append_metrics,
+            durability,
             warnings,
         }
     }
+}
+
+/// Redaction-safe persistence state for the local invoke audit journal.
+///
+/// These fields describe this host's journal, not replicated or signed evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvokeAuditDurabilityStatus {
+    /// `memory` or `local_journal`.
+    pub storage: String,
+    /// True only when this platform provides the required directory sync.
+    pub durable: bool,
+    /// Whether new evidence can currently be admitted.
+    pub writable: bool,
+    /// Entries verified and recovered when this instance opened its journal.
+    pub recovered_entries: u64,
+    /// Total full entries successfully persisted in this journal.
+    pub persisted_entries: u64,
+    /// Last successfully synchronized journal length, including its header.
+    /// A fenced partial write may have left additional unacknowledged bytes.
+    pub journal_bytes: u64,
+    /// Maximum journal bytes; no automatic evidence eviction occurs.
+    pub max_journal_bytes: u64,
+    /// Maximum serialized entry bytes accepted per frame.
+    pub max_record_bytes: u64,
+    /// Maximum retained entries, bounding recovery and resident memory.
+    pub max_entries: u64,
+    /// Stable reason code when writes have been fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl Default for InvokeAuditDurabilityStatus {
+    fn default() -> Self {
+        Self {
+            storage: "memory".to_string(),
+            durable: false,
+            writable: true,
+            recovered_entries: 0,
+            persisted_entries: 0,
+            journal_bytes: 0,
+            max_journal_bytes: INVOKE_AUDIT_MAX_JOURNAL_BYTES,
+            max_record_bytes: INVOKE_AUDIT_MAX_RECORD_BYTES as u64,
+            max_entries: INVOKE_AUDIT_MAX_ENTRIES,
+            unavailable_reason: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InvokeAuditJournal {
+    file: File,
+    bytes: u64,
+    entries: u64,
+    recovered_entries: u64,
+    unavailable_reason: Option<&'static str>,
+    #[cfg(test)]
+    fail_after_frame_prefix: bool,
+}
+
+impl InvokeAuditJournal {
+    fn open(path: &Path) -> Result<(Self, HashMap<String, ZoneChain>), AuditError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        #[cfg(unix)]
+        let new_directories = missing_audit_directories(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| journal_recovery_error("directory creation failed"))?;
+
+        let mut create_options = OpenOptions::new();
+        create_options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            create_options.mode(0o600);
+        }
+        let (mut file, created) = match create_options.open(path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|_| journal_recovery_error("open failed"))?,
+                false,
+            ),
+            Err(_) => return Err(journal_recovery_error("creation failed")),
+        };
+        if !file
+            .metadata()
+            .map_err(|_| journal_recovery_error("metadata read failed"))?
+            .is_file()
+        {
+            return Err(journal_recovery_error("must be a regular file"));
+        }
+        // Keep this handle alive: dropping it releases the OS lock. Read+append
+        // also meets Windows' requirement that locked files are not append-only.
+        file.try_lock()
+            .map_err(|_| journal_recovery_error("exclusive ownership unavailable"))?;
+        if created {
+            file.write_all(INVOKE_AUDIT_JOURNAL_MAGIC)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| journal_recovery_error("header persistence failed"))?;
+        }
+        let length = file
+            .metadata()
+            .map_err(|_| journal_recovery_error("length read failed"))?
+            .len();
+        if length > INVOKE_AUDIT_MAX_JOURNAL_BYTES {
+            return Err(journal_recovery_error("exceeds byte limit"));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| journal_recovery_error("seek failed"))?;
+        let (chains, entries, bytes) = recover_audit_journal(&file)?;
+        if bytes != length {
+            return Err(journal_recovery_error("length changed during recovery"));
+        }
+        // Resync a valid recovered prefix before using it. A prior process may
+        // have exited after a complete write whose fsync outcome was unknown.
+        file.sync_all()
+            .map_err(|_| journal_recovery_error("file synchronization failed"))?;
+        sync_audit_directory(parent)?;
+        #[cfg(unix)]
+        for directory in new_directories {
+            let ancestor = directory
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            sync_audit_directory(ancestor)?;
+        }
+        Ok((
+            Self {
+                file,
+                bytes,
+                entries,
+                recovered_entries: entries,
+                unavailable_reason: (entries == INVOKE_AUDIT_MAX_ENTRIES
+                    || bytes == INVOKE_AUDIT_MAX_JOURNAL_BYTES)
+                    .then_some("journal_capacity_exhausted"),
+                #[cfg(test)]
+                fail_after_frame_prefix: false,
+            },
+            chains,
+        ))
+    }
+
+    fn append(&mut self, entry: &AuditEntry) -> Result<(), AuditError> {
+        if self.unavailable_reason.is_some() {
+            return Err(AuditError::ChainUnavailable(entry.zone_id.clone()));
+        }
+        validate_durable_entry(entry)?;
+        let payload = serde_json::to_vec(entry)
+            .map_err(|_| AuditError::SerializationError("invoke audit entry".to_string()))?;
+        if payload.len() > INVOKE_AUDIT_MAX_RECORD_BYTES {
+            return Err(AuditError::InvalidEntry(
+                "invoke audit entry exceeds the record byte limit".to_string(),
+            ));
+        }
+        let payload_length = u32::try_from(payload.len()).map_err(|_| {
+            AuditError::InvalidEntry("invoke audit frame length is not representable".to_string())
+        })?;
+        let next_bytes = self.bytes.checked_add(4 + u64::from(payload_length));
+        let next_entries = self.entries.checked_add(1);
+        let (Some(next_bytes), Some(next_entries)) = (next_bytes, next_entries) else {
+            return self.fence(entry, "journal_capacity_exhausted");
+        };
+        if next_bytes > INVOKE_AUDIT_MAX_JOURNAL_BYTES || next_entries > INVOKE_AUDIT_MAX_ENTRIES {
+            return self.fence(entry, "journal_capacity_exhausted");
+        }
+        match self.file.metadata() {
+            Ok(metadata) if metadata.len() == self.bytes => {}
+            _ => return self.fence(entry, "journal_length_changed"),
+        }
+
+        let written = (|| -> std::io::Result<()> {
+            self.file.write_all(&payload_length.to_le_bytes())?;
+            #[cfg(test)]
+            if self.fail_after_frame_prefix {
+                return Err(std::io::Error::other("injected audit frame failure"));
+            }
+            self.file.write_all(&payload)?;
+            self.file.sync_all()
+        })();
+        if let Err(error) = written {
+            warn!(
+                event = "invoke_audit_journal_unavailable",
+                reason_code = "journal_write_or_sync_failed",
+                io_kind = ?error.kind(),
+                "audit persistence failed; all further journal writes are fenced"
+            );
+            return self.fence(entry, "journal_write_or_sync_failed");
+        }
+        self.bytes = next_bytes;
+        self.entries = next_entries;
+        if next_entries == INVOKE_AUDIT_MAX_ENTRIES || next_bytes == INVOKE_AUDIT_MAX_JOURNAL_BYTES
+        {
+            self.unavailable_reason = Some("journal_capacity_exhausted");
+        }
+        Ok(())
+    }
+
+    fn fence(&mut self, entry: &AuditEntry, reason: &'static str) -> Result<(), AuditError> {
+        self.unavailable_reason = Some(reason);
+        Err(AuditError::ChainUnavailable(entry.zone_id.clone()))
+    }
+
+    fn status(&self) -> InvokeAuditDurabilityStatus {
+        InvokeAuditDurabilityStatus {
+            storage: "local_journal".to_string(),
+            durable: cfg!(unix),
+            writable: self.unavailable_reason.is_none(),
+            recovered_entries: self.recovered_entries,
+            persisted_entries: self.entries,
+            journal_bytes: self.bytes,
+            unavailable_reason: self.unavailable_reason.map(str::to_owned),
+            ..InvokeAuditDurabilityStatus::default()
+        }
+    }
+}
+
+fn recover_audit_journal(
+    file: &File,
+) -> Result<(HashMap<String, ZoneChain>, u64, u64), AuditError> {
+    let mut reader = BufReader::new(file);
+    let mut magic = [0; INVOKE_AUDIT_JOURNAL_MAGIC.len()];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|_| journal_recovery_error("missing or incomplete format header"))?;
+    if &magic != INVOKE_AUDIT_JOURNAL_MAGIC {
+        return Err(journal_recovery_error("unsupported format header"));
+    }
+    let mut chains: HashMap<String, ZoneChain> = HashMap::new();
+    let mut entries = 0_u64;
+    let mut bytes = INVOKE_AUDIT_JOURNAL_MAGIC.len() as u64;
+    loop {
+        let mut prefix = [0; 4];
+        match reader.read_exact(&mut prefix[..1]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(_) => return Err(journal_recovery_error("frame prefix read failed")),
+        }
+        reader
+            .read_exact(&mut prefix[1..])
+            .map_err(|_| journal_recovery_error("incomplete frame prefix"))?;
+        let length = u32::from_le_bytes(prefix);
+        if length == 0 || u64::from(length) > INVOKE_AUDIT_MAX_RECORD_BYTES as u64 {
+            return Err(journal_recovery_error("invalid or oversized frame"));
+        }
+        bytes = bytes
+            .checked_add(4 + u64::from(length))
+            .filter(|value| *value <= INVOKE_AUDIT_MAX_JOURNAL_BYTES)
+            .ok_or_else(|| journal_recovery_error("exceeds byte limit"))?;
+        entries = entries
+            .checked_add(1)
+            .filter(|value| *value <= INVOKE_AUDIT_MAX_ENTRIES)
+            .ok_or_else(|| journal_recovery_error("exceeds entry limit"))?;
+        let length = usize::try_from(length)
+            .map_err(|_| journal_recovery_error("frame length is not representable"))?;
+        let mut payload = vec![0; length];
+        reader
+            .read_exact(&mut payload)
+            .map_err(|_| journal_recovery_error("incomplete frame payload"))?;
+        let entry: AuditEntry = serde_json::from_slice(&payload)
+            .map_err(|_| journal_recovery_error("invalid entry encoding"))?;
+        validate_durable_entry(&entry)?;
+        if entry.id != entry.computed_id()? {
+            return Err(journal_recovery_error("entry identity mismatch"));
+        }
+        let zone = chains.entry(entry.zone_id.clone()).or_default();
+        if entry.seq != next_audit_sequence(zone.last_seq)?
+            || entry.prev != zone.last_id
+            || zone
+                .last_occurred_at
+                .is_some_and(|previous| entry.occurred_at < previous)
+            || zone
+                .last_hlc
+                .as_ref()
+                .is_some_and(|previous| entry.hlc <= *previous)
+        {
+            return Err(journal_recovery_error("entry lineage or clock mismatch"));
+        }
+        zone.last_seq = Some(entry.seq);
+        zone.last_id = Some(entry.id.clone());
+        zone.last_occurred_at = Some(entry.occurred_at);
+        zone.last_hlc = Some(entry.hlc.clone());
+        if entry
+            .metadata
+            .get("clock_anomaly")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            zone.metrics.clock_anomalies = zone.metrics.clock_anomalies.saturating_add(1);
+        }
+        zone.entries.push(entry);
+        zone.metrics.entries = zone.entries.len();
+    }
+    for (zone_id, zone) in &chains {
+        let report = fcp_audit::verify_chain(&zone.entries, None, Some(zone_id));
+        if !report.is_clean() || !report.status.is_ok() {
+            return Err(journal_recovery_error("chain verification failed"));
+        }
+    }
+    Ok((chains, entries, bytes))
+}
+
+fn journal_recovery_error(reason: &str) -> AuditError {
+    AuditError::VerificationFailed(format!("local invoke audit journal: {reason}"))
+}
+
+#[cfg(unix)]
+fn missing_audit_directories(parent: &Path) -> Result<Vec<std::path::PathBuf>, AuditError> {
+    let mut missing = Vec::new();
+    let mut current = parent;
+    while !current
+        .try_exists()
+        .map_err(|_| journal_recovery_error("directory inspection failed"))?
+    {
+        missing.push(current.to_path_buf());
+        current = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+    }
+    Ok(missing)
+}
+
+#[cfg(unix)]
+fn sync_audit_directory(path: &Path) -> Result<(), AuditError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| journal_recovery_error("directory synchronization failed"))
+}
+
+#[cfg(not(unix))]
+fn sync_audit_directory(_path: &Path) -> Result<(), AuditError> {
+    Ok(())
+}
+
+fn validate_durable_identity(value: &str, allow_empty: bool) -> Result<(), AuditError> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.len() > INVOKE_AUDIT_MAX_IDENTITY_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(AuditError::InvalidEntry(
+            "invoke audit identity is empty, oversized, or contains control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_durable_context(ctx: &InvokeAuditContext) -> Result<(), AuditError> {
+    for identity in [
+        ctx.zone_id.as_str(),
+        ctx.actor.as_str(),
+        ctx.connector_id.as_str(),
+        ctx.operation.as_str(),
+        ctx.operation_id.as_str(),
+    ] {
+        validate_durable_identity(identity, false)?;
+    }
+    if let Some(correlation_id) = &ctx.correlation_id {
+        validate_durable_identity(correlation_id, true)?;
+    }
+    Ok(())
+}
+
+fn safe_deny_category(reason: &str) -> &str {
+    match reason {
+        "preflight_denied"
+        | "preflight_unavailable"
+        | "capability_denied"
+        | "revocation_denied"
+        | "approval_denied"
+        | "placement_denied" => reason,
+        _ => "preflight_denied",
+    }
+}
+
+fn safe_dispatch_category(error: &str) -> &str {
+    match error {
+        "dispatch_unavailable"
+        | "dispatch_cancelled"
+        | "dispatch_failed"
+        | "deadline_exceeded"
+        | "admission_rejected"
+        | "capacity_rejected"
+        | "outcome_unknown"
+        | "audit_unavailable" => error,
+        _ => "dispatch_failed",
+    }
+}
+
+fn safe_mesh_decision(decision: &str) -> &str {
+    match decision {
+        "hrw_holder_forward" | "advertised_peer_forward" | "mesh_forwarded" => decision,
+        _ => "mesh_forwarded",
+    }
+}
+
+fn durable_phase(phase: InvokePhase) -> Result<InvokePhase, AuditError> {
+    Ok(match phase {
+        InvokePhase::PreflightDeny { reason } => InvokePhase::PreflightDeny {
+            reason: safe_deny_category(&reason).to_string(),
+        },
+        InvokePhase::DispatchError { error, duration_ms } => InvokePhase::DispatchError {
+            error: safe_dispatch_category(&error).to_string(),
+            duration_ms,
+        },
+        InvokePhase::DispatchResult {
+            receipt_id,
+            success,
+            duration_ms,
+        } => {
+            if let Some(receipt_id) = &receipt_id {
+                validate_durable_identity(receipt_id, false)?;
+            }
+            InvokePhase::DispatchResult {
+                receipt_id,
+                success,
+                duration_ms,
+            }
+        }
+        InvokePhase::MeshForwardAttempt {
+            target_node,
+            decision,
+        } => {
+            validate_durable_identity(&target_node, false)?;
+            InvokePhase::MeshForwardAttempt {
+                target_node,
+                decision: safe_mesh_decision(&decision).to_string(),
+            }
+        }
+        InvokePhase::MeshForwarded {
+            target_node,
+            decision,
+            executor_status,
+            failed_attempts,
+            duration_ms,
+        } => {
+            validate_durable_identity(&target_node, false)?;
+            if failed_attempts.len() > INVOKE_AUDIT_MAX_RELAY_FAILURES
+                || executor_status.is_some_and(|status| !(100..=599).contains(&status))
+            {
+                return Err(AuditError::InvalidEntry(
+                    "invoke audit relay metadata is outside its bounds".to_string(),
+                ));
+            }
+            InvokePhase::MeshForwarded {
+                target_node,
+                decision: safe_mesh_decision(&decision).to_string(),
+                executor_status,
+                failed_attempts: vec!["peer_delivery_failed".to_string(); failed_attempts.len()],
+                duration_ms,
+            }
+        }
+        InvokePhase::PreflightAllow => InvokePhase::PreflightAllow,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // One projection boundary validates every persisted field.
+fn validate_durable_entry(entry: &AuditEntry) -> Result<(), AuditError> {
+    let invalid =
+        || AuditError::InvalidEntry("invalid durable invoke audit projection".to_string());
+    for identity in [&entry.id, &entry.actor, &entry.zone_id, &entry.hlc.node_id] {
+        validate_durable_identity(identity, false)?;
+    }
+    validate_durable_identity(&entry.correlation_id, true)?;
+    validate_durable_identity(entry.connector_id.as_deref().ok_or_else(invalid)?, false)?;
+    validate_durable_identity(entry.operation_id.as_deref().ok_or_else(invalid)?, false)?;
+    if entry.hlc.node_id != entry.actor
+        || entry.issuer_kid.is_some()
+        || entry.signature.is_some()
+        || entry.trace_context.is_some()
+    {
+        return Err(invalid());
+    }
+    let operation = entry
+        .metadata
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    validate_durable_identity(operation, false)?;
+    let phase_keys: &[&str] = match entry.event_type.as_str() {
+        event_types::INVOKE_ALLOW => &[],
+        event_types::INVOKE_DENY => {
+            let reason = entry
+                .metadata
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            if safe_deny_category(reason) != reason {
+                return Err(invalid());
+            }
+            &["reason"]
+        }
+        event_types::INVOKE_ERROR => {
+            let error = entry
+                .metadata
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            if safe_dispatch_category(error) != error
+                || entry
+                    .metadata
+                    .get("duration_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+            {
+                return Err(invalid());
+            }
+            &["error", "duration_ms"]
+        }
+        event_types::INVOKE_RESULT => {
+            if entry
+                .metadata
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+                || entry
+                    .metadata
+                    .get("duration_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+            {
+                return Err(invalid());
+            }
+            if let Some(receipt_id) = entry.metadata.get("receipt_id") {
+                validate_durable_identity(receipt_id.as_str().ok_or_else(invalid)?, false)?;
+            }
+            &["receipt_id", "success", "duration_ms"]
+        }
+        event_types::INVOKE_MESH_FORWARD_ATTEMPT => {
+            validate_durable_identity(
+                entry
+                    .metadata
+                    .get("target_node")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(invalid)?,
+                false,
+            )?;
+            let decision = entry
+                .metadata
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            if safe_mesh_decision(decision) != decision {
+                return Err(invalid());
+            }
+            &["target_node", "decision"]
+        }
+        event_types::INVOKE_MESH_FORWARDED => {
+            validate_durable_identity(
+                entry
+                    .metadata
+                    .get("target_node")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(invalid)?,
+                false,
+            )?;
+            let decision = entry
+                .metadata
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let failures = entry
+                .metadata
+                .get("failed_attempts")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(invalid)?;
+            let status = entry.metadata.get("executor_status").ok_or_else(invalid)?;
+            if safe_mesh_decision(decision) != decision
+                || failures.len() > INVOKE_AUDIT_MAX_RELAY_FAILURES
+                || failures
+                    .iter()
+                    .any(|failure| failure.as_str() != Some("peer_delivery_failed"))
+                || (!status.is_null()
+                    && !status
+                        .as_u64()
+                        .is_some_and(|value| (100..=599).contains(&value)))
+                || entry
+                    .metadata
+                    .get("duration_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+            {
+                return Err(invalid());
+            }
+            &[
+                "target_node",
+                "decision",
+                "executor_status",
+                "failed_attempts",
+                "duration_ms",
+            ]
+        }
+        _ => return Err(invalid()),
+    };
+    for (key, value) in &entry.metadata {
+        if key == "operation" || phase_keys.contains(&key.as_str()) {
+            continue;
+        }
+        let allowed = match key.as_str() {
+            "alert" => value.as_str() == Some("clock_anomaly"),
+            "clock_anomaly" => value.as_bool() == Some(true),
+            "clock_anomaly_kind" => value.as_str() == Some("wall_clock_regressed"),
+            "clock_anomaly_requested_occurred_at"
+            | "clock_anomaly_previous_occurred_at"
+            | "clock_anomaly_clamped_occurred_at"
+            | "clock_anomaly_skew_secs" => value.as_u64().is_some(),
+            _ => false,
+        };
+        if !allowed {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn next_audit_sequence(previous: Option<u64>) -> Result<u64, AuditError> {
+    previous.map_or(Ok(0), |sequence| {
+        sequence
+            .checked_add(1)
+            .ok_or(AuditError::SeqOverflow(sequence))
+    })
 }
 
 fn monotonic_occurred_at(requested: u64, previous: Option<u64>) -> u64 {
@@ -950,15 +1721,21 @@ fn next_audit_hlc(
     node_id: &str,
     occurred_at: u64,
     previous: Option<&HybridLogicalTimestamp>,
-) -> HybridLogicalTimestamp {
+) -> Result<HybridLogicalTimestamp, AuditError> {
     let physical_ms = audit_entry_hlc_from_occurred_at(occurred_at, node_id).physical_ms;
-    previous.map_or_else(
+    let timestamp = previous.map_or_else(
         || HybridLogicalTimestamp::from_physical(physical_ms, node_id),
         |previous| {
             let mut clock = HybridLogicalClock::new(node_id);
             clock.merge(previous, physical_ms)
         },
-    )
+    );
+    if previous.is_some_and(|previous| timestamp <= *previous) {
+        return Err(AuditError::InvalidEntry(
+            "invoke audit hybrid logical clock cannot advance".to_string(),
+        ));
+    }
+    Ok(timestamp)
 }
 
 fn emit_clock_anomaly(entry: &AuditEntry, anomaly: ClockAnomaly) {
@@ -989,6 +1766,364 @@ mod tests {
             correlation_id: Some("cid-42".into()),
             occurred_at: 1_700_000_000,
         }
+    }
+
+    fn write_journal_entries(path: &Path, entries: &[AuditEntry]) {
+        let mut file = File::create(path).unwrap();
+        file.write_all(INVOKE_AUDIT_JOURNAL_MAGIC).unwrap();
+        for entry in entries {
+            let payload = serde_json::to_vec(entry).unwrap();
+            file.write_all(&u32::try_from(payload.len()).unwrap().to_le_bytes())
+                .unwrap();
+            file.write_all(&payload).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn durable_audit_recovers_full_entries_and_continues_zone_clocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("new")
+            .join("nested")
+            .join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let first = chain
+            .append(&ctx("z:work", "request-1"), InvokePhase::PreflightAllow)
+            .unwrap();
+        let result = chain
+            .append(
+                &ctx("z:work", "request-1"),
+                InvokePhase::DispatchResult {
+                    receipt_id: Some("receipt-1".to_string()),
+                    success: true,
+                    duration_ms: 27,
+                },
+            )
+            .unwrap();
+        let other = chain
+            .append(&ctx("z:home", "request-2"), InvokePhase::PreflightAllow)
+            .unwrap();
+        assert_eq!(chain.durability_status().persisted_entries, 3);
+        drop(chain);
+
+        let recovered = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let work = recovered.entries_for_zone("z:work");
+        assert_eq!(
+            serde_json::to_value(&work).unwrap(),
+            serde_json::to_value([&first, &result]).unwrap()
+        );
+        assert_eq!(recovered.entries_for_zone("z:home")[0].id, other.id);
+        let mut earlier = ctx("z:work", "request-3");
+        earlier.occurred_at -= 20;
+        let next = recovered
+            .append(&earlier, InvokePhase::PreflightAllow)
+            .unwrap();
+        assert!(next.follows(&result));
+        assert!(next.hlc > result.hlc);
+        assert_eq!(next.occurred_at, result.occurred_at);
+        let status = recovered.status_for_zone("z:work", first.occurred_at, 60);
+        assert_eq!(status.durability.storage, "local_journal");
+        assert_eq!(status.durability.durable, cfg!(unix));
+        assert_eq!(status.durability.recovered_entries, 3);
+        assert_eq!(status.durability.persisted_entries, 4);
+        assert!(status.durability.writable);
+        assert_eq!(status.quorum_signers, 0);
+        assert_eq!(status.quorum_signed_checkpoints, 0);
+        assert!(
+            fcp_audit::verify_chain(&recovered.entries_for_zone("z:work"), None, Some("z:work"))
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn durable_audit_requires_exclusive_journal_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let owner = InvokeAuditChain::open_with_journal(&path).unwrap();
+        owner
+            .append(&ctx("z:work", "request"), InvokePhase::PreflightAllow)
+            .unwrap();
+        assert!(InvokeAuditChain::open_with_journal(&path).is_err());
+        drop(owner);
+        let successor = InvokeAuditChain::open_with_journal(&path).unwrap();
+        assert_eq!(successor.len_for_zone("z:work"), 1);
+    }
+
+    #[test]
+    fn partial_audit_write_fences_all_zones_without_publishing_a_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let committed = chain
+            .append(&ctx("z:work", "committed"), InvokePhase::PreflightAllow)
+            .unwrap();
+        let acknowledged_bytes = chain.durability_status().journal_bytes;
+        chain
+            .journal
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fail_after_frame_prefix = true;
+
+        assert!(
+            chain
+                .append(&ctx("z:work", "interrupted"), InvokePhase::PreflightAllow)
+                .is_err()
+        );
+        assert!(
+            chain
+                .append(&ctx("z:home", "other-zone"), InvokePhase::PreflightAllow)
+                .is_err()
+        );
+        assert_eq!(
+            chain.entries_for_zone("z:work").last().unwrap().id,
+            committed.id
+        );
+        assert_eq!(chain.len_for_zone("z:home"), 0);
+        let status = chain.durability_status();
+        assert!(!status.writable);
+        assert_eq!(status.persisted_entries, 1);
+        assert_eq!(status.journal_bytes, acknowledged_bytes);
+        assert_eq!(
+            status.unavailable_reason.as_deref(),
+            Some("journal_write_or_sync_failed")
+        );
+        drop(chain);
+
+        let damaged = std::fs::read(&path).unwrap();
+        assert_eq!(damaged.len() as u64, acknowledged_bytes + 4);
+        assert!(InvokeAuditChain::open_with_journal(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "recovery must preserve the damaged evidence"
+        );
+    }
+
+    #[test]
+    fn durable_audit_rejects_changed_payload_without_rewriting_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        chain
+            .append(&ctx("z:work", "request"), InvokePhase::PreflightAllow)
+            .unwrap();
+        drop(chain);
+        let mut damaged = std::fs::read(&path).unwrap();
+        let offset = damaged
+            .windows(b"list_repos".len())
+            .position(|window| window == b"list_repos")
+            .unwrap();
+        damaged[offset..offset + b"list_users".len()].copy_from_slice(b"list_users");
+        std::fs::write(&path, &damaged).unwrap();
+
+        let error = InvokeAuditChain::open_with_journal(&path).unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"));
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn durable_audit_rejects_rehashed_forks_sequence_gaps_and_clock_regression() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = InvokeAuditChain::new();
+        let first = memory
+            .append(&ctx("z:work", "first"), InvokePhase::PreflightAllow)
+            .unwrap();
+        let second = memory
+            .append(&ctx("z:work", "second"), InvokePhase::PreflightAllow)
+            .unwrap();
+        for case in ["previous", "sequence", "hlc", "wall_clock"] {
+            let mut changed = second.clone();
+            match case {
+                "previous" => changed.prev = Some("another-chain".to_string()),
+                "sequence" => changed.seq += 1,
+                "hlc" => changed.hlc = first.hlc.clone(),
+                "wall_clock" => changed.occurred_at = first.occurred_at - 1,
+                _ => unreachable!(),
+            }
+            changed.id = changed.computed_id().unwrap();
+            let path = directory.path().join(format!("{case}.journal"));
+            write_journal_entries(&path, &[first.clone(), changed]);
+            let original = std::fs::read(&path).unwrap();
+            let error = InvokeAuditChain::open_with_journal(&path).unwrap_err();
+            assert!(
+                error.to_string().contains("lineage or clock mismatch"),
+                "{case}: {error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn durable_audit_projects_provider_details_before_hashing_and_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let secret = "provider-token-must-never-be-persisted";
+        let phases = [
+            InvokePhase::PreflightDeny {
+                reason: format!("Authorization: Bearer {secret}"),
+            },
+            InvokePhase::DispatchError {
+                error: format!("HTTP body contains {secret}"),
+                duration_ms: 1,
+            },
+            InvokePhase::MeshForwardAttempt {
+                target_node: "node-a".to_string(),
+                decision: secret.to_string(),
+            },
+            InvokePhase::MeshForwarded {
+                target_node: "node-b".to_string(),
+                decision: "advertised_peer_forward".to_string(),
+                executor_status: Some(503),
+                failed_attempts: vec![format!("https://upstream.invalid?token={secret}")],
+                duration_ms: 2,
+            },
+            InvokePhase::DispatchError {
+                error: "outcome_unknown".to_string(),
+                duration_ms: 3,
+            },
+        ];
+        for phase in phases {
+            let entry = chain.append(&ctx("z:work", "redacted"), phase).unwrap();
+            assert_eq!(entry.id, entry.computed_id().unwrap());
+        }
+        let entries = chain.entries_for_zone("z:work");
+        assert_eq!(entries[0].metadata["reason"], json!("preflight_denied"));
+        assert_eq!(entries[1].metadata["error"], json!("dispatch_failed"));
+        assert_eq!(
+            entries[2].event_type,
+            event_types::INVOKE_MESH_FORWARD_ATTEMPT
+        );
+        assert_eq!(entries[2].metadata["decision"], json!("mesh_forwarded"));
+        assert_eq!(
+            entries[3].metadata["failed_attempts"],
+            json!(["peer_delivery_failed"])
+        );
+        assert_eq!(entries[4].metadata["error"], json!("outcome_unknown"));
+        drop(chain);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        let recovered = InvokeAuditChain::open_with_journal(&path).unwrap();
+        assert_eq!(recovered.len_for_zone("z:work"), 5);
+    }
+
+    #[test]
+    fn durable_audit_rejects_unbounded_identities_without_fencing_valid_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let mut request = ctx("z:work", "oversized");
+        request.operation_id = "x".repeat(INVOKE_AUDIT_MAX_IDENTITY_BYTES + 1);
+        assert!(chain.append(&request, InvokePhase::PreflightAllow).is_err());
+        request.operation_id = "line\nbreak".to_string();
+        assert!(chain.append(&request, InvokePhase::PreflightAllow).is_err());
+        assert_eq!(chain.len_for_zone("z:work"), 0);
+        assert_eq!(chain.durability_status().persisted_entries, 0);
+        assert!(chain.durability_status().writable);
+        assert!(
+            chain
+                .append(&ctx("z:work", "valid"), InvokePhase::PreflightAllow)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn durable_audit_refuses_oversized_frames_and_incomplete_existing_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty_path = directory.path().join("empty.journal");
+        std::fs::write(&empty_path, []).unwrap();
+        assert!(InvokeAuditChain::open_with_journal(&empty_path).is_err());
+        assert_eq!(std::fs::metadata(&empty_path).unwrap().len(), 0);
+
+        let oversized_path = directory.path().join("oversized.journal");
+        let mut bytes = INVOKE_AUDIT_JOURNAL_MAGIC.to_vec();
+        bytes.extend_from_slice(
+            &u32::try_from(INVOKE_AUDIT_MAX_RECORD_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        std::fs::write(&oversized_path, &bytes).unwrap();
+        assert!(InvokeAuditChain::open_with_journal(&oversized_path).is_err());
+        assert_eq!(std::fs::read(&oversized_path).unwrap(), bytes);
+
+        let truncated_path = directory.path().join("truncated.journal");
+        let mut partial = INVOKE_AUDIT_JOURNAL_MAGIC.to_vec();
+        partial.extend_from_slice(&[1, 2]);
+        std::fs::write(&truncated_path, &partial).unwrap();
+        assert!(InvokeAuditChain::open_with_journal(&truncated_path).is_err());
+        assert_eq!(std::fs::read(&truncated_path).unwrap(), partial);
+    }
+
+    #[test]
+    fn durable_audit_capacity_exhaustion_never_evicts_existing_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.journal");
+        let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
+        let first = chain
+            .append(&ctx("z:work", "retained"), InvokePhase::PreflightAllow)
+            .unwrap();
+        {
+            let mut journal = chain.journal.as_ref().unwrap().lock().unwrap();
+            journal.entries = INVOKE_AUDIT_MAX_ENTRIES;
+        }
+        assert!(
+            chain
+                .append(&ctx("z:work", "over-capacity"), InvokePhase::PreflightAllow)
+                .is_err()
+        );
+        assert_eq!(chain.entries_for_zone("z:work")[0].id, first.id);
+        assert_eq!(chain.len_for_zone("z:work"), 1);
+        assert!(!chain.durability_status().writable);
+        assert_eq!(
+            chain.durability_status().unavailable_reason.as_deref(),
+            Some("journal_capacity_exhausted")
+        );
+        drop(chain);
+        let recovered = InvokeAuditChain::open_with_journal(&path).unwrap();
+        assert_eq!(recovered.len_for_zone("z:work"), 1);
+    }
+
+    #[test]
+    fn durable_audit_recovery_rejects_raw_metadata_even_with_a_recomputed_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe-projection.journal");
+        let memory = InvokeAuditChain::new();
+        let mut entry = memory
+            .append(&ctx("z:work", "request"), InvokePhase::PreflightAllow)
+            .unwrap();
+        entry.metadata.insert(
+            "provider_body".to_string(),
+            json!({"token":"must-not-be-loaded"}),
+        );
+        entry.id = entry.computed_id().unwrap();
+        write_journal_entries(&path, &[entry]);
+        assert!(InvokeAuditChain::open_with_journal(&path).is_err());
+    }
+
+    #[test]
+    fn invoke_audit_sequence_exhaustion_refuses_both_commit_paths() {
+        let chain = InvokeAuditChain::new();
+        let zone = chain.zone_handle("z:work");
+        zone.lock().unwrap().last_seq = Some(u64::MAX);
+        let context = ctx("z:work", "request");
+        assert!(matches!(
+            chain.append(&context, InvokePhase::PreflightAllow),
+            Err(AuditError::SeqOverflow(u64::MAX))
+        ));
+        let template = InvokeAuditEntryTemplate::new(&context, InvokePhase::PreflightAllow);
+        assert!(matches!(
+            chain.append_serialized(&zone, &template, context.occurred_at),
+            Err(AuditError::SeqOverflow(u64::MAX))
+        ));
+        assert_eq!(chain.len_for_zone("z:work"), 0);
     }
 
     #[test]

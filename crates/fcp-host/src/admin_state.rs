@@ -3200,8 +3200,22 @@ impl HostAdminStateStore {
     /// Returns an error if the configured path is invalid or the persisted
     /// snapshot cannot be loaded.
     pub fn from_env() -> HostResult<Self> {
-        let state_path = resolve_admin_state_path()?;
+        let state_path = Self::persistence_path_from_env()?;
         Self::with_state_path_opt(state_path)
+    }
+
+    /// Resolve persistence configuration without loading or recovering state.
+    ///
+    /// Hosts can acquire their durable audit writer before recovery mutates an
+    /// interrupted admission. Pass the returned path to `with_state_path_opt`
+    /// so initialization uses exactly the configuration whose ownership was
+    /// acquired. An explicitly empty environment value selects memory storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured path is not valid Unicode.
+    pub fn persistence_path_from_env() -> HostResult<Option<PathBuf>> {
+        resolve_admin_state_path()
     }
 
     /// Create a store persisted at a specific path.

@@ -7957,6 +7957,50 @@ fn init_host_telemetry() -> HostResult<TelemetryConfig> {
     Ok(config)
 }
 
+/// Use the lifecycle store's exact persistence selection for invoke evidence.
+/// An explicitly memory-backed host remains memory-backed. Each configured
+/// lifecycle filename gets its own adjacent journal, without suffix collisions.
+fn open_host_invoke_audit(
+    lifecycle_path: Option<&StdPath>,
+) -> HostResult<fcp_host::InvokeAuditChain> {
+    let Some(lifecycle_path) = lifecycle_path else {
+        return Ok(fcp_host::InvokeAuditChain::new());
+    };
+    let mut filename = lifecycle_path
+        .file_name()
+        .ok_or_else(|| {
+            HostError::InvalidFilter(
+                "lifecycle persistence path must name a file".to_string(),
+            )
+        })?
+        .to_os_string();
+    filename.push(".invoke-audit.journal");
+    fcp_host::InvokeAuditChain::open_with_journal(lifecycle_path.with_file_name(filename))
+        .map_err(|error| invoke_audit_unavailable("startup", error))
+}
+
+/// Acquire evidence ownership before recovery can change an interrupted
+/// admission. Keep the returned journal alive for the lifecycle store's host.
+fn open_host_invocation_stores(
+    lifecycle_path: Option<PathBuf>,
+) -> HostResult<(HostAdminStateStore, fcp_host::InvokeAuditChain)> {
+    let audit = open_host_invoke_audit(lifecycle_path.as_deref())?;
+    let lifecycle = HostAdminStateStore::with_state_path_opt(lifecycle_path)?;
+    Ok((lifecycle, audit))
+}
+
+fn invoke_audit_unavailable(phase: &'static str, error: fcp_audit::AuditError) -> HostError {
+    tracing::error!(
+        event = "invoke_audit_append_error",
+        phase,
+        %error,
+        "invoke evidence could not be persisted"
+    );
+    HostError::Unavailable(format!(
+        "invoke audit could not be persisted during {phase}; inspect the invocation record before retrying"
+    ))
+}
+
 async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let bind_target = resolve_bind_target()?;
     let capability_verifying_key = resolve_verifying_key(
@@ -7984,6 +8028,12 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     emit_operational_model_selection_log(&truth_precedence_boot.selection);
     let zone_policies = load_zone_policies()?;
 
+    // Acquire journal ownership before spawning runtimes or recovering pending
+    // lifecycle admissions. A second host must fail before touching live work.
+    let (lifecycle, invoke_audit) =
+        open_host_invocation_stores(HostAdminStateStore::persistence_path_from_env()?)?;
+    let lifecycle = Arc::new(lifecycle);
+    let invoke_audit = Arc::new(invoke_audit);
     let registry = Arc::new(
         SubprocessRegistry::from_configs(
             loaded_configs.configs,
@@ -8002,7 +8052,6 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         Arc::clone(&registry),
         Arc::clone(&budget),
     ));
-    let lifecycle = Arc::new(HostAdminStateStore::from_env()?);
     let startup_inventory = registry.list().await;
     let startup_reconciliation = lifecycle
         .reconcile_registered_connectors(&startup_inventory)
@@ -8045,7 +8094,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         connectors_file: loaded_configs.connectors_file,
         zone_policies: Arc::new(RwLock::new(zone_policies)),
         telemetry_config,
-        invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
+        invoke_audit,
         invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
         started_at: Instant::now(),
         mesh: mesh_router,
@@ -14186,7 +14235,8 @@ async fn route_invoke(
                 &request,
                 asserted_principal.as_deref(),
                 &reason,
-            );
+            )
+            .map_err(map_host_error)?;
             return Err(map_host_error(HostError::PreflightFailed(reason)));
         }
     };
@@ -14377,21 +14427,18 @@ fn append_mesh_preflight_denial(
     request: &InvokeRequest,
     asserted_principal: Option<&str>,
     reason: &str,
-) {
+) -> HostResult<()> {
     let audit_ctx = mesh_forward_audit_context(request, asserted_principal);
-    if let Err(error) = state.invoke_audit.append(
-        &audit_ctx,
-        fcp_host::InvokePhase::PreflightDeny {
-            reason: reason.to_string(),
-        },
-    ) {
-        tracing::warn!(
-            event = "invoke_audit_append_error",
-            phase = "deny",
-            error = %error,
-            "failed to append invoke deny audit event"
-        );
-    }
+    state
+        .invoke_audit
+        .append(
+            &audit_ctx,
+            fcp_host::InvokePhase::PreflightDeny {
+                reason: reason.to_string(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| invoke_audit_unavailable("mesh preflight denial", error))
 }
 
 /// Relay an invoke to the mesh peer chosen by `decision` and return the
@@ -14418,6 +14465,7 @@ async fn mesh_forward_invoke(
             "mesh_forward_invoke called without a forward decision".to_string(),
         )));
     };
+    let mut audit_ctx = mesh_forward_audit_context(request, asserted_principal);
     let registered_locally = state
         .registry
         .allow_list_snapshot(&request.connector_id)
@@ -14435,20 +14483,33 @@ async fn mesh_forward_invoke(
             let reason = preflight
                 .reason
                 .unwrap_or_else(|| "preflight denied invoke request".to_string());
-            append_mesh_preflight_denial(state, request, asserted_principal, &reason);
+            append_mesh_preflight_denial(state, request, asserted_principal, &reason)
+                .map_err(map_host_error)?;
             return Err(map_host_error(HostError::PreflightFailed(reason)));
         }
-        if let Err(error) = state.invoke_audit.append(
-            &mesh_forward_audit_context(request, asserted_principal),
-            fcp_host::InvokePhase::PreflightAllow,
-        ) {
-            tracing::warn!(
-                event = "invoke_audit_append_error",
-                phase = "allow",
-                error = %error,
-                "failed to append invoke allow audit event"
-            );
-        }
+        let claims = request
+            .capability_token
+            .raw()
+            .claims_unverified()
+            .map_err(|_| {
+                map_host_error(HostError::Internal(
+                    "verified mesh invoke lost readable capability claims".to_string(),
+                ))
+            })?;
+        audit_ctx.actor = claims_principal(&claims)
+            .filter(|principal| !principal.trim().is_empty())
+            .ok_or_else(|| {
+                map_host_error(HostError::Internal(
+                    "verified mesh invoke lost its principal".to_string(),
+                ))
+            })?
+            .to_string();
+        state
+            .invoke_audit
+            .append(&audit_ctx, fcp_host::InvokePhase::PreflightAllow)
+            .map_err(|error| {
+                map_host_error(invoke_audit_unavailable("mesh preflight allow", error))
+            })?;
     }
     let started_at = Instant::now();
     let request_json = serde_json::to_string(request).map_err(|error| {
@@ -14456,27 +14517,24 @@ async fn mesh_forward_invoke(
             "invoke request could not be encoded for mesh forwarding: {error}"
         )))
     })?;
-    let audit_ctx = mesh_forward_audit_context(request, asserted_principal);
     let append_audit = |target_node: &TailscaleNodeId,
                         executor_status: Option<u16>,
-                        failed_attempts: &[String]| {
-        if let Err(error) = state.invoke_audit.append(
-            &audit_ctx,
-            fcp_host::InvokePhase::MeshForwarded {
-                target_node: target_node.as_str().to_string(),
-                decision: code.to_string(),
-                executor_status,
-                failed_attempts: failed_attempts.to_vec(),
-                duration_ms: elapsed_millis(started_at),
-            },
-        ) {
-            tracing::warn!(
-                event = "invoke_audit_append_error",
-                phase = "mesh_forwarded",
-                error = %error,
-                "failed to append mesh forward audit event"
-            );
-        }
+                        failed_attempts: &[String]|
+     -> HostResult<()> {
+        state
+            .invoke_audit
+            .append(
+                &audit_ctx,
+                fcp_host::InvokePhase::MeshForwarded {
+                    target_node: target_node.as_str().to_string(),
+                    decision: code.to_string(),
+                    executor_status,
+                    failed_attempts: failed_attempts.to_vec(),
+                    duration_ms: elapsed_millis(started_at),
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| invoke_audit_unavailable("mesh forward outcome", error))
     };
 
     let mut failed_attempts = Vec::new();
@@ -14487,9 +14545,24 @@ async fn mesh_forward_invoke(
             request_json: request_json.clone(),
             asserted_principal: asserted_principal.map(str::to_owned),
         };
+        // This is routing evidence, not an assertion that the entry node has
+        // verified an operation installed only on the remote executor.
+        state
+            .invoke_audit
+            .append(
+                &audit_ctx,
+                fcp_host::InvokePhase::MeshForwardAttempt {
+                    target_node: candidate.as_str().to_string(),
+                    decision: code.to_string(),
+                },
+            )
+            .map_err(|error| {
+                map_host_error(invoke_audit_unavailable("mesh forward attempt", error))
+            })?;
         match router.forward(&candidate, body).await {
             Ok(reply) => {
-                append_audit(&candidate, Some(reply.status), &failed_attempts);
+                append_audit(&candidate, Some(reply.status), &failed_attempts)
+                    .map_err(map_host_error)?;
                 tracing::info!(
                     event = "mesh_invoke_forwarded",
                     connector_id = %request.connector_id,
@@ -14532,7 +14605,7 @@ async fn mesh_forward_invoke(
                 failed_attempts.push(failure.summary());
             }
             Err(failure) => {
-                append_audit(&candidate, None, &failed_attempts);
+                append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
                 tracing::error!(
                     event = "mesh_invoke_forward_outcome_unknown",
                     connector_id = %request.connector_id,
@@ -14552,7 +14625,7 @@ async fn mesh_forward_invoke(
             }
         }
     }
-    append_audit(&last_target, None, &failed_attempts);
+    append_audit(&last_target, None, &failed_attempts).map_err(map_host_error)?;
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         format!(
@@ -17076,13 +17149,232 @@ deny_ptrace = true
         );
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn audit_writer_ownership_precedes_pending_invocation_recovery() {
+        let directory = tempfile::tempdir().expect("temporary host stores");
+        let path = directory.path().join("ownership.json");
+        let (lifecycle, audit) =
+            open_host_invocation_stores(Some(path.clone())).expect("first host");
+        let ticket = lifecycle
+            .admit_invocation(fcp_host::InvocationAdmission {
+                operation_id: "live-owner".to_string(),
+                connector_id: "ownership-test".to_string(),
+                operation: "ownership.execute".to_string(),
+                zone_id: ZoneId::work().to_string(),
+                principal: "owner".to_string(),
+                correlation_id: None,
+                deadline_at: Utc::now() + chrono::Duration::seconds(30),
+                idempotency: None,
+            })
+            .await
+            .expect("live admission");
+        let before = std::fs::read(&path).expect("persisted admission");
+        assert!(
+            open_host_invocation_stores(Some(path.clone())).is_err(),
+            "a competing host must fail before recovering another host's live work"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged live admission"),
+            before,
+            "failed audit ownership must not rewrite lifecycle recovery state"
+        );
+        assert!(
+            lifecycle
+                .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+                .await
+                .expect("live record")
+                .terminal
+                .is_none()
+        );
+        drop(audit);
+        drop(lifecycle);
+        let (recovered, _audit) =
+            open_host_invocation_stores(Some(path)).expect("replacement host");
+        assert_eq!(
+            recovered
+                .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
+                .await
+                .expect("recovered admission")
+                .terminal
+                .expect("interrupted outcome")
+                .outcome,
+            fcp_host::InvocationOutcome::OutcomeUnknown,
+        );
+        let (_memory, memory_audit) =
+            open_host_invocation_stores(None).expect("explicit memory host");
+        assert_eq!(memory_audit.durability_status().storage, "memory");
+        assert!(!memory_audit.durability_status().durable);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn terminal_audit_failure_preserves_source_outcome_and_unfinished_identity() {
+        let directory = tempfile::tempdir().expect("temporary host stores");
+        let state_path = directory.path().join("terminal-audit.json");
+        let journal_path = directory
+            .path()
+            .join("terminal-audit.json.invoke-audit.journal");
+        let (lifecycle, invoke_audit) =
+            open_host_invocation_stores(Some(state_path.clone())).expect("durable stores");
+        let lifecycle = Arc::new(lifecycle);
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        register_test_capability_issuer(
+            lifecycle.as_ref(),
+            &signing_key,
+            "audit-failure-test",
+            "audit.execute",
+            "audit.execute",
+            ZoneId::work().as_str(),
+        )
+        .await;
+        let introspection = serde_json::to_value(dispatcher_introspection(
+            "audit.execute",
+            "audit.execute",
+            SafetyTier::Safe,
+        ))
+        .expect("introspection");
+        let observed_lifecycle = Arc::clone(&lifecycle);
+        let invokes = Arc::new(AtomicU64::new(0));
+        let observed_invokes = Arc::clone(&invokes);
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin());
+                let result = match rpc.method.as_str() {
+                    "introspect" => introspection.clone(),
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        observed_invokes.fetch_add(1, Ordering::SeqCst);
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("invoke request");
+                        assert!(
+                            observed_lifecycle
+                                .invocation_record(&request.id.to_string(), None)
+                                .await
+                                .expect("admission before effect")
+                                .terminal
+                                .is_none()
+                        );
+                        // Simulate a noncooperating external writer after allow
+                        // evidence was synced, immediately before the response.
+                        // The next journal append must detect the changed length.
+                        let mut external = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&journal_path)
+                            .expect("external journal handle");
+                        external.write_all(&[0]).expect("incomplete external frame");
+                        external.sync_all().expect("external frame sync");
+                        serde_json::to_value(
+                            InvokeResponse::ok(
+                                request.id,
+                                json!({ "private_result": "observed provider effect" }),
+                            )
+                            .with_receipt_id(ObjectId::from_bytes([42; 32]))
+                            .with_usage_metrics(vec![UsageMetric::requests(1)]),
+                        )
+                        .expect("response")
+                    }
+                    method => panic!("unexpected connector method {method}"),
+                };
+                assert!(rpc.rpc.try_settle_reply());
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let registry = dispatcher_registry_with_connector(
+            "audit-failure-test",
+            dispatcher_test_connector("audit-failure-test", runner_tx, runner_task),
+            dispatcher_test_config("audit-failure-test"),
+        );
+        let mut state = dispatcher_app_state(
+            registry,
+            Arc::clone(&lifecycle),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        Arc::get_mut(&mut state).expect("unshared app state").invoke_audit =
+            Arc::new(invoke_audit);
+        let request = InvokeRequest {
+            r#type: "invoke".to_string(),
+            id: RequestId::new("terminal-audit-failure"),
+            connector_id: ConnectorId::from_static("audit-failure-test"),
+            operation: OperationId::from_static("audit.execute"),
+            zone_id: ZoneId::work(),
+            input: json!({ "effect": "must not be repeated" }),
+            capability_token: test_capability_token(
+                &signing_key,
+                "audit.execute",
+                "audit.execute",
+                ZoneId::work().as_str(),
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("terminal-audit-key".to_string()),
+            lease_seq: None,
+            deadline_ms: Some(10_000),
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        let error = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .expect_err("an observed result without persisted audit cannot finalize");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("dispatch outcome"));
+        assert_eq!(invokes.load(Ordering::SeqCst), 1);
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("drain observed result");
+        let record = lifecycle
+            .invocation_record("terminal-audit-failure", None)
+            .await
+            .expect("source observation");
+        let terminal = record.terminal.as_ref().expect("definite source outcome");
+        assert_eq!(terminal.outcome, fcp_host::InvocationOutcome::Succeeded);
+        assert_eq!(
+            terminal.receipt_id,
+            Some(ObjectId::from_bytes([42; 32]).to_string()),
+        );
+        let finalization = record.finalization.as_ref().expect("partial finalization");
+        assert!(finalization.audit_event_id.is_none());
+        assert!(finalization.response_http_status.is_none());
+        assert!(finalization.receipt_recorded);
+        assert!(record.admission.idempotency.is_some());
+        let durability = state.invoke_audit.durability_status();
+        assert!(!durability.writable);
+        assert_eq!(
+            durability.unavailable_reason.as_deref(),
+            Some("journal_length_changed"),
+        );
+        let reopened = HostAdminStateStore::with_state_path(state_path.clone())
+            .expect("recover retained source observation");
+        let recovered = reopened
+            .invocation_record(&record.ticket.operation_id, Some(record.ticket.attempt_id))
+            .await
+            .expect("same source ticket");
+        assert_eq!(recovered.terminal, record.terminal);
+        assert_eq!(recovered.finalization, record.finalization);
+        let before = std::fs::read(&state_path).expect("retained incomplete finalization");
+        drop(state);
+        assert!(
+            open_host_invocation_stores(Some(state_path.clone())).is_err(),
+            "damaged audit evidence cannot be silently replaced at startup"
+        );
+        assert_eq!(std::fs::read(&state_path).expect("retained source"), before);
+    }
+
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn disconnected_invoke_waiter_preserves_durable_result_and_finalization() {
         let directory = tempfile::tempdir().expect("temporary admin state");
         let state_path = directory.path().join("owned-invocations.json");
-        let lifecycle = Arc::new(
-            HostAdminStateStore::with_state_path(state_path.clone()).expect("admin store"),
-        );
+        let (lifecycle, invoke_audit) =
+            open_host_invocation_stores(Some(state_path.clone())).expect("durable host stores");
+        let lifecycle = Arc::new(lifecycle);
         let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         register_test_capability_issuer(
             lifecycle.as_ref(),
@@ -17162,12 +17454,14 @@ deny_ptrace = true
             dispatcher_test_connector("owned-test", runner_tx, runner_task),
             dispatcher_test_config("owned-test"),
         );
-        let state = dispatcher_app_state(
+        let mut state = dispatcher_app_state(
             registry,
             Arc::clone(&lifecycle),
             Some(signing_key.verifying_key()),
             HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
         );
+        Arc::get_mut(&mut state).expect("unshared app state").invoke_audit =
+            Arc::new(invoke_audit);
         state
             .budget
             .upsert_policy(
@@ -17204,6 +17498,24 @@ deny_ptrace = true
             provenance: None,
             approval_tokens: Vec::new(),
         };
+        let mut invalid_audit = request.clone();
+        invalid_audit.id = RequestId::new("oversized-audit-request-".repeat(32));
+        let invalid_audit_id = invalid_audit.id.to_string();
+        let audit_error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            invoke_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(invalid_audit),
+            ),
+        )
+        .await
+        .expect("invalid audit context must fail before connector dispatch")
+        .expect_err("allow evidence must be persisted before admission");
+        assert_eq!(audit_error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(audit_error.1.contains("invoke audit could not be persisted"));
+        assert!(lifecycle.invocation_record(&invalid_audit_id, None).await.is_none());
+
         let mut retry = request.clone();
         retry.id = RequestId::new("owned-disconnect-retry");
         let retry_id = retry.id.to_string();
@@ -17290,7 +17602,25 @@ deny_ptrace = true
         assert!(!metadata.contains("owned-disconnect-key"));
         assert!(record.admission.idempotency.is_some());
 
-        let reopened = HostAdminStateStore::with_state_path(state_path).expect("reopen store");
+        let durability = state.invoke_audit.durability_status();
+        assert_eq!(durability.storage, "local_journal");
+        assert_eq!(durability.durable, cfg!(unix));
+        assert!(durability.persisted_entries >= 2);
+        // All host jobs have drained. Release the journal writer before reopen.
+        drop(state);
+        let (reopened, recovered_audit) =
+            open_host_invocation_stores(Some(state_path)).expect("reopen host stores");
+        assert_eq!(
+            recovered_audit.durability_status().recovered_entries,
+            durability.persisted_entries,
+        );
+        assert!(
+            recovered_audit
+                .entries_for_zone(ZoneId::work().as_str())
+                .iter()
+                .any(|entry| &entry.id == audit_id),
+            "persisted finalization must still resolve to its full audit entry"
+        );
         let recovered = reopened
             .invocation_record(&ticket.operation_id, Some(ticket.attempt_id))
             .await

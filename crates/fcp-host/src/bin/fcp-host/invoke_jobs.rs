@@ -281,7 +281,7 @@ pub(super) fn execute<'a>(
         {
             Ok(preflight) => preflight,
             Err(error) => {
-                append_deny(state, &audit, &error.to_string());
+                append_deny(state, &audit, &error.to_string())?;
                 return Err(error);
             }
         };
@@ -289,7 +289,7 @@ pub(super) fn execute<'a>(
             let reason = preflight
                 .reason
                 .unwrap_or_else(|| "preflight denied invoke request".to_string());
-            append_deny(state, &audit, &reason);
+            append_deny(state, &audit, &reason)?;
             return Err(HostError::PreflightFailed(reason));
         }
 
@@ -310,12 +310,10 @@ pub(super) fn execute<'a>(
                 HostError::Internal("verified invoke lost its principal".to_string())
             })?
             .to_string();
-        if let Err(error) = state
+        state
             .invoke_audit
             .append(&audit, fcp_host::InvokePhase::PreflightAllow)
-        {
-            tracing::warn!(event = "invoke_audit_append_error", phase = "allow", %error);
-        }
+            .map_err(|error| super::invoke_audit_unavailable("preflight allow", error))?;
 
         let job_state = std::sync::Arc::clone(state);
         let job_audit = audit.clone();
@@ -374,15 +372,17 @@ fn append_deny(
     state: &super::AppState,
     audit: &fcp_host::InvokeAuditContext,
     reason: &str,
-) {
-    if let Err(error) = state.invoke_audit.append(
-        audit,
-        fcp_host::InvokePhase::PreflightDeny {
-            reason: reason.to_string(),
-        },
-    ) {
-        tracing::warn!(event = "invoke_audit_append_error", phase = "deny", %error);
-    }
+) -> HostResult<()> {
+    state
+        .invoke_audit
+        .append(
+            audit,
+            fcp_host::InvokePhase::PreflightDeny {
+                reason: reason.to_string(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| super::invoke_audit_unavailable("preflight denial", error))
 }
 
 fn append_dispatch_audit(
@@ -390,7 +390,7 @@ fn append_dispatch_audit(
     audit: &fcp_host::InvokeAuditContext,
     result: &HostResult<InvokeResponse>,
     duration_ms: u64,
-) -> Option<String> {
+) -> HostResult<String> {
     let phase = match result {
         Ok(response) => fcp_host::InvokePhase::DispatchResult {
             receipt_id: response.receipt_id.as_ref().map(ToString::to_string),
@@ -402,13 +402,11 @@ fn append_dispatch_audit(
             duration_ms,
         },
     };
-    match state.invoke_audit.append(audit, phase) {
-        Ok(entry) => Some(entry.id),
-        Err(error) => {
-            tracing::warn!(event = "invoke_audit_append_error", phase = "dispatch", %error);
-            None
-        }
-    }
+    state
+        .invoke_audit
+        .append(audit, phase)
+        .map(|entry| entry.id)
+        .map_err(|error| super::invoke_audit_unavailable("dispatch outcome", error))
 }
 
 /// The registration outlives the polled dispatch future. Native guards retain
@@ -635,7 +633,10 @@ async fn run_owned(
     .await
     .and_then(std::convert::identity);
 
-    let audit_event_id = append_dispatch_audit(state, &audit, &source_result, duration_ms);
+    let source_persisted = terminal_persistence.is_ok();
+    let audit_persistence = append_dispatch_audit(state, &audit, &source_result, duration_ms);
+    let audit_event_id = audit_persistence.as_ref().ok().cloned();
+    let audit_persisted = audit_event_id.is_some();
     let budget_recorded = before_deadline(
         finalize_by,
         super::record_invoke_budget_usage(
@@ -685,8 +686,11 @@ async fn run_owned(
         Err(error) => Err(HostError::Unavailable(format!(
             "connector outcome could not be persisted; inspect the invocation record before retrying: {error}"
         ))),
-        Ok(()) => match source_result {
-            Ok(response) if sampling => {
+        Ok(()) => match (source_result, audit_persistence) {
+            // The source observation is already retained. Failed evidence
+            // persistence cannot authorize a child effect or a completed job.
+            (_, Err(error)) => Err(error),
+            (Ok(response), Ok(_)) if sampling => {
                 // A child transport failure may conceal an external effect.
                 // Keep the parent unresolved until a complete child response
                 // (or an observed no-sampling outcome) removes that ambiguity.
@@ -708,10 +712,10 @@ async fn run_owned(
                     Err(error) => Err(error),
                 }
             }
-            result => result,
+            (result, Ok(_)) => result,
         },
     };
-    if finalization.sampling_completed != Some(false) {
+    if source_persisted && audit_persisted && finalization.sampling_completed != Some(false) {
         finalization.response_http_status = Some(match &result {
             Ok(_) => axum::http::StatusCode::OK.as_u16(),
             Err(error) => super::host_error_status(error).as_u16(),
