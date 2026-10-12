@@ -17645,6 +17645,7 @@ deny_ptrace = true
                 correlation_id: None,
                 deadline_at: Utc::now() + chrono::Duration::seconds(30),
                 idempotency: None,
+                transport_idempotency: None,
             })
             .await
             .expect("live admission");
@@ -19805,24 +19806,56 @@ deny_ptrace = true
         assert_eq!(completed.load(Ordering::SeqCst), 1);
 
         let local_invokes = Arc::new(AtomicU64::new(0));
-        let local_base = invoke_token_bucket_state(
-            "fcp.test.mesh-deadline:utility:1.0.0",
-            "test.echo",
-            "cap.test.echo",
-            &capability_key,
-            Arc::clone(&local_invokes),
-            false,
-        );
-        let local = Arc::new(AppState {
-            lifecycle: Arc::clone(&reopened),
-            ..(*local_base).clone()
-        });
-        request.id = RequestId::new(uncertain.ticket.operation_id.clone());
-        let local_error = invoke_handler(State(local), HeaderMap::new(), Json(request))
+        for (reuse_operation_id, asserted_principal) in [
+            (true, None),
+            (false, None),
+            (false, Some("user:test")),
+        ] {
+            // Give each admission a fresh rate-limit pool so the assertion
+            // proves the durable replay fence, not incidental quota denial.
+            let local_base = invoke_token_bucket_state(
+                "fcp.test.mesh-deadline:utility:1.0.0",
+                "test.echo",
+                "cap.test.echo",
+                &capability_key,
+                Arc::clone(&local_invokes),
+                false,
+            );
+            let local = Arc::new(AppState {
+                lifecycle: Arc::clone(&reopened),
+                ..(*local_base).clone()
+            });
+            request.id = if reuse_operation_id {
+                RequestId::new(uncertain.ticket.operation_id.clone())
+            } else {
+                RequestId::random()
+            };
+            let mut headers = HeaderMap::new();
+            if let Some(principal) = asserted_principal {
+                headers.insert("x-principal", HeaderValue::from_static(principal));
+            }
+            let local_error = invoke_handler(
+                State(Arc::clone(&local)),
+                headers,
+                Json(request.clone()),
+            )
             .await
-            .expect_err("moving the operation locally must preserve the unknown-ID fence");
-        assert!(local_error.1.contains("unresolved mesh forward"));
-        assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+            .expect_err("moving the operation locally must preserve the origin replay fence");
+            if asserted_principal.is_some() {
+                assert!(local_error.1.contains("idempotency key"));
+                assert!(local_error.1.contains("different"));
+            } else {
+                assert!(local_error.1.contains("unresolved mesh forward"));
+            }
+            assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+            local
+                .invoke_jobs
+                .shutdown(Duration::from_secs(1))
+                .await
+                .expect("rejected local admission retires");
+        }
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
 
         release_tx.send(true).expect("release observed remote work");
         shutdown_tx.send(true).expect("stop peer");

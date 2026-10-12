@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     HostAdminStateSnapshot, HostAdminStateStore, InvocationIdempotency, InvocationQueryResponse,
-    InvocationTicket, MAX_RETAINED_INVOCATIONS, invocation_effect_digest,
-    invocation_idempotency_conflict, invocation_idempotency_digest, invocation_state_error,
+    InvocationTicket, MAX_RETAINED_INVOCATIONS, invocation_idempotency_conflict,
+    invocation_relay_capability_digest, invocation_state_error,
     validate_invocation_metadata,
 };
 use crate::{HostError, HostResult};
@@ -37,9 +37,9 @@ pub enum MeshInvocationIdentity {
     /// The namespace binds the exact opaque capability; the asserted header
     /// is bound as an effect constraint, so changing it cannot escape a key.
     /// Renewed credentials create another namespace; it is not a verified
-    /// principal or a mesh-wide semantic idempotency guarantee. A later
-    /// locally verified request also uses a different key namespace, so only
-    /// reuse of the same operation ID is fenced across that identity change.
+    /// principal or a mesh-wide semantic idempotency guarantee. New verified
+    /// admissions retain this opaque namespace as an additional alias, so a
+    /// local/remote route change cannot escape a retained exact-token key.
     TokenBoundRelay {
         /// Domain-separated digest of the exact capability encoding.
         capability_digest: String,
@@ -78,6 +78,13 @@ pub struct MeshInvocationIntent {
     /// Optional key/effect binding in the namespace described by identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<InvocationIdempotency>,
+    /// Exact-token alias of a verified principal's idempotency scope.
+    ///
+    /// TokenBoundRelay already uses that namespace as its primary binding and
+    /// leaves this absent. Old verified records without an alias remain
+    /// readable, but their discarded credentials cannot be reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_idempotency: Option<InvocationIdempotency>,
 }
 
 impl MeshInvocationIntent {
@@ -104,55 +111,37 @@ impl MeshInvocationIntent {
         if let Some(asserted) = asserted_principal {
             validate_invocation_metadata(asserted, "asserted principal")?;
         }
-        let (identity, idempotency) = if let Some(principal) = verified_principal {
-            validate_invocation_metadata(principal, "verified principal")?;
-            if asserted_principal.is_some_and(|asserted| asserted != principal) {
-                return Err(HostError::InvalidFilter(
-                    "mesh invocation asserted principal differs from verified principal".to_string(),
-                ));
-            }
-            (
-                MeshInvocationIdentity::VerifiedPrincipal {
-                    principal: principal.to_string(),
-                },
-                InvocationIdempotency::from_request(request, principal)?,
-            )
-        } else {
-            let capability = request.capability_token.raw().to_cbor().map_err(|_| {
-                HostError::InvalidFilter(
-                    "mesh invocation capability binding could not be encoded".to_string(),
+        let (identity, idempotency, transport_idempotency) =
+            if let Some(principal) = verified_principal {
+                validate_invocation_metadata(principal, "verified principal")?;
+                if asserted_principal.is_some_and(|asserted| asserted != principal) {
+                    return Err(HostError::InvalidFilter(
+                        "mesh invocation asserted principal differs from verified principal".to_string(),
+                    ));
+                }
+                (
+                    MeshInvocationIdentity::VerifiedPrincipal {
+                        principal: principal.to_string(),
+                    },
+                    InvocationIdempotency::from_request(request, principal)?,
+                    InvocationIdempotency::from_relay_request(request, asserted_principal)?,
                 )
-            })?;
-            let capability_digest = invocation_idempotency_digest(
-                "fcp.host.mesh.relay.capability.v1",
-                &capability,
-            )?;
-            let idempotency = request.idempotency_key.as_deref().map(|key| -> HostResult<_> {
-                Ok(InvocationIdempotency {
-                    scope_digest: invocation_idempotency_digest(
-                        "fcp.host.mesh.relay.scope.v1",
-                        &(
-                            request.zone_id.as_str(),
-                            request.connector_id.as_str(),
-                            request.operation.as_str(),
-                            capability_digest.as_str(),
-                            key,
-                        ),
-                    )?,
-                    effect_digest: invocation_idempotency_digest(
-                        "fcp.host.mesh.relay.effect.v1",
-                        &(invocation_effect_digest(request)?, asserted_principal),
-                    )?,
-                })
-            }).transpose()?;
-            (
-                MeshInvocationIdentity::TokenBoundRelay {
-                    capability_digest,
-                    asserted_principal: asserted_principal.map(str::to_owned),
-                },
-                idempotency,
-            )
-        };
+            } else {
+                let capability_digest = invocation_relay_capability_digest(request)?;
+                let idempotency = InvocationIdempotency::from_relay_parts(
+                    request,
+                    &capability_digest,
+                    asserted_principal,
+                )?;
+                (
+                    MeshInvocationIdentity::TokenBoundRelay {
+                        capability_digest,
+                        asserted_principal: asserted_principal.map(str::to_owned),
+                    },
+                    idempotency,
+                    None,
+                )
+            };
         let intent = Self {
             operation_id: request.id.to_string(),
             connector_id: request.connector_id.to_string(),
@@ -164,6 +153,7 @@ impl MeshInvocationIntent {
             correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
             deadline_at,
             idempotency,
+            transport_idempotency,
         };
         intent.validate()?;
         Ok(intent)
@@ -204,7 +194,23 @@ impl MeshInvocationIntent {
         if let Some(binding) = &self.idempotency {
             binding.validate()?;
         }
+        if let Some(binding) = &self.transport_idempotency {
+            binding.validate()?;
+            if !self.has_verified_scope() || self.idempotency.is_none() {
+                return Err(HostError::InvalidFilter(
+                    "mesh transport alias requires a verified principal-scoped binding".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn transport_binding(&self) -> Option<&InvocationIdempotency> {
+        if self.has_verified_scope() {
+            self.transport_idempotency.as_ref()
+        } else {
+            self.idempotency.as_ref()
+        }
     }
 
     const fn has_verified_scope(&self) -> bool {
@@ -388,12 +394,41 @@ fn validate_observation(observation: Option<&MeshInvocationObservation>) -> Host
     Ok(())
 }
 
+pub(super) fn recover_transport_idempotency(
+    binding: &InvocationIdempotency,
+    unresolved: bool,
+    scoped_effects: &mut HashMap<String, String>,
+    unresolved_scopes: &mut HashSet<String>,
+) -> HostResult<()> {
+    binding.validate().map_err(|_| {
+        HostError::Internal("persisted transport idempotency binding is invalid".to_string())
+    })?;
+    // The exact-token namespace is shared by relay primary bindings and the
+    // transport aliases of verified local or mesh invocations.
+    let scope = format!("relay:{}", binding.scope_digest);
+    if scoped_effects
+        .insert(scope.clone(), binding.effect_digest.clone())
+        .is_some_and(|previous| previous != binding.effect_digest)
+    {
+        return Err(HostError::Internal(
+            "persisted transport idempotency effects are inconsistent".to_string(),
+        ));
+    }
+    if unresolved && !unresolved_scopes.insert(scope) {
+        return Err(HostError::Internal(
+            "persisted transport idempotency scope has overlapping unresolved attempts".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl HostAdminStateSnapshot {
     pub(super) fn check_mesh_invocation_conflicts(
         &self,
         operation_id: &str,
         idempotency: Option<&InvocationIdempotency>,
         verified_scope: bool,
+        transport_idempotency: Option<&InvocationIdempotency>,
     ) -> Result<(), fcp_kernel::LifecycleError> {
         for record in self.mesh_invocations.iter().rev() {
             if record.ticket.operation_id == operation_id && record.is_unresolved() {
@@ -402,25 +437,76 @@ impl HostAdminStateSnapshot {
                     &record.ticket,
                 ));
             }
-            let (Some(binding), Some(previous)) = (idempotency, &record.intent.idempotency) else {
-                continue;
+            let verified_previous = if verified_scope && record.intent.has_verified_scope() {
+                record.intent.idempotency.as_ref()
+            } else {
+                None
             };
-            if verified_scope != record.intent.has_verified_scope()
-                || binding.scope_digest != previous.scope_digest
-            {
-                continue;
+            for (binding, previous) in [
+                (idempotency, verified_previous),
+                (transport_idempotency, record.intent.transport_binding()),
+            ] {
+                let (Some(binding), Some(previous)) = (binding, previous) else {
+                    continue;
+                };
+                if binding.scope_digest != previous.scope_digest {
+                    continue;
+                }
+                if binding.effect_digest != previous.effect_digest {
+                    return Err(invocation_idempotency_conflict(
+                        "idempotency key is already bound to different mesh invocation effects",
+                        &record.ticket,
+                    ));
+                }
+                if record.is_unresolved() {
+                    return Err(invocation_idempotency_conflict(
+                        "idempotency key has an unresolved mesh forward",
+                        &record.ticket,
+                    ));
+                }
             }
-            if binding.effect_digest != previous.effect_digest {
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_local_invocation_conflicts(
+        &self,
+        operation_id: &str,
+        idempotency: Option<&InvocationIdempotency>,
+        transport_idempotency: Option<&InvocationIdempotency>,
+    ) -> Result<(), fcp_kernel::LifecycleError> {
+        for record in self.invocations.iter().rev() {
+            if record.ticket.operation_id == operation_id && record.is_unresolved() {
                 return Err(invocation_idempotency_conflict(
-                    "idempotency key is already bound to different mesh invocation effects",
+                    "invocation identifier has an unresolved local attempt",
                     &record.ticket,
                 ));
             }
-            if record.is_unresolved() {
-                return Err(invocation_idempotency_conflict(
-                    "idempotency key has an unresolved mesh forward",
-                    &record.ticket,
-                ));
+            for (binding, previous) in [
+                (idempotency, record.admission.idempotency.as_ref()),
+                (
+                    transport_idempotency,
+                    record.admission.transport_idempotency.as_ref(),
+                ),
+            ] {
+                let (Some(binding), Some(previous)) = (binding, previous) else {
+                    continue;
+                };
+                if binding.scope_digest != previous.scope_digest {
+                    continue;
+                }
+                if binding.effect_digest != previous.effect_digest {
+                    return Err(invocation_idempotency_conflict(
+                        "idempotency key is already bound to different invocation effects",
+                        &record.ticket,
+                    ));
+                }
+                if record.is_unresolved() {
+                    return Err(invocation_idempotency_conflict(
+                        "idempotency key has an unresolved attempt",
+                        &record.ticket,
+                    ));
+                }
             }
         }
         Ok(())
@@ -515,26 +601,33 @@ impl HostAdminStateSnapshot {
                     "persisted invocation identifier has overlapping unresolved attempts".to_string(),
                 ));
             }
-            if let Some(binding) = &record.intent.idempotency {
-                let scope = if record.intent.has_verified_scope() {
-                    binding.scope_digest.clone()
-                } else {
-                    format!("relay:{}", binding.scope_digest)
-                };
+            if record.intent.has_verified_scope()
+                && let Some(binding) = &record.intent.idempotency
+            {
                 if scoped_effects
-                    .insert(scope.clone(), binding.effect_digest.clone())
+                    .insert(binding.scope_digest.clone(), binding.effect_digest.clone())
                     .is_some_and(|previous| previous != binding.effect_digest)
                 {
                     return Err(HostError::Internal(
                         "persisted mesh invocation idempotency effects are inconsistent".to_string(),
                     ));
                 }
-                if record.is_unresolved() && !unresolved_scopes.insert(scope) {
+                if record.is_unresolved()
+                    && !unresolved_scopes.insert(binding.scope_digest.clone())
+                {
                     return Err(HostError::Internal(
                         "persisted mesh invocation idempotency scope has overlapping unresolved attempts"
                             .to_string(),
                     ));
                 }
+            }
+            if let Some(binding) = record.intent.transport_binding() {
+                recover_transport_idempotency(
+                    binding,
+                    record.is_unresolved(),
+                    scoped_effects,
+                    unresolved_scopes,
+                )?;
             }
         }
         if self
@@ -581,38 +674,18 @@ impl HostAdminStateStore {
                 &intent.operation_id,
                 intent.idempotency.as_ref(),
                 intent.has_verified_scope(),
+                intent.transport_binding(),
             )?;
-            for record in snapshot.invocations.iter().rev() {
-                if record.ticket.operation_id == intent.operation_id && record.is_unresolved() {
-                    return Err(invocation_idempotency_conflict(
-                        "invocation identifier has an unresolved local attempt",
-                        &record.ticket,
-                    ));
-                }
-                if !intent.has_verified_scope() {
-                    continue;
-                }
-                let (Some(binding), Some(previous)) =
-                    (&intent.idempotency, &record.admission.idempotency)
-                else {
-                    continue;
-                };
-                if binding.scope_digest != previous.scope_digest {
-                    continue;
-                }
-                if binding.effect_digest != previous.effect_digest {
-                    return Err(invocation_idempotency_conflict(
-                        "idempotency key is already bound to different local invocation effects",
-                        &record.ticket,
-                    ));
-                }
-                if record.is_unresolved() {
-                    return Err(invocation_idempotency_conflict(
-                        "idempotency key has an unresolved local attempt",
-                        &record.ticket,
-                    ));
-                }
-            }
+            let verified_binding = if intent.has_verified_scope() {
+                intent.idempotency.as_ref()
+            } else {
+                None
+            };
+            snapshot.check_local_invocation_conflicts(
+                &intent.operation_id,
+                verified_binding,
+                intent.transport_binding(),
+            )?;
             if !intent.has_verified_scope()
                 && snapshot
                     .mesh_invocations
@@ -892,6 +965,7 @@ mod tests {
             correlation_id: None,
             deadline_at: Utc::now() + chrono::Duration::seconds(60),
             idempotency: InvocationIdempotency::from_request(request, "owner").unwrap(),
+            transport_idempotency: InvocationIdempotency::from_relay_request(request, None).unwrap(),
         }
     }
 
@@ -931,6 +1005,59 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EntryMode {
+        Local,
+        VerifiedMesh,
+        OpaqueMesh,
+    }
+
+    const CROSS_MODE_PAIRS: [(EntryMode, EntryMode); 4] = [
+        (EntryMode::Local, EntryMode::OpaqueMesh),
+        (EntryMode::OpaqueMesh, EntryMode::Local),
+        (EntryMode::VerifiedMesh, EntryMode::OpaqueMesh),
+        (EntryMode::OpaqueMesh, EntryMode::VerifiedMesh),
+    ];
+
+    async fn admit_entry(
+        store: &HostAdminStateStore,
+        source: &InvokeRequest,
+        mode: EntryMode,
+    ) -> HostResult<InvocationTicket> {
+        match mode {
+            EntryMode::Local => store.admit_invocation(local_admission(source)).await,
+            EntryMode::VerifiedMesh => {
+                store.reserve_mesh_invocation(intent(source, Some("owner"))).await
+            }
+            EntryMode::OpaqueMesh => {
+                store.reserve_mesh_invocation(intent(source, None)).await
+            }
+        }
+    }
+
+    async fn complete_entry(
+        store: &HostAdminStateStore,
+        ticket: &InvocationTicket,
+        mode: EntryMode,
+    ) {
+        if matches!(mode, EntryMode::Local) {
+            complete_local(store, ticket).await;
+        } else {
+            store
+                .observe_mesh_invocation(
+                    ticket,
+                    "executor-one",
+                    MeshInvocationObservation::ResponseObserved { http_status: 200 },
+                )
+                .await
+                .unwrap();
+            store
+                .finish_mesh_invocation(ticket, terminal(MeshInvocationOutcome::Succeeded))
+                .await
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1314,6 +1441,7 @@ mod tests {
                 record.ticket.operation_id = format!("retained-{index}");
                 record.intent.operation_id.clone_from(&record.ticket.operation_id);
                 record.intent.idempotency = None;
+                record.intent.transport_idempotency = None;
                 record.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
                 snapshot.mesh_invocations.push(record);
             }
@@ -1448,6 +1576,317 @@ mod tests {
         assert!(reopened.reserve_mesh_invocation(intent(&retry, None)).await.is_err());
         retry.id = RequestId::new("trusted-after-restart");
         assert!(reopened.admit_invocation(local_admission(&retry)).await.is_ok());
+    }
+
+    #[test]
+    fn exact_token_alias_preserves_the_existing_relay_namespace() {
+        use super::super::{invocation_effect_digest, invocation_idempotency_digest};
+
+        let source = request("alias-format");
+        // Freeze the first persisted relay layout: assertions affect effects,
+        // never the scope. Verified aliases must collide with that old layout.
+        let capability_digest = invocation_idempotency_digest(
+            "fcp.host.mesh.relay.capability.v1",
+            &source.capability_token.raw().to_cbor().unwrap(),
+        )
+        .unwrap();
+        let legacy_binding = InvocationIdempotency {
+            scope_digest: invocation_idempotency_digest(
+                "fcp.host.mesh.relay.scope.v1",
+                &(
+                    source.zone_id.as_str(),
+                    source.connector_id.as_str(),
+                    source.operation.as_str(),
+                    capability_digest.as_str(),
+                    source.idempotency_key.as_deref().unwrap(),
+                ),
+            )
+            .unwrap(),
+            effect_digest: invocation_idempotency_digest(
+                "fcp.host.mesh.relay.effect.v1",
+                &(invocation_effect_digest(&source).unwrap(), None::<&str>),
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            InvocationIdempotency::from_relay_request(&source, None).unwrap(),
+            Some(legacy_binding.clone()),
+        );
+        assert_eq!(intent(&source, None).idempotency, Some(legacy_binding.clone()));
+        assert_eq!(
+            intent(&source, Some("owner")).transport_idempotency,
+            Some(legacy_binding.clone()),
+        );
+        assert_eq!(
+            local_admission(&source).transport_idempotency,
+            Some(legacy_binding.clone()),
+        );
+        let asserted =
+            InvocationIdempotency::from_relay_request(&source, Some("owner")).unwrap().unwrap();
+        assert_eq!(asserted.scope_digest, legacy_binding.scope_digest);
+        assert_ne!(asserted.effect_digest, legacy_binding.effect_digest);
+        let mut no_key = source;
+        no_key.idempotency_key = None;
+        assert!(InvocationIdempotency::from_relay_request(&no_key, None).unwrap().is_none());
+        assert!(intent(&no_key, Some("owner")).transport_idempotency.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn unresolved_exact_token_keys_fence_every_mode_change_after_restart() {
+        for (original_mode, retry_mode) in CROSS_MODE_PAIRS {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let source = request("original-mode");
+            let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+            let ticket = admit_entry(&store, &source, original_mode).await.unwrap();
+            let mut retry = source.clone();
+            retry.id = RequestId::new("new-id-other-mode");
+            let refusal = admit_entry(&store, &retry, retry_mode).await.unwrap_err();
+            assert!(refusal.to_string().contains(&ticket.operation_id));
+            assert!(refusal.to_string().contains(&format!("attempt_id={}", ticket.attempt_id)));
+            assert_eq!(store.state.read().await.next_invocation_attempt_id, 2);
+            drop(store);
+
+            let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+            let refusal = admit_entry(&reopened, &retry, retry_mode).await.unwrap_err();
+            assert!(refusal.to_string().contains(&ticket.operation_id));
+            assert!(refusal.to_string().contains("unresolved"));
+            let observation = reopened
+                .invocation_observation(&ticket.operation_id, Some(ticket.attempt_id))
+                .await;
+            match original_mode {
+                EntryMode::Local => {
+                    assert_eq!(
+                        observation.invocation.unwrap().terminal.unwrap().outcome,
+                        InvocationOutcome::OutcomeUnknown,
+                    );
+                }
+                EntryMode::VerifiedMesh | EntryMode::OpaqueMesh => {
+                    let record = observation.mesh_invocation.unwrap();
+                    assert_eq!(
+                        record.terminal.unwrap().outcome,
+                        MeshInvocationOutcome::OutcomeUnknown,
+                    );
+                    if matches!(original_mode, EntryMode::OpaqueMesh) {
+                        // First-version opaque records have no alias field.
+                        assert!(record.intent.transport_idempotency.is_none());
+                    }
+                }
+            }
+            assert_eq!(reopened.state.read().await.next_invocation_attempt_id, 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn concurrent_cross_mode_alias_reservations_have_one_owner() {
+        for (first_mode, second_mode) in CROSS_MODE_PAIRS {
+            let store = HostAdminStateStore::new();
+            let first_request = request("concurrent-first");
+            let mut second_request = first_request.clone();
+            second_request.id = RequestId::new("concurrent-second");
+            let (first, second) = futures_util::future::join(
+                admit_entry(&store, &first_request, first_mode),
+                admit_entry(&store, &second_request, second_mode),
+            )
+            .await;
+            assert_ne!(first.is_ok(), second.is_ok());
+            let (ticket, refusal) = match (first, second) {
+                (Ok(ticket), Err(refusal)) | (Err(refusal), Ok(ticket)) => (ticket, refusal),
+                _ => panic!("exact-token aliases admitted zero or two owners"),
+            };
+            assert!(refusal.to_string().contains(&ticket.operation_id));
+            assert!(refusal.to_string().contains(&format!("attempt_id={}", ticket.attempt_id)));
+            let snapshot = store.state.read().await;
+            assert_eq!(snapshot.invocations.len() + snapshot.mesh_invocations.len(), 1);
+            assert_eq!(snapshot.next_invocation_attempt_id, 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn completed_cross_mode_bindings_reject_changed_effects_but_allow_same_effects() {
+        for (original_mode, retry_mode) in CROSS_MODE_PAIRS {
+            let store = HostAdminStateStore::new();
+            let source = request("completed-binding");
+            let ticket = admit_entry(&store, &source, original_mode).await.unwrap();
+            complete_entry(&store, &ticket, original_mode).await;
+            let mut retry = source.clone();
+            retry.id = RequestId::new("changed-effects");
+            retry.input = serde_json::json!({"message": "different effect"});
+            let refusal = admit_entry(&store, &retry, retry_mode).await.unwrap_err();
+            assert!(refusal.to_string().contains("different"));
+            assert!(refusal.to_string().contains(&ticket.operation_id));
+            retry.input = source.input;
+            let next = admit_entry(&store, &retry, retry_mode).await.unwrap();
+            assert!(next.attempt_id > ticket.attempt_id);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn a_completed_semantic_match_does_not_skip_the_transport_alias() {
+        let store = HostAdminStateStore::new();
+        let source = request("completed-principal");
+        let original = local_admission(&source);
+        let ticket = store.admit_invocation(original.clone()).await.unwrap();
+        complete_local(&store, &ticket).await;
+        let mut retry = source.clone();
+        retry.id = RequestId::new("same-principal-changed-header");
+        let changed_assertion = MeshInvocationIntent::from_request(
+            &retry,
+            "origin-node",
+            "executor-one",
+            Some("owner"),
+            Some("owner"),
+            Utc::now() + chrono::Duration::seconds(60),
+        )
+        .unwrap();
+        assert_eq!(changed_assertion.idempotency, original.idempotency);
+        let refusal = store.reserve_mesh_invocation(changed_assertion).await.unwrap_err();
+        assert!(refusal.to_string().contains("different invocation effects"));
+        assert!(refusal.to_string().contains(&ticket.operation_id));
+
+        // A matching completed primary also cannot hide another mode's
+        // currently unresolved exact-token reservation.
+        retry.id = RequestId::new("opaque-pending");
+        let opaque = store.reserve_mesh_invocation(intent(&retry, None)).await.unwrap();
+        retry.id = RequestId::new("verified-after-opaque");
+        let refusal = store
+            .reserve_mesh_invocation(intent(&retry, Some("owner")))
+            .await
+            .unwrap_err();
+        assert!(refusal.to_string().contains("unresolved mesh forward"));
+        assert!(refusal.to_string().contains(&opaque.operation_id));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn recovery_checks_transport_alias_overlaps_and_effects_across_all_modes() {
+        for (original_mode, retry_mode) in CROSS_MODE_PAIRS {
+            let store = HostAdminStateStore::new();
+            let source = request("historical-completion");
+            let first = admit_entry(&store, &source, original_mode).await.unwrap();
+            complete_entry(&store, &first, original_mode).await;
+            let mut retry = source;
+            retry.id = RequestId::new("current-pending");
+            let second = admit_entry(&store, &retry, retry_mode).await.unwrap();
+            let original = store.state.read().await.clone();
+            let mut valid = original.clone();
+            assert!(valid.recover_invocations_after_restart(Utc::now()).is_ok());
+
+            let mut overlap = original.clone();
+            if let Some(record) = overlap.invocations.iter_mut().find(|record| record.ticket == first) {
+                record.terminal = None;
+                record.finished_at = None;
+                record.finalization = None;
+            } else {
+                let record = overlap.mesh_invocations.iter_mut()
+                    .find(|record| record.ticket == first).unwrap();
+                record.terminal = None;
+                record.finished_at = None;
+                // A successful reply without finalization becomes unknown.
+            }
+            let refusal = overlap.recover_invocations_after_restart(Utc::now()).unwrap_err();
+            assert!(refusal.to_string().contains("transport idempotency scope"));
+            assert!(refusal.to_string().contains("overlapping unresolved"));
+
+            let mut conflicting_effects = original;
+            let binding = if let Some(record) = conflicting_effects.invocations.iter_mut()
+                .find(|record| record.ticket == second)
+            {
+                record.admission.transport_idempotency.as_mut().unwrap()
+            } else {
+                let record = conflicting_effects.mesh_invocations.iter_mut()
+                    .find(|record| record.ticket == second).unwrap();
+                if record.intent.has_verified_scope() {
+                    record.intent.transport_idempotency.as_mut().unwrap()
+                } else {
+                    record.intent.idempotency.as_mut().unwrap()
+                }
+            };
+            binding.effect_digest = if binding.effect_digest == "0".repeat(64) {
+                "1".repeat(64)
+            } else {
+                "0".repeat(64)
+            };
+            let refusal = conflicting_effects
+                .recover_invocations_after_restart(Utc::now()).unwrap_err();
+            assert!(refusal.to_string().contains("transport idempotency effects"));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn malformed_transport_alias_linkage_is_rejected_on_admission_and_recovery() {
+        for mode in [EntryMode::Local, EntryMode::VerifiedMesh, EntryMode::OpaqueMesh] {
+            let store = HostAdminStateStore::new();
+            let source = request("invalid-alias");
+            let refusal = match mode {
+                EntryMode::Local => {
+                    let mut admission = local_admission(&source);
+                    admission.idempotency = None;
+                    store.admit_invocation(admission).await
+                }
+                EntryMode::VerifiedMesh => {
+                    let mut invalid = intent(&source, Some("owner"));
+                    invalid.idempotency = None;
+                    store.reserve_mesh_invocation(invalid).await
+                }
+                EntryMode::OpaqueMesh => {
+                    let mut invalid = intent(&source, None);
+                    invalid.transport_idempotency = invalid.idempotency.clone();
+                    store.reserve_mesh_invocation(invalid).await
+                }
+            };
+            assert!(refusal.is_err());
+            assert_eq!(store.state.read().await.next_invocation_attempt_id, 1);
+            admit_entry(&store, &source, mode).await.unwrap();
+            let mut persisted = store.state.read().await.clone();
+            match mode {
+                EntryMode::Local => persisted.invocations[0].admission.idempotency = None,
+                EntryMode::VerifiedMesh => persisted.mesh_invocations[0].intent.idempotency = None,
+                EntryMode::OpaqueMesh => {
+                    let intent = &mut persisted.mesh_invocations[0].intent;
+                    intent.transport_idempotency = intent.idempotency.clone();
+                }
+            }
+            assert!(persisted.recover_invocations_after_restart(Utc::now()).is_err());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn historical_verified_records_remain_readable_without_invented_aliases() {
+        for mode in [EntryMode::Local, EntryMode::VerifiedMesh] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+            let source = request("legacy-verified");
+            let ticket = match mode {
+                EntryMode::Local => {
+                    let mut admission = local_admission(&source);
+                    admission.transport_idempotency = None;
+                    store.admit_invocation(admission).await.unwrap()
+                }
+                EntryMode::VerifiedMesh => {
+                    let mut legacy = intent(&source, Some("owner"));
+                    legacy.transport_idempotency = None;
+                    store.reserve_mesh_invocation(legacy).await.unwrap()
+                }
+                EntryMode::OpaqueMesh => unreachable!(),
+            };
+            assert!(!std::fs::read_to_string(&path).unwrap().contains("transport_idempotency"));
+            drop(store);
+            let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+            let observation = reopened
+                .invocation_observation(&ticket.operation_id, Some(ticket.attempt_id))
+                .await;
+            if let Some(record) = observation.invocation {
+                assert!(record.admission.transport_idempotency.is_none());
+            } else {
+                assert!(observation.mesh_invocation.unwrap().intent.transport_idempotency.is_none());
+            }
+            let mut retry = source;
+            retry.id = RequestId::new("legacy-same-principal-new-id");
+            let refusal = admit_entry(&reopened, &retry, mode).await.unwrap_err();
+            assert!(refusal.to_string().contains("unresolved"));
+            assert!(refusal.to_string().contains(&ticket.operation_id));
+        }
     }
 
     #[fcp_async_core::runtime::test]

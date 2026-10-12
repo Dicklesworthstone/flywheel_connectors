@@ -738,6 +738,12 @@ async fn run_owned(
         deadline_at: chrono::Utc::now()
             + chrono::Duration::milliseconds(i64::try_from(remaining_ms).unwrap_or(i64::MAX)),
         idempotency: fcp_host::InvocationIdempotency::from_request(&request, &audit.actor)?,
+        // Retain the exact-token alias as well as the verified principal. A
+        // route change must not escape an earlier transparent relay's fence.
+        transport_idempotency: fcp_host::InvocationIdempotency::from_relay_request(
+            &request,
+            asserted_principal.as_deref(),
+        )?,
     };
     let ticket = match before_deadline(
         deadline,

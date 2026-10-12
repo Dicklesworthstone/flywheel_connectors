@@ -558,6 +558,60 @@ impl InvocationIdempotency {
         }))
     }
 
+    /// Bind an opaque transport alias without interpreting capability claims.
+    ///
+    /// This is the same namespace used by transparent mesh relays. Live
+    /// verified admissions retain it alongside their principal-scoped binding
+    /// so changing routes or verification vantage cannot escape an unresolved
+    /// exact-token key. Renewed credentials remain a different opaque scope.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed assertion metadata, an invalid idempotency key, or
+    /// capability/effect data that cannot be canonically encoded.
+    pub fn from_relay_request(
+        request: &fcp_kernel::InvokeRequest,
+        asserted_principal: Option<&str>,
+    ) -> HostResult<Option<Self>> {
+        if request.idempotency_key.is_none() {
+            return Ok(None);
+        }
+        let capability_digest = invocation_relay_capability_digest(request)?;
+        Self::from_relay_parts(request, &capability_digest, asserted_principal)
+    }
+
+    fn from_relay_parts(
+        request: &fcp_kernel::InvokeRequest,
+        capability_digest: &str,
+        asserted_principal: Option<&str>,
+    ) -> HostResult<Option<Self>> {
+        let Some(key) = request.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        request.validate_idempotency_key().map_err(|_| {
+            HostError::InvalidFilter("invalid mesh invocation idempotency key".to_string())
+        })?;
+        if let Some(asserted) = asserted_principal {
+            validate_invocation_metadata(asserted, "asserted principal")?;
+        }
+        Ok(Some(Self {
+            scope_digest: invocation_idempotency_digest(
+                "fcp.host.mesh.relay.scope.v1",
+                &(
+                    request.zone_id.as_str(),
+                    request.connector_id.as_str(),
+                    request.operation.as_str(),
+                    capability_digest,
+                    key,
+                ),
+            )?,
+            effect_digest: invocation_idempotency_digest(
+                "fcp.host.mesh.relay.effect.v1",
+                &(invocation_effect_digest(request)?, asserted_principal),
+            )?,
+        }))
+    }
+
     fn validate(&self) -> HostResult<()> {
         for digest in [&self.scope_digest, &self.effect_digest] {
             if digest.len() != 64
@@ -573,6 +627,15 @@ impl InvocationIdempotency {
         }
         Ok(())
     }
+}
+
+fn invocation_relay_capability_digest(request: &fcp_kernel::InvokeRequest) -> HostResult<String> {
+    let capability = request.capability_token.raw().to_cbor().map_err(|_| {
+        HostError::InvalidFilter(
+            "mesh invocation capability binding could not be encoded".to_string(),
+        )
+    })?;
+    invocation_idempotency_digest("fcp.host.mesh.relay.capability.v1", &capability)
 }
 
 fn invocation_effect_digest(request: &fcp_kernel::InvokeRequest) -> HostResult<String> {
@@ -624,6 +687,13 @@ pub struct InvocationAdmission {
     /// Optional metadata-only idempotency reservation for this authorized scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<InvocationIdempotency>,
+    /// Opaque exact-token alias shared with transparent mesh forwarding.
+    ///
+    /// New live admissions populate this after authorization. Historical
+    /// records without an alias retain their original principal and ID fences;
+    /// the missing credential binding cannot be inferred from stored metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_idempotency: Option<InvocationIdempotency>,
 }
 
 /// Identity of one retained invocation attempt.
@@ -2985,6 +3055,19 @@ impl HostAdminStateSnapshot {
                     ));
                 }
             }
+            if let Some(binding) = &record.admission.transport_idempotency {
+                if record.admission.idempotency.is_none() {
+                    return Err(HostError::Internal(
+                        "persisted local transport alias has no principal-scoped binding".to_string(),
+                    ));
+                }
+                mesh_invocations::recover_transport_idempotency(
+                    binding,
+                    record.is_unresolved(),
+                    &mut scoped_effects,
+                    &mut unresolved_scopes,
+                )?;
+            }
         }
         changed |= self.recover_mesh_invocations_after_restart(
             now,
@@ -4944,48 +5027,33 @@ impl HostAdminStateStore {
         if let Some(binding) = &admission.idempotency {
             binding.validate()?;
         }
+        if let Some(binding) = &admission.transport_idempotency {
+            binding.validate()?;
+            if admission.idempotency.is_none() {
+                return Err(HostError::InvalidFilter(
+                    "transport idempotency alias requires a principal-scoped binding".to_string(),
+                ));
+            }
+        }
         let durable = self.state_path.is_some() && cfg!(unix);
         self.apply_mutation(|snapshot| {
             let now = Utc::now();
             if admission.deadline_at <= now {
                 return Err(invocation_state_error("invocation admission deadline expired"));
             }
+            // Check every applicable scope before reclaiming history. The
+            // opaque alias fences the same token across local and relay paths.
             snapshot.check_mesh_invocation_conflicts(
                 &admission.operation_id,
                 admission.idempotency.as_ref(),
                 true,
+                admission.transport_idempotency.as_ref(),
             )?;
-            // Check retained bindings before reclaiming history. A different
-            // request ID must not bypass an unresolved external effect.
-            if let Some(binding) = &admission.idempotency {
-                for record in snapshot.invocations.iter().rev() {
-                    let Some(previous) = &record.admission.idempotency else {
-                        continue;
-                    };
-                    if previous.scope_digest != binding.scope_digest {
-                        continue;
-                    }
-                    if previous.effect_digest != binding.effect_digest {
-                        return Err(invocation_idempotency_conflict(
-                            "idempotency key is already bound to different invocation effects",
-                            &record.ticket,
-                        ));
-                    }
-                    if record.is_unresolved() {
-                        return Err(invocation_idempotency_conflict(
-                            "idempotency key has an unresolved attempt",
-                            &record.ticket,
-                        ));
-                    }
-                }
-            }
-            if snapshot.invocations.iter().any(|record| {
-                record.ticket.operation_id == admission.operation_id && record.is_unresolved()
-            }) {
-                return Err(invocation_state_error(
-                    "invocation identifier has an unresolved attempt; inspect its outcome before retrying",
-                ));
-            }
+            snapshot.check_local_invocation_conflicts(
+                &admission.operation_id,
+                admission.idempotency.as_ref(),
+                admission.transport_idempotency.as_ref(),
+            )?;
             // Local and forwarded work share one bound. Unknown effects and
             // incomplete finalization are never reclaimed to admit more work.
             snapshot.reserve_invocation_history_slot()?;
@@ -5906,6 +5974,7 @@ mod tests {
             correlation_id: Some("trace-1".to_string()),
             deadline_at: Utc::now() + Duration::seconds(60),
             idempotency: None,
+            transport_idempotency: None,
         }
     }
 
@@ -5942,6 +6011,9 @@ mod tests {
             correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
             deadline_at: Utc::now() + Duration::seconds(60),
             idempotency: InvocationIdempotency::from_request(request, principal).unwrap(),
+            // These fixtures isolate the principal-scoped contract. Live
+            // dual-scope admission is exercised by mesh_invocations tests.
+            transport_idempotency: None,
         }
     }
 
