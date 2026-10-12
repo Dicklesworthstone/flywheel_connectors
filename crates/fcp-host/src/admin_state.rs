@@ -502,6 +502,97 @@ pub struct ReceiptQueryResponse {
     pub total_receipts: usize,
 }
 
+/// Payload-free binding of a host-local idempotency key to invocation effects.
+///
+/// Both digests use canonical CBOR with separate, versioned BLAKE3 domains.
+/// They are not provider reconciliation evidence or a committed-result cache.
+/// A binding exists only while its invocation history is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationIdempotency {
+    /// Digest of zone, verified principal, connector, operation and opaque key.
+    pub scope_digest: String,
+    /// Digest of effect-affecting input, context and provenance.
+    pub effect_digest: String,
+}
+
+impl InvocationIdempotency {
+    /// Bind a request after preflight has established its authoritative principal.
+    ///
+    /// Request identity, top-level credentials, tracing, deadlines and lease
+    /// generations may change on a retry. Locale, pagination, routing tags and
+    /// provenance remain bound; the reserved host parent-request correlation
+    /// tag is excluded. Input is bound in full, including any nested sampling
+    /// dispatch credentials, so changing such input conservatively refuses reuse.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid principal metadata, oversized keys or noncanonical data.
+    pub fn from_request(
+        request: &fcp_kernel::InvokeRequest,
+        verified_principal: &str,
+    ) -> HostResult<Option<Self>> {
+        let Some(key) = request.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        validate_invocation_metadata(verified_principal, "verified principal")?;
+        request.validate_idempotency_key().map_err(|_| {
+            HostError::InvalidFilter("invalid invocation idempotency key".to_string())
+        })?;
+        let scope_digest = invocation_idempotency_digest(
+            "fcp.host.invocation.scope.v1",
+            &(
+                request.zone_id.as_str(),
+                verified_principal,
+                request.connector_id.as_str(),
+                request.operation.as_str(),
+                key,
+            ),
+        )?;
+        let mut context = request.context.clone().unwrap_or_default();
+        context.trace_id = None;
+        // Sampling adds this reserved correlation link when it creates a new
+        // child request. The parent attempt ID is not part of the child effect.
+        context.request_tags.remove("fcp.host.parent_request_id");
+        let mut provenance = request.provenance.clone();
+        if let Some(provenance) = &mut provenance {
+            // The semantic elevation and origin remain bound. Renewing the
+            // authorization proving them must not change the effect identity.
+            provenance.elevation_token = None;
+        }
+        let effect_digest = invocation_idempotency_digest(
+            "fcp.host.invocation.effect.v1",
+            &(&request.input, &context, &provenance),
+        )?;
+        Ok(Some(Self {
+            scope_digest,
+            effect_digest,
+        }))
+    }
+
+    fn validate(&self) -> HostResult<()> {
+        for digest in [&self.scope_digest, &self.effect_digest] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(HostError::InvalidFilter(
+                    "invocation idempotency digests must be 64 lowercase hexadecimal characters"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn invocation_idempotency_digest<T: Serialize>(domain: &str, value: &T) -> HostResult<String> {
+    let encoded = fcp_cbor::to_canonical_cbor(&(domain, value)).map_err(|_| {
+        HostError::InvalidFilter("invocation idempotency binding could not be encoded".to_string())
+    })?;
+    Ok(hash(&encoded).to_hex().to_string())
+}
+
 /// Metadata admitted before executor-local connector dispatch.
 ///
 /// Inputs, capability tokens, idempotency keys and result bodies are deliberately
@@ -523,6 +614,9 @@ pub struct InvocationAdmission {
     pub correlation_id: Option<String>,
     /// Absolute deadline shared by admission and execution.
     pub deadline_at: DateTime<Utc>,
+    /// Optional metadata-only idempotency reservation for this authorized scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<InvocationIdempotency>,
 }
 
 /// Identity of one retained invocation attempt.
@@ -620,6 +714,27 @@ pub struct InvocationRecord {
     /// Explicit memory-only hosts and platforms without directory sync report
     /// false and must not claim recovery across host or machine failure.
     pub durable: bool,
+}
+
+impl InvocationRecord {
+    fn is_unresolved(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal.outcome == InvocationOutcome::OutcomeUnknown)
+            || self.finalization.as_ref().is_none_or(|finalization| {
+                finalization.response_http_status.is_none()
+                    || finalization.sampling_completed == Some(false)
+            })
+    }
+}
+
+fn invocation_idempotency_conflict(reason: &str, ticket: &InvocationTicket) -> LifecycleError {
+    let operation_id = serde_json::to_string(&ticket.operation_id)
+        .expect("invocation identifier is JSON serializable");
+    invocation_state_error(&format!(
+        "{reason}; inspect operation_id={operation_id} attempt_id={} before retrying",
+        ticket.attempt_id,
+    ))
 }
 
 /// Protected admin query for a specific invocation.
@@ -2784,6 +2899,8 @@ impl Default for HostAdminStateSnapshot {
 impl HostAdminStateSnapshot {
     fn recover_invocations_after_restart(&mut self, now: DateTime<Utc>) -> HostResult<bool> {
         let mut generations = HashSet::new();
+        let mut scoped_effects = HashMap::new();
+        let mut unresolved_scopes = HashSet::new();
         let mut changed = false;
         for record in &mut self.invocations {
             if record.ticket.operation_id != record.admission.operation_id
@@ -2800,13 +2917,36 @@ impl HostAdminStateSnapshot {
                     outcome: InvocationOutcome::OutcomeUnknown,
                     receipt_id: None,
                     duration_ms: u64::try_from(
-                        now.signed_duration_since(record.admitted_at).num_milliseconds(),
+                        now.signed_duration_since(record.admitted_at)
+                            .num_milliseconds(),
                     )
                     .unwrap_or(0),
                     http_status: 503,
                 });
                 record.finished_at = Some(now);
                 changed = true;
+            }
+            if let Some(binding) = &record.admission.idempotency {
+                binding.validate().map_err(|_| {
+                    HostError::Internal(
+                        "persisted invocation idempotency binding is invalid".to_string(),
+                    )
+                })?;
+                if scoped_effects
+                    .insert(binding.scope_digest.clone(), binding.effect_digest.clone())
+                    .is_some_and(|previous| previous != binding.effect_digest)
+                {
+                    return Err(HostError::Internal(
+                        "persisted invocation idempotency effects are inconsistent".to_string(),
+                    ));
+                }
+                if record.is_unresolved() && !unresolved_scopes.insert(binding.scope_digest.clone())
+                {
+                    return Err(HostError::Internal(
+                        "persisted invocation idempotency scope has overlapping unresolved attempts"
+                            .to_string(),
+                    ));
+                }
             }
         }
         if self.next_invocation_attempt_id == 0 {
@@ -4718,10 +4858,15 @@ impl HostAdminStateStore {
     ///
     /// # Errors
     ///
-    /// Rejects invalid or expired metadata, any unresolved attempt using the
-    /// same identifier, history filled with unresolved or unfinished work,
-    /// generation overflow, or persistence failure. At capacity the oldest
-    /// confirmed, finalized attempt is evicted; unknown work is never evicted.
+    /// Rejects invalid or expired metadata, unresolved attempts using the same
+    /// identifier or scoped idempotency key, and retained keys with different
+    /// effects. History exhaustion, generation overflow and persistence failure
+    /// also refuse admission. The refusal identifies the original exact ticket.
+    ///
+    /// At capacity the oldest confirmed, finalized attempt is evicted; unknown
+    /// work is never evicted. Fully finalized matching requests retain existing
+    /// re-execution semantics: this bounded fence is not a committed-result
+    /// cache or an all-time/provider idempotency guarantee.
     pub async fn admit_invocation(
         &self,
         admission: InvocationAdmission,
@@ -4738,34 +4883,51 @@ impl HostAdminStateStore {
         if let Some(correlation_id) = &admission.correlation_id {
             validate_invocation_metadata(correlation_id, "correlation_id")?;
         }
+        if let Some(binding) = &admission.idempotency {
+            binding.validate()?;
+        }
         let durable = self.state_path.is_some() && cfg!(unix);
         self.apply_mutation(|snapshot| {
             let now = Utc::now();
             if admission.deadline_at <= now {
                 return Err(invocation_state_error("invocation admission deadline expired"));
             }
+            // Check retained bindings before reclaiming history. A different
+            // request ID must not bypass an unresolved external effect.
+            if let Some(binding) = &admission.idempotency {
+                for record in snapshot.invocations.iter().rev() {
+                    let Some(previous) = &record.admission.idempotency else {
+                        continue;
+                    };
+                    if previous.scope_digest != binding.scope_digest {
+                        continue;
+                    }
+                    if previous.effect_digest != binding.effect_digest {
+                        return Err(invocation_idempotency_conflict(
+                            "idempotency key is already bound to different invocation effects",
+                            &record.ticket,
+                        ));
+                    }
+                    if record.is_unresolved() {
+                        return Err(invocation_idempotency_conflict(
+                            "idempotency key has an unresolved attempt",
+                            &record.ticket,
+                        ));
+                    }
+                }
+            }
             if snapshot.invocations.iter().any(|record| {
-                record.ticket.operation_id == admission.operation_id
-                    && (record.terminal.as_ref().is_none_or(|terminal| {
-                        terminal.outcome == InvocationOutcome::OutcomeUnknown
-                    }) || record.finalization.as_ref().is_none_or(|finalization| {
-                        finalization.response_http_status.is_none()
-                            || finalization.sampling_completed == Some(false)
-                    }))
+                record.ticket.operation_id == admission.operation_id && record.is_unresolved()
             }) {
                 return Err(invocation_state_error(
                     "invocation identifier has an unresolved attempt; inspect its outcome before retrying",
                 ));
             }
             while snapshot.invocations.len() >= MAX_RETAINED_INVOCATIONS {
-                let completed = snapshot.invocations.iter().position(|record| {
-                    record.terminal.as_ref().is_some_and(|terminal| {
-                        terminal.outcome != InvocationOutcome::OutcomeUnknown
-                    }) && record.finalization.as_ref().is_some_and(|finalization| {
-                        finalization.response_http_status.is_some()
-                            && finalization.sampling_completed != Some(false)
-                    })
-                });
+                let completed = snapshot
+                    .invocations
+                    .iter()
+                    .position(|record| !record.is_unresolved());
                 let Some(index) = completed else {
                     return Err(invocation_state_error(
                         "retained invocation history is full of unresolved or unfinished attempts",
@@ -5689,6 +5851,43 @@ mod tests {
             principal: "owner".to_string(),
             correlation_id: Some("trace-1".to_string()),
             deadline_at: Utc::now() + Duration::seconds(60),
+            idempotency: None,
+        }
+    }
+
+    fn keyed_invocation_request(operation_id: &str) -> fcp_kernel::InvokeRequest {
+        fcp_kernel::InvokeRequest {
+            r#type: "invoke".to_string(),
+            id: fcp_kernel::RequestId::new(operation_id),
+            connector_id: connector_id(),
+            operation: OperationId::from_static("send"),
+            zone_id: fcp_core::ZoneId::work(),
+            input: serde_json::json!({ "message": "private invocation input", "count": 1 }),
+            capability_token: CapabilityToken::test_token(),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("private-idempotency-key".to_string()),
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        }
+    }
+
+    fn keyed_invocation_admission(
+        request: &fcp_kernel::InvokeRequest,
+        principal: &str,
+    ) -> InvocationAdmission {
+        InvocationAdmission {
+            operation_id: request.id.to_string(),
+            connector_id: request.connector_id.to_string(),
+            operation: request.operation.to_string(),
+            zone_id: request.zone_id.to_string(),
+            principal: principal.to_string(),
+            correlation_id: request.correlation_id.as_ref().map(ToString::to_string),
+            deadline_at: Utc::now() + Duration::seconds(60),
+            idempotency: InvocationIdempotency::from_request(request, principal).unwrap(),
         }
     }
 
@@ -5699,6 +5898,455 @@ mod tests {
             duration_ms: 17,
             http_status: 200,
         }
+    }
+
+    #[test]
+    fn invocation_idempotency_fingerprint_is_canonical_and_excludes_attempt_metadata() {
+        let mut request = keyed_invocation_request("original");
+        request.context = Some(fcp_kernel::InvokeContext {
+            locale: Some("en-US".to_string()),
+            pagination: Some(serde_json::json!({ "cursor": "page-2", "limit": 5 })),
+            trace_id: Some("first-trace".to_string()),
+            request_tags: HashMap::from([
+                ("routing.region".to_string(), "us".to_string()),
+                ("routing.pool".to_string(), "primary".to_string()),
+            ]),
+        });
+        let mut provenance = fcp_core::Provenance::new(fcp_core::ZoneId::work());
+        provenance.elevated = true;
+        provenance.elevation_token = Some("first-elevation-token".to_string());
+        request.provenance = Some(provenance);
+        let original = InvocationIdempotency::from_request(&request, "owner")
+            .unwrap()
+            .unwrap();
+
+        let mut retry = request.clone();
+        retry.id = fcp_kernel::RequestId::new("retry");
+        retry.input =
+            serde_json::from_str(r#"{"count":1,"message":"private invocation input"}"#).unwrap();
+        retry.capability_token = CapabilityToken::test_token();
+        retry.deadline_ms = Some(1234);
+        retry.lease_seq = Some(9001);
+        retry.correlation_id = Some(fcp_core::CorrelationId::new());
+        let context = retry.context.as_mut().unwrap();
+        context.trace_id = Some("second-trace".to_string());
+        context.pagination =
+            Some(serde_json::from_str(r#"{"limit":5,"cursor":"page-2"}"#).unwrap());
+        context.request_tags = HashMap::from([
+            ("routing.pool".to_string(), "primary".to_string()),
+            ("routing.region".to_string(), "us".to_string()),
+            (
+                "fcp.host.parent_request_id".to_string(),
+                "new-parent-attempt".to_string(),
+            ),
+        ]);
+        retry.provenance.as_mut().unwrap().elevation_token =
+            Some("renewed-elevation-token".to_string());
+        assert_eq!(
+            InvocationIdempotency::from_request(&retry, "owner")
+                .unwrap()
+                .unwrap(),
+            original,
+        );
+
+        let metadata = serde_json::to_string(&keyed_invocation_admission(&retry, "owner")).unwrap();
+        for private_value in [
+            "private-idempotency-key",
+            "private invocation input",
+            "renewed-elevation-token",
+            "capability_token",
+        ] {
+            assert!(!metadata.contains(private_value));
+        }
+        let mut plain = keyed_invocation_request("plain");
+        let plain_binding = InvocationIdempotency::from_request(&plain, "owner").unwrap();
+        plain.context = Some(fcp_kernel::InvokeContext::default());
+        assert_eq!(
+            InvocationIdempotency::from_request(&plain, "owner").unwrap(),
+            plain_binding,
+            "absent and empty effect contexts are equivalent",
+        );
+        plain.idempotency_key = None;
+        assert!(
+            InvocationIdempotency::from_request(&plain, "owner")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invocation_idempotency_fingerprint_binds_effects_and_authorized_scope() {
+        let original_request = keyed_invocation_request("original");
+        let original = InvocationIdempotency::from_request(&original_request, "owner")
+            .unwrap()
+            .unwrap();
+        let mut changed_effects = Vec::new();
+
+        let mut input = original_request.clone();
+        input.input["count"] = serde_json::json!(2);
+        changed_effects.push(input);
+        let mut locale = original_request.clone();
+        locale.context = Some(fcp_kernel::InvokeContext {
+            locale: Some("fr-FR".to_string()),
+            ..Default::default()
+        });
+        changed_effects.push(locale);
+        let mut pagination = original_request.clone();
+        pagination.context = Some(fcp_kernel::InvokeContext {
+            pagination: Some(serde_json::json!({ "cursor": "another-page" })),
+            ..Default::default()
+        });
+        changed_effects.push(pagination);
+        let mut routing = original_request.clone();
+        routing.context = Some(fcp_kernel::InvokeContext {
+            request_tags: HashMap::from([("routing.region".to_string(), "eu".to_string())]),
+            ..Default::default()
+        });
+        changed_effects.push(routing);
+        let mut provenance = original_request.clone();
+        provenance.provenance = Some(fcp_core::Provenance::tainted(fcp_core::ZoneId::work()));
+        changed_effects.push(provenance);
+        for changed in changed_effects {
+            let binding = InvocationIdempotency::from_request(&changed, "owner")
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.scope_digest, original.scope_digest);
+            assert_ne!(binding.effect_digest, original.effect_digest);
+        }
+
+        let mut changed_scopes = Vec::new();
+        let mut zone = original_request.clone();
+        zone.zone_id = fcp_core::ZoneId::private();
+        changed_scopes.push(zone);
+        let mut connector = original_request.clone();
+        connector.connector_id = secondary_connector_id();
+        changed_scopes.push(connector);
+        let mut operation = original_request.clone();
+        operation.operation = OperationId::from_static("update");
+        changed_scopes.push(operation);
+        let mut key = original_request.clone();
+        key.idempotency_key = Some("another-key".to_string());
+        changed_scopes.push(key);
+        for changed in changed_scopes {
+            let binding = InvocationIdempotency::from_request(&changed, "owner")
+                .unwrap()
+                .unwrap();
+            assert_ne!(binding.scope_digest, original.scope_digest);
+            assert_eq!(binding.effect_digest, original.effect_digest);
+        }
+        let other_principal = InvocationIdempotency::from_request(&original_request, "other-owner")
+            .unwrap()
+            .unwrap();
+        assert_ne!(other_principal.scope_digest, original.scope_digest);
+        assert_eq!(other_principal.effect_digest, original.effect_digest);
+
+        let mut oversized = original_request;
+        oversized.idempotency_key = Some("x".repeat(fcp_core::MAX_IDEMPOTENCY_KEY_LEN + 1));
+        assert!(InvocationIdempotency::from_request(&oversized, "owner").is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_reservation_is_atomic_across_request_ids() {
+        let store = HostAdminStateStore::new();
+        let first_request = keyed_invocation_request("first");
+        let mut second_request = first_request.clone();
+        second_request.id = fcp_kernel::RequestId::new("second");
+        let (first, second) = futures_util::future::join(
+            store.admit_invocation(keyed_invocation_admission(&first_request, "owner")),
+            store.admit_invocation(keyed_invocation_admission(&second_request, "owner")),
+        )
+        .await;
+        let (ticket, rejected) = match (first, second) {
+            (Ok(ticket), Err(error)) | (Err(error), Ok(ticket)) => (ticket, error),
+            other => panic!("one scoped-key admission must win: {other:?}"),
+        };
+        let message = rejected.to_string();
+        assert!(message.contains(&format!("operation_id={:?}", ticket.operation_id)));
+        assert!(message.contains(&format!("attempt_id={}", ticket.attempt_id)));
+        assert!(!message.contains("private-idempotency-key"));
+        assert_eq!(store.state.read().await.invocations.len(), 1);
+
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+        let mut retry = first_request;
+        retry.id = fcp_kernel::RequestId::new("third");
+        assert!(
+            store
+                .admit_invocation(keyed_invocation_admission(&retry, "owner"))
+                .await
+                .is_err(),
+            "a definite source response does not release unfinished finalization",
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_survives_restart_and_returns_original_ticket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keyed-invocations.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let request = keyed_invocation_request("before-restart");
+        let ticket = store
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
+            .await
+            .unwrap();
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        assert!(!encoded.contains("private-idempotency-key"));
+        assert!(!encoded.contains("private invocation input"));
+        drop(store);
+
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let mut retry = request;
+        retry.id = fcp_kernel::RequestId::new("after-restart");
+        let error = reopened
+            .admit_invocation(keyed_invocation_admission(&retry, "owner"))
+            .await
+            .expect_err("a fresh request ID cannot repeat an unknown effect");
+        assert!(
+            error
+                .to_string()
+                .contains("operation_id=\"before-restart\"")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("attempt_id={}", ticket.attempt_id))
+        );
+        assert!(
+            reopened
+                .invocation_record("after-restart", None)
+                .await
+                .is_none()
+        );
+        let record = reopened
+            .invocation_record("before-restart", None)
+            .await
+            .unwrap();
+        assert_eq!(record.ticket, ticket);
+        assert_eq!(
+            record.terminal.unwrap().outcome,
+            InvocationOutcome::OutcomeUnknown
+        );
+        assert!(record.admission.idempotency.is_some());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_rejects_retained_mismatch_without_claiming_result_replay() {
+        let store = HostAdminStateStore::new();
+        let request = keyed_invocation_request("original");
+        let ticket = store
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+        store
+            .record_invocation_finalization(
+                &ticket,
+                InvocationFinalization {
+                    response_http_status: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut changed = request.clone();
+        changed.id = fcp_kernel::RequestId::new("changed-input");
+        changed.input["count"] = serde_json::json!(2);
+        let error = store
+            .admit_invocation(keyed_invocation_admission(&changed, "owner"))
+            .await
+            .expect_err("retained key is still bound to original effects");
+        assert!(error.to_string().contains("different invocation effects"));
+        assert!(error.to_string().contains("operation_id=\"original\""));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("attempt_id={}", ticket.attempt_id))
+        );
+        assert!(
+            store
+                .invocation_record("changed-input", None)
+                .await
+                .is_none()
+        );
+
+        let mut same = request;
+        same.id = fcp_kernel::RequestId::new("completed-reuse");
+        let next = store
+            .admit_invocation(keyed_invocation_admission(&same, "owner"))
+            .await
+            .expect("completed matching requests retain existing re-execution semantics");
+        assert!(next.attempt_id > ticket.attempt_id);
+        assert!(
+            store
+                .invocation_record("completed-reuse", None)
+                .await
+                .unwrap()
+                .terminal
+                .is_none(),
+            "admission does not pretend that a prior result was replayed",
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_admission_is_scoped_to_verified_authority_and_operation() {
+        let store = HostAdminStateStore::new();
+        let request = keyed_invocation_request("original");
+        store
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
+            .await
+            .unwrap();
+        let mut scopes = Vec::new();
+        let mut principal = request.clone();
+        principal.id = fcp_kernel::RequestId::new("another-principal");
+        scopes.push((principal, "another-owner"));
+        let mut zone = request.clone();
+        zone.id = fcp_kernel::RequestId::new("another-zone");
+        zone.zone_id = fcp_core::ZoneId::private();
+        scopes.push((zone, "owner"));
+        let mut connector = request.clone();
+        connector.id = fcp_kernel::RequestId::new("another-connector");
+        connector.connector_id = secondary_connector_id();
+        scopes.push((connector, "owner"));
+        let mut operation = request.clone();
+        operation.id = fcp_kernel::RequestId::new("another-operation");
+        operation.operation = OperationId::from_static("update");
+        scopes.push((operation, "owner"));
+        for (scoped, principal) in scopes {
+            store
+                .admit_invocation(keyed_invocation_admission(&scoped, principal))
+                .await
+                .expect("independent authorized scope must remain usable");
+        }
+        assert_eq!(store.state.read().await.invocations.len(), 5);
+        let mut same_scope = request;
+        same_scope.id = fcp_kernel::RequestId::new("duplicate");
+        assert!(
+            store
+                .admit_invocation(keyed_invocation_admission(&same_scope, "owner"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_keeps_ambiguous_sampling_fenced_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sampling-key.json");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        let request = keyed_invocation_request("sampling-source");
+        let ticket = store
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
+            .await
+            .unwrap();
+        store
+            .finish_invocation(&ticket, successful_invocation())
+            .await
+            .unwrap();
+        store
+            .record_invocation_finalization(
+                &ticket,
+                InvocationFinalization {
+                    sampling_operation_id: Some("unknown-child".to_string()),
+                    sampling_completed: Some(false),
+                    response_http_status: Some(502),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let mut retry = request;
+        retry.id = fcp_kernel::RequestId::new("sampling-retry");
+        let error = reopened
+            .admit_invocation(keyed_invocation_admission(&retry, "owner"))
+            .await
+            .expect_err("a final HTTP error cannot release an ambiguous sampling child");
+        assert!(
+            error
+                .to_string()
+                .contains("operation_id=\"sampling-source\"")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("attempt_id={}", ticket.attempt_id))
+        );
+        assert!(
+            reopened
+                .invocation_record("sampling-retry", None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invocation_idempotency_rejects_malformed_and_conflicting_persisted_bindings() {
+        let store = HostAdminStateStore::new();
+        let request = keyed_invocation_request("original");
+        let mut malformed = keyed_invocation_admission(&request, "owner");
+        malformed.idempotency.as_mut().unwrap().scope_digest = "not-a-digest".to_string();
+        assert!(store.admit_invocation(malformed).await.is_err());
+        assert!(store.state.read().await.invocations.is_empty());
+
+        let ticket = store
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
+            .await
+            .unwrap();
+        let pristine = store.state.read().await.clone();
+        let mut malformed_snapshot = pristine.clone();
+        malformed_snapshot.invocations[0]
+            .admission
+            .idempotency
+            .as_mut()
+            .unwrap()
+            .effect_digest = "F".repeat(64);
+        assert!(
+            malformed_snapshot
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
+
+        let mut overlapping = pristine.clone();
+        let mut extra = overlapping.invocations[0].clone();
+        extra.ticket.operation_id = "duplicate".to_string();
+        extra.admission.operation_id = "duplicate".to_string();
+        extra.ticket.attempt_id = ticket.attempt_id + 1;
+        overlapping.invocations.push(extra);
+        overlapping.next_invocation_attempt_id += 1;
+        assert!(
+            overlapping
+                .recover_invocations_after_restart(Utc::now())
+                .is_err(),
+            "restart must not accept two unresolved claims for one key",
+        );
+
+        let mut conflicting = pristine;
+        let mut extra = conflicting.invocations[0].clone();
+        extra.ticket.operation_id = "changed".to_string();
+        extra.admission.operation_id = "changed".to_string();
+        extra.ticket.attempt_id = ticket.attempt_id + 1;
+        extra.admission.idempotency.as_mut().unwrap().effect_digest = "a".repeat(64);
+        extra.terminal = Some(successful_invocation());
+        extra.finalization = Some(InvocationFinalization {
+            response_http_status: Some(200),
+            ..Default::default()
+        });
+        conflicting.invocations.push(extra);
+        conflicting.next_invocation_attempt_id += 1;
+        assert!(
+            conflicting
+                .recover_invocations_after_restart(Utc::now())
+                .is_err(),
+            "even finalized retained records must agree on the key's effect binding",
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -6094,9 +6742,10 @@ mod tests {
         std::fs::write(&obstruction, b"occupied").unwrap();
         let mut store =
             HostAdminStateStore::with_state_path(obstruction.join("state.json")).unwrap();
+        let blocked = keyed_invocation_request("blocked");
         assert!(
             store
-                .admit_invocation(invocation_admission("blocked"))
+                .admit_invocation(keyed_invocation_admission(&blocked, "owner"))
                 .await
                 .is_err()
         );
@@ -6184,8 +6833,9 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn invocation_history_reclaims_completed_attempts_but_keeps_uncertain_work() {
         let store = HostAdminStateStore::new();
+        let request = keyed_invocation_request("uncertain");
         let uncertain = store
-            .admit_invocation(invocation_admission("uncertain"))
+            .admit_invocation(keyed_invocation_admission(&request, "owner"))
             .await
             .unwrap();
         let template = store.invocation_record("uncertain", None).await.unwrap();
@@ -6198,6 +6848,7 @@ mod tests {
                     .admission
                     .operation_id
                     .clone_from(&record.ticket.operation_id);
+                record.admission.idempotency = None;
                 record.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
                 record.terminal = Some(successful_invocation());
                 record.finished_at = Some(Utc::now());
@@ -6231,6 +6882,17 @@ mod tests {
             store.state.read().await.invocations.len(),
             MAX_RETAINED_INVOCATIONS
         );
+        let mut retry = request;
+        retry.id = fcp_kernel::RequestId::new("fresh-id-under-pressure");
+        assert!(
+            store
+                .admit_invocation(keyed_invocation_admission(&retry, "owner"))
+                .await
+                .is_err(),
+            "history pressure cannot release an unresolved scoped key",
+        );
+        assert!(store.invocation_record("fresh-id-under-pressure", None).await.is_none());
+        assert!(store.invocation_record("completed-3", None).await.is_some());
     }
 
     #[test]

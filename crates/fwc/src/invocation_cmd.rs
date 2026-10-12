@@ -668,6 +668,7 @@ mod tests {
                 zone_id: "z:work".to_owned(),
                 principal: "test-owner".to_owned(),
                 correlation_id: None,
+                idempotency: None,
                 deadline_at: now + chrono::Duration::seconds(30),
             },
             admitted_at: now,

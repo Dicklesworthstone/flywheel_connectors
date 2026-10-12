@@ -17106,30 +17106,28 @@ deny_ptrace = true
         let runner_task = task::spawn(async move {
             let mut started_tx = Some(started_tx);
             let mut release_rx = Some(release_rx);
+            let mut pending_invoke = None;
             while let Some(rpc) = runner_rx.recv().await {
                 assert!(rpc.rpc.try_begin(), "owned command remains admitted");
-                let result = match rpc.method.as_str() {
-                    "introspect" => introspection.clone(),
-                    "health" => dispatcher_health_result(),
-                    "invoke" => {
-                        let request: InvokeRequest =
-                            serde_json::from_value(rpc.params).expect("invoke request");
-                        let admission = observed_lifecycle
-                            .invocation_record(&request.id.to_string(), None)
-                            .await
-                            .expect("admission precedes connector dispatch");
-                        assert!(admission.terminal.is_none());
-                        started_tx
-                            .take()
-                            .expect("one invoke")
-                            .send(admission.ticket)
-                            .expect("admission observer");
-                        release_rx
-                            .take()
-                            .expect("one release")
-                            .await
-                            .expect("release connector");
-                        serde_json::to_value(
+                if rpc.method == "invoke" {
+                    let request: InvokeRequest =
+                        serde_json::from_value(rpc.params).expect("invoke request");
+                    let admission = observed_lifecycle
+                        .invocation_record(&request.id.to_string(), None)
+                        .await
+                        .expect("admission precedes connector dispatch");
+                    assert!(admission.terminal.is_none());
+                    started_tx
+                        .take()
+                        .expect("one invoke")
+                        .send(admission.ticket)
+                        .expect("admission observer");
+                    let release = release_rx.take().expect("one release");
+                    // Keep serving preflight metadata while the first effect is
+                    // unresolved, so a retry reaches the real admission fence.
+                    let held = task::spawn(async move {
+                        release.await.expect("release connector");
+                        let result = serde_json::to_value(
                             InvokeResponse::ok(
                                 request.id,
                                 json!({ "private_result": "not persisted in ownership record" }),
@@ -17137,15 +17135,26 @@ deny_ptrace = true
                             .with_receipt_id(ObjectId::from_bytes([41; 32]))
                             .with_usage_metrics(vec![UsageMetric::requests(3)]),
                         )
-                        .expect("invoke response")
-                    }
+                        .expect("invoke response");
+                        assert!(
+                            rpc.rpc.try_settle_reply(),
+                            "disconnecting the HTTP waiter must not cancel the host-owned command"
+                        );
+                        let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+                    });
+                    assert!(pending_invoke.replace(held).is_none(), "one dispatch");
+                    continue;
+                }
+                let result = match rpc.method.as_str() {
+                    "introspect" => introspection.clone(),
+                    "health" => dispatcher_health_result(),
                     method => panic!("unexpected connector method {method}"),
                 };
-                assert!(
-                    rpc.rpc.try_settle_reply(),
-                    "disconnecting the HTTP waiter must not cancel the host-owned command"
-                );
+                assert!(rpc.rpc.try_settle_reply(), "metadata reply remains live");
                 let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+            if let Some(held) = pending_invoke {
+                held.await.expect("held connector response");
             }
         });
         let registry = dispatcher_registry_with_connector(
@@ -17195,12 +17204,30 @@ deny_ptrace = true
             provenance: None,
             approval_tokens: Vec::new(),
         };
+        let mut retry = request.clone();
+        retry.id = RequestId::new("owned-disconnect-retry");
+        let retry_id = retry.id.to_string();
         let http_state = Arc::clone(&state);
         let http_waiter = task::spawn(async move {
             invoke_handler(State(http_state), HeaderMap::new(), Json(request)).await
         });
         let ticket = started_rx.await.expect("connector dispatched");
         assert!(state.invoke_jobs.is_active(&ticket.operation_id));
+        let retry_error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(retry)),
+        )
+        .await
+        .expect("retry must reach admission while the first effect is unresolved")
+        .expect_err("a fresh request ID must not bypass a retained idempotency key");
+        assert_eq!(retry_error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(retry_error.1.contains("idempotency key has an unresolved attempt"));
+        assert!(retry_error.1.contains("operation_id=\"owned-disconnect\""));
+        assert!(retry_error.1.contains(&format!("attempt_id={}", ticket.attempt_id)));
+        assert!(
+            lifecycle.invocation_record(&retry_id, None).await.is_none(),
+            "rejected retries must not create a second admission"
+        );
         http_waiter.abort();
         assert!(http_waiter.await.is_err(), "HTTP waiter was disconnected");
         assert!(state.invoke_jobs.is_active(&ticket.operation_id));
@@ -17260,6 +17287,8 @@ deny_ptrace = true
         assert!(!metadata.contains("private_input"));
         assert!(!metadata.contains("private_result"));
         assert!(!metadata.contains("capability_token"));
+        assert!(!metadata.contains("owned-disconnect-key"));
+        assert!(record.admission.idempotency.is_some());
 
         let reopened = HostAdminStateStore::with_state_path(state_path).expect("reopen store");
         let recovered = reopened

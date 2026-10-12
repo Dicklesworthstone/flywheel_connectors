@@ -599,6 +599,7 @@ async fn run_owned(
         correlation_id: audit.correlation_id.clone(),
         deadline_at: chrono::Utc::now()
             + chrono::Duration::milliseconds(i64::try_from(remaining_ms).unwrap_or(i64::MAX)),
+        idempotency: fcp_host::InvocationIdempotency::from_request(&request, &audit.actor)?,
     };
     let ticket = match before_deadline(
         deadline,
