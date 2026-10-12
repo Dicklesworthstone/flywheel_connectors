@@ -142,7 +142,7 @@ use fcp_provider_auth::{
     OAuthRefreshTokenTransport, OAuthTokens, TokenRefreshDecision, TokenRefreshOutcome,
     TokenRefreshPolicy,
 };
-use fcp_ratelimit::{BackpressureThresholds, TokenBucket};
+use fcp_ratelimit::{BackpressureThresholds, RateLimiter, TokenBucket};
 use fcp_sandbox::{
     CredentialInjector, DefaultTlsVerifier, EgressError, EgressGuard, EgressHttpRequest,
     EgressTcpConnectRequest, HttpHeader, NoOpCredentialInjector, TlsVerifier, WasiConfig,
@@ -2321,6 +2321,14 @@ struct HostRateLimiterStore {
     buckets: StdMutex<HashMap<HostRateLimitBucketKey, Arc<TokenBucket>>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RateLimitMode {
+    /// Observe current quota without reserving execution capacity.
+    Inspect,
+    /// Atomically reserve quota for an actual invocation.
+    Consume,
+}
+
 impl HostRateLimiterStore {
     fn bucket_for(
         &self,
@@ -2880,6 +2888,7 @@ impl SubprocessRegistry {
         request: &InvokeRequest,
         introspection: &IntrospectionResponse,
         principal: &str,
+        mode: RateLimitMode,
     ) -> HostResult<()> {
         let operation = introspection
             .introspection
@@ -2903,7 +2912,7 @@ impl SubprocessRegistry {
                             request.operation.as_str()
                         ))
                     })?;
-                self.enforce_declared_rate_limit_pool(request, principal, pool)
+                self.enforce_declared_rate_limit_pool(request, principal, pool, mode)
                     .await?;
                 enforced_declared_pool = true;
             }
@@ -2912,7 +2921,7 @@ impl SubprocessRegistry {
         if !enforced_declared_pool
             && let Some(rate_limit) = operation.and_then(|operation| operation.rate_limit.as_ref())
         {
-            self.enforce_inline_operation_rate_limit(request, principal, rate_limit)
+            self.enforce_inline_operation_rate_limit(request, principal, rate_limit, mode)
                 .await?;
         }
 
@@ -2924,6 +2933,7 @@ impl SubprocessRegistry {
         request: &InvokeRequest,
         principal: &str,
         pool: &RateLimitPool,
+        mode: RateLimitMode,
     ) -> HostResult<()> {
         if matches!(pool.enforcement, RateLimitEnforcement::Advisory) {
             return Ok(());
@@ -2934,7 +2944,8 @@ impl SubprocessRegistry {
                 pool.id, request.connector_id
             ))
         })?;
-        self.enforce_rate_limit_pool(request, principal, pool).await
+        self.enforce_rate_limit_pool(request, principal, pool, mode)
+            .await
     }
 
     async fn enforce_inline_operation_rate_limit(
@@ -2942,6 +2953,7 @@ impl SubprocessRegistry {
         request: &InvokeRequest,
         principal: &str,
         rate_limit: &fcp_core::RateLimit,
+        mode: RateLimitMode,
     ) -> HostResult<()> {
         rate_limit.validate().map_err(|error| {
             HostError::PreflightFailed(format!(
@@ -2974,7 +2986,7 @@ impl SubprocessRegistry {
             enforcement: RateLimitEnforcement::Hard,
             scope,
         };
-        self.enforce_rate_limit_pool(request, principal, &pool)
+        self.enforce_rate_limit_pool(request, principal, &pool, mode)
             .await
     }
 
@@ -2983,6 +2995,7 @@ impl SubprocessRegistry {
         request: &InvokeRequest,
         principal: &str,
         pool: &RateLimitPool,
+        mode: RateLimitMode,
     ) -> HostResult<()> {
         let principal_id =
             matches!(pool.scope, RateLimitScope::Credential).then(|| principal.to_string());
@@ -2997,23 +3010,47 @@ impl SubprocessRegistry {
             burst: pool.config.burst,
         };
         let bucket = self.rate_limiters.bucket_for(key, pool)?;
-        let context = fcp_ratelimit::ThrottleContext {
-            zone_id: request.zone_id.clone(),
-            connector_id: Some(request.connector_id.clone()),
-            operation_id: Some(request.operation.clone()),
-            limit_type: limit_type_for_unit(pool.config.unit),
+        let retry_after_ms = match mode {
+            RateLimitMode::Inspect => {
+                // state() performs the same synchronized refill as acquisition,
+                // but leaves all permits available for the later atomic invoke.
+                let snapshot = bucket.state();
+                if snapshot.remaining > 0 {
+                    return Ok(());
+                }
+                u64::try_from(snapshot.reset_after.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(u64::from(!snapshot.reset_after.is_zero()))
+            }
+            RateLimitMode::Consume => {
+                let context = fcp_ratelimit::ThrottleContext {
+                    zone_id: request.zone_id.clone(),
+                    connector_id: Some(request.connector_id.clone()),
+                    operation_id: Some(request.operation.clone()),
+                    limit_type: limit_type_for_unit(pool.config.unit),
+                };
+                let outcome = fcp_ratelimit::enforce(
+                    bucket.as_ref(),
+                    1,
+                    &context,
+                    BackpressureThresholds::standard(),
+                )
+                .await;
+                if outcome.allowed {
+                    return Ok(());
+                }
+                outcome
+                    .backpressure
+                    .retry_after_ms
+                    .or_else(|| {
+                        outcome
+                            .violation
+                            .as_ref()
+                            .map(|violation| violation.retry_after_ms)
+                    })
+                    .unwrap_or(0)
+            }
         };
-        let outcome = fcp_ratelimit::enforce(
-            bucket.as_ref(),
-            1,
-            &context,
-            BackpressureThresholds::standard(),
-        )
-        .await;
-
-        if outcome.allowed {
-            return Ok(());
-        }
         if matches!(pool.enforcement, RateLimitEnforcement::Soft) {
             tracing::warn!(
                 event = "invoke_rate_limit_soft_exceeded",
@@ -3021,22 +3058,13 @@ impl SubprocessRegistry {
                 operation = %request.operation,
                 zone_id = %request.zone_id,
                 pool_id = %pool.id,
-                retry_after_ms = outcome.backpressure.retry_after_ms,
+                retry_after_ms,
+                mode = ?mode,
                 "soft host invoke rate limit exceeded; allowing request"
             );
             return Ok(());
         }
 
-        let retry_after_ms = outcome
-            .backpressure
-            .retry_after_ms
-            .or_else(|| {
-                outcome
-                    .violation
-                    .as_ref()
-                    .map(|violation| violation.retry_after_ms)
-            })
-            .unwrap_or(0);
         Err(HostError::PreflightFailed(format!(
             "rate limit pool `{}` exceeded for connector `{}` operation `{}` in zone `{}`; retry after {retry_after_ms} ms",
             pool.id,
@@ -6767,7 +6795,14 @@ async fn verify_live_request(
     request: &InvokeRequest,
     principal_override: Option<&str>,
 ) -> HostResult<VerifiedLiveRequest> {
-    verify_live_request_for_target(state, request, principal_override, None).await
+    verify_live_request_for_target(
+        state,
+        request,
+        principal_override,
+        None,
+        RateLimitMode::Consume,
+    )
+    .await
 }
 
 /// Verify entry policy while allowing the elected peer to execute.
@@ -6777,6 +6812,7 @@ async fn verify_live_request_for_target(
     request: &InvokeRequest,
     principal_override: Option<&str>,
     execution_target: Option<&TailscaleNodeId>,
+    rate_limit_mode: RateLimitMode,
 ) -> HostResult<VerifiedLiveRequest> {
     // Connector home-zone binding (br-flywheel_connectors-by4vu).
     //
@@ -7046,7 +7082,7 @@ async fn verify_live_request_for_target(
     )?;
     state
         .registry
-        .enforce_invoke_rate_limits(request, &introspection, principal)
+        .enforce_invoke_rate_limits(request, &introspection, principal, rate_limit_mode)
         .await?;
 
     Ok(VerifiedLiveRequest {
@@ -7153,14 +7189,24 @@ async fn evaluate_live_preflight(
     request: &InvokeRequest,
     principal_override: Option<&str>,
 ) -> PreflightResponse {
-    evaluate_live_preflight_for_target(state, request, principal_override, None).await
+    evaluate_live_admission(
+        state,
+        request,
+        principal_override,
+        None,
+        RateLimitMode::Inspect,
+    )
+    .await
 }
 
-async fn evaluate_live_preflight_for_target(
+/// Check complete admission policy. A dry run observes quota; execution must
+/// reserve it atomically because an earlier preview does not hold a permit.
+async fn evaluate_live_admission(
     state: &AppState,
     request: &InvokeRequest,
     principal_override: Option<&str>,
     execution_target: Option<&TailscaleNodeId>,
+    rate_limit_mode: RateLimitMode,
 ) -> PreflightResponse {
     let mut response = state
         .discovery
@@ -7176,11 +7222,13 @@ async fn evaluate_live_preflight_for_target(
         return response;
     }
 
-    let verified = match execution_target {
-        Some(target) => {
-            verify_live_request_for_target(state, request, principal_override, Some(target)).await
+    let verified = match (execution_target, rate_limit_mode) {
+        (None, RateLimitMode::Consume) => {
+            verify_live_request(state, request, principal_override).await
         }
-        None => verify_live_request(state, request, principal_override).await,
+        (target, mode) => {
+            verify_live_request_for_target(state, request, principal_override, target, mode).await
+        }
     };
     match verified {
         Ok(verified) => {
@@ -11451,11 +11499,12 @@ async fn preflight_handler(
                     Ok(invoke_request) => invoke_request,
                     Err(error) => return Json(preflight_response_from_error(error)),
                 };
-                let preflight = evaluate_live_preflight_for_target(
+                let preflight = evaluate_live_admission(
                     &state,
                     &invoke_request,
                     asserted_principal.as_deref(),
                     Some(target),
+                    RateLimitMode::Inspect,
                 )
                 .await;
                 if !preflight.allowed {
@@ -11554,11 +11603,12 @@ async fn simulate_handler(
                 .await
                 .is_some()
             {
-                let preflight = evaluate_live_preflight_for_target(
+                let preflight = evaluate_live_admission(
                     &state,
                     &invoke_request,
                     asserted_principal.as_deref(),
                     Some(target),
+                    RateLimitMode::Inspect,
                 )
                 .await;
                 if !preflight.allowed {
@@ -14472,11 +14522,12 @@ async fn mesh_forward_invoke(
         .await
         .is_some();
     if registered_locally {
-        let preflight = evaluate_live_preflight_for_target(
+        let preflight = evaluate_live_admission(
             state,
             request,
             asserted_principal,
             Some(&target),
+            RateLimitMode::Consume,
         )
         .await;
         if !preflight.allowed {
@@ -14947,7 +14998,11 @@ fn mesh_forward_error_status(error: &fcp_mesh::invoke_route::MeshForwardError) -
         | MeshForwardError::Stale { .. } => StatusCode::UNAUTHORIZED,
         MeshForwardError::WrongTarget { .. } => StatusCode::MISDIRECTED_REQUEST,
         MeshForwardError::Replayed { .. } => StatusCode::CONFLICT,
-        MeshForwardError::ReplayCacheSaturated { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        MeshForwardError::ReplayCacheSaturated { .. }
+        | MeshForwardError::Malformed {
+            field: "replay_journal",
+            ..
+        } => StatusCode::SERVICE_UNAVAILABLE,
         MeshForwardError::BodyTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         MeshForwardError::HopLimitExceeded { .. }
         | MeshForwardError::SchemaMismatch { .. }
@@ -14990,7 +15045,7 @@ async fn mesh_forward_handler(
             "mesh routing is not configured on this host".to_string(),
         ));
     };
-    if let Err(error) = router.accept_inbound(&envelope) {
+    if let Err(error) = router.accept_inbound_async(&envelope).await {
         tracing::warn!(
             event = "mesh_forward_rejected",
             origin_node = envelope.origin_node.as_str(),
@@ -18626,6 +18681,139 @@ deny_ptrace = true
             started_at: Instant::now(),
             mesh: None,
         })
+    }
+
+    #[test]
+    fn mesh_inbound_durable_errors_preserve_http_semantics() {
+        use fcp_mesh::invoke_route::MeshForwardError;
+
+        for reason in [
+            "commit_failed",
+            "replay_admission_queue_full",
+            "replay_admission_deadline",
+            "worker_stopped",
+            "worker_not_configured",
+            "state_poisoned",
+        ] {
+            let error = MeshForwardError::Malformed {
+                field: "replay_journal",
+                detail: reason.to_owned(),
+            };
+            assert_eq!(
+                mesh_forward_error_status(&error),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage admission failure must be reported as unavailable: {reason}"
+            );
+        }
+        assert_eq!(
+            mesh_forward_error_status(&MeshForwardError::Malformed {
+                field: "nonce",
+                detail: "invalid nonce".to_owned(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            mesh_forward_error_status(&MeshForwardError::Replayed {
+                origin: "origin".to_owned(),
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            mesh_forward_error_status(&MeshForwardError::ReplayCacheSaturated { capacity: 1 }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_inbound_durable_handler_authenticates_and_preserves_replay_on_restart() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings, unix_now_ms};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshPeerDirectory};
+
+        let dir = tempfile::tempdir().expect("durable mesh admission directory");
+        let journal = dir.path().join("replay");
+        let origin_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let executor_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let origin = TailscaleNodeId::new("origin");
+        let executor = TailscaleNodeId::new("executor");
+        let settings = || MeshRoutingSettings {
+            node_id: executor.clone(),
+            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::from_bytes(
+                &executor_key.to_bytes(),
+            )
+            .expect("executor signing key"),
+            peers_json: json!([{
+                "node_id": origin.as_str(),
+                "endpoint": "http://127.0.0.1:1",
+                "public_key_hex": hex::encode(origin_key.verifying_key().to_bytes()),
+            }])
+            .to_string(),
+            forward_timeout: Duration::from_secs(1),
+        };
+        let trusted_executor = MeshPeerDirectory::from_json(
+            origin.clone(),
+            &json!([{
+                "node_id": executor.as_str(),
+                "endpoint": "http://127.0.0.1:1",
+                "public_key_hex": hex::encode(executor_key.verifying_key().to_bytes()),
+            }])
+            .to_string(),
+        )
+        .expect("origin trust directory");
+        let mut state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        Arc::get_mut(&mut state).expect("exclusive test state").mesh = Some(Arc::new(
+            MeshRouter::with_replay_journal(settings(), Default::default(), &journal)
+                .expect("durable executor router"),
+        ));
+        let envelope = MeshForwardEnvelope::sign(
+            &origin_key,
+            origin.clone(),
+            executor.clone(),
+            unix_now_ms(),
+            MeshForwardBody::Introspect {
+                connector_id: "fcp.test.missing:utility:1.0.0".to_owned(),
+            },
+        )
+        .expect("authenticated peer envelope");
+        let mut forged = envelope.clone();
+        forged.signature = "00".repeat(64);
+        let rejected = mesh_forward_handler(State(Arc::clone(&state)), Json(forged))
+            .await
+            .expect_err("forged signature must not consume the real nonce");
+        assert_eq!(rejected.0, StatusCode::UNAUTHORIZED);
+
+        let Json(reply) = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope.clone()))
+            .await
+            .expect("authenticated envelope reaches the local handler");
+        reply
+            .verify_for(&envelope, &trusted_executor)
+            .expect("reply is signed and bound to the admitted request");
+        assert_eq!(reply.status, StatusCode::NOT_FOUND.as_u16());
+        let rejected = mesh_forward_handler(State(Arc::clone(&state)), Json(envelope.clone()))
+            .await
+            .expect_err("accepted nonce must not dispatch again");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+
+        // Release the worker and its journal lock before reopening the same history.
+        drop(
+            Arc::get_mut(&mut state)
+                .expect("exclusive test state")
+                .mesh
+                .take(),
+        );
+        Arc::get_mut(&mut state).expect("exclusive test state").mesh = Some(Arc::new(
+            MeshRouter::with_replay_journal(settings(), Default::default(), &journal)
+                .expect("restored durable executor router"),
+        ));
+        let rejected = mesh_forward_handler(State(state), Json(envelope))
+            .await
+            .expect_err("restart must retain the consumed nonce");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -24882,13 +25070,21 @@ deny_ptrace = true
         capability_id: &'static str,
         signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
         invoke_count: Arc<AtomicU64>,
+        inline_limit: bool,
     ) -> Arc<AppState> {
-        let introspection = serde_json::to_value(dispatcher_introspection(
-            operation_id,
-            capability_id,
-            SafetyTier::Safe,
-        ))
-        .expect("test introspection should serialize");
+        let mut introspection =
+            dispatcher_introspection(operation_id, capability_id, SafetyTier::Safe);
+        if inline_limit {
+            introspection.operations[0].rate_limit = Some(fcp_core::RateLimit {
+                max: 1,
+                per_ms: 60_000,
+                burst: None,
+                scope: None,
+                pool_name: Some("host.invoke".to_string()),
+            });
+        }
+        let introspection =
+            serde_json::to_value(introspection).expect("test introspection should serialize");
         let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
         let runner_invoke_count = Arc::clone(&invoke_count);
         let runner_task = task::spawn(async move {
@@ -24916,6 +25112,14 @@ deny_ptrace = true
                             ),
                         })));
                     }
+                    "simulate" => {
+                        let simulate_request: SimulateRequest =
+                            serde_json::from_value(request.params.clone())
+                                .expect("simulate params decode");
+                        let _ = request.response_tx.send(Ok(json!({
+                            "result": SimulateResponse::allowed(simulate_request.id),
+                        })));
+                    }
                     method => {
                         let _ = request.response_tx.send(Ok(json!({
                             "error": { "message": format!("unexpected method {method}") },
@@ -24937,7 +25141,7 @@ deny_ptrace = true
                 description: None,
                 args: Vec::new(),
                 env: BTreeMap::new(),
-                config: Some(invoke_token_bucket_config(operation_id)),
+                config: (!inline_limit).then(|| invoke_token_bucket_config(operation_id)),
                 categories: vec!["test".to_string()],
                 version: None,
                 // TWO zones, deliberately. `invoke_token_bucket_is_partitioned_per_zone`
@@ -24976,6 +25180,138 @@ deny_ptrace = true
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn dry_runs_preserve_quota_and_concurrent_invokes_consume_once() {
+        const CONNECTOR: &str = "fcp.test.dry-run-rate-limit:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+
+        for inline_limit in [false, true] {
+            let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+            let invokes = Arc::new(AtomicU64::new(0));
+            let state = invoke_token_bucket_state(
+                CONNECTOR,
+                OPERATION,
+                CAPABILITY,
+                &signing_key,
+                Arc::clone(&invokes),
+                inline_limit,
+            );
+            let invoke = invoke_token_bucket_request(
+                CONNECTOR,
+                OPERATION,
+                CAPABILITY,
+                ZoneId::work(),
+                &signing_key,
+            );
+            let preflight = HostPreflightRequest {
+                request_id: invoke.id.clone(),
+                connector_id: invoke.connector_id.clone(),
+                operation: OPERATION.to_string(),
+                params: Some(invoke.input.clone()),
+                principal: Some("user:test".to_string()),
+                zone_id: Some(invoke.zone_id.clone()),
+                capability_token: Some(invoke.capability_token.clone()),
+                approval_tokens: Vec::new(),
+                lease_seq: invoke.lease_seq,
+            };
+            let simulation = HostSimulateRequest {
+                request_id: invoke.id.to_string(),
+                connector_id: CONNECTOR.to_string(),
+                operation: OPERATION.to_string(),
+                input: Some(invoke.input.clone()),
+                zone_id: Some(invoke.zone_id.to_string()),
+                principal: Some("user:test".to_string()),
+                capability_token: Some(invoke.capability_token.clone()),
+                approval_tokens: Vec::new(),
+                lease_seq: invoke.lease_seq,
+                estimate_cost: false,
+                check_availability: false,
+                deadline_ms: 5_000,
+            };
+
+            for _ in 0..3 {
+                let checked = preflight_handler(
+                    State(Arc::clone(&state)),
+                    HeaderMap::new(),
+                    Json(preflight.clone()),
+                )
+                .await
+                .0;
+                assert!(checked.allowed, "{checked:?}");
+                let simulated = simulate_handler(
+                    State(Arc::clone(&state)),
+                    HeaderMap::new(),
+                    Json(simulation.clone()),
+                )
+                .await
+                .expect("repeated simulation must not spend invocation quota")
+                .0;
+                assert!(simulated.preflight_allowed, "{simulated:?}");
+                assert!(simulated.would_succeed, "{simulated:?}");
+                assert_eq!(simulated.phase, SimulatePhase::ConnectorReached);
+            }
+            assert_eq!(invokes.load(Ordering::SeqCst), 0);
+
+            // Both callers can have seen available quota. Actual admission must
+            // atomically reserve the only permit, allowing exactly one effect.
+            let mut competing = invoke.clone();
+            competing.id = RequestId::random();
+            let (first, second) = futures_util::future::join(
+                invoke_handler(
+                    State(Arc::clone(&state)),
+                    HeaderMap::new(),
+                    Json(invoke.clone()),
+                ),
+                invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(competing)),
+            )
+            .await;
+            assert_eq!(
+                usize::from(first.is_ok()) + usize::from(second.is_ok()),
+                1,
+                "one concurrent invocation must acquire the remaining permit: {first:?}, {second:?}"
+            );
+            for (status, reason) in [first, second].into_iter().filter_map(Result::err) {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(reason.contains("rate limit pool `host.invoke` exceeded"));
+            }
+            assert_eq!(invokes.load(Ordering::SeqCst), 1);
+
+            let checked =
+                preflight_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(preflight))
+                    .await
+                    .0;
+            assert!(!checked.allowed);
+            assert!(checked.reason.as_deref().is_some_and(|reason| {
+                reason.contains("rate limit pool `host.invoke` exceeded")
+                    && reason.contains("retry after")
+            }));
+            let simulated = simulate_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(simulation),
+            )
+            .await
+            .expect("exhausted simulation remains a structured refusal")
+            .0;
+            assert!(!simulated.preflight_allowed);
+            assert!(!simulated.would_succeed);
+            assert_eq!(simulated.phase, SimulatePhase::PreflightOnly);
+            assert!(simulated.failure_reason.as_deref().is_some_and(|reason| {
+                reason.contains("rate limit pool `host.invoke` exceeded")
+            }));
+
+            let mut next = invoke;
+            next.id = RequestId::random();
+            let (status, reason) = invoke_handler(State(state), HeaderMap::new(), Json(next))
+                .await
+                .expect_err("read-only checks must not reset or refund exhausted quota");
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(reason.contains("rate limit pool `host.invoke` exceeded"));
+            assert_eq!(invokes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn invoke_token_bucket_denies_second_invoke_before_dispatch() {
         let connector_id = "fcp.test.invoke-rate-limit:utility:1.0.0";
         let operation_id = "test.echo";
@@ -24988,6 +25324,7 @@ deny_ptrace = true
             capability_id,
             &signing_key,
             Arc::clone(&invoke_count),
+            false,
         );
 
         let first = invoke_token_bucket_request(
@@ -25038,6 +25375,7 @@ deny_ptrace = true
             capability_id,
             &signing_key,
             Arc::clone(&invoke_count),
+            false,
         );
 
         let work_request = invoke_token_bucket_request(

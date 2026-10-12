@@ -274,7 +274,13 @@ pub(super) fn execute<'a>(
         };
         let preflight = match before_deadline(
             deadline,
-            super::evaluate_live_preflight(state, &request, asserted_principal.as_deref()),
+            super::evaluate_live_admission(
+                state,
+                &request,
+                asserted_principal.as_deref(),
+                None,
+                super::RateLimitMode::Consume,
+            ),
             "preflight",
         )
         .await
