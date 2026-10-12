@@ -57,8 +57,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fcp_core::TailscaleNodeId;
-use fcp_crypto::ed25519::Ed25519SigningKey;
+use fcp_core::{HolderProof, InvokeRequest, TailscaleNodeId};
+use fcp_crypto::ed25519::{Ed25519Signature, Ed25519SigningKey};
 use fcp_mesh::invoke_route::{
     AdvertisedConnector, DEFAULT_MESH_FORWARD_MAX_SKEW_MS, DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
     MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshForwardReplayGuard, MeshForwardReply,
@@ -538,6 +538,75 @@ impl MeshRouter {
     #[must_use]
     pub const fn has_owner_signed_membership(&self) -> bool {
         self.membership.is_some()
+    }
+
+    /// Verify a holder-bound capability proof against current owner-signed membership.
+    ///
+    /// The caller must supply the holder and JTI from an already verified capability
+    /// token. This checks their binding to the request without consuming invocation
+    /// or replay admission, so preflight can verify the same proof before execution.
+    /// Static peer lists cannot authorize holder keys. The local signing key is
+    /// eligible only because signed membership pins it during activation and reload.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or mismatched proof evidence, an empty token JTI, unavailable
+    /// owner-signed membership, unknown holders, invalid signatures, and holder
+    /// authority that changes during verification. Errors omit token and proof bytes.
+    pub fn verify_holder_proof(
+        &self,
+        request: &InvokeRequest,
+        expected_holder: &str,
+        token_jti: &[u8],
+    ) -> Result<(), MeshForwardError> {
+        if !self.has_owner_signed_membership() {
+            return Err(MeshForwardError::Malformed {
+                field: "holder_proof",
+                detail: "holder proof requires owner-signed mesh membership".to_owned(),
+            });
+        }
+        self.ensure_membership_valid()?;
+        let proof = request
+            .holder_proof
+            .as_ref()
+            .ok_or_else(|| MeshForwardError::Malformed {
+                field: "holder_proof",
+                detail: "holder-bound capability requires a holder proof".to_owned(),
+            })?;
+        if proof.holder_node.as_str() != expected_holder {
+            return Err(MeshForwardError::Malformed {
+                field: "holder_proof",
+                detail: "proof holder does not match the verified capability holder".to_owned(),
+            });
+        }
+        if token_jti.is_empty() {
+            return Err(MeshForwardError::Malformed {
+                field: "holder_proof",
+                detail: "holder-bound capability requires a nonempty token JTI".to_owned(),
+            });
+        }
+        let signable = HolderProof::signable_bytes(&request.id, &request.operation, token_jti);
+        let signature = Ed25519Signature::from_bytes(&proof.signature);
+        let invalid_signature = || MeshForwardError::SignatureInvalid {
+            what: "holder proof",
+            peer: proof.holder_node.as_str().to_owned(),
+        };
+        if &proof.holder_node == self.local_node() {
+            self.signing_key
+                .verifying_key()
+                .verify(&signable, &signature)
+                .map_err(|_| invalid_signature())?;
+            return self.ensure_membership_valid();
+        }
+        let snapshot = self.trusted_peer(&proof.holder_node)?;
+        let peer = snapshot
+            .directory()
+            .peer(&proof.holder_node)
+            .ok_or_else(|| MeshForwardError::UnknownPeer(proof.holder_node.as_str().to_owned()))?;
+        peer.verifying_key
+            .verify(&signable, &signature)
+            .map_err(|_| invalid_signature())?;
+        self.ensure_current_peer(&snapshot)
     }
 
     fn ensure_membership_valid(&self) -> Result<(), MeshForwardError> {

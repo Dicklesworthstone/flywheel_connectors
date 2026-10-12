@@ -5244,7 +5244,7 @@ fn invoke_request_from_preflight(request: &HostPreflightRequest) -> HostResult<I
         zone_id,
         input: request.params.clone().unwrap_or(serde_json::Value::Null),
         capability_token,
-        holder_proof: None,
+        holder_proof: request.holder_proof.clone(),
         context: None,
         idempotency_key: None,
         lease_seq: request.lease_seq,
@@ -5303,7 +5303,7 @@ fn invoke_request_from_simulate(request: &HostSimulateRequest) -> HostResult<Inv
         zone_id: simulate_request.zone_id.clone(),
         input: simulate_request.input.clone(),
         capability_token: simulate_request.capability_token.clone(),
-        holder_proof: None,
+        holder_proof: request.holder_proof.clone(),
         context: simulate_request.context.clone(),
         idempotency_key: None,
         lease_seq: request.lease_seq,
@@ -6790,6 +6790,65 @@ fn enforce_operation_network_constraint_dispatch(
     )))
 }
 
+/// Verify holder identity against the current owner-authenticated mesh view.
+fn enforce_live_holder_proof(
+    state: &AppState,
+    request: &InvokeRequest,
+    verified_claims: &fcp_crypto::cose::CwtClaims,
+) -> HostResult<()> {
+    let Some(expected_holder) = verified_claims.get_holder_node() else {
+        return Ok(());
+    };
+    let Some(holder_proof) = request.holder_proof.as_ref() else {
+        return Err(HostError::PreflightFailed(format!(
+            "capability token is holder-bound to `{expected_holder}`, but the request did not include holder_proof"
+        )));
+    };
+    if holder_proof.holder_node.as_str() != expected_holder {
+        return Err(HostError::PreflightFailed(format!(
+            "holder_proof node `{}` does not match capability token holder_node `{expected_holder}`",
+            holder_proof.holder_node.as_str()
+        )));
+    }
+    let router = state.mesh.as_ref().ok_or_else(|| {
+        HostError::PreflightFailed(
+            "holder_proof verification requires owner-authenticated mesh membership".to_string(),
+        )
+    })?;
+    let token_jti = verified_claims
+        .get_jti()
+        .filter(|jti| !jti.is_empty())
+        .ok_or_else(|| {
+            HostError::PreflightFailed(
+                "holder-bound capability token must have a nonempty jti".to_string(),
+            )
+        })?;
+    router
+        .verify_holder_proof(request, expected_holder, token_jti)
+        .map_err(|error| HostError::PreflightFailed(format!("holder_proof rejected: {error}")))
+}
+
+/// Recheck an admitted request after waits for durable storage or runtime selection.
+///
+/// This is an additional dispatch fence, not a substitute for full admission.
+/// Verify the token signature again so the final holder lookup never relies on
+/// unauthenticated claims. This does not consume quota or replay state.
+fn recheck_admitted_holder_proof(state: &AppState, request: &InvokeRequest) -> HostResult<()> {
+    let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
+        HostError::PreflightFailed(
+            "capability verification key is unavailable at dispatch".to_string(),
+        )
+    })?;
+    let claims = request
+        .capability_token
+        .raw()
+        .verify(capability_key)
+        .map_err(|error| {
+            HostError::PreflightFailed(format!("capability token rejected at dispatch: {error}"))
+        })?;
+    enforce_live_holder_proof(state, request, &claims)
+}
+
 async fn verify_live_request(
     state: &AppState,
     request: &InvokeRequest,
@@ -6982,25 +7041,8 @@ async fn verify_live_request_for_target(
         .await?;
     }
 
-    // SECURITY: holder-bound tokens (`holder_node` claim present) must never
-    // silently degrade to bearer tokens. Until fcp-host wires live holder-proof
-    // signature verification against node attestations, fail closed here.
-    if let Some(expected_holder) = verified_claims.get_holder_node() {
-        let Some(holder_proof) = request.holder_proof.as_ref() else {
-            return Err(HostError::PreflightFailed(format!(
-                "capability token is holder-bound to `{expected_holder}`, but the request did not include holder_proof"
-            )));
-        };
-        if holder_proof.holder_node.as_str() != expected_holder {
-            return Err(HostError::PreflightFailed(format!(
-                "holder_proof node `{}` does not match capability token holder_node `{expected_holder}`",
-                holder_proof.holder_node.as_str()
-            )));
-        }
-        return Err(HostError::PreflightFailed(format!(
-            "capability token is holder-bound to `{expected_holder}`, but fcp-host does not yet verify holder_proof signatures for live requests"
-        )));
-    }
+    // A relay signature never authorizes use of another node's capability.
+    enforce_live_holder_proof(state, request, verified_claims)?;
 
     let persisted_verify = state
         .lifecycle
@@ -7084,6 +7126,9 @@ async fn verify_live_request_for_target(
         .registry
         .enforce_invoke_rate_limits(request, &introspection, principal, rate_limit_mode)
         .await?;
+
+    // Membership may have changed while persisted policy or quota was awaited.
+    enforce_live_holder_proof(state, request, verified_claims)?;
 
     Ok(VerifiedLiveRequest {
         principal: principal.to_owned(),
@@ -14746,8 +14791,15 @@ async fn run_mesh_forward_job(
             request_json,
             asserted_principal: asserted_principal.map(str::to_owned),
         };
-        // Audit and serialization consume the same budget. Check again before
-        // polling any transport work; earlier attempts proved non-delivery.
+        if registered_locally
+            && let Err(error) = recheck_admitted_holder_proof(state, request)
+        {
+            append_mesh_preflight_denial(state, request, asserted_principal, &error.to_string())
+                .map_err(map_host_error)?;
+            return Err(map_host_error(error));
+        }
+        // Audit, serialization, and authorization consume the same budget.
+        // Check before transport work; earlier attempts proved non-delivery.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || forwarded_request.deadline_ms == Some(0) {
             append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
@@ -18486,6 +18538,7 @@ deny_ptrace = true
             .capability_id(capability_id)
             .operations(&[operation_id])
             .holder_node(holder_node)
+            .token_id(b"host-test-holder-token")
             .not_before(now)
             .expiration(now + chrono::Duration::hours(1))
             .try_constraints_cbor(&constraints)
@@ -19046,6 +19099,7 @@ deny_ptrace = true
             let input = json!({ "lease_seq": u64::MAX });
             let request_id = RequestId::random();
             let preflight = HostPreflightRequest {
+                holder_proof: None,
                 request_id: request_id.clone(),
                 connector_id: connector_id.clone(),
                 operation: OPERATION.to_string(),
@@ -19062,6 +19116,7 @@ deny_ptrace = true
                     .0;
             assert_eq!(checked.allowed, allowed, "{checked:?}");
             let simulation = HostSimulateRequest {
+                holder_proof: None,
                 request_id: request_id.to_string(),
                 connector_id: CONNECTOR.to_string(),
                 operation: OPERATION.to_string(),
@@ -19965,6 +20020,7 @@ deny_ptrace = true
             }
         );
         let preflight = HostPreflightRequest {
+            holder_proof: request.holder_proof.clone(),
             request_id: RequestId::random(),
             connector_id: connector_id.clone(),
             operation: OPERATION.to_string(),
@@ -19985,6 +20041,7 @@ deny_ptrace = true
 
         let simulation_token = request.capability_token.clone();
         let simulation_request = |request_id: &str| HostSimulateRequest {
+            holder_proof: None,
             request_id: request_id.to_string(),
             connector_id: CONNECTOR.to_string(),
             operation: OPERATION.to_string(),
@@ -25970,6 +26027,7 @@ deny_ptrace = true
                 &signing_key,
             );
             let preflight = HostPreflightRequest {
+                holder_proof: invoke.holder_proof.clone(),
                 request_id: invoke.id.clone(),
                 connector_id: invoke.connector_id.clone(),
                 operation: OPERATION.to_string(),
@@ -25981,6 +26039,7 @@ deny_ptrace = true
                 lease_seq: invoke.lease_seq,
             };
             let simulation = HostSimulateRequest {
+                holder_proof: invoke.holder_proof.clone(),
                 request_id: invoke.id.to_string(),
                 connector_id: CONNECTOR.to_string(),
                 operation: OPERATION.to_string(),
@@ -26833,6 +26892,322 @@ deny_ptrace = true
             msg.contains("capability constraint denied") && msg.contains("max_calls"),
             "expected live capability-constraint denial, got: {msg}"
         );
+    }
+
+
+    fn holder_test_router(
+        directory: &std::path::Path,
+        holder_key: &fcp_crypto::ed25519::Ed25519SigningKey,
+    ) -> fcp_host::mesh_routing::MeshRouter {
+        use fcp_host::mesh_routing::{MeshRouter, unix_now_ms};
+        use fcp_mesh::invoke_route::MeshPeerConfig;
+        use fcp_mesh::peer_manifest::{
+            MESH_PEER_DIRECTORY_SCHEMA, MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
+        };
+
+        let owner = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let local = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let key_path = directory.join("host.key");
+        std::fs::write(&key_path, hex::encode(local.to_bytes())).expect("host node key");
+        let now = unix_now_ms();
+        let membership = SignedMeshPeerDirectory::sign(
+            &owner,
+            &MeshPeerDirectoryPayload {
+                schema_version: MESH_PEER_DIRECTORY_SCHEMA.to_owned(),
+                mesh_id: "holder-host-tests".to_owned(),
+                generation: 1,
+                issued_at_ms: now.saturating_sub(1000),
+                expires_at_ms: now + 300_000,
+                peers: vec![
+                    MeshPeerConfig {
+                        node_id: "host".to_owned(),
+                        endpoint: "http://127.0.0.1:19001".to_owned(),
+                        public_key_hex: hex::encode(local.verifying_key().to_bytes()),
+                    },
+                    MeshPeerConfig {
+                        node_id: "holder-client".to_owned(),
+                        endpoint: "http://127.0.0.1:19002".to_owned(),
+                        public_key_hex: hex::encode(holder_key.verifying_key().to_bytes()),
+                    },
+                ],
+            },
+        )
+        .expect("owner-signed membership");
+        let config = HashMap::from([
+            ("FCP_HOST_MESH_NODE_ID", "host".to_owned()),
+            (
+                "FCP_HOST_MESH_SIGNING_KEY_FILE",
+                key_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "FCP_HOST_MESH_PEERS",
+                serde_json::to_string(&membership).expect("signed directory JSON"),
+            ),
+            ("FCP_HOST_MESH_ID", "holder-host-tests".to_owned()),
+            (
+                "FCP_HOST_MESH_DIRECTORY_OWNER_KEYS",
+                json!([hex::encode(owner.verifying_key().to_bytes())]).to_string(),
+            ),
+            (
+                "FCP_HOST_MESH_DIRECTORY_STATE",
+                directory.join("membership").to_string_lossy().into_owned(),
+            ),
+        ]);
+        MeshRouter::from_lookup(|name| config.get(name).cloned())
+            .expect("signed router configuration")
+            .expect("configured mesh")
+    }
+
+    fn holder_test_request(
+        issuer: &fcp_crypto::ed25519::Ed25519SigningKey,
+        holder: &fcp_crypto::ed25519::Ed25519SigningKey,
+    ) -> InvokeRequest {
+        let mut request = InvokeRequest {
+            r#type: "invoke".to_owned(),
+            id: RequestId::random(),
+            connector_id: ConnectorId::from_static("fcp.test.live-holder:utility:1.0.0"),
+            operation: OperationId::from_static("test.echo"),
+            zone_id: ZoneId::work(),
+            input: json!({ "message": "authorized holder" }),
+            capability_token: test_capability_token_with_holder_node(
+                issuer,
+                "cap.test.echo",
+                "test.echo",
+                ZoneId::work().as_str(),
+                "fcp.test.live-holder:utility:1.0.0",
+                "holder-client",
+            ),
+            holder_proof: None,
+            context: None,
+            idempotency_key: None,
+            lease_seq: None,
+            deadline_ms: Some(5_000),
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        };
+        let bytes = fcp_core::HolderProof::signable_bytes(
+            &request.id,
+            &request.operation,
+            b"host-test-holder-token",
+        );
+        request.holder_proof = Some(fcp_core::HolderProof::new(
+            holder.sign(&bytes).to_bytes(),
+            TailscaleNodeId::new("holder-client"),
+        ));
+        request
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn holder_dispatch_recheck_requires_owner_authenticated_current_keys() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings};
+
+        let issuer = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let holder = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let request = holder_test_request(&issuer, &holder);
+        let mut state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            Some(issuer.verifying_key()),
+            HashMap::new(),
+        );
+        assert!(
+            recheck_admitted_holder_proof(&state, &request)
+                .expect_err("a signature alone does not establish node membership")
+                .to_string()
+                .contains("owner-authenticated mesh membership")
+        );
+
+        Arc::get_mut(&mut state).expect("exclusive state").mesh = Some(Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("host"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json: json!([{
+                    "node_id": "holder-client",
+                    "endpoint": "http://127.0.0.1:19002",
+                    "public_key_hex": hex::encode(holder.verifying_key().to_bytes()),
+                }])
+                .to_string(),
+                forward_timeout: Duration::from_secs(1),
+            })
+            .expect("static router"),
+        ));
+        assert!(
+            recheck_admitted_holder_proof(&state, &request).is_err(),
+            "a legacy raw peer directory must not authorize holder-bound capabilities"
+        );
+
+        let directory = tempfile::tempdir().expect("signed membership directory");
+        Arc::get_mut(&mut state).expect("exclusive state").mesh =
+            Some(Arc::new(holder_test_router(directory.path(), &holder)));
+        recheck_admitted_holder_proof(&state, &request)
+            .expect("owner-authenticated holder proof");
+
+        let mut forged = request.clone();
+        forged.holder_proof.as_mut().expect("holder proof").signature[0] ^= 1;
+        assert!(recheck_admitted_holder_proof(&state, &forged).is_err());
+        let mut replay = request.clone();
+        replay.id = RequestId::random();
+        assert!(recheck_admitted_holder_proof(&state, &replay).is_err());
+
+        // A previously checked holder key cannot authorize a successor view
+        // that now pins a different key for the same node.
+        let successor = tempfile::tempdir().expect("successor membership directory");
+        let replacement = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        Arc::get_mut(&mut state).expect("exclusive state").mesh =
+            Some(Arc::new(holder_test_router(successor.path(), &replacement)));
+        assert!(
+            recheck_admitted_holder_proof(&state, &request).is_err(),
+            "dispatch must resolve the current holder key again"
+        );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn holder_bound_preflight_simulate_and_invoke_reach_the_connector() {
+        const CONNECTOR: &str = "fcp.test.live-holder:utility:1.0.0";
+        let issuer = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let holder = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let request = holder_test_request(&issuer, &holder);
+        let invocations = Arc::new(AtomicU64::new(0));
+        let simulations = Arc::new(AtomicU64::new(0));
+        let observed_invocations = Arc::clone(&invocations);
+        let observed_simulations = Arc::clone(&simulations);
+        let introspection =
+            dispatcher_introspection("test.echo", "cap.test.echo", SafetyTier::Safe);
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin());
+                let result = match rpc.method.as_str() {
+                    "introspect" => json!(introspection),
+                    "health" => dispatcher_health_result(),
+                    "simulate" => {
+                        observed_simulations.fetch_add(1, Ordering::SeqCst);
+                        let incoming: SimulateRequest =
+                            serde_json::from_value(rpc.params).expect("simulation request");
+                        json!(SimulateResponse::allowed(incoming.id))
+                    }
+                    "invoke" => {
+                        observed_invocations.fetch_add(1, Ordering::SeqCst);
+                        let incoming: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("invoke request");
+                        assert!(incoming.holder_proof.is_some());
+                        json!(InvokeResponse::ok(incoming.id, json!({ "authorized": true })))
+                    }
+                    method => panic!("unexpected holder test method {method}"),
+                };
+                assert!(rpc.rpc.try_settle_reply());
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            dispatcher_test_connector(CONNECTOR, runner_tx, runner_task),
+            dispatcher_test_config(CONNECTOR),
+        );
+        let directory = tempfile::tempdir().expect("signed membership directory");
+        let mut state = dispatcher_app_state(
+            registry,
+            Arc::new(HostAdminStateStore::new()),
+            Some(issuer.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        Arc::get_mut(&mut state).expect("exclusive state").mesh =
+            Some(Arc::new(holder_test_router(directory.path(), &holder)));
+
+        let preflight_request = |invoke: &InvokeRequest| HostPreflightRequest {
+            request_id: invoke.id.clone(),
+            connector_id: invoke.connector_id.clone(),
+            operation: invoke.operation.to_string(),
+            params: Some(invoke.input.clone()),
+            principal: Some("user:test".to_owned()),
+            zone_id: Some(invoke.zone_id.clone()),
+            capability_token: Some(invoke.capability_token.clone()),
+            holder_proof: invoke.holder_proof.clone(),
+            approval_tokens: Vec::new(),
+            lease_seq: invoke.lease_seq,
+        };
+        let simulation_request = |invoke: &InvokeRequest| HostSimulateRequest {
+            request_id: invoke.id.to_string(),
+            connector_id: invoke.connector_id.to_string(),
+            operation: invoke.operation.to_string(),
+            input: Some(invoke.input.clone()),
+            zone_id: Some(invoke.zone_id.to_string()),
+            principal: Some("user:test".to_owned()),
+            capability_token: Some(invoke.capability_token.clone()),
+            holder_proof: invoke.holder_proof.clone(),
+            approval_tokens: Vec::new(),
+            lease_seq: invoke.lease_seq,
+            estimate_cost: true,
+            check_availability: true,
+            deadline_ms: 5_000,
+        };
+
+        let checked = preflight_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(preflight_request(&request)),
+        )
+        .await
+        .0;
+        assert!(checked.allowed, "{checked:?}");
+        let simulated = simulate_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(simulation_request(&request)),
+        )
+        .await
+        .expect("holder-authorized simulation")
+        .0;
+        assert_eq!(simulated.phase, SimulatePhase::ConnectorReached);
+        assert!(simulated.would_succeed);
+
+        let mut missing = request.clone();
+        missing.holder_proof = None;
+        let mut replay = request.clone();
+        replay.id = RequestId::random();
+        for denied in [missing, replay] {
+            let checked = preflight_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(preflight_request(&denied)),
+            )
+            .await
+            .0;
+            assert!(!checked.allowed, "holder evidence must gate preflight");
+            let simulated = simulate_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(simulation_request(&denied)),
+            )
+            .await
+            .expect("structured holder denial")
+            .0;
+            assert!(!simulated.preflight_allowed);
+            assert!(!simulated.would_succeed);
+            assert!(
+                invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(denied))
+                    .await
+                    .is_err(),
+                "invalid holder evidence must never execute"
+            );
+        }
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(simulations.load(Ordering::SeqCst), 1);
+
+        let response = invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("holder-authorized invoke")
+        .0;
+        assert_eq!(response.id, request.id);
+        assert_eq!(response.status, InvokeStatus::Ok);
+        assert_eq!(response.result.expect("result")["authorized"], true);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(simulations.load(Ordering::SeqCst), 1);
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -27869,6 +28244,7 @@ deny_ptrace = true
         });
 
         let request = HostPreflightRequest {
+            holder_proof: None,
             request_id: RequestId::random(),
             connector_id: connector_id.parse().expect("connector id"),
             operation: "test.echo".to_string(),
@@ -27938,6 +28314,7 @@ deny_ptrace = true
         });
 
         let request = HostSimulateRequest {
+            holder_proof: None,
             request_id: "simulate-principal-mismatch".to_string(),
             connector_id: connector_id.to_string(),
             operation: "test.echo".to_string(),

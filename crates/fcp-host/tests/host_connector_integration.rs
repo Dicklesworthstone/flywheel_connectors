@@ -709,6 +709,7 @@ fn build_host_preflight_request(
         principal: principal.map(str::to_owned),
         zone_id: Some(request.zone_id.clone()),
         capability_token: Some(request.capability_token.clone()),
+        holder_proof: request.holder_proof.clone(),
         approval_tokens: request.approval_tokens.clone(),
         lease_seq: request.lease_seq,
     }
@@ -727,9 +728,37 @@ fn build_vector_preflight_request(
         principal: Some(principal_override.to_owned()),
         zone_id: Some(ZoneId::work()),
         capability_token,
+        holder_proof: None,
         approval_tokens: Vec::new(),
         lease_seq: None,
     }
+}
+
+#[test]
+fn host_preflight_conversion_preserves_holder_proof_and_request_identity() {
+    let capability_signing_key = Ed25519SigningKey::generate();
+    let (mut invoke, _) = build_invoke_request(
+        ConnectorId::from_static("fcp.test.preflight-holder:utility:1.0.0"),
+        &capability_signing_key,
+    );
+    invoke.holder_proof = Some(fcp_core::HolderProof::new(
+        [0x5a; 64],
+        TailscaleNodeId::new("node:preflight-holder"),
+    ));
+    invoke.lease_seq = Some(17);
+
+    let preflight = build_host_preflight_request(&invoke, Some(TEST_PRINCIPAL));
+    let preflight: HostPreflightRequest =
+        serde_json::from_value(serde_json::to_value(preflight).unwrap()).unwrap();
+    assert_eq!(preflight.request_id, invoke.id);
+    assert_eq!(preflight.operation, invoke.operation.as_str());
+    assert_eq!(preflight.lease_seq, Some(17));
+    let proof = preflight.holder_proof.expect("forwarded holder proof");
+    assert_eq!(proof.signature, [0x5a; 64]);
+    assert_eq!(
+        proof.holder_node,
+        TailscaleNodeId::new("node:preflight-holder")
+    );
 }
 
 fn batch_operation_json(
@@ -4363,6 +4392,7 @@ async fn fcp_host_binary_preflight_route_denies_missing_capability_token()
             principal: Some(TEST_PRINCIPAL.to_string()),
             zone_id: Some(ZoneId::work()),
             capability_token: None,
+            holder_proof: None,
             approval_tokens: Vec::new(),
             lease_seq: None,
         },
@@ -4517,6 +4547,7 @@ async fn fcp_host_binary_simulate_route_denies_missing_capability_token()
             zone_id: Some(ZoneId::work().to_string()),
             principal: Some(TEST_PRINCIPAL.to_string()),
             capability_token: None,
+            holder_proof: None,
             approval_tokens: Vec::new(),
             lease_seq: None,
             estimate_cost: false,
@@ -4616,6 +4647,7 @@ async fn fcp_host_binary_simulate_route_reaches_connector_and_records_receipt()
             principal: Some(TEST_PRINCIPAL.to_string()),
             zone_id: Some(invoke_request.zone_id.clone()),
             capability_token: Some(invoke_request.capability_token.clone()),
+            holder_proof: invoke_request.holder_proof.clone(),
             approval_tokens: Vec::new(),
             lease_seq: invoke_request.lease_seq,
         },
@@ -4634,6 +4666,7 @@ async fn fcp_host_binary_simulate_route_reaches_connector_and_records_receipt()
             zone_id: Some(invoke_request.zone_id.to_string()),
             principal: Some(TEST_PRINCIPAL.to_string()),
             capability_token: Some(invoke_request.capability_token),
+            holder_proof: invoke_request.holder_proof,
             approval_tokens: Vec::new(),
             lease_seq: invoke_request.lease_seq,
             estimate_cost: false,

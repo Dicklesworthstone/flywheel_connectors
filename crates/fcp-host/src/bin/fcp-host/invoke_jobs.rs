@@ -564,6 +564,12 @@ async fn dispatch(
     let result = before_deadline(
         deadline,
         async move {
+            super::recheck_admitted_holder_proof(state, &request)?;
+            if Instant::now() >= deadline {
+                return Err(HostError::Unavailable(
+                    "invocation deadline expired before connector dispatch".to_string(),
+                ));
+            }
             dispatch_started.store(true, std::sync::atomic::Ordering::SeqCst);
             match runtime {
                 super::ConnectorRuntime::Native(native) => match native_capture {

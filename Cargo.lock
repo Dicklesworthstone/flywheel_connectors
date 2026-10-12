@@ -8709,6 +8709,7 @@ dependencies = [
  "tru",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

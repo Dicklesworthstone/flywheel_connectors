@@ -266,10 +266,10 @@ fn invoke_request_from_preflight(
         zone_id,
         input: request.params.clone().unwrap_or(Value::Null),
         capability_token,
-        holder_proof: None,
+        holder_proof: request.holder_proof.clone(),
         context: None,
         idempotency_key: None,
-        lease_seq: None,
+        lease_seq: request.lease_seq,
         deadline_ms: None,
         correlation_id: None,
         provenance: None,
@@ -325,10 +325,10 @@ fn invoke_request_from_simulate(request: &HostSimulateRequest) -> Result<InvokeR
         zone_id: simulate_request.zone_id.clone(),
         input: simulate_request.input.clone(),
         capability_token: simulate_request.capability_token.clone(),
-        holder_proof: None,
+        holder_proof: request.holder_proof.clone(),
         context: simulate_request.context.clone(),
         idempotency_key: None,
-        lease_seq: None,
+        lease_seq: request.lease_seq,
         deadline_ms: Some(request.deadline_ms),
         correlation_id: simulate_request.correlation_id,
         provenance: None,
@@ -753,6 +753,7 @@ fn preflight_request(
         principal: Some(TEST_PRINCIPAL.to_string()),
         zone_id: Some(ZoneId::work()),
         capability_token,
+        holder_proof: None,
         approval_tokens: Vec::new(),
         lease_seq: None,
     }
@@ -771,6 +772,7 @@ fn simulate_request(
         zone_id: Some(ZoneId::work().to_string()),
         principal: Some(TEST_PRINCIPAL.to_string()),
         capability_token,
+        holder_proof: None,
         approval_tokens: Vec::new(),
         lease_seq: None,
         estimate_cost: false,
@@ -783,6 +785,63 @@ fn route_test_connector_id(suffix: &str) -> ConnectorId {
     format!("fcp.test.conformance.{suffix}:utility:1.0.0")
         .parse()
         .expect("test connector id should be canonical")
+}
+
+#[test]
+fn preflight_conversion_preserves_holder_proof_and_request_identity() {
+    let mut request = preflight_request(
+        route_test_connector_id("preflight-holder"),
+        Some(CapabilityToken::test_token()),
+    );
+    request.holder_proof = Some(fcp_core::HolderProof::new(
+        [0x5a; 64],
+        fcp_core::TailscaleNodeId::new("node:preflight-holder"),
+    ));
+    request.lease_seq = Some(17);
+    let request: HostPreflightRequest =
+        serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+
+    let invoke = invoke_request_from_preflight(&request).unwrap();
+    assert_eq!(invoke.id, request.request_id);
+    assert_eq!(invoke.operation.as_str(), request.operation);
+    assert_eq!(invoke.lease_seq, Some(17));
+    let proof = invoke
+        .holder_proof
+        .expect("forwarded preflight holder proof");
+    assert_eq!(proof.signature, [0x5a; 64]);
+    assert_eq!(
+        proof.holder_node,
+        fcp_core::TailscaleNodeId::new("node:preflight-holder")
+    );
+}
+
+#[test]
+fn simulate_conversion_preserves_holder_proof_and_request_identity() {
+    let mut request = simulate_request(
+        &route_test_connector_id("simulate-holder"),
+        Some(CapabilityToken::test_token()),
+        "simulate-holder-proof",
+    );
+    request.holder_proof = Some(fcp_core::HolderProof::new(
+        [0x6b; 64],
+        fcp_core::TailscaleNodeId::new("node:simulate-holder"),
+    ));
+    request.lease_seq = Some(23);
+    let request: HostSimulateRequest =
+        serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+
+    let invoke = invoke_request_from_simulate(&request).unwrap();
+    assert_eq!(invoke.id.to_string(), request.request_id);
+    assert_eq!(invoke.operation.as_str(), request.operation);
+    assert_eq!(invoke.lease_seq, Some(23));
+    let proof = invoke
+        .holder_proof
+        .expect("forwarded simulate holder proof");
+    assert_eq!(proof.signature, [0x6b; 64]);
+    assert_eq!(
+        proof.holder_node,
+        fcp_core::TailscaleNodeId::new("node:simulate-holder")
+    );
 }
 
 async fn issue_live_capability_token(

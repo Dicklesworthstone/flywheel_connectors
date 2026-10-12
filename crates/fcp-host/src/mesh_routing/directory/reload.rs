@@ -432,6 +432,215 @@ mod tests {
         }
     }
 
+    fn holder_proof_request(
+        holder: &str,
+        signing_key: &Ed25519SigningKey,
+    ) -> fcp_core::InvokeRequest {
+        let id = fcp_core::RequestId::new("holder-proof-request");
+        let operation = "test.read".parse().unwrap();
+        let signable = fcp_core::HolderProof::signable_bytes(&id, &operation, b"holder-proof-jti");
+        fcp_core::InvokeRequest {
+            r#type: "invoke".to_owned(),
+            id,
+            connector_id: "fcp.test:utility:1.0.0".parse().unwrap(),
+            operation,
+            zone_id: fcp_core::ZoneId::work(),
+            input: serde_json::json!({}),
+            capability_token: fcp_core::CapabilityToken::test_token(),
+            holder_proof: Some(fcp_core::HolderProof::new(
+                signing_key.sign(&signable).to_bytes(),
+                TailscaleNodeId::new(holder),
+            )),
+            context: None,
+            idempotency_key: None,
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn holder_proof_accepts_owner_pinned_local_and_remote_keys_without_consuming_it() {
+        let fixture = Fixture::new();
+        let router = fixture.router();
+        for (holder, seed) in [("local", 32), ("peer", 33)] {
+            let key = Ed25519SigningKey::from_bytes(&[seed; 32]).unwrap();
+            let request = holder_proof_request(holder, &key);
+            // Preflight and the later invocation may check the same proof.
+            router
+                .verify_holder_proof(&request, holder, b"holder-proof-jti")
+                .unwrap();
+            router
+                .verify_holder_proof(&request, holder, b"holder-proof-jti")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn holder_proof_rejects_signature_request_operation_and_token_mutations() {
+        let fixture = Fixture::new();
+        let router = fixture.router();
+        for (holder, seed) in [("local", 32), ("peer", 33)] {
+            let key = Ed25519SigningKey::from_bytes(&[seed; 32]).unwrap();
+            let original = holder_proof_request(holder, &key);
+            for scenario in ["signature", "request", "operation", "token", "wrong_key"] {
+                let mut request = original.clone();
+                let token_jti: &[u8] = if scenario == "token" {
+                    b"different-token-jti"
+                } else {
+                    b"holder-proof-jti"
+                };
+                match scenario {
+                    "signature" => request.holder_proof.as_mut().unwrap().signature[0] ^= 1,
+                    "request" => request.id = fcp_core::RequestId::new("different-request"),
+                    "operation" => request.operation = "test.write".parse().unwrap(),
+                    "wrong_key" => {
+                        let other_key = Ed25519SigningKey::from_bytes(&[99; 32]).unwrap();
+                        request = holder_proof_request(holder, &other_key);
+                    }
+                    _ => {}
+                }
+                assert!(
+                    matches!(
+                        router.verify_holder_proof(&request, holder, token_jti),
+                        Err(MeshForwardError::SignatureInvalid {
+                            what: "holder proof",
+                            ..
+                        }),
+                    ),
+                    "{holder} {scenario} must not reuse a valid proof"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn holder_proof_requires_claim_binding_and_a_known_member() {
+        let fixture = Fixture::new();
+        let router = fixture.router();
+        let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let request = holder_proof_request("peer", &key);
+        let mut missing = request.clone();
+        missing.holder_proof = None;
+        for (request, holder, token_jti) in [
+            (&missing, "peer", b"holder-proof-jti".as_slice()),
+            (&request, "local", b"holder-proof-jti".as_slice()),
+            (&request, "peer", b"".as_slice()),
+        ] {
+            let error = router
+                .verify_holder_proof(request, holder, token_jti)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MeshForwardError::Malformed {
+                    field: "holder_proof",
+                    ..
+                }
+            ));
+            let message = error.to_string();
+            assert!(!message.contains("holder-proof-jti"));
+            assert!(!message.contains(&hex::encode(key.to_bytes())));
+        }
+        let unknown = holder_proof_request("unknown", &key);
+        assert!(matches!(
+            router.verify_holder_proof(&unknown, "unknown", b"holder-proof-jti"),
+            Err(MeshForwardError::UnknownPeer(_)),
+        ));
+    }
+
+    #[test]
+    fn holder_proof_refuses_static_peer_keys_even_when_the_signature_is_valid() {
+        let fixture = Fixture::new();
+        let mut router = fixture.router();
+        router.membership = None;
+        for (holder, seed) in [("local", 32), ("peer", 33)] {
+            let key = Ed25519SigningKey::from_bytes(&[seed; 32]).unwrap();
+            let request = holder_proof_request(holder, &key);
+            assert!(matches!(
+                router.verify_holder_proof(&request, holder, b"holder-proof-jti"),
+                Err(MeshForwardError::Malformed {
+                    field: "holder_proof",
+                    ..
+                }),
+            ));
+        }
+    }
+
+    #[test]
+    fn holder_proof_uses_published_key_rotation_and_rejects_removed_members() {
+        let mut fixture = Fixture::new();
+        let router = fixture.router();
+        let old_key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
+        let new_key = Ed25519SigningKey::from_bytes(&[34; 32]).unwrap();
+        let original = holder_proof_request("peer", &old_key);
+        router
+            .verify_holder_proof(&original, "peer", b"holder-proof-jti")
+            .unwrap();
+
+        fixture.payload.generation += 1;
+        fixture.payload.expires_at_ms += 60_000;
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        router
+            .verify_holder_proof(&original, "peer", b"holder-proof-jti")
+            .unwrap();
+
+        fixture.payload.generation += 1;
+        fixture.payload.peers[1].public_key_hex = hex::encode(new_key.verifying_key().to_bytes());
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert!(matches!(
+            router.verify_holder_proof(&original, "peer", b"holder-proof-jti"),
+            Err(MeshForwardError::SignatureInvalid { .. }),
+        ));
+        let rotated = holder_proof_request("peer", &new_key);
+        router
+            .verify_holder_proof(&rotated, "peer", b"holder-proof-jti")
+            .unwrap();
+
+        fixture.payload.generation += 1;
+        fixture.payload.peers.truncate(1);
+        fixture.write_source();
+        fixture.refresh().unwrap();
+        assert!(matches!(
+            router.verify_holder_proof(&rotated, "peer", b"holder-proof-jti"),
+            Err(MeshForwardError::UnknownPeer(_)),
+        ));
+    }
+
+    #[test]
+    fn holder_proof_rejects_expired_and_storage_fenced_membership() {
+        for expired in [true, false] {
+            let fixture = Fixture::new();
+            let router = fixture.router();
+            if expired {
+                fixture
+                    .membership
+                    .publication
+                    .read()
+                    .unwrap()
+                    .validity
+                    .expired
+                    .store(true, Ordering::Release);
+            } else {
+                fixture.membership.refuse("checkpoint_commit_failed");
+            }
+            for (holder, seed) in [("local", 32), ("peer", 33)] {
+                let key = Ed25519SigningKey::from_bytes(&[seed; 32]).unwrap();
+                let request = holder_proof_request(holder, &key);
+                assert!(matches!(
+                    router.verify_holder_proof(&request, holder, b"holder-proof-jti"),
+                    Err(MeshForwardError::Malformed {
+                        field: "peer_directory",
+                        ..
+                    }),
+                ));
+            }
+        }
+    }
+
     fn wait_until(mut ready: impl FnMut() -> bool) {
         let start = Instant::now();
         while !ready() {

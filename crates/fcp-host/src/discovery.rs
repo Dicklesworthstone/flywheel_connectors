@@ -658,6 +658,10 @@ pub struct HostPreflightRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability_token: Option<CapabilityToken>,
 
+    /// Holder signature binding a holder-bound token to this planned request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_proof: Option<fcp_core::HolderProof>,
+
     /// Approval tokens authorizing elevated or explicitly approved execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_tokens: Vec<ApprovalToken>,
@@ -5406,6 +5410,7 @@ mod tests {
             principal: Some("user:bob".into()),
             zone_id: Some(ZoneId::work()),
             capability_token: None,
+            holder_proof: None,
             approval_tokens: vec![],
             lease_seq: Some(17),
         };
@@ -5427,6 +5432,7 @@ mod tests {
             principal: None,
             zone_id: None,
             capability_token: None,
+            holder_proof: None,
             approval_tokens: vec![],
             lease_seq: None,
         };
@@ -5446,6 +5452,10 @@ mod tests {
             principal: Some("agent:alpha".into()),
             zone_id: None,
             capability_token: None,
+            holder_proof: Some(fcp_core::HolderProof::new(
+                [0x5a; 64],
+                fcp_core::TailscaleNodeId::new("node:preflight-holder"),
+            )),
             approval_tokens: vec![],
             lease_seq: Some(u64::MAX),
         };
@@ -5454,6 +5464,25 @@ mod tests {
         assert_eq!(parsed.operation, "delete");
         assert_eq!(parsed.principal.as_deref(), Some("agent:alpha"));
         assert_eq!(parsed.lease_seq, Some(u64::MAX));
+        let proof = parsed.holder_proof.expect("provided holder proof");
+        assert_eq!(proof.signature, [0x5a; 64]);
+        assert_eq!(
+            proof.holder_node,
+            fcp_core::TailscaleNodeId::new("node:preflight-holder")
+        );
+    }
+
+    #[test]
+    fn host_preflight_request_missing_holder_proof_defaults_to_none() {
+        let json = serde_json::json!({
+            "request_id": "preflight-without-holder-proof",
+            "connector_id": ConnectorId::new("test", "minimal", "v1").unwrap(),
+            "operation": "read",
+        });
+        let parsed: HostPreflightRequest = serde_json::from_value(json).unwrap();
+        assert!(parsed.holder_proof.is_none());
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert!(serialized.get("holder_proof").is_none());
     }
 
     #[test]
@@ -5466,6 +5495,7 @@ mod tests {
             principal: None,
             zone_id: None,
             capability_token: None,
+            holder_proof: None,
             approval_tokens: vec![],
             lease_seq: None,
         };
@@ -6345,6 +6375,7 @@ mod tests {
             principal: None,
             zone_id: None,
             capability_token: None,
+            holder_proof: None,
             approval_tokens: vec![],
             lease_seq: None,
         };

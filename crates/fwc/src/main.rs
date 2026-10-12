@@ -2563,6 +2563,11 @@ struct LiveAuthArgs {
     #[arg(long, value_name = "PATH")]
     capability_token_file: Option<PathBuf>,
 
+    /// Node signing key for holder-bound capabilities (32 raw bytes or 64 hexadecimal digits).
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    holder_key_file: Option<PathBuf>,
+
     /// Approval token JSON payload. Repeat for multiple approvals.
     #[arg(long = "approval-token", value_name = "JSON")]
     #[serde(skip_serializing)]
@@ -23171,6 +23176,38 @@ struct ResolvedLiveAuth {
     capability_token: CapabilityToken,
     approval_tokens: Vec<ApprovalToken>,
     principal_hint: Option<String>,
+    holder_signer: Option<LiveHolderSigner>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveHolderSigner {
+    key: fcp_crypto::Ed25519SigningKey,
+    holder_node: fcp_core::TailscaleNodeId,
+    token_jti: Vec<u8>,
+}
+
+impl ResolvedLiveAuth {
+    fn holder_proof_for(
+        &self,
+        request_id: &RequestId,
+        operation: &str,
+    ) -> Result<Option<fcp_core::HolderProof>> {
+        let Some(signer) = &self.holder_signer else {
+            return Ok(None);
+        };
+        let operation_id: OperationId = operation.parse().map_err(|error| {
+            anyhow::anyhow!("cannot sign holder proof for invalid operation: {error}")
+        })?;
+        let bytes = fcp_core::HolderProof::signable_bytes(
+            request_id,
+            &operation_id,
+            &signer.token_jti,
+        );
+        Ok(Some(fcp_core::HolderProof::new(
+            signer.key.sign(&bytes).to_bytes(),
+            signer.holder_node.clone(),
+        )))
+    }
 }
 
 #[derive(Debug)]
@@ -23179,6 +23216,7 @@ enum LiveAuthError {
     ConflictingCapabilityTokenSources,
     InvalidCapabilityToken { source: String, message: String },
     InvalidApprovalToken { source: String, message: String },
+    InvalidHolderProof { message: String },
 }
 
 impl LiveAuthError {
@@ -23188,6 +23226,7 @@ impl LiveAuthError {
             Self::ConflictingCapabilityTokenSources => "ambiguous-capability-token-source",
             Self::InvalidCapabilityToken { .. } => "invalid-capability-token",
             Self::InvalidApprovalToken { .. } => "invalid-approval-token",
+            Self::InvalidHolderProof { .. } => "invalid-holder-proof",
         }
     }
 
@@ -23201,6 +23240,7 @@ impl LiveAuthError {
             Self::InvalidApprovalToken { source, message } => {
                 format!("Failed to parse an approval token from {source}: {message}")
             }
+            Self::InvalidHolderProof { message } => message.clone(),
         }
     }
 }
@@ -23237,22 +23277,88 @@ fn resolve_live_auth(args: &LiveAuthArgs) -> std::result::Result<ResolvedLiveAut
         approval_tokens.extend(parse_approval_tokens_file(path)?);
     }
 
-    let principal_hint = capability_token
-        .raw()
-        .claims_unverified()
-        .ok()
-        .and_then(|claims| {
-            claims
-                .get_subject()
-                .or_else(|| claims.get_principal_id())
-                .map(ToOwned::to_owned)
-        });
+    // These claims only select the caller's signing context. The host still
+    // verifies the token and resolves the holder key from trusted membership.
+    let claims = capability_token.raw().claims_unverified().ok();
+    let principal_hint = claims.as_ref().and_then(|claims| {
+        claims
+            .get_subject()
+            .or_else(|| claims.get_principal_id())
+            .map(ToOwned::to_owned)
+    });
+    let expected_holder = claims.as_ref().and_then(|claims| claims.get_holder_node());
+    let holder_signer = match (expected_holder, args.holder_key_file.as_deref()) {
+        (Some(holder), Some(path)) => {
+            let token_jti = claims
+                .as_ref()
+                .and_then(|claims| claims.get_jti())
+                .filter(|jti| !jti.is_empty())
+                .ok_or_else(|| LiveAuthError::InvalidHolderProof {
+                    message: "Holder-bound capabilities must contain a nonempty token jti."
+                        .to_owned(),
+                })?;
+            Some(LiveHolderSigner {
+                key: read_live_holder_signing_key(path)?,
+                holder_node: fcp_core::TailscaleNodeId::new(holder),
+                token_jti: token_jti.to_vec(),
+            })
+        }
+        (Some(_), None) => {
+            return Err(LiveAuthError::InvalidHolderProof {
+                message: "This capability is holder-bound; provide its node signing key with --holder-key-file."
+                    .to_owned(),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(LiveAuthError::InvalidHolderProof {
+                message: "--holder-key-file requires a capability with a holder_node claim."
+                    .to_owned(),
+            });
+        }
+        (None, None) => None,
+    };
 
     Ok(ResolvedLiveAuth {
         capability_token,
         approval_tokens,
         principal_hint,
+        holder_signer,
     })
+}
+
+fn read_live_holder_signing_key(
+    path: &Path,
+) -> std::result::Result<fcp_crypto::Ed25519SigningKey, LiveAuthError> {
+    let invalid = |message: &str| LiveAuthError::InvalidHolderProof {
+        message: message.to_owned(),
+    };
+    let file = std::fs::File::open(path).map_err(|error| LiveAuthError::InvalidHolderProof {
+        message: format!("Cannot open holder signing key at `{}`: {error}", path.display()),
+    })?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(129));
+    file.take(129).read_to_end(&mut bytes).map_err(|_| {
+        invalid("Cannot read holder signing key; expected 32 raw bytes or 64 hexadecimal digits.")
+    })?;
+    if bytes.len() > 128 {
+        return Err(invalid("Holder signing key file exceeds the 128-byte limit."));
+    }
+    let mut secret = zeroize::Zeroizing::new([0_u8; 32]);
+    if bytes.len() == 32 {
+        secret.copy_from_slice(&bytes);
+    } else {
+        let encoded = std::str::from_utf8(&bytes).map_err(|_| {
+            invalid("Holder signing key must be 32 raw bytes or 64 hexadecimal digits.")
+        })?;
+        let encoded = encoded.trim();
+        if encoded.len() != 64 {
+            return Err(invalid("Holder signing key must be 32 raw bytes or 64 hexadecimal digits."));
+        }
+        hex::decode_to_slice(encoded, &mut *secret).map_err(|_| {
+            invalid("Holder signing key contains invalid hexadecimal encoding.")
+        })?;
+    }
+    fcp_crypto::Ed25519SigningKey::from_bytes(&secret)
+        .map_err(|_| invalid("Holder signing key is not a valid Ed25519 secret key."))
 }
 
 fn parse_capability_token_file(path: &Path) -> std::result::Result<CapabilityToken, LiveAuthError> {
@@ -23607,8 +23713,11 @@ fn preflight_dispatch_host(
         .clone()
         .or_else(|| auth.principal_hint.clone());
 
+    let request_id = RequestId::random();
+    let holder_proof = auth.holder_proof_for(&request_id, &operation.name)?;
     let preflight_request = HostPreflightRequest {
-        request_id: RequestId::random(),
+        holder_proof,
+        request_id,
         connector_id: connector_id.clone(),
         operation: operation.name.clone(),
         params: Some(prepared_payload.clone()),
@@ -24021,8 +24130,10 @@ fn invoke_dispatch_host(
         });
     }
 
+    let holder_proof = auth.holder_proof_for(&request_id, &operation.name)?;
     if let Some(simulation) = simulation {
         let request = HostSimulateRequest {
+            holder_proof,
             request_id: request_id.to_string(),
             connector_id: connector_id.to_string(),
             operation: operation.name.clone(),
@@ -24133,6 +24244,7 @@ fn invoke_dispatch_host(
     }
 
     let preflight_request = HostPreflightRequest {
+        holder_proof: holder_proof.clone(),
         request_id: request_id.clone(),
         connector_id: connector_id.clone(),
         operation: operation.name.clone(),
@@ -24196,7 +24308,7 @@ fn invoke_dispatch_host(
         zone_id,
         input: prepared_payload.clone(),
         capability_token: auth.capability_token,
-        holder_proof: None,
+        holder_proof,
         context: None,
         idempotency_key: args.idempotency_key.clone(),
         lease_seq: args.lease_seq,
@@ -25504,8 +25616,7 @@ fn build_live_invoke_request(
     zone: &str,
     payload: Value,
     request_id: RequestId,
-    capability_token: CapabilityToken,
-    approval_tokens: Vec<ApprovalToken>,
+    auth: &ResolvedLiveAuth,
     idempotency_key: Option<String>,
     lease_seq: Option<u64>,
     deadline_ms: Option<u64>,
@@ -25520,6 +25631,7 @@ fn build_live_invoke_request(
         anyhow::anyhow!("host operation id `{operation_name}` is not canonical: {error}")
     })?;
 
+    let holder_proof = auth.holder_proof_for(&request_id, operation_name)?;
     Ok(InvokeRequest {
         r#type: "invoke".to_owned(),
         id: request_id,
@@ -25527,15 +25639,15 @@ fn build_live_invoke_request(
         operation: operation_id,
         zone_id,
         input: payload,
-        capability_token,
-        holder_proof: None,
+        capability_token: auth.capability_token.clone(),
+        holder_proof,
         context: None,
         idempotency_key,
         lease_seq,
         deadline_ms,
         correlation_id: None,
         provenance: None,
-        approval_tokens,
+        approval_tokens: auth.approval_tokens.clone(),
     })
 }
 
@@ -27800,6 +27912,7 @@ fn execute_live_pipeline_plan(
             .parse()
             .map_err(|error| anyhow::anyhow!("`{zone}` is not a valid FCP zone: {error}"))?;
         let preflight_request = HostPreflightRequest {
+            holder_proof: auth.holder_proof_for(&request_id, &resolved.operation.name)?,
             request_id: request_id.clone(),
             connector_id: connector_id.clone(),
             operation: resolved.operation.name.clone(),
@@ -27911,8 +28024,7 @@ fn execute_live_pipeline_plan(
             zone,
             rendered_input.clone(),
             request_id.clone(),
-            auth.capability_token.clone(),
-            auth.approval_tokens.clone(),
+            &auth,
             idempotency_key.clone(),
             step.lease_seq,
             None,
@@ -29278,8 +29390,7 @@ fn map_dispatch(args: &MapArgs, explicit_host: Option<&str>) -> Result<DispatchO
                 None,
                 Some(&format!("map-item-{}", index + 1)),
             )?,
-            auth.capability_token.clone(),
-            auth.approval_tokens.clone(),
+            &auth,
             None,
             args.lease_seq,
             None,
@@ -29477,6 +29588,7 @@ fn batch_file_dispatch(
                 Some(op.id.as_str()),
             )?;
             let preflight_request = HostPreflightRequest {
+                holder_proof: auth.holder_proof_for(&request_id, &operation.name)?,
                 request_id,
                 connector_id: connector.summary.id.as_str().parse().map_err(|error| {
                     anyhow::anyhow!(
@@ -29523,8 +29635,7 @@ fn batch_file_dispatch(
                 None,
                 Some(op.id.as_str()),
             )?,
-            auth.capability_token.clone(),
-            auth.approval_tokens.clone(),
+            &auth,
             None,
             op.lease_seq,
             None,
@@ -32012,11 +32123,13 @@ mod tests {
         PackageOutput, PrepareCliError, ResolvedHostConfig, ResolvedHostOperation,
         TRUTH_SOURCE_SCHEMA_VERSION, catalog, doctor_hlc_probe_warnings,
         doctor_iblt_probe_warnings, doctor_migration_probe_warnings, doctor_reality_cadence_report,
-        execute, host_discovered_connector, host_discovered_operation, host_mcp_tool_definitions,
+        derive_live_request_id, execute, host_discovered_connector, host_discovered_operation,
+        host_mcp_tool_definitions,
         host_tool_summary_entry, host_tool_when_to_use, live_pipeline_operation_metadata,
         mcp_tool_invoke_args, normalize_args, pipeline_dry_run_can_materialize_output, prepare_cli,
         resolve_install_activation_truth, resolve_mesh_live_truth, serve_mcp,
-        try_host_mcp_tool_definitions, try_host_tool_operation_info, validate_registry_binary_name,
+        to_deterministic_cbor, try_host_mcp_tool_definitions, try_host_tool_operation_info,
+        validate_registry_binary_name,
     };
     use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
     use clap::{CommandFactory, Parser};
@@ -32027,7 +32140,7 @@ mod tests {
         ConnectorInventoryMutationKind, ConnectorInventoryMutationResponse, ConnectorPrewarmConfig,
         DiscoveryResponse as HostDiscoveryResponse, DoctorReport as HostDoctorReport,
         IntrospectionResponse as HostIntrospectionResponse, ManagedConnectorConfig,
-        PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement,
+        PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement, SimulatePhase,
         StartupReconciliationReport,
     };
     use fcp_prelude::{
@@ -34314,6 +34427,338 @@ max_state_replication_staleness_secs = 120
         assert_eq!(claims.get_capability_id(), Some("cap.all"));
         assert_eq!(claims.get_zone_id(), Some("z:work"));
         assert_eq!(auth.principal_hint.as_deref(), Some("test-principal"));
+    }
+
+    const TEST_LIVE_HOLDER_NODE: &str = "node:cli-holder";
+    const TEST_LIVE_HOLDER_JTI: &[u8] = b"fwc-holder-proof-jti";
+
+    fn test_holder_capability_token_arg(holder: Option<&str>, jti: Option<&[u8]>) -> String {
+        use base64::Engine as _;
+
+        let mut claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .expect("test token claims should decode");
+        assert!(claims.get_jti().is_none());
+        if let Some(holder) = holder {
+            claims = claims.holder_node(holder);
+        }
+        if let Some(jti) = jti {
+            claims = claims.token_id(jti);
+        }
+        let issuer = Ed25519SigningKey::from_bytes(&[0x42; 32]).expect("test issuer key");
+        let token = fcp_crypto::cose::CoseToken::sign(&issuer, &claims)
+            .expect("holder capability should sign");
+        base64::engine::general_purpose::STANDARD
+            .encode(token.to_cbor().expect("holder capability should encode"))
+    }
+
+    fn test_live_holder_auth(directory: &Path) -> (String, PathBuf, Ed25519SigningKey) {
+        let seed = [0x80; 32];
+        let key_path = directory.join("holder-key.raw");
+        fs::write(&key_path, seed).expect("holder key fixture should write");
+        let signing_key = Ed25519SigningKey::from_bytes(&seed).expect("test holder key");
+        let token = test_holder_capability_token_arg(
+            Some(TEST_LIVE_HOLDER_NODE),
+            Some(TEST_LIVE_HOLDER_JTI),
+        );
+        (token, key_path, signing_key)
+    }
+
+    fn assert_live_holder_request(
+        request: &Value,
+        signing_key: &Ed25519SigningKey,
+    ) -> fcp_core::HolderProof {
+        let request_id: RequestId = serde_json::from_value(
+            request
+                .get("request_id")
+                .or_else(|| request.get("id"))
+                .expect("wire request should have an ID")
+                .clone(),
+        )
+        .expect("wire request ID should decode");
+        let operation: fcp_core::OperationId =
+            serde_json::from_value(request["operation"].clone())
+                .expect("wire operation should decode");
+        let proof: fcp_core::HolderProof =
+            serde_json::from_value(request["holder_proof"].clone())
+                .expect("wire request should contain a holder proof");
+        let token: super::CapabilityToken =
+            serde_json::from_value(request["capability_token"].clone())
+                .expect("wire capability should decode");
+        let claims = token
+            .raw()
+            .claims_unverified()
+            .expect("wire capability claims should decode");
+        assert_eq!(claims.get_holder_node(), Some(TEST_LIVE_HOLDER_NODE));
+        assert_eq!(claims.get_jti(), Some(TEST_LIVE_HOLDER_JTI));
+        assert_eq!(
+            proof.holder_node,
+            fcp_core::TailscaleNodeId::new(TEST_LIVE_HOLDER_NODE)
+        );
+        let signable = fcp_core::HolderProof::signable_bytes(
+            &request_id,
+            &operation,
+            TEST_LIVE_HOLDER_JTI,
+        );
+        signing_key
+            .verifying_key()
+            .verify(
+                &signable,
+                &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
+            )
+            .expect("holder signature should bind the actual wire request");
+        proof
+    }
+
+    #[test]
+    fn live_holder_key_accepts_raw_hex_and_bounded_whitespace() {
+        fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let tempdir = TempDir::new().expect("holder key tempdir");
+        let path = tempdir.path().join("holder.key");
+        let seed = [0xab; 32];
+        let expected = Ed25519SigningKey::from_bytes(&seed).expect("test holder key");
+        let encoded = hex::encode(seed);
+        let encodings = [
+            seed.to_vec(),
+            encoded.as_bytes().to_vec(),
+            encoded.to_uppercase().into_bytes(),
+            format!(" \t{encoded}\r\n").into_bytes(),
+            format!("{encoded}{}", " ".repeat(64)).into_bytes(),
+        ];
+        for encoding in encodings {
+            assert!(encoding.len() <= 128);
+            fs::write(&path, &encoding).expect("key fixture should write");
+            let parsed =
+                super::read_live_holder_signing_key(&path).expect("holder key should parse");
+            assert_zeroizes_on_drop(&parsed);
+            assert_eq!(
+                parsed.verifying_key().to_bytes(),
+                expected.verifying_key().to_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn live_holder_key_rejects_malformed_and_oversized_files() {
+        let tempdir = TempDir::new().expect("holder key tempdir");
+        let path = tempdir.path().join("holder.key");
+        let encoded = hex::encode([0x80; 32]);
+        let invalid_encodings = [
+            Vec::new(),
+            vec![0x80; 31],
+            vec![0x80; 33],
+            vec![b'f'; 63],
+            vec![b'f'; 65],
+            vec![b'g'; 64],
+            vec![0xff; 64],
+            format!("{encoded}{}", " ".repeat(65)).into_bytes(),
+            format!("{encoded}{}", " ".repeat(4096)).into_bytes(),
+        ];
+        for encoding in invalid_encodings {
+            fs::write(&path, &encoding).expect("invalid key fixture should write");
+            let error = super::read_live_holder_signing_key(&path)
+                .expect_err("invalid or oversized holder key must fail");
+            assert_eq!(error.error_type(), "invalid-holder-proof");
+            assert!(!error.message().contains(&encoded));
+            if encoding.len() > 128 {
+                assert!(error.message().contains("128-byte limit"));
+            }
+        }
+        let error = super::read_live_holder_signing_key(&tempdir.path().join("missing.key"))
+            .expect_err("missing holder key must fail");
+        assert_eq!(error.error_type(), "invalid-holder-proof");
+        assert!(error.message().contains("Cannot open"));
+    }
+
+    #[test]
+    fn resolve_live_auth_rejects_incomplete_or_unbound_holder_context() {
+        let tempdir = TempDir::new().expect("holder auth tempdir");
+        let (token, key_path, _) = test_live_holder_auth(tempdir.path());
+        let missing_key = super::resolve_live_auth(&LiveAuthArgs {
+            capability_token: Some(token),
+            ..LiveAuthArgs::default()
+        })
+        .expect_err("holder-bound capabilities require a key");
+        assert_eq!(missing_key.error_type(), "invalid-holder-proof");
+        assert!(missing_key.message().contains("--holder-key-file"));
+
+        let bearer_key = super::resolve_live_auth(&LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            holder_key_file: Some(tempdir.path().join("must-not-be-read.key")),
+            ..LiveAuthArgs::default()
+        })
+        .expect_err("a signing key requires an explicit holder claim");
+        assert_eq!(bearer_key.error_type(), "invalid-holder-proof");
+        assert!(bearer_key.message().contains("holder_node claim"));
+
+        for jti in [None, Some(&[][..])] {
+            let missing_jti = super::resolve_live_auth(&LiveAuthArgs {
+                capability_token: Some(test_holder_capability_token_arg(
+                    Some(TEST_LIVE_HOLDER_NODE),
+                    jti,
+                )),
+                holder_key_file: Some(key_path.clone()),
+                ..LiveAuthArgs::default()
+            })
+            .expect_err("holder-bound capabilities require a nonempty JTI");
+            assert_eq!(missing_jti.error_type(), "invalid-holder-proof");
+            assert!(missing_jti.message().contains("nonempty token jti"));
+        }
+
+        let bearer = super::resolve_live_auth(&LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        })
+        .expect("bearer capabilities should remain supported");
+        assert!(bearer.holder_signer.is_none());
+        assert!(
+            bearer
+                .holder_proof_for(&RequestId::new("bearer-request"), "issues.create")
+                .expect("bearer request should build")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_holder_proofs_bind_request_operation_and_token_jti() {
+        let tempdir = TempDir::new().expect("holder proof tempdir");
+        let (token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
+        let args = LiveAuthArgs {
+            capability_token: Some(token),
+            holder_key_file: Some(key_path),
+            ..LiveAuthArgs::default()
+        };
+        let serialized_args = serde_json::to_value(&args).expect("live args should serialize");
+        assert!(serialized_args.get("capability_token").is_none());
+        assert!(serialized_args.get("holder_key_file").is_none());
+        let auth = super::resolve_live_auth(&args).expect("holder auth should resolve");
+        let request_id = RequestId::new("holder-request-one");
+        let operation: fcp_core::OperationId = "issues.create".parse().unwrap();
+        let proof = auth
+            .holder_proof_for(&request_id, operation.as_str())
+            .expect("holder proof should sign")
+            .expect("holder proof should be present");
+        assert_eq!(
+            proof.holder_node,
+            fcp_core::TailscaleNodeId::new(TEST_LIVE_HOLDER_NODE)
+        );
+        let signature = fcp_crypto::Ed25519Signature::from_bytes(&proof.signature);
+        let verifier = signing_key.verifying_key();
+        let signable = fcp_core::HolderProof::signable_bytes(
+            &request_id,
+            &operation,
+            TEST_LIVE_HOLDER_JTI,
+        );
+        verifier
+            .verify(&signable, &signature)
+            .expect("holder proof signature should verify");
+        let repeated = auth
+            .holder_proof_for(&request_id, operation.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.signature, repeated.signature);
+
+        let other_request = RequestId::new("holder-request-two");
+        let other_operation: fcp_core::OperationId = "issues.get".parse().unwrap();
+        for changed in [
+            fcp_core::HolderProof::signable_bytes(
+                &other_request,
+                &operation,
+                TEST_LIVE_HOLDER_JTI,
+            ),
+            fcp_core::HolderProof::signable_bytes(
+                &request_id,
+                &other_operation,
+                TEST_LIVE_HOLDER_JTI,
+            ),
+            fcp_core::HolderProof::signable_bytes(&request_id, &operation, b"another-token"),
+        ] {
+            assert!(verifier.verify(&changed, &signature).is_err());
+        }
+        let other_proof = auth
+            .holder_proof_for(&other_request, operation.as_str())
+            .unwrap()
+            .unwrap();
+        assert_ne!(proof.signature, other_proof.signature);
+        assert!(
+            auth.holder_proof_for(&request_id, "invalid operation!")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_holder_proofs_reach_invoke_preflight_and_simulate() {
+        let tempdir = TempDir::new().expect("holder wire tempdir");
+        let (token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
+        let key_path_text = key_path.display().to_string();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Holder proof wire test",
+        });
+        let input_text = input.to_string();
+        for command in ["invoke", "preflight", "simulate"] {
+            let mut routes = vec![
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ];
+            if command == "simulate" {
+                routes.push((
+                    "POST /rpc/simulate".to_owned(),
+                    mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true),
+                ));
+            } else {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+                if command == "invoke" {
+                    routes.push((
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({ "created": true })),
+                    ));
+                }
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                command,
+                "github",
+                "issues.create",
+                "--input",
+                &input_text,
+                "--capability-token",
+                &token,
+                "--holder-key-file",
+                &key_path_text,
+            ]);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{command}: {payload}");
+            let requests = request_log.lock().expect("request log should lock");
+            let bodies = requests[2..]
+                .iter()
+                .map(|(_, body)| serde_json::from_str::<Value>(body).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(bodies.len(), if command == "invoke" { 2 } else { 1 });
+            for body in &bodies {
+                assert_live_holder_request(body, &signing_key);
+            }
+            if command == "invoke" {
+                assert_eq!(bodies[0]["request_id"], bodies[1]["id"]);
+                assert_eq!(bodies[0]["holder_proof"], bodies[1]["holder_proof"]);
+            }
+        }
     }
 
     fn fixture_manifest_text(
@@ -43741,7 +44186,9 @@ deny_ptrace = true
 
     #[test]
     fn execute_map_preserves_lease_sequence_for_all_items() {
-        let capability_token = test_capability_token_arg();
+        let tempdir = TempDir::new().expect("map holder tempdir");
+        let (capability_token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
+        let key_path_text = key_path.display().to_string();
         for lease_seq in [None, Some(0), Some(u64::MAX)] {
             let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
                 (
@@ -43768,6 +44215,8 @@ deny_ptrace = true
                 r#"[{"owner":"octocat","repo":"hello-world","number":1},{"owner":"octocat","repo":"hello-world","number":2}]"#,
                 "--capability-token",
                 &capability_token,
+                "--holder-key-file",
+                &key_path_text,
             ];
             let sequence_text = lease_seq.map(|sequence| sequence.to_string());
             if let Some(sequence) = sequence_text.as_deref() {
@@ -43780,13 +44229,17 @@ deny_ptrace = true
             let batch: Value = serde_json::from_str(&requests[2].1).unwrap();
             let operations = batch["operations"].as_array().unwrap();
             assert_eq!(operations.len(), 2);
+            let mut signatures = Vec::new();
             for operation in operations {
                 let request = &operation["request"];
+                signatures.push(assert_live_holder_request(request, &signing_key).signature);
                 assert_eq!(request["lease_seq"].as_u64(), lease_seq);
                 if lease_seq.is_none() {
                     assert!(request.get("lease_seq").is_none());
                 }
             }
+            assert_ne!(operations[0]["request"]["id"], operations[1]["request"]["id"]);
+            assert_ne!(signatures[0], signatures[1]);
         }
         for invalid in ["-1", "18446744073709551616", "latest"] {
             assert!(
@@ -44080,8 +44533,9 @@ default = "#general"
 
     #[test]
     fn execute_pipeline_preserves_step_lease_evidence_for_dry_run_and_invoke() {
-        let capability_token = test_capability_token_arg();
         let temp_dir = tempfile::tempdir().expect("pipeline tempdir");
+        let (capability_token, key_path, signing_key) = test_live_holder_auth(temp_dir.path());
+        let key_path_text = key_path.display().to_string();
         let path = temp_dir.path().join("fenced-pipeline.toml");
         fs::write(
             &path,
@@ -44139,6 +44593,8 @@ input = { owner = "octocat", repo = "hello-world", title = "Second" }
                 &path_text,
                 "--capability-token",
                 &capability_token,
+                "--holder-key-file",
+                &key_path_text,
             ]);
             server.join().expect("mock host thread should complete");
             assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
@@ -44147,15 +44603,24 @@ input = { owner = "octocat", repo = "hello-world", title = "Second" }
             let requests = request_log.lock().expect("request log should lock");
             let step_request_count = if mode == "run" { 2 } else { 1 };
             assert_eq!(requests.len(), 2 + 2 * step_request_count);
+            let mut signatures = Vec::new();
+            let mut request_ids = Vec::new();
             for (step_requests, sequence) in requests[2..].chunks(step_request_count).zip([42, 7]) {
                 let preflight: Value = serde_json::from_str(&step_requests[0].1).unwrap();
+                let proof = assert_live_holder_request(&preflight, &signing_key);
+                signatures.push(proof.signature);
+                request_ids.push(preflight["request_id"].clone());
                 assert_eq!(preflight["lease_seq"], sequence);
                 if mode == "run" {
                     let invocation: Value = serde_json::from_str(&step_requests[1].1).unwrap();
+                    assert_live_holder_request(&invocation, &signing_key);
                     assert_eq!(invocation["lease_seq"], sequence);
                     assert_eq!(preflight["request_id"], invocation["id"]);
+                    assert_eq!(preflight["holder_proof"], invocation["holder_proof"]);
                 }
             }
+            assert_ne!(request_ids[0], request_ids[1]);
+            assert_ne!(signatures[0], signatures[1]);
         }
     }
 
@@ -44627,7 +45092,9 @@ depends_on = ["missing"]
 
     #[test]
     fn execute_recipe_dry_run_uses_bundled_defaults() {
-        let capability_token = test_capability_token_arg();
+        let tempdir = TempDir::new().expect("recipe holder tempdir");
+        let (capability_token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
+        let key_path_text = key_path.display().to_string();
         let github_connector = mock_connector_summary_custom_json(
             "fcp.github:enterprise:v1",
             "GitHub Enterprise",
@@ -44686,7 +45153,7 @@ depends_on = ["missing"]
                 }
             }),
         );
-        let (host, server) = spawn_mock_host_sequence(vec![
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
             (
                 "POST /rpc/discover".to_owned(),
                 mock_discovery_response_with_connectors(vec![
@@ -44729,6 +45196,8 @@ depends_on = ["missing"]
             "github-pr-review-notify",
             "--capability-token",
             &capability_token,
+            "--holder-key-file",
+            &key_path_text,
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -44768,6 +45237,18 @@ depends_on = ["missing"]
             steps[1]["input"]["text"],
             "PR review requested for octocat/hello-world#1: Review the concurrency fix"
         );
+        let requests = request_log.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 6);
+        let fetch_preflight: Value = serde_json::from_str(&requests[3].1).unwrap();
+        let fetch_invoke: Value = serde_json::from_str(&requests[4].1).unwrap();
+        let notify_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+        let fetch_proof = assert_live_holder_request(&fetch_preflight, &signing_key);
+        assert_live_holder_request(&fetch_invoke, &signing_key);
+        let notify_proof = assert_live_holder_request(&notify_preflight, &signing_key);
+        assert_eq!(fetch_preflight["request_id"], fetch_invoke["id"]);
+        assert_eq!(fetch_preflight["holder_proof"], fetch_invoke["holder_proof"]);
+        assert_ne!(fetch_preflight["request_id"], notify_preflight["request_id"]);
+        assert_ne!(fetch_proof.signature, notify_proof.signature);
     }
 
     #[test]
@@ -48170,8 +48651,9 @@ depends_on = ["missing"]
 
     #[test]
     fn execute_batch_file_preserves_each_operations_lease_evidence() {
-        let capability_token = test_capability_token_arg();
         let temp_dir = tempfile::tempdir().expect("batch file tempdir");
+        let (capability_token, key_path, signing_key) = test_live_holder_auth(temp_dir.path());
+        let key_path_text = key_path.display().to_string();
         let path = temp_dir.path().join("fenced-batch.jsonl");
         fs::write(
             &path,
@@ -48219,6 +48701,8 @@ depends_on = ["missing"]
                 &path_text,
                 "--capability-token",
                 &capability_token,
+                "--holder-key-file",
+                &key_path_text,
             ];
             if dry_run {
                 arguments.push("--dry-run");
@@ -48248,6 +48732,20 @@ depends_on = ["missing"]
             assert_eq!(sent_operations[0]["lease_seq"], 42);
             assert_eq!(sent_operations[1]["lease_seq"], 7);
             assert!(sent_operations[2].get("lease_seq").is_none());
+            let proofs = sent_operations
+                .iter()
+                .map(|request| assert_live_holder_request(request, &signing_key))
+                .collect::<Vec<_>>();
+            let request_id_field = if dry_run { "request_id" } else { "id" };
+            for left in 0..sent_operations.len() {
+                for right in left + 1..sent_operations.len() {
+                    assert_ne!(
+                        sent_operations[left][request_id_field],
+                        sent_operations[right][request_id_field]
+                    );
+                    assert_ne!(proofs[left].signature, proofs[right].signature);
+                }
+            }
         }
     }
 

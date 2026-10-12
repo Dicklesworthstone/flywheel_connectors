@@ -812,6 +812,9 @@ pub struct HostSimulateRequest {
     /// Capability token authorizing the live simulation request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_token: Option<CapabilityToken>,
+    /// Holder signature binding a holder-bound token to this simulation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_proof: Option<fcp_core::HolderProof>,
     /// Approval tokens required for elevated live simulation requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_tokens: Vec<ApprovalToken>,
@@ -5572,9 +5575,12 @@ fn persist_admin_state_snapshot(
     #[cfg(unix)]
     {
         let mut directory = parent;
-        while !directory.try_exists().map_err(|err| LifecycleError::Persistence {
-            reason: format!("could not inspect admin state directory: {err}"),
-        })? {
+        while !directory
+            .try_exists()
+            .map_err(|err| LifecycleError::Persistence {
+                reason: format!("could not inspect admin state directory: {err}"),
+            })?
+        {
             new_directories.push(directory.to_path_buf());
             directory = directory
                 .parent()
@@ -6911,7 +6917,12 @@ mod tests {
                 .is_err(),
             "history pressure cannot release an unresolved scoped key",
         );
-        assert!(store.invocation_record("fresh-id-under-pressure", None).await.is_none());
+        assert!(
+            store
+                .invocation_record("fresh-id-under-pressure", None)
+                .await
+                .is_none()
+        );
         assert!(store.invocation_record("completed-3", None).await.is_some());
     }
 
@@ -9365,6 +9376,10 @@ mod tests {
             zone_id: Some("z:work".to_string()),
             principal: Some("agent:test".to_string()),
             capability_token: None,
+            holder_proof: Some(fcp_core::HolderProof::new(
+                [0x6b; 64],
+                fcp_core::TailscaleNodeId::new("node:simulate-holder"),
+            )),
             approval_tokens: Vec::new(),
             lease_seq: Some(u64::MAX),
             estimate_cost: true,
@@ -9377,6 +9392,12 @@ mod tests {
         assert_eq!(parsed.request_id, "req-1");
         assert_eq!(parsed.connector_id, "github:saas:1.0.0");
         assert!(parsed.capability_token.is_none());
+        let proof = parsed.holder_proof.expect("provided holder proof");
+        assert_eq!(proof.signature, [0x6b; 64]);
+        assert_eq!(
+            proof.holder_node,
+            fcp_core::TailscaleNodeId::new("node:simulate-holder")
+        );
         assert!(parsed.approval_tokens.is_empty());
         assert_eq!(parsed.lease_seq, Some(u64::MAX));
         assert!(parsed.estimate_cost);
@@ -9393,12 +9414,15 @@ mod tests {
         }"#;
         let parsed: HostSimulateRequest = serde_json::from_str(json).unwrap();
         assert!(parsed.capability_token.is_none());
+        assert!(parsed.holder_proof.is_none());
         assert!(parsed.approval_tokens.is_empty());
         assert!(parsed.lease_seq.is_none());
         assert!(!parsed.estimate_cost);
         assert!(!parsed.check_availability);
         assert_eq!(parsed.deadline_ms, 5000);
         assert!(parsed.input.is_none());
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert!(serialized.get("holder_proof").is_none());
     }
 
     #[test]
@@ -12383,6 +12407,7 @@ mod tests {
             zone_id: Some("z:work".to_string()),
             principal: Some("agent://cod-p9".to_string()),
             capability_token: None,
+            holder_proof: None,
             approval_tokens: Vec::new(),
             lease_seq: None,
             estimate_cost: true,
