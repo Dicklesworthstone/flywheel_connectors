@@ -25,6 +25,10 @@ use fcp_mesh::invoke_route::{
 
 use crate::{HostError, HostResult};
 
+mod group_commit;
+
+pub(crate) use group_commit::MAX_REPLAY_GROUP_SIZE;
+
 /// Optional journal path for environment-configured mesh routers.
 /// Defaults to the signing-key filename with `.mesh-replay` appended.
 pub const MESH_REPLAY_JOURNAL_ENV: &str = "FCP_HOST_MESH_REPLAY_JOURNAL";
@@ -310,71 +314,16 @@ impl DurableMeshReplayGuard {
         self.accept_verified(&identity, now_ms)
     }
 
-    /// Commit an opaque, previously authenticated identity on the blocking worker.
-    /// This does not permit execution until the existing journal sync completes.
+    /// Commit one authenticated identity using the shared group-commit rules.
+    /// Success still requires the existing journal sync to complete.
     pub(crate) fn accept_verified(
         &mut self,
         identity: &VerifiedMeshReplayNonce,
         now_ms: u64,
     ) -> Result<(), MeshForwardError> {
-        if identity.scope != self.scope {
-            return Err(replay_unavailable("node_scope_mismatch"));
-        }
-        if self.io_failed {
-            return Err(replay_unavailable("storage_failed"));
-        }
-        if now_ms < self.high_water_ms {
-            return Err(replay_unavailable("clock_rollback"));
-        }
-        if identity.issued_at_ms.abs_diff(now_ms) > self.window_ms {
-            return Err(MeshForwardError::Stale {
-                what: "forward",
-                issued_at_ms: identity.issued_at_ms,
-                now_ms,
-                window_ms: self.window_ms,
-            });
-        }
-        let key = identity.key;
-        self.high_water_ms = now_ms;
-        self.expire(now_ms);
-        if self.entries.contains_key(&key) {
-            return Err(MeshForwardError::Replayed {
-                origin: identity.origin.clone(),
-            });
-        }
-        if self.entries.len() >= self.capacity {
-            return Err(MeshForwardError::ReplayCacheSaturated {
-                capacity: self.capacity,
-            });
-        }
-        let entry = Entry {
-            expires_at_ms: identity.issued_at_ms.saturating_add(self.window_ms),
-            observed_at_ms: now_ms,
-        };
-        // Latch before any persistence or allocation that could unwind. Only a
-        // fully synced append and published in-memory entry clear this latch.
-        self.io_failed = true;
-        let persisted = (|| -> io::Result<()> {
-            if self.record_count >= self.capacity * 2 {
-                self.compact()?;
-            }
-            self.file.write_all(&encode_record(&self.scope, &key, entry))?;
-            self.file.sync_all()
-        })();
-        if let Err(error) = persisted {
-            tracing::error!(
-                event = "mesh_replay_journal_unavailable",
-                reason = "commit_failed",
-                error_kind = ?error.kind(),
-                "mesh forward refused before dispatch"
-            );
-            return Err(replay_unavailable("commit_failed"));
-        }
-        self.record_count += 1;
-        self.entries.insert(key, entry);
-        self.expirations.push(Reverse((entry.expires_at_ms, key)));
-        self.io_failed = false;
-        Ok(())
+        self.accept_verified_batch(&[identity], now_ms)
+            .pop()
+            .unwrap_or_else(|| Err(replay_unavailable("missing_admission_result")))
     }
 
     fn expire(&mut self, now_ms: u64) {

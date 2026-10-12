@@ -6,7 +6,9 @@ Bridge plan Phase A.2 (`MeshInvokeTransport`). Code: `crates/fcp-mesh/src/invoke
 (bounded authenticated discovery), and `crates/fcp-host/src/mesh_routing/admission.rs`
 (outbound resource admission and peer circuit recovery), wired into `fcp-host` at
 `/rpc/invoke`, `/rpc/preflight`, `/rpc/introspect/{id}`, and `/rpc/discover`.
-Persistent inbound admission: `crates/fcp-host/src/mesh_replay.rs`.
+Persistent inbound admission: `crates/fcp-host/src/mesh_replay.rs` and
+`crates/fcp-host/src/mesh_replay/group_commit.rs`; its bounded worker is in
+`crates/fcp-host/src/mesh_routing/inbound.rs`.
 Multi-process forwarding coverage: `crates/fcp-host/tests/mesh_invoke_e2e.rs`.
 Restart/crash admission coverage: `crates/fcp-host/tests/mesh_replay_restart.rs`.
 
@@ -18,7 +20,7 @@ operation executes.
 
 | Request names... | Executes on | `response_metadata.route.truth_source` | `decision` |
 |------------------|-------------|----------------------------------------|------------|
-| a connector in this host's inventory | this host | `host-backed` | `local_connector` |
+| an ordinary non-singleton connector in this host's inventory | this host | `host-backed` | `local_connector` |
 | a connector a peer advertises | the HRW-first advertiser | `mesh-backed` | `advertised_peer_forward` |
 | a `singleton_writer` connector, with `FCP_HOST_HRW_LEASE_NODES` set on the entry node | the HRW-elected holder | `mesh-backed` | `hrw_holder_forward` |
 | a connector nobody advertises | this host (fails `ConnectorNotFound` as before) | — | `no_advertising_peer` |
@@ -52,6 +54,9 @@ must use `MeshRouter::with_replay_journal` instead. `MeshRouter::from_env` and `
 always enable durable replay protection when mesh routing is configured.
 
 Endpoints are bare `http(s)://host:port` base URLs, normally Tailscale addresses.
+Owner-signed membership, persistent generation checkpoints, and live file reload are described
+in [Mesh membership](mesh_membership.md). That trust mode uses a signed peer source instead
+of the raw array above.
 
 ## Security model
 
@@ -106,6 +111,47 @@ sync error latches the guard closed; poisoned state also refuses further admissi
 refuses a locked, corrupt, torn, empty-existing, incorrectly scoped, or oversized journal.
 There is no automatic reset or volatile fallback. Runtime storage refusal uses the existing
 `Malformed` error with `field="replay_journal"`; it does not authorize the entry node to retry.
+
+### Asynchronous admission, isolation, and group commit
+
+The live HTTP handler awaits a dedicated replay worker. It admits at most **33 total jobs**
+across the queue and active group, with a fixed **four-job ceiling per authenticated origin**.
+The channel holds at most 32 queued jobs. Both limits are reserved atomically before enqueue;
+removing a group from the channel does not create extra capacity while its journal work runs.
+The separate accounting mutex is never held during disk I/O. Only verified nonce identities
+enter the queue, not copies of request bodies or capability tokens.
+
+After acquiring the journal mutex, the worker collects up to **16 already-queued jobs** and
+commits their admissible identities with one shared append and `sync_all`. There is no timer
+or delay to fill a group: a lone request proceeds immediately. Duplicates are detected both
+against durable history and within the group. Scope, freshness, clock rollback, and live-nonce
+capacity are checked before staging each identity; ordinary per-job results retain input order.
+A group with no admissible identities performs no append or sync.
+
+No successful result is published before the shared sync and in-memory publication complete.
+Compaction occurs first when adding the group would exceed the existing disk ceiling, and
+retains its separate file/directory sync barriers. The journal format and recovery rules are
+unchanged. An uncertain append, sync, or compaction failure refuses the entire group and keeps
+admission closed. A crash can consume some unacknowledged nonces or leave a torn journal that
+refuses startup; it never authorizes replaying those requests. Group commit is not an atomic
+transaction over the connector operations themselves.
+
+The five-second reply deadline is independent of filesystem progress. Queue/total saturation,
+peer-slot exhaustion, a stopped worker, poisoned accounting, or journal unavailability is an
+unsigned HTTP 503. The queued job owns its slot after caller cancellation or timeout. Success,
+error, queue rejection, and channel teardown release its slot before notifying its waiter.
+The worker never dispatches an operation for a cancelled handler. These limits cover journal
+work, not all host execution or all memory, and do not prove quorum health or fairness across
+arbitrarily many enrolled identities. Embedded synchronous admission shares the same journal
+and validation rules but remains outside the asynchronous worker's occupancy quotas.
+
+Group-commit and isolation regressions are alongside their implementations. They cover the
+shared sync barrier, restart recovery, mixed outcomes, uncertain writes, compaction, expiry,
+serial-equivalent admission, bounded burst collection, and cancelled-waiter accounting. These
+changes have not yet been compiled, tested, or benchmarked in the delivery environment; no
+measured throughput improvement or production-readiness graduation is claimed.
+
+### Journal storage contract
 
 The journal stores domain-separated replay-key hashes and expiry/observation timestamps,
 not request JSON, capability tokens, asserted principals, signatures, or response bodies.
@@ -199,7 +245,7 @@ from `mesh_discovery_deadline`.
 
 - The default deployment is still host-first. The README Mesh-Native row stays `STEADY-STATE
   TARGET (NOT YET OPERATIONAL)` until production evidence exists.
-- Membership is a static peer file, not gossip. Local transport circuits are not yet fed into
-  `MeshQuorumSignals` and must not be treated as authenticated quorum membership.
-- A locally installed connector always executes locally. There is no planner-driven placement
-  of local connectors onto peers.
+- Owner-signed membership and file reload do not provide gossip or authenticated quorum health.
+  Local transport circuits must not be treated as authenticated quorum membership.
+- Ordinary locally installed connectors execute locally. Singleton operations follow their
+  lease election; general planner-driven placement of local connectors remains outstanding.

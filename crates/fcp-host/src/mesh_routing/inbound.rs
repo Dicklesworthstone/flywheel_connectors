@@ -7,6 +7,8 @@
 //! only the caller's receiver, never the journal writer or its live nonce state.
 //! Authenticated origins have separate occupancy limits covering both queued
 //! and active journal work. Cancelling a waiter does not release its job's slot.
+//! Already queued work is committed in groups without waiting to fill a batch.
+//! Grouping does not increase the total number of admitted jobs.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, mpsc};
@@ -16,10 +18,13 @@ use std::time::Duration;
 use fcp_async_core::channel::oneshot;
 use fcp_mesh::invoke_route::MeshForwardError;
 
-use crate::mesh_replay::{DurableMeshReplayGuard, VerifiedMeshReplayNonce, replay_unavailable};
+use crate::mesh_replay::{
+    DurableMeshReplayGuard, MAX_REPLAY_GROUP_SIZE, VerifiedMeshReplayNonce, replay_unavailable,
+};
 use crate::{HostError, HostResult};
 
 const QUEUE_CAPACITY: usize = 32;
+const MAX_PENDING_TOTAL: usize = QUEUE_CAPACITY + 1;
 const MAX_PENDING_PER_PEER: usize = 4;
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 type AdmissionResult = Result<(), MeshForwardError>;
@@ -44,6 +49,11 @@ impl PeerAdmissions {
             .map_err(|_| replay_unavailable("replay_peer_admission_poisoned"))?;
         if pending.get(&origin).copied().unwrap_or(0) >= MAX_PENDING_PER_PEER {
             return Err(replay_unavailable("replay_admission_peer_limit"));
+        }
+        // A group can leave the channel while its jobs still occupy the
+        // journal. Bound queued PLUS active-group work, not just queue slots.
+        if pending.values().copied().sum::<usize>() >= MAX_PENDING_TOTAL {
+            return Err(replay_unavailable("replay_admission_total_limit"));
         }
         // Only a verified nonce can select the origin. Remove empty buckets
         // when reservations end; no historical peer IDs accumulate here.
@@ -88,6 +98,11 @@ pub(super) struct InboundReplayWorker {
     peers: Arc<PeerAdmissions>,
 }
 
+fn extend_ready_group(group: &mut Vec<Request>, receiver: &mpsc::Receiver<Request>) {
+    let remaining = MAX_REPLAY_GROUP_SIZE.saturating_sub(group.len());
+    group.extend(receiver.try_iter().take(remaining));
+}
+
 impl InboundReplayWorker {
     pub(super) fn spawn(state: Arc<Mutex<DurableMeshReplayGuard>>) -> HostResult<Self> {
         Self::spawn_with_clock(state, QUEUE_CAPACITY, super::unix_now_ms)
@@ -102,24 +117,31 @@ impl InboundReplayWorker {
         let thread = std::thread::Builder::new()
             .name("fcp-mesh-replay".to_owned())
             .spawn(move || {
-                while let Ok(Request {
-                    identity,
-                    reply,
-                    permit,
-                }) = receiver.recv()
-                {
-                    let result = match state.lock() {
-                        // Queue and mutex waits can outlive signed freshness.
-                        // Sampling under the lock also preserves clock order
-                        // with embedded synchronous admission callers.
-                        Ok(mut guard) => guard.accept_verified(&identity, clock()),
-                        Err(_) => Err(replay_unavailable("state_poisoned")),
+                while let Ok(first) = receiver.recv() {
+                    let mut group = Vec::with_capacity(MAX_REPLAY_GROUP_SIZE);
+                    group.push(first);
+                    let outcomes = match state.lock() {
+                        Ok(mut guard) => {
+                            // Drain only after obtaining the journal lock so
+                            // work accumulated during a mutex wait can share
+                            // the sync. Never delay a lone request to fill up.
+                            extend_ready_group(&mut group, &receiver);
+                            let identities = group.iter()
+                                .map(|request| &request.identity)
+                                .collect::<Vec<_>>();
+                            // One clock sample under the lock preserves order
+                            // with embedded synchronous admission callers.
+                            guard.accept_verified_batch(&identities, clock())
+                        }
+                        Err(_) => vec![Err(replay_unavailable("state_poisoned"))],
                     };
-                    // A dropped receiver does not undo durable consumption.
-                    // No operation is ever executed by this worker.
-                    // Release before waking the caller on success or error.
-                    drop(permit);
-                    let _ = reply.send(result);
+                    // The journal lock and sync barrier end before any caller
+                    // is notified. Cancellation never undoes a committed nonce.
+                    for (request, result) in group.into_iter().zip(outcomes) {
+                        let Request { permit, reply, .. } = request;
+                        drop(permit);
+                        let _ = reply.send(result);
+                    }
                 }
             })
             .map_err(|error| {
@@ -698,5 +720,65 @@ mod tests {
         assert_eq!(count, MAX_PENDING_PER_PEER);
         assert_eq!(usage, Some(MAX_PENDING_PER_PEER));
         assert!(peers.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_groups_cannot_refill_the_queue_past_the_total_job_ceiling() {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(QUEUE_CAPACITY);
+        let worker = InboundReplayWorker {
+            sender: Some(sender),
+            thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
+        };
+        let mut responses = Vec::new();
+        for index in 0..QUEUE_CAPACITY {
+            responses.push(worker.submit(identity_from(
+                &format!("origin-{index}"), "executor", READY,
+            )).unwrap());
+        }
+        let first = receiver.try_recv().unwrap();
+        responses.push(worker.submit(identity_from("last", "executor", READY)).unwrap());
+        let mut group = vec![first];
+        extend_ready_group(&mut group, &receiver);
+        assert_eq!(group.len(), MAX_REPLAY_GROUP_SIZE);
+        assert_eq!(worker.peers.pending.lock().unwrap().values().sum::<usize>(), MAX_PENDING_TOTAL);
+        let failure = worker.submit(identity_from("overflow", "executor", READY))
+            .err().expect("group still occupies capacity");
+        assert!(unavailable(&failure, "replay_admission_total_limit"));
+        drop(group.pop().unwrap());
+        responses.push(worker.submit(identity_from("overflow", "executor", READY)).unwrap());
+        drop(group);
+        drop(receiver);
+        drop(responses);
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_burst_shares_one_group_and_keeps_individual_results() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("replay"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let worker = InboundReplayWorker::spawn_with_clock(
+            Arc::clone(&state), QUEUE_CAPACITY, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                READY
+            },
+        ).unwrap();
+        let held = state.lock().unwrap();
+        let first = identity(READY);
+        let accepted = worker.submit(first.clone()).unwrap();
+        let other = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        let duplicate = worker.submit(first).unwrap();
+        let stale = worker.submit(identity_from("stale", "executor", READY - WINDOW - 1)).unwrap();
+        drop(held);
+        result(accepted).unwrap();
+        result(other).unwrap();
+        assert!(matches!(result(duplicate), Err(MeshForwardError::Replayed { .. })));
+        assert!(matches!(result(stale), Err(MeshForwardError::Stale { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
     }
 }
