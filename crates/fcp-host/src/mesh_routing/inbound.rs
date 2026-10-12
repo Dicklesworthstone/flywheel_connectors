@@ -5,7 +5,10 @@
 //! nonce. Cancellation cannot undo a commit or permit a repeated dispatch.
 //! Reply waits have a deadline independent of filesystem progress. Expiry drops
 //! only the caller's receiver, never the journal writer or its live nonce state.
+//! Authenticated origins have separate occupancy limits covering both queued
+//! and active journal work. Cancelling a waiter does not release its job's slot.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -17,10 +20,64 @@ use crate::mesh_replay::{DurableMeshReplayGuard, VerifiedMeshReplayNonce, replay
 use crate::{HostError, HostResult};
 
 const QUEUE_CAPACITY: usize = 32;
+const MAX_PENDING_PER_PEER: usize = 4;
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 type AdmissionResult = Result<(), MeshForwardError>;
 
+/// Short-lived accounting only: never lock this state during journal I/O.
+#[derive(Default)]
+struct PeerAdmissions {
+    pending: Mutex<BTreeMap<String, usize>>,
+}
+
+struct PeerPermit {
+    admissions: Arc<PeerAdmissions>,
+    origin: String,
+}
+
+impl PeerAdmissions {
+    fn reserve(admissions: &Arc<Self>, origin: &str) -> Result<PeerPermit, MeshForwardError> {
+        let origin = origin.to_owned();
+        let mut pending = admissions
+            .pending
+            .lock()
+            .map_err(|_| replay_unavailable("replay_peer_admission_poisoned"))?;
+        if pending.get(&origin).copied().unwrap_or(0) >= MAX_PENDING_PER_PEER {
+            return Err(replay_unavailable("replay_admission_peer_limit"));
+        }
+        // Only a verified nonce can select the origin. Remove empty buckets
+        // when reservations end; no historical peer IDs accumulate here.
+        *pending.entry(origin.clone()).or_default() += 1;
+        drop(pending);
+        Ok(PeerPermit {
+            admissions: Arc::clone(admissions),
+            origin,
+        })
+    }
+}
+
+impl Drop for PeerPermit {
+    fn drop(&mut self) {
+        // Existing jobs must release during unwinding, but poison is not
+        // cleared: new admissions still fail closed in reserve().
+        let mut pending = self
+            .admissions
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = pending.get_mut(&self.origin) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending.remove(&self.origin);
+            }
+        }
+    }
+}
+
 struct Request {
+    // Fields drop in declaration order. Release capacity before dropping the
+    // sender can wake a waiter during channel teardown or rejected enqueue.
+    permit: PeerPermit,
     identity: VerifiedMeshReplayNonce,
     reply: oneshot::Sender<AdmissionResult>,
 }
@@ -28,6 +85,7 @@ struct Request {
 pub(super) struct InboundReplayWorker {
     sender: Option<mpsc::SyncSender<Request>>,
     thread: Option<JoinHandle<()>>,
+    peers: Arc<PeerAdmissions>,
 }
 
 impl InboundReplayWorker {
@@ -44,17 +102,24 @@ impl InboundReplayWorker {
         let thread = std::thread::Builder::new()
             .name("fcp-mesh-replay".to_owned())
             .spawn(move || {
-                while let Ok(request) = receiver.recv() {
+                while let Ok(Request {
+                    identity,
+                    reply,
+                    permit,
+                }) = receiver.recv()
+                {
                     let result = match state.lock() {
                         // Queue and mutex waits can outlive signed freshness.
                         // Sampling under the lock also preserves clock order
                         // with embedded synchronous admission callers.
-                        Ok(mut guard) => guard.accept_verified(&request.identity, clock()),
+                        Ok(mut guard) => guard.accept_verified(&identity, clock()),
                         Err(_) => Err(replay_unavailable("state_poisoned")),
                     };
                     // A dropped receiver does not undo durable consumption.
                     // No operation is ever executed by this worker.
-                    let _ = request.reply.send(result);
+                    // Release before waking the caller on success or error.
+                    drop(permit);
+                    let _ = reply.send(result);
                 }
             })
             .map_err(|error| {
@@ -63,6 +128,7 @@ impl InboundReplayWorker {
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
+            peers: Arc::new(PeerAdmissions::default()),
         })
     }
 
@@ -70,14 +136,21 @@ impl InboundReplayWorker {
         &self,
         identity: VerifiedMeshReplayNonce,
     ) -> Result<oneshot::Receiver<AdmissionResult>, MeshForwardError> {
-        let (reply, receiver) = oneshot::channel();
         let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| replay_unavailable("worker_stopped"))?;
+        let permit = PeerAdmissions::reserve(&self.peers, identity.origin())?;
+        let (reply, receiver) = oneshot::channel();
         sender
-            .try_send(Request { identity, reply })
+            .try_send(Request {
+                permit,
+                identity,
+                reply,
+            })
             .map_err(|error| match error {
+                // A rejected Request drops its permit. No nonce reached the
+                // journal and no capacity remains reserved on these paths.
                 mpsc::TrySendError::Full(_) => replay_unavailable("replay_admission_queue_full"),
                 mpsc::TrySendError::Disconnected(_) => replay_unavailable("worker_stopped"),
             })?;
@@ -142,11 +215,15 @@ mod tests {
     const WINDOW: u64 = 10;
 
     fn identity_for(target: &str, now_ms: u64) -> VerifiedMeshReplayNonce {
+        identity_from("origin", target, now_ms)
+    }
+
+    fn identity_from(origin: &str, target: &str, now_ms: u64) -> VerifiedMeshReplayNonce {
         let key = Ed25519SigningKey::generate();
         let directory = MeshPeerDirectory::from_json(
             TailscaleNodeId::new(target),
             &serde_json::json!([{
-                "node_id": "origin",
+                "node_id": origin,
                 "endpoint": "http://127.0.0.1:1",
                 "public_key_hex": hex::encode(key.verifying_key().to_bytes()),
             }])
@@ -155,7 +232,7 @@ mod tests {
         .unwrap();
         let envelope = MeshForwardEnvelope::sign(
             &key,
-            TailscaleNodeId::new("origin"),
+            TailscaleNodeId::new(origin),
             TailscaleNodeId::new(target),
             now_ms,
             MeshForwardBody::Introspect {
@@ -317,6 +394,7 @@ mod tests {
         let worker = InboundReplayWorker {
             sender: None,
             thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
         };
         let result = worker.submit(identity(READY));
         assert!(matches!(result, Err(ref error) if unavailable(error, "worker_stopped")));
@@ -329,9 +407,11 @@ mod tests {
         let worker = InboundReplayWorker {
             sender: Some(sender),
             thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
         };
         let result = worker.submit(identity(READY));
         assert!(matches!(result, Err(ref error) if unavailable(error, "worker_stopped")));
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -398,5 +478,225 @@ mod tests {
             Err(MeshForwardError::Replayed { .. })
         ));
         result(worker.submit(identity(READY)).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn one_origin_cannot_monopolize_the_journal_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("replay"));
+        let worker = InboundReplayWorker::spawn_with_clock(
+            Arc::clone(&state),
+            QUEUE_CAPACITY,
+            || READY,
+        )
+        .unwrap();
+        let held = state.lock().unwrap();
+        let cancelled_nonce = identity(READY);
+        let cancelled = worker.submit(cancelled_nonce.clone()).unwrap();
+        let mut pending = Vec::new();
+        for _ in 1..MAX_PENDING_PER_PEER {
+            pending.push(worker.submit(identity(READY)).unwrap());
+        }
+        let refused_nonce = identity(READY);
+        let refusal = worker.submit(refused_nonce.clone()).err().expect("peer limit");
+        assert!(unavailable(&refusal, "replay_admission_peer_limit"));
+        let other = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        drop(cancelled);
+        let refusal = worker.submit(identity(READY)).err().expect("job still pending");
+        assert!(unavailable(&refusal, "replay_admission_peer_limit"));
+        assert_eq!(
+            worker.peers.pending.lock().unwrap().get("origin").copied(),
+            Some(MAX_PENDING_PER_PEER),
+        );
+        drop(held);
+        for receiver in pending {
+            result(receiver).unwrap();
+        }
+        result(other).unwrap();
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            result(worker.submit(cancelled_nonce).unwrap()),
+            Err(MeshForwardError::Replayed { .. }),
+        ));
+        result(worker.submit(refused_nonce).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn queue_refusal_refunds_only_the_rejected_jobs_peer_slot() {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(1);
+        let worker = InboundReplayWorker {
+            sender: Some(sender),
+            thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
+        };
+        let accepted = worker.submit(identity(READY)).unwrap();
+        let refusal = worker.submit(identity(READY)).err().expect("queue full");
+        assert!(unavailable(&refusal, "replay_admission_queue_full"));
+        assert_eq!(
+            worker.peers.pending.lock().unwrap().get("origin").copied(),
+            Some(1),
+        );
+        drop(receiver.try_recv().unwrap());
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+        assert!(fcp_async_core::runtime::block_on_sync(accepted).unwrap().is_err());
+    }
+
+    #[test]
+    fn tearing_down_an_unprocessed_channel_releases_every_peer_slot() {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(4);
+        let mut worker = InboundReplayWorker {
+            sender: Some(sender),
+            thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
+        };
+        let first = worker.submit(identity(READY)).unwrap();
+        let second = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        drop(receiver);
+        drop(worker.sender.take());
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+        for response in [first, second] {
+            assert!(fcp_async_core::runtime::block_on_sync(response).unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn teardown_releases_the_slot_before_waking_a_closed_waiter() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicBool;
+        use std::task::{Context, Wake, Waker};
+
+        struct ObserveSlot {
+            peers: Arc<PeerAdmissions>,
+            available: AtomicBool,
+        }
+        impl Wake for ObserveSlot {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.available.store(
+                    PeerAdmissions::reserve(&self.peers, "origin").is_ok(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let (sender, receiver) = mpsc::sync_channel::<Request>(MAX_PENDING_PER_PEER);
+        let worker = InboundReplayWorker {
+            sender: Some(sender),
+            thread: None,
+            peers: Arc::new(PeerAdmissions::default()),
+        };
+        let mut first = worker.submit(identity(READY)).unwrap();
+        let others = (1..MAX_PENDING_PER_PEER)
+            .map(|_| worker.submit(identity(READY)).unwrap())
+            .collect::<Vec<_>>();
+        let observer = Arc::new(ObserveSlot {
+            peers: Arc::clone(&worker.peers),
+            available: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&observer));
+        assert!(Pin::new(&mut first).poll(&mut Context::from_waker(&waker)).is_pending());
+        drop(receiver.try_recv().unwrap());
+        assert!(observer.available.load(Ordering::SeqCst));
+        drop(receiver);
+        drop(others);
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_slots_are_released_before_success_and_error_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("replay"));
+        let worker = InboundReplayWorker::spawn_with_clock(
+            state,
+            QUEUE_CAPACITY,
+            || READY + WINDOW + 1,
+        )
+        .unwrap();
+        assert!(matches!(
+            result(worker.submit(identity(READY)).unwrap()),
+            Err(MeshForwardError::Stale { .. }),
+        ));
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+        let fresh = identity(READY + WINDOW + 1);
+        result(worker.submit(fresh.clone()).unwrap()).unwrap();
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            result(worker.submit(fresh).unwrap()),
+            Err(MeshForwardError::Replayed { .. }),
+        ));
+        assert!(worker.peers.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_slot_is_released_during_unwinding() {
+        let peers = Arc::new(PeerAdmissions::default());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = PeerAdmissions::reserve(&peers, "origin").unwrap();
+            panic!("abandon a journal request during construction");
+        }));
+        assert!(outcome.is_err());
+        assert!(peers.pending.lock().unwrap().is_empty());
+        drop(PeerAdmissions::reserve(&peers, "origin").unwrap());
+    }
+
+    #[test]
+    fn poisoned_peer_accounting_fails_closed_even_after_existing_jobs_release() {
+        let peers = Arc::new(PeerAdmissions::default());
+        let permit = PeerAdmissions::reserve(&peers, "origin").unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = peers.pending.lock().unwrap();
+            panic!("poison admission accounting");
+        }));
+        assert!(outcome.is_err());
+        drop(permit);
+        let failure = PeerAdmissions::reserve(&peers, "other").err().expect("poison persists");
+        assert!(unavailable(&failure, "replay_peer_admission_poisoned"));
+        assert!(peers.pending.lock().unwrap_err().into_inner().is_empty());
+    }
+
+    #[test]
+    fn parallel_reservations_cannot_exceed_the_origin_ceiling() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let peers = Arc::new(PeerAdmissions::default());
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let contenders = MAX_PENDING_PER_PEER * 2;
+        let start = Arc::new(Barrier::new(contenders + 1));
+        let reserved = Arc::new(Barrier::new(contenders + 1));
+        let release = Arc::new(Barrier::new(contenders + 1));
+        let mut threads = Vec::new();
+        for _ in 0..contenders {
+            let peers = Arc::clone(&peers);
+            let admitted = Arc::clone(&admitted);
+            let start = Arc::clone(&start);
+            let reserved = Arc::clone(&reserved);
+            let release = Arc::clone(&release);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let permit = PeerAdmissions::reserve(&peers, "origin").ok();
+                if permit.is_some() {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+                reserved.wait();
+                release.wait();
+                drop(permit);
+            }));
+        }
+        start.wait();
+        reserved.wait();
+        let count = admitted.load(Ordering::SeqCst);
+        let usage = peers.pending.lock().unwrap().get("origin").copied();
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(count, MAX_PENDING_PER_PEER);
+        assert_eq!(usage, Some(MAX_PENDING_PER_PEER));
+        assert!(peers.pending.lock().unwrap().is_empty());
     }
 }

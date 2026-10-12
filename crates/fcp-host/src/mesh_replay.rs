@@ -67,6 +67,12 @@ impl VerifiedMeshReplayNonce {
         Self::from_authenticated(envelope, scope)
     }
 
+    /// Authenticated origin for bounded queue accounting. No unverified caller
+    /// can manufacture a nonce identity or substitute an HTTP principal here.
+    pub(crate) fn origin(&self) -> &str {
+        self.origin.as_str()
+    }
+
     fn from_authenticated(
         envelope: &MeshForwardEnvelope,
         scope: [u8; 32],
