@@ -456,6 +456,15 @@ pub enum MeshForwardBody {
         /// Zone whose connector installation is being diagnosed.
         zone_id: String,
     },
+    /// Export one explicitly authorized connector-state root and its ancestry.
+    ///
+    /// Authentication of this envelope does not authorize state disclosure.
+    /// The receiving host must match a separate local transfer grant against
+    /// the authenticated origin, exact connector/zone/instance/root and limits.
+    ConnectorStateExport {
+        /// Exact JSON-encoded bounded state-export request signed by the origin.
+        request_json: String,
+    },
 }
 
 impl MeshForwardBody {
@@ -470,6 +479,7 @@ impl MeshForwardBody {
             Self::Inventory { .. } => "inventory",
             Self::Status { .. } => "status",
             Self::SelfCheck { .. } => "self_check",
+            Self::ConnectorStateExport { .. } => "connector_state_export",
         }
     }
 
@@ -502,6 +512,9 @@ impl MeshForwardBody {
             } => {
                 out.field(connector_id.as_bytes()).field(zone_id.as_bytes());
             }
+            Self::ConnectorStateExport { request_json } => {
+                out.field(request_json.as_bytes());
+            }
         }
     }
 
@@ -526,6 +539,7 @@ impl MeshForwardBody {
                 connector_id,
                 zone_id,
             } => connector_id.len().saturating_add(zone_id.len()),
+            Self::ConnectorStateExport { request_json } => request_json.len(),
         }
     }
 }
@@ -1424,6 +1438,86 @@ mod tests {
                 zone_id: "z:work".to_owned(),
             },
         ]
+    }
+
+    #[test]
+    fn connector_state_export_signs_every_request_byte_and_method() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let payload = serde_json::json!({
+            "grant_id": "state-recovery",
+            "scope": {
+                "connector_id": "fcp.test.remote:utility:1.0.0",
+                "zone_id": "z:work",
+                "instance_id": "instance-a"
+            },
+            "root_object_id": "a".repeat(64),
+            "limits": {
+                "max_objects": 16,
+                "max_canonical_bytes": 4096,
+                "max_wire_bytes": 16384
+            }
+        });
+        let request_json = serde_json::to_string(&payload).unwrap();
+        let envelope = MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            NOW,
+            MeshForwardBody::ConnectorStateExport {
+                request_json: request_json.clone(),
+            },
+        )
+        .unwrap();
+        envelope.verify(&mesh.directory("node-b"), NOW, 30_000).unwrap();
+        let decoded: MeshForwardEnvelope =
+            serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+        assert_eq!(decoded, envelope);
+        assert_eq!(envelope.body.method(), "connector_state_export");
+        for (pointer, replacement) in [
+            ("/grant_id", serde_json::json!("other-grant")),
+            ("/scope/connector_id", serde_json::json!("fcp.other:utility:1.0.0")),
+            ("/scope/zone_id", serde_json::json!("z:private")),
+            ("/scope/instance_id", serde_json::json!("instance-b")),
+            ("/root_object_id", serde_json::json!("b".repeat(64))),
+            ("/limits/max_objects", serde_json::json!(17)),
+            ("/limits/max_canonical_bytes", serde_json::json!(4097)),
+            ("/limits/max_wire_bytes", serde_json::json!(16385)),
+        ] {
+            let mut changed = payload.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let mut tampered = envelope.clone();
+            tampered.body = MeshForwardBody::ConnectorStateExport {
+                request_json: serde_json::to_string(&changed).unwrap(),
+            };
+            assert!(matches!(
+                tampered.verify(&mesh.directory("node-b"), NOW, 30_000),
+                Err(MeshForwardError::SignatureInvalid { .. })
+            ));
+        }
+        let mut method_confusion = envelope;
+        method_confusion.body = MeshForwardBody::Simulate {
+            request_json,
+            asserted_principal: None,
+        };
+        assert!(matches!(
+            method_confusion.verify(&mesh.directory("node-b"), NOW, 30_000),
+            Err(MeshForwardError::SignatureInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn connector_state_export_counts_wire_bytes_before_signing() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let body = MeshForwardBody::ConnectorStateExport {
+            request_json: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES + 1),
+        };
+        assert_eq!(body.body_len(), MAX_MESH_FORWARD_BODY_BYTES + 1);
+        assert!(matches!(
+            MeshForwardEnvelope::sign(
+                mesh.key("node-a"), node("node-a"), node("node-b"), NOW, body
+            ),
+            Err(MeshForwardError::BodyTooLarge { .. })
+        ));
     }
 
     #[test]

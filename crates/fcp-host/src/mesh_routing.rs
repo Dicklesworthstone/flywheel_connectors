@@ -116,6 +116,37 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
+/// A peer's continuous authority and confidential endpoint for state transfer.
+///
+/// This only authenticates transport. A separately configured state-transfer
+/// grant must authorize the exact connector, zone, instance and root.
+#[derive(Debug)]
+pub struct MeshStateTransferPeer {
+    node_id: TailscaleNodeId,
+    snapshot: PeerSnapshot,
+}
+
+fn require_confidential_state_endpoint(endpoint: &str) -> Result<(), MeshForwardError> {
+    let endpoint = url::Url::parse(endpoint).map_err(|_| MeshForwardError::Malformed {
+        field: "state_transfer_endpoint",
+        detail: "state transfer requires a valid peer endpoint".to_owned(),
+    })?;
+    let local_http = endpoint.scheme() == "http"
+        && match endpoint.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
+    if endpoint.scheme() == "https" || local_http {
+        Ok(())
+    } else {
+        Err(MeshForwardError::Malformed {
+            field: "state_transfer_endpoint",
+            detail: "state transfer requires HTTPS or literal loopback HTTP".to_owned(),
+        })
+    }
+}
+
 /// Current Unix time in milliseconds.
 #[must_use]
 pub fn unix_now_ms() -> u64 {
@@ -694,6 +725,71 @@ impl MeshRouter {
             .unwrap_or_else(|_| Arc::clone(&self.empty_directory))
     }
 
+    /// Capture a continuously authorized peer for an exact-root state transfer.
+    ///
+    /// # Errors
+    /// Refuses unknown or revoked peers, expired membership and remote plaintext
+    /// endpoints. DNS names that happen to resolve to loopback are not exempt.
+    pub fn state_transfer_peer(
+        &self,
+        node_id: &TailscaleNodeId,
+    ) -> Result<MeshStateTransferPeer, MeshForwardError> {
+        let snapshot = self.trusted_peer(node_id)?;
+        let peer = snapshot.directory().peer(node_id)
+            .ok_or_else(|| MeshForwardError::UnknownPeer(node_id.as_str().to_owned()))?;
+        require_confidential_state_endpoint(&peer.endpoint)?;
+        self.ensure_current_peer(&snapshot)?;
+        Ok(MeshStateTransferPeer { node_id: node_id.clone(), snapshot })
+    }
+
+    /// Bind an already admitted export envelope to the peer continuity guard.
+    ///
+    /// Call only after `accept_inbound_async` has consumed the envelope nonce.
+    ///
+    /// # Errors
+    /// Refuses a rotated key, expired envelope, untrusted peer or unsafe endpoint.
+    pub fn state_transfer_origin(
+        &self,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<MeshStateTransferPeer, MeshForwardError> {
+        let peer = self.state_transfer_peer(&envelope.origin_node)?;
+        envelope.verify(
+            peer.snapshot.directory(),
+            unix_now_ms(),
+            DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+        )?;
+        self.check_state_transfer_peer(&peer)?;
+        Ok(peer)
+    }
+
+    /// Recheck the original peer immediately before disclosing or adopting state.
+    ///
+    /// # Errors
+    /// Key/endpoint rotation, removal and re-addition, or membership expiry revoke
+    /// this guard. Unrelated peer changes and continuous renewal do not.
+    pub fn check_state_transfer_peer(
+        &self,
+        peer: &MeshStateTransferPeer,
+    ) -> Result<(), MeshForwardError> {
+        self.ensure_current_peer(&peer.snapshot)
+    }
+
+    /// Export through the same authenticated peer captured before pull admission.
+    ///
+    /// # Errors
+    /// Returns a bounded transport failure without retrying another donor.
+    pub async fn forward_connector_state_export(
+        &self,
+        peer: &MeshStateTransferPeer,
+        request_json: String,
+    ) -> Result<MeshForwardReply, MeshForwardFailure> {
+        self.forward_to_snapshot(
+            &peer.node_id,
+            MeshForwardBody::ConnectorStateExport { request_json },
+            &peer.snapshot,
+        ).await
+    }
+
     /// Sign this node's advertisement, withdrawing inventory after membership expires.
     #[must_use]
     pub fn sign_advertisement(
@@ -822,12 +918,34 @@ impl MeshRouter {
                 peer: peer_label.clone(),
                 detail: error.to_string(),
             })?;
+        self.forward_to_snapshot(target, body, &snapshot).await
+    }
+
+    async fn forward_to_snapshot(
+        &self,
+        target: &TailscaleNodeId,
+        body: MeshForwardBody,
+        snapshot: &PeerSnapshot,
+    ) -> Result<MeshForwardReply, MeshForwardFailure> {
+        let peer_label = target.as_str().to_owned();
+        self.ensure_current_peer(snapshot).map_err(|error| MeshForwardFailure::NotDelivered {
+            peer: peer_label.clone(),
+            detail: error.to_string(),
+        })?;
         let Some(peer) = snapshot.directory().peer(target) else {
             return Err(MeshForwardFailure::NotDelivered {
                 peer: peer_label,
                 detail: "peer is not in the local mesh directory".to_owned(),
             });
         };
+        if matches!(&body, MeshForwardBody::ConnectorStateExport { .. }) {
+            require_confidential_state_endpoint(&peer.endpoint).map_err(|error| {
+                MeshForwardFailure::NotDelivered {
+                    peer: peer_label.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         let envelope = MeshForwardEnvelope::sign(
             &self.signing_key,
             self.local_node().clone(),
@@ -846,7 +964,7 @@ impl MeshRouter {
             })?;
         self.forwards
             .execute(&peer_label, payload.len(), || {
-                self.forward_transport(peer, payload, &envelope, &snapshot)
+                self.forward_transport(peer, payload, &envelope, snapshot)
             })
             .await
     }
@@ -1025,6 +1143,80 @@ async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_transfer_requires_https_or_literal_loopback() {
+        for endpoint in [
+            "https://node-b.example:443",
+            "https://100.64.0.2:8443",
+            "http://127.0.0.1:8765",
+            "http://[::1]:8765",
+        ] {
+            require_confidential_state_endpoint(endpoint).unwrap();
+        }
+        for endpoint in [
+            "http://100.64.0.2:8765",
+            "http://0.0.0.0:8765",
+            "http://[::]:8765",
+            "http://localhost:8765",
+            "http://127.0.0.1.example:8765",
+            "http://node-b.example:8765",
+            "file:///tmp/state",
+        ] {
+            assert!(require_confidential_state_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn state_transfer_origin_is_bound_to_signature_and_router_authority() {
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let settings = || MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("node-a"),
+            signing_key: local_key.clone(),
+            peers_json: peers_json(&[("node-b", &peer_key)]),
+            forward_timeout: Duration::from_secs(5),
+        };
+        let router = MeshRouter::new(settings()).unwrap();
+        let other_router = MeshRouter::new(settings()).unwrap();
+        let envelope = MeshForwardEnvelope::sign(
+            &peer_key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            unix_now_ms(),
+            MeshForwardBody::ConnectorStateExport { request_json: "{}".to_owned() },
+        ).unwrap();
+        router.accept_inbound(&envelope).unwrap();
+        let authorized = router.state_transfer_origin(&envelope).unwrap();
+        router.check_state_transfer_peer(&authorized).unwrap();
+        assert!(other_router.check_state_transfer_peer(&authorized).is_err());
+        let mut altered = envelope.clone();
+        altered.body = MeshForwardBody::ConnectorStateExport { request_json: "{\"root\":\"changed\"}".to_owned() };
+        assert!(router.state_transfer_origin(&altered).is_err());
+        assert!(router.state_transfer_peer(&TailscaleNodeId::new("unknown")).is_err());
+    }
+
+    #[test]
+    fn generic_forward_cannot_bypass_state_transfer_confidentiality() {
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("node-a"),
+            signing_key: local_key,
+            peers_json: serde_json::json!([{
+                "node_id": "node-b",
+                "endpoint": "http://100.64.0.2:8765",
+                "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+            }]).to_string(),
+            forward_timeout: Duration::from_secs(5),
+        }).unwrap();
+        let result = fcp_async_core::runtime::block_on_sync(router.forward(
+            &TailscaleNodeId::new("node-b"),
+            MeshForwardBody::ConnectorStateExport { request_json: "{}".to_owned() },
+        )).unwrap();
+        assert!(matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS")));
+        assert_eq!(router.forward_usage().unwrap().in_flight, 0);
+    }
 
     fn write_key_file(dir: &tempfile::TempDir, key: &Ed25519SigningKey) -> String {
         let path = dir.path().join("mesh.key");

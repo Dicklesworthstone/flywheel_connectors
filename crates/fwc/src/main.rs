@@ -133,6 +133,7 @@ mod computation_migration;
 #[allow(dead_code)] // Workflow confusion corpus for task/session/pipeline cases.
 mod confusion_workflow;
 mod connector_state;
+mod connector_state_pull_cmd;
 #[allow(dead_code)] // Auth verify + credential backend trait.
 mod credential;
 #[allow(dead_code)]
@@ -1068,6 +1069,9 @@ struct ConnectorStateArgs {
 enum ConnectorStateCommand {
     /// Explain where canonical connector state lives and what local cache exists.
     Explain(ConnectorStateExplainArgs),
+
+    /// Retain an authorized exact-root replica from one configured mesh peer.
+    Pull(connector_state_pull_cmd::ConnectorStatePullArgs),
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5235,7 +5239,9 @@ impl HostAdminClient {
         let builder = if follow_redirects {
             builder
         } else {
-            builder.redirect(reqwest::redirect::Policy::none())
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
         };
 
         #[cfg(unix)]
@@ -9068,6 +9074,7 @@ fn connector_state_dispatch(
         ConnectorStateCommand::Explain(args) => {
             connector_state_explain_dispatch(args, explicit_host)
         }
+        ConnectorStateCommand::Pull(args) => connector_state_pull_cmd::dispatch(args, explicit_host),
     }
 }
 
@@ -31889,7 +31896,10 @@ fn annotate_with_corrections(
     normalized_args: &[String],
     corrections: &[InputCorrection],
 ) {
-    if corrections.is_empty() || invocation_cmd::withhold_argument_echo(payload) {
+    if corrections.is_empty()
+        || invocation_cmd::withhold_argument_echo(payload)
+        || connector_state_pull_cmd::withhold_argument_echo(payload)
+    {
         return;
     }
 

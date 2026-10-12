@@ -166,6 +166,8 @@ mod invoke_jobs;
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
 mod session;
+#[path = "fcp-host/connector_state_transfer.rs"]
+mod connector_state_transfer;
 
 use native_rpc::{NativeInvocationTermination, NativeRpc, invocation_deadline};
 
@@ -4876,6 +4878,8 @@ struct AppState {
     /// Mesh-backed invoke routing (bridge plan A.2). `None` on a
     /// host-first deployment without a mesh peer directory.
     mesh: Option<Arc<fcp_host::mesh_routing::MeshRouter>>,
+    /// Startup-configured exact-root grants and retained replica store ownership.
+    connector_state_replication: Option<Arc<fcp_host::ConnectorStateReplicationService>>,
 }
 
 impl AppState {
@@ -8161,6 +8165,8 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let hybrid_owner_verifier = resolve_hybrid_owner_production_verifier()?;
     let cancellation = Arc::new(CancellationController::new());
     let mesh_router = fcp_host::mesh_routing::MeshRouter::from_env()?.map(Arc::new);
+    let connector_state_replication =
+        connector_state_transfer::from_env(&bind_target, mesh_router.as_deref())?;
     if let Some(router) = mesh_router.as_ref() {
         tracing::info!(
             event = "mesh_routing_enabled",
@@ -8191,6 +8197,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
         started_at: Instant::now(),
         mesh: mesh_router,
+        connector_state_replication,
     });
 
     // fcp_async_core aborts tasks when their handles are dropped. Keep the
@@ -8228,6 +8235,14 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route(
             "/rpc/admin/connectors/{connector_id}/state/explain",
             get(connector_state_explain_handler),
+        )
+        .route(
+            "/rpc/admin/connectors/{connector_id}/state/pull",
+            post(connector_state_transfer::pull_handler).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    connector_state_transfer::PULL_REQUEST_MAX_BYTES,
+                ),
+            ),
         )
         .route(
             "/rpc/admin/connectors/{connector_id}/lease/status",
@@ -15329,9 +15344,12 @@ fn mesh_query_response_bindings(
             ])
         }
         MeshForwardBody::Preflight { .. } => Ok(Vec::new()),
-        MeshForwardBody::Invoke { .. } => Err(map_host_error(HostError::Internal(
-            "invoke must not use read-only mesh failover".to_string(),
-        ))),
+        MeshForwardBody::Invoke { .. } | MeshForwardBody::ConnectorStateExport { .. } => {
+            Err(map_host_error(HostError::Internal(
+                "invoke and exact-root state transfer must not use read-only mesh failover"
+                    .to_string(),
+            )))
+        }
     }
 }
 
@@ -15459,6 +15477,9 @@ async fn mesh_forward_handler(
     }
     let started_at = Instant::now();
     let (status, body_json) = match &envelope.body {
+        MeshForwardBody::ConnectorStateExport { request_json } => {
+            connector_state_transfer::export_reply(&state, &router, &envelope, request_json).await
+        }
         MeshForwardBody::Invoke {
             request_json,
             asserted_principal,
@@ -17325,6 +17346,7 @@ deny_ptrace = true
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         })
     }
@@ -19106,6 +19128,7 @@ deny_ptrace = true
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         })
     }
@@ -26231,6 +26254,7 @@ deny_ptrace = true
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         });
 
@@ -26796,6 +26820,7 @@ deny_ptrace = true
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         });
         let token_id = [0x5a; 32];
@@ -32183,6 +32208,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32223,6 +32249,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32268,6 +32295,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32313,6 +32341,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32375,6 +32404,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32424,6 +32454,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
 
@@ -32538,6 +32569,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         };
         let cloned = state.clone();
@@ -32593,6 +32625,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         });
         let version = semver::Version::new(1, 2, 0);
@@ -32963,7 +32996,7 @@ done"#;
 
     // ── br-71lku: /rpc/cancel auth-bypass regression ──────────────
 
-    fn cancel_route_test_state() -> Arc<AppState> {
+    pub(super) fn cancel_route_test_state() -> Arc<AppState> {
         let registry = Arc::new(empty_registry(1));
         let budget = Arc::new(BudgetPolicyEngine::new());
         let lifecycle = Arc::new(HostAdminStateStore::new());
@@ -32994,6 +33027,7 @@ done"#;
             invoke_audit: Arc::new(fcp_host::InvokeAuditChain::new()),
             invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
             started_at: Instant::now(),
+            connector_state_replication: None,
             mesh: None,
         })
     }
