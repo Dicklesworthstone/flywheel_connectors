@@ -1,11 +1,14 @@
-//! Inspect retained local host invocation attempts and preserve uncertain invoke identity.
+//! Inspect retained host execution and mesh forwarding attempts without authorizing replay.
 
 use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use fcp_host::{InvocationOutcome, InvocationQueryRequest, InvocationQueryResponse};
+use fcp_host::{
+    InvocationOutcome, InvocationQueryRequest, InvocationQueryResponse, MeshInvocationIdentity,
+    MeshInvocationObservation, MeshInvocationOutcome, MeshInvocationRecord,
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -16,12 +19,15 @@ use crate::{
 
 const ADMIN_BEARER_TOKEN_ENV: &str = "FCP_HOST_ADMIN_BEARER_TOKEN";
 const MAX_ADMIN_TOKEN_BYTES: u64 = 65_536;
-const MAX_INVOCATION_RESPONSE_BYTES: u64 = 65_536;
+const MAX_INVOCATION_RESPONSE_BYTES: u64 = 512 * 1024;
 const MAX_OPERATION_ID_BYTES: usize = 512;
+const MAX_MESH_INVOCATION_ATTEMPTS: usize = 256;
 const INVOCATION_QUERY_PATH: &str = "/rpc/admin/invocations";
-const HISTORY_SCOPE: &str = "local-executor-history";
+const HISTORY_SCOPE: &str = "selected-host-invocation-history";
 const MISSING_HISTORY_CAVEAT: &str =
-    "A missing local record does not prove that the operation had no effects. A forwarded invocation may be recorded only by its actual mesh executor, and completed local history is bounded.";
+    "A missing retained record does not prove that the operation had no effects. Origin forwarding and executor-local histories are distinct, and completed history is bounded.";
+const MESH_HISTORY_CAVEAT: &str =
+    "Origin forwarding evidence covers this host's retained attempt. It does not establish remote cancellation, provide a replayable result, or guarantee mesh-wide exactly-once execution.";
 
 #[derive(Args, Debug)]
 pub(crate) struct InvocationArgs {
@@ -110,7 +116,7 @@ impl LookupFailure {
             ),
             Self::ResponseTooLarge => (
                 "invocation-query-response-too-large",
-                "The host invocation metadata response exceeded the 64 KiB read limit.",
+                "The host invocation metadata response exceeded the 512 KiB read limit.",
                 CliExitCode::Transport,
             ),
         }
@@ -237,15 +243,92 @@ fn query_invocation(
     }
     let response: InvocationQueryResponse =
         serde_json::from_slice(&body).map_err(|_| LookupFailure::InvalidResponse)?;
+    if response.invocation.is_some() && response.mesh_invocation.is_some() {
+        return Err(LookupFailure::InvalidResponse);
+    }
     if response.invocation.as_ref().is_some_and(|record| {
         record.ticket.operation_id != request.operation_id
             || record.admission.operation_id != request.operation_id
             || record.ticket.attempt_id == 0
             || request.attempt_id.is_some_and(|attempt| attempt != record.ticket.attempt_id)
-    }) {
+    }) || response
+        .mesh_invocation
+        .as_ref()
+        .is_some_and(|record| !mesh_record_matches_query(record, request))
+    {
         return Err(LookupFailure::InvalidResponse);
     }
     Ok(response)
+}
+
+fn mesh_record_matches_query(
+    record: &MeshInvocationRecord,
+    request: &InvocationQueryRequest,
+) -> bool {
+    if record.ticket.operation_id != request.operation_id
+        || record.intent.operation_id != request.operation_id
+        || record.ticket.attempt_id == 0
+        || request.attempt_id.is_some_and(|attempt| attempt != record.ticket.attempt_id)
+        || record.attempts.len() > MAX_MESH_INVOCATION_ATTEMPTS
+        || record.terminal.is_some() != record.finished_at.is_some()
+        || record
+            .attempts
+            .first()
+            .is_none_or(|attempt| attempt.target_node != record.intent.target_node)
+    {
+        return false;
+    }
+    // Admission atomically records the initial selected target. Every later
+    // target must be distinct, so an empty or duplicated route is not proof.
+    let mut targets = std::collections::HashSet::with_capacity(record.attempts.len());
+    if record
+        .attempts
+        .iter()
+        .any(|attempt| !targets.insert(attempt.target_node.as_str()))
+    {
+        return false;
+    }
+    // Only proven non-delivery can precede another selected peer. A response
+    // from one peer must never be combined with a later peer's observation.
+    if record
+        .attempts
+        .iter()
+        .take(record.attempts.len().saturating_sub(1))
+        .any(|attempt| {
+            !matches!(
+                attempt.observation.as_ref(),
+                Some(MeshInvocationObservation::NotDelivered)
+            )
+        })
+    {
+        return false;
+    }
+    match record.terminal.as_ref() {
+        Some(terminal)
+            if matches!(
+                terminal.outcome,
+                MeshInvocationOutcome::Succeeded | MeshInvocationOutcome::ConnectorError
+            ) =>
+        {
+            record.attempts.last().is_some_and(|attempt| {
+                matches!(
+                    attempt.observation.as_ref(),
+                    Some(MeshInvocationObservation::ResponseObserved { http_status })
+                        if (200..300).contains(http_status)
+                            && (200..300).contains(&terminal.http_status)
+                )
+            })
+        }
+        Some(terminal) if terminal.outcome == MeshInvocationOutcome::NotDelivered => {
+            record.attempts.iter().all(|attempt| {
+                matches!(
+                    attempt.observation.as_ref(),
+                    Some(MeshInvocationObservation::NotDelivered)
+                )
+            })
+        }
+        _ => true,
+    }
 }
 
 fn classify_query_transport(error: reqwest::Error) -> LookupFailure {
@@ -261,6 +344,9 @@ fn lookup_result(
     endpoint: &str,
     response: InvocationQueryResponse,
 ) -> DispatchOutcome {
+    if let Some(record) = response.mesh_invocation.as_ref() {
+        return mesh_lookup_result(args, endpoint, record, response.host_job_active);
+    }
     let record = response.invocation.as_ref();
     let terminal = record.and_then(|record| record.terminal.as_ref());
     let source_outcome_known =
@@ -289,7 +375,7 @@ fn lookup_result(
     let message = match state {
         "not-retained" => MISSING_HISTORY_CAVEAT,
         "active-record-unavailable" => {
-            "The host reports an active job without a retained executor-local record. Local admission may be pending, or this host may be forwarding to a mesh executor. This liveness observation does not establish execution effects or promise a local record."
+            "The host reports an active job without a retained attempt. Local execution or forwarding to a mesh executor may still be awaiting admission. This liveness observation does not establish execution effects or promise a record."
         }
         "running" => "The host reports an active job and a retained admission without a terminal observation.",
         "outcome-unknown" => "The host cannot establish the operation's final effects. This record does not authorize another execution.",
@@ -317,10 +403,11 @@ fn lookup_result(
         "automatic_retry_allowed": false,
         "message": message,
         "invocation": response.invocation,
+        "mesh_invocation": null,
         "caveats": [MISSING_HISTORY_CAVEAT],
         "next_actions": [
             "Use the exact attempt ID when following one retained attempt.",
-            "For a forwarded request, inspect its actual mesh executor if the gateway has no local record.",
+            "For a forwarded request, inspect the selected executor when origin history cannot establish the outcome.",
         ],
     });
     let mut envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "invocation");
@@ -331,6 +418,109 @@ fn lookup_result(
     DispatchOutcome {
         payload,
         // This is the exit status of the read, never of the recorded invocation.
+        exit_code: CliExitCode::Success,
+    }
+}
+
+fn mesh_lookup_result(
+    args: &InvocationArgs,
+    endpoint: &str,
+    record: &MeshInvocationRecord,
+    host_job_active: bool,
+) -> DispatchOutcome {
+    // Operation-ID liveness cannot establish that an exact historical attempt
+    // is still running, even when a newer job uses the same request ID.
+    let latest_job_active = host_job_active && args.attempt_id.is_none();
+    let terminal = record.terminal.as_ref();
+    let source_outcome_known = terminal.is_some_and(|terminal| {
+        matches!(
+            terminal.outcome,
+            MeshInvocationOutcome::Succeeded | MeshInvocationOutcome::ConnectorError
+        )
+    });
+    let (state, message) = match terminal.map(|terminal| terminal.outcome) {
+        None if latest_job_active => (
+            "mesh-forwarding",
+            "The origin reports an active forwarding job with a retained intent. No final executor outcome has been established.",
+        ),
+        None | Some(MeshInvocationOutcome::OutcomeUnknown) => (
+            "outcome-unknown",
+            "The origin cannot establish this forwarded operation's final effects. A stopped or restarted origin does not prove that the remote operation stopped. This record does not authorize another execution.",
+        ),
+        Some(MeshInvocationOutcome::NotDelivered) => (
+            "mesh-not-delivered",
+            "The origin retained proof that forwarding did not deliver this attempt to an executor. This evidence covers only the retained attempt; the lookup does not authorize another execution.",
+        ),
+        Some(MeshInvocationOutcome::Succeeded) => (
+            "mesh-response-observed",
+            "The origin retained a validated response reporting success from the selected mesh executor. This lookup does not reproduce the result body or establish executor-side finalization.",
+        ),
+        Some(MeshInvocationOutcome::ConnectorError) => (
+            "mesh-response-observed",
+            "The origin retained a validated connector error response from the selected mesh executor. The lookup succeeded; the recorded invocation did not succeed.",
+        ),
+    };
+    let (identity_basis, origin_principal_verified, identity_message) = match &record.intent.identity {
+        MeshInvocationIdentity::VerifiedPrincipal { .. } => (
+            "verified-principal",
+            true,
+            "The origin verified the principal before recording this forwarding intent.",
+        ),
+        MeshInvocationIdentity::TokenBoundRelay { .. } => (
+            "exact-token-relay",
+            false,
+            "The origin bound this relay to the exact capability-token fingerprint. An asserted principal is not a verified identity, and this binding does not cover token renewal or another entry host.",
+        ),
+    };
+    let selected_executor = record
+        .attempts
+        .last()
+        .map_or(record.intent.target_node.as_str(), |attempt| {
+            attempt.target_node.as_str()
+        });
+    let mut payload = json!({
+        "status": "ok",
+        "command": "invocation",
+        "source": "host-admin-api",
+        "scope": HISTORY_SCOPE,
+        "record_kind": "mesh-forward",
+        "host": { "endpoint": safe_host_endpoint(endpoint) },
+        "request": {
+            "operation_id": &args.operation_id,
+            "attempt_id": args.attempt_id,
+        },
+        "lookup_succeeded": true,
+        "host_job_active": host_job_active,
+        "host_job_active_scope": "operation-id",
+        "found": true,
+        "execution_state": state,
+        "source_outcome_known": source_outcome_known,
+        // The origin observation is distinct from executor-side finalization.
+        "finalization_complete": false,
+        "forward_observation_complete": terminal.is_some(),
+        "retained_durably": record.durable,
+        "selected_executor": selected_executor,
+        "identity_basis": identity_basis,
+        "origin_principal_verified": origin_principal_verified,
+        "identity_message": identity_message,
+        "automatic_retry_allowed": false,
+        "message": message,
+        "invocation": null,
+        "mesh_invocation": record,
+        "caveats": [MISSING_HISTORY_CAVEAT, MESH_HISTORY_CAVEAT],
+        "next_actions": [
+            "Use this record's exact attempt ID when following the retained origin attempt.",
+            "Inspect the selected executor's retained history or receipt evidence to reconcile an uncertain remote outcome.",
+        ],
+    });
+    let mut envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "invocation");
+    envelope.explanation =
+        "Retained origin forwarding evidence on the selected host; executor-local history is separate."
+            .to_owned();
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    DispatchOutcome {
+        payload,
         exit_code: CliExitCode::Success,
     }
 }
@@ -425,7 +615,7 @@ impl InvokeOutcomeUnknown {
         let next_actions = vec![
             inspection_command.clone(),
             "Authenticate the lookup with --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN.".to_owned(),
-            "A gateway may have forwarded the request; inspect the actual mesh executor if its local record is absent.".to_owned(),
+            "Inspect origin forwarding evidence on the selected host; reconcile any unknown outcome with the recorded executor.".to_owned(),
             "Establish the prior attempt's effects before deciding whether to repeat the operation.".to_owned(),
         ];
         let mut payload = json!({
@@ -693,6 +883,58 @@ mod tests {
         }
     }
 
+    fn forwarded_record(
+        outcome: Option<MeshInvocationOutcome>,
+        durable: bool,
+    ) -> MeshInvocationRecord {
+        let now = Utc::now();
+        let observation = match outcome {
+            Some(MeshInvocationOutcome::Succeeded | MeshInvocationOutcome::ConnectorError) => {
+                json!({"kind": "response_observed", "http_status": 200})
+            }
+            Some(MeshInvocationOutcome::NotDelivered) => json!({"kind": "not_delivered"}),
+            Some(MeshInvocationOutcome::OutcomeUnknown) => json!({"kind": "outcome_unknown"}),
+            None => Value::Null,
+        };
+        serde_json::from_value(json!({
+            "ticket": {"operation_id": "req-inspect", "attempt_id": 8},
+            "intent": {
+                "operation_id": "req-inspect",
+                "connector_id": "fcp.github:enterprise:v1",
+                "operation": "github.create_issue",
+                "zone_id": "z:work",
+                "origin_node": "origin-node",
+                "target_node": "peer-initial",
+                "identity": {"kind": "verified_principal", "principal": "test-owner"},
+                "deadline_at": now + chrono::Duration::seconds(30),
+            },
+            "admitted_at": now,
+            "attempts": [
+                {
+                    "target_node": "peer-initial",
+                    "selected_at": now,
+                    "observation": {"kind": "not_delivered"},
+                },
+                {
+                    "target_node": "peer-executor",
+                    "selected_at": now,
+                    "observation": observation,
+                },
+            ],
+            "terminal": outcome.map(|outcome| json!({
+                "outcome": outcome,
+                "http_status": if matches!(
+                    outcome,
+                    MeshInvocationOutcome::Succeeded | MeshInvocationOutcome::ConnectorError
+                ) { 200 } else { 503 },
+                "duration_ms": 25,
+            })),
+            "finished_at": outcome.map(|_| now),
+            "durable": durable,
+        }))
+        .expect("mesh invocation metadata fixture")
+    }
+
     fn args(attempt_id: Option<u64>) -> InvocationArgs {
         InvocationArgs {
             operation_id: "req-inspect".to_owned(),
@@ -803,6 +1045,185 @@ mod tests {
     }
 
     #[test]
+    fn invocation_cli_retains_durable_mesh_unknown_and_exact_executor_identity() {
+        let mut record = forwarded_record(Some(MeshInvocationOutcome::OutcomeUnknown), true);
+        record.intent.identity = MeshInvocationIdentity::TokenBoundRelay {
+            capability_digest: "a".repeat(64),
+            asserted_principal: Some("asserted-not-verified".to_owned()),
+        };
+        let host = TestHost::start(Reply::Json(
+            200,
+            json!({
+                "invocation": null,
+                "mesh_invocation": record,
+                "host_job_active": true,
+            }),
+        ));
+        let (exit, payload, rendered) = execute_lookup(&host.endpoint, Some("8"));
+        let captured = host.finish();
+
+        assert_eq!(captured.line, "POST /rpc/admin/invocations HTTP/1.1");
+        assert_eq!(captured.headers["authorization"], "Bearer fixture-admin-secret");
+        assert_eq!(captured.headers["x-fcp-zone"], "z:owner");
+        assert_eq!(captured.body, json!({"operation_id": "req-inspect", "attempt_id": 8}));
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["scope"], HISTORY_SCOPE);
+        assert_eq!(payload["record_kind"], "mesh-forward");
+        assert_eq!(payload["found"], true);
+        assert!(payload["invocation"].is_null());
+        assert_eq!(payload["mesh_invocation"]["ticket"]["attempt_id"], 8);
+        assert_eq!(payload["execution_state"], "outcome-unknown");
+        assert_eq!(payload["source_outcome_known"], false);
+        assert_eq!(payload["finalization_complete"], false);
+        assert_eq!(payload["forward_observation_complete"], true);
+        assert_eq!(payload["retained_durably"], true);
+        assert_eq!(payload["selected_executor"], "peer-executor");
+        assert_eq!(payload["identity_basis"], "exact-token-relay");
+        assert_eq!(payload["origin_principal_verified"], false);
+        assert!(payload["identity_message"].as_str().unwrap().contains("not a verified identity"));
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert!(!rendered.contains("fixture-admin-secret"));
+    }
+
+    #[test]
+    fn invocation_lookup_mesh_reply_observations_keep_read_status_separate() {
+        for (outcome, expected_state, source_known) in [
+            (MeshInvocationOutcome::Succeeded, "mesh-response-observed", true),
+            (MeshInvocationOutcome::ConnectorError, "mesh-response-observed", true),
+            (MeshInvocationOutcome::NotDelivered, "mesh-not-delivered", false),
+        ] {
+            let host = TestHost::start(Reply::Json(
+                200,
+                {
+                    let mut record = forwarded_record(Some(outcome), true);
+                    if source_known {
+                        // A peer's successful HTTP code can differ from the
+                        // origin's final response status without changing the
+                        // validated connector outcome.
+                        record.attempts.last_mut().unwrap().observation =
+                            Some(MeshInvocationObservation::ResponseObserved { http_status: 201 });
+                    }
+                    json!({
+                        "invocation": null,
+                        "mesh_invocation": record,
+                        "host_job_active": false,
+                    })
+                },
+            ));
+            let (exit, payload, _) = execute_lookup(&host.endpoint, Some("8"));
+            host.finish();
+
+            assert_eq!(exit, CliExitCode::Success.into());
+            assert_eq!(payload["status"], "ok");
+            assert_eq!(payload["lookup_succeeded"], true);
+            assert_eq!(payload["mesh_invocation"]["terminal"]["outcome"], json!(outcome));
+            assert_eq!(payload["execution_state"], expected_state);
+            assert_eq!(payload["source_outcome_known"], source_known);
+            assert_eq!(payload["finalization_complete"], false);
+            assert_eq!(payload["forward_observation_complete"], true);
+            assert_eq!(payload["selected_executor"], "peer-executor");
+            assert_eq!(payload["identity_basis"], "verified-principal");
+            assert_eq!(payload["origin_principal_verified"], true);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn invocation_lookup_pending_mesh_intents_respect_attempt_liveness_and_durability() {
+        for (attempt_id, active, expected_state) in [
+            (None, true, "mesh-forwarding"),
+            (None, false, "outcome-unknown"),
+            (Some(8), true, "outcome-unknown"),
+            (Some(8), false, "outcome-unknown"),
+        ] {
+            let outcome = lookup_result(
+                &args(attempt_id),
+                "http://127.0.0.1:8787",
+                InvocationQueryResponse {
+                    invocation: None,
+                    mesh_invocation: Some(forwarded_record(None, false)),
+                    host_job_active: active,
+                },
+            );
+            assert_eq!(outcome.exit_code, CliExitCode::Success);
+            assert_eq!(outcome.payload["execution_state"], expected_state);
+            assert_eq!(outcome.payload["retained_durably"], false);
+            assert_eq!(outcome.payload["host_job_active"], active);
+            assert_eq!(outcome.payload["host_job_active_scope"], "operation-id");
+            assert_eq!(outcome.payload["source_outcome_known"], false);
+            assert_eq!(outcome.payload["forward_observation_complete"], false);
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn invocation_lookup_rejects_mesh_ticket_and_observation_mismatches() {
+        for case in 0..15 {
+            let mut response = json!({
+                "invocation": null,
+                "mesh_invocation": forwarded_record(Some(MeshInvocationOutcome::Succeeded), true),
+                "host_job_active": false,
+            });
+            let requested_attempt = if case == 3 { Some("9") } else { Some("8") };
+            match case {
+                0 => response["mesh_invocation"]["ticket"]["operation_id"] = json!("other-request"),
+                1 => response["mesh_invocation"]["intent"]["operation_id"] = json!("other-request"),
+                2 => response["mesh_invocation"]["ticket"]["attempt_id"] = json!(0),
+                3 => {}
+                4 => response["invocation"] = json!(record(Some(InvocationOutcome::Succeeded), true)),
+                5 => {
+                    response["mesh_invocation"]["attempts"][1]["observation"] =
+                        json!({"kind": "outcome_unknown"});
+                }
+                6 => {
+                    response["mesh_invocation"]["attempts"][0]["observation"] =
+                        json!({"kind": "response_observed", "http_status": 200});
+                }
+                7 => response["mesh_invocation"]["terminal"]["outcome"] = json!("not_delivered"),
+                8 => response["mesh_invocation"]["terminal"]["http_status"] = json!(502),
+                9 => {
+                    response["mesh_invocation"]["terminal"]["outcome"] = json!("not_delivered");
+                    response["mesh_invocation"]["attempts"] = json!([]);
+                }
+                10 => {
+                    response["mesh_invocation"]["attempts"][0]["target_node"] =
+                        json!("different-initial-peer");
+                }
+                11 => {
+                    response["mesh_invocation"]["attempts"][1]["target_node"] =
+                        json!("peer-initial");
+                }
+                12 => {
+                    let attempts = (0..=MAX_MESH_INVOCATION_ATTEMPTS)
+                        .map(|index| {
+                            json!({
+                                "target_node": format!("peer-{index}"),
+                                "selected_at": Utc::now(),
+                                "observation": {"kind": "not_delivered"},
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    response["mesh_invocation"]["intent"]["target_node"] = json!("peer-0");
+                    response["mesh_invocation"]["attempts"] = json!(attempts);
+                    response["mesh_invocation"]["terminal"]["outcome"] = json!("not_delivered");
+                }
+                13 => response["mesh_invocation"]["finished_at"] = Value::Null,
+                14 => response["mesh_invocation"]["terminal"] = Value::Null,
+                _ => unreachable!(),
+            }
+            let host = TestHost::start(Reply::Json(200, response));
+            let (exit, payload, rendered) = execute_lookup(&host.endpoint, requested_attempt);
+            host.finish();
+            assert_eq!(exit, CliExitCode::Transport.into(), "case {case}");
+            assert_eq!(payload["error"]["type"], "invalid-invocation-query-response");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert!(payload.get("mesh_invocation").is_none());
+            assert!(!rendered.contains("other-request"));
+        }
+    }
+
+    #[test]
     fn invocation_lookup_distinguishes_abandoned_admission_and_unfinished_finalization() {
         for (terminal, active, expected) in [
             (None, true, "running"),
@@ -820,6 +1241,7 @@ mod tests {
                 "127.0.0.1:8787",
                 InvocationQueryResponse {
                     invocation: Some(record(terminal, false)),
+                    mesh_invocation: None,
                     host_job_active: active,
                 },
             );
@@ -849,6 +1271,7 @@ mod tests {
                 "http://127.0.0.1:8787",
                 InvocationQueryResponse {
                     invocation: Some(incomplete),
+                    mesh_invocation: None,
                     host_job_active: active,
                 },
             );
@@ -866,6 +1289,7 @@ mod tests {
             "http://127.0.0.1:8787",
             InvocationQueryResponse {
                 invocation: Some(record(None, false)),
+                mesh_invocation: None,
                 host_job_active: true,
             },
         );
@@ -950,6 +1374,41 @@ mod tests {
             Err(LookupFailure::Timeout)
         ));
         host.finish();
+    }
+
+    #[test]
+    fn invocation_lookup_accepts_bounded_full_mesh_attempt_history() {
+        let mut response = json!({
+            "invocation": null,
+            "mesh_invocation": forwarded_record(Some(MeshInvocationOutcome::OutcomeUnknown), true),
+        });
+        let now = Utc::now();
+        // The host retains up to 256 targets with 512-byte metadata. This
+        // valid origin history exceeds the former local-only 64 KiB cap.
+        let attempts = (0..256)
+            .map(|index| {
+                json!({
+                    "target_node": format!("{index:03}-{}", "n".repeat(508)),
+                    "selected_at": now,
+                    "observation": {
+                        "kind": if index == 255 { "outcome_unknown" } else { "not_delivered" },
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        response["mesh_invocation"]["intent"]["target_node"] = attempts[0]["target_node"].clone();
+        response["mesh_invocation"]["attempts"] = json!(attempts);
+        let encoded_len = serde_json::to_vec(&response).unwrap().len() as u64;
+        assert!(encoded_len > 65_536);
+        assert!(encoded_len < MAX_INVOCATION_RESPONSE_BYTES);
+        let host = TestHost::start(Reply::Json(200, response));
+        let (exit, payload, _) = execute_lookup(&host.endpoint, Some("8"));
+        host.finish();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["found"], true);
+        assert_eq!(payload["mesh_invocation"]["attempts"].as_array().unwrap().len(), 256);
+        assert_eq!(payload["execution_state"], "outcome-unknown");
+        assert_eq!(payload["automatic_retry_allowed"], false);
     }
 
     #[test]

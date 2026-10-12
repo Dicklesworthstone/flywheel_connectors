@@ -14742,6 +14742,38 @@ async fn run_mesh_forward_job(
     let router = router.as_ref();
     let request = &request;
     let asserted_principal = asserted_principal.as_deref();
+    let remaining_ms = u64::try_from(
+        deadline.saturating_duration_since(Instant::now()).as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    // This is origin routing evidence. Only completed local preflight supplies
+    // a verified principal; a transparent relay binds its exact token instead.
+    let intent = fcp_host::MeshInvocationIntent::from_request(
+        request,
+        router.local_node().as_str(),
+        target.as_str(),
+        asserted_principal,
+        registered_locally.then_some(audit_ctx.actor.as_str()),
+        Utc::now()
+            + chrono::Duration::milliseconds(i64::try_from(remaining_ms).unwrap_or(i64::MAX)),
+    )
+    .map_err(map_host_error)?;
+    let ticket = before_invoke_route_deadline(
+        deadline,
+        state.lifecycle.reserve_mesh_invocation(intent),
+        "durable mesh invocation reservation",
+    )
+    .await
+    .and_then(std::convert::identity)
+    .map_err(map_host_error)?;
+    state.invoke_jobs.bind_attempt(&ticket).map_err(map_host_error)?;
+
+    let terminal = |outcome, http_status, receipt_id| fcp_host::MeshInvocationTerminal {
+        outcome,
+        http_status,
+        duration_ms: elapsed_millis(started_at),
+        receipt_id,
+    };
     let append_audit = |target_node: &TailscaleNodeId,
                         executor_status: Option<u16>,
                         failed_attempts: &[String]|
@@ -14764,60 +14796,136 @@ async fn run_mesh_forward_job(
 
     let mut failed_attempts = Vec::new();
     let mut last_target = target.clone();
-    for candidate in std::iter::once(target).chain(alternates) {
-        last_target = candidate.clone();
-        // This is routing evidence, not an assertion that the entry node has
-        // verified an operation installed only on the remote executor.
-        state
-            .invoke_audit
-            .append(
-                &audit_ctx,
-                fcp_host::InvokePhase::MeshForwardAttempt {
-                    target_node: candidate.as_str().to_string(),
-                    decision: code.to_string(),
-                },
-            )
-            .map_err(|error| {
-                map_host_error(invoke_audit_unavailable("mesh forward attempt", error))
-            })?;
-        let mut forwarded_request = request.clone();
-        constrain_invoke_deadline(&mut forwarded_request, deadline);
-        let request_json = serde_json::to_string(&forwarded_request).map_err(|error| {
-            map_host_error(HostError::Internal(format!(
-                "invoke request could not be encoded for mesh forwarding: {error}"
-            )))
-        })?;
-        let body = fcp_mesh::invoke_route::MeshForwardBody::Invoke {
-            request_json,
-            asserted_principal: asserted_principal.map(str::to_owned),
-        };
-        if registered_locally
-            && let Err(error) = recheck_admitted_holder_proof(state, request)
+    for (index, candidate) in std::iter::once(target).chain(alternates).enumerate() {
+        // The store permits a new target only after durable proof that the
+        // previous attempt was not delivered. Crash recovery never selects one.
+        if index > 0
+            && let Err(error) = state
+                .lifecycle
+                .select_mesh_invocation_target(&ticket, candidate.as_str())
+                .await
         {
-            append_mesh_preflight_denial(state, request, asserted_principal, &error.to_string())
+            // No new transport was polled. Preserve the prior non-delivery
+            // evidence even when the remaining route budget has expired.
+            let error = map_host_error(error);
+            append_audit(&last_target, None, &failed_attempts).map_err(map_host_error)?;
+            state
+                .lifecycle
+                .finish_mesh_invocation(
+                    &ticket,
+                    terminal(
+                        fcp_host::MeshInvocationOutcome::NotDelivered,
+                        error.0.as_u16(),
+                        None,
+                    ),
+                )
+                .await
+                .map_err(mesh_invocation_evidence_error)?;
+            return Err(error);
+        }
+        last_target = candidate.clone();
+        let prepared = (|| {
+            state
+                .invoke_audit
+                .append(
+                    &audit_ctx,
+                    fcp_host::InvokePhase::MeshForwardAttempt {
+                        target_node: candidate.as_str().to_string(),
+                        decision: code.to_string(),
+                    },
+                )
+                .map_err(|error| {
+                    map_host_error(invoke_audit_unavailable("mesh forward attempt", error))
+                })?;
+            let mut forwarded_request = request.clone();
+            constrain_invoke_deadline(&mut forwarded_request, deadline);
+            let request_json = serde_json::to_string(&forwarded_request).map_err(|error| {
+                map_host_error(HostError::Internal(format!(
+                    "invoke request could not be encoded for mesh forwarding: {error}"
+                )))
+            })?;
+            if registered_locally
+                && let Err(error) = recheck_admitted_holder_proof(state, request)
+            {
+                append_mesh_preflight_denial(
+                    state,
+                    request,
+                    asserted_principal,
+                    &error.to_string(),
+                )
                 .map_err(map_host_error)?;
-            return Err(map_host_error(error));
-        }
-        // Audit, serialization, and authorization consume the same budget.
-        // Check before transport work; earlier attempts proved non-delivery.
+                return Err(map_host_error(error));
+            }
+            if Instant::now() >= deadline || forwarded_request.deadline_ms == Some(0) {
+                return Err(map_host_error(HostError::Unavailable(
+                    "invocation deadline expired before mesh forwarding; no further peer was contacted"
+                        .to_string(),
+                )));
+            }
+            Ok(fcp_mesh::invoke_route::MeshForwardBody::Invoke {
+                request_json,
+                asserted_principal: asserted_principal.map(str::to_owned),
+            })
+        })();
+        let body = match prepared {
+            Ok(body) => body,
+            Err(error) => {
+                state
+                    .lifecycle
+                    .observe_mesh_invocation(
+                        &ticket,
+                        candidate.as_str(),
+                        fcp_host::MeshInvocationObservation::NotDelivered,
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
+                append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
+                state
+                    .lifecycle
+                    .finish_mesh_invocation(
+                        &ticket,
+                        terminal(
+                            fcp_host::MeshInvocationOutcome::NotDelivered,
+                            error.0.as_u16(),
+                            None,
+                        ),
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
+                return Err(error);
+            }
+        };
+        // Reservation, audit, encoding, and authorization consume the same
+        // deadline. A timeout after starting transport is always uncertain.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || forwarded_request.deadline_ms == Some(0) {
-            append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
-            return Err(map_host_error(HostError::Unavailable(
-                "invocation deadline expired before mesh forwarding; no further peer was contacted"
-                    .to_string(),
-            )));
-        }
-        let forwarded = fcp_async_core::time::timeout(remaining, router.forward(&candidate, body))
-            .await
-            .unwrap_or_else(|_| {
-                Err(fcp_host::mesh_routing::MeshForwardFailure::OutcomeUnknown {
-                    peer: candidate.as_str().to_owned(),
-                    detail: "invocation deadline expired during mesh forwarding".to_string(),
+        let forwarded = if remaining.is_zero() {
+            Err(fcp_host::mesh_routing::MeshForwardFailure::NotDelivered {
+                peer: candidate.as_str().to_owned(),
+                detail: "invocation deadline expired before transport started".to_string(),
+            })
+        } else {
+            fcp_async_core::time::timeout(remaining, router.forward(&candidate, body))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(fcp_host::mesh_routing::MeshForwardFailure::OutcomeUnknown {
+                        peer: candidate.as_str().to_owned(),
+                        detail: "invocation deadline expired during mesh forwarding".to_string(),
+                    })
                 })
-            });
+        };
         match forwarded {
             Ok(reply) => {
+                state
+                    .lifecycle
+                    .observe_mesh_invocation(
+                        &ticket,
+                        candidate.as_str(),
+                        fcp_host::MeshInvocationObservation::ResponseObserved {
+                            http_status: reply.status,
+                        },
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
                 append_audit(&candidate, Some(reply.status), &failed_attempts)
                     .map_err(map_host_error)?;
                 tracing::info!(
@@ -14829,16 +14937,35 @@ async fn run_mesh_forward_job(
                     executor_status = reply.status,
                     failed_attempts = failed_attempts.len(),
                     duration_ms = elapsed_millis(started_at),
-                    "invoke executed by mesh peer"
+                    "invoke response observed from mesh peer"
                 );
-                let response = mesh_reply_into_invoke_response(
+                let response = match mesh_reply_into_invoke_response(
                     router,
                     request,
                     &candidate,
                     code,
                     failed_attempts,
                     &reply,
-                )?;
+                ) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // Even a signed HTTP error may follow external effects.
+                        // An undecodable or mismatched reply proves no outcome.
+                        state
+                            .lifecycle
+                            .finish_mesh_invocation(
+                                &ticket,
+                                terminal(
+                                    fcp_host::MeshInvocationOutcome::OutcomeUnknown,
+                                    error.0.as_u16(),
+                                    None,
+                                ),
+                            )
+                            .await
+                            .map_err(mesh_invocation_evidence_error)?;
+                        return Err(error);
+                    }
+                };
                 if registered_locally {
                     record_invoke_budget_usage(
                         state.budget.as_ref(),
@@ -14849,9 +14976,35 @@ async fn run_mesh_forward_job(
                     )
                     .await;
                 }
+                state
+                    .lifecycle
+                    .finish_mesh_invocation(
+                        &ticket,
+                        terminal(
+                            match response.status {
+                                InvokeStatus::Ok => fcp_host::MeshInvocationOutcome::Succeeded,
+                                InvokeStatus::Error => {
+                                    fcp_host::MeshInvocationOutcome::ConnectorError
+                                }
+                            },
+                            StatusCode::OK.as_u16(),
+                            response.receipt_id.as_ref().map(ToString::to_string),
+                        ),
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
                 return Ok(response);
             }
             Err(failure) if failure.safe_to_retry() => {
+                state
+                    .lifecycle
+                    .observe_mesh_invocation(
+                        &ticket,
+                        candidate.as_str(),
+                        fcp_host::MeshInvocationObservation::NotDelivered,
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
                 tracing::warn!(
                     event = "mesh_invoke_forward_attempt_failed",
                     connector_id = %request.connector_id,
@@ -14862,7 +15015,28 @@ async fn run_mesh_forward_job(
                 failed_attempts.push(failure.summary());
             }
             Err(failure) => {
+                state
+                    .lifecycle
+                    .observe_mesh_invocation(
+                        &ticket,
+                        candidate.as_str(),
+                        fcp_host::MeshInvocationObservation::OutcomeUnknown,
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
                 append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
+                state
+                    .lifecycle
+                    .finish_mesh_invocation(
+                        &ticket,
+                        terminal(
+                            fcp_host::MeshInvocationOutcome::OutcomeUnknown,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            None,
+                        ),
+                    )
+                    .await
+                    .map_err(mesh_invocation_evidence_error)?;
                 tracing::error!(
                     event = "mesh_invoke_forward_outcome_unknown",
                     connector_id = %request.connector_id,
@@ -14883,6 +15057,18 @@ async fn run_mesh_forward_job(
         }
     }
     append_audit(&last_target, None, &failed_attempts).map_err(map_host_error)?;
+    state
+        .lifecycle
+        .finish_mesh_invocation(
+            &ticket,
+            terminal(
+                fcp_host::MeshInvocationOutcome::NotDelivered,
+                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                None,
+            ),
+        )
+        .await
+        .map_err(mesh_invocation_evidence_error)?;
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         format!(
@@ -14891,6 +15077,16 @@ async fn run_mesh_forward_job(
             failed_attempts.join("; ")
         ),
     ))
+}
+
+/// Losing origin evidence after reservation cannot authorize another send.
+fn mesh_invocation_evidence_error(error: HostError) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "mesh invocation evidence could not be persisted; the remote outcome may be unknown; inspect the invocation record before retrying: {error}"
+        ),
+    )
 }
 
 fn mesh_reply_into_invoke_response(
@@ -16333,25 +16529,37 @@ async fn invocation_query_handler(
                 .to_string(),
         )));
     }
-    let invocation = state
+    let mut observation = state
         .lifecycle
-        .invocation_record(&request.operation_id, request.attempt_id)
+        .invocation_observation(&request.operation_id, request.attempt_id)
         .await;
-    // A forwarding job does not create an executor-local attempt. Sample
-    // ownership once so a newer remote attempt cannot borrow an older local
-    // record's completion while its forwarding job is still active.
-    let active_kind = state.invoke_jobs.active_kind(&request.operation_id);
-    let invocation = if request.attempt_id.is_none()
-        && matches!(active_kind, Some(invoke_jobs::InvocationJobKind::Forward))
+    // Bind current ownership to the durable attempt, not just its operation
+    // ID or route kind. Before reservation finishes, an older completed local
+    // or forwarded attempt cannot masquerade as the new job's result.
+    let active = state.invoke_jobs.active_observation(&request.operation_id);
+    if request.attempt_id.is_none()
+        && let Some((kind, attempt_id)) = active
     {
-        None
-    } else {
-        invocation
-    };
-    Ok(Json(fcp_host::InvocationQueryResponse {
-        invocation,
-        host_job_active: active_kind.is_some(),
-    }))
+        let selected_attempt = match kind {
+            invoke_jobs::InvocationJobKind::Local => {
+                observation.mesh_invocation = None;
+                observation.invocation.as_ref().map(|record| record.ticket.attempt_id)
+            }
+            invoke_jobs::InvocationJobKind::Forward => {
+                observation.invocation = None;
+                observation
+                    .mesh_invocation
+                    .as_ref()
+                    .map(|record| record.ticket.attempt_id)
+            }
+        };
+        if attempt_id.is_none() || selected_attempt != attempt_id {
+            observation.invocation = None;
+            observation.mesh_invocation = None;
+        }
+    }
+    observation.host_job_active = active.is_some();
+    Ok(Json(observation))
 }
 
 async fn journal_query_handler(
@@ -19327,6 +19535,11 @@ deny_ptrace = true
             decision_codes,
         };
 
+        let directory = tempfile::TempDir::new().expect("origin state directory");
+        let state_path = directory.path().join("origin-lifecycle.json");
+        let lifecycle = Arc::new(
+            HostAdminStateStore::with_state_path(state_path.clone()).expect("durable origin store"),
+        );
         let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let peer_key_hex = hex::encode(peer_key.verifying_key().to_bytes());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
@@ -19349,6 +19562,7 @@ deny_ptrace = true
         let pending = Arc::new(AtomicU64::new(0));
         let observed_completed = Arc::clone(&completed);
         let observed_pending = Arc::clone(&pending);
+        let observed_lifecycle = Arc::clone(&lifecycle);
         let (received_tx, mut received_rx) = mpsc::channel::<()>(1);
         let (release_tx, release_rx) = fcp_async_core::channel::watch::channel(false);
         let app = Router::new().route(
@@ -19360,6 +19574,9 @@ deny_ptrace = true
                 let request: InvokeRequest =
                     serde_json::from_str(request_json).expect("forwarded request");
                 let wait_for_release = envelope.target_node.as_str() == "pending";
+                let operation_id = request.id.to_string();
+                let selected_node = envelope.target_node.as_str().to_string();
+                let lifecycle = Arc::clone(&observed_lifecycle);
                 if wait_for_release {
                     observed_pending.fetch_add(1, Ordering::SeqCst);
                 } else {
@@ -19379,6 +19596,14 @@ deny_ptrace = true
                 let received_tx = received_tx.clone();
                 let mut release_rx = release_rx.clone();
                 async move {
+                    let persisted = lifecycle
+                        .mesh_invocation_record(&operation_id, None)
+                        .await
+                        .expect("origin intent must exist before a peer receives the invoke");
+                    assert_eq!(persisted.durable, cfg!(unix));
+                    let selection = persisted.attempts.last().expect("persisted executor");
+                    assert_eq!(selection.target_node, selected_node);
+                    assert!(selection.observation.is_none());
                     if wait_for_release {
                         received_tx.send(()).await.expect("receipt observer");
                         while !*release_rx.borrow() {
@@ -19419,16 +19644,17 @@ deny_ptrace = true
         );
         let state = dispatcher_app_state(
             dispatcher_registry_with_connectors(Vec::new()),
-            Arc::new(HostAdminStateStore::new()),
+            Arc::clone(&lifecycle),
             None,
             HashMap::new(),
         );
+        let capability_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
         let mut request = invoke_token_bucket_request(
             "fcp.test.mesh-deadline:utility:1.0.0",
             "test.echo",
             "cap.test.echo",
             ZoneId::work(),
-            &fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            &capability_key,
         );
         request.deadline_ms = Some(30_000);
         let decision = |target: &str| InvokeRouteDecision::Forward {
@@ -19465,8 +19691,23 @@ deny_ptrace = true
             1
         );
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+        let completed_record = lifecycle
+            .mesh_invocation_record(&request.id.to_string(), None)
+            .await
+            .expect("retained failover outcome");
+        assert_eq!(completed_record.attempts.len(), 2);
+        assert_eq!(
+            completed_record.attempts[0].observation,
+            Some(fcp_host::MeshInvocationObservation::NotDelivered)
+        );
+        assert_eq!(completed_record.attempts[1].target_node, "available");
+        assert_eq!(
+            completed_record.terminal.expect("completed forward").outcome,
+            fcp_host::MeshInvocationOutcome::Succeeded
+        );
 
         request.id = RequestId::random();
+        request.idempotency_key = Some("mesh-origin-recovery-key".to_string());
         let (result, ()) = futures_util::future::join(
             mesh_forward_invoke(
                 &state,
@@ -19505,6 +19746,84 @@ deny_ptrace = true
         .expect_err("expired invocation must not start another peer");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+        let uncertain = lifecycle
+            .mesh_invocation_record(&request.id.to_string(), None)
+            .await
+            .expect("retained uncertain forward");
+        assert_eq!(
+            uncertain.terminal.as_ref().expect("uncertain outcome").outcome,
+            fcp_host::MeshInvocationOutcome::OutcomeUnknown
+        );
+        assert_eq!(uncertain.attempts.len(), 1);
+        assert_eq!(uncertain.attempts[0].target_node, "pending");
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("original origin ownership retires");
+        drop(state);
+
+        // Reopen the actual persisted origin history while the remote work
+        // remains live. A new route or request ID cannot erase uncertainty.
+        let reopened = Arc::new(
+            HostAdminStateStore::with_state_path(state_path).expect("replacement origin store"),
+        );
+        assert_eq!(
+            reopened.mesh_invocation_record(&uncertain.ticket.operation_id, None).await,
+            Some(uncertain.clone())
+        );
+        let replacement = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::clone(&reopened),
+            None,
+            HashMap::new(),
+        );
+        let retry_error = mesh_forward_invoke(
+            &replacement,
+            &router,
+            &request,
+            None,
+            decision("available"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("restart must not send an unresolved ID to another executor");
+        assert!(retry_error.1.contains("unresolved mesh forward"));
+        request.id = RequestId::random();
+        let key_error = mesh_forward_invoke(
+            &replacement,
+            &router,
+            &request,
+            None,
+            decision("available"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("new request ID must not bypass an unresolved exact-token key");
+        assert!(key_error.1.contains("idempotency key has an unresolved mesh forward"));
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        let local_invokes = Arc::new(AtomicU64::new(0));
+        let local_base = invoke_token_bucket_state(
+            "fcp.test.mesh-deadline:utility:1.0.0",
+            "test.echo",
+            "cap.test.echo",
+            &capability_key,
+            Arc::clone(&local_invokes),
+            false,
+        );
+        let local = Arc::new(AppState {
+            lifecycle: Arc::clone(&reopened),
+            ..(*local_base).clone()
+        });
+        request.id = RequestId::new(uncertain.ticket.operation_id.clone());
+        let local_error = invoke_handler(State(local), HeaderMap::new(), Json(request))
+            .await
+            .expect_err("moving the operation locally must preserve the unknown-ID fence");
+        assert!(local_error.1.contains("unresolved mesh forward"));
+        assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+
         release_tx.send(true).expect("release observed remote work");
         shutdown_tx.send(true).expect("stop peer");
         server.await.expect("peer task").expect("peer shutdown");
@@ -19705,6 +20024,21 @@ deny_ptrace = true
             active["invocation"].is_null(),
             "older local completion must not masquerade as the active remote result"
         );
+        assert_eq!(active["mesh_invocation"]["intent"]["target_node"], "executor");
+        assert_eq!(
+            active["mesh_invocation"]["intent"]["identity"]["kind"],
+            "token_bound_relay"
+        );
+        assert!(active["mesh_invocation"]["terminal"].is_null());
+        assert_eq!(active["mesh_invocation"]["durable"], false);
+        let active_attempt = active["mesh_invocation"]["ticket"]["attempt_id"]
+            .as_u64()
+            .expect("current forwarding attempt");
+        assert!(active_attempt > previous.ticket.attempt_id);
+        assert_eq!(
+            state.invoke_jobs.active_observation(OPERATION_ID),
+            Some((invoke_jobs::InvocationJobKind::Forward, Some(active_attempt)))
+        );
         let historical = response_body_json_ok(
             send_json_request(
                 admin_app.clone(),
@@ -19726,6 +20060,7 @@ deny_ptrace = true
             previous.ticket.attempt_id
         );
         assert_eq!(historical["invocation"]["terminal"]["outcome"], "succeeded");
+        assert!(historical["mesh_invocation"].is_null());
         assert!(
             state
                 .invoke_audit
@@ -19754,6 +20089,16 @@ deny_ptrace = true
         )
         .await?;
         assert_eq!(completed["host_job_active"], false);
+        assert!(completed["invocation"].is_null());
+        assert_eq!(
+            completed["mesh_invocation"]["ticket"]["attempt_id"],
+            active_attempt
+        );
+        assert_eq!(
+            completed["mesh_invocation"]["terminal"]["outcome"],
+            "succeeded"
+        );
+        assert_eq!(completed["mesh_invocation"]["terminal"]["http_status"], 200);
         let forwarding_audit = state
             .invoke_audit
             .entries_for_zone(ZoneId::work().as_str())
@@ -19773,6 +20118,62 @@ deny_ptrace = true
             Some(previous),
             "remote-only forwarding must not invent an executor-local admission"
         );
+
+        // A new same-ID forward may be waiting for durable admission while
+        // the previous forward's completed record is still the newest one.
+        let pending_state = Arc::new(AppState {
+            invoke_jobs: Arc::new(invoke_jobs::InvocationJobs::new()),
+            ..(*state).clone()
+        });
+        let (pending_release_tx, pending_release_rx) = oneshot::channel();
+        let pending_waiter = pending_state
+            .invoke_jobs
+            .spawn_forward(
+                OPERATION_ID.to_string(),
+                Instant::now() + Duration::from_secs(5),
+                async move {
+                    pending_release_rx.await.expect("release pending reservation");
+                    Ok(InvokeResponse::ok(RequestId::new(OPERATION_ID), json!({})))
+                },
+            )
+            .expect("new forwarding owner");
+        let pending_lookup = invocation_query_handler(
+            State(Arc::clone(&pending_state)),
+            Json(fcp_host::InvocationQueryRequest {
+                operation_id: OPERATION_ID.to_string(),
+                attempt_id: None,
+            }),
+        )
+        .await
+        .expect("latest pending query")
+        .0;
+        assert!(pending_lookup.host_job_active);
+        assert!(pending_lookup.invocation.is_none());
+        assert!(
+            pending_lookup.mesh_invocation.is_none(),
+            "a pending reservation must not borrow the previous forward's completion"
+        );
+        let exact_lookup = invocation_query_handler(
+            State(Arc::clone(&pending_state)),
+            Json(fcp_host::InvocationQueryRequest {
+                operation_id: OPERATION_ID.to_string(),
+                attempt_id: Some(active_attempt),
+            }),
+        )
+        .await
+        .expect("exact previous forwarding attempt")
+        .0;
+        assert_eq!(
+            exact_lookup.mesh_invocation.expect("historical mesh record").ticket.attempt_id,
+            active_attempt
+        );
+        pending_release_tx.send(()).expect("release pending owner");
+        pending_waiter.await.expect("pending waiter").expect("pending job");
+        pending_state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("pending owner drained");
 
         shutdown_tx.send(true).expect("stop peer");
         server.await.expect("peer task").expect("peer shutdown");

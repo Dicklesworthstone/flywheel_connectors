@@ -3,9 +3,9 @@
 //! HTTP requests retain only a response receiver. The host retains each task
 //! handle until the complete invocation/finalization job exits, so losing a
 //! connection cannot abandon an observed connector result. Local dispatch waits
-//! for its durable invocation admission; mesh forwarding records routing audit
-//! evidence before sending. A forwarding job never asserts executor-local
-//! authorization or creates an invocation admission on the entry host.
+//! for its durable invocation admission; mesh forwarding reserves a separate
+//! durable origin intent before sending. Both bind current ownership to the
+//! persisted attempt. A forwarding job never asserts executor-local authority.
 //!
 //! This uses async-core's runtime-root admission, not a detached request task.
 //! The absolute job deadline and shutdown drain below bound that ownership;
@@ -51,6 +51,7 @@ pub(super) enum InvocationJobKind {
 struct JobActivity {
     kind: InvocationJobKind,
     alive: Arc<AtomicBool>,
+    attempt_id: Option<u64>,
 }
 
 struct JobLifetime(Arc<AtomicBool>);
@@ -227,7 +228,11 @@ impl InvocationJobs {
             operation_id,
             InvocationJob {
                 handle,
-                activity: JobActivity { kind, alive },
+                activity: JobActivity {
+                    kind,
+                    alive,
+                    attempt_id: None,
+                },
             },
         );
         drop(state);
@@ -242,22 +247,63 @@ impl InvocationJobs {
         self.active_kind(operation_id).is_some()
     }
 
+    /// Bind the current job only after its local admission or origin intent
+    /// has persisted. Repeating the same binding is safe; replacing it is not.
+    pub(super) fn bind_attempt(&self, ticket: &fcp_host::InvocationTicket) -> HostResult<()> {
+        if ticket.attempt_id == 0 {
+            return Err(HostError::Internal(
+                "invocation ownership requires a positive durable attempt ID".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().expect("invocation jobs lock");
+        let activity = if let Some(job) = state.jobs.get_mut(&ticket.operation_id) {
+            &mut job.activity
+        } else {
+            state.draining.get_mut(&ticket.operation_id).ok_or_else(|| {
+                HostError::Unavailable(
+                    "invocation lost host ownership before attempt binding".to_string(),
+                )
+            })?
+        };
+        if !activity.alive.load(Ordering::Acquire) {
+            return Err(HostError::Unavailable(
+                "invocation owner ended before attempt binding".to_string(),
+            ));
+        }
+        if activity.attempt_id.is_some_and(|previous| previous != ticket.attempt_id) {
+            return Err(HostError::Internal(
+                "refusing to replace an owned invocation attempt".to_string(),
+            ));
+        }
+        activity.attempt_id = Some(ticket.attempt_id);
+        Ok(())
+    }
+
     /// Observe liveness and job kind together, including during shutdown.
-    /// A forwarding job cannot establish the outcome of an older local
-    /// admission that happens to use the same operation ID.
     #[must_use]
     pub(super) fn active_kind(&self, operation_id: &str) -> Option<InvocationJobKind> {
+        self.active_observation(operation_id).map(|(kind, _)| kind)
+    }
+
+    /// Sample kind and durable identity under one ownership lock. An absent
+    /// attempt means the current job has not finished durable admission yet.
+    #[must_use]
+    pub(super) fn active_observation(
+        &self,
+        operation_id: &str,
+    ) -> Option<(InvocationJobKind, Option<u64>)> {
         let state = self.state.lock().expect("invocation jobs lock");
         if let Some(job) = state.jobs.get(operation_id)
             && !job.handle.is_finished()
+            && job.activity.alive.load(Ordering::Acquire)
         {
-            return Some(job.activity.kind);
+            return Some((job.activity.kind, job.activity.attempt_id));
         }
         state
             .draining
             .get(operation_id)
             .filter(|activity| activity.alive.load(Ordering::Acquire))
-            .map(|activity| activity.kind)
+            .map(|activity| (activity.kind, activity.attempt_id))
     }
 
     pub(super) fn stop_accepting(&self) {
@@ -713,6 +759,7 @@ async fn run_owned(
         }
     };
 
+    state.invoke_jobs.bind_attempt(&ticket)?;
     let (source_result, dispatched) = dispatch(state, request.clone(), deadline).await;
     let duration_ms = super::elapsed_millis(started_at);
     let terminal = terminal_observation(&source_result, dispatched, deadline, duration_ms);
@@ -852,6 +899,73 @@ mod tests {
 
     fn reply() -> InvokeResponse {
         InvokeResponse::ok(fcp_kernel::RequestId::new("owned-job"), serde_json::json!({}))
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn owned_attempt_binding_is_immutable_and_survives_shutdown_handoff() {
+        let jobs = Arc::new(InvocationJobs::with_capacity(1));
+        let (release_tx, release_rx) = oneshot::channel();
+        let receiver = jobs
+            .spawn_forward(
+                "bound-forward".to_string(),
+                Instant::now() + Duration::from_secs(5),
+                async move {
+                    release_rx.await.expect("release owned forward");
+                    Ok(reply())
+                },
+            )
+            .expect("admit unbound forward");
+        assert_eq!(
+            jobs.active_observation("bound-forward"),
+            Some((InvocationJobKind::Forward, None))
+        );
+        let mut ticket = fcp_host::InvocationTicket {
+            operation_id: "bound-forward".to_string(),
+            attempt_id: 0,
+        };
+        assert!(jobs.bind_attempt(&ticket).is_err());
+        ticket.attempt_id = 17;
+        jobs.bind_attempt(&ticket).expect("bind durable reservation");
+        jobs.bind_attempt(&ticket).expect("repeat identical binding");
+        let mut replacement = ticket.clone();
+        replacement.attempt_id = 18;
+        assert!(jobs.bind_attempt(&replacement).is_err());
+        assert_eq!(
+            jobs.active_observation("bound-forward"),
+            Some((InvocationJobKind::Forward, Some(17)))
+        );
+
+        let draining_jobs = Arc::clone(&jobs);
+        let draining = task::spawn(async move {
+            draining_jobs.shutdown(Duration::from_secs(2)).await
+        });
+        fcp_async_core::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let handed_off = jobs
+                    .state
+                    .lock()
+                    .expect("jobs lock")
+                    .draining
+                    .contains_key("bound-forward");
+                if handed_off {
+                    break;
+                }
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown takes ownership");
+        jobs.bind_attempt(&ticket).expect("binding remains in draining owner");
+        assert!(jobs.bind_attempt(&replacement).is_err());
+        assert_eq!(
+            jobs.active_observation("bound-forward"),
+            Some((InvocationJobKind::Forward, Some(17)))
+        );
+        release_tx.send(()).expect("release draining job");
+        receiver.await.expect("response channel").expect("forward result");
+        draining.await.expect("drain task").expect("drain complete");
+        assert_eq!(jobs.active_observation("bound-forward"), None);
+        assert!(jobs.bind_attempt(&ticket).is_err());
     }
 
     #[fcp_async_core::runtime::test]

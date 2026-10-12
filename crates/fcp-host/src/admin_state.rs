@@ -31,6 +31,9 @@ use crate::{
     discovery::ConnectorSummary, supervisor::ConnectorPrewarmConfig,
 };
 
+mod mesh_invocations;
+pub use mesh_invocations::*;
+
 const HOST_ADMIN_STATE_SNAPSHOT_VERSION: u32 = 1;
 const REDACTED_CONFIG_VALUE: &str = "[REDACTED]";
 
@@ -548,21 +551,7 @@ impl InvocationIdempotency {
                 key,
             ),
         )?;
-        let mut context = request.context.clone().unwrap_or_default();
-        context.trace_id = None;
-        // Sampling adds this reserved correlation link when it creates a new
-        // child request. The parent attempt ID is not part of the child effect.
-        context.request_tags.remove("fcp.host.parent_request_id");
-        let mut provenance = request.provenance.clone();
-        if let Some(provenance) = &mut provenance {
-            // The semantic elevation and origin remain bound. Renewing the
-            // authorization proving them must not change the effect identity.
-            provenance.elevation_token = None;
-        }
-        let effect_digest = invocation_idempotency_digest(
-            "fcp.host.invocation.effect.v1",
-            &(&request.input, &context, &provenance),
-        )?;
+        let effect_digest = invocation_effect_digest(request)?;
         Ok(Some(Self {
             scope_digest,
             effect_digest,
@@ -584,6 +573,24 @@ impl InvocationIdempotency {
         }
         Ok(())
     }
+}
+
+fn invocation_effect_digest(request: &fcp_kernel::InvokeRequest) -> HostResult<String> {
+    let mut context = request.context.clone().unwrap_or_default();
+    context.trace_id = None;
+    // Sampling adds this reserved correlation link when it creates a new
+    // child request. The parent attempt ID is not part of the child effect.
+    context.request_tags.remove("fcp.host.parent_request_id");
+    let mut provenance = request.provenance.clone();
+    if let Some(provenance) = &mut provenance {
+        // The semantic elevation and origin remain bound. Renewing the
+        // authorization proving them must not change the effect identity.
+        provenance.elevation_token = None;
+    }
+    invocation_idempotency_digest(
+        "fcp.host.invocation.effect.v1",
+        &(&request.input, &context, &provenance),
+    )
 }
 
 fn invocation_idempotency_digest<T: Serialize>(domain: &str, value: &T) -> HostResult<String> {
@@ -751,8 +758,11 @@ pub struct InvocationQueryRequest {
 /// not occur on another host or outside the retained local history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvocationQueryResponse {
-    /// Locally retained attempt metadata, if present.
+    /// Executor-local attempt metadata, if selected.
     pub invocation: Option<InvocationRecord>,
+    /// Entry-host forwarding evidence, if selected instead of a local attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_invocation: Option<MeshInvocationRecord>,
     /// Whether this host still owns an unfinished job with this invocation ID.
     ///
     /// This is a current process observation, not durable completion evidence.
@@ -2865,6 +2875,8 @@ pub struct HostAdminStateSnapshot {
     simulate_receipts: Vec<SimulateReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     invocations: Vec<InvocationRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mesh_invocations: Vec<MeshInvocationRecord>,
     #[serde(
         default = "initial_invocation_attempt_id",
         skip_serializing_if = "is_initial_invocation_attempt_id"
@@ -2900,6 +2912,7 @@ impl Default for HostAdminStateSnapshot {
             receipts: Vec::new(),
             simulate_receipts: Vec::new(),
             invocations: Vec::new(),
+            mesh_invocations: Vec::new(),
             next_invocation_attempt_id: initial_invocation_attempt_id(),
         }
     }
@@ -2907,9 +2920,17 @@ impl Default for HostAdminStateSnapshot {
 
 impl HostAdminStateSnapshot {
     fn recover_invocations_after_restart(&mut self, now: DateTime<Utc>) -> HostResult<bool> {
+        if self.invocations.len().saturating_add(self.mesh_invocations.len())
+            > MAX_RETAINED_INVOCATIONS
+        {
+            return Err(HostError::Internal(
+                "persisted invocation history exceeds its retention bound".to_string(),
+            ));
+        }
         let mut generations = HashSet::new();
         let mut scoped_effects = HashMap::new();
         let mut unresolved_scopes = HashSet::new();
+        let mut unresolved_operations = HashSet::new();
         let mut changed = false;
         for record in &mut self.invocations {
             if record.ticket.operation_id != record.admission.operation_id
@@ -2935,6 +2956,13 @@ impl HostAdminStateSnapshot {
                 record.finished_at = Some(now);
                 changed = true;
             }
+            if record.is_unresolved()
+                && !unresolved_operations.insert(record.ticket.operation_id.clone())
+            {
+                return Err(HostError::Internal(
+                    "persisted invocation identifier has overlapping unresolved attempts".to_string(),
+                ));
+            }
             if let Some(binding) = &record.admission.idempotency {
                 binding.validate().map_err(|_| {
                     HostError::Internal(
@@ -2958,6 +2986,13 @@ impl HostAdminStateSnapshot {
                 }
             }
         }
+        changed |= self.recover_mesh_invocations_after_restart(
+            now,
+            &mut generations,
+            &mut scoped_effects,
+            &mut unresolved_scopes,
+            &mut unresolved_operations,
+        )?;
         if self.next_invocation_attempt_id == 0 {
             return Err(HostError::Internal(
                 "persisted invocation attempt generation is invalid".to_string(),
@@ -4915,6 +4950,11 @@ impl HostAdminStateStore {
             if admission.deadline_at <= now {
                 return Err(invocation_state_error("invocation admission deadline expired"));
             }
+            snapshot.check_mesh_invocation_conflicts(
+                &admission.operation_id,
+                admission.idempotency.as_ref(),
+                true,
+            )?;
             // Check retained bindings before reclaiming history. A different
             // request ID must not bypass an unresolved external effect.
             if let Some(binding) = &admission.idempotency {
@@ -4946,21 +4986,9 @@ impl HostAdminStateStore {
                     "invocation identifier has an unresolved attempt; inspect its outcome before retrying",
                 ));
             }
-            while snapshot.invocations.len() >= MAX_RETAINED_INVOCATIONS {
-                let completed = snapshot
-                    .invocations
-                    .iter()
-                    .position(|record| !record.is_unresolved());
-                let Some(index) = completed else {
-                    return Err(invocation_state_error(
-                        "retained invocation history is full of unresolved or unfinished attempts",
-                    ));
-                };
-                // Completed-ID reuse is permitted independently of this bounded
-                // local history. Never evict uncertain effects or a source
-                // response whose sampling/finalization may still be running.
-                snapshot.invocations.remove(index);
-            }
+            // Local and forwarded work share one bound. Unknown effects and
+            // incomplete finalization are never reclaimed to admit more work.
+            snapshot.reserve_invocation_history_slot()?;
             let attempt_id = snapshot.next_invocation_attempt_id;
             let next_attempt_id = attempt_id.checked_add(1).ok_or_else(|| {
                 invocation_state_error("invocation attempt generation exhausted")
