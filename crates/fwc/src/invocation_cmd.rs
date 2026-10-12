@@ -288,7 +288,9 @@ fn lookup_result(
     };
     let message = match state {
         "not-retained" => MISSING_HISTORY_CAVEAT,
-        "active-record-unavailable" => "The host reports an active job but has no retained record yet. Admission may still be queued; no conclusion about effects is available.",
+        "active-record-unavailable" => {
+            "The host reports an active job without a retained executor-local record. Local admission may be pending, or this host may be forwarding to a mesh executor. This liveness observation does not establish execution effects or promise a local record."
+        }
         "running" => "The host reports an active job and a retained admission without a terminal observation.",
         "outcome-unknown" => "The host cannot establish the operation's final effects. This record does not authorize another execution.",
         "source-observed-finalizing" => "The source outcome was recorded and the host job is still active. Response, audit, or sampling finalization is not yet complete.",
@@ -766,6 +768,37 @@ mod tests {
             assert_eq!(payload["source_outcome_known"], false);
             assert_eq!(payload["automatic_retry_allowed"], false);
             assert!(payload["caveats"][0].as_str().unwrap().contains("does not prove"));
+        }
+    }
+
+    #[test]
+    fn invocation_lookup_forward_liveness_never_invents_local_history_or_retry_permission() {
+        for (active, expected_state) in
+            [(true, "active-record-unavailable"), (false, "not-retained")]
+        {
+            let host = TestHost::start(Reply::Json(
+                200,
+                json!({"invocation": null, "host_job_active": active}),
+            ));
+            let (exit, payload, _) = execute_lookup(&host.endpoint, None);
+            host.finish();
+            assert_eq!(exit, CliExitCode::Success.into());
+            assert_eq!(payload["execution_state"], expected_state);
+            assert_eq!(payload["host_job_active"], active);
+            assert_eq!(payload["host_job_active_scope"], "operation-id");
+            assert_eq!(payload["found"], false);
+            assert!(payload["invocation"].is_null());
+            assert_eq!(payload["source_outcome_known"], false);
+            assert_eq!(payload["finalization_complete"], false);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            if active {
+                assert!(
+                    payload["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mesh executor")
+                );
+            }
         }
     }
 

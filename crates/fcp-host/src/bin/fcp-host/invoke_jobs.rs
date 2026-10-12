@@ -1,9 +1,11 @@
-//! Bounded host ownership of admitted local invocations.
+//! Bounded host ownership of local invocations and mesh forwarding.
 //!
 //! HTTP requests retain only a response receiver. The host retains each task
 //! handle until the complete invocation/finalization job exits, so losing a
-//! connection cannot abandon an observed connector result. Dispatch still waits
-//! for the durable ownership record written by the job itself.
+//! connection cannot abandon an observed connector result. Local dispatch waits
+//! for its durable invocation admission; mesh forwarding records routing audit
+//! evidence before sending. A forwarding job never asserts executor-local
+//! authorization or creates an invocation admission on the entry host.
 //!
 //! This uses async-core's runtime-root admission, not a detached request task.
 //! The absolute job deadline and shutdown drain below bound that ownership;
@@ -25,6 +27,8 @@ const MAX_OWNED_INVOCATIONS: usize = 256;
 pub(super) const FINALIZATION_GRACE: Duration = Duration::from_secs(5);
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(65);
 
+pub(super) type ForwardResult = Result<InvokeResponse, (axum::http::StatusCode, String)>;
+
 #[must_use]
 pub(super) fn finalization_deadline(execution_deadline: Instant) -> Instant {
     execution_deadline
@@ -34,6 +38,18 @@ pub(super) fn finalization_deadline(execution_deadline: Instant) -> Instant {
 
 struct InvocationJob {
     handle: JoinHandle<()>,
+    activity: JobActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InvocationJobKind {
+    Local,
+    Forward,
+}
+
+#[derive(Clone)]
+struct JobActivity {
+    kind: InvocationJobKind,
     alive: Arc<AtomicBool>,
 }
 
@@ -50,7 +66,7 @@ struct JobsState {
     jobs: HashMap<String, InvocationJob>,
     /// Shutdown owns these handles outside the mutex, while queries still
     /// need to distinguish live jobs from unresolved persisted admissions.
-    draining: HashMap<String, Arc<AtomicBool>>,
+    draining: HashMap<String, JobActivity>,
 }
 
 /// A bounded supervisor. No task callback needs to acquire its ownership lock.
@@ -108,6 +124,56 @@ impl InvocationJobs {
     where
         F: Future<Output = HostResult<InvokeResponse>> + Send + 'static,
     {
+        self.spawn_with_error(
+            operation_id,
+            execution_deadline,
+            InvocationJobKind::Local,
+            future,
+            std::convert::identity,
+        )
+    }
+
+    /// Retain a mesh forward without creating an executor-local admission.
+    ///
+    /// The future must append routing evidence before any peer send and enforce
+    /// its execution deadline separately from the finalization grace. Signed
+    /// peer HTTP status and response bodies pass through without remapping.
+    pub(super) fn spawn_forward<F>(
+        &self,
+        operation_id: String,
+        execution_deadline: Instant,
+        future: F,
+    ) -> HostResult<oneshot::Receiver<ForwardResult>>
+    where
+        F: Future<Output = ForwardResult> + Send + 'static,
+    {
+        self.spawn_with_error(
+            operation_id,
+            execution_deadline,
+            InvocationJobKind::Forward,
+            future,
+            |_| {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "owned mesh forward exceeded its finalization deadline; the remote executor may have executed the operation and its outcome is unknown; do not automatically retry"
+                        .to_string(),
+                )
+            },
+        )
+    }
+
+    fn spawn_with_error<F, E>(
+        &self,
+        operation_id: String,
+        execution_deadline: Instant,
+        kind: InvocationJobKind,
+        future: F,
+        map_error: fn(HostError) -> E,
+    ) -> HostResult<oneshot::Receiver<Result<InvokeResponse, E>>>
+    where
+        F: Future<Output = Result<InvokeResponse, E>> + Send + 'static,
+        E: Send + 'static,
+    {
         self.reap_finished();
         let mut state = self.state.lock().expect("invocation jobs lock");
         if !state.accepting {
@@ -146,10 +212,10 @@ impl InvocationJobs {
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err(HostError::Unavailable(
+                Err(_) => Err(map_error(HostError::Unavailable(
                     "host invocation finalization deadline expired; consult the invocation record before retrying"
                         .to_string(),
-                )),
+                ))),
             };
             // A disconnected client cannot cancel the completed host work.
             let _ = response_tx.send(result);
@@ -157,7 +223,13 @@ impl InvocationJobs {
         .map_err(|error| {
             HostError::Unavailable(format!("host invocation task admission failed: {error}"))
         })?;
-        state.jobs.insert(operation_id, InvocationJob { handle, alive });
+        state.jobs.insert(
+            operation_id,
+            InvocationJob {
+                handle,
+                activity: JobActivity { kind, alive },
+            },
+        );
         drop(state);
         Ok(response_rx)
     }
@@ -167,15 +239,25 @@ impl InvocationJobs {
     /// after this returns false; it is never a no-side-effect assertion.
     #[must_use]
     pub(super) fn is_active(&self, operation_id: &str) -> bool {
+        self.active_kind(operation_id).is_some()
+    }
+
+    /// Observe liveness and job kind together, including during shutdown.
+    /// A forwarding job cannot establish the outcome of an older local
+    /// admission that happens to use the same operation ID.
+    #[must_use]
+    pub(super) fn active_kind(&self, operation_id: &str) -> Option<InvocationJobKind> {
         let state = self.state.lock().expect("invocation jobs lock");
+        if let Some(job) = state.jobs.get(operation_id)
+            && !job.handle.is_finished()
+        {
+            return Some(job.activity.kind);
+        }
         state
-            .jobs
+            .draining
             .get(operation_id)
-            .is_some_and(|job| !job.handle.is_finished())
-            || state
-                .draining
-                .get(operation_id)
-                .is_some_and(|alive| alive.load(Ordering::Acquire))
+            .filter(|activity| activity.alive.load(Ordering::Acquire))
+            .map(|activity| activity.kind)
     }
 
     pub(super) fn stop_accepting(&self) {
@@ -195,7 +277,7 @@ impl InvocationJobs {
             let active = state
                 .jobs
                 .iter()
-                .map(|(id, job)| (id.clone(), Arc::clone(&job.alive)))
+                .map(|(id, job)| (id.clone(), job.activity.clone()))
                 .collect::<Vec<_>>();
             state.draining.extend(active);
             std::mem::take(&mut state.jobs)
@@ -792,6 +874,207 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn disconnected_forward_waiter_retains_job_until_observation_finishes() {
+        let jobs = InvocationJobs::with_capacity(1);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let receiver = jobs
+            .spawn_forward(
+                "forwarded-job".to_string(),
+                Instant::now() + Duration::from_secs(5),
+                async move {
+                    started_tx.send(()).expect("started observer");
+                    release_rx.await.expect("release forward");
+                    observed_tx.send(()).expect("outcome observer");
+                    Err((
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "executor outcome remains unknown".to_string(),
+                    ))
+                },
+            )
+            .expect("admit forward");
+        started_rx.await.expect("forward started");
+        drop(receiver);
+        assert_eq!(
+            jobs.active_kind("forwarded-job"),
+            Some(InvocationJobKind::Forward)
+        );
+        release_tx.send(()).expect("forward still owned");
+        observed_rx
+            .await
+            .expect("forward observation after disconnect");
+        jobs.shutdown(Duration::from_secs(1)).await.expect("drain");
+        assert_eq!(jobs.active_kind("forwarded-job"), None);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn forwarded_responses_preserve_executor_http_status_body_and_success() {
+        use axum::http::StatusCode;
+
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let jobs = InvocationJobs::with_capacity(1);
+            let expected_body = format!("executor response with status {status}");
+            let body = expected_body.clone();
+            let receiver = jobs
+                .spawn_forward(
+                    "forwarded-error".to_string(),
+                    Instant::now() + Duration::from_secs(5),
+                    async move { Err((status, body)) },
+                )
+                .expect("admit forward");
+            let error = receiver
+                .await
+                .expect("response channel")
+                .expect_err("peer error");
+            assert_eq!(error, (status, expected_body));
+            jobs.shutdown(Duration::from_secs(1)).await.expect("drain");
+        }
+
+        let jobs = InvocationJobs::with_capacity(1);
+        let response = InvokeResponse::ok(
+            fcp_kernel::RequestId::new("executor-reply"),
+            serde_json::json!({"remote_result": {"retained": true}}),
+        );
+        let expected = serde_json::to_value(&response).expect("expected response");
+        let receiver = jobs
+            .spawn_forward(
+                "forwarded-success".to_string(),
+                Instant::now() + Duration::from_secs(5),
+                async move { Ok(response) },
+            )
+            .expect("admit forward");
+        let response = receiver
+            .await
+            .expect("response channel")
+            .expect("peer success");
+        assert_eq!(
+            serde_json::to_value(response).expect("response JSON"),
+            expected
+        );
+        jobs.shutdown(Duration::from_secs(1)).await.expect("drain");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_and_forward_jobs_share_duplicate_and_capacity_rejection_without_polling() {
+        for owner in [InvocationJobKind::Local, InvocationJobKind::Forward] {
+            let jobs = InvocationJobs::with_capacity(1);
+            let (release_tx, release_rx) = oneshot::channel();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            match owner {
+                InvocationJobKind::Local => drop(
+                    jobs.spawn("first".to_string(), deadline, async move {
+                        release_rx.await.expect("release local job");
+                        Ok(reply())
+                    })
+                    .expect("admit local owner"),
+                ),
+                InvocationJobKind::Forward => drop(
+                    jobs.spawn_forward("first".to_string(), deadline, async move {
+                        release_rx.await.expect("release forward job");
+                        Ok(reply())
+                    })
+                    .expect("admit forward owner"),
+                ),
+            }
+            assert_eq!(jobs.active_kind("first"), Some(owner));
+            let polled = Arc::new(AtomicBool::new(false));
+            for id in ["first", "second"] {
+                let local_polled = Arc::clone(&polled);
+                let local_error = jobs
+                    .spawn(id.to_string(), deadline, async move {
+                        local_polled.store(true, Ordering::SeqCst);
+                        Ok(reply())
+                    })
+                    .expect_err("local admission rejected");
+                let forward_polled = Arc::clone(&polled);
+                let forward_error = jobs
+                    .spawn_forward(id.to_string(), deadline, async move {
+                        forward_polled.store(true, Ordering::SeqCst);
+                        Ok(reply())
+                    })
+                    .expect_err("forward admission rejected");
+                for error in [local_error, forward_error] {
+                    if id == "first" {
+                        assert!(matches!(error, HostError::PreflightFailed(_)));
+                    } else {
+                        assert!(matches!(error, HostError::Unavailable(_)));
+                    }
+                }
+            }
+            assert!(!polled.load(Ordering::SeqCst));
+            release_tx.send(()).expect("owner retained its receiver");
+            jobs.shutdown(Duration::from_secs(1)).await.expect("drain");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn shared_shutdown_preserves_local_and_forward_kinds_and_stops_new_forwards() {
+        let jobs = InvocationJobs::with_capacity(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (local_started_tx, local_started_rx) = oneshot::channel();
+        let (local_release_tx, local_release_rx) = oneshot::channel();
+        let local_receiver = jobs
+            .spawn("draining-local".to_string(), deadline, async move {
+                local_started_tx.send(()).expect("local observer");
+                local_release_rx.await.expect("release local");
+                Ok(reply())
+            })
+            .expect("admit local");
+        let (forward_started_tx, forward_started_rx) = oneshot::channel();
+        let (forward_release_tx, forward_release_rx) = oneshot::channel();
+        let forward_receiver = jobs
+            .spawn_forward("draining-forward".to_string(), deadline, async move {
+                forward_started_tx.send(()).expect("forward observer");
+                forward_release_rx.await.expect("release forward");
+                Ok(reply())
+            })
+            .expect("admit forward");
+        local_started_rx.await.expect("local started");
+        forward_started_rx.await.expect("forward started");
+        let mut shutdown = Box::pin(jobs.shutdown(Duration::from_secs(1)));
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        assert!(jobs.state.lock().expect("jobs").jobs.is_empty());
+        assert_eq!(
+            jobs.active_kind("draining-local"),
+            Some(InvocationJobKind::Local)
+        );
+        assert_eq!(
+            jobs.active_kind("draining-forward"),
+            Some(InvocationJobKind::Forward)
+        );
+        let polled = Arc::new(AtomicBool::new(false));
+        let captured = Arc::clone(&polled);
+        assert!(
+            jobs.spawn_forward("late-forward".to_string(), deadline, async move {
+                captured.store(true, Ordering::SeqCst);
+                Ok(reply())
+            })
+            .is_err()
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        local_release_tx.send(()).expect("release local");
+        forward_release_tx.send(()).expect("release forward");
+        shutdown.await.expect("shared drain");
+        local_receiver
+            .await
+            .expect("local channel")
+            .expect("local result");
+        forward_receiver
+            .await
+            .expect("forward channel")
+            .expect("forward result");
+        assert_eq!(jobs.active_kind("draining-local"), None);
+        assert_eq!(jobs.active_kind("draining-forward"), None);
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn duplicate_and_capacity_rejection_never_poll_another_dispatch() {
         let jobs = InvocationJobs::with_capacity(1);
         let (release_tx, release_rx) = oneshot::channel();
@@ -840,6 +1123,16 @@ mod tests {
         );
         assert!(!dispatched.load(Ordering::SeqCst));
         assert!(jobs.state.lock().expect("jobs").jobs.is_empty());
+        let capture = Arc::clone(&dispatched);
+        assert!(
+            jobs.spawn_forward("expired-forward".to_string(), Instant::now(), async move {
+                capture.store(true, Ordering::SeqCst);
+                Ok(reply())
+            })
+            .is_err()
+        );
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(jobs.state.lock().expect("jobs").jobs.is_empty());
     }
 
     #[test]
@@ -848,6 +1141,15 @@ mod tests {
         let error = jobs
             .spawn(
                 "outside-runtime".to_string(),
+                Instant::now() + Duration::from_secs(5),
+                async { Ok(reply()) },
+            )
+            .expect_err("no runtime");
+        assert!(error.to_string().contains("task admission failed"));
+        assert!(jobs.state.lock().expect("jobs").jobs.is_empty());
+        let error = jobs
+            .spawn_forward(
+                "forward-outside-runtime".to_string(),
                 Instant::now() + Duration::from_secs(5),
                 async { Ok(reply()) },
             )

@@ -14551,10 +14551,22 @@ fn append_mesh_preflight_denial(
 /// Candidates that fail before delivery are skipped in favour of the next
 /// ranked advertiser (singleton writers have none). A forward whose outcome
 /// is unknown is never retried: the operation may have executed on the peer.
+struct MeshForwardJob {
+    request: InvokeRequest,
+    asserted_principal: Option<String>,
+    target: TailscaleNodeId,
+    alternates: Vec<TailscaleNodeId>,
+    code: &'static str,
+    audit_ctx: fcp_host::InvokeAuditContext,
+    registered_locally: bool,
+    started_at: Instant,
+    deadline: Instant,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn mesh_forward_invoke(
-    state: &AppState,
-    router: &fcp_host::mesh_routing::MeshRouter,
+    state: &Arc<AppState>,
+    router: &Arc<fcp_host::mesh_routing::MeshRouter>,
     request: &InvokeRequest,
     asserted_principal: Option<&str>,
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
@@ -14630,6 +14642,61 @@ async fn mesh_forward_invoke(
             return Err(map_host_error(error));
         }
     };
+    // Preserve target-aware authorization before reserving host capacity.
+    // Remote-only operations remain authorized by their executor; this job
+    // retains routing work and never manufactures a local admission record.
+    let response_rx = state
+        .invoke_jobs
+        .spawn_forward(
+            request.id.to_string(),
+            deadline,
+            run_mesh_forward_job(
+                Arc::clone(state),
+                Arc::clone(router),
+                MeshForwardJob {
+                    request: request.clone(),
+                    asserted_principal: asserted_principal.map(str::to_owned),
+                    target,
+                    alternates,
+                    code,
+                    audit_ctx,
+                    registered_locally,
+                    started_at,
+                    deadline,
+                },
+            ),
+        )
+        .map_err(map_host_error)?;
+    response_rx.await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "host-owned mesh forwarding ended without a response; the remote outcome is unknown and the operation may have executed; it was not retried elsewhere"
+                .to_string(),
+        )
+    })?
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_mesh_forward_job(
+    state: Arc<AppState>,
+    router: Arc<fcp_host::mesh_routing::MeshRouter>,
+    job: MeshForwardJob,
+) -> invoke_jobs::ForwardResult {
+    let MeshForwardJob {
+        request,
+        asserted_principal,
+        target,
+        alternates,
+        code,
+        audit_ctx,
+        registered_locally,
+        started_at,
+        deadline,
+    } = job;
+    let state = state.as_ref();
+    let router = router.as_ref();
+    let request = &request;
+    let asserted_principal = asserted_principal.as_deref();
     let append_audit = |target_node: &TailscaleNodeId,
                         executor_status: Option<u16>,
                         failed_attempts: &[String]|
@@ -16218,9 +16285,20 @@ async fn invocation_query_handler(
         .lifecycle
         .invocation_record(&request.operation_id, request.attempt_id)
         .await;
+    // A forwarding job does not create an executor-local attempt. Sample
+    // ownership once so a newer remote attempt cannot borrow an older local
+    // record's completion while its forwarding job is still active.
+    let active_kind = state.invoke_jobs.active_kind(&request.operation_id);
+    let invocation = if request.attempt_id.is_none()
+        && matches!(active_kind, Some(invoke_jobs::InvocationJobKind::Forward))
+    {
+        None
+    } else {
+        invocation
+    };
     Ok(Json(fcp_host::InvocationQueryResponse {
         invocation,
-        host_job_active: state.invoke_jobs.is_active(&request.operation_id),
+        host_job_active: active_kind.is_some(),
     }))
 }
 
@@ -19258,30 +19336,32 @@ deny_ptrace = true
         );
         let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
         let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
-        let router = MeshRouter::new(MeshRoutingSettings {
-            node_id: TailscaleNodeId::new("entry"),
-            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
-            peers_json: json!([
-                {
-                    "node_id": "not-delivered",
-                    "endpoint": failed_endpoint,
-                    "public_key_hex": peer_key_hex,
-                },
-                {
-                    "node_id": "available",
-                    "endpoint": endpoint,
-                    "public_key_hex": peer_key_hex,
-                },
-                {
-                    "node_id": "pending",
-                    "endpoint": endpoint,
-                    "public_key_hex": peer_key_hex,
-                },
-            ])
-            .to_string(),
-            forward_timeout: Duration::from_secs(10),
-        })
-        .expect("entry router");
+        let router = Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("entry"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json: json!([
+                    {
+                        "node_id": "not-delivered",
+                        "endpoint": failed_endpoint,
+                        "public_key_hex": peer_key_hex,
+                    },
+                    {
+                        "node_id": "available",
+                        "endpoint": endpoint,
+                        "public_key_hex": peer_key_hex,
+                    },
+                    {
+                        "node_id": "pending",
+                        "endpoint": endpoint,
+                        "public_key_hex": peer_key_hex,
+                    },
+                ])
+                .to_string(),
+                forward_timeout: Duration::from_secs(10),
+            })
+            .expect("entry router"),
+        );
         let state = dispatcher_app_state(
             dispatcher_registry_with_connectors(Vec::new()),
             Arc::new(HostAdminStateStore::new()),
@@ -19373,6 +19453,275 @@ deny_ptrace = true
         release_tx.send(true).expect("release observed remote work");
         shutdown_tx.send(true).expect("stop peer");
         server.await.expect("peer task").expect("peer shutdown");
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn disconnected_mesh_invoke_retains_forwarding_and_truthful_query()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use fcp_host::mesh_routing::{
+            MESH_ADVERTISEMENT_ROUTE, MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings,
+        };
+        use fcp_mesh::invoke_route::{
+            AdvertisedConnector, MeshForwardBody, MeshForwardEnvelope, MeshForwardReply,
+            MeshPeerAdvertisement,
+        };
+
+        const CONNECTOR: &str = "fcp.test.mesh-owned:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+        const OPERATION_ID: &str = "mesh-owned-disconnect";
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let local_invokes = Arc::new(AtomicU64::new(0));
+        let base_state = invoke_token_bucket_state(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            &signing_key,
+            Arc::clone(&local_invokes),
+            false,
+        );
+        let mut request = invoke_token_bucket_request(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            ZoneId::work(),
+            &signing_key,
+        );
+        request.id = RequestId::new(OPERATION_ID);
+        request.deadline_ms = Some(10_000);
+
+        // Produce real local history, then move the connector to a peer.
+        // An active forward must never present that older result as its own.
+        invoke_handler(
+            State(Arc::clone(&base_state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("initial local invocation");
+        fcp_async_core::time::timeout(Duration::from_secs(2), async {
+            while base_state.invoke_jobs.is_active(OPERATION_ID) {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial local job finishes");
+        let previous = base_state
+            .lifecycle
+            .invocation_record(OPERATION_ID, None)
+            .await
+            .expect("real local attempt");
+        assert_eq!(
+            previous.terminal.as_ref().expect("local outcome").outcome,
+            fcp_host::InvocationOutcome::Succeeded
+        );
+        base_state
+            .registry
+            .state
+            .write()
+            .await
+            .connectors
+            .remove(&request.connector_id)
+            .expect("remove local registration");
+
+        let peer_node = TailscaleNodeId::new("executor");
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let peers_json = json!([{
+            "node_id": peer_node.as_str(),
+            "endpoint": format!("http://{}", listener.local_addr()?),
+            "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+        }])
+        .to_string();
+        let advertisement = MeshPeerAdvertisement::sign(
+            &peer_key,
+            peer_node.clone(),
+            fcp_host::mesh_routing::unix_now_ms(),
+            vec![AdvertisedConnector {
+                connector_id: CONNECTOR.to_string(),
+                zones: vec![ZoneId::work().to_string()],
+                singleton_writer: false,
+                summary_json: None,
+            }],
+        );
+        let forwarded = Arc::new(AtomicU64::new(0));
+        let observed_forwarded = Arc::clone(&forwarded);
+        let (received_tx, mut received_rx) = mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = fcp_async_core::channel::watch::channel(false);
+        let peer_app = Router::new()
+            .route(
+                MESH_ADVERTISEMENT_ROUTE,
+                get(move || {
+                    let advertisement = advertisement.clone();
+                    async move { Json(advertisement) }
+                }),
+            )
+            .route(
+                MESH_FORWARD_ROUTE,
+                post(move |Json(envelope): Json<MeshForwardEnvelope>| {
+                    let MeshForwardBody::Invoke { request_json, .. } = &envelope.body else {
+                        panic!("expected forwarded invoke");
+                    };
+                    let request: InvokeRequest =
+                        serde_json::from_str(request_json).expect("forwarded invoke");
+                    assert_eq!(request.id.to_string(), OPERATION_ID);
+                    observed_forwarded.fetch_add(1, Ordering::SeqCst);
+                    let reply = MeshForwardReply::sign(
+                        &peer_key,
+                        peer_node.clone(),
+                        &envelope,
+                        StatusCode::OK.as_u16(),
+                        serde_json::to_string(&InvokeResponse::ok(
+                            request.id,
+                            json!({ "executed_on_peer": true }),
+                        ))
+                        .expect("signed invoke response"),
+                    );
+                    let received_tx = received_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    async move {
+                        received_tx.send(()).await.expect("delivery observer");
+                        while !*release_rx.borrow() {
+                            release_rx.changed().await.expect("release peer reply");
+                        }
+                        Json(reply)
+                    }
+                }),
+            );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, peer_app, shutdown_rx).await });
+        let state = Arc::new(AppState {
+            admin_bearer_token: Some(Arc::<str>::from("mesh-owner-secret")),
+            mesh: Some(Arc::new(
+                MeshRouter::new(MeshRoutingSettings {
+                    node_id: TailscaleNodeId::new("entry"),
+                    signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                    peers_json,
+                    forward_timeout: Duration::from_secs(10),
+                })
+                .expect("entry router"),
+            )),
+            ..(*base_state).clone()
+        });
+        let admin_app = Router::new()
+            .route("/rpc/admin/invocations", post(invocation_query_handler))
+            .route_layer(from_fn_with_state(Arc::clone(&state), admin_auth_middleware))
+            .with_state(Arc::clone(&state));
+        let caller_state = Arc::clone(&state);
+        let caller = task::spawn(async move {
+            invoke_handler(State(caller_state), HeaderMap::new(), Json(request)).await
+        });
+        fcp_async_core::time::timeout(Duration::from_secs(3), received_rx.recv())
+            .await
+            .expect("remote executor receives the actual handler request")
+            .expect("delivery confirmation");
+        caller.abort();
+        assert!(caller.await.is_err(), "caller future was disconnected");
+        assert!(state.invoke_jobs.is_active(OPERATION_ID));
+
+        let query = json!({ "operation_id": OPERATION_ID });
+        let rejected = send_json_request(
+            admin_app.clone(),
+            axum::http::Method::POST,
+            "/rpc/admin/invocations",
+            query.clone(),
+            &[],
+        )
+        .await?;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let auth = [
+            ("Authorization", "Bearer mesh-owner-secret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        let active = response_body_json_ok(
+            send_json_request(
+                admin_app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/invocations",
+                query.clone(),
+                &auth,
+            )
+            .await?,
+            "active forwarding ownership",
+        )
+        .await?;
+        assert_eq!(active["host_job_active"], true);
+        assert!(
+            active["invocation"].is_null(),
+            "older local completion must not masquerade as the active remote result"
+        );
+        let historical = response_body_json_ok(
+            send_json_request(
+                admin_app.clone(),
+                axum::http::Method::POST,
+                "/rpc/admin/invocations",
+                json!({
+                    "operation_id": OPERATION_ID,
+                    "attempt_id": previous.ticket.attempt_id,
+                }),
+                &auth,
+            )
+            .await?,
+            "exact historical attempt",
+        )
+        .await?;
+        assert_eq!(historical["host_job_active"], true);
+        assert_eq!(
+            historical["invocation"]["ticket"]["attempt_id"],
+            previous.ticket.attempt_id
+        );
+        assert_eq!(historical["invocation"]["terminal"]["outcome"], "succeeded");
+        assert!(
+            state
+                .invoke_audit
+                .entries_for_zone(ZoneId::work().as_str())
+                .iter()
+                .all(|entry| entry.event_type != "invoke.mesh_forwarded"),
+            "an unanswered peer has no completed forwarding audit"
+        );
+
+        release_tx.send(true).expect("release owned forwarding");
+        state
+            .invoke_jobs
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("forwarding and postreply audit drain after caller disconnect");
+        let completed = response_body_json_ok(
+            send_json_request(
+                admin_app,
+                axum::http::Method::POST,
+                "/rpc/admin/invocations",
+                query,
+                &auth,
+            )
+            .await?,
+            "completed forwarding ownership",
+        )
+        .await?;
+        assert_eq!(completed["host_job_active"], false);
+        let forwarding_audit = state
+            .invoke_audit
+            .entries_for_zone(ZoneId::work().as_str())
+            .into_iter()
+            .filter(|entry| {
+                entry.event_type == "invoke.mesh_forwarded"
+                    && entry.operation_id.as_deref() == Some(OPERATION_ID)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(forwarding_audit.len(), 1);
+        assert_eq!(forwarding_audit[0].metadata["target_node"], "executor");
+        assert_eq!(forwarding_audit[0].metadata["executor_status"], 200);
+        assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+        assert_eq!(local_invokes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.lifecycle.invocation_record(OPERATION_ID, None).await,
+            Some(previous),
+            "remote-only forwarding must not invent an executor-local admission"
+        );
+
+        shutdown_tx.send(true).expect("stop peer");
+        server.await.expect("peer task").expect("peer shutdown");
+        Ok(())
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
