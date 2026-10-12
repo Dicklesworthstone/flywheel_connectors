@@ -14257,28 +14257,46 @@ async fn invoke_handler(
 /// Other requests use verified peer advertisements (answer stamped `mesh-backed`).
 async fn route_invoke(
     state: &Arc<AppState>,
-    request: InvokeRequest,
+    mut request: InvokeRequest,
     asserted_principal: Option<String>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
+    let deadline = invocation_deadline(Instant::now(), request.deadline_ms);
     let Some(router) = state.mesh.clone() else {
-        return Box::pin(execute_local_invoke(state, request, asserted_principal)).await;
+        constrain_invoke_deadline(&mut request, deadline);
+        return invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
+            .await
+            .map_err(map_host_error);
     };
     request.validate_idempotency_key().map_err(|err| {
         map_host_error(HostError::InvalidFilter(format!(
             "invalid invoke request: {err}"
         )))
     })?;
-    let decision = match mesh_route_decision(
-        state,
-        &router,
-        &request.connector_id,
-        Some(&request.zone_id),
-        Some(request.operation.as_str()),
+    let decision = match before_invoke_route_deadline(
+        deadline,
+        mesh_route_decision(
+            state,
+            &router,
+            &request.connector_id,
+            Some(&request.zone_id),
+            Some(request.operation.as_str()),
+        ),
+        "mesh route discovery",
     )
     .await
     {
-        Ok(decision) => decision,
+        Ok(Ok(decision)) => decision,
         Err(error) => {
+            append_mesh_preflight_denial(
+                state,
+                &request,
+                asserted_principal.as_deref(),
+                &error.to_string(),
+            )
+            .map_err(map_host_error)?;
+            return Err(map_host_error(error));
+        }
+        Ok(Err(error)) => {
             let reason = error.to_string();
             append_mesh_preflight_denial(
                 state,
@@ -14297,10 +14315,14 @@ async fn route_invoke(
             &request,
             asserted_principal.as_deref(),
             decision,
+            deadline,
         )
         .await;
     }
-    let mut response = Box::pin(execute_local_invoke(state, request, asserted_principal)).await?;
+    constrain_invoke_deadline(&mut request, deadline);
+    let mut response = invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
+        .await
+        .map_err(map_host_error)?;
     stamp_invoke_route(
         &mut response,
         InvokeRouteProvenance::host_backed(
@@ -14309,6 +14331,38 @@ async fn route_invoke(
         ),
     );
     Ok(response)
+}
+
+/// Keep each handoff within the entry node's original monotonic budget.
+fn constrain_invoke_deadline(request: &mut InvokeRequest, deadline: Instant) {
+    let remaining_ms = u64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    request.deadline_ms = Some(
+        request
+            .deadline_ms
+            .map_or(remaining_ms, |current| current.min(remaining_ms)),
+    );
+}
+
+/// Bound routing and admission before ownership or remote delivery begins.
+async fn before_invoke_route_deadline<T>(
+    deadline: Instant,
+    future: impl std::future::Future<Output = T>,
+    phase: &str,
+) -> HostResult<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(HostError::Unavailable(format!(
+            "invocation deadline expired before {phase}"
+        )));
+    }
+    fcp_async_core::time::timeout(remaining, future)
+        .await
+        .map_err(|_| HostError::Unavailable(format!("invocation deadline expired during {phase}")))
 }
 
 /// Execute the local pipeline under retained host ownership. Mesh peers use
@@ -14504,7 +14558,9 @@ async fn mesh_forward_invoke(
     request: &InvokeRequest,
     asserted_principal: Option<&str>,
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
+    deadline: Instant,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
+    let started_at = Instant::now();
     let fcp_mesh::invoke_route::InvokeRouteDecision::Forward {
         target,
         alternates,
@@ -14516,58 +14572,64 @@ async fn mesh_forward_invoke(
         )));
     };
     let mut audit_ctx = mesh_forward_audit_context(request, asserted_principal);
-    let registered_locally = state
-        .registry
-        .allow_list_snapshot(&request.connector_id)
-        .await
-        .is_some();
-    if registered_locally {
-        let preflight = evaluate_live_admission(
-            state,
-            request,
-            asserted_principal,
-            Some(&target),
-            RateLimitMode::Consume,
-        )
-        .await;
-        if !preflight.allowed {
-            let reason = preflight
-                .reason
-                .unwrap_or_else(|| "preflight denied invoke request".to_string());
-            append_mesh_preflight_denial(state, request, asserted_principal, &reason)
+    let admission = before_invoke_route_deadline(
+        deadline,
+        async {
+            let registered_locally = state
+                .registry
+                .allow_list_snapshot(&request.connector_id)
+                .await
+                .is_some();
+            if registered_locally {
+                let preflight = evaluate_live_admission(
+                    state,
+                    request,
+                    asserted_principal,
+                    Some(&target),
+                    RateLimitMode::Consume,
+                )
+                .await;
+                if !preflight.allowed {
+                    return Err(HostError::PreflightFailed(
+                        preflight
+                            .reason
+                            .unwrap_or_else(|| "preflight denied invoke request".to_string()),
+                    ));
+                }
+                let claims = request
+                    .capability_token
+                    .raw()
+                    .claims_unverified()
+                    .map_err(|_| {
+                        HostError::Internal(
+                            "verified mesh invoke lost readable capability claims".to_string(),
+                        )
+                    })?;
+                audit_ctx.actor = claims_principal(&claims)
+                    .filter(|principal| !principal.trim().is_empty())
+                    .ok_or_else(|| {
+                        HostError::Internal("verified mesh invoke lost its principal".to_string())
+                    })?
+                    .to_string();
+                state
+                    .invoke_audit
+                    .append(&audit_ctx, fcp_host::InvokePhase::PreflightAllow)
+                    .map_err(|error| invoke_audit_unavailable("mesh preflight allow", error))?;
+            }
+            Ok(registered_locally)
+        },
+        "mesh invoke admission",
+    )
+    .await
+    .and_then(std::convert::identity);
+    let registered_locally = match admission {
+        Ok(registered_locally) => registered_locally,
+        Err(error) => {
+            append_mesh_preflight_denial(state, request, asserted_principal, &error.to_string())
                 .map_err(map_host_error)?;
-            return Err(map_host_error(HostError::PreflightFailed(reason)));
+            return Err(map_host_error(error));
         }
-        let claims = request
-            .capability_token
-            .raw()
-            .claims_unverified()
-            .map_err(|_| {
-                map_host_error(HostError::Internal(
-                    "verified mesh invoke lost readable capability claims".to_string(),
-                ))
-            })?;
-        audit_ctx.actor = claims_principal(&claims)
-            .filter(|principal| !principal.trim().is_empty())
-            .ok_or_else(|| {
-                map_host_error(HostError::Internal(
-                    "verified mesh invoke lost its principal".to_string(),
-                ))
-            })?
-            .to_string();
-        state
-            .invoke_audit
-            .append(&audit_ctx, fcp_host::InvokePhase::PreflightAllow)
-            .map_err(|error| {
-                map_host_error(invoke_audit_unavailable("mesh preflight allow", error))
-            })?;
-    }
-    let started_at = Instant::now();
-    let request_json = serde_json::to_string(request).map_err(|error| {
-        map_host_error(HostError::Internal(format!(
-            "invoke request could not be encoded for mesh forwarding: {error}"
-        )))
-    })?;
+    };
     let append_audit = |target_node: &TailscaleNodeId,
                         executor_status: Option<u16>,
                         failed_attempts: &[String]|
@@ -14592,10 +14654,6 @@ async fn mesh_forward_invoke(
     let mut last_target = target.clone();
     for candidate in std::iter::once(target).chain(alternates) {
         last_target = candidate.clone();
-        let body = fcp_mesh::invoke_route::MeshForwardBody::Invoke {
-            request_json: request_json.clone(),
-            asserted_principal: asserted_principal.map(str::to_owned),
-        };
         // This is routing evidence, not an assertion that the entry node has
         // verified an operation installed only on the remote executor.
         state
@@ -14610,7 +14668,36 @@ async fn mesh_forward_invoke(
             .map_err(|error| {
                 map_host_error(invoke_audit_unavailable("mesh forward attempt", error))
             })?;
-        match router.forward(&candidate, body).await {
+        let mut forwarded_request = request.clone();
+        constrain_invoke_deadline(&mut forwarded_request, deadline);
+        let request_json = serde_json::to_string(&forwarded_request).map_err(|error| {
+            map_host_error(HostError::Internal(format!(
+                "invoke request could not be encoded for mesh forwarding: {error}"
+            )))
+        })?;
+        let body = fcp_mesh::invoke_route::MeshForwardBody::Invoke {
+            request_json,
+            asserted_principal: asserted_principal.map(str::to_owned),
+        };
+        // Audit and serialization consume the same budget. Check again before
+        // polling any transport work; earlier attempts proved non-delivery.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || forwarded_request.deadline_ms == Some(0) {
+            append_audit(&candidate, None, &failed_attempts).map_err(map_host_error)?;
+            return Err(map_host_error(HostError::Unavailable(
+                "invocation deadline expired before mesh forwarding; no further peer was contacted"
+                    .to_string(),
+            )));
+        }
+        let forwarded = fcp_async_core::time::timeout(remaining, router.forward(&candidate, body))
+            .await
+            .unwrap_or_else(|_| {
+                Err(fcp_host::mesh_routing::MeshForwardFailure::OutcomeUnknown {
+                    peer: candidate.as_str().to_owned(),
+                    detail: "invocation deadline expired during mesh forwarding".to_string(),
+                })
+            });
+        match forwarded {
             Ok(reply) => {
                 append_audit(&candidate, Some(reply.status), &failed_attempts)
                     .map_err(map_host_error)?;
@@ -18956,6 +19043,336 @@ deny_ptrace = true
             })
             .await;
         assert_eq!(receipts.receipts.len(), 3);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_invoke_deadline_bounds_discovery_admission_and_local_handoff() {
+        use fcp_host::mesh_routing::{MeshRouter, MeshRoutingSettings};
+        use fcp_mesh::invoke_route::{InvokeRouteDecision, decision_codes};
+
+        const CONNECTOR: &str = "fcp.test.mesh-deadline:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let invokes = Arc::new(AtomicU64::new(0));
+        let observed_invokes = Arc::clone(&invokes);
+        let introspection = dispatcher_introspection(OPERATION, CAPABILITY, SafetyTier::Safe);
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(rpc) = runner_rx.recv().await {
+                assert!(rpc.rpc.try_begin());
+                let result = match rpc.method.as_str() {
+                    "introspect" => json!(introspection),
+                    "health" => dispatcher_health_result(),
+                    "invoke" => {
+                        observed_invokes.fetch_add(1, Ordering::SeqCst);
+                        let request: InvokeRequest =
+                            serde_json::from_value(rpc.params).expect("local invoke request");
+                        json!(InvokeResponse::ok(
+                            request.id,
+                            json!({ "deadline_ms": request.deadline_ms }),
+                        ))
+                    }
+                    method => panic!("unexpected connector method {method}"),
+                };
+                assert!(rpc.rpc.try_settle_reply());
+                let _ = rpc.response_tx.send(Ok(json!({ "result": result })));
+            }
+        });
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            dispatcher_test_connector(CONNECTOR, runner_tx, runner_task),
+            dispatcher_test_config(CONNECTOR),
+        );
+        let mut state = dispatcher_app_state(
+            registry,
+            Arc::new(HostAdminStateStore::new()),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
+        );
+        Arc::get_mut(&mut state).expect("exclusive test state").mesh = Some(Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("entry"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json: "[]".to_string(),
+                forward_timeout: Duration::from_secs(10),
+            })
+            .expect("local mesh router"),
+        ));
+        let mut request = invoke_token_bucket_request(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            ZoneId::work(),
+            &signing_key,
+        );
+        request.deadline_ms = Some(50);
+        let registry_guard = state.registry.state.write().await;
+        let error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            route_invoke(&state, request.clone(), None),
+        )
+        .await
+        .expect("route deadline must bound a blocked registry read")
+        .expect_err("discovery must expire before connector admission");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("deadline expired during mesh route discovery")
+        );
+        let error = fcp_async_core::time::timeout(
+            Duration::from_secs(2),
+            mesh_forward_invoke(
+                &state,
+                state.mesh.as_ref().expect("router"),
+                &request,
+                None,
+                InvokeRouteDecision::Forward {
+                    target: TailscaleNodeId::new("remote"),
+                    alternates: Vec::new(),
+                    code: decision_codes::ADVERTISED_PEER_FORWARD,
+                },
+                Instant::now() + Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("forward admission must share the deadline")
+        .expect_err("blocked admission must not reach a peer");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .1
+                .contains("deadline expired during mesh invoke admission")
+        );
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+        assert!(
+            state
+                .lifecycle
+                .invocation_record(&request.id.to_string(), None)
+                .await
+                .is_none()
+        );
+        drop(registry_guard);
+
+        // The first future polls route discovery before the release timer.
+        // Time waiting for the registry must reduce the native handoff too.
+        request.id = RequestId::random();
+        request.deadline_ms = Some(5_000);
+        let registry_guard = state.registry.state.write().await;
+        let (response, ()) =
+            futures_util::future::join(route_invoke(&state, request.clone(), None), async move {
+                fcp_async_core::time::sleep(Duration::from_millis(100)).await;
+                drop(registry_guard);
+            })
+            .await;
+        let response = response.expect("remaining budget permits local execution");
+        let forwarded_ms = response.result.as_ref().expect("result")["deadline_ms"]
+            .as_u64()
+            .expect("bounded native request");
+        assert!((1..=4_900).contains(&forwarded_ms), "{forwarded_ms}");
+
+        for requested_deadline in [None, Some(u64::MAX)] {
+            request.id = RequestId::random();
+            request.deadline_ms = requested_deadline;
+            let response = route_invoke(&state, request.clone(), None)
+                .await
+                .expect("default and excessive deadlines retain a finite host budget");
+            let forwarded_ms = response.result.as_ref().expect("result")["deadline_ms"]
+                .as_u64()
+                .expect("bounded native request");
+            assert!((1..=60_000).contains(&forwarded_ms), "{forwarded_ms}");
+        }
+        assert_eq!(invokes.load(Ordering::SeqCst), 3);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn mesh_invoke_deadline_shrinks_failover_and_never_retries_unknown_outcome() {
+        use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings};
+        use fcp_mesh::invoke_route::{
+            InvokeRouteDecision, MeshForwardBody, MeshForwardEnvelope, MeshForwardReply,
+            decision_codes,
+        };
+
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let peer_key_hex = hex::encode(peer_key.verifying_key().to_bytes());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("peer address"));
+        let failed_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failed TLS peer");
+        let failed_endpoint = format!(
+            "https://{}",
+            failed_listener.local_addr().expect("failed TLS address")
+        );
+        let failed_peer = task::spawn(async move {
+            let (stream, _) = failed_listener.accept().await.expect("TLS connection");
+            // Closing during TLS setup proves no HTTP invoke was delivered.
+            // This delay must be charged before the alternate gets its budget.
+            fcp_async_core::time::sleep(Duration::from_millis(100)).await;
+            drop(stream);
+        });
+        let completed = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(AtomicU64::new(0));
+        let observed_completed = Arc::clone(&completed);
+        let observed_pending = Arc::clone(&pending);
+        let (received_tx, mut received_rx) = mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = fcp_async_core::channel::watch::channel(false);
+        let app = Router::new().route(
+            MESH_FORWARD_ROUTE,
+            post(move |Json(envelope): Json<MeshForwardEnvelope>| {
+                let MeshForwardBody::Invoke { request_json, .. } = &envelope.body else {
+                    panic!("expected invoke");
+                };
+                let request: InvokeRequest =
+                    serde_json::from_str(request_json).expect("forwarded request");
+                let wait_for_release = envelope.target_node.as_str() == "pending";
+                if wait_for_release {
+                    observed_pending.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    observed_completed.fetch_add(1, Ordering::SeqCst);
+                }
+                let reply = MeshForwardReply::sign(
+                    &peer_key,
+                    envelope.target_node.clone(),
+                    &envelope,
+                    StatusCode::OK.as_u16(),
+                    serde_json::to_string(&InvokeResponse::ok(
+                        request.id,
+                        json!({ "deadline_ms": request.deadline_ms }),
+                    ))
+                    .expect("reply JSON"),
+                );
+                let received_tx = received_tx.clone();
+                let mut release_rx = release_rx.clone();
+                async move {
+                    if wait_for_release {
+                        received_tx.send(()).await.expect("receipt observer");
+                        while !*release_rx.borrow() {
+                            release_rx.changed().await.expect("release pending peer");
+                        }
+                    }
+                    Json(reply)
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("entry"),
+            signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+            peers_json: json!([
+                {
+                    "node_id": "not-delivered",
+                    "endpoint": failed_endpoint,
+                    "public_key_hex": peer_key_hex,
+                },
+                {
+                    "node_id": "available",
+                    "endpoint": endpoint,
+                    "public_key_hex": peer_key_hex,
+                },
+                {
+                    "node_id": "pending",
+                    "endpoint": endpoint,
+                    "public_key_hex": peer_key_hex,
+                },
+            ])
+            .to_string(),
+            forward_timeout: Duration::from_secs(10),
+        })
+        .expect("entry router");
+        let state = dispatcher_app_state(
+            dispatcher_registry_with_connectors(Vec::new()),
+            Arc::new(HostAdminStateStore::new()),
+            None,
+            HashMap::new(),
+        );
+        let mut request = invoke_token_bucket_request(
+            "fcp.test.mesh-deadline:utility:1.0.0",
+            "test.echo",
+            "cap.test.echo",
+            ZoneId::work(),
+            &fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+        );
+        request.deadline_ms = Some(30_000);
+        let decision = |target: &str| InvokeRouteDecision::Forward {
+            target: TailscaleNodeId::new(target),
+            alternates: vec![TailscaleNodeId::new("available")],
+            code: decision_codes::ADVERTISED_PEER_FORWARD,
+        };
+        let response = mesh_forward_invoke(
+            &state,
+            &router,
+            &request,
+            None,
+            decision("not-delivered"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("a pre-send TLS failure may use the alternate");
+        fcp_async_core::time::timeout(Duration::from_secs(2), failed_peer)
+            .await
+            .expect("TLS fixture must accept and close the connection")
+            .expect("failed TLS peer stopped");
+        let forwarded_ms = response.result.as_ref().expect("result")["deadline_ms"]
+            .as_u64()
+            .expect("remaining forwarded budget");
+        assert!((1..=4_900).contains(&forwarded_ms), "{forwarded_ms}");
+        assert_eq!(
+            response
+                .response_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.route.as_ref())
+                .expect("mesh route")
+                .failed_attempts
+                .len(),
+            1
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        request.id = RequestId::random();
+        let (result, ()) = futures_util::future::join(
+            mesh_forward_invoke(
+                &state,
+                &router,
+                &request,
+                None,
+                decision("pending"),
+                Instant::now() + Duration::from_secs(2),
+            ),
+            async {
+                fcp_async_core::time::timeout(Duration::from_secs(2), received_rx.recv())
+                    .await
+                    .expect("first executor must observe the request before expiry")
+                    .expect("first executor receipt");
+            },
+        )
+        .await;
+        let error = result.expect_err("an in-flight deadline cannot authorize failover");
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert!(error.1.contains("outcome unknown"));
+        assert!(error.1.contains("deadline expired during mesh forwarding"));
+        assert!(error.1.contains("was not retried elsewhere"));
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        // An already exhausted budget must not initiate another send either.
+        let error = mesh_forward_invoke(
+            &state,
+            &router,
+            &request,
+            None,
+            decision("available"),
+            Instant::now(),
+        )
+        .await
+        .expect_err("expired invocation must not start another peer");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        release_tx.send(true).expect("release observed remote work");
+        shutdown_tx.send(true).expect("stop peer");
+        server.await.expect("peer task").expect("peer shutdown");
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
