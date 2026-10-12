@@ -31,6 +31,7 @@ use fcp_audit::AuditEntry;
 use fcp_audit::explain::{CausalExplanation, ReplayBundle};
 use fcp_cbor::to_canonical_cbor;
 use fcp_crypto::{Ed25519VerifyingKey, KeyId, ed25519::PUBLIC_KEY_SIZE};
+use fcp_host::InvokeAuditDurabilityStatus;
 use fcp_kernel::{AuditEvent, AuditHead, ObjectId, ZoneId};
 use hex::encode as hex_encode;
 use reqwest::blocking::{Client as BlockingClient, ClientBuilder as BlockingClientBuilder};
@@ -624,6 +625,9 @@ pub(crate) struct AuditChainStatusReport {
     max_age_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_quorum_checkpoint_snapshot: Option<Value>,
+    /// Local host persistence evidence, distinct from checkpoint quorum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    durability: Option<InvokeAuditDurabilityStatus>,
     warnings: Vec<String>,
 }
 
@@ -676,6 +680,8 @@ struct HostAuditChainStatusResponse {
     max_age_seconds: u64,
     live_quorum_checkpoint_snapshot: Option<Value>,
     #[serde(default)]
+    durability: Option<InvokeAuditDurabilityStatus>,
+    #[serde(default)]
     warnings: Vec<String>,
 }
 
@@ -692,11 +698,40 @@ impl HostAuditChainStatusResponse {
             warnings.push("host audit-chain status source was not marked live".to_string());
         }
 
+        let mut status = self.status;
+        if let Some(durability) = &self.durability {
+            if !durability.writable || durability.unavailable_reason.is_some() {
+                // Doctor consumes this status for readiness. A fresh old head
+                // cannot make a host that refuses new evidence appear healthy.
+                if status == fcp_audit::FreshnessLevel::Fresh {
+                    status = fcp_audit::FreshnessLevel::Degraded;
+                }
+                warnings.push(format!(
+                    "host audit write admission is fenced: {}",
+                    durability
+                        .unavailable_reason
+                        .as_deref()
+                        .unwrap_or("host reported writable=false")
+                ));
+            }
+            if !durability.durable {
+                warnings.push(
+                    "host audit persistence does not provide a confirmed crash-durability guarantee"
+                        .to_string(),
+                );
+            }
+        } else {
+            warnings.push(
+                "host did not report audit persistence evidence; durability and write admission are unknown"
+                    .to_string(),
+            );
+        }
+
         AuditChainStatusReport {
             schema_version: AUDIT_CHAIN_STATUS_SCHEMA_VERSION,
             command: "audit",
             subcommand: "chain status",
-            status: self.status,
+            status,
             telemetry_state: "live-host",
             source: AuditChainStatusSource {
                 kind: self.source.kind,
@@ -720,6 +755,7 @@ impl HostAuditChainStatusResponse {
             hlc_physical_drift_ms: self.hlc_physical_drift_ms,
             max_age_seconds: self.max_age_seconds,
             live_quorum_checkpoint_snapshot: self.live_quorum_checkpoint_snapshot,
+            durability: self.durability,
             warnings,
         }
     }
@@ -1092,6 +1128,7 @@ fn build_artifact_chain_status_report(
         hlc_physical_drift_ms,
         max_age_seconds: args.max_age_seconds,
         live_quorum_checkpoint_snapshot: None,
+        durability: None,
         warnings,
     })
 }
@@ -1128,6 +1165,7 @@ fn missing_chain_status_report(args: &ChainStatusArgs) -> AuditChainStatusReport
         hlc_physical_drift_ms: None,
         max_age_seconds: args.max_age_seconds,
         live_quorum_checkpoint_snapshot: None,
+        durability: None,
         warnings: vec![
             "no signed audit chain head artifact or live telemetry was supplied".to_string(),
         ],
@@ -1185,6 +1223,7 @@ fn output_chain_status_report(
 
     println!("audit chain status: {}", report.status);
     println!("telemetry: {}", report.telemetry_state);
+    print_chain_status_durability(report);
     if let Some(ref zone_id) = report.zone_id {
         println!("zone: {zone_id}");
     }
@@ -1200,6 +1239,51 @@ fn output_chain_status_report(
     }
     print_audit_answer_source_footer(truth_source);
     Ok(())
+}
+
+fn print_chain_status_durability(report: &AuditChainStatusReport) {
+    let Some(durability) = &report.durability else {
+        if report.source.live {
+            println!("host audit persistence: unknown (not reported by host)");
+            println!("audit write admission: unknown");
+        } else {
+            println!("host audit persistence: not assessed from offline artifacts");
+        }
+        return;
+    };
+
+    println!("host audit storage: {}", durability.storage);
+    println!(
+        "host audit durability: {}",
+        if durability.durable {
+            "confirmed"
+        } else {
+            "not guaranteed"
+        }
+    );
+    println!(
+        "audit write admission: {}",
+        if durability.writable && durability.unavailable_reason.is_none() {
+            "writable"
+        } else {
+            "fenced"
+        }
+    );
+    if let Some(reason) = &durability.unavailable_reason {
+        println!("audit write fence reason: {reason}");
+    }
+    println!(
+        "host journal entries: {} persisted, {} recovered on open",
+        durability.persisted_entries, durability.recovered_entries
+    );
+    println!(
+        "host journal bytes: {} / {}",
+        durability.journal_bytes, durability.max_journal_bytes
+    );
+    println!(
+        "host journal limits: {} bytes per record, {} entries",
+        durability.max_record_bytes, durability.max_entries
+    );
 }
 
 fn audit_truth_source_payload<T: Serialize>(

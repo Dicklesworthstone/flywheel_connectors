@@ -101,6 +101,83 @@ fn spawn_mock_audit_status_host(response: &Value) -> (String, thread::JoinHandle
     (endpoint, handle)
 }
 
+fn journal_durability() -> fcp_host::InvokeAuditDurabilityStatus {
+    fcp_host::InvokeAuditDurabilityStatus {
+        storage: "local_journal".to_string(),
+        durable: true,
+        writable: true,
+        recovered_entries: 7,
+        persisted_entries: 9,
+        journal_bytes: 4096,
+        max_journal_bytes: 268_435_456,
+        max_record_bytes: 65_536,
+        max_entries: 262_144,
+        unavailable_reason: None,
+    }
+}
+
+fn fresh_host_status(durability: Option<&fcp_host::InvokeAuditDurabilityStatus>) -> Value {
+    let mut response = json!({
+        "schema_version": "fcp.host.invoke_audit_chain_status.v1",
+        "status": "fresh",
+        "telemetry_state": "live-host",
+        "source": {
+            "kind": "host-invoke-audit-chain",
+            "live": true
+        },
+        "zone_id": "z:work",
+        "head_seq": 42,
+        "head_entry": "entry-work-head",
+        "last_quorum_height": 42,
+        "quorum_signed_checkpoints": 1,
+        "quorum_signers": 2,
+        "quorum_signer_ids": ["node-a", "node-b"],
+        "hlc_physical_drift_ms": 30_000,
+        "max_age_seconds": 60,
+        "live_quorum_checkpoint_snapshot": {
+            "available": true,
+            "height": 42,
+            "signers": ["node-a", "node-b"]
+        },
+        "warnings": []
+    });
+    if let Some(durability) = durability {
+        response["durability"] = json!(durability);
+    }
+    response
+}
+
+fn run_mock_chain_status(response: &Value, json_output: bool) -> Output {
+    let (host, server) = spawn_mock_audit_status_host(response);
+    let mut args = vec![
+        "--host",
+        &host,
+        "audit",
+        "chain",
+        "status",
+        "--zone",
+        "z:work",
+        "--now-unix-secs",
+        "1700000030",
+        "--max-age-seconds",
+        "60",
+        "--require-source",
+        "any-live",
+    ];
+    if json_output {
+        args.push("--json");
+    }
+    let output = run_fwc(&args);
+    server.join().expect("mock host should complete");
+    assert!(
+        output.status.success(),
+        "fwc failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 #[test]
 fn missing_status_is_fail_closed_and_parseable() {
     let output = run_fwc(&["audit", "chain", "status", "--json"]);
@@ -317,6 +394,266 @@ fn doctor_audit_uses_host_status_for_live_truth_requirement() {
             .expect("status command string")
             .contains("audit chain status --zone z:work --max-age-seconds 60 --require-source any-live --json")
     );
+}
+
+#[test]
+fn host_journal_status_preserves_durability_and_validates_its_schema() {
+    let durability = journal_durability();
+    let response = fresh_host_status(Some(&durability));
+    let output = run_mock_chain_status(&response, true);
+    let payload = stdout_json(&output);
+    assert_eq!(payload["durability"], json!(durability));
+    assert_eq!(payload["status"], "fresh");
+    assert_eq!(payload["_truth_source"], "host");
+    assert_eq!(payload["quorum_signed_checkpoints"], 1);
+    assert_eq!(payload["quorum_signers"], 2);
+
+    let schema: Value =
+        serde_json::from_str(include_str!("../schemas/audit_chain_status.schema.json"))
+            .expect("audit status schema should parse");
+    let validator = jsonschema::validator_for(&schema).expect("audit status schema should compile");
+    assert!(validator.is_valid(&payload), "invalid status: {payload}");
+
+    let mut missing_limit = payload.clone();
+    missing_limit["durability"]
+        .as_object_mut()
+        .expect("durability object")
+        .remove("max_record_bytes");
+    assert!(!validator.is_valid(&missing_limit));
+
+    let mut negative_bytes = payload.clone();
+    negative_bytes["durability"]["journal_bytes"] = json!(-1);
+    assert!(!validator.is_valid(&negative_bytes));
+
+    let mut invented_evidence = payload.clone();
+    invented_evidence["durability"]["replicated"] = json!(true);
+    assert!(!validator.is_valid(&invented_evidence));
+
+    let mut fenced_but_fresh = payload.clone();
+    fenced_but_fresh["durability"]["writable"] = json!(false);
+    assert!(!validator.is_valid(&fenced_but_fresh));
+    fenced_but_fresh["status"] = json!("degraded");
+    assert!(validator.is_valid(&fenced_but_fresh));
+    fenced_but_fresh["status"] = json!("stale");
+    assert!(validator.is_valid(&fenced_but_fresh));
+
+    let mut inconsistent_admission = payload;
+    inconsistent_admission["durability"]["unavailable_reason"] = json!("journal_io_failed");
+    assert!(!validator.is_valid(&inconsistent_admission));
+    inconsistent_admission["status"] = json!("degraded");
+    assert!(validator.is_valid(&inconsistent_admission));
+}
+
+#[test]
+fn fenced_journal_text_overrides_freshness_and_explains_write_admission() {
+    for (writable, unavailable_reason) in [
+        (false, Some("journal_io_failed")),
+        (false, None),
+        (true, Some("journal_io_failed")),
+    ] {
+        let mut durability = journal_durability();
+        durability.writable = writable;
+        durability.unavailable_reason = unavailable_reason.map(str::to_string);
+        let response = fresh_host_status(Some(&durability));
+        let output = run_mock_chain_status(&response, false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("audit chain status: degraded\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("host audit storage: local_journal\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("host audit durability: confirmed\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("audit write admission: fenced\n"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("audit chain status: fresh\n"), "{stdout}");
+        assert!(
+            stdout.contains("host journal entries: 9 persisted, 7 recovered on open\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("host journal bytes: 4096 / 268435456\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("host journal limits: 65536 bytes per record, 262144 entries\n"),
+            "{stdout}"
+        );
+        if unavailable_reason.is_some() {
+            assert!(
+                stdout.contains("audit write fence reason: journal_io_failed\n"),
+                "{stdout}"
+            );
+        } else {
+            assert!(stdout.contains("host reported writable=false"), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn doctor_audit_rejects_a_fenced_journal_even_with_fresh_quorum_evidence() {
+    let mut durability = journal_durability();
+    durability.writable = false;
+    durability.unavailable_reason = Some("journal_io_failed".to_string());
+    let (host, server) = spawn_mock_audit_status_host(&fresh_host_status(Some(&durability)));
+    let output = run_fwc(&[
+        "--json",
+        "--host",
+        &host,
+        "doctor",
+        "audit",
+        "--zone",
+        "z:work",
+        "--audit-now-unix-secs",
+        "1700000030",
+        "--audit-max-age-seconds",
+        "60",
+        "--audit-min-quorum-signers",
+        "2",
+        "--audit-max-hlc-drift-ms",
+        "60000",
+        "--require-source",
+        "any-live",
+    ]);
+    server.join().expect("mock host should complete");
+
+    let payload = stdout_json(&output);
+    assert_eq!(payload["_truth_source"], "host");
+    assert_eq!(payload["healthy"], false);
+    assert_eq!(payload["report"]["healthy"], false);
+    let chain_status = &payload["report"]["chain_status"];
+    assert_eq!(chain_status["status"], "degraded");
+    assert_eq!(chain_status["durability"], json!(durability));
+    assert_eq!(chain_status["quorum_signed_checkpoints"], 1);
+    assert_eq!(chain_status["quorum_signers"], 2);
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor check array");
+    let freshness = checks
+        .iter()
+        .find(|check| check["id"] == "audit_chain_freshness")
+        .expect("freshness check");
+    assert_eq!(freshness["status"], "fail");
+    assert!(
+        payload["report"]["warnings"]
+            .as_array()
+            .expect("warning array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("journal_io_failed")))
+    );
+}
+
+#[test]
+fn older_hosts_leave_durability_unknown_without_inventing_defaults() {
+    let response = fresh_host_status(None);
+    let output = run_mock_chain_status(&response, true);
+    let payload = stdout_json(&output);
+    assert!(payload.get("durability").is_none());
+    assert_eq!(payload["status"], "fresh");
+    assert_eq!(payload["_truth_source"], "host");
+    assert!(
+        payload["warnings"]
+            .as_array()
+            .expect("warning array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("durability and write admission are unknown")))
+    );
+
+    let output = run_mock_chain_status(&response, false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("host audit persistence: unknown (not reported by host)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("audit write admission: unknown\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("host audit durability: confirmed\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn writable_storage_without_durability_is_reported_separately_from_a_fence() {
+    let mut unsupported_journal = journal_durability();
+    unsupported_journal.durable = false;
+    for durability in [
+        fcp_host::InvokeAuditDurabilityStatus::default(),
+        unsupported_journal,
+    ] {
+        let response = fresh_host_status(Some(&durability));
+        let output = run_mock_chain_status(&response, true);
+        let payload = stdout_json(&output);
+        assert_eq!(payload["durability"], json!(durability));
+        assert_eq!(payload["status"], "fresh");
+        assert!(
+            payload["warnings"]
+                .as_array()
+                .expect("warning array")
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|text| text
+                        .contains("does not provide a confirmed crash-durability guarantee")))
+        );
+
+        let output = run_mock_chain_status(&response, false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("host audit durability: not guaranteed\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("audit write admission: writable\n"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("audit write admission: fenced\n"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_fenced_host_keeps_existing_stale_or_missing_chain_status() {
+    let mut durability = journal_durability();
+    durability.writable = false;
+    durability.unavailable_reason = Some("journal_io_failed".to_string());
+    for status in ["stale", "missing"] {
+        let mut response = fresh_host_status(Some(&durability));
+        response["status"] = json!(status);
+        if status == "missing" {
+            response["head_seq"] = Value::Null;
+            response["head_entry"] = Value::Null;
+            response["last_quorum_height"] = Value::Null;
+            response["quorum_signed_checkpoints"] = json!(0);
+            response["quorum_signers"] = json!(0);
+            response["quorum_signer_ids"] = json!([]);
+            response["live_quorum_checkpoint_snapshot"] = json!({"available": false});
+        }
+        let output = run_mock_chain_status(&response, true);
+        let payload = stdout_json(&output);
+        assert_eq!(payload["status"], status);
+        assert_eq!(payload["durability"], json!(durability));
+        assert_eq!(
+            payload["quorum_signed_checkpoints"],
+            response["quorum_signed_checkpoints"]
+        );
+        assert_eq!(payload["quorum_signers"], response["quorum_signers"]);
+    }
 }
 
 #[test]

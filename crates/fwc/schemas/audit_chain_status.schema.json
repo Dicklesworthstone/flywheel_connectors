@@ -38,6 +38,33 @@
         "events_path": { "$ref": "#/definitions/non_empty_string" }
       }
     },
+    "durability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "storage",
+        "durable",
+        "writable",
+        "recovered_entries",
+        "persisted_entries",
+        "journal_bytes",
+        "max_journal_bytes",
+        "max_record_bytes",
+        "max_entries"
+      ],
+      "properties": {
+        "storage": { "$ref": "#/definitions/non_empty_string" },
+        "durable": { "type": "boolean" },
+        "writable": { "type": "boolean" },
+        "recovered_entries": { "type": "integer", "minimum": 0 },
+        "persisted_entries": { "type": "integer", "minimum": 0 },
+        "journal_bytes": { "type": "integer", "minimum": 0 },
+        "max_journal_bytes": { "type": "integer", "minimum": 0 },
+        "max_record_bytes": { "type": "integer", "minimum": 0 },
+        "max_entries": { "type": "integer", "minimum": 0 },
+        "unavailable_reason": { "$ref": "#/definitions/non_empty_string" }
+      }
+    },
     "audit_chain_status_success": {
       "type": "object",
       "additionalProperties": false,
@@ -79,8 +106,30 @@
         "hlc_physical_drift_ms": { "type": "integer", "minimum": 0 },
         "max_age_seconds": { "type": "integer", "minimum": 0 },
         "live_quorum_checkpoint_snapshot": true,
+        "durability": { "$ref": "#/definitions/durability" },
         "warnings": { "$ref": "#/definitions/string_array" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["durability"],
+            "properties": {
+              "durability": {
+                "anyOf": [
+                  {
+                    "required": ["writable"],
+                    "properties": { "writable": { "const": false } }
+                  },
+                  { "required": ["unavailable_reason"] }
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": { "status": { "enum": ["stale", "degraded", "missing"] } }
+          }
+        }
+      ]
     },
     "truth_source_unavailable": {
       "type": "object",
