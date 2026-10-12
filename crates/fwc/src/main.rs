@@ -2609,6 +2609,10 @@ struct InvokeArgs {
     #[arg(long)]
     idempotency_key: Option<String>,
 
+    /// Expected singleton-writer lease sequence from live lease status.
+    #[arg(long)]
+    lease_seq: Option<u64>,
+
     /// Optional deadline in milliseconds.
     #[arg(long)]
     deadline_ms: Option<u64>,
@@ -2663,6 +2667,10 @@ struct PreflightArgs {
     #[arg(long)]
     principal: Option<String>,
 
+    /// Expected singleton-writer lease sequence from live lease status.
+    #[arg(long)]
+    lease_seq: Option<u64>,
+
     #[command(flatten)]
     auth: LiveAuthArgs,
 }
@@ -2680,6 +2688,7 @@ impl PreflightArgs {
             zone: self.zone.clone(),
             principal: self.principal.clone(),
             idempotency_key: None,
+            lease_seq: self.lease_seq,
             deadline_ms: None,
             auth: self.auth.clone(),
         }
@@ -3571,6 +3580,7 @@ fn mcp_tool_invoke_args(
             .or_else(|| host.and_then(|config| config.default_zone.clone())),
         principal: principal.map(str::to_owned),
         idempotency_key: None,
+        lease_seq: None,
         deadline_ms: None,
         auth: auth.clone(),
     }
@@ -23600,6 +23610,7 @@ fn preflight_dispatch_host(
         params: Some(prepared_payload.clone()),
         principal: effective_principal,
         zone_id: Some(zone_id),
+        lease_seq: args.lease_seq,
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
     };
@@ -23958,6 +23969,7 @@ fn invoke_dispatch_host(
             "principal": &effective_principal,
             "request_id": request_id.to_string(),
             "idempotency_key": args.idempotency_key.clone(),
+            "lease_seq": args.lease_seq,
             "deadline_ms": args.deadline_ms,
             "approval_token_count": auth.approval_tokens.len(),
         },
@@ -24013,6 +24025,7 @@ fn invoke_dispatch_host(
             input: Some(prepared_payload.clone()),
             zone_id: Some(zone_id.to_string()),
             principal: effective_principal,
+            lease_seq: args.lease_seq,
             capability_token: Some(auth.capability_token),
             approval_tokens: auth.approval_tokens,
             estimate_cost: simulation.estimate_cost,
@@ -24122,6 +24135,7 @@ fn invoke_dispatch_host(
         params: Some(prepared_payload.clone()),
         principal: effective_principal,
         zone_id: Some(zone_id.clone()),
+        lease_seq: args.lease_seq,
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
     };
@@ -24181,7 +24195,7 @@ fn invoke_dispatch_host(
         holder_proof: None,
         context: None,
         idempotency_key: args.idempotency_key.clone(),
-        lease_seq: None,
+        lease_seq: args.lease_seq,
         deadline_ms: args.deadline_ms,
         correlation_id: None,
         provenance: None,
@@ -27787,6 +27801,7 @@ fn execute_live_pipeline_plan(
             params: Some(rendered_input.clone()),
             principal: auth.principal_hint.clone(),
             zone_id: Some(zone_id.clone()),
+            lease_seq: None,
             capability_token: Some(auth.capability_token.clone()),
             approval_tokens: auth.approval_tokens.clone(),
         };
@@ -29468,6 +29483,7 @@ fn batch_file_dispatch(
                 zone_id: Some(zone.parse().map_err(|error| {
                     anyhow::anyhow!("`{zone}` is not a valid FCP zone for `batch-file`: {error}")
                 })?),
+                lease_seq: None,
                 capability_token: Some(auth.capability_token.clone()),
                 approval_tokens: auth.approval_tokens.clone(),
             };
@@ -45876,6 +45892,138 @@ depends_on = ["missing"]
         assert_eq!(payload["_truth_source"], "offline");
         assert_eq!(payload["error"]["type"], "invalid-input-payload");
         assert_eq!(payload["input_authoring"]["validation"]["valid"], false);
+    }
+
+    #[test]
+    fn live_operation_commands_parse_explicit_lease_sequence() {
+        for command in ["invoke", "preflight", "simulate"] {
+            for lease_seq in [None, Some(0), Some(42), Some(u64::MAX)] {
+                let mut arguments = vec![
+                    "fwc".to_owned(),
+                    command.to_owned(),
+                    "github".to_owned(),
+                    "issues.create".to_owned(),
+                ];
+                if let Some(sequence) = lease_seq {
+                    arguments.extend(["--lease-seq".to_owned(), sequence.to_string()]);
+                }
+                let cli = Cli::try_parse_from(arguments).expect("lease sequence should parse");
+                let parsed = match cli.command {
+                    Commands::Invoke(args) => args.lease_seq,
+                    Commands::Simulate(args) => args.request.lease_seq,
+                    Commands::Preflight(args) => {
+                        assert_eq!(args.as_invoke_args().lease_seq, lease_seq);
+                        args.lease_seq
+                    }
+                    _ => panic!("expected a live operation command"),
+                };
+                assert_eq!(
+                    parsed, lease_seq,
+                    "{command} must preserve explicit evidence"
+                );
+            }
+
+            for invalid in ["-1", "18446744073709551616", "latest", "1.5"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "fwc",
+                        command,
+                        "github",
+                        "issues.create",
+                        "--lease-seq",
+                        invalid,
+                    ])
+                    .is_err(),
+                    "{command} accepted invalid lease sequence {invalid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_operation_commands_preserve_lease_evidence_in_host_requests() {
+        let capability_token = test_capability_token_arg();
+        let input = json!({
+            "owner": "octocat",
+            "repo": "hello-world",
+            "title": "Fenced singleton operation",
+        });
+        let input_text = input.to_string();
+
+        for command in ["invoke", "preflight", "simulate", "preview"] {
+            for lease_seq in [None, Some(0), Some(42), Some(u64::MAX)] {
+                let mut routes = vec![
+                    (
+                        "POST /rpc/discover".to_owned(),
+                        mock_discovery_response_json(),
+                    ),
+                    (
+                        "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                        mock_introspection_response_json(),
+                    ),
+                ];
+                if matches!(command, "simulate" | "preview") {
+                    routes.push((
+                        "POST /rpc/simulate".to_owned(),
+                        mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true),
+                    ));
+                } else {
+                    routes.push((
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ));
+                    if command == "invoke" {
+                        routes.push((
+                            "POST /rpc/invoke".to_owned(),
+                            mock_invoke_response_json(json!({ "created": true })),
+                        ));
+                    }
+                }
+                let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+                let mut arguments = vec![
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    command,
+                    "github",
+                    "issues.create",
+                    "--input",
+                    &input_text,
+                    "--capability-token",
+                    &capability_token,
+                ];
+                let sequence_text = lease_seq.map(|sequence| sequence.to_string());
+                if let Some(sequence) = sequence_text.as_deref() {
+                    arguments.extend(["--lease-seq", sequence]);
+                }
+                let (exit_code, payload) = execute_json(&arguments);
+                server.join().expect("mock host thread should complete");
+                assert_eq!(
+                    exit_code,
+                    CliExitCode::Success.into(),
+                    "{command}: {payload}"
+                );
+
+                let requests = request_log.lock().expect("request log should lock");
+                for (route, body) in requests.iter().skip(2) {
+                    let request: Value = serde_json::from_str(body).expect("host request body");
+                    assert_eq!(request["lease_seq"].as_u64(), lease_seq, "{route}");
+                    if lease_seq.is_none() {
+                        assert!(
+                            request.get("lease_seq").is_none(),
+                            "{route} invented evidence"
+                        );
+                    }
+                }
+                if command == "invoke" {
+                    let preflight: Value = serde_json::from_str(&requests[2].1).unwrap();
+                    let invocation: Value = serde_json::from_str(&requests[3].1).unwrap();
+                    assert_eq!(preflight["request_id"], invocation["id"]);
+                    assert_eq!(preflight["lease_seq"], invocation["lease_seq"]);
+                }
+            }
+        }
     }
 
     // ── invoke with denied preflight (host returns deny) ───────────

@@ -5219,7 +5219,7 @@ fn invoke_request_from_preflight(request: &HostPreflightRequest) -> HostResult<I
         holder_proof: None,
         context: None,
         idempotency_key: None,
-        lease_seq: None,
+        lease_seq: request.lease_seq,
         deadline_ms: None,
         correlation_id: None,
         provenance: None,
@@ -5278,7 +5278,7 @@ fn invoke_request_from_simulate(request: &HostSimulateRequest) -> HostResult<Inv
         holder_proof: None,
         context: simulate_request.context.clone(),
         idempotency_key: None,
-        lease_seq: None,
+        lease_seq: request.lease_seq,
         deadline_ms: Some(request.deadline_ms),
         correlation_id: simulate_request.correlation_id.clone(),
         provenance: None,
@@ -18629,6 +18629,148 @@ deny_ptrace = true
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn local_singleton_dry_runs_enforce_caller_lease_evidence() {
+        const CONNECTOR: &str = "fcp.test.singleton-dry-run:utility:1.0.0";
+        const OPERATION: &str = "test.singleton";
+        const CAPABILITY: &str = "cap.test.singleton";
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let zone_id = ZoneId::work();
+        let eligible_nodes = vec![
+            TailscaleNodeId::new("node-a"),
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-c"),
+        ];
+        let subject = singleton_writer_connector_lease_subject_id(&connector_id, &zone_id);
+        let holder = fcp_mesh::planner::select_lease_holder(&zone_id, &subject, &eligible_nodes)
+            .expect("elected holder");
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let simulations = Arc::new(AtomicU64::new(0));
+        let observed_simulations = Arc::clone(&simulations);
+        let introspection = dispatcher_introspection_with_input_schema(
+            OPERATION,
+            CAPABILITY,
+            SafetyTier::Safe,
+            json!({ "type": "object", "x-fcp-state-model": "singleton_writer" }),
+        );
+        let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(8);
+        let runner_task = task::spawn(async move {
+            while let Some(request) = runner_rx.recv().await {
+                let result = match request.method.as_str() {
+                    "introspect" => json!({ "result": introspection }),
+                    "health" => json!({ "result": dispatcher_health_result() }),
+                    "simulate" => {
+                        observed_simulations.fetch_add(1, Ordering::SeqCst);
+                        let request: SimulateRequest = serde_json::from_value(request.params)
+                            .expect("connector simulation request");
+                        json!({ "result": SimulateResponse::allowed(request.id) })
+                    }
+                    method => panic!("dry run must not dispatch {method}"),
+                };
+                let _ = request.response_tx.send(Ok(result));
+            }
+        });
+        let connector = dispatcher_test_connector(CONNECTOR, runner_tx, runner_task);
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            connector,
+            dispatcher_test_config(CONNECTOR),
+        );
+        let state = dispatcher_app_state(
+            registry,
+            Arc::new(HostAdminStateStore::new()),
+            Some(signing_key.verifying_key()),
+            HashMap::from([(zone_id.clone(), host_runtime_policy(zone_id.clone()))]),
+        );
+        let _guard = set_test_hrw_lease_routing_override(Some(HrwLeaseRoutingConfig {
+            local_node: holder,
+            eligible_nodes,
+            current_lease_seq: Some(8),
+        }));
+        let token = test_capability_token(&signing_key, CAPABILITY, OPERATION, zone_id.as_str());
+
+        for (lease_seq, allowed) in [(None, false), (Some(7), false), (Some(8), true)] {
+            // Input data cannot replace the fencing evidence in the host envelope.
+            let input = json!({ "lease_seq": u64::MAX });
+            let request_id = RequestId::random();
+            let preflight = HostPreflightRequest {
+                request_id: request_id.clone(),
+                connector_id: connector_id.clone(),
+                operation: OPERATION.to_string(),
+                params: Some(input.clone()),
+                principal: Some("user:test".to_string()),
+                zone_id: Some(zone_id.clone()),
+                capability_token: Some(token.clone()),
+                approval_tokens: Vec::new(),
+                lease_seq,
+            };
+            let checked =
+                preflight_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(preflight))
+                    .await
+                    .0;
+            assert_eq!(checked.allowed, allowed, "{checked:?}");
+            let simulation = HostSimulateRequest {
+                request_id: request_id.to_string(),
+                connector_id: CONNECTOR.to_string(),
+                operation: OPERATION.to_string(),
+                input: Some(input),
+                zone_id: Some(zone_id.to_string()),
+                principal: Some("user:test".to_string()),
+                capability_token: Some(token.clone()),
+                approval_tokens: Vec::new(),
+                lease_seq,
+                estimate_cost: false,
+                check_availability: false,
+                deadline_ms: 5_000,
+            };
+            let simulated = simulate_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(simulation),
+            )
+            .await
+            .expect("structured local simulation")
+            .0;
+            assert_eq!(simulated.preflight_allowed, allowed, "{simulated:?}");
+            assert_eq!(simulated.would_succeed, allowed, "{simulated:?}");
+            assert_eq!(simulated.receipt.would_succeed, allowed);
+            let phase = if allowed {
+                SimulatePhase::ConnectorReached
+            } else {
+                assert!(
+                    checked
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("LeaseFenced"))
+                );
+                assert!(
+                    simulated
+                        .failure_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("LeaseFenced"))
+                );
+                SimulatePhase::PreflightOnly
+            };
+            assert_eq!(simulated.phase, phase);
+            assert_eq!(simulated.receipt.phase, phase);
+        }
+        assert_eq!(
+            simulations.load(Ordering::SeqCst),
+            1,
+            "only the request with current lease evidence may reach the connector"
+        );
+        let receipts = state
+            .lifecycle
+            .query_simulate_receipts(&SimulateReceiptQueryRequest {
+                connector_id: CONNECTOR.to_string(),
+                operation: Some(OPERATION.to_string()),
+                after: None,
+                limit: 10,
+            })
+            .await;
+        assert_eq!(receipts.receipts.len(), 3);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn mesh_local_singleton_forwards_only_after_entry_authorization_and_fencing() {
         use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings};
         use fcp_mesh::invoke_route::{
@@ -18720,11 +18862,41 @@ deny_ptrace = true
                         ))
                         .expect("invoke response")
                     }
-                    MeshForwardBody::Preflight { .. } => {
+                    MeshForwardBody::Preflight { request_json, .. } => {
+                        let request: HostPreflightRequest =
+                            serde_json::from_str(request_json).expect("forwarded preflight");
+                        assert!(matches!(request.lease_seq, Some(7 | 8)));
                         let mut response = PreflightResponse::denied("test fixture");
                         response.allowed = true;
                         response.reason = None;
                         serde_json::to_string(&response).expect("preflight response")
+                    }
+                    MeshForwardBody::Simulate { request_json, .. } => {
+                        let request: HostSimulateRequest =
+                            serde_json::from_str(request_json).expect("forwarded simulation");
+                        assert_eq!(request.lease_seq, Some(8));
+                        let receipt = simulate_receipt_for_request(
+                            &request,
+                            request.input.as_ref().expect("simulation input"),
+                            SimulatePhase::ConnectorReached,
+                            true,
+                            0,
+                        )
+                        .expect("simulation receipt");
+                        serde_json::to_string(&HostSimulateResponse {
+                            request_id: request.request_id,
+                            would_succeed: true,
+                            phase: SimulatePhase::ConnectorReached,
+                            preflight_allowed: true,
+                            failure_reason: None,
+                            denial_code: None,
+                            missing_capabilities: Vec::new(),
+                            cost_estimate: None,
+                            availability: None,
+                            duration_ms: 0,
+                            receipt,
+                        })
+                        .expect("simulation response")
                     }
                     other => panic!("unexpected forwarded method: {}", other.method()),
                 };
@@ -18847,6 +19019,7 @@ deny_ptrace = true
             zone_id: Some(zone_id.clone()),
             capability_token: Some(request.capability_token.clone()),
             approval_tokens: Vec::new(),
+            lease_seq: request.lease_seq,
         };
         assert!(
             preflight_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(preflight.clone()))
@@ -18866,6 +19039,7 @@ deny_ptrace = true
             principal: Some("user:test".to_string()),
             capability_token: Some(simulation_token.clone()),
             approval_tokens: Vec::new(),
+            lease_seq: Some(7),
             estimate_cost: false,
             check_availability: false,
             deadline_ms: 5_000,
@@ -19001,6 +19175,46 @@ deny_ptrace = true
             .await
             .expect_err("stale or missing lease must not reach the peer");
             assert!(denied.1.contains("LeaseFenced"));
+
+            let mut fenced_preflight = preflight.clone();
+            fenced_preflight.request_id = RequestId::random();
+            fenced_preflight.lease_seq = lease_seq;
+            let denied = preflight_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(fenced_preflight),
+            )
+            .await
+            .0;
+            assert!(!denied.allowed);
+            assert!(
+                denied
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("LeaseFenced"))
+            );
+
+            let mut fenced_simulation = simulation_request("mesh-simulate-lease-fenced");
+            fenced_simulation.lease_seq = lease_seq;
+            let denied = simulate_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(fenced_simulation),
+            )
+            .await
+            .expect("lease denial must be a structured simulation response")
+            .0;
+            assert!(!denied.preflight_allowed);
+            assert!(!denied.would_succeed);
+            assert_eq!(denied.phase, SimulatePhase::PreflightOnly);
+            assert!(
+                denied
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("LeaseFenced"))
+            );
+            assert_eq!(denied.receipt.phase, SimulatePhase::PreflightOnly);
+            assert_eq!(forwards.load(Ordering::SeqCst), 3);
         }
         assert_eq!(forwards.load(Ordering::SeqCst), 3);
         request.lease_seq = Some(8);
@@ -19008,6 +19222,35 @@ deny_ptrace = true
             .await
             .expect("current lease boundary forwards");
         assert_eq!(forwards.load(Ordering::SeqCst), 4);
+        assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
+
+        let mut current_preflight = preflight.clone();
+        current_preflight.request_id = RequestId::random();
+        current_preflight.lease_seq = Some(8);
+        assert!(
+            preflight_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(current_preflight),
+            )
+            .await
+            .0
+            .allowed
+        );
+        let mut current_simulation = simulation_request("mesh-simulate-current-lease");
+        current_simulation.lease_seq = Some(8);
+        let simulated = simulate_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(current_simulation),
+        )
+        .await
+        .expect("current simulation lease reaches elected holder")
+        .0;
+        assert!(simulated.preflight_allowed);
+        assert!(simulated.would_succeed);
+        assert_eq!(simulated.phase, SimulatePhase::ConnectorReached);
+        assert_eq!(forwards.load(Ordering::SeqCst), 6);
         assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
 
         state
@@ -19044,7 +19287,7 @@ deny_ptrace = true
                 used,
                 "charge each forwarded invoke exactly once"
             );
-            assert_eq!(forwards.load(Ordering::SeqCst), 4 + used);
+            assert_eq!(forwards.load(Ordering::SeqCst), 6 + used);
         }
         request.id = RequestId::random();
         let denied = invoke_handler(
@@ -19113,7 +19356,7 @@ deny_ptrace = true
         }));
         assert_eq!(
             forwards.load(Ordering::SeqCst),
-            6,
+            8,
             "denials must stay on entry node"
         );
         assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
@@ -26535,6 +26778,7 @@ deny_ptrace = true
                 ZoneId::work().as_str(),
             )),
             approval_tokens: Vec::new(),
+            lease_seq: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -26603,6 +26847,7 @@ deny_ptrace = true
                 ZoneId::work().as_str(),
             )),
             approval_tokens: Vec::new(),
+            lease_seq: None,
             estimate_cost: false,
             check_availability: false,
             deadline_ms: 5_000,

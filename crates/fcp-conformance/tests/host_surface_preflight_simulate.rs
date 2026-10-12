@@ -754,6 +754,7 @@ fn preflight_request(
         zone_id: Some(ZoneId::work()),
         capability_token,
         approval_tokens: Vec::new(),
+        lease_seq: None,
     }
 }
 
@@ -771,6 +772,7 @@ fn simulate_request(
         principal: Some(TEST_PRINCIPAL.to_string()),
         capability_token,
         approval_tokens: Vec::new(),
+        lease_seq: None,
         estimate_cost: false,
         check_availability: false,
         deadline_ms: 5_000,

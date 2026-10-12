@@ -815,6 +815,12 @@ pub struct HostSimulateRequest {
     /// Approval tokens required for elevated live simulation requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_tokens: Vec<ApprovalToken>,
+    /// Lease fencing sequence to validate during host admission.
+    ///
+    /// This is the same caller-supplied evidence required by an invoke. A
+    /// simulation does not acquire a lease or bypass a known current fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_seq: Option<u64>,
     /// Whether to ask the connector for cost estimates.
     #[serde(default)]
     pub estimate_cost: bool,
@@ -9360,6 +9366,7 @@ mod tests {
             principal: Some("agent:test".to_string()),
             capability_token: None,
             approval_tokens: Vec::new(),
+            lease_seq: Some(u64::MAX),
             estimate_cost: true,
             check_availability: false,
             deadline_ms: 3000,
@@ -9371,6 +9378,7 @@ mod tests {
         assert_eq!(parsed.connector_id, "github:saas:1.0.0");
         assert!(parsed.capability_token.is_none());
         assert!(parsed.approval_tokens.is_empty());
+        assert_eq!(parsed.lease_seq, Some(u64::MAX));
         assert!(parsed.estimate_cost);
         assert!(!parsed.check_availability);
         assert_eq!(parsed.deadline_ms, 3000);
@@ -9386,6 +9394,7 @@ mod tests {
         let parsed: HostSimulateRequest = serde_json::from_str(json).unwrap();
         assert!(parsed.capability_token.is_none());
         assert!(parsed.approval_tokens.is_empty());
+        assert!(parsed.lease_seq.is_none());
         assert!(!parsed.estimate_cost);
         assert!(!parsed.check_availability);
         assert_eq!(parsed.deadline_ms, 5000);
@@ -12375,6 +12384,7 @@ mod tests {
             principal: Some("agent://cod-p9".to_string()),
             capability_token: None,
             approval_tokens: Vec::new(),
+            lease_seq: None,
             estimate_cost: true,
             check_availability: true,
             deadline_ms: 2_500,

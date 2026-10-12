@@ -710,6 +710,7 @@ fn build_host_preflight_request(
         zone_id: Some(request.zone_id.clone()),
         capability_token: Some(request.capability_token.clone()),
         approval_tokens: request.approval_tokens.clone(),
+        lease_seq: request.lease_seq,
     }
 }
 
@@ -727,6 +728,7 @@ fn build_vector_preflight_request(
         zone_id: Some(ZoneId::work()),
         capability_token,
         approval_tokens: Vec::new(),
+        lease_seq: None,
     }
 }
 
@@ -4362,6 +4364,7 @@ async fn fcp_host_binary_preflight_route_denies_missing_capability_token()
             zone_id: Some(ZoneId::work()),
             capability_token: None,
             approval_tokens: Vec::new(),
+            lease_seq: None,
         },
     )
     .await?;
@@ -4515,6 +4518,7 @@ async fn fcp_host_binary_simulate_route_denies_missing_capability_token()
             principal: Some(TEST_PRINCIPAL.to_string()),
             capability_token: None,
             approval_tokens: Vec::new(),
+            lease_seq: None,
             estimate_cost: false,
             check_availability: false,
             deadline_ms: 5_000,
@@ -4613,6 +4617,7 @@ async fn fcp_host_binary_simulate_route_reaches_connector_and_records_receipt()
             zone_id: Some(invoke_request.zone_id.clone()),
             capability_token: Some(invoke_request.capability_token.clone()),
             approval_tokens: Vec::new(),
+            lease_seq: invoke_request.lease_seq,
         },
     )
     .await?;
@@ -4630,6 +4635,7 @@ async fn fcp_host_binary_simulate_route_reaches_connector_and_records_receipt()
             principal: Some(TEST_PRINCIPAL.to_string()),
             capability_token: Some(invoke_request.capability_token),
             approval_tokens: Vec::new(),
+            lease_seq: invoke_request.lease_seq,
             estimate_cost: false,
             check_availability: false,
             deadline_ms: 5_000,

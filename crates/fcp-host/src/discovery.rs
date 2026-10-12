@@ -661,6 +661,14 @@ pub struct HostPreflightRequest {
     /// Approval tokens authorizing elevated or explicitly approved execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_tokens: Vec<ApprovalToken>,
+
+    /// Lease fencing sequence that the subsequent invoke will present.
+    ///
+    /// Singleton-writer preflight checks enforce the same lease boundary as
+    /// execution. A missing or stale sequence is refused when a current fence
+    /// is known; the host never substitutes its own sequence for the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_seq: Option<u64>,
 }
 
 impl HostPreflightRequest {
@@ -5399,6 +5407,7 @@ mod tests {
             zone_id: Some(ZoneId::work()),
             capability_token: None,
             approval_tokens: vec![],
+            lease_seq: Some(17),
         };
         let budget = req.budget_request();
         assert_eq!(budget.connector_id, req.connector_id);
@@ -5419,6 +5428,7 @@ mod tests {
             zone_id: None,
             capability_token: None,
             approval_tokens: vec![],
+            lease_seq: None,
         };
         let budget = req.budget_request();
         assert!(budget.params.is_none());
@@ -5437,11 +5447,13 @@ mod tests {
             zone_id: None,
             capability_token: None,
             approval_tokens: vec![],
+            lease_seq: Some(u64::MAX),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostPreflightRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.operation, "delete");
         assert_eq!(parsed.principal.as_deref(), Some("agent:alpha"));
+        assert_eq!(parsed.lease_seq, Some(u64::MAX));
     }
 
     #[test]
@@ -5455,6 +5467,7 @@ mod tests {
             zone_id: None,
             capability_token: None,
             approval_tokens: vec![],
+            lease_seq: None,
         };
         let dbg = format!("{req:?}");
         assert!(dbg.contains("HostPreflightRequest"));
@@ -6333,6 +6346,7 @@ mod tests {
             zone_id: None,
             capability_token: None,
             approval_tokens: vec![],
+            lease_seq: None,
         };
         let cloned = req.clone();
         assert_eq!(req.connector_id, cloned.connector_id);
