@@ -1,5 +1,6 @@
 [package]
 name = "fwc"
+default-run = "fwc"
 description = "Standalone Flywheel connectors CLI"
 version.workspace = true
 edition.workspace = true
