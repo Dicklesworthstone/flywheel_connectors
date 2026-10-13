@@ -6,6 +6,8 @@
 //! verified inventories nor the ability of another caller to resume discovery.
 //! A persistent attempt cursor prevents an unreachable prefix of the directory
 //! from monopolizing every refresh budget and starving later peers.
+//! Signed freshness advances with monotonic elapsed time as well as wall time;
+//! clock rollback, cache invalidation, and refetch cannot revive expired evidence.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,6 +26,36 @@ const MAX_CONCURRENT_FETCHES: usize = 16;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const SUCCESS_CACHE_TTL: Duration = Duration::from_secs(10);
 const FAILURE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Process-local lower bound on time used to validate signed evidence.
+///
+/// A wall-clock high-water mark alone is insufficient: a frozen or slowly
+/// advancing clock could extend an advertisement's lifetime indefinitely by
+/// repeatedly fetching it. Preserve elapsed time from the last forward anchor,
+/// including fractional milliseconds between frequent observations.
+#[derive(Debug, Default)]
+struct DiscoveryClock {
+    anchor: Option<(u64, Instant)>,
+}
+
+impl DiscoveryClock {
+    fn observe(&mut self, wall_ms: u64, monotonic_now: Instant) -> u64 {
+        let Some((anchor_ms, anchor_at)) = self.anchor else {
+            self.anchor = Some((wall_ms, monotonic_now));
+            return wall_ms;
+        };
+        let elapsed_ms =
+            u64::try_from(monotonic_now.saturating_duration_since(anchor_at).as_millis())
+                .unwrap_or(u64::MAX);
+        let projected_ms = anchor_ms.saturating_add(elapsed_ms);
+        if wall_ms > projected_ms {
+            self.anchor = Some((wall_ms, monotonic_now));
+            wall_ms
+        } else {
+            projected_ms
+        }
+    }
+}
 
 #[derive(Debug)]
 struct CachedAdvertisement {
@@ -55,6 +87,7 @@ impl CachedAdvertisement {
 #[derive(Debug, Default)]
 struct AdvertisementCache {
     generation: u64,
+    clock: DiscoveryClock,
     // Advance when a fetch starts, including fetches later cancelled. The
     // cursor is reduced modulo the current snapshot's peer count.
     next_peer_index: usize,
@@ -62,7 +95,12 @@ struct AdvertisementCache {
 }
 
 impl AdvertisementCache {
-    fn stale_peers(&self, directory: &MeshPeerDirectory, now_ms: u64) -> Vec<(usize, MeshPeer)> {
+    fn stale_peers(
+        &self,
+        directory: &MeshPeerDirectory,
+        now_ms: u64,
+        freshness_floor_ms: u64,
+    ) -> Vec<(usize, MeshPeer)> {
         let mut peers: Vec<_> = directory.peers().enumerate().collect();
         if peers.is_empty() {
             return Vec::new();
@@ -75,7 +113,10 @@ impl AdvertisementCache {
                 !self
                     .entries
                     .get(peer.node_id.as_str())
-                    .is_some_and(|entry| entry.is_reusable(peer, now_ms))
+                    .is_some_and(|entry| {
+                        entry.is_reusable(peer, now_ms)
+                            && entry.is_reusable(peer, freshness_floor_ms)
+                    })
             })
             .map(|(index, peer)| (index, peer.clone()))
             .collect()
@@ -108,6 +149,8 @@ impl PeerDiscovery {
         F: Fn(MeshPeer) -> Fut,
         Fut: Future<Output = Result<MeshPeerAdvertisement, String>>,
     {
+        // Start elapsed-time accounting before any lock or network wait.
+        self.freshness_now();
         let refresh = async {
             // Recheck after acquiring the async lock: another caller may
             // have refreshed everything while this caller was waiting.
@@ -123,7 +166,12 @@ impl PeerDiscovery {
                 cache.entries.retain(|_, entry| {
                     directory.peer(&entry.peer.node_id) == Some(&entry.peer)
                 });
-                (cache.generation, cache.stale_peers(directory, unix_now_ms()))
+                let now_ms = unix_now_ms();
+                let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
+                (
+                    cache.generation,
+                    cache.stale_peers(directory, now_ms, freshness_floor_ms),
+                )
             };
             let mut pending = stream::iter(stale_peers)
                 .map(|(index, peer)| {
@@ -134,14 +182,24 @@ impl PeerDiscovery {
                 .buffer_unordered(MAX_CONCURRENT_FETCHES);
             while let Some((peer, result)) = pending.next().await {
                 let result = result.and_then(|advertisement| {
+                    let (now_ms, freshness_floor_ms) = self.freshness_now();
                     advertisement
                         .verify(
                             &peer.node_id,
                             directory,
-                            unix_now_ms(),
+                            now_ms,
                             DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
                         )
                         .map_err(|error| error.to_string())?;
+                    // The monotonic floor is an additional restriction, not
+                    // a replacement for the real wall-clock future-skew check.
+                    if advertisement.issued_at_ms.abs_diff(freshness_floor_ms)
+                        > DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
+                    {
+                        return Err(
+                            "mesh advertisement expired under monotonic freshness".to_owned(),
+                        );
+                    }
                     Ok(advertisement)
                 });
                 let mut cache = self
@@ -190,6 +248,15 @@ impl PeerDiscovery {
         self.snapshot(directory, unix_now_ms())
     }
 
+    fn freshness_now(&self) -> (u64, u64) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now_ms = unix_now_ms();
+        (now_ms, cache.clock.observe(now_ms, Instant::now()))
+    }
+
     fn record_attempt(&self, generation: u64, index: usize, peer_count: usize) {
         let mut cache = self
             .cache
@@ -201,16 +268,20 @@ impl PeerDiscovery {
     }
 
     fn snapshot(&self, directory: &MeshPeerDirectory, now_ms: u64) -> Vec<MeshPeerAdvertisement> {
-        let cache = self
+        let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
         // Directory order is stable even when fetches complete out of order.
         directory
             .peers()
             .filter_map(|peer| {
                 cache.entries.get(peer.node_id.as_str())
-                    .filter(|entry| entry.is_reusable(peer, now_ms))
+                    .filter(|entry| {
+                        entry.is_reusable(peer, now_ms)
+                            && entry.is_reusable(peer, freshness_floor_ms)
+                    })
                     .and_then(|entry| entry.advertisement.clone())
             })
             .collect()
@@ -224,6 +295,8 @@ impl PeerDiscovery {
         cache.generation = cache.generation.wrapping_add(1);
         cache.next_peer_index = 0;
         cache.entries.clear();
+        // Membership/cache changes are not permission to rewind signed time.
+        // The clock belongs to the router lifetime, not a cache generation.
     }
 }
 
@@ -391,6 +464,122 @@ mod tests {
                 .snapshot(&directory, issued_at_ms + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS + 1)
                 .is_empty()
         );
+        assert!(
+            discovery.snapshot(&directory, issued_at_ms).is_empty(),
+            "wall-clock rollback must not revive an expired cached inventory"
+        );
+    }
+
+    #[test]
+    fn discovery_clock_advances_through_frozen_and_rewound_wall_time() {
+        let start = Instant::now();
+        let mut clock = DiscoveryClock::default();
+        assert_eq!(clock.observe(1_000, start), 1_000);
+        assert_eq!(clock.observe(900, start + Duration::from_millis(5)), 1_005);
+        assert_eq!(clock.observe(1_000, start + Duration::from_millis(10)), 1_010);
+        assert_eq!(clock.observe(1_001, start + Duration::from_millis(20)), 1_020);
+    }
+
+    #[test]
+    fn discovery_clock_preserves_fractional_elapsed_time() {
+        let start = Instant::now();
+        let mut clock = DiscoveryClock::default();
+        assert_eq!(clock.observe(1_000, start), 1_000);
+        for tick in 1..=40_u64 {
+            assert_eq!(
+                clock.observe(1_000, start + Duration::from_micros(tick * 100)),
+                1_000 + tick / 10,
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_clock_forward_adjustment_cannot_be_undone() {
+        let start = Instant::now();
+        let mut clock = DiscoveryClock::default();
+        assert_eq!(clock.observe(1_000, start), 1_000);
+        assert_eq!(clock.observe(5_000, start + Duration::from_millis(1)), 5_000);
+        assert_eq!(clock.observe(1_000, start + Duration::from_millis(11)), 5_010);
+    }
+
+    #[test]
+    fn discovery_clock_saturates_instead_of_wrapping() {
+        let start = Instant::now();
+        let mut clock = DiscoveryClock::default();
+        assert_eq!(clock.observe(u64::MAX - 1, start), u64::MAX - 1);
+        assert_eq!(clock.observe(0, start + Duration::from_millis(2)), u64::MAX);
+        assert_eq!(clock.observe(0, start + Duration::from_millis(3)), u64::MAX);
+    }
+
+    #[test]
+    fn frozen_wall_clock_cannot_extend_a_cached_signed_lifetime() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let peer = directory.peers().next().unwrap();
+        let ad = advertisement(peer, &key);
+        let near_expiry = ad.issued_at_ms + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS - 1;
+        let discovery = PeerDiscovery::new();
+        {
+            let mut cache = discovery.cache.lock().unwrap();
+            cache.clock.anchor = Some((near_expiry, Instant::now() - Duration::from_millis(2)));
+            cache.entries.insert(
+                peer.node_id.as_str().to_owned(),
+                CachedAdvertisement {
+                    peer: peer.clone(),
+                    checked_at: Instant::now(),
+                    advertisement: Some(ad),
+                },
+            );
+        }
+        assert!(discovery.snapshot(&directory, near_expiry).is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalidation_and_refetch_do_not_reset_signed_freshness() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let peer = directory.peers().next().unwrap();
+        let old = advertisement(peer, &key);
+        let discovery = PeerDiscovery::new();
+        let initial = discovery
+            .collect(&directory, |_| {
+                let ad = old.clone();
+                async move { Ok(ad) }
+            })
+            .await;
+        assert_eq!(initial.len(), 1);
+        let expired_at = old.issued_at_ms + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS + 1;
+        assert!(discovery.snapshot(&directory, expired_at).is_empty());
+        discovery.invalidate();
+        let calls = AtomicUsize::new(0);
+        let replayed = discovery
+            .collect(&directory, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let ad = old.clone();
+                async move { Ok(ad) }
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(replayed.is_empty());
+        assert!(discovery.cache.lock().unwrap().entries["peer-000"].advertisement.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn monotonic_floor_never_relaxes_wall_clock_future_skew() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let future_ms = unix_now_ms() + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS * 2;
+        let discovery = PeerDiscovery::new();
+        discovery.cache.lock().unwrap().clock.anchor = Some((future_ms, Instant::now()));
+        let result = discovery
+            .collect(&directory, |peer| {
+                let ad =
+                    MeshPeerAdvertisement::sign(&key, peer.node_id, future_ms, Vec::new());
+                async move { Ok(ad) }
+            })
+            .await;
+        assert!(result.is_empty());
+        assert!(discovery.cache.lock().unwrap().entries["peer-000"].advertisement.is_none());
     }
 
     #[fcp_async_core::runtime::test]
