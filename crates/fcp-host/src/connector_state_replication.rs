@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HostError, HostResult};
 
+pub(super) mod runtime;
+
 /// Maximum number of objects in one transfer, including the root.
 pub const MAX_CONNECTOR_STATE_TRANSFER_OBJECTS: usize = 4096;
 /// Maximum canonical object bytes in one transfer, independently of JSON size.
@@ -222,6 +224,12 @@ pub struct ConnectorStatePullResponse {
 /// Construct at host startup, then share one `Arc` for the host's lifetime.
 /// A registration never opens a filesystem path or creates an independent
 /// store. Hosts must retain the same adapter and backing-store ownership.
+///
+/// Shared admission permits at most eight active service operations, two per
+/// peer, and aggregate reservations of 16 MiB each for canonical and wire bytes
+/// plus 8192 objects. Admission is fail-fast, with no waiter queue. Reservations
+/// end with the service future; this is not a bound on allocator overhead or
+/// already-admitted persistent work inside the underlying object store.
 #[derive(Default)]
 pub struct ConnectorStateReplicationService {
     stores: HashMap<
@@ -229,6 +237,7 @@ pub struct ConnectorStateReplicationService {
         Arc<FcpStoreConnectorStateStore>,
     >,
     grants: HashMap<String, RegisteredTransferGrant>,
+    pub(super) runtime: runtime::TransferRuntime,
 }
 
 struct RegisteredTransferGrant {
@@ -381,6 +390,7 @@ impl ConnectorStateReplicationService {
             request,
         )?;
         authorize_transport()?;
+        let _permit = self.runtime.admit(authenticated_peer, request.limits)?;
         let bundle = store
             .export_replica(request.root_object_id, request.limits.store_limits())
             .await
@@ -432,6 +442,7 @@ impl ConnectorStateReplicationService {
             &request.request,
         )?;
         authorize_transport()?;
+        let _permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
         if wire.len() > request.request.limits.max_wire_bytes {
             return Err(invalid(
                 "connector-state export response exceeds its wire limit",
@@ -1180,5 +1191,55 @@ mod tests {
             assert!(!message.contains("transfer-secret"));
             assert!(!message.contains("/private/object-store"));
         }
+    }
+
+    #[test]
+    fn complete_export_and_import_share_per_service_admission() {
+        let fixture = fixture();
+        let first = fixture.donor.runtime.admit("recipient", limits()).unwrap();
+        let second = fixture.donor.runtime.admit("recipient", limits()).unwrap();
+        assert!(matches!(
+            run(fixture.donor.export_for_peer("recipient", &fixture.request.request, || Ok(()))),
+            Err(HostError::Unavailable(_))
+        ));
+        assert_eq!(fixture.donor.runtime.active(), 2);
+        // Grant failure takes precedence over capacity: unknown callers do not
+        // learn whether an authorized peer is currently consuming its budget.
+        assert!(matches!(
+            run(fixture.donor.export_for_peer("unknown", &fixture.request.request, || Ok(()))),
+            Err(HostError::PreflightFailed(_))
+        ));
+        drop(first);
+        let wire = export(&fixture);
+        assert_eq!(fixture.donor.runtime.active(), 1);
+        drop(second);
+
+        let first = fixture.recipient.runtime.admit("donor", limits()).unwrap();
+        let second = fixture.recipient.runtime.admit("donor", limits()).unwrap();
+        assert!(matches!(
+            run(fixture.recipient.import_from_peer(&fixture.request, &wire, || Ok(()))),
+            Err(HostError::Unavailable(_))
+        ));
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+        drop(first);
+        assert!(run(fixture.recipient.import_from_peer(&fixture.request, &wire, || Ok(()))).is_ok());
+        assert_eq!(fixture.recipient.runtime.active(), 1);
+        drop(second);
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert_eq!(fixture.donor.runtime.active(), 0);
+    }
+
+    #[test]
+    fn failed_import_releases_capacity_and_services_do_not_share_counters() {
+        let fixture = fixture();
+        let first = fixture.donor.runtime.admit("recipient", limits()).unwrap();
+        let second = fixture.donor.runtime.admit("recipient", limits()).unwrap();
+        for _ in 0..4 {
+            assert!(run(fixture.recipient.import_from_peer(&fixture.request, "invalid", || Ok(()))).is_err());
+            assert_eq!(fixture.recipient.runtime.active(), 0);
+        }
+        assert_eq!(fixture.donor.runtime.active(), 2);
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+        drop((first, second));
     }
 }
