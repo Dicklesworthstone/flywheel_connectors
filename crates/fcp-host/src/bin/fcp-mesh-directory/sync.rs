@@ -22,6 +22,9 @@ use serde::Serialize;
 use url::{Host, Url};
 
 #[cfg(unix)]
+#[path = "sync/sources.rs"]
+mod sources;
+#[cfg(unix)]
 #[path = "sync/watch.rs"]
 mod watch;
 
@@ -349,11 +352,10 @@ pub(super) fn run(options: &BTreeMap<String, OsString>, output: &mut impl io::Wr
     #[cfg(unix)]
     {
         let trust = Trust::from_options(options)?;
-        let url = source_url(options["--url"].to_str().ok_or_else(|| "source URL is not UTF-8".to_owned())?)
-            .map_err(|error| error.to_string())?;
+        let sources = sources::SourceSet::from_options(options)?;
         let mut installer = disk::Installer::open(Path::new(&options["--directory"]))
             .map_err(|error| error.to_string())?;
-        let text = fetch(&url, FETCH_TIMEOUT).map_err(|error| error.to_string())?;
+        let text = sources.fetch(&trust, FETCH_TIMEOUT).map_err(|error| error.to_string())?;
         let report = installer.install(&text, &trust).map_err(|error| error.to_string())?;
         serde_json::to_writer(&mut *output, &report).map_err(|_| "sync output failed".to_owned())?;
         writeln!(output).map_err(|_| "sync output failed".to_owned())

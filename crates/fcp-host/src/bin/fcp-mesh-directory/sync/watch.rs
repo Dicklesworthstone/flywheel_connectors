@@ -197,14 +197,13 @@ fn drive(
 
 pub(super) fn run(options: &BTreeMap<String, OsString>, output: &mut impl io::Write) -> super::super::Result<()> {
     let config = WatchConfig::from_options(options)?;
-    // Trust and source URL are pinned for this process. A downloaded key or a
-    // rewritten public-key file cannot silently replace its roots during a run.
+    // Trust and all source URLs are pinned for this process. A downloaded key
+    // or rewritten public-key file cannot silently replace its roots during a run.
     let trust = Trust::from_options(options)?;
-    let url = source_url(options["--url"].to_str().ok_or_else(|| "source URL is not UTF-8".to_owned())?)
-        .map_err(|error| error.to_string())?;
+    let sources = sources::SourceSet::from_options(options)?;
     let mut installer = disk::Installer::open(Path::new(&options["--directory"]))
         .map_err(|error| error.to_string())?;
-    drive(&mut installer, &trust, config, output, || fetch(&url, FETCH_TIMEOUT), |delay| {
+    drive(&mut installer, &trust, config, output, || sources.fetch(&trust, FETCH_TIMEOUT), |delay| {
         std::thread::sleep(delay);
         true
     }).map_err(|error| error.to_string())
