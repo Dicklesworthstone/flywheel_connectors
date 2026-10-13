@@ -23,6 +23,9 @@ use fcp_host::{HostError, HostResult};
 use fcp_kernel::InvokeResponse;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
+#[path = "dispatch_authority.rs"]
+mod dispatch_authority;
+
 const MAX_OWNED_INVOCATIONS: usize = 256;
 pub(super) const FINALIZATION_GRACE: Duration = Duration::from_secs(5);
 pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_secs(65);
@@ -610,6 +613,9 @@ async fn dispatch(
     let result = before_deadline(
         deadline,
         async move {
+            // Admission may have waited for durable storage and runtime selection.
+            // Revalidate without spending another quota permit, before any IO.
+            dispatch_authority::revalidate(state, &request).await?;
             super::recheck_admitted_holder_proof(state, &request)?;
             if Instant::now() >= deadline {
                 return Err(HostError::Unavailable(
