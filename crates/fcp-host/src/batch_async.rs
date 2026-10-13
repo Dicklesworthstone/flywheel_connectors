@@ -49,15 +49,22 @@ pub struct BatchStreamingResponse {
     pub delivery_status: BatchDeliveryStatus,
 }
 
-type ResultSink<'a> = dyn FnMut(&OperationResult) -> Result<(), BatchOperationError> + 'a;
+type SilentResultSink = fn(&OperationResult) -> Result<(), BatchOperationError>;
 
-struct ResultDelivery<'a> {
-    sink: Option<&'a mut ResultSink<'a>>,
+// Retain the concrete callback type across await points. Erasing it into a
+// non-Send trait object makes even callback-free batches unspawnable by the
+// host. Generic ownership preserves Send when available without requiring it
+// from callers on a local executor.
+struct ResultDelivery<S> {
+    sink: Option<S>,
     acknowledged: usize,
     status: BatchDeliveryStatus,
 }
 
-impl ResultDelivery<'_> {
+impl<S> ResultDelivery<S>
+where
+    S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
+{
     fn deliver(&mut self, result: &OperationResult) -> bool {
         let Some(sink) = self.sink.as_mut() else {
             return self.status == BatchDeliveryStatus::Complete;
@@ -109,6 +116,8 @@ impl BatchExecutor {
     /// after every completion. Handlers must be cooperative async functions:
     /// neither a blocking factory nor a blocking future poll can be preempted.
     /// Futures can borrow the request and need not be `Send` or `'static`.
+    /// The returned future is `Send` when its handler and handler futures are
+    /// `Send`; local-only handlers remain supported.
     /// Dropping the batch drops its in-flight futures, without spawning detached
     /// tasks or promising to undo side effects already performed by a handler.
     /// Use the host's capability/lease enforcement inside the handler; batch zone
@@ -127,7 +136,7 @@ impl BatchExecutor {
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
     {
-        self.execute_async_inner(request, None, handler, None)
+        self.execute_async_inner(request, None, handler, None::<SilentResultSink>)
             .await
             .map(|result| result.response)
     }
@@ -166,7 +175,7 @@ impl BatchExecutor {
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
     {
-        self.execute_async_inner(request, Some(context), handler, None)
+        self.execute_async_inner(request, Some(context), handler, None::<SilentResultSink>)
             .await
             .map(|result| result.response)
     }
@@ -200,28 +209,29 @@ impl BatchExecutor {
         request: &'a BatchInvokeRequest,
         context: Option<&ExecutionContext>,
         handler: F,
-        mut on_result: S,
+        on_result: S,
     ) -> HostResult<BatchStreamingResponse>
     where
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
         S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
     {
-        self.execute_async_inner(request, context, handler, Some(&mut on_result))
+        self.execute_async_inner(request, context, handler, Some(on_result))
             .await
     }
 
     #[allow(clippy::future_not_send)]
-    async fn execute_async_inner<'a, 's, F, Fut>(
+    async fn execute_async_inner<'a, F, Fut, S>(
         &self,
         request: &'a BatchInvokeRequest,
         context: Option<&ExecutionContext>,
         mut handler: F,
-        sink: Option<&'s mut ResultSink<'s>>,
+        sink: Option<S>,
     ) -> HostResult<BatchStreamingResponse>
     where
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
+        S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
     {
         let started_at = Instant::now();
         let (plan, report) = self.plan_with_schedule_report(request)?;
@@ -495,7 +505,10 @@ impl<'a> BatchRun<'a> {
         )));
     }
 
-    fn deliver_recorded(&mut self, index: usize, delivery: &mut ResultDelivery<'_>) {
+    fn deliver_recorded<S>(&mut self, index: usize, delivery: &mut ResultDelivery<S>)
+    where
+        S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
+    {
         if let Some(result) = &self.results[index]
             && !delivery.deliver(result)
             && !self.interrupted()
@@ -504,11 +517,14 @@ impl<'a> BatchRun<'a> {
         }
     }
 
-    fn finish(
+    fn finish<S>(
         mut self,
         schedule_report: Option<BatchScheduleReport>,
-        delivery: &mut ResultDelivery<'_>,
-    ) -> BatchInvokeResponse {
+        delivery: &mut ResultDelivery<S>,
+    ) -> BatchInvokeResponse
+    where
+        S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
+    {
         let (skip_code, skip_message) = match self.halt {
             Some(Halt::Timeout) => ("BATCH_TIMEOUT", "batch timeout exceeded before admission"),
             Some(Halt::Cancelled) => ("BATCH_CANCELLED", "batch context cancelled before admission"),
@@ -580,6 +596,89 @@ fn skipped(operation: &BatchOperation, code: &str, message: &str) -> OperationRe
         output: None,
         error: Some(operation_error(code, message)),
         duration_ms: 0,
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use std::cell::Cell;
+    use std::future::{Future, ready};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{BatchOptions, BatchScheduleHint};
+
+    fn request() -> BatchInvokeRequest {
+        BatchInvokeRequest {
+            operations: vec![BatchOperation {
+                id: "a".to_owned(),
+                tool: "test.echo".to_owned(),
+                input: json!({"value": 42}),
+                depends_on: vec![],
+                zone: None,
+                scheduler: BatchScheduleHint::default(),
+            }],
+            options: BatchOptions::default(),
+        }
+    }
+
+    // Passing the *returned* future through this bound catches type erasure
+    // even when every callback captured by the public method is thread-safe.
+    fn require_send<F: Future + Send>(future: F) -> F {
+        future
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn callback_free_batch_is_send() {
+        let executor = BatchExecutor::new();
+        let request = request();
+        let response = require_send(executor.execute_async(&request, |operation| {
+            ready(Ok(operation.input.clone()))
+        })).await.unwrap();
+        assert_eq!(response.completed, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn context_batch_is_send() {
+        let executor = BatchExecutor::new();
+        let request = request();
+        let context = ExecutionContext::background();
+        let response = require_send(executor.execute_async_with_context(
+            &request, &context, |operation| ready(Ok(operation.input.clone())),
+        )).await.unwrap();
+        assert_eq!(response.completed, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn streaming_batch_preserves_borrowed_send_callbacks() {
+        let executor = BatchExecutor::new();
+        let request = request();
+        let observed = AtomicUsize::new(0);
+        let response = require_send(executor.execute_async_streaming(
+            &request, None, |operation| ready(Ok(operation.input.clone())),
+            |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )).await.unwrap();
+        assert_eq!(response.response.completed, 1);
+        assert_eq!(response.acknowledged_results, 1);
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_only_streaming_callbacks_still_work() {
+        let executor = BatchExecutor::new();
+        let request = request();
+        let observed = Cell::new(0);
+        let response = executor.execute_async_streaming(
+            &request, None, |operation| ready(Ok(operation.input.clone())),
+            |_| { observed.set(observed.get() + 1); Ok(()) },
+        ).await.unwrap();
+        assert_eq!(response.delivery_status, BatchDeliveryStatus::Complete);
+        assert_eq!(observed.get(), 1);
     }
 }
 
