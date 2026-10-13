@@ -5,6 +5,8 @@
 //! reply authentication. Dropping the future releases every reservation, so
 //! cancellation cannot strand capacity or create an unbounded waiter queue.
 //! Peer circuits affect only future admission, never an already-sent result.
+//! Every admitted forward also reserves its maximum wire-reply size before
+//! transmission. Reply pressure cannot force us to abandon a delivered write.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -13,7 +15,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::{MeshForwardFailure, MeshForwardReply};
+use super::{MAX_REPLY_BYTES, MeshForwardFailure, MeshForwardReply};
 use crate::{HostError, HostResult};
 
 mod circuit;
@@ -27,16 +29,22 @@ pub const MESH_FORWARD_MAX_PER_PEER_ENV: &str = "FCP_HOST_MESH_FORWARD_MAX_PER_P
 /// Maximum aggregate serialized request bytes held by admitted forwards.
 pub const MESH_FORWARD_MAX_REQUEST_BYTES_ENV: &str = "FCP_HOST_MESH_FORWARD_MAX_REQUEST_BYTES";
 
-pub(super) const LIMIT_ENV_KEYS: [&str; 3] = [
+pub(super) const LIMIT_ENV_KEYS: [&str; 4] = [
     MESH_FORWARD_MAX_IN_FLIGHT_ENV,
     MESH_FORWARD_MAX_PER_PEER_ENV,
     MESH_FORWARD_MAX_REQUEST_BYTES_ENV,
+    MeshForwardLimits::RESPONSE_BYTES_ENV,
 ];
 
 /// Router-wide and per-peer outbound resource ceilings.
 ///
-/// The byte limit accounts for serialized signed requests, not response
-/// bodies. Each response also has the transport's independent size limit.
+/// Request bytes and worst-case wire-reply headroom have independent limits.
+/// Each forward reserves the transport's full per-reply limit before sending,
+/// even when its actual reply is small. This avoids post-delivery resource
+/// refusals with ambiguous execution outcomes. These are not process-RSS limits:
+/// decoder copies, HTTP buffers, discovery, and caller-owned results are outside
+/// this accounting. Reservations last through reply authentication, not through
+/// subsequent use of the returned result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MeshForwardLimits {
     /// Maximum number of admitted forwards across all peers.
@@ -45,6 +53,9 @@ pub struct MeshForwardLimits {
     pub max_per_peer: usize,
     /// Maximum sum of serialized request lengths for admitted forwards.
     pub max_request_bytes: usize,
+    /// Maximum aggregate wire-reply headroom reserved by admitted forwards.
+    /// Must accommodate at least one full transport reply (16 MiB).
+    pub max_response_bytes: usize,
 }
 
 impl Default for MeshForwardLimits {
@@ -53,11 +64,18 @@ impl Default for MeshForwardLimits {
             max_in_flight: 32,
             max_per_peer: 4,
             max_request_bytes: 64 * 1024 * 1024,
+            // Preserve the default 32-forward capacity while giving operators
+            // an independent ceiling when increasing concurrency or reducing
+            // the reply-buffer memory allowance.
+            max_response_bytes: 32 * MAX_REPLY_BYTES,
         }
     }
 }
 
 impl MeshForwardLimits {
+    /// Environment variable controlling aggregate reserved wire-reply bytes.
+    pub const RESPONSE_BYTES_ENV: &'static str = "FCP_HOST_MESH_FORWARD_MAX_RESPONSE_BYTES";
+
     /// Load optional limits without reading ambient process state.
     ///
     /// # Errors
@@ -80,6 +98,7 @@ impl MeshForwardLimits {
                 MESH_FORWARD_MAX_REQUEST_BYTES_ENV,
                 defaults.max_request_bytes,
             )?,
+            max_response_bytes: read(Self::RESPONSE_BYTES_ENV, defaults.max_response_bytes)?,
         };
         limits.validate()?;
         Ok(limits)
@@ -101,6 +120,12 @@ impl MeshForwardLimits {
                 "mesh forward per-peer limit must not exceed the router limit".to_owned(),
             ));
         }
+        if self.max_response_bytes < MAX_REPLY_BYTES {
+            return Err(HostError::InvalidFilter(format!(
+                "{} must be at least {MAX_REPLY_BYTES} bytes (one full mesh reply)",
+                Self::RESPONSE_BYTES_ENV
+            )));
+        }
         Ok(())
     }
 }
@@ -115,6 +140,8 @@ pub struct MeshForwardUsage {
     pub in_flight: usize,
     /// Aggregate serialized request bytes reserved by those forwards.
     pub request_bytes: usize,
+    /// Worst-case wire-reply bytes reserved, not measured response sizes or RSS.
+    pub response_bytes_reserved: usize,
     /// Active reservations per peer, in deterministic node-id order.
     pub peers: BTreeMap<String, usize>,
 }
@@ -224,6 +251,13 @@ impl ForwardControl {
             Some("peer_in_flight_limit")
         } else if request_bytes > self.limits.max_request_bytes.saturating_sub(usage.request_bytes) {
             Some("request_byte_limit")
+        } else if MAX_REPLY_BYTES
+            > self
+                .limits
+                .max_response_bytes
+                .saturating_sub(usage.response_bytes_reserved)
+        {
+            Some("response_byte_limit")
         } else {
             None
         };
@@ -245,6 +279,7 @@ impl ForwardControl {
         // validated usize ceiling, and byte admission checked the remainder.
         usage.in_flight += 1;
         usage.request_bytes += request_bytes;
+        usage.response_bytes_reserved += MAX_REPLY_BYTES;
         *usage.peers.entry(peer.to_owned()).or_default() += 1;
         drop(state);
         Ok(ForwardPermit {
@@ -301,6 +336,7 @@ impl Drop for ForwardPermit<'_> {
         let usage = &mut state.usage;
         usage.in_flight = usage.in_flight.saturating_sub(1);
         usage.request_bytes = usage.request_bytes.saturating_sub(self.request_bytes);
+        usage.response_bytes_reserved = usage.response_bytes_reserved.saturating_sub(MAX_REPLY_BYTES);
         if let Some(count) = usage.peers.get_mut(self.peer) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -350,6 +386,7 @@ mod tests {
             max_in_flight: total,
             max_per_peer: peer,
             max_request_bytes: bytes,
+            ..MeshForwardLimits::default()
         })
         .unwrap()
     }
@@ -405,12 +442,14 @@ mod tests {
             MESH_FORWARD_MAX_IN_FLIGHT_ENV => Some(" 8 ".to_owned()),
             MESH_FORWARD_MAX_PER_PEER_ENV => Some("2".to_owned()),
             MESH_FORWARD_MAX_REQUEST_BYTES_ENV => Some("4096".to_owned()),
+            MeshForwardLimits::RESPONSE_BYTES_ENV => Some((2 * MAX_REPLY_BYTES).to_string()),
             _ => None,
         })
         .unwrap();
         assert_eq!(limits.max_in_flight, 8);
         assert_eq!(limits.max_per_peer, 2);
         assert_eq!(limits.max_request_bytes, 4096);
+        assert_eq!(limits.max_response_bytes, 2 * MAX_REPLY_BYTES);
     }
 
     #[test]
@@ -431,6 +470,7 @@ mod tests {
                 max_in_flight: 1,
                 max_per_peer: 2,
                 max_request_bytes: 1,
+                ..MeshForwardLimits::default()
             }
             .validate()
             .is_err()
@@ -513,6 +553,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(future.as_mut().poll(&mut cx).is_pending());
         assert_eq!(control.snapshot().unwrap().request_bytes, 10);
+        assert_eq!(control.snapshot().unwrap().response_bytes_reserved, MAX_REPLY_BYTES);
         drop(future);
         assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
         assert!(control.reserve("a", 10).is_ok());
@@ -720,5 +761,138 @@ mod tests {
         old.complete(ForwardOutcome::AuthenticatedReply, now);
         assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
         assert!(control.reserve_at("a", 1, now).is_err());
+    }
+
+    #[test]
+    fn reply_budget_requires_room_for_one_full_reply() {
+        for bytes in [0, 1, MAX_REPLY_BYTES - 1] {
+            assert!(
+                MeshForwardLimits {
+                    max_response_bytes: bytes,
+                    ..MeshForwardLimits::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for bytes in [MAX_REPLY_BYTES, MAX_REPLY_BYTES + 1, usize::MAX] {
+            MeshForwardLimits {
+                max_response_bytes: bytes,
+                ..MeshForwardLimits::default()
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn reply_budget_alone_cannot_silently_select_host_first() {
+        assert!(
+            crate::mesh_routing::MeshRoutingSettings::from_lookup(|name| {
+                (name == MeshForwardLimits::RESPONSE_BYTES_ENV)
+                    .then(|| MAX_REPLY_BYTES.to_string())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reply_headroom_is_reserved_before_constructing_transport() {
+        let control = ForwardControl::new(MeshForwardLimits {
+            // A partial additional reply allowance cannot authorize a send.
+            max_response_bytes: 2 * MAX_REPLY_BYTES - 1,
+            ..MeshForwardLimits::default()
+        })
+        .unwrap();
+        let first = control.reserve("a", 1).unwrap();
+        let before = control.snapshot().unwrap();
+        assert_eq!(before.response_bytes_reserved, MAX_REPLY_BYTES);
+        let called = Cell::new(false);
+        let error = control
+            .execute("b", 1, || {
+                called.set(true);
+                pending()
+            })
+            .now_or_never()
+            .unwrap()
+            .unwrap_err();
+        assert!(!called.get());
+        assert!(error.safe_to_retry());
+        assert!(error.summary().contains("response_byte_limit"));
+        assert_eq!(control.snapshot().unwrap(), before);
+        drop(first);
+        let recovered = control.reserve("b", 1).unwrap();
+        drop(recovered);
+        assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
+    }
+
+    #[test]
+    fn reply_budget_cannot_consume_or_poison_a_recovery_probe() {
+        let control = ForwardControl::new(MeshForwardLimits {
+            max_response_bytes: MAX_REPLY_BYTES,
+            ..MeshForwardLimits::default()
+        })
+        .unwrap();
+        let now = Instant::now();
+        open_peer(&control, "a", now);
+        let occupied = control.reserve_at("b", 1, now).unwrap();
+        let retry_at = now + Duration::from_secs(5);
+        for _ in 0..4 {
+            let error = control.reserve_at("a", 1, retry_at).unwrap_err();
+            assert!(error.summary().contains("response_byte_limit"));
+        }
+        drop(occupied);
+        let probe = control.reserve_at("a", 1, retry_at).unwrap();
+        probe.complete(ForwardOutcome::AuthenticatedReply, retry_at);
+        assert!(control.reserve_at("a", 1, retry_at).is_ok());
+    }
+
+    #[test]
+    fn concurrent_reply_reservations_never_oversubscribe() {
+        let control = ForwardControl::new(MeshForwardLimits {
+            max_in_flight: 16,
+            max_per_peer: 16,
+            max_response_bytes: 3 * MAX_REPLY_BYTES,
+            ..MeshForwardLimits::default()
+        })
+        .unwrap();
+        let barrier = Barrier::new(16);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let permit = control.reserve("a", 1);
+                    if permit.is_ok() {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    barrier.wait();
+                    drop(permit);
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 3);
+        assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
+    }
+
+    #[test]
+    fn reply_budget_remainder_check_cannot_overflow() {
+        let control = ForwardControl::new(MeshForwardLimits {
+            max_response_bytes: usize::MAX,
+            ..MeshForwardLimits::default()
+        })
+        .unwrap();
+        // Exercise the arithmetic boundary without creating billions of jobs.
+        control.state.lock().unwrap().usage.response_bytes_reserved = usize::MAX - MAX_REPLY_BYTES;
+        let permit = control.reserve("a", 1).unwrap();
+        assert_eq!(control.snapshot().unwrap().response_bytes_reserved, usize::MAX);
+        let before = control.snapshot().unwrap();
+        assert!(control.reserve("b", 1).unwrap_err().summary().contains("response_byte_limit"));
+        assert_eq!(control.snapshot().unwrap(), before);
+        drop(permit);
+        assert_eq!(
+            control.snapshot().unwrap().response_bytes_reserved,
+            usize::MAX - MAX_REPLY_BYTES
+        );
     }
 }
