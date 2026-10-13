@@ -4,7 +4,8 @@
 //! than live host state. A caller supplies the audit-event chain, capability
 //! token evidence, and decision receipts captured with an operation. The
 //! explainer then derives a deterministic human-readable "why did this happen"
-//! narrative from those artifacts.
+//! narrative from those artifacts. Association is not authentication: callers
+//! must verify chain integrity and signatures independently before trusting it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,7 +64,7 @@ impl CausalExplanation {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "Connector {} invoked operation {} at time {} because:",
+            "Captured audit: Connector {} invoked operation {} at time {}. Associated evidence:",
             self.connector_id, self.operation_id, self.occurred_at
         );
         for (idx, reason) in self.reasons.iter().enumerate() {
@@ -115,6 +116,9 @@ pub enum ExplainError {
     /// No invocation-like audit entry could be selected.
     #[error("replay bundle does not contain an invocation audit entry")]
     NoInvocation,
+    /// Different entries claim the same selected invocation ID.
+    #[error("replay bundle contains conflicting entries for the selected invocation")]
+    ConflictingInvocation,
     /// JSON parsing failed.
     #[error("failed to parse replay bundle: {0}")]
     Parse(String),
@@ -220,13 +224,18 @@ pub fn parse_capability_tokens(input: &str) -> Result<Vec<Value>, ExplainError> 
         .collect()
 }
 
-/// Build a deterministic causal explanation from replay evidence.
+/// Explain the newest actual capability invocation in captured evidence.
+///
+/// Evidence must bind to the selected request, not merely share a connector.
+/// Missing revocation evidence is reported as unknown, never as proof that an
+/// issuer was intact. This function does not authenticate captured artifacts.
+/// Use [`explain_invocation`] to select an older invocation explicitly.
 ///
 /// # Errors
 ///
 /// Returns [`ExplainError::EmptyBundle`] when no replay evidence is present and
-/// [`ExplainError::NoInvocation`] when no invocation-like audit entry can be
-/// selected from the bundle.
+/// [`ExplainError::NoInvocation`] when no complete capability invocation is
+/// present, or [`ExplainError::ConflictingInvocation`] for conflicting IDs.
 pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, ExplainError> {
     if bundle.audit_entries.is_empty()
         && bundle.capability_tokens.is_empty()
@@ -236,6 +245,43 @@ pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, Explai
     }
 
     let invocation = select_invocation(&bundle.audit_entries).ok_or(ExplainError::NoInvocation)?;
+    explain_selected(bundle, invocation)
+}
+
+/// Explain exactly one invocation by its audit-entry ID.
+///
+/// Unlike [`explain_bundle`], this never silently selects another invocation
+/// when the requested ID is absent. IDs naming non-invocation events are also
+/// rejected. Duplicate identical captures are harmless; conflicting captures
+/// of the selected ID are rejected before evidence is associated.
+///
+/// # Errors
+///
+/// Returns [`ExplainError::NoInvocation`] if the ID has no complete invocation,
+/// or [`ExplainError::ConflictingInvocation`] if its captured entries disagree.
+pub fn explain_invocation(
+    bundle: &ReplayBundle,
+    invocation_id: &str,
+) -> Result<CausalExplanation, ExplainError> {
+    let invocation = bundle
+        .audit_entries
+        .iter()
+        .find(|entry| entry.id == invocation_id && is_invocation(entry))
+        .ok_or(ExplainError::NoInvocation)?;
+    explain_selected(bundle, invocation)
+}
+
+fn explain_selected(
+    bundle: &ReplayBundle,
+    invocation: &AuditEntry,
+) -> Result<CausalExplanation, ExplainError> {
+    if bundle
+        .audit_entries
+        .iter()
+        .any(|entry| entry.id == invocation.id && entry != invocation)
+    {
+        return Err(ExplainError::ConflictingInvocation);
+    }
     let connector_id = invocation
         .connector_id
         .clone()
@@ -248,21 +294,31 @@ pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, Explai
 
     let capability_token = select_capability_token(bundle, invocation);
     let admission_entry = select_admission_entry(&bundle.audit_entries, invocation);
-    let receipt = select_receipt(&bundle.receipts, invocation);
+    let receipt = select_receipt(bundle, invocation);
     let mut reasons = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings = vec![
+        "captured artifacts are not authenticated by this explanation; verify chain integrity and signatures separately"
+            .to_string(),
+    ];
+    let denied = receipt.is_some_and(|receipt| receipt.decision == Decision::Deny);
+    if denied {
+        warnings.push(
+            "a request-bound denial contradicts the recorded invocation; positive authorization evidence is not presented as its justification"
+                .to_string(),
+        );
+    }
 
-    if let Some(token) = capability_token {
+    if let Some(token) = capability_token.filter(|_| !denied) {
         reasons.push(capability_reason(token, invocation));
-    } else {
+    } else if !denied {
         warnings.push(format!(
             "no capability token matched connector {connector_id} operation {operation_id}"
         ));
     }
 
-    if let Some(entry) = admission_entry {
+    if let Some(entry) = admission_entry.filter(|_| !denied) {
         reasons.push(admission_reason(entry, invocation));
-    } else {
+    } else if !denied {
         warnings.push(format!(
             "no admission audit event matched invocation {}",
             invocation.id
@@ -273,12 +329,19 @@ pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, Explai
         reasons.push(receipt_reason(decision_receipt));
     } else {
         warnings.push(format!(
-            "no allow decision receipt matched invocation {}",
+            "no decision receipt matched invocation {}",
             invocation.id
         ));
     }
 
-    reasons.push(revocation_reason(bundle, invocation, capability_token));
+    if let Some(reason) = revocation_reason(bundle, invocation) {
+        reasons.push(reason);
+    } else {
+        warnings.push(
+            "no request-bound revocation evidence was captured; revocation status is unknown"
+                .to_string(),
+        );
+    }
 
     Ok(CausalExplanation {
         connector_id,
@@ -360,119 +423,180 @@ fn looks_like_bundle_object(value: &Value) -> bool {
 }
 
 fn select_invocation(entries: &[AuditEntry]) -> Option<&AuditEntry> {
-    entries.iter().max_by_key(|entry| {
-        (
-            invocation_score(entry),
-            entry.occurred_at,
-            entry.seq,
-            entry.id.as_str(),
-        )
-    })
+    entries
+        .iter()
+        .filter(|entry| is_invocation(entry))
+        .max_by_key(|entry| (entry.occurred_at, entry.seq, entry.id.as_str()))
 }
 
-fn invocation_score(entry: &AuditEntry) -> u8 {
-    let mut score = 0;
-    if entry.event_type == event_types::CAPABILITY_INVOKE {
-        score += 8;
-    }
-    if entry.connector_id.is_some() {
-        score += 2;
-    }
-    if entry.operation_id.is_some() {
-        score += 2;
-    }
-    if metadata_value_contains(&entry.metadata, "decision", "allow")
-        || metadata_value_contains(&entry.metadata, "admission", "allow")
-        || metadata_value_contains(&entry.metadata, "admitted", "true")
-    {
-        score += 1;
-    }
-    score
+fn is_invocation(entry: &AuditEntry) -> bool {
+    entry.event_type == event_types::CAPABILITY_INVOKE
+        && !entry.id.is_empty()
+        && !entry.actor.is_empty()
+        && !entry.zone_id.is_empty()
+        && entry.connector_id.as_deref().and_then(non_empty).is_some()
+        && entry.operation_id.as_deref().and_then(non_empty).is_some()
 }
 
 fn select_capability_token<'a>(
     bundle: &'a ReplayBundle,
     invocation: &AuditEntry,
 ) -> Option<&'a Value> {
-    bundle
+    let mut matching = bundle
         .capability_tokens
         .iter()
-        .find(|token| token_matches_invocation(token, invocation))
+        .filter(|token| token_matches_invocation(token, invocation))
+        .filter(|token| {
+            token_field(token, &["audit_entry_id", "invocation_audit_entry_id"])
+                == Ok(Some(invocation.id.as_str()))
+                || has_unique_request_context(&bundle.audit_entries, invocation)
+        });
+    let first = matching.next()?;
+    // Do not choose an arbitrary grant when two different captures both claim
+    // this request. Reordering a bundle must not change its justification.
+    matching.all(|token| token == first).then_some(first)
 }
 
 fn select_admission_entry<'a>(
     entries: &'a [AuditEntry],
     invocation: &'a AuditEntry,
 ) -> Option<&'a AuditEntry> {
-    // br-vs4nt completion: do NOT fall back to the invocation entry
-    // itself when no actual admission audit was recorded. Pre-fix the
-    // `.or(Some(invocation))` made `admission_entry` always Some, which
-    // suppressed the "no admission audit event matched" warning AND
-    // injected a misleading `AuditAdmission` reason claiming the
-    // invocation entry "recorded the admitted invocation". A bundle
-    // with NO real admission audit thus rendered as if admission had
-    // been confirmed before dispatch — exactly the cross-evidence
-    // borrowing pattern vs4nt closed for capability_token + receipt,
-    // missed for admission_entry.
-    entries.iter().find(|entry| {
-        entry_matches_invocation(entry, invocation)
-            && (entry.event_type.contains("admission")
-                || metadata_value_contains(&entry.metadata, "decision", "allow")
-                || metadata_value_contains(&entry.metadata, "admission", "allow")
-                || metadata_value_contains(&entry.metadata, "admitted", "true"))
-    })
+    if !has_unique_request_context(entries, invocation) {
+        return None;
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry_matches_invocation(entry, invocation)
+                && entry.id != invocation.id
+                && entry.seq < invocation.seq
+                && entry.occurred_at <= invocation.occurred_at
+                && entry.event_type == "capability.admission"
+        })
+        .max_by_key(|entry| (entry.seq, entry.occurred_at, entry.id.as_str()))
+        .filter(|entry| admission_allows(entry))
 }
 
 fn select_receipt<'a>(
-    receipts: &'a [DecisionReceipt],
+    bundle: &'a ReplayBundle,
     invocation: &AuditEntry,
 ) -> Option<&'a DecisionReceipt> {
-    receipts.iter().find(|receipt| {
-        receipt_matches_invocation(receipt, invocation) && receipt.decision.is_allow()
-    })
+    bundle
+        .receipts
+        .iter()
+        .filter(|receipt| receipt_matches_invocation(receipt, invocation))
+        .filter(|receipt| {
+            receipt.audit_entry_id.is_some()
+                || has_unique_request_context(&bundle.audit_entries, invocation)
+        })
+        .max_by_key(|receipt| {
+            // A denial must not disappear behind an earlier (or reordered)
+            // allow. Surface the contradiction instead of narrating success.
+            (
+                receipt.decision == Decision::Deny,
+                receipt.decided_at,
+                receipt.id.as_str(),
+            )
+        })
 }
 
 fn token_matches_invocation(token: &Value, invocation: &AuditEntry) -> bool {
-    field_matches(
-        token,
-        &["connector_id", "connector"],
-        invocation.connector_id.as_deref(),
-    ) && field_matches(
-        token,
-        &["operation_id", "operation", "op"],
-        invocation.operation_id.as_deref(),
-    ) && field_matches(
-        token,
-        &["correlation_id", "correlation"],
-        non_empty(invocation.correlation_id.as_str()),
-    )
+    if token_field(token, &["connector_id", "connector"])
+        != Ok(invocation.connector_id.as_deref())
+        || token_field(token, &["operation_id", "operation", "op"])
+            != Ok(invocation.operation_id.as_deref())
+        || token_field(token, &["zone_id", "zone"]) != Ok(Some(invocation.zone_id.as_str()))
+        || token_field(token, &["actor", "principal", "sub"])
+            != Ok(Some(invocation.actor.as_str()))
+        || !matches!(token_field(token, &["id", "token_id", "jti"]), Ok(Some(_)))
+    {
+        return false;
+    }
+    let Ok(reference) = token_field(token, &["audit_entry_id", "invocation_audit_entry_id"])
+    else {
+        return false;
+    };
+    let Ok(correlation) = token_field(token, &["correlation_id", "correlation"]) else {
+        return false;
+    };
+    if reference.is_some_and(|id| id != invocation.id)
+        || correlation.is_some_and(|id| id != invocation.correlation_id)
+    {
+        return false;
+    }
+    reference.is_some()
+        || (non_empty(&invocation.correlation_id).is_some()
+            && correlation == Some(invocation.correlation_id.as_str()))
 }
 
 fn entry_matches_invocation(entry: &AuditEntry, invocation: &AuditEntry) -> bool {
-    optional_str_matches(
-        entry.connector_id.as_deref(),
-        invocation.connector_id.as_deref(),
-    ) && optional_str_matches(
-        entry.operation_id.as_deref(),
-        invocation.operation_id.as_deref(),
-    ) && optional_str_matches(
-        non_empty(entry.correlation_id.as_str()),
-        non_empty(invocation.correlation_id.as_str()),
-    )
+    entry.zone_id == invocation.zone_id
+        && entry.actor == invocation.actor
+        && entry.connector_id == invocation.connector_id
+        && entry.operation_id == invocation.operation_id
+        && !invocation.correlation_id.is_empty()
+        && entry.correlation_id == invocation.correlation_id
 }
 
 fn receipt_matches_invocation(receipt: &DecisionReceipt, invocation: &AuditEntry) -> bool {
-    receipt.audit_entry_id.as_deref() == Some(invocation.id.as_str())
-        || (optional_str_matches(
-            receipt.connector_id.as_deref(),
-            invocation.connector_id.as_deref(),
-        ) && optional_str_matches(
-            receipt.operation_id.as_deref(),
-            invocation.operation_id.as_deref(),
-        ) && optional_str_matches(
-            receipt.correlation_id.as_deref(),
-            non_empty(invocation.correlation_id.as_str()),
-        ))
+    if receipt.zone_id != invocation.zone_id
+        || receipt.decided_at > invocation.occurred_at
+        || receipt.connector_id.as_ref().is_some_and(|id| {
+            Some(id) != invocation.connector_id.as_ref()
+        })
+        || receipt.operation_id.as_ref().is_some_and(|id| {
+            Some(id) != invocation.operation_id.as_ref()
+        })
+        || receipt
+            .correlation_id
+            .as_ref()
+            .is_some_and(|id| id != &invocation.correlation_id)
+    {
+        return false;
+    }
+    // An explicit reference is authoritative for association, never a hint
+    // that may fall back to correlation after naming a different invocation.
+    match receipt.audit_entry_id.as_deref() {
+        Some(id) => id == invocation.id,
+        None => {
+            !invocation.correlation_id.is_empty()
+                && receipt.correlation_id.as_deref()
+                    == Some(invocation.correlation_id.as_str())
+                && receipt.connector_id == invocation.connector_id
+                && receipt.operation_id == invocation.operation_id
+        }
+    }
+}
+
+fn has_unique_request_context(entries: &[AuditEntry], invocation: &AuditEntry) -> bool {
+    !invocation.correlation_id.is_empty()
+        && !entries.iter().any(|entry| {
+            is_invocation(entry)
+                && entry.id != invocation.id
+                && entry.zone_id == invocation.zone_id
+                && entry.correlation_id == invocation.correlation_id
+                && entry.connector_id == invocation.connector_id
+                && entry.operation_id == invocation.operation_id
+        })
+}
+
+fn admission_allows(entry: &AuditEntry) -> bool {
+    let mut saw_allow = false;
+    for key in ["decision", "admission", "admitted"] {
+        if let Some(value) = entry.metadata.get(key) {
+            let allowed = if key == "admitted" {
+                value.as_bool() == Some(true)
+                    || value.as_str().is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            } else {
+                value.as_str().is_some_and(|value| value.eq_ignore_ascii_case("allow"))
+            };
+            if !allowed {
+                return false;
+            }
+            saw_allow = true;
+        }
+    }
+    saw_allow
 }
 
 fn capability_reason(token: &Value, invocation: &AuditEntry) -> CausalReason {
@@ -480,10 +604,10 @@ fn capability_reason(token: &Value, invocation: &AuditEntry) -> CausalReason {
         .unwrap_or_else(|| "captured-token".to_string());
     let capability = value_string(token, &["capability_id", "capability", "cap"])
         .unwrap_or_else(|| "the required capability".to_string());
-    let issuer = value_string(token, &["issuer_kid", "issuer", "iss"])
-        .or_else(|| invocation.issuer_kid.as_ref().map(ToString::to_string));
+    // The audit entry's signer is not necessarily the capability's issuer.
+    let issuer = value_string(token, &["issuer_kid", "issuer", "iss"]);
     let mut statement = format!(
-        "capability token {token_id} granted {capability} for connector {} operation {}",
+        "captured capability token {token_id} declares {capability} for connector {} operation {}",
         invocation
             .connector_id
             .as_deref()
@@ -550,27 +674,29 @@ fn receipt_reason(receipt: &DecisionReceipt) -> CausalReason {
 fn revocation_reason(
     bundle: &ReplayBundle,
     invocation: &AuditEntry,
-    token: Option<&Value>,
-) -> CausalReason {
+) -> Option<CausalReason> {
     let relevant_revocations: Vec<&AuditEntry> = bundle
         .audit_entries
         .iter()
-        .filter(|entry| entry.event_type.contains("revocation"))
+        .filter(|entry| entry.event_type == event_types::REVOCATION_ISSUED)
         .filter(|entry| {
-            optional_str_matches(
-                non_empty(entry.correlation_id.as_str()),
-                non_empty(invocation.correlation_id.as_str()),
-            ) || optional_str_matches(
-                entry.connector_id.as_deref(),
-                invocation.connector_id.as_deref(),
-            )
+            entry_matches_invocation(entry, invocation)
+                && entry.occurred_at <= invocation.occurred_at
+                && entry.seq <= invocation.seq
+                && has_unique_request_context(&bundle.audit_entries, invocation)
         })
         .collect();
     let revocation_receipts: Vec<&DecisionReceipt> = bundle
         .receipts
         .iter()
         .filter(|receipt| {
-            receipt.decision == Decision::Deny && receipt.reason_code.contains("revocation")
+            receipt.decision == Decision::Deny
+                && receipt.reason_code.split('.').any(|part| {
+                    part.eq_ignore_ascii_case("revocation") || part.eq_ignore_ascii_case("revoked")
+                })
+                && receipt_matches_invocation(receipt, invocation)
+                && (receipt.audit_entry_id.is_some()
+                    || has_unique_request_context(&bundle.audit_entries, invocation))
         })
         .collect();
 
@@ -584,35 +710,55 @@ fn revocation_reason(
                 .iter()
                 .map(|receipt| format!("receipt:{}", receipt.id)),
         );
-        return CausalReason {
+        evidence.sort();
+        evidence.dedup();
+        return Some(CausalReason {
             kind: CausalReasonKind::RevocationCascade,
-            statement: "revocation cascade triggered for this replay bundle".to_string(),
+            statement: "captured revocation-related evidence is associated with this invocation"
+                .to_string(),
             evidence,
-        };
+        });
     }
 
-    let issuer = token
-        .and_then(|value| value_string(value, &["issuer_kid", "issuer", "iss"]))
-        .or_else(|| invocation.issuer_kid.as_ref().map(ToString::to_string))
-        .unwrap_or_else(|| "the captured issuer chain".to_string());
-    CausalReason {
-        kind: CausalReasonKind::RevocationCascade,
-        statement: format!(
-            "revocation cascade did not trigger because {issuer} remained intact in the replay evidence"
-        ),
-        evidence: vec![format!("audit_entry:{}", invocation.id)],
+    None
+}
+
+fn token_field<'a>(value: &'a Value, keys: &[&str]) -> Result<Option<&'a str>, ()> {
+    token_field_at_depth(value, keys, 0)
+}
+
+fn token_field_at_depth<'a>(
+    value: &'a Value,
+    keys: &[&str],
+    depth: usize,
+) -> Result<Option<&'a str>, ()> {
+    // Public entry-backed callers can construct Values without the JSON
+    // decoder's recursion limit. Bound traversal of envelope aliases too.
+    if depth > 16 {
+        return Err(());
     }
-}
-
-fn field_matches(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    value_string(value, keys).is_none_or(|actual| actual == expected)
-}
-
-fn optional_str_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
-    expected.is_none_or(|expected| actual.is_none_or(|actual| actual == expected))
+    let object = value.as_object().ok_or(())?;
+    let mut selected = None;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            let field = value.as_str().and_then(non_empty).ok_or(())?;
+            if selected.is_some_and(|existing| existing != field) {
+                return Err(());
+            }
+            selected = Some(field);
+        }
+    }
+    for wrapper in ["claims", "payload", "token", "capability_token", "capability"] {
+        if let Some(nested) = object.get(wrapper).filter(|value| value.is_object())
+            && let Some(field) = token_field_at_depth(nested, keys, depth + 1)?
+        {
+            if selected.is_some_and(|existing| existing != field) {
+                return Err(());
+            }
+            selected = Some(field);
+        }
+    }
+    Ok(selected)
 }
 
 const fn non_empty(value: &str) -> Option<&str> {
@@ -650,17 +796,6 @@ fn scalar_to_string(value: &Value) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
-}
-
-fn metadata_value_contains(
-    metadata: &std::collections::BTreeMap<String, Value>,
-    key: &str,
-    expected: &str,
-) -> bool {
-    metadata
-        .get(key)
-        .and_then(scalar_to_string)
-        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
 }
 
 fn reason_marker(idx: usize) -> char {
@@ -753,6 +888,9 @@ mod tests {
             "capability_id": "slack.messages.write",
             "connector_id": "fcp.slack",
             "operation_id": "chat.postMessage",
+            "zone_id": "z:work",
+            "actor": "user:alice",
+            "correlation_id": "corr-1",
             "issuer_kid": "kid-owner"
         });
         let bundle = ReplayBundle {
@@ -765,10 +903,11 @@ mod tests {
         let human = explanation.render_human();
 
         assert!(human.contains("Connector fcp.slack invoked operation chat.postMessage"));
-        assert!(human.contains("capability token tok-1 granted slack.messages.write"));
+        assert!(human.contains("capability token tok-1 declares slack.messages.write"));
         assert!(human.contains("confirmed admission"));
         assert!(human.contains("decision receipt receipt-allow-1 returned allow"));
-        assert!(human.contains("revocation cascade did not trigger"));
+        assert!(human.contains("revocation status is unknown"));
+        assert!(human.contains("not authenticated"));
     }
 
     #[test]
@@ -965,5 +1104,331 @@ mod tests {
         assert!(parse_replay_bundle(&duplicate).is_err());
         assert!(parse_replay_bundle("{\"audit_entries\":[],\"events\":[]}").is_err());
         assert!(parse_capability_tokens("{\"id\":\"a\"}\n{").is_err());
+    }
+
+    fn invocation() -> AuditEntry {
+        audit_entry(
+            10,
+            event_types::CAPABILITY_INVOKE,
+            Some("fcp.github"),
+            Some("issues.create"),
+            "request-a",
+            BTreeMap::new(),
+        )
+    }
+
+    fn bound_token(entry: &AuditEntry) -> Value {
+        serde_json::json!({
+            "id": "token-a",
+            "capability_id": "github.issues.write",
+            "connector_id": entry.connector_id,
+            "operation_id": entry.operation_id,
+            "zone_id": entry.zone_id,
+            "actor": entry.actor,
+            "correlation_id": entry.correlation_id,
+        })
+    }
+
+    fn admission() -> AuditEntry {
+        audit_entry(
+            9,
+            "capability.admission",
+            Some("fcp.github"),
+            Some("issues.create"),
+            "request-a",
+            BTreeMap::from([("decision".to_string(), serde_json::json!("allow"))]),
+        )
+    }
+
+    fn has_reason(explanation: &CausalExplanation, kind: CausalReasonKind) -> bool {
+        explanation.reasons.iter().any(|reason| reason.kind == kind)
+    }
+
+    #[test]
+    fn explicit_selection_never_substitutes_a_newer_invocation() {
+        let older = invocation();
+        let mut newer = older.clone();
+        newer.id = "newer-invocation".to_string();
+        newer.occurred_at += 1;
+        newer.correlation_id = "request-b".to_string();
+        let bundle = ReplayBundle {
+            audit_entries: vec![older.clone(), newer.clone()],
+            ..ReplayBundle::default()
+        };
+        assert_eq!(explain_bundle(&bundle).unwrap().invocation_audit_entry_id, newer.id);
+        assert_eq!(
+            explain_invocation(&bundle, &older.id).unwrap().invocation_audit_entry_id,
+            older.id
+        );
+        assert_eq!(explain_invocation(&bundle, "missing"), Err(ExplainError::NoInvocation));
+    }
+
+    #[test]
+    fn non_invocation_events_and_incomplete_scope_are_not_invocations() {
+        let valid = invocation();
+        for field in ["event_type", "id", "actor", "zone_id", "connector_id", "operation_id"] {
+            let mut entry = valid.clone();
+            match field {
+                "event_type" => entry.event_type = event_types::SECRET_ACCESS.to_string(),
+                "id" => entry.id.clear(),
+                "actor" => entry.actor.clear(),
+                "zone_id" => entry.zone_id.clear(),
+                "connector_id" => entry.connector_id = None,
+                _ => entry.operation_id = Some(String::new()),
+            }
+            let bundle = ReplayBundle { audit_entries: vec![entry], ..ReplayBundle::default() };
+            assert_eq!(explain_bundle(&bundle), Err(ExplainError::NoInvocation), "{field}");
+        }
+    }
+
+    #[test]
+    fn selected_id_conflicts_fail_but_identical_duplicates_are_safe() {
+        let entry = invocation();
+        let mut bundle = ReplayBundle {
+            audit_entries: vec![entry.clone(), entry.clone()],
+            ..ReplayBundle::default()
+        };
+        assert!(explain_invocation(&bundle, &entry.id).is_ok());
+        bundle.audit_entries[1].actor = "user:mallory".to_string();
+        assert_eq!(explain_bundle(&bundle), Err(ExplainError::ConflictingInvocation));
+        assert_eq!(explain_invocation(&bundle, &entry.id), Err(ExplainError::ConflictingInvocation));
+    }
+
+    #[test]
+    fn token_scope_must_be_present_and_match_exactly() {
+        let entry = invocation();
+        let token = bound_token(&entry);
+        assert!(token_matches_invocation(&token, &entry));
+        assert!(!token_matches_invocation(&serde_json::json!({}), &entry));
+        for field in ["id", "connector_id", "operation_id", "zone_id", "actor", "correlation_id"] {
+            let mut missing = token.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!token_matches_invocation(&missing, &entry), "missing {field}");
+            for value in [Value::Null, serde_json::json!(17), serde_json::json!("")] {
+                let mut malformed = token.clone();
+                malformed[field] = value;
+                assert!(!token_matches_invocation(&malformed, &entry), "malformed {field}");
+            }
+        }
+        for field in ["connector_id", "operation_id", "zone_id", "actor", "correlation_id"] {
+            let mut other = token.clone();
+            other[field] = serde_json::json!("another-request");
+            assert!(!token_matches_invocation(&other, &entry), "mismatched {field}");
+        }
+    }
+
+    #[test]
+    fn token_aliases_cannot_hide_conflicting_nested_scope() {
+        let entry = invocation();
+        let token = bound_token(&entry);
+        assert!(token_matches_invocation(&serde_json::json!({"claims": token}), &entry));
+        for nested in [
+            serde_json::json!({"zone": "z:private"}),
+            serde_json::json!({"sub": "user:mallory"}),
+            serde_json::json!({"op": false}),
+            serde_json::json!({"correlation": "request-b"}),
+            serde_json::json!({"jti": "other-token"}),
+        ] {
+            let mut conflicting = token.clone();
+            conflicting["claims"] = nested;
+            assert!(!token_matches_invocation(&conflicting, &entry));
+        }
+        let mut nested = token;
+        for _ in 0..18 {
+            nested = serde_json::json!({"claims": nested});
+        }
+        assert!(!token_matches_invocation(&nested, &entry));
+    }
+
+    #[test]
+    fn explicit_token_reference_works_without_correlation_but_never_overrides_conflicts() {
+        let mut entry = invocation();
+        entry.correlation_id.clear();
+        let mut token = bound_token(&entry);
+        token.as_object_mut().unwrap().remove("correlation_id");
+        token["audit_entry_id"] = serde_json::json!(entry.id);
+        assert!(token_matches_invocation(&token, &entry));
+        token["invocation_audit_entry_id"] = serde_json::json!("foreign-id");
+        assert!(!token_matches_invocation(&token, &entry));
+    }
+
+    #[test]
+    fn ambiguous_token_captures_are_not_selected_by_input_order() {
+        let entry = invocation();
+        let first = bound_token(&entry);
+        let mut second = first.clone();
+        second["id"] = serde_json::json!("token-b");
+        let mut bundle = ReplayBundle {
+            audit_entries: vec![entry.clone()],
+            capability_tokens: vec![first, second],
+            ..ReplayBundle::default()
+        };
+        assert!(select_capability_token(&bundle, &entry).is_none());
+        bundle.capability_tokens.reverse();
+        assert!(select_capability_token(&bundle, &entry).is_none());
+    }
+
+    #[test]
+    fn admission_requires_explicit_allow_without_conflicting_flags() {
+        let mut entry = admission();
+        assert!(admission_allows(&entry));
+        entry.metadata.insert("admitted".to_string(), serde_json::json!(false));
+        assert!(!admission_allows(&entry));
+        entry.metadata.clear();
+        assert!(!admission_allows(&entry));
+        entry.metadata.insert("admitted".to_string(), serde_json::json!(true));
+        assert!(admission_allows(&entry));
+    }
+
+    #[test]
+    fn admission_must_precede_dispatch_and_match_the_principal_and_zone() {
+        let target = invocation();
+        let valid = admission();
+        assert!(select_admission_entry(&[valid.clone(), target.clone()], &target).is_some());
+        for field in ["actor", "zone", "correlation", "time", "sequence", "type"] {
+            let mut other = valid.clone();
+            match field {
+                "actor" => other.actor = "user:mallory".to_string(),
+                "zone" => other.zone_id = "z:private".to_string(),
+                "correlation" => other.correlation_id.clear(),
+                "time" => other.occurred_at = target.occurred_at + 1,
+                "sequence" => other.seq = target.seq,
+                _ => other.event_type = "capability.admission.denied".to_string(),
+            }
+            assert!(select_admission_entry(&[other, target.clone()], &target).is_none(), "{field}");
+        }
+        let mut self_admitted = target.clone();
+        self_admitted.metadata = valid.metadata;
+        assert!(select_admission_entry(&[self_admitted.clone()], &self_admitted).is_none());
+    }
+
+    #[test]
+    fn a_later_denied_admission_does_not_reveal_an_earlier_allow() {
+        let target = invocation();
+        let mut allowed = admission();
+        allowed.seq = 8;
+        let mut denied = admission();
+        denied.id = "denied-admission".to_string();
+        denied.metadata.insert("decision".to_string(), serde_json::json!("deny"));
+        assert!(select_admission_entry(&[allowed, denied, target.clone()], &target).is_none());
+    }
+
+    #[test]
+    fn receipt_reference_cannot_fall_back_or_override_conflicting_scope() {
+        let target = invocation();
+        let receipt = allow_receipt(&target);
+        assert!(receipt_matches_invocation(&receipt, &target));
+        for field in ["reference", "zone", "connector", "operation", "correlation", "time"] {
+            let mut other = receipt.clone();
+            match field {
+                "reference" => other.audit_entry_id = Some("foreign-id".to_string()),
+                "zone" => other.zone_id = "z:private".to_string(),
+                "connector" => other.connector_id = Some("fcp.slack".to_string()),
+                "operation" => other.operation_id = Some("issues.delete".to_string()),
+                "correlation" => other.correlation_id = Some("request-b".to_string()),
+                _ => other.decided_at = target.occurred_at + 1,
+            }
+            assert!(!receipt_matches_invocation(&other, &target), "{field}");
+        }
+    }
+
+    #[test]
+    fn receipt_without_a_reference_requires_complete_correlation_scope() {
+        let target = invocation();
+        let mut receipt = allow_receipt(&target);
+        receipt.audit_entry_id = None;
+        assert!(receipt_matches_invocation(&receipt, &target));
+        receipt.connector_id = None;
+        assert!(!receipt_matches_invocation(&receipt, &target));
+        receipt.audit_entry_id = Some(target.id.clone());
+        receipt.operation_id = None;
+        receipt.correlation_id = None;
+        assert!(receipt_matches_invocation(&receipt, &target));
+    }
+
+    #[test]
+    fn denial_receipts_are_not_hidden_behind_allow_receipts() {
+        let target = invocation();
+        let mut denied = allow_receipt(&target);
+        denied.id = "denial".to_string();
+        denied.decision = Decision::Deny;
+        denied.reason_code = "capability.revoked".to_string();
+        denied.explanation = None;
+        let mut bundle = ReplayBundle {
+            audit_entries: vec![admission(), target.clone()],
+            capability_tokens: vec![bound_token(&target)],
+            receipts: vec![allow_receipt(&target), denied],
+        };
+        let first = explain_bundle(&bundle).unwrap();
+        assert!(!has_reason(&first, CausalReasonKind::CapabilityGrant));
+        assert!(!has_reason(&first, CausalReasonKind::AuditAdmission));
+        assert!(first.render_human().contains("returned deny"));
+        assert!(first.render_human().contains("contradicts"));
+        assert!(has_reason(&first, CausalReasonKind::RevocationCascade));
+        bundle.receipts.reverse();
+        assert_eq!(explain_bundle(&bundle).unwrap(), first);
+    }
+
+    #[test]
+    fn unrelated_revocations_do_not_contaminate_an_invocation() {
+        let target = invocation();
+        let mut revocation = admission();
+        revocation.event_type = event_types::REVOCATION_ISSUED.to_string();
+        revocation.zone_id = "z:private".to_string();
+        let mut receipt = allow_receipt(&target);
+        receipt.audit_entry_id = Some("other-invocation".to_string());
+        receipt.decision = Decision::Deny;
+        receipt.reason_code = "capability.revoked".to_string();
+        let bundle = ReplayBundle {
+            audit_entries: vec![revocation, target],
+            receipts: vec![receipt],
+            ..ReplayBundle::default()
+        };
+        let explanation = explain_bundle(&bundle).unwrap();
+        assert!(!has_reason(&explanation, CausalReasonKind::RevocationCascade));
+        assert!(explanation.render_human().contains("revocation status is unknown"));
+        assert!(!explanation.render_human().contains("remained intact"));
+    }
+
+    #[test]
+    fn revocation_witnesses_are_scoped_sorted_and_deduplicated() {
+        let target = invocation();
+        let mut revocation = admission();
+        revocation.event_type = event_types::REVOCATION_ISSUED.to_string();
+        let mut bundle = ReplayBundle {
+            audit_entries: vec![revocation.clone(), target.clone(), revocation],
+            ..ReplayBundle::default()
+        };
+        let explanation = explain_bundle(&bundle).unwrap();
+        let reason = explanation.reasons.iter().find(|reason| {
+            reason.kind == CausalReasonKind::RevocationCascade
+        }).unwrap();
+        assert_eq!(reason.evidence.len(), 1);
+        bundle.audit_entries.reverse();
+        assert_eq!(explain_bundle(&bundle).unwrap(), explanation);
+        bundle.audit_entries[0].occurred_at = target.occurred_at + 1;
+        bundle.audit_entries[2].seq = target.seq + 1;
+        assert!(revocation_reason(&bundle, &target).is_none());
+    }
+
+    #[test]
+    fn reused_correlation_requires_an_explicit_invocation_reference() {
+        let target = invocation();
+        let mut previous = target.clone();
+        previous.id = "previous-invocation".to_string();
+        previous.seq = 8;
+        let mut bundle = ReplayBundle {
+            audit_entries: vec![previous, admission(), target.clone()],
+            capability_tokens: vec![bound_token(&target)],
+            receipts: vec![allow_receipt(&target)],
+        };
+        let explanation = explain_invocation(&bundle, &target.id).unwrap();
+        assert!(!has_reason(&explanation, CausalReasonKind::CapabilityGrant));
+        assert!(!has_reason(&explanation, CausalReasonKind::AuditAdmission));
+        assert!(has_reason(&explanation, CausalReasonKind::DecisionReceipt));
+        bundle.capability_tokens[0]["audit_entry_id"] = serde_json::json!(target.id);
+        assert!(select_capability_token(&bundle, &target).is_some());
+        bundle.receipts[0].audit_entry_id = None;
+        assert!(select_receipt(&bundle, &target).is_none());
     }
 }
