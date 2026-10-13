@@ -10,6 +10,7 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
+use crate::connector_state_replication::runtime::ExportLookup;
 use crate::{
     ConnectorStateExportRequest, ConnectorStatePullRequest, ConnectorStatePullResponse,
     ConnectorStateReplicationService, HostError, HostResult,
@@ -110,7 +111,12 @@ fn stable_export_wire(wire: String, limit: usize) -> HostResult<String> {
     Ok(wire)
 }
 
+#[cfg(test)]
 fn encode_page(request: &PageRequest, wire: &str) -> HostResult<String> {
+    encode_page_with_digest(request, wire, blake3::hash(wire.as_bytes()).to_hex().as_str())
+}
+
+fn encode_page_with_digest(request: &PageRequest, wire: &str, digest: &str) -> HostResult<String> {
     request.validate()?;
     let total_bytes = wire.len();
     if total_bytes == 0
@@ -119,8 +125,7 @@ fn encode_page(request: &PageRequest, wire: &str) -> HostResult<String> {
     {
         return Err(invalid("connector-state export does not fit the requested page bounds"));
     }
-    let digest = blake3::hash(wire.as_bytes()).to_hex().to_string();
-    if request.wire_digest.as_ref().is_some_and(|expected| expected != &digest) {
+    if request.wire_digest.as_deref().is_some_and(|expected| expected != digest) {
         return Err(invalid("connector-state export changed between pages"));
     }
     let end = request.offset.saturating_add(PAGE_BYTES).min(total_bytes);
@@ -128,7 +133,7 @@ fn encode_page(request: &PageRequest, wire: &str) -> HostResult<String> {
         schema_version: PAGE_SCHEMA.to_owned(),
         request: request.clone(),
         total_bytes,
-        wire_digest: digest,
+        wire_digest: digest.to_owned(),
         // Offsets are bytes, not UTF-8 indices. Hex can split inside a scalar.
         data_hex: hex::encode(&wire.as_bytes()[request.offset..end]),
     };
@@ -196,11 +201,16 @@ impl Assembly {
 impl ConnectorStateReplicationService {
     /// Serve a complete v1 export or one bounded page of that same export.
     ///
-    /// The complete ancestry, exact-root grant and transport authority are
-    /// revalidated on every page. No server-side transfer session is created.
+    /// The exact-root grant and current transport authority are checked on every
+    /// page. Fully validated immutable exports are reused within this service,
+    /// keyed by peer and the complete export request, for at most 60 seconds.
+    /// The cache retains at most 16 entries / 16 MiB and does not extend age on
+    /// use. Expiry/eviction is lazy; no background worker or disk cache exists.
     /// A continuation pins a digest and fails if the serialized export changes.
-    /// This currently rereads the complete bounded ancestry for each page;
-    /// it is wire paging, not unbounded-history or delta replication.
+    /// A cache miss revalidates the complete bounded ancestry. Concurrent builds
+    /// of the same export fail fast instead of repeating reads and signatures.
+    /// No grant, writer pin or transport authority is inferred from the cache;
+    /// replicas are still independently validated before publication.
     ///
     /// # Errors
     /// Rejects malformed requests, stale authority and all ordinary export
@@ -225,11 +235,25 @@ impl ConnectorStateReplicationService {
             }
             ExportWireRequest::Page(page) => {
                 page.validate()?;
-                let wire = self.export_for_peer(
-                    authenticated_peer, &page.export, &authorize_transport,
-                ).await?;
-                let wire = stable_export_wire(wire, page.export.limits.max_wire_bytes)?;
-                let encoded = encode_page(&page, &wire)?;
+                self.validate_export(authenticated_peer, &page.export)?;
+                authorize_transport()?;
+                let permit = self.runtime.admit(authenticated_peer, page.export.limits)?;
+                let snapshot = match self.runtime.begin_export(&permit, &page.export)? {
+                    ExportLookup::Ready(snapshot) => snapshot,
+                    ExportLookup::Build(build) => {
+                        let wire = self.export_admitted(
+                            authenticated_peer, &page.export, &authorize_transport, &permit,
+                        ).await?;
+                        let wire = stable_export_wire(wire, page.export.limits.max_wire_bytes)?;
+                        self.validate_export(authenticated_peer, &page.export)?;
+                        authorize_transport()?;
+                        build.finish(wire)?
+                    }
+                };
+                let encoded = encode_page_with_digest(&page, snapshot.wire(), snapshot.digest())?;
+                // A cached byte string is neither a capability nor a freshness
+                // witness. Recheck after all work, including a cache hit.
+                self.validate_export(authenticated_peer, &page.export)?;
                 authorize_transport()?;
                 Ok(encoded)
             }
@@ -265,6 +289,11 @@ impl ConnectorStateReplicationService {
         Fut: Future<Output = HostResult<String>>,
         A: Fn() -> HostResult<()> + Send + Sync,
     {
+        self.validate_pull(request)?;
+        authorize_transport()?;
+        // Keep the same reservation through every page and the final import.
+        // Releasing/reacquiring here would admit unbounded partial assemblies.
+        let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
         let mut page = PageRequest::first(&request.request);
         let mut assembly = Assembly::default();
         // Every accepted page makes exact, nonzero progress. The total grant
@@ -282,7 +311,7 @@ impl ConnectorStateReplicationService {
             page.wire_digest.clone_from(&assembly.digest);
         }
         let wire = assembly.finish()?;
-        self.import_from_peer(request, &wire, authorize_transport).await
+        self.import_admitted(request, &wire, authorize_transport, &permit).await
     }
 }
 

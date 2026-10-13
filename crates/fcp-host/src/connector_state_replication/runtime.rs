@@ -4,13 +4,22 @@
 //! queue. Reservations cover declared canonical bytes, wire bytes and object
 //! counts, not allocator overhead. They end when the service future ends;
 //! already-admitted durable store work retains its own cancellation semantics.
+//!
+//! Validated immutable export snapshots have a separate bounded memory cache.
+//! Cache membership is not authorization. The service rechecks grants and peer
+//! continuity on every use. Snapshots expire by monotonic age, without extending
+//! their age on access, and are reclaimed lazily on cache activity or service drop.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use super::{ConnectorStateTransferLimits, validate_metadata};
+use super::{ConnectorStateExportRequest, ConnectorStateTransferLimits, validate_metadata};
 use crate::{HostError, HostResult};
 
+const MAX_CACHE_ENTRIES: usize = 16;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_ACTIVE: usize = 8;
 const MAX_PER_PEER: usize = 2;
 const MAX_CANONICAL_BYTES: usize = 16 * 1024 * 1024;
@@ -69,6 +78,7 @@ struct State {
 #[derive(Default)]
 pub(crate) struct TransferRuntime {
     state: Mutex<State>,
+    cache: Mutex<ExportCache>,
 }
 
 impl TransferRuntime {
@@ -80,8 +90,8 @@ impl TransferRuntime {
         Ok(state)
     }
 
-    /// Called only after grant and transport authorization. No future is
-    /// created, source read, or response decoded before successful admission.
+    /// Called after grant and transport authorization, before constructing
+    /// source work, starting a paged fetch, or decoding an export response.
     pub(crate) fn admit(
         &self,
         peer: &str,
@@ -106,12 +116,182 @@ impl TransferRuntime {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ExportKey {
+    peer: String,
+    // This is the complete bounded, typed request, not a peer-controlled cache
+    // ID. It binds the grant, connector, zone, instance, root and every limit.
+    request_json: String,
+}
+
+pub(crate) struct ExportSnapshot {
+    wire: String,
+    digest: String,
+    created_at: Instant,
+}
+
+impl ExportSnapshot {
+    pub(crate) fn wire(&self) -> &str { &self.wire }
+    pub(crate) fn digest(&self) -> &str { &self.digest }
+}
+
+#[derive(Default)]
+struct ExportCache {
+    ready: HashMap<ExportKey, Arc<ExportSnapshot>>,
+    building: HashSet<ExportKey>,
+    bytes: usize,
+    #[cfg(test)]
+    builds_started: u64,
+}
+
+impl ExportCache {
+    fn expire(&mut self, now: Instant) {
+        let mut bytes = 0;
+        self.ready.retain(|_, snapshot| {
+            // A caller may have sampled now just before another builder
+            // published under the cache lock. That is age zero, not expiry.
+            let fresh = now.checked_duration_since(snapshot.created_at)
+                .is_none_or(|age| age < CACHE_MAX_AGE);
+            if fresh { bytes += snapshot.wire.len(); }
+            fresh
+        });
+        self.bytes = bytes;
+    }
+
+    fn insert(&mut self, key: ExportKey, snapshot: Arc<ExportSnapshot>) {
+        self.expire(snapshot.created_at);
+        // A builder is unique for its exact key. Eviction does not invalidate
+        // an in-flight Arc: its live transfer still reserves the same wire
+        // budget until page encoding ends. Cache and active-wire bounds add.
+        while self.ready.len() >= MAX_CACHE_ENTRIES
+            || self.bytes + snapshot.wire.len() > MAX_CACHE_BYTES
+        {
+            let oldest = self.ready.iter()
+                .min_by_key(|(key, value)| (value.created_at, *key))
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break; };
+            if let Some(removed) = self.ready.remove(&oldest) {
+                self.bytes -= removed.wire.len();
+            }
+        }
+        self.bytes += snapshot.wire.len();
+        self.ready.insert(key, snapshot);
+    }
+}
+
+pub(crate) enum ExportLookup<'a> {
+    Ready(Arc<ExportSnapshot>),
+    Build(ExportBuild<'a>),
+}
+
+/// A cancelled or failed builder releases its key without publishing bytes.
+/// Duplicate builders fail immediately: they never queue or repeat ancestry
+/// verification while the same export is already being constructed.
+pub(crate) struct ExportBuild<'a> {
+    runtime: &'a TransferRuntime,
+    key: ExportKey,
+    max_wire_bytes: usize,
+}
+
+impl TransferRuntime {
+    pub(crate) fn begin_export<'a>(
+        &'a self,
+        permit: &'a TransferPermit<'_>,
+        request: &ConnectorStateExportRequest,
+    ) -> HostResult<ExportLookup<'a>> {
+        self.begin_export_at(permit, request, Instant::now())
+    }
+
+    fn begin_export_at<'a>(
+        &'a self,
+        permit: &'a TransferPermit<'_>,
+        request: &ConnectorStateExportRequest,
+        now: Instant,
+    ) -> HostResult<ExportLookup<'a>> {
+        permit.check(self, &permit.peer, request.limits)?;
+        let key = ExportKey { peer: permit.peer.clone(), request_json: request.to_json()? };
+        let mut cache = self.cache.lock().map_err(|_| unavailable())?;
+        cache.expire(now);
+        if let Some(snapshot) = cache.ready.get(&key) {
+            return Ok(ExportLookup::Ready(Arc::clone(snapshot)));
+        }
+        if cache.building.contains(&key) || cache.building.len() >= MAX_ACTIVE {
+            return Err(exhausted());
+        }
+        cache.building.insert(key.clone());
+        #[cfg(test)]
+        { cache.builds_started += 1; }
+        Ok(ExportLookup::Build(ExportBuild {
+            runtime: self, key, max_wire_bytes: request.limits.max_wire_bytes,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_builds_started(&self) -> u64 {
+        self.cache.lock().expect("test export cache").builds_started
+    }
+}
+
+impl ExportBuild<'_> {
+    /// Only the caller's fully validated, stably encoded export may be passed
+    /// here. Hash once before locking; neither I/O nor callbacks run in a lock.
+    pub(crate) fn finish(self, wire: String) -> HostResult<Arc<ExportSnapshot>> {
+        if wire.is_empty() || wire.len() > self.max_wire_bytes || wire.len() > MAX_CACHE_BYTES {
+            return Err(HostError::InvalidFilter("connector-state snapshot exceeds its bounds".to_owned()));
+        }
+        let digest = blake3::hash(wire.as_bytes()).to_hex().to_string();
+        let mut cache = self.runtime.cache.lock().map_err(|_| unavailable())?;
+        if !cache.building.contains(&self.key) {
+            return Err(unavailable());
+        }
+        // Stamp publication while serialized with other insertions. An older
+        // builder delayed before this lock must not expire a newer snapshot
+        // by presenting its earlier construction time as the current clock.
+        let snapshot = Arc::new(ExportSnapshot {
+            digest,
+            wire,
+            created_at: Instant::now(),
+        });
+        cache.insert(self.key.clone(), Arc::clone(&snapshot));
+        drop(cache);
+        Ok(snapshot)
+    }
+}
+
+impl Drop for ExportBuild<'_> {
+    fn drop(&mut self) {
+        let mut cache = match self.runtime.cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.building.remove(&self.key);
+    }
+}
+
 /// Owning a permit is necessary but never sufficient authority to transfer
 /// state. Grant expiry and peer continuity are still checked by the caller.
 pub(crate) struct TransferPermit<'a> {
     runtime: &'a TransferRuntime,
     peer: String,
     limits: ConnectorStateTransferLimits,
+}
+
+impl TransferPermit<'_> {
+    /// Internal helpers cannot use another service's or another-sized permit.
+    /// This checks resource ownership only, never grant or transport authority.
+    pub(crate) fn check(
+        &self,
+        runtime: &TransferRuntime,
+        peer: &str,
+        limits: ConnectorStateTransferLimits,
+    ) -> HostResult<()> {
+        if !std::ptr::eq(self.runtime, runtime) || self.peer != peer || self.limits != limits {
+            return Err(unavailable());
+        }
+        // A failure discovered after admission also fences internal reuse.
+        drop(runtime.lock()?);
+        Ok(())
+    }
 }
 
 impl Drop for TransferPermit<'_> {
@@ -284,6 +464,153 @@ mod tests {
             assert_eq!(count, MAX_ACTIVE);
             assert_eq!(active, MAX_ACTIVE);
         });
+        empty(&runtime);
+    }
+
+    fn export_request(grant: &str) -> ConnectorStateExportRequest {
+        ConnectorStateExportRequest {
+            grant_id: grant.to_owned(),
+            scope: super::super::ConnectorStateTransferScope {
+                connector_id: fcp_kernel::ConnectorId::from_static("slack:chat:v1"),
+                zone_id: fcp_kernel::ZoneId::work(),
+                instance_id: None,
+            },
+            root_object_id: fcp_kernel::ObjectId::from_bytes([1; 32]),
+            limits: small(),
+        }
+    }
+
+    fn build<'a>(runtime: &'a TransferRuntime, permit: &'a TransferPermit<'_>, request: &ConnectorStateExportRequest) -> ExportBuild<'a> {
+        match runtime.begin_export(permit, request).unwrap() {
+            ExportLookup::Build(build) => build,
+            ExportLookup::Ready(_) => panic!("expected a cache miss"),
+        }
+    }
+
+    #[test]
+    fn immutable_snapshots_are_reused_without_extending_their_age() {
+        let runtime = TransferRuntime::default();
+        let request = export_request("grant");
+        let permit = runtime.admit("peer", request.limits).unwrap();
+        let original = build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
+        let earlier_sample = original.created_at.checked_sub(Duration::from_nanos(1)).unwrap();
+        let ExportLookup::Ready(newer_publication) = runtime.begin_export_at(&permit, &request, earlier_sample).unwrap() else {
+            panic!("a sample taken before cache-lock acquisition cannot expire a newer publication");
+        };
+        assert!(Arc::ptr_eq(&original, &newer_publication));
+        let before_expiry = original.created_at + CACHE_MAX_AGE - Duration::from_nanos(1);
+        let ExportLookup::Ready(reused) = runtime.begin_export_at(&permit, &request, before_expiry).unwrap() else {
+            panic!("snapshot must remain available before its fixed expiry");
+        };
+        assert!(Arc::ptr_eq(&original, &reused));
+        assert_eq!(reused.digest(), blake3::hash(b"x").to_hex().as_str());
+        assert!(matches!(
+            runtime.begin_export_at(&permit, &request, original.created_at + CACHE_MAX_AGE).unwrap(),
+            ExportLookup::Build(_)
+        ));
+        assert_eq!(runtime.cache.lock().unwrap().bytes, 0);
+        assert_eq!(runtime.cache_builds_started(), 2);
+    }
+
+    #[test]
+    fn cancellation_or_failed_construction_never_pins_an_export_key() {
+        let runtime = TransferRuntime::default();
+        let request = export_request("grant");
+        let permit = runtime.admit("peer", request.limits).unwrap();
+        drop(build(&runtime, &permit, &request));
+        assert!(build(&runtime, &permit, &request).finish("too long".to_owned()).is_err());
+        assert!(runtime.cache.lock().unwrap().ready.is_empty());
+        assert!(runtime.cache.lock().unwrap().building.is_empty());
+        assert_eq!(build(&runtime, &permit, &request).finish("x".to_owned()).unwrap().wire(), "x");
+        assert!(runtime.cache.lock().unwrap().building.is_empty());
+    }
+
+    #[test]
+    fn same_export_has_one_builder_and_requires_a_matching_permit() {
+        let runtime = TransferRuntime::default();
+        let other = TransferRuntime::default();
+        let request = export_request("grant");
+        let first = runtime.admit("peer", request.limits).unwrap();
+        let second = runtime.admit("peer", request.limits).unwrap();
+        let builder = build(&runtime, &first, &request);
+        assert!(runtime.begin_export(&second, &request).is_err());
+        assert!(other.begin_export(&first, &request).is_err());
+        assert!(first.check(&runtime, "other-peer", request.limits).is_err());
+        let mut larger = request.clone();
+        larger.limits.max_wire_bytes = 2;
+        assert!(runtime.begin_export(&first, &larger).is_err());
+        let original = builder.finish("x".to_owned()).unwrap();
+        let ExportLookup::Ready(cached) = runtime.begin_export(&second, &request).unwrap() else {
+            panic!("second request must reuse the completed snapshot");
+        };
+        assert!(Arc::ptr_eq(&original, &cached));
+        assert_eq!(runtime.cache_builds_started(), 1);
+    }
+
+    #[test]
+    fn snapshot_keys_bind_peer_root_scope_grant_and_every_limit() {
+        let runtime = TransferRuntime::default();
+        let request = export_request("grant");
+        let permit = runtime.admit("peer", request.limits).unwrap();
+        build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
+        let original = serde_json::to_value(&request).unwrap();
+        for (pointer, value) in [
+            ("/grant_id", serde_json::json!("other-grant")),
+            ("/root_object_id", serde_json::json!("2".repeat(64))),
+            ("/scope/zone_id", serde_json::json!("z:private")),
+            ("/scope/connector_id", serde_json::json!("github:request_response:v1")),
+            ("/limits/max_objects", serde_json::json!(2)),
+            ("/limits/max_canonical_bytes", serde_json::json!(2)),
+            ("/limits/max_wire_bytes", serde_json::json!(2)),
+        ] {
+            let mut value_copy = original.clone();
+            *value_copy.pointer_mut(pointer).unwrap() = value;
+            let different: ConnectorStateExportRequest = serde_json::from_value(value_copy).unwrap();
+            let other_permit = runtime.admit("peer", different.limits).unwrap();
+            drop(build(&runtime, &other_permit, &different));
+        }
+        let mut instance = request.clone();
+        instance.scope.instance_id = Some(fcp_kernel::InstanceId::new());
+        drop(build(&runtime, &permit, &instance));
+        let other_peer = runtime.admit("other-peer", request.limits).unwrap();
+        drop(build(&runtime, &other_peer, &request));
+        let other_service = TransferRuntime::default();
+        let other_permit = other_service.admit("peer", request.limits).unwrap();
+        drop(build(&other_service, &other_permit, &request));
+    }
+
+    #[test]
+    fn snapshot_cache_evicts_to_both_byte_and_entry_budgets() {
+        for bytes in [1, 4 * 1024 * 1024] {
+            let runtime = TransferRuntime::default();
+            for index in 0..=MAX_CACHE_ENTRIES {
+                let mut request = export_request(&format!("grant-{index}"));
+                request.limits.max_wire_bytes = bytes;
+                let permit = runtime.admit("peer", request.limits).unwrap();
+                build(&runtime, &permit, &request).finish("x".repeat(bytes)).unwrap();
+                let cache = runtime.cache.lock().unwrap();
+                assert!(cache.ready.len() <= MAX_CACHE_ENTRIES);
+                assert!(cache.bytes <= MAX_CACHE_BYTES);
+                assert_eq!(cache.bytes, cache.ready.values().map(|snapshot| snapshot.wire.len()).sum::<usize>());
+            }
+            let expected_entries = MAX_CACHE_ENTRIES.min(MAX_CACHE_BYTES / bytes);
+            assert_eq!(runtime.cache.lock().unwrap().ready.len(), expected_entries);
+            empty(&runtime);
+        }
+    }
+
+    #[test]
+    fn a_poisoned_cache_never_returns_previously_valid_bytes() {
+        let runtime = TransferRuntime::default();
+        let request = export_request("grant");
+        let permit = runtime.admit("peer", request.limits).unwrap();
+        build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _lock = runtime.cache.lock().unwrap();
+            panic!("fixture poisoned export cache");
+        }).is_err());
+        assert!(runtime.begin_export(&permit, &request).is_err());
+        drop(permit);
         empty(&runtime);
     }
 }
