@@ -4,6 +4,8 @@
 //! A circuit never rewrites the outcome of an already-sent request. It only
 //! refuses later, not-yet-delivered forwards. Advertisements and HTTP status
 //! alone are not authenticated evidence that the invoke path is healthy.
+//! Retained peer history is bounded even when signed membership keeps rotating
+//! through new node IDs. Capacity pressure never evicts a live ticket or probe.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,6 +14,8 @@ use std::time::{Duration, Instant};
 const FAILURE_THRESHOLD: u8 = 3;
 const BASE_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_TRACKED_PEERS: usize = 16_384;
+const IDLE_HISTORY_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ForwardOutcome {
@@ -35,20 +39,39 @@ struct PeerCircuit {
     // Identity, not a wrapping integer counter. In-flight tickets retain
     // their generation, so an old allocation cannot be reused underneath one.
     generation: Arc<()>,
+    // Independent of generation: opening a circuit must not make tickets from
+    // the previous generation invisible to capacity reclamation. Every ticket
+    // pins this identity until its owning forward has finished dropping.
+    activity: Arc<()>,
+    last_activity: Instant,
 }
 
-impl Default for PeerCircuit {
-    fn default() -> Self {
+impl PeerCircuit {
+    fn new(now: Instant) -> Self {
         Self {
             mode: Mode::Closed,
             failures: 0,
             cooldown: BASE_COOLDOWN,
             generation: Arc::new(()),
+            activity: Arc::new(()),
+            last_activity: now,
         }
     }
-}
 
-impl PeerCircuit {
+    fn reclaimable(&self, now: Instant) -> bool {
+        if Arc::strong_count(&self.activity) != 1 {
+            return false;
+        }
+        match self.mode {
+            Mode::Probe => false,
+            Mode::Closed if self.failures == 0 => true,
+            Mode::Open { retry_at } if now < retry_at => false,
+            Mode::Closed | Mode::Open { .. } => {
+                now.saturating_duration_since(self.last_activity) >= IDLE_HISTORY_RETENTION
+            }
+        }
+    }
+
     fn open(&mut self, now: Instant, reason: &'static str) -> CircuitTransition {
         self.generation = Arc::new(());
         self.mode = Mode::Open {
@@ -65,6 +88,7 @@ impl PeerCircuit {
 #[derive(Debug)]
 pub(super) struct CircuitTicket {
     generation: Arc<()>,
+    activity: Arc<()>,
     probe: bool,
 }
 
@@ -75,11 +99,22 @@ pub(super) struct CircuitTransition {
     pub(super) cooldown_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct CircuitBook {
     // Only directory-resolved peers reach the transport admission path.
-    // Entries do not grow with request ids, connector ids, or payload data.
+    // Membership churn can still introduce unlimited distinct node IDs over
+    // time, so directory size alone is not a bound on retained circuit state.
     peers: BTreeMap<String, PeerCircuit>,
+    capacity: usize,
+}
+
+impl Default for CircuitBook {
+    fn default() -> Self {
+        Self {
+            peers: BTreeMap::new(),
+            capacity: MAX_TRACKED_PEERS,
+        }
+    }
 }
 
 impl CircuitBook {
@@ -90,7 +125,23 @@ impl CircuitBook {
         peer: &str,
         now: Instant,
     ) -> Result<CircuitTicket, &'static str> {
-        let circuit = self.peers.entry(peer.to_owned()).or_default();
+        if !self.peers.contains_key(peer) && self.peers.len() >= self.capacity {
+            // Scan only at capacity for a new identity; established peers keep
+            // logarithmic admission. Never discard a cooldown to create room.
+            // Oldest reclaimable history wins, with node-id order breaking ties.
+            let victim = self
+                .peers
+                .iter()
+                .filter(|(_, circuit)| circuit.reclaimable(now))
+                .min_by_key(|(_, circuit)| circuit.last_activity)
+                .map(|(node_id, _)| node_id.clone())
+                .ok_or("peer_circuit_capacity")?;
+            self.peers.remove(&victim);
+        }
+        let circuit = self
+            .peers
+            .entry(peer.to_owned())
+            .or_insert_with(|| PeerCircuit::new(now));
         let probe = match circuit.mode {
             Mode::Closed => false,
             Mode::Open { retry_at } if now >= retry_at => true,
@@ -100,8 +151,12 @@ impl CircuitBook {
         if probe {
             circuit.mode = Mode::Probe;
         }
+        // Concurrent callers can sample their clocks before acquiring the
+        // admission mutex, so observations need not arrive in time order.
+        circuit.last_activity = circuit.last_activity.max(now);
         Ok(CircuitTicket {
             generation: Arc::clone(&circuit.generation),
+            activity: Arc::clone(&circuit.activity),
             probe,
         })
     }
@@ -116,6 +171,10 @@ impl CircuitBook {
         now: Instant,
     ) -> Option<CircuitTransition> {
         let circuit = self.peers.get_mut(peer)?;
+        if !Arc::ptr_eq(&circuit.activity, &ticket.activity) {
+            return None;
+        }
+        circuit.last_activity = circuit.last_activity.max(now);
         if !Arc::ptr_eq(&circuit.generation, &ticket.generation) {
             return None;
         }
@@ -346,5 +405,176 @@ mod tests {
         }
         assert_eq!(book.peers["a"].failures, 0);
         assert!(book.reserve("a", now).is_ok());
+    }
+
+    fn bounded_book(capacity: usize) -> CircuitBook {
+        assert!(capacity > 0);
+        CircuitBook {
+            capacity,
+            ..CircuitBook::default()
+        }
+    }
+
+    #[test]
+    fn capacity_refusal_preserves_live_tickets_and_existing_peer_admission() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        let ticket = book.reserve("a", now).unwrap();
+        assert_eq!(book.reserve("b", now).unwrap_err(), "peer_circuit_capacity");
+        assert_eq!(book.peers.len(), 1);
+        assert!(Arc::ptr_eq(&book.peers["a"].generation, &ticket.generation));
+        let second = book.reserve("a", now).unwrap();
+        drop(second);
+        book.complete("a", &ticket, None, now);
+        drop(ticket);
+        assert!(book.reserve("b", now).is_ok());
+        assert_eq!(book.peers.len(), 1);
+        assert!(!book.peers.contains_key("a"));
+    }
+
+    #[test]
+    fn healthy_idle_history_is_reclaimed_in_deterministic_oldest_order() {
+        let mut book = bounded_book(2);
+        let now = Instant::now();
+        // Insert in reverse lexical order to pin the tie-breaker independently
+        // of insertion order. No failure history needs to be retained here.
+        for peer in ["b", "a"] {
+            let ticket = book.reserve(peer, now).unwrap();
+            book.complete(peer, &ticket, Some(ForwardOutcome::AuthenticatedReply), now);
+        }
+        let c = book.reserve("c", now).unwrap();
+        assert!(!book.peers.contains_key("a"));
+        assert!(book.peers.contains_key("b"));
+        book.complete("c", &c, None, now + Duration::from_secs(1));
+        drop(c);
+        assert!(book.reserve("d", now + Duration::from_secs(2)).is_ok());
+        assert!(!book.peers.contains_key("b"));
+        assert!(book.peers.contains_key("c"));
+        assert_eq!(book.peers.len(), 2);
+    }
+
+    #[test]
+    fn failure_history_survives_pressure_until_idle_retention_boundary() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        fail_three(&mut book, "a", now);
+        for elapsed in [
+            Duration::ZERO,
+            BASE_COOLDOWN,
+            IDLE_HISTORY_RETENTION - Duration::from_nanos(1),
+        ] {
+            assert_eq!(
+                book.reserve("b", now + elapsed).unwrap_err(),
+                "peer_circuit_capacity"
+            );
+        }
+        assert_eq!(book.peers["a"].failures, FAILURE_THRESHOLD);
+        assert!(matches!(book.peers["a"].mode, Mode::Open { .. }));
+        assert!(book.reserve("b", now + IDLE_HISTORY_RETENTION).is_ok());
+        assert!(!book.peers.contains_key("a"));
+    }
+
+    #[test]
+    fn partial_failure_streak_and_recent_probe_cancellation_are_retained() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        let ticket = book.reserve("a", now).unwrap();
+        book.complete("a", &ticket, Some(ForwardOutcome::Unavailable), now);
+        drop(ticket);
+        assert_eq!(book.reserve("b", now).unwrap_err(), "peer_circuit_capacity");
+        assert_eq!(book.peers["a"].failures, 1);
+        for _ in 0..2 {
+            let ticket = book.reserve("a", now).unwrap();
+            book.complete("a", &ticket, Some(ForwardOutcome::Unavailable), now);
+        }
+        let later = now + IDLE_HISTORY_RETENTION;
+        let probe = book.reserve("a", later).unwrap();
+        assert_eq!(
+            book.reserve("b", later + IDLE_HISTORY_RETENTION).unwrap_err(),
+            "peer_circuit_capacity",
+            "a live recovery probe must never be reclaimed"
+        );
+        let cancelled_at = later + IDLE_HISTORY_RETENTION;
+        book.complete("a", &probe, None, cancelled_at);
+        drop(probe);
+        assert_eq!(
+            book.reserve("b", cancelled_at + BASE_COOLDOWN).unwrap_err(),
+            "peer_circuit_capacity"
+        );
+        assert!(book.reserve("b", cancelled_at + IDLE_HISTORY_RETENTION).is_ok());
+    }
+
+    #[test]
+    fn generation_rotation_cannot_hide_an_old_live_ticket_from_reclamation() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        let old = book.reserve("a", now).unwrap();
+        fail_three(&mut book, "a", now);
+        let recovered_at = now + BASE_COOLDOWN;
+        let probe = book.reserve("a", recovered_at).unwrap();
+        book.complete("a", &probe, Some(ForwardOutcome::AuthenticatedReply), recovered_at);
+        drop(probe);
+        assert!(!Arc::ptr_eq(&book.peers["a"].generation, &old.generation));
+        assert_eq!(
+            book.reserve("b", now + IDLE_HISTORY_RETENTION).unwrap_err(),
+            "peer_circuit_capacity"
+        );
+        assert!(
+            book.complete("a", &old, Some(ForwardOutcome::InvalidReply), recovered_at)
+                .is_none()
+        );
+        assert_eq!(book.peers["a"].failures, 0);
+        drop(old);
+        assert!(book.reserve("b", recovered_at).is_ok());
+    }
+
+    #[test]
+    fn clock_observation_reordering_cannot_age_history_prematurely() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        let later = now + IDLE_HISTORY_RETENTION;
+        let first = book.reserve("a", now).unwrap();
+        let second = book.reserve("a", later).unwrap();
+        book.complete("a", &second, Some(ForwardOutcome::Unavailable), later);
+        drop(second);
+        book.complete("a", &first, Some(ForwardOutcome::Unavailable), now);
+        drop(first);
+        assert_eq!(book.peers["a"].last_activity, later);
+        assert_eq!(book.reserve("b", later).unwrap_err(), "peer_circuit_capacity");
+        assert!(book.reserve("b", later + IDLE_HISTORY_RETENTION).is_ok());
+    }
+
+    #[test]
+    fn membership_churn_cannot_grow_retained_state_past_capacity() {
+        let mut book = bounded_book(3);
+        let now = Instant::now();
+        let pinned = book.reserve("pinned", now).unwrap();
+        for index in 0..1000 {
+            let peer = format!("rotating-peer-{index}");
+            let ticket = book.reserve(&peer, now).unwrap();
+            book.complete(&peer, &ticket, Some(ForwardOutcome::AuthenticatedReply), now);
+            drop(ticket);
+            assert!(book.peers.len() <= 3);
+            assert!(Arc::ptr_eq(&book.peers["pinned"].activity, &pinned.activity));
+        }
+        assert_eq!(book.peers.len(), 3);
+    }
+
+    #[test]
+    fn capacity_pressure_does_not_steal_a_ready_recovery_probe() {
+        let mut book = bounded_book(1);
+        let now = Instant::now();
+        fail_three(&mut book, "a", now);
+        let retry_at = now + BASE_COOLDOWN;
+        assert_eq!(book.reserve("b", retry_at).unwrap_err(), "peer_circuit_capacity");
+        let probe = book.reserve("a", retry_at).unwrap();
+        assert!(probe.probe);
+        assert_eq!(
+            book.reserve("a", retry_at).unwrap_err(),
+            "peer_recovery_probe_in_flight"
+        );
+        book.complete("a", &probe, Some(ForwardOutcome::AuthenticatedReply), retry_at);
+        drop(probe);
+        assert!(book.reserve("b", retry_at).is_ok());
     }
 }
