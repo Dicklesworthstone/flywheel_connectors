@@ -121,6 +121,84 @@ fn reconnect_delay_for_error(handler: &ReconnectHandler, err: &StreamError) -> D
     })
 }
 
+/// A 204 is the server's explicit stop signal, not a reconnectable EOF.
+/// Other successful statuses and non-SSE bodies must never reach the parser.
+fn sse_response_should_stop(
+    status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+) -> StreamResult<bool> {
+    if status == 204 {
+        return Ok(true);
+    }
+    if status != 200 {
+        return Err(http_error_from_head(status, reason.to_owned(), headers));
+    }
+    let mut content_types = headers.iter().filter(|(key, _)| key.eq_ignore_ascii_case("content-type"));
+    let valid_type = content_types.next().is_some_and(|(_, value)| {
+        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case(SSE_MIME_TYPE))
+    });
+    if !valid_type || content_types.next().is_some() {
+        return Err(StreamError::SseError("expected one text/event-stream Content-Type".to_owned()));
+    }
+    Ok(false)
+}
+
+/// FCP deliberately retains retries for transient HTTP failures, unlike the
+/// browser EventSource API. Authentication, protocol and retention failures
+/// are permanent; an unchanged request must not loop or hide them.
+fn sse_error_can_reconnect(error: &StreamError) -> bool {
+    if error.is_terminal_backpressure() {
+        return false;
+    }
+    match error {
+        StreamError::HttpError { status, .. } => matches!(*status, 408 | 425 | 429 | 500..=599),
+        StreamError::BufferOverflow { .. }
+        | StreamError::ParseError(_)
+        | StreamError::SseError(_)
+        | StreamError::InvalidState(_)
+        | StreamError::ReconnectLimitExceeded { .. } => false,
+        _ => true,
+    }
+}
+
+fn sse_request_headers(
+    config: &SseConfig,
+    explicit_id: Option<&str>,
+) -> StreamResult<(Vec<(String, String)>, Option<String>)> {
+    let mut configured_ids = config.headers.iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(LAST_EVENT_ID_HEADER));
+    let id = if let Some(explicit) = explicit_id {
+        // Some("") is a reset, not permission to reuse a configured old ID.
+        Some(explicit)
+    } else {
+        let configured = configured_ids.next().map(|(_, value)| value.as_str());
+        if configured_ids.next().is_some() {
+            return Err(StreamError::SseError("ambiguous Last-Event-ID configuration".to_owned()));
+        }
+        configured
+    };
+    if let Some(id) = id {
+        if id.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+            return Err(StreamError::SseError("invalid Last-Event-ID characters".to_owned()));
+        }
+        if let Some(error) = retained_buffer_overflow(0, id.len().saturating_mul(2), config.max_buffer_size) {
+            return Err(error);
+        }
+    }
+    let mut headers = vec![
+        (ACCEPT_HEADER.to_owned(), SSE_MIME_TYPE.to_owned()),
+        (CACHE_CONTROL_HEADER.to_owned(), NO_CACHE_VALUE.to_owned()),
+    ];
+    if let Some(id) = id.filter(|id| !id.is_empty()) {
+        headers.push((LAST_EVENT_ID_HEADER.to_owned(), id.to_owned()));
+    }
+    headers.extend(config.headers.iter()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case(LAST_EVENT_ID_HEADER))
+        .map(|(key, value)| (key.clone(), value.clone())));
+    Ok((headers, id.map(str::to_owned)))
+}
+
 /// SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -251,6 +329,9 @@ struct SseParser {
     /// First rejected retained size. Poisoning is sticky: no partial event may
     /// be completed with bytes received after a discarded chunk or field.
     overflow: Option<usize>,
+    first_line: bool,
+    /// Persistent server reconnect hint, including standalone retry fields.
+    reconnect_retry: Option<u64>,
 }
 
 impl SseParser {
@@ -274,6 +355,8 @@ impl SseParser {
             max_data_bytes: clamp_sse_buffer_size(max_data_bytes),
             pending_cr_swallows_lf: false,
             overflow: None,
+            first_line: true,
+            reconnect_retry: None,
         }
     }
 
@@ -321,6 +404,12 @@ impl SseParser {
             self.parse_cursor = 0;
 
             let line_str = String::from_utf8_lossy(&line);
+            let line_str = if self.first_line {
+                self.first_line = false;
+                line_str.strip_prefix('\u{feff}').unwrap_or(&line_str)
+            } else {
+                &line_str
+            };
 
             if line_str.is_empty() {
                 // Empty line = dispatch event
@@ -330,7 +419,7 @@ impl SseParser {
             } else if line_str.starts_with(':') {
                 // Comment, ignore
             } else {
-                self.process_field(&line_str);
+                self.process_field(line_str);
             }
 
             if self.overflow.is_some() {
@@ -388,8 +477,12 @@ impl SseParser {
                 }
             }
             "retry" => {
-                if let Ok(ms) = value.parse() {
+                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    // Arbitrarily large digit strings remain a valid hint;
+                    // the reconnect policy bounds them to its local ceiling.
+                    let ms = value.parse().unwrap_or(u64::MAX);
                     self.retry = Some(ms);
+                    self.reconnect_retry = Some(ms);
                 }
             }
             _ => {} // Unknown field, ignore
@@ -401,18 +494,22 @@ impl SseParser {
         if self.overflow.is_some() {
             return None;
         }
-        if self.data_lines.is_empty() {
-            // Reset state but don't dispatch
-            self.event_type = None;
-            return None;
-        }
-
         if self.event_id.is_some()
             && !self.reserve_retained(
                 self.last_event_id.as_ref().map_or(0, String::len),
                 self.event_id.as_ref().map_or(0, String::len),
             )
         {
+            return None;
+        }
+
+        // A complete id-only block updates the resume cursor without
+        // manufacturing a data event. An unterminated block does not.
+        if self.event_id.is_some() {
+            self.last_event_id.clone_from(&self.event_id);
+        }
+        if self.data_lines.is_empty() {
+            self.event_type = None;
             return None;
         }
 
@@ -423,11 +520,6 @@ impl SseParser {
             id: self.event_id.clone(),
             retry: self.retry.take(),
         };
-
-        // Update last event ID
-        if event.id.is_some() {
-            self.last_event_id.clone_from(&event.id);
-        }
 
         self.data_lines.clear();
         self.data_retained_bytes = 0;
@@ -755,7 +847,8 @@ impl SseClient {
     /// Connect and return an event stream.
     ///
     /// # Errors
-    /// Returns a stream error if the HTTP request fails or returns a non-2xx status.
+    /// Returns an error for a failed request, non-SSE response, or invalid
+    /// resumption headers. HTTP 204 returns a permanently closed stream.
     pub async fn connect(&self) -> StreamResult<SseStream> {
         self.connect_with_last_id(None).await
     }
@@ -763,25 +856,13 @@ impl SseClient {
     /// Connect with a last event ID for resumption.
     ///
     /// # Errors
-    /// Returns a stream error if the HTTP request fails or returns a non-2xx status.
+    /// Returns an error for a failed request, non-SSE response, or invalid
+    /// resumption headers. An explicit empty ID suppresses Last-Event-ID.
     pub async fn connect_with_last_id(
         &self,
         last_event_id: Option<&str>,
     ) -> StreamResult<SseStream> {
-        let mut headers = vec![
-            (ACCEPT_HEADER.to_string(), SSE_MIME_TYPE.to_string()),
-            (CACHE_CONTROL_HEADER.to_string(), NO_CACHE_VALUE.to_string()),
-        ];
-        if let Some(id) = last_event_id {
-            headers.push((LAST_EVENT_ID_HEADER.to_string(), id.to_string()));
-        }
-
-        headers.extend(
-            self.config
-                .headers
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        let (headers, resume_id) = sse_request_headers(&self.config, last_event_id)?;
 
         let cx = fcp_async_core::compatibility_cx();
         let request =
@@ -797,16 +878,15 @@ impl SseClient {
             request.await?
         };
 
-        if !(200..300).contains(&response.head.status) {
-            let head = response.head;
-            return Err(http_error_from_head(
-                head.status,
-                head.reason,
-                &head.headers,
-            ));
+        let stop = sse_response_should_stop(response.head.status, &response.head.reason, &response.head.headers)?;
+        let mut stream = SseStream::new(response.body, self.config.max_buffer_size);
+        stream.seed_resume_id(resume_id);
+        if stop {
+            stream.inner.body = None;
+            stream.terminated = true;
+            stream.stop_reconnecting = true;
         }
-
-        Ok(SseStream::new(response.body, self.config.max_buffer_size))
+        Ok(stream)
     }
 
     /// Get the URL.
@@ -889,6 +969,7 @@ pin_project! {
         pending_events: VecDeque<SseEvent>,
         delivered_event_id: Option<String>,
         terminated: bool,
+        stop_reconnecting: bool,
     }
 }
 
@@ -902,11 +983,19 @@ impl SseStream {
             pending_events: VecDeque::new(),
             delivered_event_id: None,
             terminated: false,
+            stop_reconnecting: false,
         }
+    }
+
+    fn seed_resume_id(&mut self, id: Option<String>) {
+        self.parser.event_id.clone_from(&id);
+        self.parser.last_event_id.clone_from(&id);
+        self.delivered_event_id = id;
     }
 
     /// Get the last delivered event ID, never a cursor ahead of queued events.
     /// Delivery is not an application-level acknowledgement or durable commit.
+    /// Complete id-only blocks are applied after earlier queued events drain.
     #[must_use]
     pub fn last_event_id(&self) -> Option<&str> {
         self.delivered_event_id.as_deref()
@@ -941,6 +1030,8 @@ impl Stream for SseStream {
                 *this.terminated = true;
                 return Poll::Ready(Some(Err(error)));
             }
+            // No queued event can be skipped by a later id-only control block.
+            this.delivered_event_id.clone_from(&this.parser.last_event_id);
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(data))) => {
                     *this.pending_events = this.parser.parse(&data).into();
@@ -977,6 +1068,7 @@ pub struct ReconnectingSseStream {
     handler: ReconnectHandler,
     state: ReconnectState,
     last_event_id: Option<String>,
+    retry_hint: Option<Duration>,
 }
 
 enum ReconnectState {
@@ -1017,6 +1109,7 @@ impl ReconnectingSseStream {
             handler: ReconnectHandler::new(config),
             state: ReconnectState::Idle,
             last_event_id: None,
+            retry_hint: None,
         }
     }
 
@@ -1025,6 +1118,20 @@ impl ReconnectingSseStream {
             self.last_event_id = Some(id.clone());
         }
         self.handler.reset();
+    }
+
+    fn observe_stream_controls(&mut self, stream: &SseStream) {
+        if let Some(retry) = stream.parser.reconnect_retry {
+            self.retry_hint = Some(Duration::from_millis(retry).min(self.handler.config().max_delay));
+        }
+    }
+
+    fn reconnect_delay(&self, error: Option<&StreamError>) -> Duration {
+        let base = error.map_or_else(
+            || self.handler.config().delay_for_attempt(self.handler.attempts()),
+            |error| reconnect_delay_for_error(&self.handler, error),
+        );
+        self.retry_hint.map_or(base, |hint| base.max(hint).min(self.handler.config().max_delay))
     }
 }
 
@@ -1048,17 +1155,18 @@ impl Stream for ReconnectingSseStream {
                 ReconnectState::Terminated => return Poll::Ready(None),
                 ReconnectState::Connecting(future) => match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(stream)) => {
+                        if stream.stop_reconnecting {
+                            self.state = ReconnectState::Terminated;
+                            return Poll::Ready(None);
+                        }
                         self.state = ReconnectState::Connected(Box::new(stream));
                     }
                     Poll::Ready(Err(err)) => {
-                        if err.is_terminal_backpressure()
-                            || matches!(err, StreamError::BufferOverflow { .. })
-                            || !self.handler.can_reconnect()
-                        {
+                        if !sse_error_can_reconnect(&err) || !self.handler.can_reconnect() {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = reconnect_delay_for_error(&self.handler, &err);
+                        let delay = self.reconnect_delay(Some(&err));
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1077,33 +1185,33 @@ impl Stream for ReconnectingSseStream {
                 }
                 ReconnectState::Receiving(future) => match future.as_mut().poll(cx) {
                     Poll::Ready((stream, Some(Ok(event)))) => {
+                        self.observe_stream_controls(&stream);
                         self.note_event_received(&event);
                         self.state = ReconnectState::Connected(stream);
                         return Poll::Ready(Some(Ok(event)));
                     }
                     Poll::Ready((stream, Some(Err(err)))) => {
+                        self.observe_stream_controls(&stream);
+                        self.last_event_id = stream.last_event_id().map(str::to_owned);
                         drop(stream);
-                        if err.is_terminal_backpressure()
-                            || matches!(err, StreamError::BufferOverflow { .. })
-                            || !self.handler.can_reconnect()
-                        {
+                        if !sse_error_can_reconnect(&err) || !self.handler.can_reconnect() {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
-                        let delay = reconnect_delay_for_error(&self.handler, &err);
+                        let delay = self.reconnect_delay(Some(&err));
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
                     Poll::Ready((stream, None)) => {
+                        self.observe_stream_controls(&stream);
+                        self.last_event_id = stream.last_event_id().map(str::to_owned);
+                        let stop = stream.stop_reconnecting;
                         drop(stream);
-                        if !self.handler.can_reconnect() {
+                        if stop || !self.handler.can_reconnect() {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(None);
                         }
-                        let delay = self
-                            .handler
-                            .config()
-                            .delay_for_attempt(self.handler.attempts());
+                        let delay = self.reconnect_delay(None);
                         self.handler.record_failure();
                         self.state = ReconnectState::Waiting(Box::pin(sleep(delay)));
                     }
@@ -1128,6 +1236,204 @@ mod tests {
             pending_events: events.into(),
             delivered_event_id: None,
             terminated: false,
+            stop_reconnecting: false,
+        }
+    }
+
+    #[test]
+    fn response_admission_requires_sse_and_recognizes_explicit_stop() {
+        assert!(sse_response_should_stop(204, "No Content", &[]).unwrap());
+        for value in ["text/event-stream", "Text/Event-Stream; charset=utf-8"] {
+            let headers = vec![("Content-Type".to_owned(), value.to_owned())];
+            assert!(!sse_response_should_stop(200, "OK", &headers).unwrap());
+        }
+        for headers in [
+            vec![],
+            vec![("content-type".to_owned(), "text/html".to_owned())],
+            vec![("content-type".to_owned(), "text/event-stream-invalid".to_owned())],
+            vec![("content-type".to_owned(), "text/event-stream".to_owned()),
+                 ("Content-Type".to_owned(), "text/html".to_owned())],
+        ] {
+            assert!(matches!(sse_response_should_stop(200, "OK", &headers), Err(StreamError::SseError(_))));
+        }
+        let headers = vec![("content-type".to_owned(), "text/event-stream".to_owned())];
+        assert!(matches!(sse_response_should_stop(201, "Created", &headers), Err(StreamError::HttpError { status: 201, .. })));
+    }
+
+    #[test]
+    fn retry_policy_keeps_transient_http_failures_but_refuses_permanent_ones() {
+        for status in [408, 425, 429, 500, 502, 503, 504, 599] {
+            assert!(sse_error_can_reconnect(&http_error_from_head(status, String::new(), &[])));
+        }
+        for status in [201, 204, 206, 301, 400, 401, 403, 404, 410, 422] {
+            assert!(!sse_error_can_reconnect(&http_error_from_head(status, String::new(), &[])));
+        }
+        let headers = vec![(FCP_BACKPRESSURE_REASON_HEADER.to_owned(), crate::FCP_BACKPRESSURE_BUDGET_EXHAUSTED.to_owned())];
+        assert!(!sse_error_can_reconnect(&http_error_from_head(503, String::new(), &headers)));
+        assert!(!sse_error_can_reconnect(&StreamError::SseError("wrong media type".to_owned())));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn permanent_connection_errors_are_returned_once_without_retry() {
+        for status in [201, 401, 403, 404, 410] {
+            let mut stream = SseClient::new("http://127.0.0.1:1/events").stream();
+            stream.state = ReconnectState::Connecting(Box::pin(async move {
+                Err(http_error_from_head(status, String::new(), &[]))
+            }));
+            assert!(matches!(stream.next().await, Some(Err(StreamError::HttpError { status: actual, .. })) if actual == status));
+            assert_eq!(stream.handler.attempts(), 0);
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_resume_id_wins_and_empty_id_suppresses_configured_headers() {
+        let config = SseConfig::new()
+            .with_header("last-event-id", "old")
+            .with_header("Last-Event-ID", "another-old")
+            .with_header("Authorization", "Bearer retained");
+        assert!(sse_request_headers(&config, None).is_err());
+        for explicit in ["new", ""] {
+            let (headers, resume) = sse_request_headers(&config, Some(explicit)).unwrap();
+            assert_eq!(resume.as_deref(), Some(explicit));
+            let ids: Vec<_> = headers.iter().filter(|(key, _)| key.eq_ignore_ascii_case(LAST_EVENT_ID_HEADER)).collect();
+            assert_eq!(ids.len(), usize::from(!explicit.is_empty()));
+            if !explicit.is_empty() {
+                assert_eq!(ids[0].1, explicit);
+            }
+            assert_eq!(header_value(&headers, "Authorization"), Some("Bearer retained"));
+        }
+    }
+
+    #[test]
+    fn resume_headers_reject_control_characters_and_oversized_cursors() {
+        for id in ["secret\r\nInjected: value", "secret\0value", "secret\nvalue"] {
+            let error = sse_request_headers(&SseConfig::new(), Some(id)).unwrap_err();
+            assert!(matches!(error, StreamError::SseError(_)));
+            assert!(!error.to_string().contains("secret"));
+        }
+        let config = SseConfig::new().with_max_buffer_size(8);
+        assert!(matches!(sse_request_headers(&config, Some("12345")), Err(StreamError::BufferOverflow { size: 10, limit: 8 })));
+        let config = SseConfig::new().with_header("LAST-EVENT-ID", "initial");
+        let (headers, cursor) = sse_request_headers(&config, None).unwrap();
+        assert_eq!(header_value(&headers, LAST_EVENT_ID_HEADER), Some("initial"));
+        assert_eq!(cursor.as_deref(), Some("initial"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn resumed_stream_inherits_cursor_until_an_explicit_reset() {
+        let mut stream = parsed_stream(SseParser::new(), Vec::new());
+        stream.seed_resume_id(Some("previous".to_owned()));
+        stream.pending_events = stream.parser.parse(&Bytes::from("data: resumed\n\nid:\ndata: reset\n\n")).into();
+        assert_eq!(stream.last_event_id(), Some("previous"));
+        assert_eq!(stream.next().await.unwrap().unwrap().id.as_deref(), Some("previous"));
+        assert_eq!(stream.last_event_id(), Some("previous"));
+        assert_eq!(stream.next().await.unwrap().unwrap().id.as_deref(), Some(""));
+        assert_eq!(stream.last_event_id(), Some(""));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn id_only_blocks_apply_after_queued_events_but_partial_ids_do_not() {
+        let mut parser = SseParser::new();
+        let events = parser.parse(&Bytes::from("id: one\ndata: payload\n\nid: two\n\nid: partial\n"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(parser.last_event_id(), Some("two"));
+        let mut stream = parsed_stream(parser, events);
+        assert_eq!(stream.next().await.unwrap().unwrap().id.as_deref(), Some("one"));
+        assert_eq!(stream.last_event_id(), Some("one"));
+        assert!(stream.next().await.is_none());
+        assert_eq!(stream.last_event_id(), Some("two"));
+    }
+
+    #[test]
+    fn retry_fields_are_ascii_only_persistent_and_bounded_by_policy() {
+        let mut parser = SseParser::new();
+        assert!(parser.parse(&Bytes::from("retry: 7000\n\n")).is_empty());
+        assert_eq!(parser.reconnect_retry, Some(7000));
+        for value in ["+1", "-1", "1.0", " 1", "1 ", "١", ""] {
+            parser.parse(&Bytes::from(format!("retry: {value}\n\n")));
+            assert_eq!(parser.reconnect_retry, Some(7000));
+        }
+        let event = parser.parse(&Bytes::from("data: payload\n\n"));
+        assert_eq!(event[0].retry, Some(7000));
+        assert_eq!(parser.reconnect_retry, Some(7000));
+        let mut reconnecting = SseClient::new("http://127.0.0.1:1/events").stream();
+        reconnecting.handler = ReconnectHandler::new(
+            ReconnectConfig::new()
+                .with_initial_delay(Duration::from_millis(100))
+                .with_max_delay(Duration::from_secs(30))
+                .with_jitter(false),
+        );
+        reconnecting.observe_stream_controls(&parsed_stream(parser, Vec::new()));
+        assert_eq!(reconnecting.reconnect_delay(None), Duration::from_secs(7));
+        let mut huge = SseParser::new();
+        huge.parse(&Bytes::from("retry: 999999999999999999999999999999999999\n\n"));
+        reconnecting.observe_stream_controls(&parsed_stream(huge, Vec::new()));
+        assert_eq!(reconnecting.reconnect_delay(None), reconnecting.handler.config().max_delay);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn standalone_controls_survive_eof_without_fabricating_an_event() {
+        let mut parser = SseParser::new();
+        let events = parser.parse(&Bytes::from("id: checkpoint\nretry: 7000\n\n"));
+        assert!(events.is_empty());
+        let mut stream = SseClient::with_config("http://127.0.0.1:1/events", SseConfig::new().with_auto_reconnect(false)).stream();
+        stream.state = ReconnectState::Connected(Box::new(parsed_stream(parser, events)));
+        assert!(stream.next().await.is_none());
+        assert_eq!(stream.last_event_id.as_deref(), Some("checkpoint"));
+        assert_eq!(stream.retry_hint, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn leading_utf8_bom_is_stripped_even_when_split_across_chunks() {
+        let input = "\u{feff}data: first\n\ndata: \u{feff}retained\n\n".as_bytes();
+        for split in 0..=input.len() {
+            let mut parser = SseParser::new();
+            let mut events = parser.parse(&Bytes::copy_from_slice(&input[..split]));
+            events.extend(parser.parse(&Bytes::new()));
+            events.extend(parser.parse(&Bytes::copy_from_slice(&input[split..])));
+            assert_eq!(events, vec![SseEvent::new("first"), SseEvent::new("\u{feff}retained")], "split {split}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn http_stop_and_invalid_response_admission_are_terminal() {
+        for (status, content_type) in [(204, "text/plain"), (401, "text/plain"), (200, "text/html"), (201, "text/event-stream")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "SSE accept deadline");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("SSE accept failed: {error}"),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                let _ = read_request_head(&mut socket);
+                let response = format!("HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).unwrap();
+                socket.flush().unwrap();
+            });
+            let client = SseClient::with_config(format!("http://{address}/events"), SseConfig::new().with_timeout(Duration::from_secs(2)));
+            let mut stream = client.stream();
+            let result = time::timeout(Duration::from_secs(5), stream.next()).await.unwrap();
+            if status == 204 {
+                assert!(result.is_none());
+            } else if status == 200 {
+                assert!(matches!(result, Some(Err(StreamError::SseError(_)))));
+            } else {
+                assert!(matches!(result, Some(Err(StreamError::HttpError { status: actual, .. })) if actual == status));
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(stream.handler.attempts(), 0);
+            server.join().expect("SSE response server");
         }
     }
 
@@ -1150,7 +1456,7 @@ mod tests {
     #[test]
     fn decoded_overhead_overflow_preserves_only_complete_prefix_events() {
         let mut parser = SseParser::with_max_data_bytes(128);
-        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(128 / DATA_LINE_OVERHEAD + 1));
         assert!(input.len() < 128, "raw-byte admission alone cannot detect this");
         let events = parser.parse(&Bytes::from(input));
         assert_eq!(events, vec![SseEvent::new("ok").with_id("good")]);
@@ -1197,7 +1503,7 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn stream_delivers_valid_prefix_then_one_overflow_and_is_fused() {
         let mut parser = SseParser::with_max_data_bytes(128);
-        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(128 / DATA_LINE_OVERHEAD + 1));
         let events = parser.parse(&Bytes::from(input));
         let mut stream = parsed_stream(parser, events);
         assert_eq!(stream.next().await.unwrap().unwrap().data, "ok");
@@ -1241,7 +1547,7 @@ mod tests {
             socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
             let _ = read_request_head(&mut socket);
-            let body = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+            let body = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(128 / DATA_LINE_OVERHEAD + 1));
             write_sse_response(&mut socket, &body);
         });
         let client = SseClient::with_config(
@@ -1968,8 +2274,8 @@ mod tests {
     #[test]
     fn test_sse_client_with_http_client() {
         let http_client = HttpClient::new();
-        let client = SseClient::with_http_client("https://example.com/sse", http_client);
-        assert_eq!(client.url(), "https://example.com/sse");
+        let client = SseClient::with_http_client("https://example.com/events", http_client);
+        assert_eq!(client.url(), "https://example.com/events");
     }
 
     #[test]
@@ -2515,8 +2821,8 @@ mod tests {
         let events = parser.parse(&data);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "line1\nline2\nline3");
-        assert_eq!(events[0].id, Some("77".to_string()));
         assert_eq!(events[0].event, Some("batch".to_string()));
+        assert_eq!(events[0].id, Some("77".to_string()));
     }
 
     #[test]
