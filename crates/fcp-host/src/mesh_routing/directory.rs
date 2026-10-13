@@ -2,8 +2,10 @@
 //!
 //! Startup commits the first checkpoint before publishing the router. File-backed
 //! signed sources are subsequently checked by a dedicated worker; request handlers
-//! never perform source or checkpoint I/O. The separate lock outlives that worker,
-//! including across atomic checkpoint replacement.
+//! never perform source or checkpoint I/O. Source files may also explicitly name
+//! a remote signed-directory publisher; fetched bytes use the same verifier and
+//! durable publication path. The separate lock outlives the worker, including
+//! across atomic checkpoint replacement.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -26,6 +28,7 @@ use crate::{HostError, HostResult};
 
 mod peer_authority;
 mod reload;
+mod remote;
 
 use peer_authority::PeerContinuity;
 pub(super) use peer_authority::PeerSnapshot;
@@ -392,8 +395,10 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
-/// Bound source reads before allocation. Signatures authorize signed sources;
-/// static sources still require the operator's trusted configuration boundary.
+/// Bound source reads before allocation. A local descriptor can name a remote
+/// signed document; it is resolved on startup and by the existing reload worker.
+/// Signatures authorize signed sources; static sources still require the
+/// operator's trusted configuration boundary and cannot accept remote raw lists.
 pub(super) fn read_peer_file(path: &Path) -> HostResult<String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -420,7 +425,9 @@ pub(super) fn read_peer_file(path: &Path) -> HostResult<String> {
     if bytes.len() > MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES {
         return Err(invalid("peer directory source exceeds its byte limit"));
     }
-    String::from_utf8(bytes).map_err(|_| invalid("peer directory source is not UTF-8"))
+    let json = String::from_utf8(bytes)
+        .map_err(|_| invalid("peer directory source is not UTF-8"))?;
+    remote::resolve_file_source(json)
 }
 
 fn invalid(detail: &str) -> HostError {
