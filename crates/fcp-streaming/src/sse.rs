@@ -2,7 +2,7 @@
 //!
 //! Implements SSE parsing and client per the WHATWG HTML Living Standard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -248,6 +248,9 @@ struct SseParser {
     /// next chunk must be swallowed rather than treated as a new empty
     /// line (which would dispatch a spurious event between the CR and LF).
     pending_cr_swallows_lf: bool,
+    /// First rejected retained size. Poisoning is sticky: no partial event may
+    /// be completed with bytes received after a discarded chunk or field.
+    overflow: Option<usize>,
 }
 
 impl SseParser {
@@ -268,13 +271,20 @@ impl SseParser {
             retry: None,
             last_event_id: None,
             data_retained_bytes: 0,
-            max_data_bytes,
+            max_data_bytes: clamp_sse_buffer_size(max_data_bytes),
             pending_cr_swallows_lf: false,
+            overflow: None,
         }
     }
 
     /// Parse incoming data and return complete events.
     fn parse(&mut self, data: &Bytes) -> Vec<SseEvent> {
+        if self.overflow.is_some() || data.is_empty() {
+            return Vec::new();
+        }
+        if !self.reserve_retained(0, data.len()) {
+            return Vec::new();
+        }
         // If the previous chunk's final terminator was a lone CR, a leading
         // LF in this chunk is the second half of a CRLF, not a new line
         // terminator. Swallow it before appending to the buffer.
@@ -323,6 +333,10 @@ impl SseParser {
                 self.process_field(&line_str);
             }
 
+            if self.overflow.is_some() {
+                break;
+            }
+
             if consumed_lone_trailing_cr {
                 self.pending_cr_swallows_lf = true;
             }
@@ -354,16 +368,24 @@ impl SseParser {
         });
 
         match field {
-            "event" => self.event_type = Some(value.to_string()),
+            "event" => {
+                let previous = self.event_type.as_ref().map_or(0, String::len);
+                if self.reserve_retained(previous, value.len()) {
+                    self.event_type = Some(value.to_string());
+                }
+            }
             "data" => {
                 let line_cost = value.len().saturating_add(DATA_LINE_OVERHEAD);
-                if self.data_retained_bytes.saturating_add(line_cost) <= self.max_data_bytes {
+                if self.reserve_retained(0, line_cost) {
                     self.data_lines.push(value.to_string());
                     self.data_retained_bytes += line_cost;
                 }
             }
             "id" if !value.contains('\0') => {
-                self.event_id = Some(value.to_string());
+                let previous = self.event_id.as_ref().map_or(0, String::len);
+                if self.reserve_retained(previous, value.len()) {
+                    self.event_id = Some(value.to_string());
+                }
             }
             "retry" => {
                 if let Ok(ms) = value.parse() {
@@ -376,9 +398,21 @@ impl SseParser {
 
     /// Dispatch the current event.
     fn dispatch_event(&mut self) -> Option<SseEvent> {
+        if self.overflow.is_some() {
+            return None;
+        }
         if self.data_lines.is_empty() {
             // Reset state but don't dispatch
             self.event_type = None;
+            return None;
+        }
+
+        if self.event_id.is_some()
+            && !self.reserve_retained(
+                self.last_event_id.as_ref().map_or(0, String::len),
+                self.event_id.as_ref().map_or(0, String::len),
+            )
+        {
             return None;
         }
 
@@ -402,13 +436,52 @@ impl SseParser {
     }
 
     /// Get the last event ID for reconnection.
+    #[cfg(test)]
     fn last_event_id(&self) -> Option<&str> {
         self.last_event_id.as_deref()
     }
 
     /// Bytes currently retained for the in-progress event.
     fn retained_bytes(&self) -> usize {
-        self.buffer.len().saturating_add(self.data_retained_bytes)
+        self.buffer
+            .len()
+            .saturating_add(self.data_retained_bytes)
+            .saturating_add(self.event_type.as_ref().map_or(0, String::len))
+            .saturating_add(self.event_id.as_ref().map_or(0, String::len))
+            .saturating_add(self.last_event_id.as_ref().map_or(0, String::len))
+    }
+
+    /// Check a replacement before allocating a retained field. The raw bytes
+    /// and decoded strings coexist, and empty data lines still have a cost.
+    fn reserve_retained(&mut self, replaced: usize, added: usize) -> bool {
+        if self.overflow.is_some() {
+            return false;
+        }
+        let retained = self.retained_bytes().saturating_sub(replaced);
+        if let Some(StreamError::BufferOverflow { size, .. }) =
+            retained_buffer_overflow(retained, added, self.max_data_bytes)
+        {
+            self.overflow = Some(size);
+            // Release the damaged event, including spare allocation capacity.
+            // Keep only the last complete cursor, not the rejected event's ID.
+            self.buffer = BytesMut::new();
+            self.data_lines = Vec::new();
+            self.event_type = None;
+            self.event_id = None;
+            self.retry = None;
+            self.data_retained_bytes = 0;
+            self.parse_cursor = 0;
+            self.pending_cr_swallows_lf = false;
+            return false;
+        }
+        true
+    }
+
+    fn overflow_error(&self) -> Option<StreamError> {
+        self.overflow.map(|size| StreamError::BufferOverflow {
+            size,
+            limit: self.max_data_bytes,
+        })
     }
 }
 
@@ -771,6 +844,11 @@ impl SseChunkStream {
     const fn new(body: ClientIncomingBody<ClientIo>) -> Self {
         Self { body: Some(body) }
     }
+
+    fn close(self: Pin<&mut Self>) {
+        let mut this = self.project();
+        this.body.set(None);
+    }
 }
 
 impl Stream for SseChunkStream {
@@ -808,8 +886,9 @@ pin_project! {
         #[pin]
         inner: SseChunkStream,
         parser: SseParser,
-        pending_events: Vec<SseEvent>,
-        max_buffer_size: usize,
+        pending_events: VecDeque<SseEvent>,
+        delivered_event_id: Option<String>,
+        terminated: bool,
     }
 }
 
@@ -820,15 +899,17 @@ impl SseStream {
         Self {
             inner: SseChunkStream::new(body),
             parser: SseParser::with_max_data_bytes(max_buffer_size),
-            pending_events: Vec::new(),
-            max_buffer_size,
+            pending_events: VecDeque::new(),
+            delivered_event_id: None,
+            terminated: false,
         }
     }
 
-    /// Get the last event ID.
+    /// Get the last delivered event ID, never a cursor ahead of queued events.
+    /// Delivery is not an application-level acknowledgement or durable commit.
     #[must_use]
     pub fn last_event_id(&self) -> Option<&str> {
-        self.parser.last_event_id()
+        self.delivered_event_id.as_deref()
     }
 }
 
@@ -838,9 +919,8 @@ impl Stream for SseStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
-        // Return pending events first
-        if !this.pending_events.is_empty() {
-            return Poll::Ready(Some(Ok(this.pending_events.remove(0))));
+        if *this.terminated {
+            return Poll::Ready(None);
         }
 
         // Loop until we produce an event, hit a chunk-level error/EOF, or the
@@ -850,25 +930,37 @@ impl Stream for SseStream {
         // close an event boundary (common with fragmented TCP segments or
         // large multi-chunk events) would hang the consumer indefinitely.
         loop {
+            if let Some(event) = this.pending_events.pop_front() {
+                if event.id.is_some() {
+                    this.delivered_event_id.clone_from(&event.id);
+                }
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if let Some(error) = this.parser.overflow_error() {
+                this.inner.as_mut().close();
+                *this.terminated = true;
+                return Poll::Ready(Some(Err(error)));
+            }
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(data))) => {
-                    let retained_bytes = this.parser.retained_bytes();
-                    if let Some(error) =
-                        retained_buffer_overflow(retained_bytes, data.len(), *this.max_buffer_size)
-                    {
-                        return Poll::Ready(Some(Err(error)));
-                    }
-
-                    let events = this.parser.parse(&data);
-                    if !events.is_empty() {
-                        *this.pending_events = events;
-                        return Poll::Ready(Some(Ok(this.pending_events.remove(0))));
+                    *this.pending_events = this.parser.parse(&data).into();
+                    if this.parser.overflow.is_some() {
+                        // Close immediately even when complete prefix events
+                        // still need delivery before the one terminal error.
+                        this.inner.as_mut().close();
                     }
                     // No complete events yet; keep draining the inner stream
                     // until it either yields more data or parks with a waker.
                 }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(error))) => {
+                    this.inner.as_mut().close();
+                    *this.terminated = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    *this.terminated = true;
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -959,7 +1051,10 @@ impl Stream for ReconnectingSseStream {
                         self.state = ReconnectState::Connected(Box::new(stream));
                     }
                     Poll::Ready(Err(err)) => {
-                        if err.is_terminal_backpressure() || !self.handler.can_reconnect() {
+                        if err.is_terminal_backpressure()
+                            || matches!(err, StreamError::BufferOverflow { .. })
+                            || !self.handler.can_reconnect()
+                        {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
@@ -988,7 +1083,10 @@ impl Stream for ReconnectingSseStream {
                     }
                     Poll::Ready((stream, Some(Err(err)))) => {
                         drop(stream);
-                        if err.is_terminal_backpressure() || !self.handler.can_reconnect() {
+                        if err.is_terminal_backpressure()
+                            || matches!(err, StreamError::BufferOverflow { .. })
+                            || !self.handler.can_reconnect()
+                        {
                             self.state = ReconnectState::Terminated;
                             return Poll::Ready(Some(Err(err)));
                         }
@@ -1022,6 +1120,143 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    fn parsed_stream(parser: SseParser, events: Vec<SseEvent>) -> SseStream {
+        SseStream {
+            inner: SseChunkStream { body: None },
+            parser,
+            pending_events: events.into(),
+            delivered_event_id: None,
+            terminated: false,
+        }
+    }
+
+    #[test]
+    fn overflow_never_completes_a_damaged_event_or_advances_its_cursor() {
+        let mut parser = SseParser::with_max_data_bytes(64);
+        assert_eq!(parser.parse(&Bytes::from("id: good\ndata: ok\n\n")).len(), 1);
+        assert!(parser.parse(&Bytes::from("id: bad\ndata: prefix\n")).is_empty());
+        assert!(parser.parse(&Bytes::from("data: this line cannot fit\n\n")).is_empty());
+        let size = parser.overflow.expect("sticky overflow");
+        assert!(size > 64);
+        assert_eq!(parser.last_event_id(), Some("good"));
+        assert!(parser.data_lines.is_empty());
+        assert!(parser.buffer.is_empty());
+        assert!(parser.parse(&Bytes::from("id: later\ndata: suffix\n\n")).is_empty());
+        assert_eq!(parser.overflow, Some(size));
+        assert_eq!(parser.last_event_id(), Some("good"));
+    }
+
+    #[test]
+    fn decoded_overhead_overflow_preserves_only_complete_prefix_events() {
+        let mut parser = SseParser::with_max_data_bytes(128);
+        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+        assert!(input.len() < 128, "raw-byte admission alone cannot detect this");
+        let events = parser.parse(&Bytes::from(input));
+        assert_eq!(events, vec![SseEvent::new("ok").with_id("good")]);
+        assert!(matches!(parser.overflow_error(), Some(StreamError::BufferOverflow { .. })));
+        assert_eq!(parser.last_event_id(), Some("good"));
+    }
+
+    #[test]
+    fn retained_metadata_and_incomplete_lines_share_the_budget() {
+        let mut parser = SseParser::with_max_data_bytes(64);
+        let id = format!("id: {}\n", "i".repeat(32));
+        assert!(parser.parse(&Bytes::from(id)).is_empty());
+        assert_eq!(parser.retained_bytes(), 32);
+        let event = format!("event: {}", "t".repeat(32));
+        assert!(parser.parse(&Bytes::from(event)).is_empty());
+        assert!(parser.overflow.is_some());
+        assert_eq!(parser.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn empty_chunks_do_not_split_a_crlf_event_boundary() {
+        let mut parser = SseParser::new();
+        assert!(parser.parse(&Bytes::from("data: first\r")).is_empty());
+        assert!(parser.parse(&Bytes::new()).is_empty());
+        let events = parser.parse(&Bytes::from("\ndata: second\n\n"));
+        assert_eq!(events, vec![SseEvent::new("first\nsecond")]);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_cursor_never_skips_queued_events() {
+        let mut parser = SseParser::new();
+        let events = parser.parse(&Bytes::from("id: one\ndata: a\n\nid: two\ndata: b\n\n"));
+        assert_eq!(parser.last_event_id(), Some("two"));
+        let mut stream = parsed_stream(parser, events);
+        assert_eq!(stream.last_event_id(), None);
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "a");
+        assert_eq!(stream.last_event_id(), Some("one"));
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "b");
+        assert_eq!(stream.last_event_id(), Some("two"));
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn stream_delivers_valid_prefix_then_one_overflow_and_is_fused() {
+        let mut parser = SseParser::with_max_data_bytes(128);
+        let input = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+        let events = parser.parse(&Bytes::from(input));
+        let mut stream = parsed_stream(parser, events);
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "ok");
+        assert_eq!(stream.last_event_id(), Some("good"));
+        assert!(matches!(stream.next().await, Some(Err(StreamError::BufferOverflow { limit: 128, .. }))));
+        for _ in 0..3 {
+            assert!(stream.next().await.is_none());
+            assert_eq!(stream.last_event_id(), Some("good"));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn reconnecting_stream_exposes_overflow_without_another_attempt() {
+        let mut parser = SseParser::with_max_data_bytes(1);
+        let events = parser.parse(&Bytes::from("data: cannot fit\n\n"));
+        let mut stream = SseClient::new("http://127.0.0.1:1/events").stream();
+        stream.state = ReconnectState::Connected(Box::new(parsed_stream(parser, events)));
+        assert!(matches!(stream.next().await, Some(Err(StreamError::BufferOverflow { .. }))));
+        assert_eq!(stream.handler.attempts(), 0);
+        assert!(matches!(stream.state, ReconnectState::Terminated));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn http_stream_overflow_is_not_silently_truncated_or_reconnected() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE listener");
+        let address = listener.local_addr().expect("SSE address");
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "SSE accept deadline");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("SSE accept failed: {error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = read_request_head(&mut socket);
+            let body = format!("id: good\ndata: ok\n\nid: damaged\n{}\n", "data:\n".repeat(6));
+            write_sse_response(&mut socket, &body);
+        });
+        let client = SseClient::with_config(
+            format!("http://{address}/events"),
+            SseConfig::new().with_max_buffer_size(128).with_timeout(Duration::from_secs(2)),
+        );
+        let mut stream = client.stream();
+        let first = time::timeout(Duration::from_secs(5), stream.next()).await.unwrap();
+        assert_eq!(first.unwrap().unwrap().data, "ok");
+        let failure = time::timeout(Duration::from_secs(5), stream.next()).await.unwrap();
+        assert!(matches!(failure, Some(Err(StreamError::BufferOverflow { .. }))));
+        assert!(stream.next().await.is_none());
+        assert_eq!(stream.handler.attempts(), 0);
+        server.join().expect("SSE server");
+    }
 
     fn read_request_head(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
@@ -1733,8 +1968,8 @@ mod tests {
     #[test]
     fn test_sse_client_with_http_client() {
         let http_client = HttpClient::new();
-        let client = SseClient::with_http_client("https://example.com/events", http_client);
-        assert_eq!(client.url(), "https://example.com/events");
+        let client = SseClient::with_http_client("https://example.com/sse", http_client);
+        assert_eq!(client.url(), "https://example.com/sse");
     }
 
     #[test]
@@ -1862,7 +2097,7 @@ mod tests {
     // ── SseParser: data overflow protection ─────────────────────────────
 
     #[test]
-    fn test_parse_data_exceeds_10mb_ignored() {
+    fn test_parse_data_exceeds_10mb_refused() {
         use std::fmt::Write;
         let mut parser = SseParser::new();
         // Push enough data lines to exceed the 10MB limit
@@ -1873,9 +2108,8 @@ mod tests {
         }
         input.push('\n');
         let events = parser.parse(&Bytes::from(input));
-        // Event dispatches, but not all data lines were accepted
-        assert_eq!(events.len(), 1);
-        assert!(events[0].data.len() <= 10 * 1024 * 1024);
+        assert!(events.is_empty(), "oversized events must never be truncated");
+        assert!(matches!(parser.overflow_error(), Some(StreamError::BufferOverflow { .. })));
     }
 
     #[test]
@@ -1953,12 +2187,8 @@ mod tests {
         input.push('\n');
         let events = parser.parse(&Bytes::from(input));
 
-        assert_eq!(events.len(), 1);
-        assert!(
-            events[0].data.len() <= MAX_DATA_BYTES,
-            "dispatched payload must respect the cap, got {}",
-            events[0].data.len()
-        );
+        assert!(events.is_empty(), "do not publish a prefix as a complete event");
+        assert!(matches!(parser.overflow_error(), Some(StreamError::BufferOverflow { .. })));
     }
 
     // ── SseParser: multiple sequential parses ───────────────────────────
