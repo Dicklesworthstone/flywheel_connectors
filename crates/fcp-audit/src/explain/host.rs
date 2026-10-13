@@ -30,6 +30,12 @@ pub enum HostRequestOutcome {
     DispatchError,
     /// A dispatch response was captured without its preceding admission.
     Incomplete,
+    /// The entry host recorded a relay attempt, without a terminal response.
+    RelayPending,
+    /// The entry host received a peer response, not proof of connector success.
+    RelayResponse,
+    /// The relay ended without a peer response; delivery and effects are unknown.
+    RelayUnconfirmed,
 }
 
 impl HostRequestOutcome {
@@ -43,6 +49,9 @@ impl HostRequestOutcome {
             Self::ReportedFailure => "reported_failure",
             Self::DispatchError => "dispatch_error",
             Self::Incomplete => "incomplete",
+            Self::RelayPending => "relay_pending",
+            Self::RelayResponse => "relay_response",
+            Self::RelayUnconfirmed => "relay_unconfirmed",
         }
     }
 }
@@ -72,6 +81,22 @@ pub struct HostRequestSummary {
     pub duration_ms: Option<u64>,
     /// Connector-supplied receipt reference; the receipt itself is not verified.
     pub reported_receipt_id: Option<String>,
+    /// Entry-host routing evidence, never borrowed as executor authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<HostRelaySummary>,
+}
+
+/// Routing custody reported by the entry host for one request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRelaySummary {
+    /// Targets in captured attempt order; may omit attempts outside the capture.
+    pub observed_targets: Vec<String>,
+    /// Peer named by the terminal relay record, if one was captured.
+    pub reported_terminal_target: Option<String>,
+    /// Peer HTTP-equivalent response status; a 2xx is not connector success.
+    pub reported_executor_status: Option<u16>,
+    /// Count of failures reported by the terminal record, not a verified history.
+    pub reported_failed_attempt_count: Option<usize>,
 }
 
 /// Explain a host request by its zone and server-assigned request ID.
@@ -130,6 +155,7 @@ pub(super) fn explain_request_at_entry(
         reported_success: None,
         duration_ms: None,
         reported_receipt_id: None,
+        relay: None,
     };
     let mut reasons = Vec::with_capacity(entries.len());
     let mut warnings = vec![
@@ -142,49 +168,7 @@ pub(super) fn explain_request_at_entry(
         }
         summary.last_seq = entry.seq;
         summary.last_observed_at = entry.occurred_at;
-        let statement = match entry.event_type.as_str() {
-            "invoke.allow" => {
-                if summary.admission_observed {
-                    return Err(invalid("a request has multiple preflight admissions"));
-                }
-                summary.admission_observed = true;
-                summary.outcome = HostRequestOutcome::Admitted;
-                "host recorded preflight admission; this alone does not establish dispatch or completion"
-            }
-            "invoke.deny" => {
-                if summary.admission_observed {
-                    return Err(invalid("a preflight denial conflicts with an admission"));
-                }
-                summary.outcome = HostRequestOutcome::Denied;
-                summary.terminal_observed = true;
-                "host recorded preflight denial before connector dispatch"
-            }
-            "invoke.result" => {
-                let success = entry.metadata.get("success").and_then(Value::as_bool)
-                    .ok_or(invalid("dispatch result requires a boolean success flag"))?;
-                summary.duration_ms = Some(required_duration(entry)?);
-                summary.reported_receipt_id = optional_string(entry, "receipt_id")?.map(str::to_owned);
-                summary.reported_success = Some(success);
-                summary.terminal_observed = true;
-                summary.outcome = if !summary.admission_observed {
-                    warnings.push("dispatch result has no captured admission; the authorization path is unknown".to_owned());
-                    HostRequestOutcome::Incomplete
-                } else if success {
-                    HostRequestOutcome::ReportedSuccess
-                } else {
-                    HostRequestOutcome::ReportedFailure
-                };
-                "host recorded a dispatch response; its receipt reference is not receipt verification"
-            }
-            "invoke.error" => {
-                summary.duration_ms = Some(required_duration(entry)?);
-                summary.terminal_observed = true;
-                summary.outcome = HostRequestOutcome::DispatchError;
-                warnings.push("a dispatch error may occur before or during execution; external side effects and retry safety are unknown".to_owned());
-                "host recorded a dispatch error, not a successful connector response"
-            }
-            _ => return Err(invalid("unsupported host request phase")),
-        };
+        let statement = observe_phase(entry, &mut summary, &mut warnings)?;
         reasons.push(CausalReason {
             kind: CausalReasonKind::HostLifecycle,
             statement: statement.to_owned(),
@@ -209,6 +193,123 @@ pub(super) fn explain_request_at_entry(
         warnings,
         host_request: Some(summary),
     })
+}
+
+fn observe_phase(
+    entry: &AuditEntry,
+    summary: &mut HostRequestSummary,
+    warnings: &mut Vec<String>,
+) -> Result<&'static str, ExplainError> {
+    Ok(match entry.event_type.as_str() {
+        "invoke.allow" => {
+            if summary.admission_observed || summary.relay.is_some() {
+                return Err(invalid("preflight admission follows admission or relay"));
+            }
+            summary.admission_observed = true;
+            summary.outcome = HostRequestOutcome::Admitted;
+            "host recorded preflight admission; this alone does not establish dispatch or completion"
+        }
+        "invoke.deny" => {
+            if summary.admission_observed || summary.relay.is_some() {
+                return Err(invalid("a preflight denial follows admission or relay"));
+            }
+            summary.outcome = HostRequestOutcome::Denied;
+            summary.terminal_observed = true;
+            "host recorded preflight denial before connector dispatch"
+        }
+        "invoke.result" => {
+            if summary.relay.is_some() {
+                return Err(invalid("local dispatch result cannot complete an entry-host relay"));
+            }
+            let success = entry.metadata.get("success").and_then(Value::as_bool)
+                .ok_or(invalid("dispatch result requires a boolean success flag"))?;
+            summary.duration_ms = Some(required_duration(entry)?);
+            summary.reported_receipt_id = optional_string(entry, "receipt_id")?.map(str::to_owned);
+            summary.reported_success = Some(success);
+            summary.terminal_observed = true;
+            summary.outcome = if !summary.admission_observed {
+                warnings.push("dispatch result has no captured admission; the authorization path is unknown".to_owned());
+                HostRequestOutcome::Incomplete
+            } else if success {
+                HostRequestOutcome::ReportedSuccess
+            } else {
+                HostRequestOutcome::ReportedFailure
+            };
+            "host recorded a dispatch response; its receipt reference is not receipt verification"
+        }
+        "invoke.error" => {
+            summary.duration_ms = Some(required_duration(entry)?);
+            summary.terminal_observed = true;
+            summary.outcome = HostRequestOutcome::DispatchError;
+            warnings.push("a dispatch error may occur before or during execution; external side effects and retry safety are unknown".to_owned());
+            "host recorded a dispatch error, not a successful connector response"
+        }
+        "invoke.mesh_forward_attempt" => observe_relay_attempt(entry, summary)?,
+        "invoke.mesh_forwarded" => observe_relay_response(entry, summary, warnings)?,
+        _ => return Err(invalid("unsupported host request phase")),
+    })
+}
+
+fn relay_summary(summary: &mut HostRequestSummary) -> &mut HostRelaySummary {
+    summary.relay.get_or_insert_with(|| HostRelaySummary {
+        observed_targets: Vec::new(),
+        reported_terminal_target: None,
+        reported_executor_status: None,
+        reported_failed_attempt_count: None,
+    })
+}
+
+fn observe_relay_attempt(
+    entry: &AuditEntry,
+    summary: &mut HostRequestSummary,
+) -> Result<&'static str, ExplainError> {
+    let target = required_string(entry, "target_node")?;
+    required_string(entry, "decision")?;
+    relay_summary(summary).observed_targets.push(target.to_owned());
+    summary.outcome = HostRequestOutcome::RelayPending;
+    Ok("entry host recorded a relay attempt; this is not delivery or executor-admission evidence")
+}
+
+fn observe_relay_response(
+    entry: &AuditEntry,
+    summary: &mut HostRequestSummary,
+    warnings: &mut Vec<String>,
+) -> Result<&'static str, ExplainError> {
+    let target = required_string(entry, "target_node")?;
+    required_string(entry, "decision")?;
+    let status = match entry.metadata.get("executor_status") {
+        Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().filter(|status| (100..=599).contains(status))
+            .and_then(|status| u16::try_from(status).ok())
+            .ok_or(invalid("relay executor_status must be null or a valid HTTP status"))?),
+        None => return Err(invalid("relay record is missing executor_status")),
+    };
+    let failures = entry.metadata.get("failed_attempts").and_then(Value::as_array)
+        .ok_or(invalid("relay record requires a failed_attempts array"))?;
+    if failures.iter().any(|value| value.as_str().is_none_or(|value| value.trim().is_empty())) {
+        return Err(invalid("relay failed_attempts must contain nonempty strings"));
+    }
+    summary.duration_ms = Some(required_duration(entry)?);
+    let relay = relay_summary(summary);
+    match relay.observed_targets.last() {
+        None => warnings.push("relay response has no captured attempt; routing history is incomplete".to_owned()),
+        Some(previous) if previous != target => warnings.push("terminal peer differs from the last captured attempt; intervening routing history is missing".to_owned()),
+        Some(_) => {}
+    }
+    relay.reported_terminal_target = Some(target.to_owned());
+    relay.reported_executor_status = status;
+    relay.reported_failed_attempt_count = Some(failures.len());
+    summary.terminal_observed = true;
+    summary.outcome = if status.is_some() {
+        HostRequestOutcome::RelayResponse
+    } else {
+        HostRequestOutcome::RelayUnconfirmed
+    };
+    warnings.push("entry-host relay evidence does not establish executor authorization or connector completion; inspect the executor's independently verified chain".to_owned());
+    if status.is_none() {
+        warnings.push("no peer response was recorded; delivery, side effects and retry safety remain unknown".to_owned());
+    }
+    Ok("entry host recorded a relay outcome; a peer HTTP response is not a connector success receipt")
 }
 
 fn request_entries<'a>(
@@ -469,5 +570,159 @@ mod tests {
         let value = serde_json::to_string(&explain_bundle(&bundle(vec![denied])).unwrap()).unwrap();
         assert!(!value.contains("private-secret"));
         assert!(!value.contains("revocation passed"));
+    }
+
+    fn relay_phase(seq: u64, event_type: &str, target: &str) -> AuditEntry {
+        let mut entry = phase(seq, event_type);
+        entry.metadata = BTreeMap::from([
+            ("operation".to_owned(), json!("issues.create")),
+            ("target_node".to_owned(), json!(target)),
+            ("decision".to_owned(), json!("mesh_selected")),
+            ("executor_status".to_owned(), json!(200)),
+            ("failed_attempts".to_owned(), json!([])),
+            ("duration_ms".to_owned(), json!(29)),
+        ]);
+        entry
+    }
+
+    #[test]
+    fn relay_attempt_is_neither_admission_nor_delivery() {
+        let capture = bundle(vec![relay_phase(0, "invoke.mesh_forward_attempt", "peer-a")]);
+        let result = explain_bundle(&capture).unwrap();
+        let summary = result.host_request.as_ref().unwrap();
+        assert_eq!(summary.outcome, HostRequestOutcome::RelayPending);
+        assert!(!summary.admission_observed);
+        assert!(!summary.terminal_observed);
+        assert_eq!(summary.reported_success, None);
+        assert_eq!(summary.relay.as_ref().unwrap().observed_targets, ["peer-a"]);
+        assert!(!result.render_human().contains("invoked operation"));
+    }
+
+    #[test]
+    fn peer_response_status_never_becomes_connector_success() {
+        for status in [200, 202, 403, 500] {
+            let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
+            response.metadata.insert("executor_status".to_owned(), json!(status));
+            let capture = bundle(vec![
+                relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+                response,
+            ]);
+            let result = explain_bundle(&capture).unwrap();
+            let summary = result.host_request.as_ref().unwrap();
+            assert_eq!(summary.outcome, HostRequestOutcome::RelayResponse);
+            assert!(!summary.admission_observed);
+            assert!(summary.terminal_observed);
+            assert_eq!(summary.reported_success, None);
+            assert_eq!(summary.reported_receipt_id, None);
+            assert_eq!(summary.duration_ms, Some(29));
+            assert_eq!(summary.relay.as_ref().unwrap().reported_executor_status, Some(status));
+            assert!(result.render_human().contains("not a connector success receipt"));
+        }
+    }
+
+    #[test]
+    fn relay_without_peer_response_keeps_delivery_and_retries_uncertain() {
+        let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
+        response.metadata.insert("executor_status".to_owned(), Value::Null);
+        response.metadata.insert("failed_attempts".to_owned(), json!(["private-relay-error"]));
+        let result = explain_bundle(&bundle(vec![response])).unwrap();
+        let summary = result.host_request.as_ref().unwrap();
+        assert_eq!(summary.outcome, HostRequestOutcome::RelayUnconfirmed);
+        assert_eq!(summary.relay.as_ref().unwrap().reported_failed_attempt_count, Some(1));
+        assert!(result.render_human().contains("retry safety remain unknown"));
+        assert!(!serde_json::to_string(&result).unwrap().contains("private-relay-error"));
+    }
+
+    #[test]
+    fn missing_relay_attempts_are_reported_not_fabricated() {
+        for captured_attempt in [None, Some("peer-a")] {
+            let mut entries = Vec::new();
+            if let Some(target) = captured_attempt {
+                entries.push(relay_phase(0, "invoke.mesh_forward_attempt", target));
+            }
+            entries.push(relay_phase(2, "invoke.mesh_forwarded", "peer-b"));
+            let result = explain_bundle(&bundle(entries)).unwrap();
+            let relay = result.host_request.as_ref().unwrap().relay.as_ref().unwrap();
+            assert_eq!(relay.observed_targets.len(), if captured_attempt.is_some() { 1 } else { 0 });
+            assert_eq!(relay.reported_terminal_target.as_deref(), Some("peer-b"));
+            assert!(result.warnings.iter().any(|warning| {
+                warning.contains("routing history is incomplete")
+                    || warning.contains("routing history is missing")
+            }));
+        }
+    }
+
+    #[test]
+    fn malformed_relay_metadata_never_falls_back_to_pending() {
+        let invalid_fields = [
+            ("target_node", json!("")),
+            ("decision", Value::Null),
+            ("executor_status", json!("200")),
+            ("executor_status", json!(99)),
+            ("executor_status", json!(600)),
+            ("executor_status", json!(200.5)),
+            ("failed_attempts", Value::Null),
+            ("failed_attempts", json!([false])),
+            ("failed_attempts", json!([""])),
+            ("duration_ms", json!(-1)),
+        ];
+        for (field, value) in invalid_fields {
+            let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
+            response.metadata.insert(field.to_owned(), value);
+            assert!(explain_bundle(&bundle(vec![
+                relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+                response,
+            ])).is_err(), "{field}");
+        }
+        let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
+        response.metadata.remove("executor_status");
+        assert!(explain_bundle(&bundle(vec![response])).is_err());
+    }
+
+    #[test]
+    fn relay_and_local_completion_cannot_be_spliced_into_success() {
+        for phase_name in ["invoke.allow", "invoke.deny", "invoke.result"] {
+            assert!(explain_bundle(&bundle(vec![
+                relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+                phase(2, phase_name),
+            ])).is_err());
+        }
+        assert!(explain_bundle(&bundle(vec![
+            relay_phase(0, "invoke.mesh_forwarded", "peer-a"),
+            relay_phase(2, "invoke.mesh_forward_attempt", "peer-b"),
+        ])).is_err());
+        let result = explain_bundle(&bundle(vec![
+            relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+            phase(2, "invoke.error"),
+        ])).unwrap();
+        assert_eq!(result.host_request.unwrap().outcome, HostRequestOutcome::DispatchError);
+    }
+
+    #[test]
+    fn relay_attempt_order_is_stable_across_duplicate_captures() {
+        let first = relay_phase(0, "invoke.mesh_forward_attempt", "peer-a");
+        let second = relay_phase(2, "invoke.mesh_forward_attempt", "peer-b");
+        let response = relay_phase(4, "invoke.mesh_forwarded", "peer-b");
+        let expected = explain_bundle(&bundle(vec![first.clone(), second.clone(), response.clone()])).unwrap();
+        let shuffled = bundle(vec![response, second.clone(), first.clone(), second, first]);
+        assert_eq!(explain_bundle(&shuffled).unwrap(), expected);
+        let relay = expected.host_request.unwrap().relay.unwrap();
+        assert_eq!(relay.observed_targets, ["peer-a", "peer-b"]);
+    }
+
+    #[test]
+    fn relay_summary_roundtrips_without_changing_local_admission_evidence() {
+        let result = explain_bundle(&bundle(vec![
+            phase(0, "invoke.allow"),
+            relay_phase(1, "invoke.mesh_forward_attempt", "peer-a"),
+            relay_phase(2, "invoke.mesh_forwarded", "peer-a"),
+        ])).unwrap();
+        let summary = result.host_request.as_ref().unwrap();
+        assert!(summary.admission_observed);
+        assert_eq!(summary.outcome, HostRequestOutcome::RelayResponse);
+        assert_eq!(summary.reported_success, None);
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["host_request"]["relay"]["reported_executor_status"], 200);
+        assert_eq!(serde_json::from_value::<CausalExplanation>(value).unwrap(), result);
     }
 }
