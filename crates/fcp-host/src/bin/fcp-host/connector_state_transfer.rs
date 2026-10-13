@@ -3,12 +3,17 @@
 //! The configuration is operator-owned and loaded once at startup. Grants name
 //! exact immutable roots; changing the authorized root or writer pins requires
 //! a restart. Replicas remain separate from live connector execution state.
+//! Pulls use bounded, independently authenticated pages under one total deadline;
+//! the complete export is validated before any replica import is admitted.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fcp_host::mesh_routing::MeshRouter;
+#[cfg(test)]
+use fcp_host::ConnectorStateExportRequest;
 use fcp_host::{
-    ConnectorStateExportRequest, ConnectorStatePullRequest, ConnectorStatePullResponse,
+    ConnectorStatePullRequest, ConnectorStatePullResponse,
     ConnectorStateReplicationService, ConnectorStateTransferDirection, ConnectorStateTransferGrant,
     ConnectorStateTransferScope, MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES,
 };
@@ -316,23 +321,50 @@ async fn pull(
             "state-transfer donor authority or transport is unavailable".to_owned(),
         )
     })?;
-    let request_json = request.request.to_json().map_err(map_host_error)?;
-    let reply = router.forward_connector_state_export(&peer, request_json).await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "authenticated state-transfer response unavailable; no replica publication was admitted".to_owned()))?;
-    if reply.status != StatusCode::OK.as_u16() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "donor refused the exact-root state transfer".to_owned(),
-        ));
-    }
+    // Keep the same authority snapshot for every page. Resolving the peer again
+    // could silently authorize a removal/re-addition or key rotation mid-pull.
+    let pinned_peer = &peer;
+    let donor_failed = AtomicBool::new(false);
+    let failure = &donor_failed;
     let response = service
-        .import_from_peer(&request, &reply.body_json, || {
-            router.check_state_transfer_peer(&peer).map_err(|_| {
-                unavailable("state-transfer donor authority changed before publication")
-            })
-        })
+        .pull_paged_from_peer(
+            &request,
+            |request_json| async move {
+                // MeshRouter signs a fresh nonce and verifies the corresponding
+                // signed reply on every call. Never retry or switch donors here.
+                let reply = router
+                    .forward_connector_state_export(pinned_peer, request_json)
+                    .await
+                    .map_err(|_| {
+                        failure.store(true, Ordering::Relaxed);
+                        unavailable("authenticated state-transfer page unavailable")
+                    })?;
+                if reply.status != StatusCode::OK.as_u16() {
+                    failure.store(true, Ordering::Relaxed);
+                    return Err(unavailable("donor refused the exact-root state-transfer page"));
+                }
+                Ok(reply.body_json)
+            },
+            || {
+                router.check_state_transfer_peer(pinned_peer).map_err(|_| {
+                    unavailable("state-transfer donor authority changed before publication")
+                })
+            },
+        )
         .await
-        .map_err(map_host_error)?;
+        .map_err(|error| {
+            if donor_failed.load(Ordering::Relaxed) {
+                // Preserve the admin API's upstream-failure status without
+                // trusting or exposing a donor-controlled error body.
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "donor could not supply an authenticated state-transfer page; no replica publication was admitted"
+                        .to_owned(),
+                )
+            } else {
+                map_host_error(error)
+            }
+        })?;
     Ok(response)
 }
 
@@ -348,14 +380,13 @@ pub(super) async fn export_reply(
             .connector_state_replication
             .as_ref()
             .ok_or_else(|| unavailable("connector-state export is not configured"))?;
-        let request = ConnectorStateExportRequest::from_json(request_json)?;
         let peer = router.state_transfer_origin(envelope).map_err(|_| {
             HostError::PreflightFailed(
                 "state-transfer origin authority or transport is unavailable".to_owned(),
             )
         })?;
         service
-            .export_for_peer(envelope.origin_node.as_str(), &request, || {
+            .export_transfer_for_peer(envelope.origin_node.as_str(), request_json, || {
                 router.check_state_transfer_peer(&peer).map_err(|_| {
                     unavailable("state-transfer origin authority changed before disclosure")
                 })
