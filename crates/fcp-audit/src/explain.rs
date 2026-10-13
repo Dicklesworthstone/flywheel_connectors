@@ -136,12 +136,16 @@ pub fn parse_replay_bundle(input: &str) -> Result<ReplayBundle, ExplainError> {
         return Ok(ReplayBundle::default());
     }
 
-    if trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed).map_err(|err| parse_error(&err))?;
+    // Preserve pretty-printed single documents. Multiple JSONL objects also
+    // start with `{`, so a failed whole-document parse must reach the strict
+    // per-line parser below instead of rejecting every ordinary JSONL chain.
+    if trimmed.starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+    {
         if looks_like_bundle_object(&value) {
-            return serde_json::from_value(value).map_err(|err| parse_error(&err));
+            return serde_json::from_str(trimmed).map_err(|err| parse_error(&err));
         }
-        let entry = serde_json::from_value(value).map_err(|err| parse_error(&err))?;
+        let entry = serde_json::from_str(trimmed).map_err(|err| parse_error(&err))?;
         return Ok(ReplayBundle {
             audit_entries: vec![entry],
             capability_tokens: Vec::new(),
@@ -192,8 +196,9 @@ pub fn parse_capability_tokens(input: &str) -> Result<Vec<Value>, ExplainError> 
         return serde_json::from_str(trimmed).map_err(|err| parse_error(&err));
     }
 
-    if trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed).map_err(|err| parse_error(&err))?;
+    if trimmed.starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+    {
         if let Some(tokens) = value
             .get("capability_tokens")
             .or_else(|| value.get("tokens"))
@@ -301,7 +306,12 @@ where
         return serde_json::from_str(trimmed).map_err(|err| parse_error(&err));
     }
 
-    if trimmed.starts_with('{') {
+    if trimmed.starts_with('{')
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
+    {
+        // A valid document with invalid fields remains an error, not a reason
+        // to downgrade to a different input shape or accept a partial prefix.
+        // Deserialize the original text so duplicate fields remain errors.
         return serde_json::from_str(trimmed)
             .map(|single| vec![single])
             .map_err(|err| parse_error(&err));
@@ -857,5 +867,103 @@ mod tests {
         assert_eq!(bundle.audit_entries, vec![invocation]);
         assert_eq!(bundle.capability_tokens, [] as [serde_json::Value; 0]);
         assert_eq!(bundle.receipts, [] as [DecisionReceipt; 0]);
+    }
+
+    #[test]
+    fn parses_multiple_audit_records_with_blank_lines_and_crlf() {
+        let entries: Vec<_> = (0..2)
+            .map(|seq| {
+                audit_entry(
+                    seq,
+                    event_types::CAPABILITY_INVOKE,
+                    Some("fcp.github"),
+                    Some("issues.create"),
+                    "corr-jsonl",
+                    BTreeMap::new(),
+                )
+            })
+            .collect();
+        let input = format!(
+            "\r\n{}\r\n \r\n{}\r\n",
+            serde_json::to_string(&entries[0]).unwrap(),
+            serde_json::to_string(&entries[1]).unwrap(),
+        );
+        assert_eq!(parse_audit_entries(&input).unwrap(), entries);
+        assert_eq!(parse_replay_bundle(&input).unwrap().audit_entries, entries);
+    }
+
+    #[test]
+    fn parses_multiple_receipts_and_token_records() {
+        let entry = audit_entry(
+            0,
+            event_types::CAPABILITY_INVOKE,
+            None,
+            None,
+            "corr-jsonl",
+            BTreeMap::new(),
+        );
+        let first = allow_receipt(&entry);
+        let mut second = first.clone();
+        second.id = "receipt-allow-2".to_owned();
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+        );
+        assert_eq!(parse_decision_receipts(&input).unwrap(), vec![first, second]);
+        assert_eq!(
+            parse_capability_tokens("{\"id\":\"a\"}\n\n{\"id\":\"b\"}\n").unwrap(),
+            vec![serde_json::json!({"id": "a"}), serde_json::json!({"id": "b"})]
+        );
+    }
+
+    #[test]
+    fn preserves_pretty_documents_arrays_and_bundle_aliases() {
+        let entry = audit_entry(
+            0,
+            event_types::CAPABILITY_INVOKE,
+            None,
+            None,
+            "corr-json",
+            BTreeMap::new(),
+        );
+        for value in [
+            serde_json::to_value(&entry).unwrap(),
+            serde_json::json!([entry]),
+            serde_json::json!({"audit_events": [entry]}),
+        ] {
+            let input = serde_json::to_string_pretty(&value).unwrap();
+            assert_eq!(
+                parse_replay_bundle(&input).unwrap().audit_entries,
+                vec![entry.clone()]
+            );
+        }
+        assert_eq!(
+            parse_capability_tokens("{\n  \"tokens\": [{\"id\": \"a\"}]\n}").unwrap(),
+            vec![serde_json::json!({"id": "a"})]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_suffixes_and_duplicate_typed_fields() {
+        let entry = audit_entry(
+            0,
+            event_types::CAPABILITY_INVOKE,
+            None,
+            None,
+            "corr-jsonl",
+            BTreeMap::new(),
+        );
+        let valid = serde_json::to_string(&entry).unwrap();
+        for suffix in ["{", "{}", "null", "[]", "garbage"] {
+            let input = format!("{valid}\n{suffix}");
+            assert!(parse_replay_bundle(&input).is_err());
+            assert!(parse_audit_entries(&input).is_err());
+        }
+        let duplicate = format!("{{\"seq\":1,{}", &valid[1..]);
+        assert!(parse_audit_entries(&duplicate).is_err());
+        assert!(parse_replay_bundle(&duplicate).is_err());
+        assert!(parse_replay_bundle("{\"audit_entries\":[],\"events\":[]}").is_err());
+        assert!(parse_capability_tokens("{\"id\":\"a\"}\n{").is_err());
     }
 }
