@@ -25,7 +25,7 @@ jobs:
           clean: false
           fetch-depth: 1
           show-progress: false
-      - name: Verify the reviewed patch and prepare an unreferenced host source blob
+      - name: Verify exact source and prepare shared-scheduler and mesh wiring
         shell: python
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,17 +41,14 @@ jobs:
 
           REPO = 'Dicklesworthstone/flywheel_connectors'
           PATH = 'crates/fcp-host/src/bin/fcp-host.rs'
-          BASE_BLOB = 'aa653d02ac51a206e88a5ca9b1fee2557b931925'
-          PATCH_SHA256 = 'ef643277aff3854e87f0d9a398b633c555f14fa254983b5d20d500f80a8d8632'
-          # Immutable transport chunks of the reviewed, gzip-compressed patch.
-          # They are not executable code. Verify every object and the complete
-          # uncompressed patch before applying it to the checked-out source.
-          CHUNKS = [
-              'aa365a3af32b248c259b494dcc08348dd8a4ded8',
-              '39cd2585935f074b6a2970345d8bced9c52806a6',
-              '629a5b2e7dcc53b0c67806c74dda5bfb1524ff30',
-              'dcd317d64b44f1f589b359403f4ad7a2802b35ee',
-          ]
+          BASE_BLOB = 'a4b34764a741d0dbd5826f45d9d70b6fd459c26e'
+          PATCH_SHA256 = '2d63367fae5c64fe2c3b587ef9d431cbcdb851a4bad9afc96d88739be4839caa'
+          CHUNKS = ['181f1d7e87bb93050da1d0392297d8ec773cc0f9']
+          REQUIRED_BLOBS = {
+              'crates/fcp-host/src/batch_async.rs': '3b8564762453e41bef489714b57fe5cebd3e5fcb',
+              'crates/fcp-host/src/bin/fcp-host/http_batch.rs': '9e8bd27d33d544c406bec209896da618e0afe57a',
+              'crates/fcp-host/src/bin/fcp-host/http_batch_tests.rs': '6f01da93857a56eecb7df480208e537a80462948',
+          }
 
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
@@ -77,10 +74,13 @@ jobs:
           if git('branch', '--show-current') != 'main':
               raise SystemExit('Only a main checkout may prepare this integration')
           if git('status', '--porcelain'):
-              raise SystemExit('Refusing to prepare against a dirty checkout')
+              raise SystemExit('Refusing a dirty checkout')
           original = Path(PATH).read_bytes()
           if blob_sha(original) != BASE_BLOB:
-              raise SystemExit('Host source changed; reconcile the patch before preparing another candidate')
+              raise SystemExit('Host source changed; reconcile before preparing another candidate')
+          for path, expected in REQUIRED_BLOBS.items():
+              if blob_sha(Path(path).read_bytes()) != expected:
+                  raise SystemExit('A reviewed integration dependency changed: ' + path)
 
           compressed = bytearray()
           for sha in CHUNKS:
@@ -89,7 +89,7 @@ jobs:
                   raise SystemExit('Unexpected Git blob encoding')
               chunk = base64.b64decode(''.join(obj['content'].split()), validate=True)
               if blob_sha(chunk) != sha:
-                  raise SystemExit('Patch transport object checksum mismatch')
+                  raise SystemExit('Patch transport checksum mismatch')
               compressed.extend(chunk)
           patch = gzip.decompress(compressed)
           if hashlib.sha256(patch).hexdigest() != PATCH_SHA256:
@@ -100,12 +100,13 @@ jobs:
               raise SystemExit('Patch changed an unexpected path')
           subprocess.run(['git', 'diff', '--check'], check=True)
           candidate = Path(PATH).read_bytes()
-          # A Rust parser check only: this is not a Cargo build or executed test.
-          subprocess.run(
-              ['rustup', 'run', 'stable', 'rustfmt', '--edition', '2024',
-               '--config', 'skip_children=true', '--emit', 'stdout'],
-              input=candidate, check=True, stdout=subprocess.DEVNULL,
-          )
+          # Syntax checks only, not a Cargo build or executed Rust tests.
+          for path in [PATH, *REQUIRED_BLOBS]:
+              subprocess.run(
+                  ['rustup', 'run', 'stable', 'rustfmt', '--edition', '2024',
+                   '--config', 'skip_children=true', '--emit', 'stdout'],
+                  input=Path(path).read_bytes(), check=True, stdout=subprocess.DEVNULL,
+              )
           print(patch.decode())
           blob = api('/git/blobs', {'content': candidate.decode(), 'encoding': 'utf-8'})
           if blob['sha'] != blob_sha(candidate):
@@ -116,9 +117,10 @@ jobs:
               'path': PATH,
               'old_sha': BASE_BLOB,
               'new_sha': blob['sha'],
+              'required_blobs': REQUIRED_BLOBS,
               'patch_sha256': PATCH_SHA256,
               'validation': 'exact patch application, diff whitespace, Rust syntax; Cargo tests not run',
           }
-          # No commits or ref updates occur here. Publication is reviewed and
-          # performed separately through the GitHub connector, without a PR.
+          # No commits or ref updates occur in this job. Reviewed publication
+          # happens through the GitHub connector with a main-head lease, no PR.
           print('PREPARED_HTTP_BATCH=' + json.dumps(result, sort_keys=True))
