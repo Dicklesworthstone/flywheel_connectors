@@ -1,21 +1,18 @@
 //! Reusable implementation for `fwc capability replay`.
 
 use std::fmt::{self, Write as _};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fcp_audit::AuditEntry;
-use fcp_audit::explain::parse_replay_bundle;
+pub use fcp_audit::replay::AUDIT_CHAIN_ENV;
 use fcp_audit::replay::{
     DEFAULT_REPLAY_WINDOW_SECS, PredicateTrace, ReplayError,
-    reconstruct_predicate_trace_from_entries,
+    reconstruct_predicate_trace_from_entries, reconstruct_predicate_trace_from_path,
+    validate_replay_window,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-/// Environment variable used as the default audit-chain artifact path.
-pub const AUDIT_CHAIN_ENV: &str = "FWC_AUDIT_CHAIN";
 
 /// Requested capability replay output shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,15 +43,6 @@ impl ReplayOutput {
 pub enum CapabilityReplayError {
     /// The `--since` duration could not be parsed.
     InvalidSince(String),
-    /// The audit-chain artifact could not be read.
-    ReadAuditChain {
-        /// Path that failed.
-        path: String,
-        /// I/O error text.
-        source: String,
-    },
-    /// The audit-chain artifact was not valid JSON/JSONL.
-    ParseAuditChain(String),
     /// Predicate replay failed.
     Replay(ReplayError),
     /// The rendered JSONL payload could not be serialized.
@@ -67,12 +55,10 @@ impl CapabilityReplayError {
     pub const fn error_type(&self) -> &'static str {
         match self {
             Self::InvalidSince(_) => "invalid-since-duration",
-            Self::ReadAuditChain { .. } | Self::Replay(ReplayError::AuditChainUnavailable(_)) => {
-                "audit-chain-unavailable"
+            Self::Replay(ReplayError::AuditChainUnavailable(_)) => "audit-chain-unavailable",
+            Self::Serialize(_) | Self::Replay(ReplayError::AuditChainCorrupted(_)) => {
+                "audit-chain-corrupted"
             }
-            Self::ParseAuditChain(_)
-            | Self::Serialize(_)
-            | Self::Replay(ReplayError::AuditChainCorrupted(_)) => "audit-chain-corrupted",
             Self::Replay(ReplayError::WideWindowRequiresConfirm { .. }) => {
                 "wide-window-requires-confirm"
             }
@@ -87,9 +73,7 @@ impl CapabilityReplayError {
     pub const fn recoverable(&self) -> bool {
         match self {
             Self::InvalidSince(_) | Self::Serialize(_) => false,
-            Self::ReadAuditChain { .. }
-            | Self::ParseAuditChain(_)
-            | Self::Replay(
+            Self::Replay(
                 ReplayError::WideWindowRequiresConfirm { .. }
                 | ReplayError::TokenNotFoundInAuditChain { .. }
                 | ReplayError::AuditChainUnavailable(_)
@@ -114,15 +98,6 @@ impl fmt::Display for CapabilityReplayError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSince(message) => write!(formatter, "{message}"),
-            Self::ReadAuditChain { path, source } => {
-                write!(
-                    formatter,
-                    "failed to read audit-chain artifact `{path}`: {source}"
-                )
-            }
-            Self::ParseAuditChain(message) => {
-                write!(formatter, "failed to parse audit-chain artifact: {message}")
-            }
             Self::Replay(error) => write!(formatter, "{error}"),
             Self::Serialize(message) => {
                 write!(formatter, "failed to render replay output: {message}")
@@ -154,8 +129,25 @@ pub fn build_replay_payload(
     now_unix: u64,
 ) -> Result<Value, CapabilityReplayError> {
     let since_seconds = parse_since_seconds(since)?;
-    let entries = load_audit_entries(audit_chain)?;
-    build_replay_payload_from_entries(token, since_seconds, confirm, &entries, output, now_unix)
+    // Do not open a file or block on stdin before the caller confirms a wide scan.
+    validate_replay_window(since_seconds, confirm)?;
+    let path = audit_chain
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(AUDIT_CHAIN_ENV).map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            ReplayError::AuditChainUnavailable(format!(
+                "no artifact configured; use --audit-chain or set {AUDIT_CHAIN_ENV}"
+            ))
+        })?;
+    let trace = reconstruct_predicate_trace_from_path(
+        token,
+        Duration::from_secs(since_seconds),
+        confirm,
+        now_unix,
+        &path,
+    )?;
+    payload_from_trace(&trace, output)
 }
 
 /// Build a complete fwc payload from already-loaded audit entries.
@@ -223,35 +215,6 @@ pub fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-fn load_audit_entries(path: Option<&Path>) -> Result<Vec<AuditEntry>, CapabilityReplayError> {
-    let Some(path) = path
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os(AUDIT_CHAIN_ENV).map(PathBuf::from))
-    else {
-        return Ok(Vec::new());
-    };
-
-    let input = if path.as_os_str() == "-" {
-        let mut input = String::new();
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .map_err(|error| CapabilityReplayError::ReadAuditChain {
-                path: "-".to_owned(),
-                source: error.to_string(),
-            })?;
-        input
-    } else {
-        std::fs::read_to_string(&path).map_err(|error| CapabilityReplayError::ReadAuditChain {
-            path: path.display().to_string(),
-            source: error.to_string(),
-        })?
-    };
-
-    let bundle = parse_replay_bundle(&input)
-        .map_err(|error| CapabilityReplayError::ParseAuditChain(error.to_string()))?;
-    Ok(bundle.audit_entries)
 }
 
 fn payload_from_trace(
@@ -332,11 +295,56 @@ mod tests {
     use fcp_audit::{AuditEntry, AuditEntryBuilder, event_types};
 
     use crate::capability_replay::{
-        CapabilityReplayError, ReplayOutput, build_replay_payload_from_entries, parse_since_seconds,
+        CapabilityReplayError, ReplayOutput, build_replay_payload,
+        build_replay_payload_from_entries, parse_since_seconds,
     };
 
     const NOW: u64 = 1_700_000_100;
     const TOKEN: &str = "cap-token-secret";
+
+    #[test]
+    fn wide_window_is_rejected_before_reading_stdin() {
+        let error = build_replay_payload(
+            TOKEN,
+            "8d",
+            false,
+            Some(std::path::Path::new("-")),
+            ReplayOutput::Json,
+            NOW,
+        )
+        .expect_err("confirmation precedes potentially blocking stdin");
+        assert_eq!(error.error_type(), "wide-window-requires-confirm");
+    }
+
+    #[test]
+    fn explicitly_empty_source_is_unavailable_not_token_absence() {
+        let error = build_replay_payload(
+            TOKEN,
+            "7d",
+            false,
+            Some(std::path::Path::new("")),
+            ReplayOutput::Json,
+            NOW,
+        )
+        .expect_err("an absent source cannot prove token absence");
+        assert_eq!(error.error_type(), "audit-chain-unavailable");
+        assert!(error.recoverable());
+        assert!(error.token_hash().is_none());
+    }
+
+    #[test]
+    fn invalid_duration_precedes_source_resolution() {
+        let error = build_replay_payload(
+            TOKEN,
+            "not-a-duration",
+            false,
+            Some(std::path::Path::new("-")),
+            ReplayOutput::Json,
+            NOW,
+        )
+        .expect_err("invalid duration");
+        assert_eq!(error.error_type(), "invalid-since-duration");
+    }
 
     fn entry(seq: u64, metadata: Vec<(&str, Value)>) -> AuditEntry {
         metadata
@@ -411,5 +419,43 @@ mod tests {
             )
         ));
         assert_eq!(error.error_type(), "wide-window-requires-confirm");
+    }
+
+    #[test]
+    fn all_output_modes_redact_labels_and_nested_secret_keys() {
+        let evidence = entry(1, vec![
+            ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
+            ("rule_name", json!(format!("zone_match:{TOKEN}"))),
+            ("evaluator_version", json!(format!("v1:{TOKEN}"))),
+            ("inputs_json", json!({"nested": {(TOKEN): "value"}})),
+            ("output", json!(true)),
+        ]);
+        for output in [ReplayOutput::Json, ReplayOutput::Jsonl, ReplayOutput::Human] {
+            let payload = build_replay_payload_from_entries(
+                TOKEN, 60, false, std::slice::from_ref(&evidence), output, NOW,
+            ).expect("redacted payload");
+            assert!(!payload.to_string().contains(TOKEN));
+            assert_eq!(payload["status"], "ok");
+            if output == ReplayOutput::Jsonl {
+                let line = payload["jsonl"].as_str().expect("JSONL string");
+                let step: Value = serde_json::from_str(line).expect("valid JSONL step");
+                assert_eq!(step["output"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn contradictory_evidence_is_reported_as_corruption_not_success() {
+        let evidence = entry(1, vec![
+            ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
+            ("rule_name", json!("revocation_check")),
+            ("output", json!(false)),
+            ("final_verdict", json!("accepted")),
+        ]);
+        let error = build_replay_payload_from_entries(
+            TOKEN, 60, false, &[evidence], ReplayOutput::Json, NOW,
+        ).expect_err("cannot render contradictory evidence as success");
+        assert_eq!(error.error_type(), "audit-chain-corrupted");
+        assert!(!error.to_string().contains(TOKEN));
     }
 }
