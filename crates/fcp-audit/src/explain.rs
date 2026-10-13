@@ -14,6 +14,8 @@ use thiserror::Error;
 
 use crate::{AuditEntry, Decision, DecisionReceipt, event_types};
 
+pub mod host;
+
 /// Replay evidence consumed by [`explain_bundle`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayBundle {
@@ -55,6 +57,9 @@ pub struct CausalExplanation {
     pub reasons: Vec<CausalReason>,
     /// Non-fatal evidence gaps observed while explaining.
     pub warnings: Vec<String>,
+    /// Captured host request lifecycle, distinct from a capability invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_request: Option<host::HostRequestSummary>,
 }
 
 impl CausalExplanation {
@@ -62,11 +67,19 @@ impl CausalExplanation {
     #[must_use]
     pub fn render_human(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "Captured audit: Connector {} invoked operation {} at time {}. Associated evidence:",
-            self.connector_id, self.operation_id, self.occurred_at
-        );
+        if let Some(request) = &self.host_request {
+            let _ = writeln!(
+                out,
+                "Captured host request {}: connector {}, operation {}, outcome {}. Associated evidence:",
+                request.request_id, self.connector_id, self.operation_id, request.outcome.as_str()
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Captured audit: Connector {} invoked operation {} at time {}. Associated evidence:",
+                self.connector_id, self.operation_id, self.occurred_at
+            );
+        }
         for (idx, reason) in self.reasons.iter().enumerate() {
             let marker = reason_marker(idx);
             let _ = writeln!(out, "({marker}) {}", reason.statement);
@@ -105,6 +118,8 @@ pub enum CausalReasonKind {
     DecisionReceipt,
     /// Revocation-cascade evidence.
     RevocationCascade,
+    /// A host request phase; not a capability grant or authenticated proof.
+    HostLifecycle,
 }
 
 /// Errors returned by replay-bundle explanation.
@@ -119,6 +134,9 @@ pub enum ExplainError {
     /// Different entries claim the same selected invocation ID.
     #[error("replay bundle contains conflicting entries for the selected invocation")]
     ConflictingInvocation,
+    /// The captured host request has malformed or contradictory phase evidence.
+    #[error("invalid captured host lifecycle: {0}")]
+    InvalidHostLifecycle(&'static str),
     /// JSON parsing failed.
     #[error("failed to parse replay bundle: {0}")]
     Parse(String),
@@ -224,18 +242,21 @@ pub fn parse_capability_tokens(input: &str) -> Result<Vec<Value>, ExplainError> 
         .collect()
 }
 
-/// Explain the newest actual capability invocation in captured evidence.
+/// Explain the newest capability invocation or host request phase in a capture.
 ///
 /// Evidence must bind to the selected request, not merely share a connector.
 /// Missing revocation evidence is reported as unknown, never as proof that an
 /// issuer was intact. This function does not authenticate captured artifacts.
 /// Use [`explain_invocation`] to select an older invocation explicitly.
+/// Host phases are grouped by the server request ID, not client correlation.
+/// A preflight denial, admission, or relay is never called a completed invoke.
 ///
 /// # Errors
 ///
 /// Returns [`ExplainError::EmptyBundle`] when no replay evidence is present and
 /// [`ExplainError::NoInvocation`] when no complete capability invocation is
-/// present, or [`ExplainError::ConflictingInvocation`] for conflicting IDs.
+/// present, [`ExplainError::ConflictingInvocation`] for conflicting IDs, or
+/// [`ExplainError::InvalidHostLifecycle`] for unusable host phase evidence.
 pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, ExplainError> {
     if bundle.audit_entries.is_empty()
         && bundle.capability_tokens.is_empty()
@@ -248,17 +269,20 @@ pub fn explain_bundle(bundle: &ReplayBundle) -> Result<CausalExplanation, Explai
     explain_selected(bundle, invocation)
 }
 
-/// Explain exactly one invocation by its audit-entry ID.
+/// Explain one capability invocation or host request by an audit-entry ID.
 ///
 /// Unlike [`explain_bundle`], this never silently selects another invocation
 /// when the requested ID is absent. IDs naming non-invocation events are also
 /// rejected. Duplicate identical captures are harmless; conflicting captures
 /// of the selected ID are rejected before evidence is associated.
+/// For a host phase, the ID selects its request and all captured phases of that
+/// request are summarized; the caller's filtered capture defines the horizon.
 ///
 /// # Errors
 ///
 /// Returns [`ExplainError::NoInvocation`] if the ID has no complete invocation,
-/// or [`ExplainError::ConflictingInvocation`] if its captured entries disagree.
+/// [`ExplainError::ConflictingInvocation`] if its captured entries disagree,
+/// or [`ExplainError::InvalidHostLifecycle`] for contradictory host phases.
 pub fn explain_invocation(
     bundle: &ReplayBundle,
     invocation_id: &str,
@@ -266,7 +290,9 @@ pub fn explain_invocation(
     let invocation = bundle
         .audit_entries
         .iter()
-        .find(|entry| entry.id == invocation_id && is_invocation(entry))
+        .find(|entry| {
+            entry.id == invocation_id && (is_invocation(entry) || host::is_host_event(entry))
+        })
         .ok_or(ExplainError::NoInvocation)?;
     explain_selected(bundle, invocation)
 }
@@ -281,6 +307,9 @@ fn explain_selected(
         .any(|entry| entry.id == invocation.id && entry != invocation)
     {
         return Err(ExplainError::ConflictingInvocation);
+    }
+    if host::is_host_event(invocation) {
+        return host::explain_request_at_entry(bundle, invocation);
     }
     let connector_id = invocation
         .connector_id
@@ -353,6 +382,7 @@ fn explain_selected(
         invocation_audit_entry_id: invocation.id.clone(),
         reasons,
         warnings,
+        host_request: None,
     })
 }
 
@@ -425,7 +455,7 @@ fn looks_like_bundle_object(value: &Value) -> bool {
 fn select_invocation(entries: &[AuditEntry]) -> Option<&AuditEntry> {
     entries
         .iter()
-        .filter(|entry| is_invocation(entry))
+        .filter(|entry| is_invocation(entry) || host::is_host_event(entry))
         .max_by_key(|entry| (entry.occurred_at, entry.seq, entry.id.as_str()))
 }
 
