@@ -7,10 +7,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fcp_async_core::{AsyncError, ExecutionContext};
+use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
@@ -44,6 +46,13 @@ impl BatchExecutor {
     /// Admitted operations without an observed result instead fail with
     /// `BATCH_OUTCOME_UNKNOWN` and no retry hint: dropping a future does not prove
     /// that a remote side effect was cancelled. This executor never retries work.
+    ///
+    /// With unwinding enabled, a panic in a factory or future poll stops all new
+    /// admission, even when `stop_on_first_error` is false. The panicked operation
+    /// has an unknown external outcome; other admitted operations are drained
+    /// under the original budget. The factory is never reused after a panic.
+    /// Panic payloads are not copied into responses; the process panic hook is
+    /// unchanged. Aborting panics and panics in destructors are not contained.
     ///
     /// The budget includes planning and is checked before every admission and
     /// after every completion. Handlers must be cooperative async functions:
@@ -160,8 +169,18 @@ impl BatchExecutor {
                 // Record admission first so even an unpolled future is not
                 // mistaken for an operation whose execution never began.
                 run.admitted_at[index] = Some(Instant::now());
-                let future = handler(operation);
-                active.push(async move { (index, future.await) });
+                // AssertUnwindSafe is deliberately local to the handler boundary.
+                // After any panic we stop admission rather than calling a factory
+                // whose captured state may have been left partially mutated.
+                match catch_unwind(AssertUnwindSafe(|| handler(operation))) {
+                    Ok(future) => active.push(async move {
+                        (index, AssertUnwindSafe(future).catch_unwind().await)
+                    }),
+                    Err(_) => {
+                        run.record_panicked(index);
+                        dependencies.complete(index);
+                    }
+                }
                 cooperate(&mut cooperative_steps).await;
             }
             run.check_limits(context);
@@ -178,7 +197,10 @@ impl BatchExecutor {
             };
             match result {
                 Ok(Some((index, result))) => {
-                    run.record(index, result);
+                    match result {
+                        Ok(result) => run.record(index, result),
+                        Err(_) => run.record_panicked(index),
+                    }
                     dependencies.complete(index);
                 }
                 Ok(None) => break,
@@ -255,6 +277,7 @@ impl DependencyQueue {
 #[derive(Clone, Copy)]
 enum Halt {
     FirstError,
+    HandlerPanic,
     Timeout,
     Cancelled,
     RuntimeFailure,
@@ -352,11 +375,22 @@ impl<'a> BatchRun<'a> {
         });
     }
 
+    fn record_panicked(&mut self, index: usize) {
+        if !self.interrupted() {
+            self.halt = Some(Halt::HandlerPanic);
+        }
+        self.record(index, Err(operation_error(
+            "BATCH_OUTCOME_UNKNOWN",
+            "batch handler panicked after admission; side effects may have occurred; do not retry without reconciliation",
+        )));
+    }
+
     fn finish(mut self, schedule_report: Option<BatchScheduleReport>) -> BatchInvokeResponse {
         let (skip_code, skip_message) = match self.halt {
             Some(Halt::Timeout) => ("BATCH_TIMEOUT", "batch timeout exceeded before admission"),
             Some(Halt::Cancelled) => ("BATCH_CANCELLED", "batch context cancelled before admission"),
             Some(Halt::RuntimeFailure) => ("BATCH_RUNTIME_ERROR", "batch runtime failed before admission"),
+            Some(Halt::HandlerPanic) => ("BATCH_PANICKED", "batch handler panicked before this operation was admitted"),
             _ => ("BATCH_ABORTED", "batch stopped before admission"),
         };
         let results: Vec<_> = self.request.operations.iter().enumerate().map(|(index, operation)| {
@@ -412,5 +446,158 @@ fn skipped(operation: &BatchOperation, code: &str, message: &str) -> OperationRe
         output: None,
         error: Some(operation_error(code, message)),
         duration_ms: 0,
+    }
+}
+
+#[cfg(all(test, panic = "unwind"))]
+mod panic_tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::{pending, ready};
+
+    use futures_util::poll;
+    use serde_json::json;
+
+    use super::*;
+    use crate::{BatchOptions, BatchScheduleHint};
+
+    fn operation(id: &str, dependencies: &[&str]) -> BatchOperation {
+        BatchOperation {
+            id: id.to_owned(),
+            tool: "test.echo".to_owned(),
+            input: json!({ "id": id }),
+            depends_on: dependencies.iter().map(|id| (*id).to_owned()).collect(),
+            zone: None,
+            scheduler: BatchScheduleHint::default(),
+        }
+    }
+
+    fn request(operations: Vec<BatchOperation>) -> BatchInvokeRequest {
+        BatchInvokeRequest {
+            operations,
+            options: BatchOptions {
+                max_parallelism: 2,
+                stop_on_first_error: false,
+                ..BatchOptions::default()
+            },
+        }
+    }
+
+    fn assert_unknown(result: &OperationResult) {
+        assert_eq!(result.status, OperationResultStatus::Error);
+        assert!(result.output.is_none());
+        let error = result.error.as_ref().unwrap();
+        assert_eq!(error.code, "BATCH_OUTCOME_UNKNOWN");
+        assert_eq!(error.retry_after_ms, None);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn factory_panic_stops_admission_and_drains_previously_created_futures() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
+        let calls = RefCell::new(Vec::new());
+        let response = executor.execute_async(&request, |operation| {
+            calls.borrow_mut().push(operation.id.clone());
+            assert_ne!(operation.id, "b", "private factory panic payload");
+            ready(Ok(operation.input.clone()))
+        }).await.unwrap();
+
+        assert_eq!(*calls.borrow(), ["a", "b"]);
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+        assert_eq!(response.results[0].output, Some(json!({ "id": "a" })));
+        assert_unknown(&response.results[1]);
+        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_PANICKED");
+        assert!(!serde_json::to_string(&response).unwrap().contains("private factory"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn poll_panic_preserves_other_results_without_releasing_dependents() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &["a"])]);
+        let calls = RefCell::new(Vec::new());
+        let response = executor.execute_async(&request, |operation| {
+            calls.borrow_mut().push(operation.id.clone());
+            async move {
+                assert_ne!(operation.id, "a", "private poll panic payload");
+                Ok(operation.input.clone())
+            }
+        }).await.unwrap();
+
+        assert_eq!(*calls.borrow(), ["a", "b"]);
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+        assert_unknown(&response.results[0]);
+        assert_eq!(response.results[1].output, Some(json!({ "id": "b" })));
+        assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
+        assert!(!serde_json::to_string(&response).unwrap().contains("private poll"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn panic_after_pending_keeps_already_observed_success() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &["a"])]);
+        let release = Cell::new(false);
+        let mut batch = Box::pin(executor.execute_async(&request, |operation| {
+            let release = &release;
+            async move {
+                if operation.id == "a" {
+                    poll_fn(|cx| {
+                        if release.get() {
+                            Poll::Ready(())
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }).await;
+                    std::panic::panic_any(17_u8);
+                }
+                Ok(operation.input.clone())
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        release.set(true);
+        let response = batch.await.unwrap();
+        assert_unknown(&response.results[0]);
+        assert_eq!(response.results[1].status, OperationResultStatus::Success);
+        assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
+        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_during_panic_drain_preserves_unknown_outcomes() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
+        let context = ExecutionContext::background();
+        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |operation| {
+            async move {
+                assert_ne!(operation.id, "a", "handler failed");
+                pending::<()>().await;
+                Ok(json!(null))
+            }
+        }));
+        assert!(poll!(batch.as_mut()).is_pending());
+        context.cancel();
+        let response = batch.await.unwrap();
+        assert_unknown(&response.results[0]);
+        assert_unknown(&response.results[1]);
+        assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
+        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(response.status, BatchStatus::Aborted);
+        assert_eq!((response.completed, response.failed, response.skipped), (0, 2, 1));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn multiple_admitted_panics_are_each_accounted_for() {
+        let executor = BatchExecutor::new();
+        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
+        let response = executor.execute_async(&request, |operation| async move {
+            assert_ne!(operation.id, "a", "first admitted panic");
+            assert_ne!(operation.id, "b", "second admitted panic");
+            Ok(operation.input.clone())
+        }).await.unwrap();
+        assert_unknown(&response.results[0]);
+        assert_unknown(&response.results[1]);
+        assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
+        assert_eq!((response.completed, response.failed, response.skipped), (0, 2, 1));
     }
 }
