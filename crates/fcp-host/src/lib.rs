@@ -48,6 +48,7 @@ mod error;
 #[allow(dead_code)]
 mod health;
 mod invoke_audit;
+mod invoke_audit_snapshot;
 pub mod mesh_replay;
 pub mod mesh_routing;
 mod migration_linux;
@@ -81,6 +82,7 @@ pub use emergency_revocation::*;
 pub use enforcement::*;
 pub use error::*;
 pub use invoke_audit::*;
+pub use invoke_audit_snapshot::*;
 pub use migration_linux::*;
 #[cfg(target_os = "macos")]
 pub use migration_macos::*;
