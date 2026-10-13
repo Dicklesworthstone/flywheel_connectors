@@ -20,6 +20,7 @@ mod batch;
 mod batch_async;
 mod budget;
 mod cancellation;
+mod connector_state_pages;
 mod connector_state_replication;
 mod credentials;
 mod cutover;
