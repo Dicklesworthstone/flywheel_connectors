@@ -8,6 +8,10 @@
 //! The protected pull route also accepts ordered multi-donor recovery plans.
 //! Each donor needs its own exact-root grant and a pinned transport incarnation.
 //! Only downloads can fail over; import attempts are never retried.
+//! Set FCP_HOST_CONNECTOR_STATE_PAGE_CONCURRENCY=2 on a recipient to overlap
+//! continuation round trips. The default is one; values outside 1..=2 fail
+//! startup before storage is opened. This does not widen any grant, change a
+//! recovery plan or its deadline, or activate a replica.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +33,7 @@ use fcp_store::{
 use super::*;
 
 pub(super) const CONFIG_FILE_ENV: &str = "FCP_HOST_CONNECTOR_STATE_TRANSFER_CONFIG_FILE";
+const PAGE_CONCURRENCY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_PAGE_CONCURRENCY";
 pub(super) const PULL_REQUEST_MAX_BYTES: usize = MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES;
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const REPLICA_NAMESPACE: &str = "connector-state-replicas-v1";
@@ -232,11 +237,45 @@ fn open_service(
     Ok(service)
 }
 
+/// Validate the complete setting pair before reading source state or creating
+/// a retained store. A lone tuning setting must not silently disable transfer.
+fn validate_transfer_settings(
+    config_path: Option<String>,
+    page_concurrency: Option<String>,
+) -> HostResult<Option<(String, usize)>> {
+    let Some(path) = config_path else {
+        if page_concurrency.is_some() {
+            return Err(invalid(
+                "state-transfer page concurrency requires state-transfer configuration",
+            ));
+        }
+        return Ok(None);
+    };
+    let pages = match page_concurrency.as_deref().map(str::trim) {
+        None | Some("1") => 1,
+        Some("2") => 2,
+        Some(_) => return Err(invalid("state-transfer page concurrency must be 1 or 2")),
+    };
+    Ok(Some((path, pages)))
+}
+
 pub(super) fn from_env(
     bind: &BindTarget,
     mesh: Option<&MeshRouter>,
 ) -> HostResult<Option<Arc<ConnectorStateReplicationService>>> {
-    let Some(path) = read_optional_trimmed_env_string(CONFIG_FILE_ENV)? else {
+    // Preserve explicit empty/non-Unicode values as errors rather than letting
+    // a generic optional-string reader silently restore serial defaults.
+    let raw_page_concurrency = match std::env::var(PAGE_CONCURRENCY_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(invalid("state-transfer page concurrency must be 1 or 2"));
+        }
+    };
+    let Some((path, page_concurrency)) = validate_transfer_settings(
+        read_optional_trimmed_env_string(CONFIG_FILE_ENV)?,
+        raw_page_concurrency,
+    )? else {
         return Ok(None);
     };
     if mesh.is_none() {
@@ -266,7 +305,8 @@ pub(super) fn from_env(
     }
     let config: TransferConfig = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("state-transfer configuration is malformed"))?;
-    open_service(config, bind).map(|service| Some(Arc::new(service)))
+    let service = open_service(config, bind)?.with_page_concurrency(page_concurrency)?;
+    Ok(Some(Arc::new(service)))
 }
 
 // The constituent request structs deny unknown fields, so a malformed recovery
@@ -479,5 +519,46 @@ pub(super) async fn export_reply(
     match result {
         Ok(wire) => (StatusCode::OK.as_u16(), wire),
         Err(error) => mesh_reply_body::<()>(Err(map_host_error(error))),
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn state_transfer_settings_preserve_absence_and_serial_default() {
+        assert_eq!(validate_transfer_settings(None, None).unwrap(), None);
+        let path = "/operator/transfer.json".to_owned();
+        assert_eq!(
+            validate_transfer_settings(Some(path.clone()), None).unwrap(),
+            Some((path, 1)),
+        );
+    }
+
+    #[test]
+    fn state_transfer_settings_accept_only_bounded_explicit_windows() {
+        for (raw, expected) in [("1", 1), ("2", 2), (" 2 ", 2)] {
+            let path = "/operator/transfer.json".to_owned();
+            assert_eq!(
+                validate_transfer_settings(Some(path.clone()), Some(raw.to_owned())).unwrap(),
+                Some((path, expected)),
+            );
+        }
+        for raw in ["0", "3", "-1", "1.5", "", "  ", "18446744073709551616", "secret-marker"] {
+            let error = validate_transfer_settings(
+                Some("/operator/transfer.json".to_owned()),
+                Some(raw.to_owned()),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("secret-marker"));
+        }
+    }
+
+    #[test]
+    fn page_concurrency_without_transfer_configuration_is_not_a_silent_fallback() {
+        for raw in ["1", "2", "0", ""] {
+            assert!(validate_transfer_settings(None, Some(raw.to_owned())).is_err());
+        }
     }
 }
