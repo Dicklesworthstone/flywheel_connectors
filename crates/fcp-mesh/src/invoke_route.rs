@@ -791,10 +791,14 @@ impl MeshForwardReply {
 /// once they fall outside the freshness window (after which the envelope
 /// would be rejected as stale anyway). When the cache is full of unexpired
 /// entries the guard fails closed rather than forgetting a live nonce.
+/// Admission also fails closed on clock rollback, so an evicted envelope
+/// cannot become eligible again by rewinding the freshness window. This guard
+/// is process-local; hosts needing restart safety must use durable admission.
 #[derive(Debug)]
 pub struct MeshForwardReplayGuard {
     window_ms: u64,
     capacity: usize,
+    high_water_ms: u64,
     seen: HashMap<(String, String), u64>,
     order: VecDeque<(u64, String, String)>,
 }
@@ -806,6 +810,7 @@ impl MeshForwardReplayGuard {
         Self {
             window_ms,
             capacity: capacity.max(1),
+            high_water_ms: 0,
             seen: HashMap::new(),
             order: VecDeque::new(),
         }
@@ -824,8 +829,9 @@ impl MeshForwardReplayGuard {
     }
 
     fn evict_expired(&mut self, now_ms: u64) {
-        // Entries are recorded with their local acceptance time, so the
-        // deque is ordered and we can pop from the front.
+        // check_and_record enforces nondecreasing local acceptance time before
+        // reaching this point, so the deque is ordered. Retain for TWICE the
+        // skew window: a future-dated envelope can remain fresh that long.
         while let Some((accepted_at, _, _)) = self.order.front() {
             if now_ms.saturating_sub(*accepted_at) <= self.window_ms.saturating_mul(2) {
                 break;
@@ -838,15 +844,35 @@ impl MeshForwardReplayGuard {
 
     /// Record `envelope`'s nonce, rejecting replays.
     ///
+    /// Callers MUST authenticate the envelope with [`MeshForwardEnvelope::verify`]
+    /// before calling this method. Freshness is rechecked at admission using
+    /// this guard's window; verification before a queue or lock wait is not
+    /// sufficient. `now_ms` must be sampled at admission, not request arrival.
+    ///
     /// # Errors
     ///
-    /// Returns [`MeshForwardError::Replayed`] for a repeated nonce or
-    /// [`MeshForwardError::ReplayCacheSaturated`] when full.
+    /// Returns [`MeshForwardError::Replayed`] for a repeated nonce,
+    /// [`MeshForwardError::ReplayCacheSaturated`] when full,
+    /// [`MeshForwardError::Stale`] for an expired or future-dated envelope,
+    /// or [`MeshForwardError::Malformed`] for a malformed nonce or a clock
+    /// rollback (`field = "replay_clock"`). A rollback neither evicts nor
+    /// records anything; admission resumes when the clock catches up.
     pub fn check_and_record(
         &mut self,
         envelope: &MeshForwardEnvelope,
         now_ms: u64,
     ) -> Result<(), MeshForwardError> {
+        if now_ms < self.high_water_ms {
+            return Err(MeshForwardError::Malformed {
+                field: "replay_clock",
+                detail: "clock moved backwards; refusing admission until it catches up".to_owned(),
+            });
+        }
+        check_freshness("forward", envelope.issued_at_ms, now_ms, self.window_ms)?;
+        validate_nonce_hex(&envelope.nonce)?;
+        // Advance even if a fresh request is a duplicate or the cache is full.
+        // Any observation that can evict state must fence later clock rollback.
+        self.high_water_ms = now_ms;
         self.evict_expired(now_ms);
         let key = (
             envelope.origin_node.as_str().to_owned(),
@@ -1904,8 +1930,176 @@ mod tests {
         ));
         // Once the earlier nonces age out of twice the window they are
         // evicted; an envelope that old is already rejected as stale.
-        guard.check_and_record(&third, NOW + 60_003).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&third, NOW + 60_003),
+            Err(MeshForwardError::Stale { .. })
+        ));
+        let fresh = signed_forward_at(&mesh, NOW + 60_003);
+        guard.check_and_record(&fresh, NOW + 60_003).unwrap();
         assert_eq!(guard.len(), 1);
+    }
+
+    fn signed_forward_at(mesh: &Mesh, issued_at_ms: u64) -> MeshForwardEnvelope {
+        MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            issued_at_ms,
+            invoke_body(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_guard_rejects_authenticated_replay_after_eviction_and_clock_rollback() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        let mut guard = MeshForwardReplayGuard::new(10, 2);
+        let first = signed_forward_at(&mesh, NOW);
+        first.verify(&directory, NOW, 10).unwrap();
+        guard.check_and_record(&first, NOW).unwrap();
+
+        let later = signed_forward_at(&mesh, NOW + 21);
+        later.verify(&directory, NOW + 21, 10).unwrap();
+        guard.check_and_record(&later, NOW + 21).unwrap();
+        assert_eq!(guard.len(), 1);
+        assert!(!guard.seen.contains_key(&("node-a".to_owned(), first.nonce.clone())));
+
+        // A real, still-valid signature becomes wall-clock-fresh again. The
+        // replay guard, not signature verification, must prevent redispatch.
+        first.verify(&directory, NOW, 10).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&first, NOW),
+            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+        ));
+        assert_eq!(guard.len(), 1);
+        assert!(matches!(
+            guard.check_and_record(&later, NOW + 21),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert!(matches!(
+            guard.check_and_record(&first, NOW + 21),
+            Err(MeshForwardError::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_guard_rechecks_freshness_without_mutating_on_expired_waiters() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(10, 1);
+        let first = signed_forward_at(&mesh, NOW);
+        guard.check_and_record(&first, NOW).unwrap();
+        let queued = signed_forward_at(&mesh, NOW);
+        queued.verify(&mesh.directory("node-b"), NOW, 10).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&queued, NOW + 21),
+            Err(MeshForwardError::Stale { .. })
+        ));
+        assert_eq!(guard.high_water_ms, NOW);
+        assert_eq!(guard.len(), 1);
+        assert!(matches!(
+            guard.check_and_record(&first, NOW),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_guard_uses_its_own_skew_window_at_admission() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(10, 2);
+        let future = signed_forward_at(&mesh, NOW + 11);
+        future.verify(&mesh.directory("node-b"), NOW, 30_000).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&future, NOW),
+            Err(MeshForwardError::Stale { .. })
+        ));
+        assert!(guard.is_empty());
+        assert_eq!(guard.high_water_ms, 0);
+        let boundary = signed_forward_at(&mesh, NOW + 10);
+        guard.check_and_record(&boundary, NOW).unwrap();
+    }
+
+    #[test]
+    fn replay_guard_retains_future_dated_nonces_through_the_inclusive_boundary() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(10, 1);
+        let first = signed_forward_at(&mesh, NOW + 10);
+        guard.check_and_record(&first, NOW).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&first, NOW + 20),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        let fresh = signed_forward_at(&mesh, NOW + 20);
+        assert!(matches!(
+            guard.check_and_record(&fresh, NOW + 20),
+            Err(MeshForwardError::ReplayCacheSaturated { .. })
+        ));
+        guard.check_and_record(&fresh, NOW + 21).unwrap();
+        assert_eq!(guard.len(), 1);
+    }
+
+    #[test]
+    fn replay_guard_capacity_refusal_still_fences_clock_rollback() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(10, 1);
+        let first = signed_forward_at(&mesh, NOW);
+        let second = signed_forward_at(&mesh, NOW);
+        guard.check_and_record(&first, NOW).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&second, NOW + 1),
+            Err(MeshForwardError::ReplayCacheSaturated { .. })
+        ));
+        assert!(matches!(
+            guard.check_and_record(&second, NOW),
+            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+        ));
+        assert_eq!(guard.len(), 1);
+        let fresh = signed_forward_at(&mesh, NOW + 21);
+        guard.check_and_record(&fresh, NOW + 21).unwrap();
+    }
+
+    #[test]
+    fn replay_guard_malformed_nonce_does_not_consume_or_evict_capacity() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(10, 1);
+        let first = signed_forward_at(&mesh, NOW);
+        guard.check_and_record(&first, NOW).unwrap();
+        for nonce in ["", "00", "not-hex"] {
+            let mut malformed = signed_forward_at(&mesh, NOW + 21);
+            malformed.nonce = nonce.to_owned();
+            assert!(matches!(
+                guard.check_and_record(&malformed, NOW + 21),
+                Err(MeshForwardError::Malformed { field: "nonce", .. })
+            ));
+            assert_eq!(guard.high_water_ms, NOW);
+            assert_eq!(guard.len(), 1);
+        }
+    }
+
+    #[test]
+    fn replay_guard_handles_zero_window_and_timestamp_limits_without_forgetting() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let mut guard = MeshForwardReplayGuard::new(0, 0);
+        let first = signed_forward_at(&mesh, u64::MAX);
+        guard.check_and_record(&first, u64::MAX).unwrap();
+        assert!(matches!(
+            guard.check_and_record(&first, u64::MAX),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert!(matches!(
+            guard.check_and_record(&first, 0),
+            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+        ));
+        assert_eq!(guard.len(), 1);
+
+        let mut wide = MeshForwardReplayGuard::new(u64::MAX, 1);
+        let first = signed_forward_at(&mesh, 0);
+        wide.check_and_record(&first, 0).unwrap();
+        assert!(matches!(
+            wide.check_and_record(&first, u64::MAX),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert_eq!(wide.len(), 1);
     }
 
     #[test]
