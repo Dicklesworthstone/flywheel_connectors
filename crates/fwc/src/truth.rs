@@ -872,13 +872,17 @@ impl ResolverConfig {
 /// ```
 pub struct LiveTruthResolver {
     config: ResolverConfig,
+    precedence_policy: Option<TruthPrecedencePolicy>,
 }
 
 impl LiveTruthResolver {
     /// Create a resolver with the given configuration.
     #[must_use]
     pub fn new(config: ResolverConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            precedence_policy: None,
+        }
     }
 
     /// Effective source order for a strategy under this resolver's config.
@@ -924,6 +928,14 @@ impl LiveTruthResolver {
     where
         F: FnMut(KnowledgeState) -> Option<T>,
     {
+        if let Some(policy) = &self.precedence_policy {
+            return self.resolve_policy_query(policy, Some(strategy), |source| {
+                query_fn(source).map_or_else(
+                    || QueryResult::Unavailable(format!("{} did not return data", source.label())),
+                    QueryResult::Complete,
+                )
+            });
+        }
         let start = Instant::now();
         let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
@@ -985,6 +997,9 @@ impl LiveTruthResolver {
     where
         F: FnMut(KnowledgeState) -> QueryResult<T>,
     {
+        if let Some(policy) = &self.precedence_policy {
+            return self.resolve_policy_query(policy, Some(strategy), query_fn);
+        }
         let start = Instant::now();
         let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
@@ -1666,19 +1681,21 @@ impl TruthPrecedencePolicy {
         }
     }
 
-    /// Convert this policy to a [`ResolutionStrategy`] for backward
-    /// compatibility with existing resolver code.
+    /// Summarize this policy as a coarse [`ResolutionStrategy`].
+    ///
+    /// A strategy cannot express every custom order, floor or fallback rule.
+    /// Use `LiveTruthResolver::with_precedence_policy` for enforcement. Report
+    /// a no-network strategy only when no live source occurs anywhere in the
+    /// policy, even when a local source is preferred before a live fallback.
     #[must_use]
     pub fn to_resolution_strategy(&self) -> ResolutionStrategy {
-        if self.precedence.is_empty() {
-            return ResolutionStrategy::OfflineOnly;
-        }
-        match self.precedence[0] {
-            KnowledgeState::MeshBacked => ResolutionStrategy::BestAvailable,
-            KnowledgeState::HostBacked => ResolutionStrategy::PreferHost,
-            KnowledgeState::Offline => ResolutionStrategy::OfflineOnly,
-            KnowledgeState::NodeLocal => ResolutionStrategy::NodeLocalOnly,
-            _ => ResolutionStrategy::PreferHost,
+        match self.precedence.iter().find(|source| source.is_live()) {
+            Some(KnowledgeState::MeshBacked) => ResolutionStrategy::BestAvailable,
+            Some(KnowledgeState::HostBacked) => ResolutionStrategy::PreferHost,
+            _ if self.precedence.contains(&KnowledgeState::NodeLocal) => {
+                ResolutionStrategy::NodeLocalOnly
+            }
+            _ => ResolutionStrategy::OfflineOnly,
         }
     }
 
@@ -1726,9 +1743,10 @@ impl Default for TruthPrecedencePolicy {
 impl LiveTruthResolver {
     /// Create a resolver constrained by a zone-wide precedence policy.
     ///
-    /// The resolver will use the policy's source ordering instead of
-    /// allowing per-operator strategy selection. This ensures that all
-    /// operators in the same zone produce consistent answers.
+    /// The complete policy is retained, not approximated by its first source.
+    /// Per-call strategies may restrict network access but cannot reorder the
+    /// policy, relax its minimum, or enable fallback. Invalid policies fail
+    /// resolution before any query is made.
     #[must_use]
     pub fn with_precedence_policy(config: ResolverConfig, policy: TruthPrecedencePolicy) -> Self {
         let strategy = policy.to_resolution_strategy();
@@ -1737,14 +1755,15 @@ impl LiveTruthResolver {
                 default_strategy: strategy,
                 ..config
             },
+            precedence_policy: Some(policy),
         }
     }
 
-    /// Resolve truth using a zone-wide precedence policy.
+    /// Resolve complete truth under an explicit precedence policy.
     ///
-    /// This is the policy-aware resolution path. The resolver queries
-    /// sources in the policy's precedence order and rejects answers
-    /// that fall below the policy's minimum acceptable threshold.
+    /// Configuration, minimum-source and no-fallback restrictions are checked
+    /// BEFORE invoking the callback. An explicitly supplied policy cannot
+    /// replace a different policy retained by `with_precedence_policy`.
     pub fn resolve_with_policy<T, F>(
         &self,
         policy: &TruthPrecedencePolicy,
@@ -1753,45 +1772,103 @@ impl LiveTruthResolver {
     where
         F: FnMut(KnowledgeState) -> Option<T>,
     {
+        self.resolve_policy_query(policy, None, |source| {
+            query_fn(source).map_or_else(
+                || QueryResult::Unavailable(format!("{} did not return data", source.label())),
+                QueryResult::Complete,
+            )
+        })
+    }
+
+    fn validate_resolution_policy(
+        &self,
+        policy: &TruthPrecedencePolicy,
+        strategy: ResolutionStrategy,
+    ) -> Result<(), ResolutionError> {
+        let invalid = |reason: &str| ResolutionError {
+            strategy,
+            attempts: Vec::new(),
+            reason: reason.to_owned(),
+        };
+        if self.precedence_policy.as_ref().is_some_and(|bound| bound != policy) {
+            return Err(invalid("explicit truth policy differs from the resolver's bound policy"));
+        }
+        let sources = policy.source_order();
+        if sources.is_empty() || sources.len() > 4
+            || !sources.contains(&policy.minimum_acceptable)
+            || sources.iter().enumerate().any(|(index, source)| {
+                matches!(source, KnowledgeState::Degraded | KnowledgeState::FallbackDerived)
+                    || sources[..index].contains(source)
+            })
+        {
+            return Err(invalid(
+                "truth policy requires distinct queryable sources and a minimum present in its precedence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_policy_query<T, F>(
+        &self,
+        policy: &TruthPrecedencePolicy,
+        restriction: Option<ResolutionStrategy>,
+        mut query_fn: F,
+    ) -> Result<TruthResolution<T>, ResolutionError>
+    where
+        F: FnMut(KnowledgeState) -> QueryResult<T>,
+    {
+        // OfflineOnly/NodeLocalOnly remain real no-network restrictions even
+        // when the retained policy prefers live sources. The policy still owns
+        // the ordering and threshold within that intersection.
+        let strategy = match restriction {
+            Some(ResolutionStrategy::OfflineOnly) => ResolutionStrategy::OfflineOnly,
+            Some(ResolutionStrategy::NodeLocalOnly) => ResolutionStrategy::NodeLocalOnly,
+            _ => policy.to_resolution_strategy(),
+        };
+        self.validate_resolution_policy(policy, strategy)?;
+        let permitted_by_strategy = restriction.map(ResolutionStrategy::source_order);
         let start = Instant::now();
         let sources = policy.source_order();
-        let strategy = policy.to_resolution_strategy();
         let mut attempts = Vec::with_capacity(sources.len());
 
-        for source in sources {
+        for (index, source) in sources.iter().copied().enumerate() {
+            let skipped = if !policy.is_acceptable(source) {
+                Some("source is below the policy's minimum acceptable state")
+            } else if source == KnowledgeState::MeshBacked && !self.config.mesh_backed_enabled {
+                Some("mesh-backed queries are disabled by resolver configuration")
+            } else if permitted_by_strategy.as_ref().is_some_and(|allowed| !allowed.contains(&source)) {
+                Some("source is excluded by the requested resolution strategy")
+            } else {
+                None
+            };
+            if let Some(reason) = skipped {
+                attempts.push(SourceAttempt {
+                    source,
+                    outcome: SourceOutcome::Skipped,
+                    elapsed: Duration::ZERO,
+                    detail: Some(reason.to_owned()),
+                });
+                if !policy.allow_fallback {
+                    break;
+                }
+                continue;
+            }
+
             let attempt_start = Instant::now();
-            let result = query_fn(*source);
-            let attempt_elapsed = attempt_start.elapsed();
-
-            match result {
-                Some(value) => {
-                    // Check if this source meets the minimum acceptable threshold
-                    if !policy.is_acceptable(*source) {
-                        attempts.push(SourceAttempt {
-                            source: *source,
-                            outcome: SourceOutcome::Skipped,
-                            elapsed: attempt_elapsed,
-                            detail: Some(format!(
-                                "{} below minimum acceptable ({})",
-                                source.label(),
-                                policy.minimum_acceptable.label(),
-                            )),
-                        });
-                        continue;
-                    }
-
+            let result = query_fn(source);
+            let elapsed = attempt_start.elapsed();
+            let (outcome, detail) = match result {
+                QueryResult::Complete(value) => {
                     attempts.push(SourceAttempt {
-                        source: *source,
+                        source,
                         outcome: SourceOutcome::Success,
-                        elapsed: attempt_elapsed,
+                        elapsed,
                         detail: None,
                     });
-
-                    let freshness = TruthFreshness::now(self.max_age_for(*source), start.elapsed());
-
+                    let freshness = TruthFreshness::now(self.max_age_for(source), start.elapsed());
                     let trace = DecisionTrace {
                         attempts,
-                        selected_source: *source,
+                        selected_source: source,
                         strategy,
                         reason: format!(
                             "{} returned answer (policy: {}, zone: {})",
@@ -1799,25 +1876,23 @@ impl LiveTruthResolver {
                             policy.model_version,
                             policy.zone_id.as_deref().unwrap_or("global"),
                         ),
-                        used_fallback: *source != sources[0],
+                        used_fallback: index != 0,
                         correlation_id: Uuid::new_v4(),
                     };
-
-                    return Ok(TruthResolution::new(value, *source, freshness, trace));
+                    return Ok(TruthResolution::new(value, source, freshness, trace));
                 }
-                None => {
-                    attempts.push(SourceAttempt {
-                        source: *source,
-                        outcome: SourceOutcome::Unreachable,
-                        elapsed: attempt_elapsed,
-                        detail: Some(format!("{} did not return data", source.label())),
-                    });
-
-                    if !policy.allow_fallback {
-                        // Policy forbids fallback — stop after first source fails
-                        break;
-                    }
+                QueryResult::Partial(_, detail) => {
+                    // Partial/stale evidence remains diagnostic. It is not a
+                    // complete answer satisfying a policy's source floor.
+                    (SourceOutcome::Partial, Some(detail))
                 }
+                QueryResult::Unavailable(detail) => (SourceOutcome::Unreachable, Some(detail)),
+                QueryResult::Error(detail) => (SourceOutcome::Error, Some(detail)),
+                QueryResult::NotConfigured => (SourceOutcome::NotConfigured, None),
+            };
+            attempts.push(SourceAttempt { source, outcome, elapsed, detail });
+            if !policy.allow_fallback {
+                break;
             }
         }
 
@@ -1825,7 +1900,7 @@ impl LiveTruthResolver {
             strategy,
             attempts,
             reason: format!(
-                "all sources failed or were unavailable (policy: {}, zone: {})",
+                "all sources failed or were unavailable under the truth policy (policy: {}, zone: {})",
                 policy.model_version,
                 policy.zone_id.as_deref().unwrap_or("global"),
             ),
@@ -1840,6 +1915,289 @@ impl LiveTruthResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_disabled_mesh_is_skipped_before_the_callback() {
+        let resolver = LiveTruthResolver::with_defaults();
+        let mut queried = Vec::new();
+        let result = resolver.resolve_with_policy(&TruthPrecedencePolicy::v2_default(), |source| {
+            assert_ne!(source, KnowledgeState::MeshBacked, "disabled source was queried");
+            queried.push(source);
+            Some("host")
+        }).unwrap();
+        assert_eq!(queried, vec![KnowledgeState::HostBacked]);
+        assert_eq!(result.knowledge_state, KnowledgeState::HostBacked);
+        assert_eq!(result.trace.attempts[0].outcome, SourceOutcome::Skipped);
+        assert_eq!(result.trace.attempts[0].elapsed, Duration::ZERO);
+        assert!(result.trace.failed_sources().is_empty());
+        assert!(result.is_fallback());
+    }
+
+    #[test]
+    fn policy_floor_prevents_querying_unacceptable_sources() {
+        let resolver = LiveTruthResolver::with_defaults();
+        let policy = TruthPrecedencePolicy::for_zone(
+            "z:work",
+            vec![KnowledgeState::HostBacked, KnowledgeState::NodeLocal, KnowledgeState::Offline],
+            KnowledgeState::HostBacked,
+        );
+        let mut queried = Vec::new();
+        let error = resolver.resolve_with_policy::<(), _>(&policy, |source| {
+            assert_eq!(source, KnowledgeState::HostBacked);
+            queried.push(source);
+            None
+        }).unwrap_err();
+        assert_eq!(queried, vec![KnowledgeState::HostBacked]);
+        assert_eq!(error.attempts.len(), 3);
+        assert_eq!(error.attempts[0].outcome, SourceOutcome::Unreachable);
+        assert!(error.attempts[1..].iter().all(|attempt| {
+            attempt.outcome == SourceOutcome::Skipped && attempt.elapsed.is_zero()
+        }));
+    }
+
+    #[test]
+    fn policy_invalid_shapes_fail_before_querying_any_source() {
+        use KnowledgeState::{Degraded, FallbackDerived, HostBacked, MeshBacked, Offline};
+        let resolver = mesh_enabled_resolver();
+        for (precedence, minimum) in [
+            (vec![], Offline),
+            (vec![HostBacked], Offline),
+            (vec![HostBacked, HostBacked, Offline], Offline),
+            (vec![Degraded, Offline], Offline),
+            (vec![FallbackDerived], FallbackDerived),
+            (vec![MeshBacked, HostBacked, Offline, HostBacked, Offline], Offline),
+        ] {
+            let policy = TruthPrecedencePolicy::for_zone("z:work", precedence, minimum);
+            let error = resolver.resolve_with_policy::<(), _>(&policy, |_| {
+                panic!("invalid policy performed I/O")
+            }).unwrap_err();
+            assert!(error.attempts.is_empty());
+        }
+    }
+
+    #[test]
+    fn no_fallback_does_not_promote_a_source_when_the_head_is_disabled() {
+        let policy = TruthPrecedencePolicy {
+            allow_fallback: false,
+            ..TruthPrecedencePolicy::v2_default()
+        };
+        let resolver = LiveTruthResolver::with_defaults();
+        let error = resolver.resolve_with_policy::<(), _>(&policy, |_| {
+            panic!("disabled preferred source must not enable a fallback")
+        }).unwrap_err();
+        assert_eq!(error.attempts.len(), 1);
+        assert_eq!(error.attempts[0].source, KnowledgeState::MeshBacked);
+        assert_eq!(error.attempts[0].outcome, SourceOutcome::Skipped);
+    }
+
+    #[test]
+    fn bound_policy_preserves_custom_order_instead_of_approximating_its_head() {
+        let policy = TruthPrecedencePolicy::for_zone(
+            "z:work",
+            vec![KnowledgeState::NodeLocal, KnowledgeState::HostBacked],
+            KnowledgeState::HostBacked,
+        );
+        let resolver = LiveTruthResolver::with_precedence_policy(ResolverConfig::default(), policy);
+        let mut queried = Vec::new();
+        let result = resolver.resolve_sync(ResolutionStrategy::PreferHost, |source| {
+            queried.push(source);
+            (source == KnowledgeState::HostBacked).then_some("live")
+        }).unwrap();
+        assert_eq!(queried, vec![KnowledgeState::NodeLocal, KnowledgeState::HostBacked]);
+        assert_eq!(result.value, "live");
+        assert!(result.is_fallback());
+    }
+
+    #[test]
+    fn bound_policy_minimum_and_no_fallback_survive_strategy_calls() {
+        let policy = TruthPrecedencePolicy {
+            allow_fallback: false,
+            minimum_acceptable: KnowledgeState::HostBacked,
+            ..TruthPrecedencePolicy::v1_default()
+        };
+        let resolver = LiveTruthResolver::with_precedence_policy(
+            ResolverConfig::default().with_mesh_backed(true), policy,
+        );
+        let error = resolver.resolve_sync::<(), _>(ResolutionStrategy::BestAvailable, |source| {
+            assert_eq!(source, KnowledgeState::HostBacked);
+            None
+        }).unwrap_err();
+        assert_eq!(error.attempts.len(), 1);
+        assert_eq!(error.attempts[0].outcome, SourceOutcome::Unreachable);
+    }
+
+    #[test]
+    fn bound_policy_never_promotes_a_partial_answer_to_a_compliant_result() {
+        let policy = TruthPrecedencePolicy::for_zone(
+            "z:private", vec![KnowledgeState::HostBacked], KnowledgeState::HostBacked,
+        );
+        let resolver = LiveTruthResolver::with_precedence_policy(ResolverConfig::default(), policy);
+        let error = resolver.resolve_with_partials(ResolutionStrategy::PreferHost, |source| {
+            assert_eq!(source, KnowledgeState::HostBacked);
+            QueryResult::Partial("stale", "expired observation".to_owned())
+        }).unwrap_err();
+        assert_eq!(error.attempts.len(), 1);
+        assert_eq!(error.attempts[0].outcome, SourceOutcome::Partial);
+        assert_eq!(error.attempts[0].detail.as_deref(), Some("expired observation"));
+    }
+
+    #[test]
+    fn bound_policy_partial_failover_keeps_diagnostics_and_uses_only_allowed_sources() {
+        let policy = TruthPrecedencePolicy::for_zone(
+            "z:work", vec![KnowledgeState::MeshBacked, KnowledgeState::HostBacked],
+            KnowledgeState::HostBacked,
+        );
+        let resolver = LiveTruthResolver::with_precedence_policy(
+            ResolverConfig::default().with_mesh_backed(true), policy,
+        );
+        let result = resolver.resolve_with_partials(ResolutionStrategy::PreferHost, |source| {
+            match source {
+                KnowledgeState::MeshBacked => QueryResult::Partial("stale", "not current".into()),
+                KnowledgeState::HostBacked => QueryResult::Complete("current"),
+                _ => panic!("unlisted source was queried"),
+            }
+        }).unwrap();
+        assert_eq!(result.value, "current");
+        assert_eq!(result.knowledge_state, KnowledgeState::HostBacked);
+        assert_eq!(result.trace.attempts[0].outcome, SourceOutcome::Partial);
+        assert_eq!(result.trace.attempts[1].outcome, SourceOutcome::Success);
+    }
+
+    #[test]
+    fn bound_policy_cannot_be_replaced_by_a_more_permissive_explicit_policy() {
+        let mut policy = TruthPrecedencePolicy::for_zone(
+            "z:private", vec![KnowledgeState::HostBacked], KnowledgeState::HostBacked,
+        );
+        let resolver = LiveTruthResolver::with_precedence_policy(
+            ResolverConfig::default(), policy.clone(),
+        );
+        policy.precedence.push(KnowledgeState::Offline);
+        policy.minimum_acceptable = KnowledgeState::Offline;
+        let error = resolver.resolve_with_policy::<(), _>(&policy, |_| {
+            panic!("replacement policy performed I/O")
+        }).unwrap_err();
+        assert!(error.attempts.is_empty());
+        assert!(error.reason.contains("bound policy"));
+    }
+
+    #[test]
+    fn bound_policy_never_overrides_a_callers_no_network_strategy() {
+        let policy = TruthPrecedencePolicy::v1_default();
+        let resolver = LiveTruthResolver::with_precedence_policy(
+            ResolverConfig::default().with_mesh_backed(true), policy,
+        );
+        for strategy in [ResolutionStrategy::OfflineOnly, ResolutionStrategy::NodeLocalOnly] {
+            let result = resolver.resolve_sync(strategy, |source| {
+                assert!(!source.is_live());
+                assert!(strategy.source_order().contains(&source));
+                Some("local")
+            }).unwrap();
+            assert_eq!(result.trace.strategy, strategy);
+            assert!(!result.knowledge_state.is_live());
+        }
+        let strict = TruthPrecedencePolicy::for_zone(
+            "z:owner", vec![KnowledgeState::HostBacked], KnowledgeState::HostBacked,
+        );
+        let resolver = LiveTruthResolver::with_precedence_policy(ResolverConfig::default(), strict);
+        assert!(resolver.resolve_sync::<(), _>(ResolutionStrategy::OfflineOnly, |_| {
+            panic!("network query under OfflineOnly")
+        }).is_err());
+    }
+
+    #[test]
+    fn bound_policy_keeps_rich_failure_classification_without_weakening_fallback() {
+        let resolver = LiveTruthResolver::with_precedence_policy(
+            ResolverConfig::default().with_mesh_backed(true), TruthPrecedencePolicy::v2_default(),
+        );
+        let error = resolver.resolve_with_partials::<(), _>(ResolutionStrategy::BestAvailable, |source| {
+            match source {
+                KnowledgeState::MeshBacked => QueryResult::NotConfigured,
+                KnowledgeState::HostBacked => QueryResult::Error("host error".into()),
+                KnowledgeState::NodeLocal => QueryResult::Unavailable("missing cache".into()),
+                KnowledgeState::Offline => QueryResult::Partial((), "incomplete".into()),
+                _ => panic!("derived states are not sources"),
+            }
+        }).unwrap_err();
+        let outcomes: Vec<_> = error.attempts.iter().map(|attempt| attempt.outcome).collect();
+        assert_eq!(outcomes, vec![SourceOutcome::NotConfigured, SourceOutcome::Error,
+            SourceOutcome::Unreachable, SourceOutcome::Partial]);
+    }
+
+    #[test]
+    fn policy_source_matrix_never_queries_outside_the_admitted_prefix() {
+        for base in [TruthPrecedencePolicy::v1_default(), TruthPrecedencePolicy::v2_default()] {
+            for mesh_enabled in [false, true] {
+                for allow_fallback in [false, true] {
+                    for minimum_index in 0..base.precedence.len() {
+                        for available in 0_u8..16 {
+                            let mut policy = base.clone();
+                            policy.minimum_acceptable = policy.precedence[minimum_index];
+                            policy.allow_fallback = allow_fallback;
+                            let resolver = LiveTruthResolver::with_precedence_policy(
+                                ResolverConfig::default().with_mesh_backed(mesh_enabled), policy.clone(),
+                            );
+                            let mut expected_queries = Vec::new();
+                            let mut expected_source = None;
+                            let last = if allow_fallback { minimum_index } else { 0 };
+                            for (index, source) in policy.precedence[..=last].iter().copied().enumerate() {
+                                if source == KnowledgeState::MeshBacked && !mesh_enabled { continue; }
+                                expected_queries.push(source);
+                                if available & (1_u8 << index) != 0 {
+                                    expected_source = Some(source);
+                                    break;
+                                }
+                            }
+                            let mut queried = Vec::new();
+                            let result = resolver.resolve_sync(ResolutionStrategy::BestAvailable, |source| {
+                                assert!(policy.is_acceptable(source));
+                                assert!(mesh_enabled || source != KnowledgeState::MeshBacked);
+                                queried.push(source);
+                                let index = policy.precedence.iter().position(|entry| *entry == source).unwrap();
+                                (available & (1_u8 << index) != 0).then_some(source)
+                            });
+                            assert_eq!(queried, expected_queries);
+                            match result {
+                                Ok(resolution) => {
+                                    assert_eq!(Some(resolution.knowledge_state), expected_source);
+                                    assert_eq!(resolution.is_fallback(), resolution.knowledge_state != policy.precedence[0]);
+                                }
+                                Err(_) => assert!(expected_source.is_none()),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_strategy_summary_does_not_claim_offline_for_live_fallbacks() {
+        for preferred in [KnowledgeState::NodeLocal, KnowledgeState::Offline] {
+            for (live, expected) in [
+                (KnowledgeState::HostBacked, ResolutionStrategy::PreferHost),
+                (KnowledgeState::MeshBacked, ResolutionStrategy::BestAvailable),
+            ] {
+                let policy = TruthPrecedencePolicy::for_zone(
+                    "z:work", vec![preferred, live], live,
+                );
+                assert_eq!(policy.to_resolution_strategy(), expected);
+                let resolver = LiveTruthResolver::with_precedence_policy(
+                    ResolverConfig::default().with_mesh_backed(true), policy,
+                );
+                let result = resolver.resolve_sync(expected, |source| {
+                    (source == live).then_some("live fallback")
+                }).unwrap();
+                assert_eq!(result.trace.strategy, expected);
+                assert_eq!(result.knowledge_state, live);
+            }
+        }
+        let local = TruthPrecedencePolicy::for_zone(
+            "z:work", vec![KnowledgeState::Offline, KnowledgeState::NodeLocal],
+            KnowledgeState::NodeLocal,
+        );
+        assert_eq!(local.to_resolution_strategy(), ResolutionStrategy::NodeLocalOnly);
+    }
+
     /// Resolver with the mesh-backed rung explicitly enabled, for tests that
     /// exercise mesh-first ladders. Production default is mesh-disabled until
     /// the host reports healthy mesh peers (A.6) or `FWC_MESH_BACKED` is set.
@@ -3905,7 +4263,7 @@ mod tests {
             model_version: OperationalModelVersion::V1HostFirst,
         };
 
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
 
         // Mesh unavailable → resolution should fail
         let result = resolver.resolve_with_policy(&strict_policy, |source| match source {
@@ -3935,7 +4293,7 @@ mod tests {
         // When higher-precedence source is unavailable and fallback is allowed,
         // the policy should fall back to the next source in order.
         let policy = TruthPrecedencePolicy::v1_default();
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
 
         // Host unavailable, but mesh and offline available
         let result = resolver
