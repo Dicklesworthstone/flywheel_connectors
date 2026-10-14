@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use fcp_async_core::channel::mpsc;
 use fcp_async_core::process::Child;
+use fcp_async_core::CancellationToken;
 use fcp_core::InvokeResponse;
 use fcp_host::{
     CancellationController, CancellationRegistration, CancellationTerminator, HostError, HostResult,
@@ -23,6 +24,8 @@ use super::{CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcReques
 
 const MAX_NATIVE_INVOCATION_LIFETIME: Duration = Duration::from_secs(60);
 const RETIREMENT_GRACE: Duration = Duration::from_secs(2);
+// Physical exit still needs a nonblocking child probe. Ordinary cancellation
+// must not use this interval: async-core sleep creates a thread for every wait.
 const RETIREMENT_POLL: Duration = Duration::from_millis(20);
 
 fn deadline_after(started_at: Instant, timeout: Duration) -> Instant {
@@ -37,6 +40,18 @@ pub(super) fn invocation_deadline(started_at: Instant, deadline_ms: Option<u64>)
         .unwrap_or(MAX_NATIVE_INVOCATION_LIFETIME)
         .min(MAX_NATIVE_INVOCATION_LIFETIME);
     deadline_after(started_at, timeout)
+}
+
+/// One notification subscription and one absolute-deadline timer per waiter.
+/// Subscribing before checking the sticky state closes cancellation-before-poll
+/// and cancellation-during-registration races without a polling timer.
+async fn cancellation_or_deadline(signal: &CancellationToken, deadline: Instant) {
+    let mut listener = signal.subscribe();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if listener.is_cancelled() || remaining.is_zero() {
+        return;
+    }
+    let _ = fcp_async_core::time::timeout(remaining, listener.cancelled()).await;
 }
 
 enum RpcPhase {
@@ -57,6 +72,8 @@ struct RpcState {
 pub(super) struct NativeRpc {
     deadline: Instant,
     state: Arc<Mutex<RpcState>>,
+    // Notification only: selection and settlement still consult the state lock.
+    cancellation: CancellationToken,
 }
 
 impl std::fmt::Debug for NativeRpc {
@@ -78,6 +95,7 @@ impl NativeRpc {
                 cancel_requested: false,
                 transport_retired: false,
             })),
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -148,7 +166,7 @@ impl NativeRpc {
 
     pub(super) fn cancel(&self) {
         let mut state = self.state.lock().expect("native RPC state lock");
-        if matches!(state.phase, RpcPhase::Settled) {
+        if matches!(state.phase, RpcPhase::Settled) || state.cancel_requested {
             return;
         }
         state.cancel_requested = true;
@@ -156,6 +174,10 @@ impl NativeRpc {
             // The actor cannot select this ticket after this transition.
             state.phase = RpcPhase::Settled;
         }
+        // A wake callback can re-enter host code. Publish the transition first
+        // and never invoke it while holding the command's ownership lock.
+        drop(state);
+        self.cancellation.cancel();
     }
 
     /// Transfer process custody before clearing the runner's active command.
@@ -209,11 +231,8 @@ impl NativeRpc {
     }
 
     async fn cancelled(&self) {
-        loop {
-            if self.is_cancelled() {
-                return;
-            }
-            fcp_async_core::time::sleep(RETIREMENT_POLL.min(self.remaining())).await;
+        if !self.is_cancelled() {
+            cancellation_or_deadline(&self.cancellation, self.deadline).await;
         }
     }
 
@@ -252,14 +271,12 @@ pub(super) async fn run_dispatcher(
         runner.active_rpc = Some(rpc.clone());
         let response = {
             let mut cancelled = pin!(rpc.cancelled());
-            let mut operation = pin!(fcp_async_core::time::timeout(
-                rpc.remaining(),
-                runner.request(&request.method, request.params),
-            ));
+            // cancelled() already enforces the ticket's absolute deadline;
+            // wrapping the request in another timeout would duplicate its timer.
+            let mut operation = pin!(runner.request(&request.method, request.params));
             match select(cancelled.as_mut(), operation.as_mut()).await {
                 Either::Left(_) => Err(rpc.stop_error()),
-                Either::Right((Ok(response), _)) => response,
-                Either::Right((Err(_), _)) => Err(rpc.stop_error()),
+                Either::Right((response, _)) => response,
             }
         };
         if response.is_ok() && rpc.try_settle_reply() {
@@ -291,6 +308,7 @@ struct InvocationCommands {
 struct InvocationState {
     deadline: Instant,
     commands: Mutex<InvocationCommands>,
+    cancellation: CancellationToken,
     waiter_finished: AtomicBool,
     registration: OnceLock<(Weak<CancellationController>, CancellationRegistration)>,
     retirement_deadline: OnceLock<Instant>,
@@ -312,6 +330,7 @@ impl NativeInvocationTermination {
                     stop_requested: false,
                     rpcs: Vec::new(),
                 }),
+                cancellation: CancellationToken::new(),
                 waiter_finished: AtomicBool::new(false),
                 registration: OnceLock::new(),
                 retirement_deadline: OnceLock::new(),
@@ -350,13 +369,14 @@ impl NativeInvocationTermination {
                 .min(deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT)),
         );
         let mut commands = self.state.commands.lock().expect("native invocation lock");
-        if commands.stop_requested
+        let cancel = commands.stop_requested
             || self.state.waiter_finished.load(Ordering::SeqCst)
-            || Instant::now() >= self.state.deadline
-        {
+            || Instant::now() >= self.state.deadline;
+        commands.rpcs.push(rpc.clone());
+        drop(commands);
+        if cancel {
             rpc.cancel();
         }
-        commands.rpcs.push(rpc.clone());
         rpc
     }
 
@@ -371,16 +391,31 @@ impl NativeInvocationTermination {
     }
 
     pub(super) fn cancel(&self) {
-        let mut commands = self.state.commands.lock().expect("native invocation lock");
-        commands.stop_requested = true;
-        for rpc in &commands.rpcs {
+        let rpcs = {
+            let mut commands = self.state.commands.lock().expect("native invocation lock");
+            if commands.stop_requested {
+                return;
+            }
+            commands.stop_requested = true;
+            commands.rpcs.clone()
+        };
+        // Any concurrently registered command observes the stop latch before
+        // leaving register_rpc. Wake only outside both ownership locks.
+        for rpc in rpcs {
             rpc.cancel();
         }
+        self.state.cancellation.cancel();
     }
 
     fn cancel_pending_rpcs(&self) {
-        let commands = self.state.commands.lock().expect("native invocation lock");
-        for rpc in &commands.rpcs {
+        let rpcs = self
+            .state
+            .commands
+            .lock()
+            .expect("native invocation lock")
+            .rpcs
+            .clone();
+        for rpc in rpcs {
             rpc.cancel();
         }
     }
@@ -401,21 +436,8 @@ impl NativeInvocationTermination {
     }
 
     async fn cancelled(&self) {
-        loop {
-            let stop_requested = self
-                .state
-                .commands
-                .lock()
-                .expect("native invocation lock")
-                .stop_requested;
-            if stop_requested || Instant::now() >= self.state.deadline {
-                return;
-            }
-            fcp_async_core::time::sleep(
-                RETIREMENT_POLL
-                    .min(self.state.deadline.saturating_duration_since(Instant::now())),
-            )
-            .await;
+        if !self.is_cancel_requested() {
+            cancellation_or_deadline(&self.state.cancellation, self.state.deadline).await;
         }
     }
 
@@ -811,5 +833,264 @@ exec sleep 30
         rpc.retire(child);
         rpc.wait_for_settlement().await;
         assert!(rpc.is_settled(), "child must be observed exited");
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use std::future::pending;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::*;
+
+    struct WakeProbe {
+        wakes: AtomicUsize,
+        ownership_locks_free: AtomicBool,
+        rpc: Option<Weak<Mutex<RpcState>>>,
+        invocation: Option<Weak<InvocationState>>,
+    }
+
+    impl WakeProbe {
+        fn new(rpc: Option<&NativeRpc>, invocation: Option<&NativeInvocationTermination>) -> Arc<Self> {
+            Arc::new(Self {
+                wakes: AtomicUsize::new(0),
+                ownership_locks_free: AtomicBool::new(true),
+                rpc: rpc.map(|rpc| Arc::downgrade(&rpc.state)),
+                invocation: invocation.map(|invocation| Arc::downgrade(&invocation.state)),
+            })
+        }
+
+        fn observe(&self) {
+            let rpc_free = self.rpc.as_ref().and_then(Weak::upgrade)
+                .is_none_or(|state| state.try_lock().is_ok());
+            let invocation_free = self.invocation.as_ref().and_then(Weak::upgrade)
+                .is_none_or(|state| state.commands.try_lock().is_ok());
+            self.ownership_locks_free.fetch_and(rpc_free && invocation_free, Ordering::SeqCst);
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn assert_notified(&self) {
+            assert!(self.wakes.load(Ordering::SeqCst) > 0, "cancellation must wake a parked task");
+            assert!(self.ownership_locks_free.load(Ordering::SeqCst), "wake ran under an ownership lock");
+        }
+    }
+
+    impl Wake for WakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>, probe: &Arc<WakeProbe>) -> Poll<F::Output> {
+        let waker = Waker::from(Arc::clone(probe));
+        future.poll(&mut Context::from_waker(&waker))
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rpc_cancel_notifies_all_parked_listeners_without_timer_progress() {
+        let rpc = NativeRpc::new(invocation_deadline(Instant::now(), None));
+        assert!(rpc.try_begin());
+        let first_probe = WakeProbe::new(Some(&rpc), None);
+        let second_probe = WakeProbe::new(Some(&rpc), None);
+        let mut first = Box::pin(rpc.cancelled());
+        let mut second = Box::pin(rpc.cancelled());
+        assert!(poll_once(first.as_mut(), &first_probe).is_pending());
+        assert!(poll_once(second.as_mut(), &second_probe).is_pending());
+
+        rpc.cancel();
+        first_probe.assert_notified();
+        second_probe.assert_notified();
+        assert!(poll_once(first.as_mut(), &first_probe).is_ready());
+        assert!(poll_once(second.as_mut(), &second_probe).is_ready());
+        assert!(!rpc.try_settle_reply());
+        assert!(!rpc.is_settled(), "notification is not physical retirement");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn logical_cancel_notifies_command_and_invocation_outside_both_locks() {
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let rpc = invocation.register_rpc();
+        assert!(rpc.try_begin());
+        let command_probe = WakeProbe::new(Some(&rpc), Some(&invocation));
+        let invocation_probe = WakeProbe::new(Some(&rpc), Some(&invocation));
+        let mut command = Box::pin(rpc.cancelled());
+        let mut logical = Box::pin(invocation.cancelled());
+        assert!(poll_once(command.as_mut(), &command_probe).is_pending());
+        assert!(poll_once(logical.as_mut(), &invocation_probe).is_pending());
+
+        invocation.cancel();
+        command_probe.assert_notified();
+        invocation_probe.assert_notified();
+        assert!(poll_once(command.as_mut(), &command_probe).is_ready());
+        assert!(poll_once(logical.as_mut(), &invocation_probe).is_ready());
+        assert!(!invocation.register_rpc().try_begin());
+        let command_wakes = command_probe.wakes.load(Ordering::SeqCst);
+        let invocation_wakes = invocation_probe.wakes.load(Ordering::SeqCst);
+        invocation.cancel();
+        rpc.cancel();
+        assert_eq!(command_probe.wakes.load(Ordering::SeqCst), command_wakes);
+        assert_eq!(invocation_probe.wakes.load(Ordering::SeqCst), invocation_wakes);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancellation_before_subscription_is_sticky() {
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let rpc = invocation.register_rpc();
+        invocation.cancel();
+        let probe = WakeProbe::new(Some(&rpc), Some(&invocation));
+        let mut command = Box::pin(rpc.cancelled());
+        let mut logical = Box::pin(invocation.cancelled());
+        assert!(poll_once(command.as_mut(), &probe).is_ready());
+        assert!(poll_once(logical.as_mut(), &probe).is_ready());
+        assert!(rpc.is_settled());
+        assert!(!rpc.try_begin());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn late_cancellation_does_not_signal_a_settled_ticket() {
+        let rpc = NativeRpc::new(invocation_deadline(Instant::now(), None));
+        assert!(rpc.try_begin());
+        assert!(rpc.try_settle_reply());
+        let probe = WakeProbe::new(Some(&rpc), None);
+        let mut cancelled = Box::pin(rpc.cancelled());
+        assert!(poll_once(cancelled.as_mut(), &probe).is_pending());
+        rpc.cancel();
+        assert!(!rpc.cancellation.is_cancelled());
+        assert!(!rpc.is_cancelled());
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn candidate_drain_does_not_signal_logical_cancellation() {
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let rejected = invocation.register_rpc();
+        let probe = WakeProbe::new(Some(&rejected), Some(&invocation));
+        let mut logical = Box::pin(invocation.cancelled());
+        assert!(poll_once(logical.as_mut(), &probe).is_pending());
+        invocation.cancel_pending_rpcs();
+        assert!(rejected.cancellation.is_cancelled());
+        assert!(rejected.is_settled());
+        assert!(!invocation.state.cancellation.is_cancelled());
+        assert!(!invocation.is_cancel_requested());
+        assert_eq!(probe.wakes.load(Ordering::SeqCst), 0);
+        let fresh = invocation.register_rpc();
+        assert!(fresh.try_begin());
+        assert!(fresh.try_settle_reply());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancel_releases_a_parked_invocation_and_its_owned_future() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(Arc::clone(&dropped));
+        let mut running = Box::pin(invocation.invoke(async move {
+            let _guard = guard;
+            pending::<HostResult<InvokeResponse>>().await
+        }));
+        let probe = WakeProbe::new(None, Some(&invocation));
+        assert!(poll_once(running.as_mut(), &probe).is_pending());
+        invocation.cancel();
+        probe.assert_notified();
+        assert!(matches!(poll_once(running.as_mut(), &probe), Poll::Ready(Err(_))));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(invocation.is_finished());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn waiter_abandonment_wakes_only_its_exact_queued_command() {
+        let abandoned = NativeRpc::new(invocation_deadline(Instant::now(), None));
+        let other = NativeRpc::new(invocation_deadline(Instant::now(), None));
+        let abandoned_probe = WakeProbe::new(Some(&abandoned), None);
+        let other_probe = WakeProbe::new(Some(&other), None);
+        let mut abandoned_stop = Box::pin(abandoned.cancelled());
+        let mut other_stop = Box::pin(other.cancelled());
+        assert!(poll_once(abandoned_stop.as_mut(), &abandoned_probe).is_pending());
+        assert!(poll_once(other_stop.as_mut(), &other_probe).is_pending());
+        drop(abandoned.waiter());
+        abandoned_probe.assert_notified();
+        assert!(abandoned.is_settled());
+        assert!(!abandoned.try_begin());
+        assert_eq!(other_probe.wakes.load(Ordering::SeqCst), 0);
+        assert!(other.try_begin());
+        assert!(other.try_settle_reply());
+    }
+
+    #[test]
+    fn racing_registration_cannot_escape_logical_cancellation() {
+        for _ in 0..64 {
+            let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            let cancelling = invocation.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other_barrier = Arc::clone(&barrier);
+            let thread = std::thread::spawn(move || {
+                other_barrier.wait();
+                cancelling.cancel();
+            });
+            barrier.wait();
+            let rpc = invocation.register_rpc();
+            thread.join().unwrap();
+            assert!(rpc.is_settled());
+            assert!(rpc.cancellation.is_cancelled());
+            assert!(!rpc.try_begin());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn absolute_deadlines_still_wake_without_explicit_cancellation() {
+        let deadline = deadline_after(Instant::now(), Duration::from_millis(30));
+        let rpc = NativeRpc::new(deadline);
+        let invocation = NativeInvocationTermination::new(deadline);
+        fcp_async_core::time::timeout(
+            Duration::from_secs(3),
+            futures_util::future::join(rpc.cancelled(), invocation.cancelled()),
+        ).await.expect("absolute deadline must release both parked waiters");
+        assert!(rpc.is_cancelled());
+        assert!(invocation.is_cancel_requested());
+        assert!(!rpc.cancellation.is_cancelled(), "deadline is not an explicit cancellation");
+        assert!(!invocation.state.cancellation.is_cancelled());
+        assert!(!rpc.try_begin());
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn production_dispatcher_keeps_deadline_and_child_retirement_without_duplicate_timeout() {
+        use std::collections::BTreeMap;
+        use fcp_async_core::channel::oneshot;
+
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "IFS= read -r request || exit 1; exec sleep 30".to_owned()],
+            &BTreeMap::new(),
+        ).await.unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        let actor = fcp_async_core::task::try_spawn(run_dispatcher(runner, receiver)).unwrap();
+        let rpc = NativeRpc::new(deadline_after(Instant::now(), Duration::from_secs(1)));
+        let _waiter = rpc.waiter();
+        let (response_tx, response_rx) = oneshot::channel();
+        sender.send(ConnectorRpcRequest {
+            method: "blocked".to_owned(),
+            params: serde_json::json!({}),
+            response_tx,
+            rpc: rpc.clone(),
+        }).await.unwrap();
+        let error = fcp_async_core::time::timeout(Duration::from_secs(5), response_rx)
+            .await.unwrap().unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        fcp_async_core::time::timeout(Duration::from_secs(3), actor).await.unwrap().unwrap();
+        assert!(rpc.transport_retired(), "selected timeout must retire its transport");
+        assert!(rpc.is_settled(), "actual child exit is still required");
     }
 }
