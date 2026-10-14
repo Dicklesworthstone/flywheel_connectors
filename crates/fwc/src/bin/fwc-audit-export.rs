@@ -14,6 +14,9 @@ use serde::Serialize;
 
 const SCHEMA: &str = "fcp.fwc.invoke_audit_export.v1";
 
+#[path = "fwc-audit-export/follow.rs"]
+mod follow;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Format {
     /// Replay bundle with explicit snapshot provenance.
@@ -27,7 +30,7 @@ enum Format {
 
 #[derive(Debug, Parser)]
 #[command(name = "fwc-audit-export", version, about = "Read-only export of a retained host invoke journal")]
-#[command(after_help = "This is a local file snapshot, not a live host RPC or authenticated checkpoint.\nThe journal is never repaired or modified. An incomplete sampled frame fails without output.\nDo not redirect output onto the source journal. Captured records may contain sensitive identities.")]
+#[command(after_help = "This observes a local file, not a live host RPC or authenticated checkpoint.\nSnapshots fail on incomplete framing; --follow --format jsonl waits for a partial final append.\nThe journal is never repaired or modified. Do not redirect output onto the source journal.\nCaptured records may contain sensitive identities; follow-mode output is a stream of observed prefixes.")]
 struct Args {
     /// Existing regular FCPAUD1 journal file; never created by this command.
     #[arg(long)]
@@ -44,12 +47,17 @@ struct Args {
     /// Explanation requires --zone and --request-id, without --from-seq.
     #[arg(long, value_enum, default_value_t = Format::Bundle)]
     format: Format,
+    #[command(flatten)]
+    stream: follow::FollowOptions,
 }
 
 #[derive(Debug)]
 enum ExportError {
     Usage,
     Snapshot(InvokeAuditSnapshotError),
+    Follow(InvokeAuditSnapshotError),
+    FollowIncomplete,
+    FollowNoMatch,
     NoMatchingRecords,
     Explanation,
     Output,
@@ -60,6 +68,9 @@ impl ExportError {
         match self {
             Self::Usage => "audit.export.invalid_selection",
             Self::Snapshot(error) => error.code(),
+            Self::Follow(error) => error.code(),
+            Self::FollowIncomplete => "audit.export.incomplete_tail",
+            Self::FollowNoMatch => "audit.export.follow_no_matching_records",
             Self::NoMatchingRecords => "audit.export.no_matching_records",
             Self::Explanation => "audit.export.unusable_explanation",
             Self::Output => "audit.export.output_failed",
@@ -68,8 +79,11 @@ impl ExportError {
 
     const fn message(&self) -> &'static str {
         match self {
-            Self::Usage => "selection is invalid; request/sequence filters need a zone and explanations need one complete request",
+            Self::Usage => "invalid selection or follow options; filters need a zone, explanations need a complete request, and --follow requires --format jsonl with positive limits",
             Self::Snapshot(_) => "the full sampled journal could not be validated; no export was emitted",
+            Self::Follow(_) => "journal following failed; earlier output is only an observed prefix, not a complete export",
+            Self::FollowIncomplete => "idle deadline reached with an incomplete frame; earlier output is only an observed prefix",
+            Self::FollowNoMatch => "idle deadline reached before any records matched the selection",
             Self::NoMatchingRecords => "no records in the sampled journal match the explicit selection",
             Self::Explanation => "the selected captured request cannot be explained consistently",
             Self::Output => "output could not be completed; discard any partial export",
@@ -105,6 +119,7 @@ struct PreparedExport {
 }
 
 fn validate_selection(args: &Args) -> Result<(), ExportError> {
+    args.stream.validate(args.format)?;
     let invalid_identity = |value: &str| {
         value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
     };
@@ -186,6 +201,9 @@ fn json_line(output: &mut impl Write, value: &impl Serialize) -> Result<(), Expo
 }
 
 fn run(args: &Args, output: &mut impl Write, diagnostics: &mut impl Write) -> Result<(), ExportError> {
+    if args.stream.follow {
+        return follow::run(args, output, diagnostics);
+    }
     // Complete source validation and explanation precede all output. A corrupt
     // record in a filtered-out zone cannot be hidden behind a successful prefix.
     let prepared = prepare(args)?;
@@ -263,7 +281,7 @@ mod tests {
             receipt_id: None, success: true, duration_ms: 12,
         }).unwrap();
         drop(writer);
-        (directory, Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle })
+        (directory, Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle, stream: follow::FollowOptions::default() })
     }
 
     fn output(args: &Args) -> (String, String) {
@@ -360,7 +378,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("empty.journal");
         drop(InvokeAuditChain::open_with_journal(&journal).unwrap());
-        let args = Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle };
+        let args = Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle, stream: follow::FollowOptions::default() };
         let (text, _) = output(&args);
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["source"]["snapshot_records"], 0);
