@@ -7,7 +7,9 @@ use serde_json::json;
 use tracing::debug;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{ShopifyError, ShopifyResult};
 use crate::types::{
@@ -22,6 +24,27 @@ pub struct ShopifyClient {
     base_url: String,
     auth: ShopifyAuth,
     retry_config: HttpRetryConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaySafety {
+    ReadOnly,
+    IdempotencyKey,
+    UnprotectedMutation,
+}
+
+impl ReplaySafety {
+    const fn permits_replay_after_delivery(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::IdempotencyKey)
+    }
+}
+
+fn mutation_safety(idempotency_key: Option<&str>) -> ReplaySafety {
+    if idempotency_key.is_some_and(|key| !key.trim().is_empty()) {
+        ReplaySafety::IdempotencyKey
+    } else {
+        ReplaySafety::UnprotectedMutation
+    }
 }
 
 impl std::fmt::Debug for ShopifyClient {
@@ -50,6 +73,8 @@ impl ShopifyClient {
     ) -> ShopifyResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_millis(request_timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(ShopifyError::Http)?;
 
@@ -329,7 +354,7 @@ impl ShopifyClient {
             async move {
                 debug!(attempt, url = %redact_url(&url), "GET");
                 let req = authenticate(client.get(&url), &auth);
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, ReplaySafety::ReadOnly).await
             }
         })
         .await
@@ -346,7 +371,10 @@ impl ShopifyClient {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let body = body.clone();
-        let idempotency_key = idempotency_key.map(String::from);
+        let safety = mutation_safety(idempotency_key);
+        let idempotency_key = idempotency_key
+            .filter(|key| !key.trim().is_empty())
+            .map(String::from);
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
@@ -360,7 +388,7 @@ impl ShopifyClient {
                 if let Some(key) = &idempotency_key {
                     req = req.header("X-Shopify-Idempotency-Key", key.as_str());
                 }
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, safety).await
             }
         })
         .await
@@ -377,7 +405,10 @@ impl ShopifyClient {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let body = body.clone();
-        let idempotency_key = idempotency_key.map(String::from);
+        let safety = mutation_safety(idempotency_key);
+        let idempotency_key = idempotency_key
+            .filter(|key| !key.trim().is_empty())
+            .map(String::from);
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
@@ -391,7 +422,7 @@ impl ShopifyClient {
                 if let Some(key) = &idempotency_key {
                     req = req.header("X-Shopify-Idempotency-Key", key.as_str());
                 }
-                handle_response::<T>(req, attempt).await
+                handle_response::<T>(req, attempt, safety).await
             }
         })
         .await
@@ -416,10 +447,13 @@ impl ShopifyClient {
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: ShopifyError::Http(e),
-                            retry_after: None,
+                        let replayable = !transport_error_reached_service(&e);
+                        let error = if replayable {
+                            ShopifyError::Http(e)
+                        } else {
+                            ShopifyError::OutcomeUnknown { status: None }
                         };
+                        return AttemptOutcome::retryable_if_replayable(error, None, replayable);
                     }
                 };
                 let status = resp.status().as_u16();
@@ -430,11 +464,14 @@ impl ShopifyClient {
                 }
                 if resp.status().is_success() {
                     AttemptOutcome::Success(json!({"deleted": true}))
+                } else if status >= 500 || status == 408 || resp.status().is_redirection() {
+                    AttemptOutcome::Terminal(ShopifyError::OutcomeUnknown {
+                        status: Some(status),
+                    })
                 } else {
-                    let text = resp.text().await.unwrap_or_default();
                     AttemptOutcome::Terminal(ShopifyError::Api {
                         code: u32::from(status),
-                        message: text,
+                        message: format!("request rejected (HTTP {status}); provider body omitted"),
                     })
                 }
             }
@@ -516,14 +553,19 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
 async fn handle_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     _attempt: u32,
+    safety: ReplaySafety,
 ) -> AttemptOutcome<T, ShopifyError> {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: ShopifyError::Http(e),
-                retry_after: None,
+            let reached = transport_error_reached_service(&e);
+            let replayable = !reached || safety.permits_replay_after_delivery();
+            let error = if reached && !safety.permits_replay_after_delivery() {
+                ShopifyError::OutcomeUnknown { status: None }
+            } else {
+                ShopifyError::Http(e)
             };
+            return AttemptOutcome::retryable_if_replayable(error, None, replayable);
         }
     };
 
@@ -553,12 +595,18 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
     }
 
     if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
+        if !safety.permits_replay_after_delivery()
+            && (status >= 500 || status == 408 || resp.status().is_redirection())
+        {
+            return AttemptOutcome::Terminal(ShopifyError::OutcomeUnknown {
+                status: Some(status),
+            });
+        }
         let err = ShopifyError::Api {
             code: u32::from(status),
-            message: text,
+            message: format!("request rejected (HTTP {status}); provider body omitted"),
         };
-        if status >= 500 {
+        if status >= 500 && safety.permits_replay_after_delivery() {
             return AttemptOutcome::Retryable {
                 error: err,
                 retry_after: None,
@@ -577,6 +625,17 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use reqwest::header::{HeaderName, HeaderValue};
+
+    #[test]
+    fn mutation_replay_requires_a_nonempty_idempotency_key() {
+        assert_eq!(mutation_safety(None), ReplaySafety::UnprotectedMutation);
+        assert_eq!(mutation_safety(Some("")), ReplaySafety::UnprotectedMutation);
+        assert_eq!(mutation_safety(Some("   ")), ReplaySafety::UnprotectedMutation);
+        assert_eq!(mutation_safety(Some("op-123")), ReplaySafety::IdempotencyKey);
+        assert!(ReplaySafety::ReadOnly.permits_replay_after_delivery());
+        assert!(ReplaySafety::IdempotencyKey.permits_replay_after_delivery());
+        assert!(!ReplaySafety::UnprotectedMutation.permits_replay_after_delivery());
+    }
 
     #[test]
     fn parse_retry_after_trims_delta_seconds() {

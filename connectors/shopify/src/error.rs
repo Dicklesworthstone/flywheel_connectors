@@ -34,6 +34,9 @@ pub enum ShopifyError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Shopify request outcome is unknown after delivery (status {status:?})")]
+    OutcomeUnknown { status: Option<u16> },
 }
 
 impl ShopifyError {
@@ -48,7 +51,8 @@ impl ShopifyError {
             | Self::NotFound(_)
             | Self::Async(_)
             | Self::Config(_)
-            | Self::InvalidInput(_) => false,
+            | Self::InvalidInput(_)
+            | Self::OutcomeUnknown { .. } => false,
         }
     }
 
@@ -102,6 +106,14 @@ impl ShopifyError {
                 code: 1005,
                 message: message.clone(),
             },
+            Self::OutcomeUnknown { status } => FcpError::External {
+                service: "shopify".into(),
+                message: "Shopify request may already have taken effect; automatic replay refused"
+                    .into(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
         }
     }
 }
@@ -133,6 +145,22 @@ impl ConnectorErrorMapping for ShopifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_unknown_is_never_retryable_at_fcp_boundary() {
+        let err = ShopifyError::OutcomeUnknown { status: Some(503) };
+        assert!(!err.is_retryable());
+        assert!(err.retry_after().is_none());
+        assert!(matches!(
+            err.to_fcp_error(),
+            FcpError::External {
+                status_code: Some(503),
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn rate_limited_is_retryable() {
