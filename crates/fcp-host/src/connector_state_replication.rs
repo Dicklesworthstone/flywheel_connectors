@@ -238,6 +238,7 @@ pub struct ConnectorStateReplicationService {
     >,
     grants: HashMap<String, RegisteredTransferGrant>,
     pub(super) runtime: runtime::TransferRuntime,
+    pub(super) page_concurrency: crate::connector_state_pages::PageConcurrency,
 }
 
 struct RegisteredTransferGrant {
@@ -1341,6 +1342,103 @@ mod tests {
         assert_eq!(fixture.recipient.runtime.active(), 1);
         drop(held);
         assert_eq!(fixture.recipient.runtime.active(), 0);
+    }
+
+    #[test]
+    fn parallel_paged_recovery_preserves_authentication_and_one_import_reservation() {
+        let mut fixture = large_fixture();
+        fixture.recipient = fixture.recipient.with_page_concurrency(2).unwrap();
+        let held = fixture.recipient.runtime.admit("donor", fixture.request.request.limits).unwrap();
+        let pages = AtomicUsize::new(0);
+        let result = run(fixture.recipient.pull_paged_from_peer(
+            &fixture.request,
+            |request_json| {
+                let (donor, recipient, pages) = (&fixture.donor, &fixture.recipient, &pages);
+                async move {
+                    assert_eq!(recipient.runtime.active(), 2);
+                    pages.fetch_add(1, Ordering::SeqCst);
+                    donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await
+                }
+            },
+            || Ok(()),
+        )).unwrap();
+        assert!(pages.load(Ordering::SeqCst) >= 3);
+        assert!(result.replica_only);
+        assert!(result.replica_root_published);
+        assert_eq!(result.root_object_id, fixture.request.request.root_object_id);
+        assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, result.root_object_id);
+        assert_eq!(fixture.donor.runtime.cache_builds_started(), 1);
+        assert_eq!(fixture.donor.runtime.active(), 0);
+        assert_eq!(fixture.recipient.runtime.active(), 1);
+        drop(held);
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+    }
+
+    #[test]
+    fn parallel_paged_failure_never_imports_and_releases_the_assembly_reservation() {
+        let mut fixture = large_fixture();
+        fixture.recipient = fixture.recipient.with_page_concurrency(2).unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = run(fcp_async_core::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.recipient.pull_paged_from_peer(
+                &fixture.request,
+                |request_json| {
+                    let (donor, attempts) = (&fixture.donor, &attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        let page: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+                        let offset = page["offset"].as_u64().unwrap();
+                        if offset == 48 * 1024 {
+                            std::future::pending::<()>().await;
+                        }
+                        if offset == 2 * 48 * 1024 {
+                            return Err(HostError::Unavailable("fixture later page failed".to_owned()));
+                        }
+                        donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await
+                    }
+                },
+                || Ok(()),
+            ),
+        ))
+        .expect("later-page failure must cancel the hung sibling");
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "no implicit retry or later window");
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert_eq!(fixture.donor.runtime.active(), 0);
+    }
+
+    #[test]
+    fn parallel_pages_are_used_by_the_shared_multi_donor_download_boundary() {
+        let mut fixture = large_fixture();
+        fixture.recipient = fixture.recipient.with_page_concurrency(2).unwrap();
+        let plan = crate::ConnectorStateRecoveryRequest {
+            candidates: vec![fixture.request.clone()],
+            attempt_timeout_ms: 5_000,
+            total_timeout_ms: 10_000,
+        };
+        let pages = AtomicUsize::new(0);
+        let result = run(fixture.recipient.recover_from_peers(
+            &plan,
+            |index, request_json| {
+                assert_eq!(index, 0);
+                let (donor, recipient, pages) = (&fixture.donor, &fixture.recipient, &pages);
+                async move {
+                    assert_eq!(recipient.runtime.active(), 1);
+                    pages.fetch_add(1, Ordering::SeqCst);
+                    donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await
+                }
+            },
+            |_| Ok(()),
+        )).unwrap();
+        assert!(pages.load(Ordering::SeqCst) >= 3);
+        assert_eq!(result.attempts.len(), 1);
+        assert!(result.replica.replica_only);
+        assert!(result.replica.replica_root_published);
+        assert_eq!(result.replica.root_object_id, fixture.request.request.root_object_id);
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert_eq!(fixture.donor.runtime.active(), 0);
     }
 
     #[test]

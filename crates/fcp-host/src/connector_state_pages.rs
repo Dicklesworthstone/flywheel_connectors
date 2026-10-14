@@ -6,9 +6,12 @@
 //! one byte-identical export, not to a new source of authority. A failed download
 //! drops its assembly without importing anything. Explicit multi-donor recovery
 //! may then start a separate download; import failures are never retried.
+//! Optional two-page windows overlap round trips after the first page pins the
+//! export. Completed pages are verified immediately and assembled in order.
 
 use std::future::Future;
 
+use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::connector_state_replication::runtime::{ExportLookup, TransferPermit};
@@ -20,9 +23,29 @@ use crate::{
 
 const PAGE_SCHEMA: &str = "fcp.host.state-transfer-page.v1";
 // Hex keeps the signed JSON wrapper free of a second layer of string escaping.
-// Only one page is requested at a time; no peer-controlled URL/cursor is used.
+// No peer-controlled URL/cursor is used, even with pipelining enabled.
 const PAGE_BYTES: usize = 48 * 1024;
 const MAX_PAGE_WIRE_BYTES: usize = 256 * 1024;
+// The donor permits at most two service operations per authenticated peer.
+const MAX_PAGE_CONCURRENCY: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PageConcurrency(usize);
+
+impl Default for PageConcurrency {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl PageConcurrency {
+    fn new(pages: usize) -> HostResult<Self> {
+        if !(1..=MAX_PAGE_CONCURRENCY).contains(&pages) {
+            return Err(invalid("state-transfer page concurrency must be 1 or 2"));
+        }
+        Ok(Self(pages))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,9 +176,18 @@ struct Assembly {
     digest: Option<String>,
 }
 
+/// Fully checked against the exact request and the current assembly anchor.
+/// Only decoded payload bytes survive an out-of-order completion, not wire JSON.
+struct DecodedPage {
+    offset: usize,
+    total_bytes: usize,
+    digest: String,
+    bytes: Vec<u8>,
+}
+
 impl Assembly {
-    /// Validate the complete page before retaining even its first byte.
-    fn accept(&mut self, request: &PageRequest, wire: &str) -> HostResult<bool> {
+    /// Validate before retaining payload bytes, independently of arrival order.
+    fn decode_page(&self, request: &PageRequest, wire: &str) -> HostResult<DecodedPage> {
         request.validate()?;
         if wire.len() > MAX_PAGE_WIRE_BYTES {
             return Err(invalid("connector-state page exceeds its envelope limit"));
@@ -164,7 +196,6 @@ impl Assembly {
             .map_err(|_| invalid("connector-state page is malformed"))?;
         if page.schema_version != PAGE_SCHEMA
             || page.request != *request
-            || request.offset != self.bytes.len()
             || request.wire_digest != self.digest
             || page.total_bytes == 0
             || page.total_bytes > request.export.limits.max_wire_bytes
@@ -182,10 +213,32 @@ impl Assembly {
         }
         let decoded = hex::decode(&page.data_hex)
             .map_err(|_| invalid("connector-state page payload is malformed"))?;
-        self.bytes.extend_from_slice(&decoded);
+        Ok(DecodedPage {
+            offset: request.offset,
+            total_bytes: page.total_bytes,
+            digest: page.wire_digest,
+            bytes: decoded,
+        })
+    }
+
+    /// Publish only the next contiguous page from this same immutable export.
+    fn append(&mut self, page: DecodedPage) -> HostResult<bool> {
+        if page.offset != self.bytes.len()
+            || self.total_bytes.is_some_and(|total| total != page.total_bytes)
+            || self.digest.as_ref().is_some_and(|digest| digest != &page.digest)
+        {
+            return Err(invalid("connector-state page does not match the admitted transfer"));
+        }
+        self.bytes.extend_from_slice(&page.bytes);
         self.total_bytes = Some(page.total_bytes);
-        self.digest = Some(page.wire_digest);
+        self.digest = Some(page.digest);
         Ok(self.bytes.len() == page.total_bytes)
+    }
+
+    /// Validate the complete page before retaining even its first byte.
+    fn accept(&mut self, request: &PageRequest, wire: &str) -> HostResult<bool> {
+        let page = self.decode_page(request, wire)?;
+        self.append(page)
     }
 
     fn finish(self) -> HostResult<String> {
@@ -199,7 +252,91 @@ impl Assembly {
     }
 }
 
+/// Fetches are owned by this future: no detached tasks, retries or donor changes.
+async fn fetch_export_pages<F, Fut, A>(
+    export: &ConnectorStateExportRequest,
+    concurrency: PageConcurrency,
+    mut fetch_page: F,
+    authorize: A,
+) -> HostResult<String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = HostResult<String>>,
+    A: Fn() -> HostResult<()>,
+{
+    authorize()?;
+    let first = PageRequest::first(export);
+    let fetch = fetch_page(first.to_json()?);
+    authorize()?;
+    let wire = fetch.await?;
+    authorize()?;
+    let mut assembly = Assembly::default();
+    assembly.accept(&first, &wire)?;
+    drop(wire);
+    let total_bytes = assembly
+        .total_bytes
+        .ok_or_else(|| invalid("connector-state transfer has no validated first page"))?;
+
+    while assembly.bytes.len() < total_bytes {
+        let mut window = Vec::with_capacity(concurrency.0);
+        let mut offset = assembly.bytes.len();
+        for _ in 0..concurrency.0 {
+            if offset >= total_bytes {
+                break;
+            }
+            let page = PageRequest {
+                schema_version: PAGE_SCHEMA.to_owned(),
+                export: export.clone(),
+                offset,
+                wire_digest: assembly.digest.clone(),
+            };
+            authorize()?;
+            let fetch = fetch_page(page.to_json()?);
+            let authority = &authorize;
+            let anchor = &assembly;
+            window.push(async move {
+                // Construction and first poll need not be adjacent. Recheck
+                // before polling a network future and after it completes.
+                authority()?;
+                let wire = fetch.await?;
+                authority()?;
+                anchor.decode_page(&page, &wire)
+            });
+            offset += PAGE_BYTES;
+        }
+
+        // The window bounds active AND completed-but-not-assembled pages.
+        // An error in a later page cancels a hung earlier sibling immediately.
+        // Do not use an unbounded reorder buffer or spawn network tasks here.
+        let pages = try_join_all(window).await?;
+        for page in pages {
+            authorize()?;
+            assembly.append(page)?;
+        }
+    }
+    let wire = assembly.finish()?;
+    authorize()?;
+    Ok(wire)
+}
+
 impl ConnectorStateReplicationService {
+    /// Configure one or two concurrent pages per pull, before sharing the service.
+    ///
+    /// Serial mode is the default. Two-page mode overlaps continuation round
+    /// trips only after the first verified page fixes the digest and total size.
+    /// Each pull retains one assembly reservation until import completes. A
+    /// window retains at most two decoded 48 KiB payloads in addition to the
+    /// assembly; the fetcher must still bound its network response buffering.
+    /// All existing per-peer and aggregate admission ceilings remain in force.
+    /// A busy donor may refuse a pipelined pull; no automatic retry is implied.
+    ///
+    /// # Errors
+    /// Rejects zero and values greater than two.
+    pub fn with_page_concurrency(mut self, pages: usize) -> HostResult<Self> {
+        self.page_concurrency = PageConcurrency::new(pages)?;
+        Ok(self)
+    }
+
     /// Serve a complete v1 export or one bounded page of that same export.
     ///
     /// The exact-root grant and current transport authority are checked on every
@@ -267,6 +404,9 @@ impl ConnectorStateReplicationService {
     /// nonce-bound reply from the selected donor. Each call gets a new signed
     /// request, not a retry of an earlier envelope. Never follow a peer-provided
     /// cursor or URL. The host must bound this entire future with one deadline.
+    /// With two-page concurrency, fetch futures may run simultaneously and finish
+    /// out of order. Their replies are verified on completion, then assembled in
+    /// request order. Failure or cancellation drops every outstanding fetch.
     ///
     /// Existing grant limits apply to the reassembled v1 JSON, canonical bytes
     /// and object count. Page framing has a separate fixed cap. `wire_bytes` in
@@ -306,7 +446,7 @@ impl ConnectorStateReplicationService {
     pub(super) async fn download_paged_admitted<F, Fut, A>(
         &self,
         request: &ConnectorStatePullRequest,
-        mut fetch_page: F,
+        fetch_page: F,
         authorize_transport: A,
         permit: &TransferPermit<'_>,
     ) -> HostResult<String>
@@ -316,23 +456,16 @@ impl ConnectorStateReplicationService {
         A: Fn() -> HostResult<()> + Send + Sync,
     {
         permit.check(&self.runtime, &request.peer_node, request.request.limits)?;
-        let mut page = PageRequest::first(&request.request);
-        let mut assembly = Assembly::default();
-        // Every accepted page makes exact, nonzero progress. The total grant
-        // limit therefore bounds both retained bytes and network round trips.
-        loop {
-            self.validate_pull(request)?;
-            authorize_transport()?;
-            let wire = fetch_page(page.to_json()?).await?;
-            self.validate_pull(request)?;
-            authorize_transport()?;
-            if assembly.accept(&page, &wire)? {
-                break;
-            }
-            page.offset = assembly.bytes.len();
-            page.wire_digest.clone_from(&assembly.digest);
-        }
-        let wire = assembly.finish()?;
+        let wire = fetch_export_pages(
+            &request.request,
+            self.page_concurrency,
+            fetch_page,
+            || {
+                self.validate_pull(request)?;
+                authorize_transport()
+            },
+        )
+        .await?;
         self.validate_pull(request)?;
         authorize_transport()?;
         Ok(wire)
@@ -341,6 +474,10 @@ impl ConnectorStateReplicationService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Poll;
+
     use fcp_kernel::{ConnectorId, ObjectId, ZoneId};
     use crate::{ConnectorStateTransferLimits, ConnectorStateTransferScope};
     use super::*;
@@ -500,6 +637,318 @@ mod tests {
             |_| async { panic!("unauthorized transfer reached the network") },
             || Ok(()),
         )).unwrap();
+        assert!(result.is_err());
+    }
+
+    struct ActiveFetch<'a>(&'a AtomicUsize);
+
+    impl<'a> ActiveFetch<'a> {
+        fn new(active: &'a AtomicUsize) -> Self {
+            active.fetch_add(1, Ordering::SeqCst);
+            Self(active)
+        }
+    }
+
+    impl Drop for ActiveFetch<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn page_concurrency_defaults_to_serial_and_rejects_unbounded_windows() {
+        let service = ConnectorStateReplicationService::new();
+        assert_eq!(service.page_concurrency.0, 1);
+        for pages in [1, 2] {
+            let service = ConnectorStateReplicationService::new()
+                .with_page_concurrency(pages)
+                .unwrap();
+            assert_eq!(service.page_concurrency.0, pages);
+        }
+        for pages in [0, 3, usize::MAX] {
+            assert!(ConnectorStateReplicationService::new()
+                .with_page_concurrency(pages)
+                .is_err());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn both_windows_preserve_exact_bytes_and_page_boundaries() {
+        let export = request().export;
+        for concurrency in [1, 2] {
+            for length in [1, PAGE_BYTES, PAGE_BYTES + 1, 2 * PAGE_BYTES, 5 * PAGE_BYTES + 7] {
+                let wire = "x".repeat(length);
+                let offsets = Mutex::new(Vec::new());
+                let recovered = fetch_export_pages(
+                    &export,
+                    PageConcurrency::new(concurrency).unwrap(),
+                    |json| {
+                        let page: PageRequest = serde_json::from_str(&json).unwrap();
+                        offsets.lock().unwrap().push(page.offset);
+                        let response = encode_page(&page, &wire);
+                        async move { response }
+                    },
+                    || Ok(()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(recovered, wire);
+                assert_eq!(
+                    *offsets.lock().unwrap(),
+                    (0..length).step_by(PAGE_BYTES).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn first_page_must_finish_before_any_continuation_is_constructed() {
+        let export = request().export;
+        let constructed = AtomicUsize::new(0);
+        let mut pull = Box::pin(fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |_| {
+                constructed.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<HostResult<String>>()
+            },
+            || Ok(()),
+        ));
+        assert!(futures_util::poll!(pull.as_mut()).is_pending());
+        assert_eq!(constructed.load(Ordering::SeqCst), 1);
+        drop(pull);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn out_of_order_completion_has_a_bounded_window_and_correct_utf8() {
+        let export = request().export;
+        let wire = format!("{}{}", "x".repeat(PAGE_BYTES - 1), "\u{1f642}".repeat(PAGE_BYTES));
+        let release = AtomicBool::new(false);
+        let started = Mutex::new(Vec::new());
+        let completed = Mutex::new(Vec::new());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut pull = Box::pin(fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                let (wire, release, started, completed, active, peak) =
+                    (&wire, &release, &started, &completed, &active, &peak);
+                async move {
+                    let _active = ActiveFetch::new(active);
+                    peak.fetch_max(active.load(Ordering::SeqCst), Ordering::SeqCst);
+                    started.lock().unwrap().push(page.offset);
+                    if page.offset == PAGE_BYTES {
+                        std::future::poll_fn(|cx| {
+                            if release.load(Ordering::SeqCst) {
+                                Poll::Ready(())
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                    completed.lock().unwrap().push(page.offset);
+                    encode_page(&page, wire)
+                }
+            },
+            || Ok(()),
+        ));
+        assert!(futures_util::poll!(pull.as_mut()).is_pending());
+        assert_eq!(*started.lock().unwrap(), vec![0, PAGE_BYTES, 2 * PAGE_BYTES]);
+        assert_eq!(*completed.lock().unwrap(), vec![0, 2 * PAGE_BYTES]);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        // A completed later page still occupies its window slot; page three
+        // cannot race ahead while page one is stalled.
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(pull.await.unwrap(), wire);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn later_page_failure_cancels_a_hung_sibling_without_retry() {
+        let export = request().export;
+        let wire = "x".repeat(4 * PAGE_BYTES);
+        let started = AtomicUsize::new(0);
+        let active = AtomicUsize::new(0);
+        let mut pull = Box::pin(fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                let (wire, started, active) = (&wire, &started, &active);
+                async move {
+                    let _active = ActiveFetch::new(active);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if page.offset == PAGE_BYTES {
+                        std::future::pending::<()>().await;
+                    }
+                    if page.offset == 2 * PAGE_BYTES {
+                        return Err(invalid("fixture later page failed"));
+                    }
+                    encode_page(&page, wire)
+                }
+            },
+            || Ok(()),
+        ));
+        assert!(matches!(futures_util::poll!(pull.as_mut()), Poll::Ready(Err(_))));
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelling_parallel_fetch_drops_every_owned_network_future() {
+        let export = request().export;
+        let wire = "x".repeat(4 * PAGE_BYTES);
+        let active = AtomicUsize::new(0);
+        let mut pull = Box::pin(fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                let (wire, active) = (&wire, &active);
+                async move {
+                    let _active = ActiveFetch::new(active);
+                    if page.offset != 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    encode_page(&page, wire)
+                }
+            },
+            || Ok(()),
+        ));
+        assert!(futures_util::poll!(pull.as_mut()).is_pending());
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(pull);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn authority_is_rechecked_before_polling_each_constructed_fetch() {
+        let export = request().export;
+        let wire = "x".repeat(4 * PAGE_BYTES);
+        let allowed = AtomicBool::new(true);
+        let polled = AtomicUsize::new(0);
+        let result = fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                if page.offset == 2 * PAGE_BYTES {
+                    allowed.store(false, Ordering::SeqCst);
+                }
+                let (wire, polled) = (&wire, &polled);
+                async move {
+                    polled.fetch_add(1, Ordering::SeqCst);
+                    encode_page(&page, wire)
+                }
+            },
+            || {
+                if allowed.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(invalid("fixture authority revoked")) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(polled.load(Ordering::SeqCst), 1, "only the anchor reached the network");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn revocation_during_a_reply_cancels_the_other_in_flight_page() {
+        let export = request().export;
+        let wire = "x".repeat(4 * PAGE_BYTES);
+        let active = AtomicUsize::new(0);
+        let allowed = AtomicBool::new(true);
+        let mut pull = Box::pin(fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                let (wire, active, allowed) = (&wire, &active, &allowed);
+                async move {
+                    let _active = ActiveFetch::new(active);
+                    if page.offset == PAGE_BYTES {
+                        std::future::pending::<()>().await;
+                    }
+                    if page.offset == 2 * PAGE_BYTES {
+                        allowed.store(false, Ordering::SeqCst);
+                    }
+                    encode_page(&page, wire)
+                }
+            },
+            || {
+                if allowed.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(invalid("fixture authority revoked")) }
+            },
+        ));
+        assert!(matches!(futures_util::poll!(pull.as_mut()), Poll::Ready(Err(_))));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn changed_or_oversized_later_page_fails_before_a_hung_sibling_finishes() {
+        let export = request().export;
+        let wire = "x".repeat(4 * PAGE_BYTES);
+        for mutation in 0..5 {
+            let active = AtomicUsize::new(0);
+            let mut pull = Box::pin(fetch_export_pages(
+                &export,
+                PageConcurrency::new(2).unwrap(),
+                |json| {
+                    let page: PageRequest = serde_json::from_str(&json).unwrap();
+                    let (wire, active) = (&wire, &active);
+                    async move {
+                        let _active = ActiveFetch::new(active);
+                        if page.offset == PAGE_BYTES {
+                            std::future::pending::<()>().await;
+                        }
+                        let encoded = encode_page(&page, wire)?;
+                        if page.offset != 2 * PAGE_BYTES {
+                            return Ok(encoded);
+                        }
+                        if mutation == 4 {
+                            return Ok(" ".repeat(MAX_PAGE_WIRE_BYTES + 1));
+                        }
+                        let mut response: PageResponse = serde_json::from_str(&encoded).unwrap();
+                        match mutation {
+                            0 => response.total_bytes -= 1,
+                            1 => response.wire_digest = "f".repeat(64),
+                            2 => response.request.offset = PAGE_BYTES,
+                            _ => response.data_hex.truncate(2),
+                        }
+                        Ok(serde_json::to_string(&response).unwrap())
+                    }
+                },
+                || Ok(()),
+            ));
+            assert!(matches!(futures_util::poll!(pull.as_mut()), Poll::Ready(Err(_))));
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn parallel_pages_still_require_the_complete_export_digest() {
+        let export = request().export;
+        let wire = "x".repeat(3 * PAGE_BYTES);
+        let result = fetch_export_pages(
+            &export,
+            PageConcurrency::new(2).unwrap(),
+            |json| {
+                let page: PageRequest = serde_json::from_str(&json).unwrap();
+                let mut response: PageResponse =
+                    serde_json::from_str(&encode_page(&page, &wire).unwrap()).unwrap();
+                if page.offset == 2 * PAGE_BYTES {
+                    response.data_hex = hex::encode("y".repeat(PAGE_BYTES));
+                }
+                let wire = serde_json::to_string(&response).unwrap();
+                async move { Ok(wire) }
+            },
+            || Ok(()),
+        )
+        .await;
         assert!(result.is_err());
     }
 }
