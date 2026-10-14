@@ -2,7 +2,10 @@
 
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
+    transport_error_reached_service,
+};
 use fcp_sdk::retry::RetryDecision;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
@@ -63,6 +66,10 @@ impl TwitchClient {
     ) -> TwitchResult<Self> {
         let client = Client::builder()
             .timeout(request_timeout)
+            // Keep authenticated redirect/retry decisions in this connector.
+            // Twitch mutations have no general idempotency key contract.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(TwitchError::Http)?;
 
@@ -333,10 +340,17 @@ impl TwitchClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: TwitchError::Http(e),
-                            retry_after: None,
+                        let reached = transport_error_reached_service(&e);
+                        let error = if reached {
+                            TwitchError::OutcomeUnknown { status: None }
+                        } else {
+                            TwitchError::Http(e)
                         };
+                        return AttemptOutcome::retryable_if_replayable(
+                            error,
+                            None,
+                            !reached,
+                        );
                     }
                 };
 
@@ -357,19 +371,15 @@ impl TwitchClient {
                         "Invalid token".into(),
                     ));
                 }
-                let text = resp.text().await.unwrap_or_default();
-                let decision = classify_http_status(status, None);
-                let err = TwitchError::Api {
-                    status,
-                    message: text,
-                };
-                if !matches!(decision, RetryDecision::Terminal) {
-                    AttemptOutcome::Retryable {
-                        error: err,
-                        retry_after: None,
-                    }
+                if !matches!(classify_http_status(status, None), RetryDecision::Terminal) {
+                    AttemptOutcome::Terminal(TwitchError::OutcomeUnknown {
+                        status: Some(status),
+                    })
                 } else {
-                    AttemptOutcome::Terminal(err)
+                    AttemptOutcome::Terminal(TwitchError::Api {
+                        status,
+                        message: format!("request rejected (HTTP {status}); provider body omitted"),
+                    })
                 }
             }
         })
@@ -421,10 +431,17 @@ impl TwitchClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: TwitchError::Http(e),
-                            retry_after: None,
+                        let reached = transport_error_reached_service(&e);
+                        let error = if reached {
+                            TwitchError::OutcomeUnknown { status: None }
+                        } else {
+                            TwitchError::Http(e)
                         };
+                        return AttemptOutcome::retryable_if_replayable(
+                            error,
+                            None,
+                            !reached,
+                        );
                     }
                 };
 
@@ -443,15 +460,8 @@ impl TwitchClient {
                     ));
                 }
                 if !resp.status().is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    // br-kxd3e: NOT replay-safe — a replay creates a SECOND clip.
-                    // Every remaining retryable class here is a 5xx, which
-                    // means Twitch RECEIVED the request and may already have
-                    // acted. 429 is handled above, before this point, because
-                    // it was refused WITHOUT being performed.
-                    return AttemptOutcome::Terminal(TwitchError::Api {
-                        status,
-                        message: text,
+                    return AttemptOutcome::Terminal(TwitchError::OutcomeUnknown {
+                        status: Some(status),
                     });
                 }
                 match resp.json::<HelixResponse<CreateClipResponse>>().await {
@@ -499,10 +509,17 @@ impl TwitchClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: TwitchError::Http(e),
-                            retry_after: None,
+                        let reached = transport_error_reached_service(&e);
+                        let error = if reached {
+                            TwitchError::OutcomeUnknown { status: None }
+                        } else {
+                            TwitchError::Http(e)
                         };
+                        return AttemptOutcome::retryable_if_replayable(
+                            error,
+                            None,
+                            !reached,
+                        );
                     }
                 };
 
@@ -521,15 +538,8 @@ impl TwitchClient {
                     ));
                 }
                 if !resp.status().is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    // br-kxd3e: NOT replay-safe — a replay posts the chat message TWICE.
-                    // Every remaining retryable class here is a 5xx, which
-                    // means Twitch RECEIVED the request and may already have
-                    // acted. 429 is handled above, before this point, because
-                    // it was refused WITHOUT being performed.
-                    return AttemptOutcome::Terminal(TwitchError::Api {
-                        status,
-                        message: text,
+                    return AttemptOutcome::Terminal(TwitchError::OutcomeUnknown {
+                        status: Some(status),
                     });
                 }
                 match resp.json::<HelixResponse<SendChatMessageResponse>>().await {
@@ -603,6 +613,21 @@ impl TwitchClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructor_disables_hidden_redirects_and_retries() {
+        let client = TwitchClient::new(
+            "https://api.twitch.tv",
+            "https://id.twitch.tv/oauth2/token",
+            "https://id.twitch.tv/oauth2/validate",
+            "id",
+            "secret",
+            HttpRetryConfig::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(client.base_url(), "https://api.twitch.tv");
+    }
 
     #[test]
     fn client_creation() {

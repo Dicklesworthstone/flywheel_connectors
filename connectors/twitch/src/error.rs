@@ -46,19 +46,27 @@ pub enum TwitchError {
     /// Invalid input.
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// A mutation may have reached Twitch; replay could duplicate its effect.
+    #[error("Twitch request outcome is unknown after delivery (status {status:?})")]
+    OutcomeUnknown { status: Option<u16> },
 }
 
 impl TwitchError {
     /// Whether this error is retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
+            Self::Http(error) => !fcp_sdk::migration::transport_error_reached_service(error),
+            Self::RateLimited { .. } => true,
+            // Context timeout/cancellation can happen after request transmission.
+            Self::Async(_) => false,
             Self::Api { status, .. } => classify_http_status(*status, None).is_retryable(),
             Self::Json(_)
             | Self::Unauthorized(_)
             | Self::TokenError(_)
             | Self::Config(_)
-            | Self::InvalidInput(_) => false,
+            | Self::InvalidInput(_)
+            | Self::OutcomeUnknown { .. } => false,
         }
     }
 
@@ -129,6 +137,14 @@ impl TwitchError {
                 code: 1008,
                 message: format!("Invalid input: {msg}"),
             },
+            Self::OutcomeUnknown { status } => FcpError::External {
+                service: "twitch".into(),
+                message: "Twitch request may already have taken effect; automatic replay refused"
+                    .into(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
         }
     }
 }
@@ -172,6 +188,23 @@ mod tests {
                 .unwrap_err(),
         );
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn outcome_unknown_and_context_interruptions_are_not_outer_retryable() {
+        let unknown = TwitchError::OutcomeUnknown { status: Some(503) };
+        assert!(!unknown.is_retryable());
+        assert!(matches!(
+            unknown.to_fcp_error(),
+            FcpError::External {
+                status_code: Some(503),
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+        assert!(!TwitchError::from_async_error(AsyncError::Cancelled).is_retryable());
+        assert!(!TwitchError::from_async_error(AsyncError::Timeout { timeout_ms: 1 }).is_retryable());
     }
 
     #[test]
@@ -243,7 +276,7 @@ mod tests {
     fn from_async_timeout() {
         let err = TwitchError::from_async_error(AsyncError::Timeout { timeout_ms: 5000 });
         assert!(matches!(err, TwitchError::Async(_)));
-        assert!(err.is_retryable());
+        assert!(!err.is_retryable());
     }
 
     #[test]
