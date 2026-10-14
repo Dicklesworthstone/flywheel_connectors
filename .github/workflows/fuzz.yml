@@ -53,7 +53,7 @@ jobs:
           - session_transcript
           - zone_key_manifest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Skip if specific target requested
         if: inputs.target != 'all' && inputs.target != matrix.target
