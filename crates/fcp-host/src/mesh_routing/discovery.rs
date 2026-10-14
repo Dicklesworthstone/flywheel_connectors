@@ -14,7 +14,6 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use fcp_async_core::sync::Mutex as AsyncMutex;
 use fcp_mesh::invoke_route::{
     DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS, MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
 };
@@ -92,6 +91,10 @@ struct AdvertisementCache {
     // cursor is reduced modulo the current snapshot's peer count.
     next_peer_index: usize,
     entries: HashMap<String, CachedAdvertisement>,
+    // Serialized refresh ownership without holding an async mutex guard across
+    // network awaits. This bit is protected by the same short std mutex as the
+    // cache, so the resulting discovery future can remain Send for Axum.
+    refreshing: bool,
 }
 
 impl AdvertisementCache {
@@ -126,14 +129,27 @@ impl AdvertisementCache {
 #[derive(Debug)]
 pub(super) struct PeerDiscovery {
     cache: Mutex<AdvertisementCache>,
-    refresh: AsyncMutex<()>,
+}
+
+struct RefreshLease<'a> {
+    discovery: &'a PeerDiscovery,
+}
+
+impl Drop for RefreshLease<'_> {
+    fn drop(&mut self) {
+        let mut cache = self
+            .discovery
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.refreshing = false;
+    }
 }
 
 impl PeerDiscovery {
     pub(super) fn new() -> Self {
         Self {
             cache: Mutex::new(AdvertisementCache::default()),
-            refresh: AsyncMutex::new(()),
         }
     }
 
@@ -152,27 +168,17 @@ impl PeerDiscovery {
         // Start elapsed-time accounting before any lock or network wait.
         self.freshness_now();
         let refresh = async {
-            // Recheck after acquiring the async lock: another caller may
-            // have refreshed everything while this caller was waiting.
-            let _refresh_guard = self.refresh.lock().await;
-            let (generation, stale_peers) = {
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Repeated additions/removals must not grow an unbounded cache.
-                // Also remove old negative entries when a peer's endpoint/key
-                // changes, so recovery does not wait for the old failure TTL.
-                cache.entries.retain(|_, entry| {
-                    directory.peer(&entry.peer.node_id) == Some(&entry.peer)
-                });
-                let now_ms = unix_now_ms();
-                let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
-                (
-                    cache.generation,
-                    cache.stale_peers(directory, now_ms, freshness_floor_ms),
-                )
+            // Only one caller fetches at a time, but refresh ownership is a
+            // cancellation-safe RAII bit rather than a non-Send async mutex
+            // guard held across network I/O. Waiters periodically re-check the
+            // cache under the same overall five-second deadline.
+            let (lease, generation, stale_peers) = loop {
+                if let Some(refresh) = self.try_begin_refresh(directory) {
+                    break refresh;
+                }
+                fcp_async_core::time::sleep(Duration::from_millis(1)).await;
             };
+            let _refresh_lease = lease;
             let mut pending = stream::iter(stale_peers)
                 .map(|(index, peer)| {
                     self.record_attempt(generation, index, directory.len());
@@ -246,6 +252,29 @@ impl PeerDiscovery {
         // Re-evaluate signed age after the refresh. A still-live local TTL
         // must never extend the authority of an expired signed advertisement.
         self.snapshot(directory, unix_now_ms())
+    }
+
+    fn try_begin_refresh(
+        &self,
+        directory: &MeshPeerDirectory,
+    ) -> Option<(RefreshLease<'_>, u64, Vec<(usize, MeshPeer)>)> {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.refreshing {
+            return None;
+        }
+        cache.refreshing = true;
+        cache.entries.retain(|_, entry| {
+            directory.peer(&entry.peer.node_id) == Some(&entry.peer)
+        });
+        let now_ms = unix_now_ms();
+        let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
+        let generation = cache.generation;
+        let stale_peers = cache.stale_peers(directory, now_ms, freshness_floor_ms);
+        drop(cache);
+        Some((RefreshLease { discovery: self }, generation, stale_peers))
     }
 
     fn freshness_now(&self) -> (u64, u64) {
@@ -324,6 +353,20 @@ mod tests {
 
     fn advertisement(peer: &MeshPeer, key: &Ed25519SigningKey) -> MeshPeerAdvertisement {
         MeshPeerAdvertisement::sign(key, peer.node_id.clone(), unix_now_ms(), Vec::new())
+    }
+
+    #[test]
+    fn discovery_future_is_send_for_http_handler_composition() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let discovery = PeerDiscovery::new();
+        let future = discovery.collect(&directory, |peer| {
+            let ad = advertisement(&peer, &key);
+            async move { Ok(ad) }
+        });
+        assert_send(&future);
     }
 
     #[fcp_async_core::runtime::test]
