@@ -575,6 +575,84 @@ mod tests {
         assert_eq!(hex::encode(nonce), "d8e8964f71113d581648b346");
     }
 
+    /// RFC 9180 Appendix A.2.1: `DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`,
+    /// `ChaCha20Poly1305`, base mode. Fed the RFC's own encapsulation (standard
+    /// X25519 DH and Montgomery `enc`), the module's `ExtractAndExpand`, key
+    /// schedule intermediates and AEAD reproduce the published values. Only the
+    /// threshold ciphertext encoding differs from RFC 9180 (deviation 2 above).
+    #[test]
+    fn rfc_9180_appendix_a_2_1_base_vectors() {
+        let unhex = |text: &str| hex::decode(text).expect("RFC vector hex");
+        let array = |text: &str| -> [u8; 32] { unhex(text).try_into().expect("32 bytes") };
+        let sk_e = array("f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600");
+        let pk_r = array("4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a");
+        let enc = array("1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a");
+        let info = unhex("4f6465206f6e2061204772656369616e2055726e");
+        assert_eq!(
+            x25519_dalek::x25519(sk_e, x25519_dalek::X25519_BASEPOINT_BYTES),
+            enc,
+            "enc is the RFC ephemeral public key"
+        );
+
+        let dh = x25519_dalek::x25519(sk_e, pk_r);
+        let mut kem_context = enc.to_vec();
+        kem_context.extend_from_slice(&pk_r);
+        let shared_secret = extract_and_expand(&dh, &kem_context);
+        assert_eq!(
+            hex::encode(shared_secret),
+            "0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7"
+        );
+
+        let suite = b"HPKE\x00\x20\x00\x01\x00\x03";
+        let mut context = vec![0x00];
+        context.extend_from_slice(&labeled_extract_bytes(suite, b"psk_id_hash", b""));
+        context.extend_from_slice(&labeled_extract_bytes(suite, b"info_hash", &info));
+        assert_eq!(
+            hex::encode(&context),
+            concat!(
+                "00431df6cd95e11ff49d7013563baf7f11588c75a6611e",
+                "e2a4404a49306ae4cfc5b69c5718a60cc5876c358d3f7fc31ddb598503f67be58ea1",
+                "e798c0bb19eb9796"
+            )
+        );
+        let secret =
+            hkdf_extract_to_prk_bytes(Some(&shared_secret), &labeled_ikm(suite, b"secret", b""));
+        assert_eq!(
+            hex::encode(secret),
+            "5b9cd775e64b437a2335cf499361b2e0d5e444d5cb41a8a53336d8fe402282c6"
+        );
+        let (key, base_nonce) = key_schedule(&shared_secret, &info);
+        assert_eq!(
+            hex::encode(key),
+            "ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91"
+        );
+        assert_eq!(hex::encode(base_nonce), "5c4d98150661b848853b547f");
+
+        // A.2.1.1 sequence 0: nonce = base_nonce, as the module seals and opens.
+        let plaintext = unhex("4265617574792069732074727574682c20747275746820626561757479");
+        let aad = unhex("436f756e742d30");
+        let sealed = ChaCha20Poly1305::new((&key).into())
+            .encrypt(
+                Nonce::from_slice(&base_nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .expect("seal");
+        assert_eq!(
+            hex::encode(&sealed),
+            concat!(
+                "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db",
+                "21993c62ce81883d2dd1b51a28"
+            )
+        );
+        let opened = ChaCha20Poly1305Cipher::new(&AeadKey::from_bytes(key))
+            .decrypt(&ChaCha20Nonce::from_bytes(base_nonce), &sealed, &aad)
+            .expect("open");
+        assert_eq!(opened, plaintext);
+    }
+
     #[test]
     fn zero_threshold_and_empty_shares_fail_as_typed_errors_not_panics() {
         let ct = ThresholdHpkeCiphertext {
