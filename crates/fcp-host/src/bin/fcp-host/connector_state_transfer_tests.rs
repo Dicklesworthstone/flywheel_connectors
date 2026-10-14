@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fcp_cbor::{CanonicalSerializer, SchemaId};
 use fcp_crypto::Ed25519SigningKey;
 use fcp_evidence::{ObjectHeader, RetentionClass, StorageMeta};
-use fcp_host::ConnectorStateTransferLimits;
+use fcp_host::{
+    CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION, ConnectorStateRecoveryOutcome,
+    ConnectorStateTransferLimits,
+};
 use fcp_host::mesh_routing::{MESH_FORWARD_ROUTE, MeshRoutingSettings};
 use fcp_kernel::{ConnectorStateObject, ConnectorStateRoot};
 use fcp_mesh::invoke_route::MeshForwardEnvelope;
@@ -201,7 +204,7 @@ fn pull_app(state: Arc<AppState>) -> Router {
 
 async fn request_pull(
     state: Arc<AppState>,
-    request: &ConnectorStatePullRequest,
+    request: &impl Serialize,
     authorization: Option<&str>,
     zone: Option<&str>,
 ) -> Response {
@@ -379,6 +382,45 @@ impl LiveTransfer {
             })
             .expect("recipient mesh router"),
         )
+    }
+
+    fn recovery_plan(&mut self, alternate_endpoint: &str) -> ConnectorStateRecoveryRequest {
+        let mut alternate = self.request.clone();
+        alternate.peer_node = "alternate".to_owned();
+        alternate.request.grant_id = "restore-alternate".to_owned();
+        let state = Arc::get_mut(&mut self.recipient).expect("unshared fixture recipient");
+        let service = Arc::get_mut(
+            state.connector_state_replication.as_mut().expect("replica service"),
+        ).expect("unshared fixture service");
+        let mut alternate_grant = grant(
+            ConnectorStateTransferDirection::Import,
+            "alternate",
+            self.request.request.root_object_id,
+        );
+        alternate_grant.grant_id.clone_from(&alternate.request.grant_id);
+        service.add_grant(alternate_grant).expect("independent alternate import grant");
+        state.mesh = Some(Arc::new(MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("recipient"),
+            signing_key: signing_key(0xc1),
+            peers_json: json!([
+                {
+                    "node_id": "donor",
+                    "endpoint": self.donor_endpoint,
+                    "public_key_hex": hex::encode(signing_key(0xd1).verifying_key().to_bytes()),
+                },
+                {
+                    "node_id": "alternate",
+                    "endpoint": alternate_endpoint,
+                    "public_key_hex": hex::encode(signing_key(0xd1).verifying_key().to_bytes()),
+                }
+            ]).to_string(),
+            forward_timeout: Duration::from_secs(5),
+        }).expect("recovery recipient router")));
+        ConnectorStateRecoveryRequest {
+            candidates: vec![self.request.clone(), alternate],
+            attempt_timeout_ms: 2_000,
+            total_timeout_ms: 10_000,
+        }
     }
 
     fn replica_dir(&self) -> PathBuf {
@@ -699,5 +741,154 @@ async fn state_transfer_refuses_remote_plaintext_even_with_a_valid_local_grant()
         assert_eq!(directory_bytes(&fixture.replica_dir()), empty_replica);
     }
     assert_eq!(fixture.mesh_requests.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+
+#[test]
+fn pull_command_preserves_single_wire_and_never_downgrades_recovery_fields() {
+    let single = ConnectorStatePullRequest {
+        peer_node: "donor".to_owned(),
+        request: ConnectorStateExportRequest {
+            grant_id: GRANT.to_owned(),
+            scope: transfer_scope(),
+            root_object_id: ObjectId::from_bytes([0x33; 32]),
+            limits: transfer_limits(),
+        },
+    };
+    let single_wire = serde_json::to_value(&single).expect("single wire");
+    assert!(matches!(
+        serde_json::from_value::<StatePullCommand>(single_wire.clone()).unwrap(),
+        StatePullCommand::Single(_)
+    ));
+    let recovery_wire = json!({"candidates": [single]});
+    let decoded: StatePullCommand = serde_json::from_value(recovery_wire.clone()).unwrap();
+    let StatePullCommand::Recovery(plan) = decoded else {
+        panic!("recovery plan was downgraded");
+    };
+    plan.validate().expect("bounded defaults");
+    assert_eq!(plan.attempt_timeout_ms, 10_000);
+    assert_eq!(plan.total_timeout_ms, 60_000);
+
+    let mut ambiguous = single_wire;
+    ambiguous["candidates"] = recovery_wire["candidates"].clone();
+    assert!(serde_json::from_value::<StatePullCommand>(ambiguous).is_err());
+    let mut extra_authority = recovery_wire;
+    extra_authority["allow_untrusted_donors"] = json!(true);
+    assert!(serde_json::from_value::<StatePullCommand>(extra_authority).is_err());
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn recovery_admin_route_fails_over_and_preserves_durable_ancestry() {
+    let mut fixture = LiveTransfer::start(writer_pin()).await;
+    // A held but unserved listener makes the first download genuinely stall.
+    // Do not assume an unused port stays unused or fabricate a signed response.
+    let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_endpoint = format!("http://{}", stalled_listener.local_addr().unwrap());
+    let mut plan = fixture.recovery_plan(&stalled_endpoint);
+    plan.candidates.swap(0, 1);
+    let source_before = directory_bytes(&fixture.source_dir);
+    let empty_replica = directory_bytes(&fixture.replica_dir());
+
+    for (authorization, zone) in [
+        (None, None),
+        (Some("Bearer wrong-token"), Some("z:owner")),
+        (Some("Bearer topsecret"), None),
+        (Some("Bearer topsecret"), Some("z:work")),
+    ] {
+        let response = request_pull(
+            Arc::clone(&fixture.recipient), &plan, authorization, zone,
+        ).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let mut missing_later_grant = plan.clone();
+    missing_later_grant.candidates[1].request.grant_id = "not-configured".to_owned();
+    let response = request_pull(
+        Arc::clone(&fixture.recipient), &missing_later_grant,
+        Some("Bearer topsecret"), Some("z:owner"),
+    ).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(fixture.mesh_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(directory_bytes(&fixture.replica_dir()), empty_replica);
+
+    let response = request_pull(
+        Arc::clone(&fixture.recipient), &plan,
+        Some("Bearer topsecret"), Some("z:owner"),
+    ).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let receipt: ConnectorStateRecoveryResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(receipt.schema_version, CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION);
+    assert_eq!(receipt.attempts.len(), 2);
+    assert_eq!(receipt.attempts[0].peer_node, "alternate");
+    assert_eq!(receipt.attempts[0].outcome, ConnectorStateRecoveryOutcome::DownloadDeadline);
+    assert_eq!(receipt.attempts[1].peer_node, "donor");
+    assert_eq!(receipt.attempts[1].outcome, ConnectorStateRecoveryOutcome::Retained);
+    assert_eq!(receipt.replica.peer_node, "donor");
+    assert_eq!(receipt.replica.grant_id, GRANT);
+    assert_eq!(receipt.replica.scope, transfer_scope());
+    assert_eq!(receipt.replica.root_object_id, fixture.request.request.root_object_id);
+    assert_eq!(receipt.replica.object_count, 3);
+    assert!(receipt.replica.replica_only);
+    assert!(receipt.replica.replica_root_published);
+    assert_eq!(fixture.mesh_requests.load(Ordering::SeqCst), 1);
+    assert!(fixture.recipient.registry.inventory().await.is_empty());
+    fixture.assert_ancestry().await;
+    assert_eq!(directory_bytes(&fixture.source_dir), source_before);
+    fixture.restart_recipient();
+    fixture.assert_ancestry().await;
+    drop(stalled_listener);
+    fixture.stop().await;
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn recovery_route_does_not_retry_an_import_rejected_by_writer_pins() {
+    let wrong_writer = signing_key(0x52).verifying_key().to_bytes();
+    let mut fixture = LiveTransfer::start(wrong_writer).await;
+    let endpoint = fixture.donor_endpoint.clone();
+    let plan = fixture.recovery_plan(&endpoint);
+    let empty_replica = directory_bytes(&fixture.replica_dir());
+    let response = request_pull(
+        Arc::clone(&fixture.recipient), &plan,
+        Some("Bearer topsecret"), Some("z:owner"),
+    ).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        fixture.mesh_requests.load(Ordering::SeqCst), 1,
+        "an import failure must not send even one request to the alternate"
+    );
+    assert_eq!(directory_bytes(&fixture.replica_dir()), empty_replica);
+    assert!(fixture.replica_reader().read_root().await.unwrap().is_none());
+    fixture.stop().await;
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn invalid_recovery_plans_and_oversized_bodies_never_contact_a_donor() {
+    let mut fixture = LiveTransfer::start(writer_pin()).await;
+    let endpoint = fixture.donor_endpoint.clone();
+    let plan = fixture.recovery_plan(&endpoint);
+    let empty_replica = directory_bytes(&fixture.replica_dir());
+    for change in 0..4 {
+        let mut invalid = plan.clone();
+        match change {
+            0 => invalid.candidates.clear(),
+            1 => invalid.candidates[1].request.root_object_id = ObjectId::from_bytes([0xee; 32]),
+            2 => invalid.candidates[1].request.scope.zone_id = ZoneId::private(),
+            _ => invalid.total_timeout_ms = 60_001,
+        }
+        let response = request_pull(
+            Arc::clone(&fixture.recipient), &invalid,
+            Some("Bearer topsecret"), Some("z:owner"),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let oversized = json!({"candidates": [], "padding": "x".repeat(PULL_REQUEST_MAX_BYTES)});
+    let response = request_pull(
+        Arc::clone(&fixture.recipient), &oversized,
+        Some("Bearer topsecret"), Some("z:owner"),
+    ).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(fixture.mesh_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(directory_bytes(&fixture.replica_dir()), empty_replica);
     fixture.stop().await;
 }
