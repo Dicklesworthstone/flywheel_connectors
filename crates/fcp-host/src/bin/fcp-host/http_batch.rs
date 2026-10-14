@@ -79,15 +79,17 @@ where
         .map(|operation| (operation.id.as_str(), operation))
         .collect();
 
+    // Live HTTP batches must not revert to unbounded provider-result retention.
+    // A withheld result is an unknown external effect, not a retry permit.
     let mut response = executor
-        .execute_async_with_context(&planning, &context, |planned| {
+        .execute_async_bounded(&planning, Some(&context), fcp_host::BatchResultLimits::default(), |planned| {
             let operation = members[planned.id.as_str()];
             let future = handler(operation, deadline);
             async move { member_outcome(&operation.id, future.await) }
         })
         .await?;
-    response.total_duration_ms = elapsed_millis(started_at);
-    Ok(response)
+    response.response.total_duration_ms = elapsed_millis(started_at);
+    Ok(response.response)
 }
 
 fn validate_members(request: &HttpBatchInvokeRequest) -> HostResult<()> {
