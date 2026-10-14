@@ -3,14 +3,15 @@
 //! Pages transport the existing, fully validated v1 export; they neither widen
 //! grants nor publish partial histories. Every page is independently protected
 //! by the mesh request/reply signature and nonce. The digest binds all pages to
-//! one byte-identical export, not to a new source of authority. A failed pull
-//! drops its assembly without importing anything or retrying another donor.
+//! one byte-identical export, not to a new source of authority. A failed download
+//! drops its assembly without importing anything. Explicit multi-donor recovery
+//! may then start a separate download; import failures are never retried.
 
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
-use crate::connector_state_replication::runtime::ExportLookup;
+use crate::connector_state_replication::runtime::{ExportLookup, TransferPermit};
 use crate::{
     ConnectorStateExportRequest, ConnectorStatePullRequest, ConnectorStatePullResponse,
     ConnectorStateReplicationService, HostError, HostResult,
@@ -281,7 +282,7 @@ impl ConnectorStateReplicationService {
     pub async fn pull_paged_from_peer<F, Fut, A>(
         &self,
         request: &ConnectorStatePullRequest,
-        mut fetch_page: F,
+        fetch_page: F,
         authorize_transport: A,
     ) -> HostResult<ConnectorStatePullResponse>
     where
@@ -294,6 +295,27 @@ impl ConnectorStateReplicationService {
         // Keep the same reservation through every page and the final import.
         // Releasing/reacquiring here would admit unbounded partial assemblies.
         let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
+        let wire = self
+            .download_paged_admitted(request, fetch_page, &authorize_transport, &permit)
+            .await?;
+        self.import_admitted(request, &wire, authorize_transport, &permit).await
+    }
+
+    // Download only: this helper cannot write to a replica. Its caller must
+    // retain the same permit through either import or destruction of the wire.
+    pub(super) async fn download_paged_admitted<F, Fut, A>(
+        &self,
+        request: &ConnectorStatePullRequest,
+        mut fetch_page: F,
+        authorize_transport: A,
+        permit: &TransferPermit<'_>,
+    ) -> HostResult<String>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = HostResult<String>>,
+        A: Fn() -> HostResult<()> + Send + Sync,
+    {
+        permit.check(&self.runtime, &request.peer_node, request.request.limits)?;
         let mut page = PageRequest::first(&request.request);
         let mut assembly = Assembly::default();
         // Every accepted page makes exact, nonzero progress. The total grant
@@ -311,7 +333,9 @@ impl ConnectorStateReplicationService {
             page.wire_digest.clone_from(&assembly.digest);
         }
         let wire = assembly.finish()?;
-        self.import_admitted(request, &wire, authorize_transport, &permit).await
+        self.validate_pull(request)?;
+        authorize_transport()?;
+        Ok(wire)
     }
 }
 
