@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use fcp_audit::AuditEntry;
+use fcp_audit::{AuditEntry, HybridLogicalTimestamp};
 use thiserror::Error;
 
 use crate::{
@@ -21,6 +21,9 @@ use crate::{
 };
 
 const JOURNAL_V1_MAGIC: &[u8; 8] = b"FCPAUD1\n";
+
+mod follow;
+pub use follow::{INVOKE_AUDIT_FOLLOW_BATCH_RECORDS, InvokeAuditFollowBatch, InvokeAuditFollower};
 
 /// Redaction-safe failures from read-only journal observation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -145,7 +148,11 @@ impl InvokeAuditSnapshot {
 pub fn read_invoke_audit_snapshot(
     path: impl AsRef<Path>,
 ) -> Result<InvokeAuditSnapshot, InvokeAuditSnapshotError> {
-    let path = path.as_ref();
+    let mut file = open_snapshot_source(path.as_ref())?;
+    read_invoke_audit_snapshot_from_file(&mut file)
+}
+
+fn open_snapshot_source(path: &Path) -> Result<File, InvokeAuditSnapshotError> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| source_io(&error))?;
     if !metadata.file_type().is_file() {
         return Err(InvokeAuditSnapshotError::NotRegularFile);
@@ -157,8 +164,11 @@ pub fn read_invoke_audit_snapshot(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path).map_err(|error| source_io(&error))?;
-    read_invoke_audit_snapshot_from_file(&mut file)
+    let file = options.open(path).map_err(|error| source_io(&error))?;
+    if !file.metadata().map_err(|error| source_io(&error))?.is_file() {
+        return Err(InvokeAuditSnapshotError::NotRegularFile);
+    }
+    Ok(file)
 }
 
 /// Observe the initial extent of an already opened regular file.
@@ -212,6 +222,30 @@ fn read_exact_at(
     })
 }
 
+fn decode_record(payload: &[u8], offset: u64) -> Result<AuditEntry, InvokeAuditSnapshotError> {
+    let entry: AuditEntry = serde_json::from_slice(payload)
+        .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
+    let id = entry.computed_id()
+        .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
+    if entry.id != id {
+        return Err(InvokeAuditSnapshotError::InvalidRecord { offset });
+    }
+    Ok(entry)
+}
+
+fn valid_successor(
+    entry: &AuditEntry,
+    seq: u64,
+    id: &str,
+    occurred_at: u64,
+    hlc: &HybridLogicalTimestamp,
+) -> bool {
+    seq.checked_add(1) == Some(entry.seq)
+        && entry.prev.as_deref() == Some(id)
+        && entry.occurred_at >= occurred_at
+        && entry.hlc > *hlc
+}
+
 fn decode_snapshot(
     reader: impl Read,
     length: u64,
@@ -248,21 +282,12 @@ fn decode_snapshot(
             .map_err(|_| InvokeAuditSnapshotError::LimitExceeded)?;
         let mut payload = vec![0; size_usize];
         read_exact_at(&mut reader, &mut payload, offset + 4)?;
-        let entry: AuditEntry = serde_json::from_slice(&payload)
-            .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
-        let id = entry.computed_id()
-            .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
-        if entry.id != id {
-            return Err(InvokeAuditSnapshotError::InvalidRecord { offset });
-        }
+        let entry = decode_record(&payload, offset)?;
         let lineage_valid = tips.get(&entry.zone_id).map_or_else(
             || entry.seq == 0 && entry.prev.is_none(),
             |index| {
                 let previous = &entries[*index];
-                previous.seq.checked_add(1) == Some(entry.seq)
-                    && entry.prev.as_deref() == Some(previous.id.as_str())
-                    && entry.occurred_at >= previous.occurred_at
-                    && entry.hlc > previous.hlc
+                valid_successor(&entry, previous.seq, &previous.id, previous.occurred_at, &previous.hlc)
             },
         );
         if !lineage_valid {
