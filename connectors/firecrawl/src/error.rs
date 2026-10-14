@@ -34,6 +34,14 @@ pub enum FirecrawlError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// A billable POST may have executed. Never invite a second job or charge.
+    #[error("firecrawl.outcome_unknown: the request may have executed; automatic replay refused")]
+    OutcomeUnknown { status: Option<u16> },
+
+    /// A bounded read could not produce a usable provider response.
+    #[error("invalid Firecrawl response: {0}")]
+    InvalidResponse(&'static str),
 }
 
 impl FirecrawlError {
@@ -48,7 +56,9 @@ impl FirecrawlError {
             | Self::NotFound(_)
             | Self::Async(_)
             | Self::Config(_)
-            | Self::InvalidInput(_) => false,
+            | Self::InvalidInput(_)
+            | Self::OutcomeUnknown { .. }
+            | Self::InvalidResponse(_) => false,
         }
     }
 
@@ -102,6 +112,20 @@ impl FirecrawlError {
                 code: 1005,
                 message: message.clone(),
             },
+            Self::OutcomeUnknown { status } => FcpError::External {
+                service: "firecrawl".into(),
+                message: self.to_string(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
+            },
+            Self::InvalidResponse(_) => FcpError::External {
+                service: "firecrawl".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
         }
     }
 }
@@ -133,6 +157,32 @@ impl ConnectorErrorMapping for FirecrawlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_post_outcomes_are_terminal_in_both_error_contracts() {
+        for status in [None, Some(200), Some(408), Some(503)] {
+            let error = FirecrawlError::OutcomeUnknown { status };
+            assert!(!error.is_retryable());
+            assert!(!ConnectorErrorMapping::is_retryable(&error));
+            assert!(error.retry_after().is_none());
+            let FcpError::External { status_code, retryable, retry_after, message, .. } =
+                error.to_fcp_error()
+            else {
+                panic!("unknown outcomes must remain external provider failures");
+            };
+            assert_eq!(status_code, status);
+            assert!(!retryable);
+            assert!(retry_after.is_none());
+            assert!(message.contains("firecrawl.outcome_unknown"));
+        }
+    }
+
+    #[test]
+    fn response_limit_errors_do_not_become_retryable_provider_errors() {
+        let error = FirecrawlError::InvalidResponse("response exceeds byte limit");
+        assert!(!error.is_retryable());
+        assert!(matches!(error.to_fcp_error(), FcpError::External { retryable: false, .. }));
+    }
 
     #[test]
     fn rate_limited_is_retryable() {
