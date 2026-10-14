@@ -34,6 +34,10 @@ pub const MAX_CONNECTOR_STATE_TRANSFER_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES: usize = 16 * 1024;
 /// Version of the explicitly scoped state-transfer response.
 pub const CONNECTOR_STATE_TRANSFER_SCHEMA_VERSION: &str = "fcp.host.state-transfer.v1";
+/// Version of a read-only, exact-root replica inspection receipt.
+pub const CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION: &str = "fcp.host.state-inspection.v1";
+/// Inspection returns bounded metadata, never serialized state objects.
+pub const MAX_CONNECTOR_STATE_INSPECTION_RESPONSE_BYTES: usize = 16 * 1024;
 
 const MAX_REGISTERED_STATE_STORES: usize = 256;
 const MAX_STATE_TRANSFER_GRANTS: usize = 1024;
@@ -219,6 +223,93 @@ pub struct ConnectorStatePullResponse {
     pub replica_only: bool,
 }
 
+/// Protected read-only request, distinct from a pull or a recovery plan.
+///
+/// The existing local import grant selects the replica and exact root. The
+/// named donor is not contacted and need not currently be reachable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorStateInspectionRequest {
+    /// Exact request whose retained replica should be verified, not imported.
+    pub inspect: ConnectorStatePullRequest,
+}
+
+impl ConnectorStateInspectionRequest {
+    /// Encode a bounded, unambiguous read-only command.
+    ///
+    /// # Errors
+    /// Rejects invalid metadata, invalid limits and oversized request wrappers.
+    pub fn to_json(&self) -> HostResult<String> {
+        validate_metadata(&self.inspect.peer_node)?;
+        self.inspect.request.validate()?;
+        bounded_json(self, MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES)
+    }
+}
+
+/// Local observation of an explicitly authorized immutable root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorStateInspectionStatus {
+    /// The exact root and its complete ancestry passed the adapter's checks.
+    Verified,
+    /// The exact root object was absent at the time of the read.
+    /// An earlier admitted import may still publish it later.
+    RootNotFound,
+}
+
+/// Metadata from checking the recipient's existing replica without writing.
+///
+/// This is not an import receipt, current-head assertion, durability proof,
+/// mesh-wide replica count, or evidence that a previous writer has settled.
+/// In particular, neither status authorizes an automatic retry of an import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorStateInspectionResponse {
+    /// Always `CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION`.
+    pub schema_version: String,
+    /// Exact request whose local import grant authorized this inspection.
+    pub request: ConnectorStatePullRequest,
+    /// Verified history or a narrowly classified missing root observation.
+    pub status: ConnectorStateInspectionStatus,
+    /// Validated objects including the root; zero only for a missing root.
+    pub object_count: usize,
+    /// Canonical bytes validated locally; no state bytes are disclosed.
+    pub canonical_bytes: usize,
+    /// Always true: live connector state was neither activated nor selected.
+    pub replica_only: bool,
+}
+
+impl ConnectorStateInspectionResponse {
+    /// Bind a receipt to the exact requested grant, donor, scope, root and limits.
+    ///
+    /// # Errors
+    /// Rejects mismatched identities, unknown schemas and inconsistent counts.
+    /// This checks metadata only; the caller must authenticate its host transport.
+    pub fn validate_for(&self, request: &ConnectorStatePullRequest) -> HostResult<()> {
+        validate_metadata(&request.peer_node)?;
+        request.request.validate()?;
+        let counts_valid = match self.status {
+            ConnectorStateInspectionStatus::Verified => {
+                self.object_count > 0
+                    && self.object_count <= request.request.limits.max_objects
+                    && self.canonical_bytes > 0
+                    && self.canonical_bytes <= request.request.limits.max_canonical_bytes
+            }
+            ConnectorStateInspectionStatus::RootNotFound => {
+                self.object_count == 0 && self.canonical_bytes == 0
+            }
+        };
+        if self.schema_version != CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION
+            || self.request != *request
+            || !self.replica_only
+            || !counts_valid
+        {
+            return Err(invalid("connector-state inspection receipt does not match its request"));
+        }
+        Ok(())
+    }
+}
+
 /// Explicitly registered source/replica adapters and immutable transfer grants.
 ///
 /// Construct at host startup, then share one `Arc` for the host's lifetime.
@@ -365,6 +456,69 @@ impl ConnectorStateReplicationService {
             &request.request,
         )?;
         Ok(())
+    }
+
+    /// Verify one exact root already in the registered retained-replica store.
+    ///
+    /// Call only through a protected local operator surface. Current local
+    /// import authority is required before any store read and rechecked after
+    /// awaited validation. No donor lookup, network request, import, root scan,
+    /// cache publication, or state activation occurs. The caller must impose
+    /// a total deadline, just as for the other state-transfer service methods.
+    ///
+    /// Reuses full keyed-ID, writer-pin and ancestry validation with the
+    /// request's object/canonical-byte limits and the shared admission quota.
+    /// `max_wire_bytes` remains reserved conservatively, but no export payload
+    /// is serialized; the metadata response has its own fixed 16 KiB bound.
+    /// Missing ancestors, malformed objects and storage failures are errors,
+    /// never a successful missing-root report. An absent root is only a local
+    /// read observation: an earlier cancelled import may still finish later.
+    ///
+    /// # Errors
+    /// Rejects missing/expired authority, resource exhaustion, incomplete or
+    /// invalid history, and storage failures without disclosing state or paths.
+    pub async fn inspect_replica(
+        &self,
+        request: &ConnectorStatePullRequest,
+    ) -> HostResult<ConnectorStateInspectionResponse> {
+        let (grant, store) = self.authorize(
+            ConnectorStateTransferDirection::Import,
+            &request.peer_node,
+            &request.request,
+        )?;
+        let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
+        let result = store
+            .export_replica(request.request.root_object_id, request.request.limits.store_limits())
+            .await;
+        check_grant_expiry(grant)?;
+        let (status, object_count, canonical_bytes) = match result {
+            Ok(bundle) => (
+                ConnectorStateInspectionStatus::Verified,
+                bundle.objects.len(),
+                canonical_size(&bundle, request.request.limits)?,
+            ),
+            Err(ConnectorStateStoreError::ObjectStore(fcp_store::ObjectStoreError::NotFound(id)))
+                if id == request.request.root_object_id =>
+            {
+                (ConnectorStateInspectionStatus::RootNotFound, 0, 0)
+            }
+            Err(error) => return Err(state_transfer_error(error)),
+        };
+        let response = ConnectorStateInspectionResponse {
+            schema_version: CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION.to_owned(),
+            request: request.clone(),
+            status,
+            object_count,
+            canonical_bytes,
+            replica_only: true,
+        };
+        response.validate_for(request)?;
+        // Metadata can contain escaped operator identifiers. Bound the actual
+        // encoding, not just character counts, without serializing state bytes.
+        bounded_json(&response, MAX_CONNECTOR_STATE_INSPECTION_RESPONSE_BYTES)?;
+        check_grant_expiry(grant)?;
+        permit.check(&self.runtime, &request.peer_node, request.request.limits)?;
+        Ok(response)
     }
 
     /// Export only a granted root for an authenticated requesting peer.
@@ -883,6 +1037,168 @@ mod tests {
             .donor
             .export_for_peer("recipient", &fixture.request.request, || Ok(())))
         .unwrap()
+    }
+
+    #[test]
+    fn inspection_missing_root_is_read_only_and_does_not_contact_the_donor() {
+        let fixture = fixture();
+        let response = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap();
+        assert_eq!(response.status, ConnectorStateInspectionStatus::RootNotFound);
+        assert_eq!((response.object_count, response.canonical_bytes), (0, 0));
+        response.validate_for(&fixture.request).unwrap();
+        assert!(response.replica_only);
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert_eq!(fixture.donor.runtime.cache_builds_started(), 0);
+    }
+
+    #[test]
+    fn inspection_revalidates_retained_history_without_a_publication_claim() {
+        let fixture = fixture();
+        let wire = export(&fixture);
+        let retained = run(fixture.recipient.import_from_peer(
+            &fixture.request, &wire, || Ok(()),
+        )).unwrap();
+        for _ in 0..2 {
+            let response = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap();
+            assert_eq!(response.status, ConnectorStateInspectionStatus::Verified);
+            assert_eq!(response.object_count, retained.object_count);
+            assert_eq!(response.canonical_bytes, retained.canonical_bytes);
+            response.validate_for(&fixture.request).unwrap();
+            let value = serde_json::to_value(&response).unwrap();
+            for absent in ["bundle", "objects", "state_cbor", "current_root", "replica_root_published"] {
+                assert!(value.get(absent).is_none(), "unexpected claim or state field: {absent}");
+            }
+            assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, retained.root_object_id);
+            assert_eq!(fixture.recipient.runtime.active(), 0);
+        }
+    }
+
+    #[test]
+    fn inspection_incomplete_ancestry_is_an_error_not_a_missing_root_receipt() {
+        let mut fixture = fixture();
+        let response: ConnectorStateExportResponse = serde_json::from_str(&export(&fixture)).unwrap();
+        let objects = Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        // Stage only the authenticated root. Its head is absent, as can happen
+        // with damaged storage; presence of a root alone is not verification.
+        let root = response.bundle.objects.into_iter()
+            .find(|object| object.object_id == fixture.request.request.root_object_id).unwrap();
+        run(objects.put(root)).unwrap();
+        fixture.recipient.stores.insert(
+            (ConnectorStateTransferDirection::Import, scope()), adapter(objects),
+        );
+        let error = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap_err();
+        assert!(matches!(error, HostError::Unavailable(_)));
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+    }
+
+    #[test]
+    fn inspection_requires_pinned_writers_even_for_locally_present_objects() {
+        let mut fixture = fixture();
+        let response: ConnectorStateExportResponse = serde_json::from_str(&export(&fixture)).unwrap();
+        let objects = Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        for object in response.bundle.objects {
+            run(objects.put(object)).unwrap();
+        }
+        let other = Ed25519SigningKey::from_bytes(&[0x6b; 32]).unwrap();
+        let untrusted = FcpStoreConnectorStateStore::new(
+            objects, key(), scope().connector_id, scope().zone_id,
+        ).with_trusted_writer_keys([other.verifying_key().to_bytes()]);
+        fixture.recipient.stores.insert(
+            (ConnectorStateTransferDirection::Import, scope()), Arc::new(untrusted),
+        );
+        let error = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap_err();
+        assert!(error.to_string().contains("state writer authentication failed"));
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+    }
+
+    #[test]
+    fn inspection_checks_authority_before_exposing_presence_or_capacity() {
+        let fixture = fixture();
+        let first = fixture.recipient.runtime.admit("donor", limits()).unwrap();
+        let second = fixture.recipient.runtime.admit("donor", limits()).unwrap();
+        assert!(matches!(run(fixture.recipient.inspect_replica(&fixture.request)),
+            Err(HostError::Unavailable(_))));
+        let mut wrong = fixture.request.clone();
+        wrong.request.root_object_id = ObjectId::from_bytes([0xff; 32]);
+        assert!(matches!(run(fixture.recipient.inspect_replica(&wrong)),
+            Err(HostError::PreflightFailed(_))));
+        wrong = fixture.request.clone();
+        wrong.peer_node = "other-peer".to_owned();
+        assert!(matches!(run(fixture.recipient.inspect_replica(&wrong)),
+            Err(HostError::PreflightFailed(_))));
+        assert!(run(fixture.donor.inspect_replica(&fixture.request)).is_err(),
+            "an export-only registration is not a retained-replica read grant");
+        drop((first, second));
+        fixture.recipient.grants["restore-state"].expired.store(true, Ordering::Release);
+        assert!(matches!(run(fixture.recipient.inspect_replica(&fixture.request)),
+            Err(HostError::PreflightFailed(_))));
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+    }
+
+    #[test]
+    fn inspection_enforces_exact_object_and_canonical_budgets_without_exporting_state() {
+        let fixture = fixture();
+        let wire = export(&fixture);
+        let retained = run(fixture.recipient.import_from_peer(
+            &fixture.request, &wire, || Ok(()),
+        )).unwrap();
+        let mut exact = fixture.request.clone();
+        exact.request.limits.max_objects = retained.object_count;
+        exact.request.limits.max_canonical_bytes = retained.canonical_bytes;
+        // No state export is serialized, so this transfer-payload bound is
+        // not the bound on the small, separately capped inspection receipt.
+        exact.request.limits.max_wire_bytes = 1;
+        let receipt = run(fixture.recipient.inspect_replica(&exact)).unwrap();
+        assert_eq!(receipt.status, ConnectorStateInspectionStatus::Verified);
+        let mut too_small = exact.clone();
+        too_small.request.limits.max_objects -= 1;
+        assert!(run(fixture.recipient.inspect_replica(&too_small)).is_err());
+        too_small = exact;
+        too_small.request.limits.max_canonical_bytes -= 1;
+        assert!(run(fixture.recipient.inspect_replica(&too_small)).is_err());
+        assert_eq!(fixture.recipient.runtime.active(), 0);
+        assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, retained.root_object_id);
+    }
+
+    #[test]
+    fn inspection_receipt_binds_request_status_schema_and_resource_counts() {
+        let fixture = fixture();
+        let valid = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap();
+        let original = serde_json::to_value(&valid).unwrap();
+        for (pointer, replacement) in [
+            ("/schema_version", serde_json::json!("other")),
+            ("/request/peer_node", serde_json::json!("other-peer")),
+            ("/request/request/grant_id", serde_json::json!("other-grant")),
+            ("/request/request/root_object_id", serde_json::json!("f".repeat(64))),
+            ("/request/request/scope/zone_id", serde_json::json!("z:private")),
+            ("/request/request/limits/max_objects", serde_json::json!(15)),
+            ("/status", serde_json::json!("verified")),
+            ("/object_count", serde_json::json!(1)),
+            ("/canonical_bytes", serde_json::json!(1)),
+            ("/replica_only", serde_json::json!(false)),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let changed: ConnectorStateInspectionResponse = serde_json::from_value(changed).unwrap();
+            assert!(changed.validate_for(&fixture.request).is_err(), "{pointer}");
+        }
+        let mut unexpected = original;
+        unexpected["raw_state"] = serde_json::json!("private");
+        assert!(serde_json::from_value::<ConnectorStateInspectionResponse>(unexpected).is_err());
+    }
+
+    #[test]
+    fn inspection_command_cannot_be_decoded_as_a_mutating_pull() {
+        let fixture = fixture();
+        let inspection = ConnectorStateInspectionRequest { inspect: fixture.request };
+        let wire = inspection.to_json().unwrap();
+        assert_eq!(serde_json::from_str::<ConnectorStateInspectionRequest>(&wire).unwrap(), inspection);
+        assert!(serde_json::from_str::<ConnectorStatePullRequest>(&wire).is_err());
+        let mut changed = serde_json::to_value(&inspection).unwrap();
+        changed["candidates"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ConnectorStateInspectionRequest>(changed).is_err());
     }
 
     #[test]
