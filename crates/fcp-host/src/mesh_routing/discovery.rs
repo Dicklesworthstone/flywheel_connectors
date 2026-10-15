@@ -91,10 +91,6 @@ struct AdvertisementCache {
     // cursor is reduced modulo the current snapshot's peer count.
     next_peer_index: usize,
     entries: HashMap<String, CachedAdvertisement>,
-    // Serialized refresh ownership without holding an async mutex guard across
-    // network awaits. This bit is protected by the same short std mutex as the
-    // cache, so the resulting discovery future can remain Send for Axum.
-    refreshing: bool,
 }
 
 impl AdvertisementCache {
@@ -128,27 +124,17 @@ impl AdvertisementCache {
 
 #[derive(Debug)]
 pub(super) struct PeerDiscovery {
+    // Unlike the asupersync mutex guard, this runtime-independent guard is
+    // Send and can cross network awaits in an Axum handler. Unlock wakes a
+    // waiting lookup directly; it must not require a periodic polling timer.
+    refresh: futures_util::lock::Mutex<()>,
     cache: Mutex<AdvertisementCache>,
-}
-
-struct RefreshLease<'a> {
-    discovery: &'a PeerDiscovery,
-}
-
-impl Drop for RefreshLease<'_> {
-    fn drop(&mut self) {
-        let mut cache = self
-            .discovery
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.refreshing = false;
-    }
 }
 
 impl PeerDiscovery {
     pub(super) fn new() -> Self {
         Self {
+            refresh: futures_util::lock::Mutex::new(()),
             cache: Mutex::new(AdvertisementCache::default()),
         }
     }
@@ -168,17 +154,12 @@ impl PeerDiscovery {
         // Start elapsed-time accounting before any lock or network wait.
         self.freshness_now();
         let refresh = async {
-            // Only one caller fetches at a time, but refresh ownership is a
-            // cancellation-safe RAII bit rather than a non-Send async mutex
-            // guard held across network I/O. Waiters periodically re-check the
-            // cache under the same overall five-second deadline.
-            let (lease, generation, stale_peers) = loop {
-                if let Some(refresh) = self.try_begin_refresh(directory) {
-                    break refresh;
-                }
-                fcp_async_core::time::sleep(Duration::from_millis(1)).await;
-            };
-            let _refresh_lease = lease;
+            // The same total deadline covers lock admission and network I/O.
+            // Cancelling the owner releases this Send guard; cancelling a
+            // notified waiter passes the wakeup to another waiting lookup.
+            // Cache locks remain short and never cross an await.
+            let _refresh_guard = self.refresh.lock().await;
+            let (generation, stale_peers) = self.begin_refresh(directory);
             let mut pending = stream::iter(stale_peers)
                 .map(|(index, peer)| {
                     self.record_attempt(generation, index, directory.len());
@@ -254,18 +235,13 @@ impl PeerDiscovery {
         self.snapshot(directory, unix_now_ms())
     }
 
-    fn try_begin_refresh(
-        &self,
-        directory: &MeshPeerDirectory,
-    ) -> Option<(RefreshLease<'_>, u64, Vec<(usize, MeshPeer)>)> {
+    // Called only while holding refresh ownership. Snapshot stale work after
+    // admission so a waiting lookup reuses the previous owner's completed cache.
+    fn begin_refresh(&self, directory: &MeshPeerDirectory) -> (u64, Vec<(usize, MeshPeer)>) {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.refreshing {
-            return None;
-        }
-        cache.refreshing = true;
         cache.entries.retain(|_, entry| {
             directory.peer(&entry.peer.node_id) == Some(&entry.peer)
         });
@@ -273,8 +249,7 @@ impl PeerDiscovery {
         let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
         let generation = cache.generation;
         let stale_peers = cache.stale_peers(directory, now_ms, freshness_floor_ms);
-        drop(cache);
-        Some((RefreshLease { discovery: self }, generation, stale_peers))
+        (generation, stale_peers)
     }
 
     fn freshness_now(&self) -> (u64, u64) {
@@ -388,6 +363,95 @@ mod tests {
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(results.iter().all(|result| result.len() == 1));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelled_owner_and_notified_waiter_handoff_without_polling() {
+        use std::sync::Arc;
+        use std::task::Context;
+        use futures_util::task::{ArcWake, waker};
+
+        struct WakeCount {
+            polling_thread: std::thread::ThreadId,
+            notifications: AtomicUsize,
+        }
+
+        impl ArcWake for WakeCount {
+            fn wake_by_ref(this: &Arc<Self>) {
+                // A deadline timer on another thread cannot make this test pass.
+                // Ownership release must notify the waiter synchronously.
+                if std::thread::current().id() == this.polling_thread {
+                    this.notifications.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let discovery = PeerDiscovery::new();
+        let mut owner = Box::pin(discovery.collect(&directory, |_| {
+            pending::<Result<MeshPeerAdvertisement, String>>()
+        }));
+        assert!(futures_util::poll!(owner.as_mut()).is_pending());
+        let calls = AtomicUsize::new(0);
+        let fetch = |peer| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let ad = advertisement(&peer, &key);
+            async move { Ok(ad) }
+        };
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let wake = Arc::new(WakeCount {
+                polling_thread: std::thread::current().id(),
+                notifications: AtomicUsize::new(0),
+            });
+            let mut future = Box::pin(discovery.collect(&directory, &fetch));
+            let task_waker = waker(Arc::clone(&wake));
+            let mut context = Context::from_waker(&task_waker);
+            assert!(future.as_mut().poll(&mut context).is_pending());
+            wake.notifications.store(0, Ordering::SeqCst);
+            waiters.push((future, wake));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(owner);
+        let notified = waiters.iter().position(|(_, wake)| {
+            wake.notifications.load(Ordering::SeqCst) != 0
+        }).expect("dropping the refresher must directly wake a queued lookup");
+        // Cancellation after notification but before repolling must hand the
+        // notification to the other lookup instead of losing refresh progress.
+        drop(waiters.remove(notified));
+        let (mut survivor, wake) = waiters.pop().unwrap();
+        assert_ne!(wake.notifications.load(Ordering::SeqCst), 0);
+        let task_waker = waker(wake);
+        let mut context = Context::from_waker(&task_waker);
+        let result = survivor.as_mut().poll(&mut context);
+        assert!(matches!(result, std::task::Poll::Ready(ref ads) if ads.len() == 1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelling_a_queued_lookup_does_not_unlock_the_active_refresh() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let discovery = PeerDiscovery::new();
+        let mut owner = Box::pin(discovery.collect(&directory, |_| {
+            pending::<Result<MeshPeerAdvertisement, String>>()
+        }));
+        assert!(futures_util::poll!(owner.as_mut()).is_pending());
+        let mut waiter = Box::pin(discovery.collect(&directory, |_| {
+            panic!("a queued lookup must not fetch while another refresh is active");
+            #[allow(unreachable_code)]
+            pending::<Result<MeshPeerAdvertisement, String>>()
+        }));
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert!(discovery.refresh.try_lock().is_none());
+        drop(owner);
+        let result = discovery.collect(&directory, |peer| {
+            let ad = advertisement(&peer, &key);
+            async move { Ok(ad) }
+        }).await;
+        assert_eq!(result.len(), 1);
     }
 
     #[fcp_async_core::runtime::test]
