@@ -190,4 +190,5 @@ pub(super) async fn prepare_handler(
 }
 
 #[cfg(test)]
+#[path = "session/tests.rs"]
 mod tests;

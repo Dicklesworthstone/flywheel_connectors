@@ -200,4 +200,5 @@ impl Selection {
 }
 
 #[cfg(test)]
+#[path = "sources/tests.rs"]
 mod tests;
