@@ -1,5 +1,6 @@
 //! Pagination helpers for GraphQL APIs.
 
+use std::collections::HashSet;
 use std::future::Future;
 
 use thiserror::Error;
@@ -79,7 +80,47 @@ pub enum PaginationError {
 /// never actually terminates.
 const MAX_PAGES: usize = 10_000;
 
-/// Paginate a cursor-based API.
+/// Maximum retained bytes used to detect cursor cycles in one traversal.
+/// The page count separately bounds the collection's per-entry overhead.
+const MAX_CURSOR_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
+/// A cursor is opaque: do not trim it, decode it, or include it in an error.
+#[derive(Default)]
+struct CursorProgress {
+    seen: HashSet<String>,
+    retained_bytes: usize,
+}
+
+impl CursorProgress {
+    fn record(&mut self, cursor: &str) -> Result<(), PaginationError> {
+        if self.seen.contains(cursor) {
+            return Err(PaginationError::Stalled(
+                "server returned an end_cursor already visited in this traversal".to_owned(),
+            ));
+        }
+        let remaining = MAX_CURSOR_HISTORY_BYTES.saturating_sub(self.retained_bytes);
+        if cursor.len() > remaining {
+            return Err(PaginationError::LimitExceeded(
+                "cursor history byte budget exceeded".to_owned(),
+            ));
+        }
+        self.seen.insert(cursor.to_owned());
+        self.retained_bytes += cursor.len();
+        Ok(())
+    }
+}
+
+/// Paginate a cursor-based API without returning an incomplete connection as success.
+///
+/// Cursors are opaque and compared byte-for-byte. A continuation must exist
+/// whenever the server advertises another page, and it must not revisit any
+/// cursor in this traversal, including an explicitly supplied initial cursor.
+/// Cursor history is bounded to 4 MiB and the request count to 10,000 pages.
+/// A terminal page may omit its cursor or repeat a previous one.
+///
+/// # Errors
+/// Returns client errors, item/history limit violations, missing continuation
+/// cursors, cursor cycles, or an exhausted page budget. No retry is attempted.
 pub async fn paginate_cursor<T, F, Fut>(
     mut cursor: Option<String>,
     limit: Option<PageLimit>,
@@ -92,6 +133,10 @@ where
     let mut out = Vec::new();
     let max_items = limit.map(|limit| limit.max_items);
     let mut pages = 0usize;
+    let mut progress = CursorProgress::default();
+    if let Some(initial) = cursor.as_deref() {
+        progress.record(initial)?;
+    }
     loop {
         if let Some(max_items) = max_items {
             if out.len() >= max_items {
@@ -117,7 +162,6 @@ where
                 ));
             }
             if page.items.len() > remaining {
-                out.extend(page.items.into_iter().take(remaining));
                 return Err(PaginationError::LimitExceeded(
                     "page limit reached".to_string(),
                 ));
@@ -128,19 +172,13 @@ where
         if !page.page_info.has_next_page {
             break;
         }
-        let next_cursor = page.page_info.end_cursor;
-        if next_cursor.is_none() {
-            break;
-        }
-        // A server that hands back the SAME cursor it was just given is not
-        // advancing: the next request would be byte-identical to this one, so
-        // the loop can only spin. Refuse rather than hang.
-        if next_cursor == cursor {
-            return Err(PaginationError::Stalled(
-                "server returned the same end_cursor it was given".to_string(),
-            ));
-        }
-        cursor = next_cursor;
+        let next_cursor = page.page_info.end_cursor.ok_or_else(|| {
+            PaginationError::Stalled(
+                "server advertised another page without an end_cursor".to_owned(),
+            )
+        })?;
+        progress.record(&next_cursor)?;
+        cursor = Some(next_cursor);
     }
 
     Ok(out)
@@ -185,7 +223,6 @@ where
                 ));
             }
             if page.items.len() > remaining {
-                out.extend(page.items.into_iter().take(remaining));
                 return Err(PaginationError::LimitExceeded(
                     "page limit reached".to_string(),
                 ));
@@ -623,9 +660,8 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn paginate_cursor_stops_when_end_cursor_is_none() {
-        // has_next_page = true but end_cursor = None → should stop
-        let items = paginate_cursor(None, None, |_cursor| async {
+    async fn paginate_cursor_rejects_missing_continuation_instead_of_truncating() {
+        let result = paginate_cursor(None, None, |_cursor| async {
             Ok(CursorPage {
                 items: vec![1, 2],
                 page_info: CursorPageInfo {
@@ -635,9 +671,8 @@ mod tests {
                 },
             })
         })
-        .await
-        .unwrap();
-        assert_eq!(items, vec![1, 2]);
+        .await;
+        assert!(matches!(result, Err(PaginationError::Stalled(_))));
     }
 
     #[fcp_async_core::runtime::test]
@@ -997,7 +1032,7 @@ mod tests {
         let page = CursorPage {
             items,
             page_info: CursorPageInfo {
-                has_next_page: true,
+                has_next_page: false,
                 end_cursor: Some("c1000".into()),
                 total_count: Some(5000),
             },
@@ -1130,5 +1165,137 @@ mod tests {
             total_count: None,
         };
         assert_ne!(a, b);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cursor_cycles_stop_before_refetching_a_page() {
+        for cycle in [vec!["a", "b"], vec!["a", "b", "c"]] {
+            let mut calls = 0usize;
+            let result = paginate_cursor(None, None, |_| {
+                let next = cycle[calls % cycle.len()].to_owned();
+                calls += 1;
+                std::future::ready(Ok(CursorPage {
+                    items: vec![calls],
+                    page_info: CursorPageInfo {
+                        has_next_page: true,
+                        end_cursor: Some(next),
+                        total_count: None,
+                    },
+                }))
+            })
+            .await;
+            assert!(matches!(result, Err(PaginationError::Stalled(_))));
+            assert_eq!(calls, cycle.len() + 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cursor_cycles_include_the_resume_cursor_without_disclosing_it() {
+        let initial = "private-resume-token";
+        let mut calls = 0;
+        let result = paginate_cursor(Some(initial.to_owned()), None, |_| {
+            calls += 1;
+            std::future::ready(Ok(CursorPage::<()> {
+                items: Vec::new(),
+                page_info: CursorPageInfo {
+                    has_next_page: true,
+                    end_cursor: Some(if calls == 1 { "next" } else { initial }.to_owned()),
+                    total_count: None,
+                },
+            }))
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert!(matches!(&error, PaginationError::Stalled(_)));
+        assert!(!error.to_string().contains(initial));
+        assert_eq!(calls, 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn missing_continuation_after_valid_pages_never_returns_a_partial_success() {
+        for empty_page in [false, true] {
+            let mut calls = 0;
+            let result = paginate_cursor(None, None, |_| {
+                calls += 1;
+                std::future::ready(Ok(CursorPage {
+                    items: if empty_page { Vec::new() } else { vec![calls] },
+                    page_info: CursorPageInfo {
+                        has_next_page: true,
+                        end_cursor: (calls == 1).then(|| "valid".to_owned()),
+                        total_count: None,
+                    },
+                }))
+            })
+            .await;
+            assert!(matches!(result, Err(PaginationError::Stalled(_))));
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn opaque_cursors_are_not_normalized_and_terminal_cursors_are_not_followed() {
+        let cursors = ["", "  opaque  ", "世界"];
+        let mut calls = 0usize;
+        let items = paginate_cursor(None, None, |cursor| {
+            assert_eq!(cursor.as_deref(), calls.checked_sub(1).map(|i| cursors[i]));
+            let index = calls;
+            calls += 1;
+            std::future::ready(Ok(CursorPage {
+                items: vec![index],
+                page_info: CursorPageInfo {
+                    has_next_page: index < cursors.len(),
+                    end_cursor: Some(cursors.get(index).copied().unwrap_or("").to_owned()),
+                    total_count: None,
+                },
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, vec![0, 1, 2, 3]);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn cursor_history_enforces_exact_byte_budget_without_mutating_on_failure() {
+        let mut progress = CursorProgress::default();
+        let initial = "x".repeat(MAX_CURSOR_HISTORY_BYTES - "世界".len());
+        progress.record(&initial).unwrap();
+        progress.record("世界").unwrap();
+        assert_eq!(progress.retained_bytes, MAX_CURSOR_HISTORY_BYTES);
+        assert_eq!(progress.seen.len(), 2);
+        assert!(matches!(
+            progress.record("y"),
+            Err(PaginationError::LimitExceeded(_))
+        ));
+        assert_eq!(progress.retained_bytes, MAX_CURSOR_HISTORY_BYTES);
+        assert_eq!(progress.seen.len(), 2);
+        assert!(!progress.seen.contains("y"));
+        assert!(matches!(
+            progress.record(&initial),
+            Err(PaginationError::Stalled(_))
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn oversized_resume_cursor_is_rejected_before_network_access() {
+        let mut calls = 0;
+        let result = paginate_cursor(
+            Some("x".repeat(MAX_CURSOR_HISTORY_BYTES + 1)),
+            None,
+            |_| {
+                calls += 1;
+                std::future::ready(Ok(CursorPage::<()> {
+                    items: Vec::new(),
+                    page_info: CursorPageInfo {
+                        has_next_page: false,
+                        end_cursor: None,
+                        total_count: None,
+                    },
+                }))
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(PaginationError::LimitExceeded(_))));
+        assert_eq!(calls, 0);
     }
 }
