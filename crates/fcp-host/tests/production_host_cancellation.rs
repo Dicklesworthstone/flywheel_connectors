@@ -510,6 +510,113 @@ mod native {
         exercise_hung_invoke(true).await
     }
 
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn simultaneous_expirations_preserve_the_latest_native_incarnation() -> TestResult {
+        const OLD_INCARNATIONS: usize = 3;
+        let connector_id = ConnectorId::from_static("fcp.test.cancel-cohort:utility:1.0.0");
+        let key = Ed25519SigningKey::generate();
+        let host = ProductionHost::spawn(&connector_id, &key).await?;
+        let mut current = host.next_process(None).await?;
+        let mut history = vec![current];
+        let mut pending = Vec::with_capacity(OLD_INCARNATIONS);
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+        let setup_started = Instant::now();
+
+        // These are successive incarnations of ONE registry entry, all kept
+        // alive by outstanding calls in ONE production host/reaper. Separate
+        // hosts or connector IDs would not exercise a stale registry lookup.
+        for generation in 0..OLD_INCARNATIONS {
+            let mut request = invoke_request(connector_id.clone(), &key);
+            request.input = json!({"message": "cohort-hang", "delay_ms": BLOCK_MS});
+            let operation_id = request.id.to_string();
+            let client = client.clone();
+            let url = host.url("/rpc/invoke");
+            let task = fcp_async_core::task::spawn(async move {
+                let response = client.post(url).header("x-principal", PRINCIPAL)
+                    .json(&request).send().await.map_err(|error| error.to_string())?;
+                read_response::<InvokeResponse>(response).await.map_err(|error| error.to_string())
+            });
+            // Consume each exact request/PID marker before the next incarnation
+            // can overwrite the fixture's shared marker file.
+            host.wait_for_blocked_invoke(&operation_id, current).await?;
+            pending.push((operation_id, current, task));
+            let response: ConnectorConfigApplyResponse = host.post(
+                &format!("/rpc/connectors/{}/config/apply", connector_id.as_str()),
+                &ConnectorConfigApplyRequest {
+                    payload: json!({"generation": generation + 2}),
+                    expected_active_revision_id: None,
+                    created_by: Some("issue-59-cohort".to_owned()),
+                    change_reason: Some("retain old blocked incarnation during replacement".to_owned()),
+                }, true,
+            ).await?;
+            assert!(response.changed);
+            current = host.next_process(Some(current)).await?;
+            assert!(!history.contains(&current), "replacement must be a new process incarnation");
+            history.push(current);
+            assert_eq!(spawn_history(&host.history)?, history);
+        }
+        assert!(setup_started.elapsed() < Duration::from_secs(5), "cohort setup exceeded RPC-timeout margin");
+        for (id, process, task) in &pending {
+            assert!(process.is_alive()?, "{id} exited before cohort cancellation");
+            assert!(!task.is_finished(), "{id} returned before cohort cancellation");
+        }
+        assert!(current.is_alive()?, "latest incarnation must be alive before cancellation");
+
+        let live_request = invoke_request(connector_id.clone(), &key);
+        let live_id = live_request.id.clone();
+        let cancellations = futures_util::future::join_all(pending.iter().map(|(id, process, _)| {
+            let host = &host;
+            async move {
+                let request = CancellationRequest {
+                    operation_id: id.clone(), reason: CancelReason::UserRequested,
+                    cleanup: CleanupBehavior::BestEffort, return_partial: false, capability_token: None,
+                };
+                let started = Instant::now();
+                // Each operation has its own unchanged deadline, measured from
+                // before its HTTP request. No serial wait resets another budget.
+                let (answer, terminated) = futures_util::future::join(
+                    host.post::<CancellationResponse>("/rpc/operations/cancel", &request, true),
+                    observe_termination(*process, started),
+                ).await;
+                assert_eq!(answer?.operation_id, *id);
+                Ok::<_, Box<dyn std::error::Error>>((id.clone(), *process, terminated?))
+            }
+        }));
+        let (outcomes, live_response) = futures_util::future::join(
+            cancellations, host.post::<InvokeResponse>("/rpc/invoke", &live_request, false),
+        ).await;
+        assert_eq!(outcomes.len(), OLD_INCARNATIONS);
+        for outcome in outcomes {
+            let (id, process, elapsed) = outcome?;
+            eprintln!("ISSUE-59 COHORT: operation={id}; original={process:?}; terminated_after={elapsed:?}; budget={KILL_BUDGET:?}");
+        }
+        let live_response = live_response?;
+        assert_eq!(live_response.id, live_id);
+        assert_eq!(live_response.status, InvokeStatus::Ok);
+        assert!(current.is_alive()?, "old cancellations killed the latest incarnation");
+        assert_eq!(spawn_history(&host.history)?, history, "concurrent follow-up must not respawn");
+
+        for (id, process, task) in pending {
+            let result = fcp_async_core::time::timeout(Duration::from_secs(3), task)
+                .await.map_err(|_| io::Error::other("cohort invoke did not return after termination"))?
+                .map_err(io::Error::other)?;
+            assert!(!matches!(&result, Ok(response) if response.status == InvokeStatus::Ok),
+                "terminated cohort invoke {id} reported success: {result:?}");
+            assert!(!process.is_alive()?, "original incarnation {id} is still live");
+            host.wait_for_forced_audit(&id).await?;
+        }
+        // Cross additional reaper sweeps, then prove service from the exact same
+        // replacement again. A kill followed by an automatic respawn cannot pass.
+        fcp_async_core::time::sleep(Duration::from_secs(1)).await;
+        let request = invoke_request(connector_id, &key);
+        let response: InvokeResponse = host.post("/rpc/invoke", &request, false).await?;
+        assert_eq!(response.id, request.id);
+        assert_eq!(response.status, InvokeStatus::Ok);
+        assert!(current.is_alive()?);
+        assert_eq!(spawn_history(&host.history)?, history, "late cancellation must not trigger respawn");
+        Ok(())
+    }
+
     #[test]
     fn process_stat_handles_parentheses_and_spaces_in_comm() {
         let mut fields = vec!["0"; 20];
