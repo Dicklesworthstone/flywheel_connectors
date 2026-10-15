@@ -17,7 +17,7 @@ use std::time::Duration;
 use fcp_mesh::invoke_route::{
     DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS, MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 
 use super::{Instant, unix_now_ms};
 
@@ -25,6 +25,18 @@ const MAX_CONCURRENT_FETCHES: usize = 16;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const SUCCESS_CACHE_TTL: Duration = Duration::from_secs(10);
 const FAILURE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+// Own the peer and transport future directly. No mapped-stream closure or
+// borrowed factory is retained in the pending queue across a network await.
+async fn fetch_with_peer<Fut>(
+    peer: MeshPeer,
+    fetch: Fut,
+) -> (MeshPeer, Result<MeshPeerAdvertisement, String>)
+where
+    Fut: Future<Output = Result<MeshPeerAdvertisement, String>>,
+{
+    (peer, fetch.await)
+}
 
 /// Process-local lower bound on time used to validate signed evidence.
 ///
@@ -142,97 +154,134 @@ impl PeerDiscovery {
     /// Fetch missing inventories through `fetch`, then authenticate them
     /// against this immutable membership snapshot. Transport success alone is
     /// never sufficient to populate the cache.
-    pub(super) async fn collect<F, Fut>(
-        &self,
-        directory: &MeshPeerDirectory,
+    ///
+    /// The HTTP boundary requires Send. Enforce that contract here rather than
+    /// leaving it to an opaque Axum Handler error in a downstream route table.
+    /// Factories need not be Sync or static: one refresh owns its factory, and
+    /// its borrowed, Send transport futures never escape the returned future.
+    pub(super) fn collect<'a, F, Fut>(
+        &'a self,
+        directory: &'a MeshPeerDirectory,
         fetch: F,
-    ) -> Vec<MeshPeerAdvertisement>
+    ) -> impl Future<Output = Vec<MeshPeerAdvertisement>> + Send + 'a
     where
-        F: Fn(MeshPeer) -> Fut,
-        Fut: Future<Output = Result<MeshPeerAdvertisement, String>>,
+        F: Fn(MeshPeer) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<MeshPeerAdvertisement, String>> + Send + 'a,
     {
-        // Start elapsed-time accounting before any lock or network wait.
-        self.freshness_now();
-        let refresh = async {
-            // The same total deadline covers lock admission and network I/O.
-            // Cancelling the owner releases this Send guard; cancelling a
-            // notified waiter passes the wakeup to another waiting lookup.
-            // Cache locks remain short and never cross an await.
-            let _refresh_guard = self.refresh.lock().await;
-            let (generation, stale_peers) = self.begin_refresh(directory);
-            let mut pending = stream::iter(stale_peers)
-                .map(|(index, peer)| {
-                    self.record_attempt(generation, index, directory.len());
-                    let result = fetch(peer.clone());
-                    async move { (peer, result.await) }
-                })
-                .buffer_unordered(MAX_CONCURRENT_FETCHES);
-            while let Some((peer, result)) = pending.next().await {
-                let result = result.and_then(|advertisement| {
-                    let (now_ms, freshness_floor_ms) = self.freshness_now();
-                    advertisement
-                        .verify(
-                            &peer.node_id,
-                            directory,
-                            now_ms,
-                            DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    // The monotonic floor is an additional restriction, not
-                    // a replacement for the real wall-clock future-skew check.
-                    if advertisement.issued_at_ms.abs_diff(freshness_floor_ms)
-                        > DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
-                    {
-                        return Err(
-                            "mesh advertisement expired under monotonic freshness".to_owned(),
-                        );
+        async move {
+            let started = Instant::now();
+            self.freshness_now();
+            let refresh = async move {
+                // The same total deadline covers lock admission and network I/O.
+                // Cancelling the owner drops its owned pending futures before
+                // releasing the refresh guard. Cache locks never cross awaits.
+                let _refresh_guard = self.refresh.lock().await;
+                let (generation, stale_peers) = self.begin_refresh(directory);
+                let mut stale_peers = stale_peers.into_iter();
+                let mut pending = FuturesUnordered::new();
+                loop {
+                    while pending.len() < MAX_CONCURRENT_FETCHES {
+                        let Some((index, peer)) = stale_peers.next() else {
+                            break;
+                        };
+                        if !self.admit_attempt(generation, index, directory.len(), started) {
+                            return;
+                        }
+                        // Admission linearizes with invalidation under the cache
+                        // lock, but the factory runs outside it and may reenter.
+                        let future = fetch(peer.clone());
+                        pending.push(fetch_with_peer(peer, future));
                     }
-                    Ok(advertisement)
-                });
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cache.generation != generation {
-                    // Invalidation must also fence a fetch that started before
-                    // the cache was cleared, not just erase existing entries.
-                    break;
+                    // A factory can invalidate even when it returns a pending
+                    // future. Do not wait for that transport to expose the fence.
+                    if !self.refresh_is_live(generation, started) {
+                        return;
+                    }
+                    let Some((peer, result)) = pending.next().await else {
+                        return;
+                    };
+                    if !self.cache_result(generation, directory, peer, result, started) {
+                        return;
+                    }
                 }
-                let advertisement = match result {
-                    Ok(advertisement) => Some(advertisement),
-                    Err(detail) => {
-                        tracing::warn!(
-                            event = "mesh_advertisement_unavailable",
-                            peer = peer.node_id.as_str(),
-                            detail = %detail,
-                            "skipping mesh peer advertisement"
-                        );
-                        None
-                    }
-                };
-                cache.entries.insert(
-                    peer.node_id.as_str().to_owned(),
-                    CachedAdvertisement {
-                        peer,
-                        checked_at: Instant::now(),
-                        advertisement,
-                    },
+            };
+            let remaining = REFRESH_TIMEOUT.saturating_sub(started.elapsed());
+            if fcp_async_core::time::timeout(remaining, refresh).await.is_err()
+                || started.elapsed() >= REFRESH_TIMEOUT
+            {
+                tracing::warn!(
+                    event = "mesh_discovery_deadline",
+                    peer_count = directory.len(),
+                    "mesh discovery deadline reached; returning only fresh verified inventories"
                 );
             }
-        };
-        if fcp_async_core::time::timeout(REFRESH_TIMEOUT, refresh)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                event = "mesh_discovery_deadline",
-                peer_count = directory.len(),
-                "mesh discovery deadline reached; returning only fresh verified inventories"
-            );
+            // Re-evaluate signed age after the refresh. A still-live local TTL
+            // must never extend the authority of an expired signed advertisement.
+            self.snapshot(directory, unix_now_ms())
         }
-        // Re-evaluate signed age after the refresh. A still-live local TTL
-        // must never extend the authority of an expired signed advertisement.
-        self.snapshot(directory, unix_now_ms())
+    }
+
+    // Keep both cache-lock scopes and signature validation out of the async
+    // state machine. Ready transports must not bypass deadline or generation
+    // checks merely because the executor has not polled its timeout branch.
+    fn cache_result(
+        &self,
+        generation: u64,
+        directory: &MeshPeerDirectory,
+        peer: MeshPeer,
+        result: Result<MeshPeerAdvertisement, String>,
+        started: Instant,
+    ) -> bool {
+        if !self.refresh_is_live(generation, started) {
+            return false;
+        }
+        let result = result.and_then(|advertisement| {
+            let (now_ms, freshness_floor_ms) = self.freshness_now();
+            advertisement
+                .verify(
+                    &peer.node_id,
+                    directory,
+                    now_ms,
+                    DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
+                )
+                .map_err(|error| error.to_string())?;
+            // The monotonic floor is an additional restriction, not
+            // a replacement for the real wall-clock future-skew check.
+            if advertisement.issued_at_ms.abs_diff(freshness_floor_ms)
+                > DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
+            {
+                return Err("mesh advertisement expired under monotonic freshness".to_owned());
+            }
+            Ok(advertisement)
+        });
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.generation != generation || started.elapsed() >= REFRESH_TIMEOUT {
+            return false;
+        }
+        let advertisement = match result {
+            Ok(advertisement) => Some(advertisement),
+            Err(detail) => {
+                tracing::warn!(
+                    event = "mesh_advertisement_unavailable",
+                    peer = peer.node_id.as_str(),
+                    detail = %detail,
+                    "skipping mesh peer advertisement"
+                );
+                None
+            }
+        };
+        cache.entries.insert(
+            peer.node_id.as_str().to_owned(),
+            CachedAdvertisement {
+                peer,
+                checked_at: Instant::now(),
+                advertisement,
+            },
+        );
+        true
     }
 
     // Called only while holding refresh ownership. Snapshot stale work after
@@ -261,14 +310,33 @@ impl PeerDiscovery {
         (now_ms, cache.clock.observe(now_ms, Instant::now()))
     }
 
-    fn record_attempt(&self, generation: u64, index: usize, peer_count: usize) {
+    fn refresh_is_live(&self, generation: u64, started: Instant) -> bool {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.generation == generation && started.elapsed() < REFRESH_TIMEOUT
+    }
+
+    fn admit_attempt(
+        &self,
+        generation: u64,
+        index: usize,
+        peer_count: usize,
+        started: Instant,
+    ) -> bool {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.generation == generation {
-            cache.next_peer_index = if index + 1 < peer_count { index + 1 } else { 0 };
+        if cache.generation != generation
+            || started.elapsed() >= REFRESH_TIMEOUT
+            || index >= peer_count
+        {
+            return false;
         }
+        cache.next_peer_index = if index + 1 < peer_count { index + 1 } else { 0 };
+        true
     }
 
     fn snapshot(&self, directory: &MeshPeerDirectory, now_ms: u64) -> Vec<MeshPeerAdvertisement> {
@@ -875,5 +943,113 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id.as_str(), "peer-000");
         assert_eq!(discovery.cache.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn discovery_owns_a_send_factory_without_requiring_sync() {
+        fn assert_send<T: Send>(_: T) {}
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let discovery = PeerDiscovery::new();
+        // Cell is Send but not Sync. Borrowing this factory across a network
+        // await would violate the contract, even though owning it is sufficient.
+        let calls = std::cell::Cell::new(0_usize);
+        assert_send(discovery.collect(&directory, move |_| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err("unreachable".to_owned()))
+        }));
+    }
+
+    struct DroppedFetch<'a>(&'a AtomicUsize);
+
+    impl Drop for DroppedFetch<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalidating_factory_stops_admission_and_drops_its_unpolled_transport() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(MAX_CONCURRENT_FETCHES * 2 + 1, &key);
+        let discovery = PeerDiscovery::new();
+        let calls = AtomicUsize::new(0);
+        let dropped = AtomicUsize::new(0);
+        let result = discovery.collect(&directory, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            discovery.invalidate();
+            let guard = DroppedFetch(&dropped);
+            async move {
+                let _guard = guard;
+                pending::<Result<MeshPeerAdvertisement, String>>().await
+            }
+        }).await;
+        assert!(result.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "invalidation must stop the remaining factories");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(discovery.cache.lock().unwrap().next_peer_index, 0);
+        assert!(discovery.refresh.try_lock().is_some());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn dropping_refresh_drops_every_admitted_transport_without_starting_backlog() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(MAX_CONCURRENT_FETCHES * 2 + 1, &key);
+        let discovery = PeerDiscovery::new();
+        let calls = AtomicUsize::new(0);
+        let dropped = AtomicUsize::new(0);
+        let mut refresh = Box::pin(discovery.collect(&directory, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let guard = DroppedFetch(&dropped);
+            async move {
+                let _guard = guard;
+                pending::<Result<MeshPeerAdvertisement, String>>().await
+            }
+        }));
+        assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_CONCURRENT_FETCHES);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(refresh);
+        assert_eq!(dropped.load(Ordering::SeqCst), MAX_CONCURRENT_FETCHES);
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_CONCURRENT_FETCHES);
+        assert!(discovery.refresh.try_lock().is_some());
+    }
+
+    #[test]
+    fn expired_or_invalidated_admission_does_not_advance_the_attempt_cursor() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(3, &key);
+        let discovery = PeerDiscovery::new();
+        let (generation, _) = discovery.begin_refresh(&directory);
+        let expired = Instant::now() - REFRESH_TIMEOUT;
+        assert!(!discovery.admit_attempt(generation, 0, directory.len(), expired));
+        assert_eq!(discovery.cache.lock().unwrap().next_peer_index, 0);
+        assert!(discovery.admit_attempt(generation, 0, directory.len(), Instant::now()));
+        assert_eq!(discovery.cache.lock().unwrap().next_peer_index, 1);
+        discovery.invalidate();
+        assert!(!discovery.admit_attempt(generation, 1, directory.len(), Instant::now()));
+        assert_eq!(discovery.cache.lock().unwrap().next_peer_index, 0);
+    }
+
+    #[test]
+    fn ready_results_cannot_publish_after_deadline_or_invalidation() {
+        let key = Ed25519SigningKey::generate();
+        let directory = directory(1, &key);
+        let peer = directory.peers().next().unwrap();
+        let discovery = PeerDiscovery::new();
+        let (generation, _) = discovery.begin_refresh(&directory);
+        let expired = Instant::now() - REFRESH_TIMEOUT;
+        assert!(!discovery.cache_result(
+            generation, &directory, peer.clone(), Ok(advertisement(peer, &key)), expired,
+        ));
+        assert!(!discovery.cache_result(
+            generation, &directory, peer.clone(), Err("expired failure".to_owned()), expired,
+        ));
+        assert!(discovery.cache.lock().unwrap().entries.is_empty());
+        discovery.invalidate();
+        assert!(!discovery.cache_result(
+            generation, &directory, peer.clone(), Ok(advertisement(peer, &key)), Instant::now(),
+        ));
+        assert!(discovery.cache.lock().unwrap().entries.is_empty());
     }
 }
