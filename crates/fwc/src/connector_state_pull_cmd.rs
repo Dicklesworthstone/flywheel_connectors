@@ -3,6 +3,8 @@
 //! Explicit fallback donors form one bounded host-side recovery plan. The CLI
 //! still sends exactly one request to the selected recipient, never retries an
 //! ambiguous response, and validates the complete ordered attempt receipt.
+//! `--inspect` instead checks an already-retained exact root without asking the
+//! host to contact a donor or to perform another import.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,8 @@ use anyhow::Result;
 use clap::Args;
 use fcp_core::{ConnectorId, InstanceId, ObjectId, TailscaleNodeId, ZoneId};
 use fcp_host::{
+    ConnectorStateInspectionRequest, ConnectorStateInspectionResponse,
+    ConnectorStateInspectionStatus,
     CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION, CONNECTOR_STATE_TRANSFER_SCHEMA_VERSION,
     ConnectorStateExportRequest, ConnectorStateRecoveryOutcome, ConnectorStateRecoveryRequest,
     ConnectorStateRecoveryResponse,
@@ -38,6 +42,14 @@ const MAX_PULL_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Args, Debug, Serialize)]
 pub(crate) struct ConnectorStatePullArgs {
+    /// Inspect this exact root in the host's retained replica without importing.
+    ///
+    /// The donor ID selects the local grant; the donor is not contacted. This
+    /// read does not establish whether a previous timed-out import has settled
+    /// and never authorizes retrying it. Cannot be combined with recovery.
+    #[arg(long, conflicts_with_all = ["fallback", "attempt_timeout_ms"])]
+    inspect: bool,
+
     /// Exact canonical connector ID; local installation is not required.
     #[arg(long)]
     connector: String,
@@ -190,6 +202,9 @@ pub(crate) fn dispatch(
     args: &ConnectorStatePullArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
+    if args.inspect {
+        return Ok(dispatch_inspection(args, explicit_host));
+    }
     let request = match prepare_request(args) {
         Ok(request) => request,
         Err(error) => return Ok(failure(error, false)),
@@ -227,6 +242,169 @@ pub(crate) fn dispatch(
         Ok(response) => Ok(success(&host.endpoint, response)),
         Err(error) => Ok(failure(error, true)),
     }
+}
+
+// Deliberately separate from mutating dispatch: no inspection failure may
+// fall through to a pull/recovery, and no read receipt may confirm an import.
+fn dispatch_inspection(
+    args: &ConnectorStatePullArgs,
+    explicit_host: Option<&str>,
+) -> DispatchOutcome {
+    let request = match prepare_inspection(args) {
+        Ok(request) => request,
+        Err(error) => return inspection_failure(error, false),
+    };
+    let host = match resolve_host_config(explicit_host) {
+        Ok(Some(host)) => host,
+        Ok(None) => return inspection_failure(PullFailure::MissingHost, false),
+        Err(_) => return inspection_failure(PullFailure::InvalidHost, false),
+    };
+    let client = match HostAdminClient::without_redirects(&host.endpoint) {
+        Ok(client) => client,
+        Err(_) => return inspection_failure(PullFailure::InvalidHost, false),
+    };
+    let token = match read_admin_token(args.admin_token_file.as_deref()) {
+        Ok(token) => token,
+        Err(error) => return inspection_failure(error, false),
+    };
+    match inspect_replica(
+        &client,
+        &request,
+        &token,
+        Duration::from_millis(args.timeout_ms),
+    ) {
+        Ok(response) => inspection_success(&host.endpoint, response),
+        Err(error) => inspection_failure(error, true),
+    }
+}
+
+fn prepare_inspection(
+    args: &ConnectorStatePullArgs,
+) -> std::result::Result<ConnectorStateInspectionRequest, PullFailure> {
+    // Also enforce the mode boundary for callers that bypass clap parsing.
+    if !args.inspect || !args.fallback.is_empty() || args.attempt_timeout_ms.is_some() {
+        return Err(PullFailure::InvalidRequest);
+    }
+    let request = ConnectorStateInspectionRequest {
+        inspect: prepare_request(args)?,
+    };
+    request.to_json().map_err(|_| PullFailure::InvalidRequest)?;
+    Ok(request)
+}
+
+fn inspect_replica(
+    client: &HostAdminClient,
+    request: &ConnectorStateInspectionRequest,
+    token: &str,
+    timeout: Duration,
+) -> std::result::Result<ConnectorStateInspectionResponse, PullFailure> {
+    request.to_json().map_err(|_| PullFailure::InvalidRequest)?;
+    let body = post_pull(
+        client,
+        &request.inspect.request.scope.connector_id,
+        request,
+        token,
+        timeout,
+    )?;
+    let response: ConnectorStateInspectionResponse =
+        serde_json::from_slice(&body).map_err(|_| PullFailure::InvalidResponse)?;
+    response
+        .validate_for(&request.inspect)
+        .map_err(|_| PullFailure::InvalidResponse)?;
+    Ok(response)
+}
+
+fn inspection_success(endpoint: &str, response: ConnectorStateInspectionResponse) -> DispatchOutcome {
+    let (observed, message) = match response.status {
+        ConnectorStateInspectionStatus::Verified => (
+            "verified",
+            "The host verified this exact locally retained root and its complete ancestry. No donor was contacted and no state was imported or activated.",
+        ),
+        ConnectorStateInspectionStatus::RootNotFound => (
+            "root-not-found",
+            "The exact requested root was absent at the time of inspection. A previously admitted import may still publish it; absence is not permission to retry that import.",
+        ),
+    };
+    let mut payload = json!({
+        "status": "ok", "command": "connector", "subcommand": "state pull",
+        "mode": "inspect", "read_only": true,
+        "source": "host-admin-api", "host_endpoint_hash": sha256_prefixed(endpoint.as_bytes()),
+        "inspection_completed": true, "inspection_outcome": observed,
+        "transfer_outcome": "not-requested", "prior_import_settled": Value::Null,
+        "replica_only": true, "connector_activated": false, "lease_acquired": false,
+        "automatic_retry_allowed": false, "message": message, "inspection": response,
+        "caveats": [
+            "This read-only observation does not establish whether an earlier import has settled.",
+            "It does not establish the current canonical head, storage durability, or mesh-wide replica availability.",
+            "Neither verified nor root-not-found authorizes an automatic import retry or connector activation.",
+        ],
+    });
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector").inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    DispatchOutcome { payload, exit_code: CliExitCode::Success }
+}
+
+fn inspection_failure(error: PullFailure, attempted: bool) -> DispatchOutcome {
+    let (kind, message) = match error {
+        PullFailure::InvalidRequest | PullFailure::InvalidRecovery => (
+            "invalid-state-inspection-request",
+            "Inspection requires exact connector, zone, donor, grant and root bindings with bounded limits, and cannot be combined with fallback donors or an attempt timeout.",
+        ),
+        PullFailure::MissingHost => (
+            "missing-state-inspection-host",
+            "Inspection requires a selected host. Supply --host or configure a host context.",
+        ),
+        PullFailure::InvalidHost => (
+            "invalid-state-inspection-host",
+            "The selected host endpoint or client configuration is invalid.",
+        ),
+        PullFailure::MissingCredential => (
+            "missing-admin-credential",
+            "Inspection requires --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN for the selected host.",
+        ),
+        PullFailure::InvalidCredential => (
+            "invalid-admin-credential",
+            "The host admin secret could not be read or is not a nonempty bounded HTTP bearer token.",
+        ),
+        PullFailure::Transport => (
+            "state-inspection-unavailable",
+            "The host did not return a readable inspection response. No import was requested by this command.",
+        ),
+        PullFailure::Timeout => (
+            "state-inspection-timeout",
+            "The read-only inspection exceeded its deadline. The state of any earlier import remains unknown.",
+        ),
+        PullFailure::Http(401 | 403) => (
+            "state-inspection-denied",
+            "The host denied inspection. Check its admin credential and the exact-root local import grant.",
+        ),
+        PullFailure::Http(_) => (
+            "state-inspection-rejected",
+            "The host rejected inspection or does not support it. No pull or recovery fallback was attempted.",
+        ),
+        PullFailure::InvalidResponse => (
+            "invalid-state-inspection-response",
+            "The host returned invalid inspection metadata or a receipt for a different request. Retention is unconfirmed.",
+        ),
+        PullFailure::ResponseTooLarge => (
+            "state-inspection-response-too-large",
+            "The host's inspection metadata exceeded its 16 KiB response limit. Retention is unconfirmed.",
+        ),
+    };
+    let mut payload = json!({
+        "status": "error", "command": "connector", "subcommand": "state pull",
+        "mode": "inspect", "read_only": true, "source": "host-admin-api",
+        "inspection_completed": false,
+        "inspection_outcome": if attempted { "unknown" } else { "not-started" },
+        "transfer_outcome": "not-requested", "prior_import_settled": Value::Null,
+        "automatic_retry_allowed": false, "message": message,
+        "error": { "type": kind, "http_status": match error { PullFailure::Http(status) => Some(status), _ => None } },
+    });
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector").inject_into(&mut payload);
+    if attempted {
+        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    }
+    DispatchOutcome { payload, exit_code: error.description().2 }
 }
 
 fn prepare_request(
@@ -675,6 +853,7 @@ mod tests {
 
     fn args() -> ConnectorStatePullArgs {
         ConnectorStatePullArgs {
+            inspect: false,
             connector: "fcp.test:request-response:v1".to_owned(),
             zone: "z:work".to_owned(),
             peer: "node-donor".to_owned(),
@@ -1267,5 +1446,301 @@ mod tests {
             Err(PullFailure::Timeout),
         );
         host.finish();
+    }
+
+    fn inspection_args() -> ConnectorStatePullArgs {
+        let mut arguments = args();
+        arguments.inspect = true;
+        arguments
+    }
+
+    fn inspection_response(
+        request: &ConnectorStateInspectionRequest,
+        status: ConnectorStateInspectionStatus,
+    ) -> ConnectorStateInspectionResponse {
+        let found = status == ConnectorStateInspectionStatus::Verified;
+        ConnectorStateInspectionResponse {
+            schema_version: fcp_host::CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION.to_owned(),
+            request: request.inspect.clone(),
+            status,
+            object_count: if found { 2 } else { 0 },
+            canonical_bytes: if found { 800 } else { 0 },
+            replica_only: true,
+        }
+    }
+
+    fn inspection_cli() -> Vec<String> {
+        let mut arguments = [
+            "fwc", "--json", "connector", "state", "pull", "--inspect",
+            "--connector", "fcp.test:request-response:v1", "--zone", "z:work",
+            "--peer", "node-donor", "--grant", "grant-state-root",
+            "--instance", "inst-source", "--max-objects", "128",
+            "--max-canonical-bytes", "65536", "--max-wire-bytes", "262144",
+            "--timeout-ms", "2000",
+        ].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        arguments.extend(["--root".to_owned(), args().root]);
+        arguments
+    }
+
+    #[test]
+    fn cli_inspection_sends_only_the_read_command_and_withholds_sensitive_arguments() {
+        let request = prepare_inspection(&inspection_args()).unwrap();
+        let receipt = inspection_response(&request, ConnectorStateInspectionStatus::Verified);
+        let host = TestHost::start(Reply::Json(200, json!(receipt)));
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("private-inspection-token");
+        std::fs::write(&token_path, "fixture-admin-secret\n").unwrap();
+        let mut arguments = inspection_cli();
+        arguments.extend([
+            "--host".to_owned(), host.endpoint.clone(),
+            "--admin-token-file".to_owned(), token_path.to_string_lossy().into_owned(),
+        ]);
+        let outcome = crate::execute(&arguments).unwrap();
+        let captured = host.finish();
+        assert_eq!(captured.body, json!(request));
+        assert_eq!(captured.body.as_object().unwrap().len(), 1);
+        assert_eq!(captured.line, "POST /rpc/admin/connectors/fcp.test:request-response:v1/state/pull HTTP/1.1");
+        assert_eq!(captured.headers["authorization"], "Bearer fixture-admin-secret");
+        assert_eq!(captured.headers["x-fcp-zone"], "z:owner");
+        assert_eq!(outcome.exit_code, CliExitCode::Success.into());
+        let payload: Value = serde_json::from_str(&outcome.text).unwrap();
+        assert_eq!(payload["mode"], "inspect");
+        assert_eq!(payload["read_only"], true);
+        assert_eq!(payload["inspection_completed"], true);
+        assert_eq!(payload["inspection_outcome"], "verified");
+        assert_eq!(payload["inspection"], json!(receipt));
+        assert_eq!(payload["transfer_outcome"], "not-requested");
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert_eq!(payload["prior_import_settled"], Value::Null);
+        assert_eq!(payload["_truth_source"], "host");
+        assert!(withhold_argument_echo(&payload));
+        assert!(!outcome.text.contains("fixture-admin-secret"));
+        assert!(!outcome.text.contains("private-inspection-token"));
+        for field in ["replica", "recovery", "transfer_succeeded", "current_replica_root", "durable"] {
+            assert!(payload.get(field).is_none(), "unexpected claim: {field}");
+        }
+    }
+
+    #[test]
+    fn cli_missing_root_is_a_read_observation_not_a_failed_or_retryable_import() {
+        let request = prepare_inspection(&inspection_args()).unwrap();
+        let host = TestHost::start(Reply::Json(200, json!(inspection_response(
+            &request, ConnectorStateInspectionStatus::RootNotFound,
+        ))));
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("admin.token");
+        std::fs::write(&token_path, "fixture-admin-secret").unwrap();
+        let mut arguments = inspection_cli();
+        arguments.extend([
+            "--host".to_owned(), host.endpoint.clone(),
+            "--admin-token-file".to_owned(), token_path.to_string_lossy().into_owned(),
+        ]);
+        let outcome = crate::execute(&arguments).unwrap();
+        assert_eq!(host.finish().body, json!(request));
+        assert_eq!(outcome.exit_code, CliExitCode::Success.into());
+        let payload: Value = serde_json::from_str(&outcome.text).unwrap();
+        assert_eq!(payload["inspection_outcome"], "root-not-found");
+        assert_eq!(payload["inspection"]["object_count"], 0);
+        assert_eq!(payload["inspection"]["canonical_bytes"], 0);
+        assert_eq!(payload["transfer_outcome"], "not-requested");
+        assert_eq!(payload["automatic_retry_allowed"], false);
+        assert_eq!(payload["prior_import_settled"], Value::Null);
+        assert_eq!(payload["connector_activated"], false);
+        assert_eq!(payload["lease_acquired"], false);
+    }
+
+    #[test]
+    fn inspection_mode_conflicts_are_rejected_by_both_parser_and_dispatch() {
+        for extra in [
+            vec!["--fallback", "node-backup=grant-backup"],
+            vec!["--attempt-timeout-ms", "100"],
+            vec!["--fallback", "node-backup=grant-backup", "--attempt-timeout-ms", "100"],
+        ] {
+            let mut arguments = vec!["state-pull".to_owned()];
+            arguments.extend(inspection_cli().into_iter().skip(5));
+            arguments.extend(extra.into_iter().map(str::to_owned));
+            let command = <ConnectorStatePullArgs as clap::Args>::augment_args(
+                clap::Command::new("state-pull"),
+            );
+            assert_eq!(
+                command.try_get_matches_from(arguments).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+            );
+        }
+        for with_fallback in [false, true] {
+            let mut arguments = inspection_args();
+            if with_fallback {
+                arguments.fallback.push("node-backup=grant-backup".to_owned());
+            } else {
+                arguments.attempt_timeout_ms = Some(100);
+            }
+            arguments.admin_token_file = Some(PathBuf::from("/not-opened/private-token"));
+            let outcome = dispatch(&arguments, Some("invalid-host-private-value")).unwrap();
+            assert_eq!(outcome.exit_code, CliExitCode::Validation);
+            assert_eq!(outcome.payload["error"]["type"], "invalid-state-inspection-request");
+            assert_eq!(outcome.payload["inspection_outcome"], "not-started");
+            assert_eq!(outcome.payload["transfer_outcome"], "not-requested");
+            assert!(!outcome.payload.to_string().contains("private"));
+        }
+        assert_eq!(prepare_inspection(&args()), Err(PullFailure::InvalidRequest));
+    }
+
+    #[test]
+    fn inspection_validates_authority_and_limits_before_any_host_access() {
+        let mut invalid = Vec::new();
+        let mut arguments = inspection_args();
+        arguments.root = "latest".to_owned();
+        invalid.push(arguments);
+        let mut arguments = inspection_args();
+        arguments.peer = "https://untrusted.example/private".to_owned();
+        invalid.push(arguments);
+        let mut arguments = inspection_args();
+        arguments.grant.clear();
+        invalid.push(arguments);
+        let mut arguments = inspection_args();
+        arguments.max_objects = 0;
+        invalid.push(arguments);
+        let mut arguments = inspection_args();
+        arguments.max_canonical_bytes = MAX_CONNECTOR_STATE_TRANSFER_CANONICAL_BYTES + 1;
+        invalid.push(arguments);
+        let mut arguments = inspection_args();
+        arguments.timeout_ms = 0;
+        invalid.push(arguments);
+        for mut arguments in invalid {
+            arguments.admin_token_file = Some(PathBuf::from("/not-opened/private-token"));
+            let outcome = dispatch(&arguments, Some("invalid-host-private-value")).unwrap();
+            assert_eq!(outcome.exit_code, CliExitCode::Validation);
+            assert_eq!(outcome.payload["error"]["type"], "invalid-state-inspection-request");
+            assert_eq!(outcome.payload["inspection_outcome"], "not-started");
+            assert!(withhold_argument_echo(&outcome.payload));
+            assert!(!outcome.payload.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_mismatched_receipts_counts_schemas_and_unknown_fields() {
+        let request = prepare_inspection(&inspection_args()).unwrap();
+        let valid = json!(inspection_response(&request, ConnectorStateInspectionStatus::Verified));
+        let mut invalid = Vec::new();
+        for (pointer, replacement) in [
+            ("/schema_version", json!("wrong-schema")),
+            ("/status", json!("unknown")),
+            ("/request/peer_node", json!("node-other")),
+            ("/request/request/grant_id", json!("other-grant")),
+            ("/request/request/root_object_id", json!("22".repeat(32))),
+            ("/request/request/scope/connector_id", json!("fcp.other:request-response:v1")),
+            ("/request/request/scope/zone_id", json!("z:private")),
+            ("/request/request/scope/instance_id", json!(null)),
+            ("/request/request/limits/max_objects", json!(129)),
+            ("/request/request/limits/max_canonical_bytes", json!(65_537)),
+            ("/request/request/limits/max_wire_bytes", json!(262_145)),
+            ("/object_count", json!(0)),
+            ("/object_count", json!(129)),
+            ("/canonical_bytes", json!(0)),
+            ("/canonical_bytes", json!(65_537)),
+            ("/replica_only", json!(false)),
+        ] {
+            let mut changed = valid.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            invalid.push(changed);
+        }
+        for pointer in ["", "/request", "/request/request", "/request/request/scope"] {
+            let mut changed = valid.clone();
+            changed.pointer_mut(pointer).unwrap()["raw_state"] = json!("private-state");
+            invalid.push(changed);
+        }
+        let missing = json!(inspection_response(&request, ConnectorStateInspectionStatus::RootNotFound));
+        for field in ["object_count", "canonical_bytes"] {
+            let mut changed = missing.clone();
+            changed[field] = json!(1);
+            invalid.push(changed);
+        }
+        invalid.push(json!(response(&request.inspect, true)));
+        invalid.push(json!(recovery_response(&recovery_plan(), 0, true)));
+        for body in invalid {
+            let host = TestHost::start(Reply::Json(200, body));
+            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            assert_eq!(
+                inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)),
+                Err(PullFailure::InvalidResponse),
+            );
+            assert_eq!(host.finish().body, json!(request));
+        }
+    }
+
+    #[test]
+    fn inspection_never_follows_redirects_or_treats_http_not_found_as_a_missing_root() {
+        let request = prepare_inspection(&inspection_args()).unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        for (reply, expected) in [
+            (Reply::Redirect(format!("http://{}/capture", destination.local_addr().unwrap())), PullFailure::Http(307)),
+            (Reply::Json(404, json!({"error": "private-state"})), PullFailure::Http(404)),
+            (Reply::Json(403, json!({"error": "fixture-admin-secret"})), PullFailure::Http(403)),
+            (Reply::Disconnect, PullFailure::Transport),
+        ] {
+            let host = TestHost::start(reply);
+            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let error = inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(host.finish().body, json!(request));
+            let outcome = inspection_failure(error, true);
+            assert_eq!(outcome.payload["inspection_outcome"], "unknown");
+            assert_eq!(outcome.payload["transfer_outcome"], "not-requested");
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+            assert!(outcome.payload.get("inspection").is_none());
+            assert!(!outcome.payload.to_string().contains("private-state"));
+            assert!(!outcome.payload.to_string().contains("fixture-admin-secret"));
+        }
+        assert!(matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn inspection_keeps_response_consumption_bounded_and_timeout_read_only() {
+        let request = prepare_inspection(&inspection_args()).unwrap();
+        assert_eq!(MAX_PULL_RESPONSE_BYTES, fcp_host::MAX_CONNECTOR_STATE_INSPECTION_RESPONSE_BYTES as u64);
+        for known_length in [true, false] {
+            let host = TestHost::start(Reply::Oversized(known_length));
+            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            assert_eq!(
+                inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)),
+                Err(PullFailure::ResponseTooLarge),
+            );
+            host.finish();
+        }
+        let host = TestHost::start(Reply::Stalled);
+        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let error = inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error, PullFailure::Timeout);
+        assert_eq!(host.finish().body, json!(request));
+        let outcome = inspection_failure(error, true);
+        assert_eq!(outcome.payload["error"]["type"], "state-inspection-timeout");
+        assert_eq!(outcome.payload["transfer_outcome"], "not-requested");
+        assert_eq!(outcome.payload["prior_import_settled"], Value::Null);
+    }
+
+    #[test]
+    fn inspection_failures_do_not_publish_mutation_or_retention_success_claims() {
+        for error in [
+            PullFailure::InvalidRequest, PullFailure::InvalidRecovery,
+            PullFailure::MissingHost, PullFailure::InvalidHost,
+            PullFailure::MissingCredential, PullFailure::InvalidCredential,
+            PullFailure::Transport, PullFailure::Timeout, PullFailure::Http(401),
+            PullFailure::Http(503), PullFailure::InvalidResponse, PullFailure::ResponseTooLarge,
+        ] {
+            for attempted in [false, true] {
+                let outcome = inspection_failure(error, attempted);
+                assert_ne!(outcome.exit_code, CliExitCode::Success);
+                assert_eq!(outcome.payload["read_only"], true);
+                assert_eq!(outcome.payload["inspection_completed"], false);
+                assert_eq!(outcome.payload["transfer_outcome"], "not-requested");
+                assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+                assert_eq!(outcome.payload["prior_import_settled"], Value::Null);
+                assert!(withhold_argument_echo(&outcome.payload));
+                for field in ["inspection", "replica", "recovery", "transfer_succeeded"] {
+                    assert!(outcome.payload.get(field).is_none());
+                }
+            }
+        }
     }
 }
