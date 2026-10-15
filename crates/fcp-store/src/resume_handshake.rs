@@ -241,6 +241,7 @@ impl ResumeHandshakeRequest {
         timeout_ms: u64,
         in_flight_ops: Vec<ResumeReplayOp>,
     ) -> Result<Self, ResumeHandshakeError> {
+        snapshot_manifest.verify_snapshot_id()?;
         let source_node = source_node.into();
         let target_node = target_node.into();
         let snapshot_manifest_hash = snapshot_manifest.manifest_object_id()?;
@@ -273,6 +274,39 @@ impl ResumeHandshakeRequest {
         })
     }
 
+    /// Recompute the content binding of a received or deserialized request.
+    ///
+    /// This is linkage validation, not authentication: the surrounding mesh
+    /// transport must authenticate peers and enforce capability and lease policy.
+    ///
+    /// # Errors
+    /// Returns an error if request fields no longer match `handshake_id`, or
+    /// duplicate replay operations disagree about their effects.
+    pub fn validate_identity(&self) -> Result<(), ResumeHandshakeError> {
+        let computed = derive_handshake_id(&self.identity()?)?;
+        if computed != self.handshake_id {
+            return Err(ResumeHandshakeError::LinkageMismatch {
+                reason: "request fields differ from their handshake identity".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn identity(&self) -> Result<ResumeHandshakeIdentity, ResumeHandshakeError> {
+        Ok(ResumeHandshakeIdentity {
+            source_node: self.source_node.clone(),
+            target_node: self.target_node.clone(),
+            snapshot_manifest_hash: self.snapshot_manifest_hash,
+            snapshot_id: self.snapshot_id,
+            capability_token_pinned: self.capability_token_pinned,
+            raptorq: self.raptorq,
+            lease_fencing_token: self.lease_fencing_token,
+            started_at_ms: self.started_at_ms,
+            timeout_ms: self.timeout_ms,
+            in_flight_ops: canonical_replay_ops(&self.in_flight_ops)?,
+        })
+    }
+
     /// Encode a manifest byte stream as handshake-bound snapshot symbols.
     ///
     /// # Errors
@@ -286,6 +320,7 @@ impl ResumeHandshakeRequest {
         config: &RaptorQConfig,
         first_sent_at_ms: u64,
     ) -> Result<Vec<ResumeSnapshotSymbol>, ResumeHandshakeError> {
+        self.validate_identity()?;
         let actual_hash = ObjectId::from_unscoped_bytes(manifest_bytes);
         if actual_hash != self.snapshot_manifest_hash {
             return Err(ResumeHandshakeError::SnapshotManifestHashMismatch {
@@ -515,6 +550,10 @@ impl ResumeHandshakeTranscript {
     /// Validate ordering, timeout, target preflight, replay idempotence, and
     /// atomic source lease release.
     ///
+    /// This checks transcript consistency, not peer authentication, actual
+    /// process liveness, or payload reconstruction. Verify the signed manifest
+    /// and its payload separately before restoring any process state.
+    ///
     /// # Errors
     ///
     /// Returns [`ResumeHandshakeError`] for any invalid transcript invariant.
@@ -585,6 +624,13 @@ impl ResumeHandshakeTranscript {
                 actual,
             });
         }
+        if manifest.snapshot_id != self.request.snapshot_id
+            || manifest.capability_token_pinned != self.request.capability_token_pinned
+        {
+            return Err(ResumeHandshakeError::LinkageMismatch {
+                reason: "verified manifest differs from the snapshot or capability pin accepted in preflight".into(),
+            });
+        }
         Ok(manifest)
     }
 
@@ -593,8 +639,17 @@ impl ResumeHandshakeTranscript {
     #[must_use]
     pub fn rollback_if_timed_out(&self, now_ms: u64) -> Option<ResumeRollbackPlan> {
         let elapsed = now_ms.saturating_sub(self.request.started_at_ms);
-        if elapsed <= self.request.effective_timeout_ms()
-            || matches!(self.complete.status, RehydrationStatus::Rehydrated)
+        if elapsed <= self.request.effective_timeout_ms() {
+            return None;
+        }
+        // A bare status marker from another attempt, a late completion, or a
+        // missing replay must not settle this timeout. Source release is not
+        // required here: valid target completion precedes that separate step.
+        if self
+            .validate_preflight()
+            .and_then(|()| self.validate_symbols())
+            .and_then(|()| self.validate_completion())
+            .is_ok()
         {
             return None;
         }
@@ -610,6 +665,7 @@ impl ResumeHandshakeTranscript {
     }
 
     fn validate_preflight(&self) -> Result<(), ResumeHandshakeError> {
+        self.request.validate_identity()?;
         ensure_linkage(
             self.request.handshake_id,
             self.request.snapshot_manifest_hash,
@@ -637,7 +693,11 @@ impl ResumeHandshakeTranscript {
     }
 
     fn validate_symbols(&self) -> Result<(), ResumeHandshakeError> {
+        if self.symbols.is_empty() {
+            return Err(ResumeHandshakeError::IncompleteSnapshotStream);
+        }
         let mut previous_ordinal = None;
+        let mut previous_sent_at_ms = self.ack.acked_at_ms;
         for symbol in &self.symbols {
             ensure_linkage(
                 self.request.handshake_id,
@@ -646,11 +706,16 @@ impl ResumeHandshakeTranscript {
                 symbol.snapshot_manifest_hash,
                 "snapshot symbol",
             )?;
-            if symbol.sent_at_ms < self.ack.acked_at_ms {
+            if symbol.sent_at_ms < previous_sent_at_ms {
                 return Err(ResumeHandshakeError::OutOfOrder {
-                    reason: "snapshot symbol sent before target ack".into(),
+                    reason: "snapshot symbol sent before target ack or preceding symbol".into(),
                 });
             }
+            ensure_elapsed_within_timeout(
+                self.request.started_at_ms,
+                symbol.sent_at_ms,
+                self.request.effective_timeout_ms(),
+            )?;
             if symbol.frame.object_id != self.request.snapshot_manifest_hash {
                 return Err(ResumeHandshakeError::SymbolFrameMismatch {
                     reason: "symbol object id differs from announced manifest hash".into(),
@@ -674,6 +739,7 @@ impl ResumeHandshakeTranscript {
                 });
             }
             previous_ordinal = Some(symbol.ordinal);
+            previous_sent_at_ms = symbol.sent_at_ms;
         }
         Ok(())
     }
@@ -797,12 +863,16 @@ fn ensure_linkage(
     Ok(())
 }
 
-const fn ensure_elapsed_within_timeout(
+fn ensure_elapsed_within_timeout(
     started_at_ms: u64,
     observed_at_ms: u64,
     timeout_ms: u64,
 ) -> Result<(), ResumeHandshakeError> {
-    let elapsed_ms = observed_at_ms.saturating_sub(started_at_ms);
+    let elapsed_ms = observed_at_ms.checked_sub(started_at_ms).ok_or_else(|| {
+        ResumeHandshakeError::OutOfOrder {
+            reason: "handshake evidence predates the source request".into(),
+        }
+    })?;
     if elapsed_ms > timeout_ms {
         return Err(ResumeHandshakeError::Timeout {
             elapsed_ms,
@@ -843,6 +913,11 @@ fn validate_replay_set(
 ) -> Result<(), ResumeHandshakeError> {
     let expected = replay_map(expected)?;
     let actual = replay_map(actual)?;
+    if actual.keys().any(|op_id| !expected.contains_key(op_id)) {
+        return Err(ResumeHandshakeError::LinkageMismatch {
+            reason: "target replay includes an operation absent from the source request".into(),
+        });
+    }
     for (op_id, expected_hash) in expected {
         match actual.get(&op_id) {
             Some(actual_hash) if *actual_hash == expected_hash => {}
@@ -1043,5 +1118,231 @@ mod tests {
             err,
             ResumeHandshakeError::SymbolFrameMismatch { .. }
         ));
+    }
+
+    fn rebind_request(transcript: &mut ResumeHandshakeTranscript) {
+        let id = derive_handshake_id(&transcript.request.identity().unwrap()).unwrap();
+        transcript.request.handshake_id = id;
+        transcript.ack.handshake_id = id;
+        transcript.complete.handshake_id = id;
+        transcript.source_release.handshake_id = id;
+        for symbol in &mut transcript.symbols {
+            symbol.handshake_id = id;
+        }
+    }
+
+    #[test]
+    fn deserialized_request_fields_cannot_reuse_an_accepted_identity() {
+        let original = successful_transcript();
+        let changes = [
+            ("source_node", serde_json::json!("another-source")),
+            ("target_node", serde_json::json!("another-target")),
+            ("lease_fencing_token", serde_json::json!(78)),
+            ("started_at_ms", serde_json::json!(999)),
+            ("timeout_ms", serde_json::json!(60_000)),
+            ("in_flight_ops", serde_json::json!([])),
+            (
+                "snapshot_id",
+                serde_json::to_value(ObjectId::from_bytes([4; 32])).unwrap(),
+            ),
+            (
+                "capability_token_pinned",
+                serde_json::to_value([3_u8; 32]).unwrap(),
+            ),
+        ];
+        for (field, replacement) in changes {
+            let mut value = serde_json::to_value(&original).unwrap();
+            value["request"][field] = replacement;
+            let altered: ResumeHandshakeTranscript = serde_json::from_value(value).unwrap();
+            assert!(
+                matches!(
+                    altered.validate_success(),
+                    Err(ResumeHandshakeError::LinkageMismatch { .. })
+                ),
+                "accepted altered request field {field}"
+            );
+            assert!(matches!(
+                altered.decode_snapshot_manifest_bytes(&raptorq_config()),
+                Err(ResumeHandshakeError::LinkageMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn encoding_refuses_a_request_with_a_stale_identity() {
+        let (mut request, _) = sample_request_and_symbols();
+        request.target_node = "replacement-target".into();
+        assert!(matches!(
+            request.encode_snapshot_manifest_symbols(
+                &sample_manifest().canonical_bytes().unwrap(),
+                &raptorq_config(),
+                1_010,
+            ),
+            Err(ResumeHandshakeError::LinkageMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verified_manifest_must_match_even_rehashed_preflight_snapshot_and_token_pins() {
+        let anchors = ProcessSnapshotTrustAnchors::single(signing_key().verifying_key());
+        for change_pin in [false, true] {
+            let mut transcript = successful_transcript();
+            if change_pin {
+                transcript.request.capability_token_pinned[0] ^= 1;
+            } else {
+                transcript.request.snapshot_id = ObjectId::from_bytes([4; 32]);
+            }
+            rebind_request(&mut transcript);
+            transcript.validate_success().unwrap();
+            assert!(matches!(
+                transcript.decode_verified_snapshot_manifest(&raptorq_config(), TOKEN, &anchors),
+                Err(ResumeHandshakeError::LinkageMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn request_construction_rejects_an_inconsistent_snapshot_identity() {
+        let mut manifest = sample_manifest();
+        manifest.snapshot_id = ObjectId::from_bytes([4; 32]);
+        let (request, _) = sample_request_and_symbols();
+        assert!(matches!(
+            ResumeHandshakeRequest::new(
+                "source-node",
+                "target-node",
+                &manifest,
+                request.raptorq,
+                77,
+                1_000,
+                DEFAULT_RESUME_HANDSHAKE_TIMEOUT_MS,
+                Vec::new(),
+            ),
+            Err(ResumeHandshakeError::Snapshot(
+                ProcessSnapshotError::SnapshotIdMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn preflight_cannot_predate_the_source_request() {
+        let mut transcript = successful_transcript();
+        transcript.ack.acked_at_ms = transcript.request.started_at_ms - 1;
+        assert!(matches!(
+            transcript.validate_success(),
+            Err(ResumeHandshakeError::OutOfOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn symbol_timestamps_cannot_hide_a_late_predecessor() {
+        let mut transcript = successful_transcript();
+        assert!(transcript.symbols.len() > 1);
+        transcript.symbols[0].sent_at_ms = transcript.symbols[1].sent_at_ms + 1;
+        assert!(matches!(
+            transcript.validate_success(),
+            Err(ResumeHandshakeError::OutOfOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_decoding_rejects_symbols_outside_the_shared_deadline() {
+        let mut transcript = successful_transcript();
+        transcript.symbols.last_mut().unwrap().sent_at_ms =
+            transcript.request.started_at_ms + transcript.request.effective_timeout_ms() + 1;
+        assert!(matches!(
+            transcript.decode_snapshot_manifest_bytes(&raptorq_config()),
+            Err(ResumeHandshakeError::Timeout { .. })
+        ));
+    }
+
+    #[test]
+    fn a_completion_without_manifest_transfer_is_not_successful() {
+        let mut transcript = successful_transcript();
+        transcript.symbols.clear();
+        assert!(matches!(
+            transcript.validate_success(),
+            Err(ResumeHandshakeError::IncompleteSnapshotStream)
+        ));
+    }
+
+    #[test]
+    fn replay_cannot_include_an_operation_not_requested_by_the_source() {
+        let mut transcript = successful_transcript();
+        transcript
+            .complete
+            .replayed_ops
+            .push(ResumeReplayOp::from_effect("unrequested", b"effect"));
+        assert!(matches!(
+            transcript.validate_success(),
+            Err(ResumeHandshakeError::LinkageMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rehydrated_marker_with_wrong_linkage_does_not_suppress_timeout_rollback() {
+        let mut transcript = successful_transcript();
+        transcript.complete.handshake_id = ObjectId::from_bytes([6; 32]);
+        let now = transcript.request.started_at_ms + transcript.request.effective_timeout_ms() + 1;
+        assert!(
+            transcript
+                .rollback_if_timed_out(now)
+                .unwrap()
+                .keep_source_lease
+        );
+    }
+
+    #[test]
+    fn late_or_incomplete_rehydration_does_not_suppress_timeout_rollback() {
+        for late in [false, true] {
+            let mut transcript = successful_transcript();
+            let now =
+                transcript.request.started_at_ms + transcript.request.effective_timeout_ms() + 1;
+            if late {
+                transcript.complete.resumed_at_ms = now;
+            } else {
+                transcript.complete.replayed_ops.pop();
+            }
+            assert!(
+                transcript
+                    .rollback_if_timed_out(now)
+                    .unwrap()
+                    .keep_source_lease
+            );
+        }
+    }
+
+    #[test]
+    fn valid_completion_suppresses_rollback_before_the_separate_source_release() {
+        let mut transcript = successful_transcript();
+        let now = transcript.request.started_at_ms + transcript.request.effective_timeout_ms() + 1;
+        transcript.source_release.released_at_ms = 0;
+        assert!(transcript.rollback_if_timed_out(now).is_none());
+        assert!(matches!(
+            transcript.validate_success(),
+            Err(ResumeHandshakeError::LeaseReleasedBeforeRehydration)
+        ));
+    }
+
+    #[test]
+    fn canonical_replay_order_and_identical_duplicates_preserve_request_identity() {
+        let mut transcript = successful_transcript();
+        transcript.request.in_flight_ops.reverse();
+        transcript
+            .request
+            .in_flight_ops
+            .push(transcript.request.in_flight_ops[0].clone());
+        transcript.validate_success().unwrap();
+    }
+
+    #[test]
+    fn deadline_boundary_and_equal_symbol_timestamps_remain_valid() {
+        let mut transcript = successful_transcript();
+        for symbol in &mut transcript.symbols {
+            symbol.sent_at_ms = transcript.ack.acked_at_ms;
+        }
+        transcript.complete.resumed_at_ms =
+            transcript.request.started_at_ms + transcript.request.effective_timeout_ms();
+        transcript.source_release.released_at_ms = transcript.complete.resumed_at_ms;
+        transcript.validate_success().unwrap();
     }
 }
