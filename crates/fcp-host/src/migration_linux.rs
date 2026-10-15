@@ -9,13 +9,18 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use fcp_prelude::ObjectId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[path = "migration_linux/command.rs"]
+mod command;
+
+pub use command::{CriuCommandError, CriuCommandLimits, CriuCommandStopReason};
 
 const CRIU_DUMP_LOG: &str = "criu-dump.log";
 const CRIU_RESTORE_LOG: &str = "criu-restore.log";
@@ -82,6 +87,15 @@ pub enum LinuxMigrationError {
         status: String,
         /// Captured stderr.
         stderr: String,
+    },
+    /// CRIU setup, resource admission, execution or bounded capture failed.
+    #[error("criu {action}: {source}")]
+    CriuExecution {
+        /// CRIU action, or `configure` when validating local limits.
+        action: &'static str,
+        /// Subprocess-boundary failure, including exact-child reap evidence.
+        #[source]
+        source: CriuCommandError,
     },
     /// Filesystem or process-spawn failure.
     #[error("io error while {context}: {source}")]
@@ -342,6 +356,7 @@ pub struct CriuConnectorMigrator {
     criu_binary: PathBuf,
     limits: ConnectorMigrationLimits,
     require_linux: bool,
+    command_limits: CriuCommandLimits,
 }
 
 impl Default for CriuConnectorMigrator {
@@ -358,7 +373,27 @@ impl CriuConnectorMigrator {
             criu_binary: criu_binary.into(),
             limits,
             require_linux: true,
+            command_limits: CriuCommandLimits::default(),
         }
+    }
+
+    /// Set independent limits for each CRIU dump/restore command.
+    ///
+    /// Defaults are 60 seconds and 1 MiB of combined stdout/stderr. The
+    /// existing synchronous migration methods must run on a blocking worker,
+    /// not an async executor thread. OS spawn/kill/wait calls cannot be forcibly
+    /// preempted. Only the CRIU child is terminated on interruption; a restored
+    /// process may already exist and must be reconciled before any retry.
+    /// These limits do not bound CRIU's own image files or explicit log files.
+    ///
+    /// # Errors
+    /// Returns an error when the timeout or diagnostic-byte budget is zero.
+    pub fn with_command_limits(mut self, limits: CriuCommandLimits) -> Result<Self, LinuxMigrationError> {
+        limits.validate().map_err(|source| LinuxMigrationError::CriuExecution {
+            action: "configure", source,
+        })?;
+        self.command_limits = limits;
+        Ok(self)
     }
 
     /// Checkpoint a connector subprocess with CRIU.
@@ -481,13 +516,8 @@ impl CriuConnectorMigrator {
         action: &'static str,
         args: &[OsString],
     ) -> Result<Output, LinuxMigrationError> {
-        let output = Command::new(&self.criu_binary)
-            .args(args)
-            .output()
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "running criu",
-                source,
-            })?;
+        let output = command::run(&self.criu_binary, args, self.command_limits)
+            .map_err(|source| LinuxMigrationError::CriuExecution { action, source })?;
         if !output.status.success() {
             return Err(LinuxMigrationError::CriuCommandFailed {
                 action,
@@ -504,6 +534,7 @@ impl CriuConnectorMigrator {
             criu_binary: criu_binary.into(),
             limits,
             require_linux: false,
+            command_limits: CriuCommandLimits::default(),
         }
     }
 }
@@ -832,6 +863,56 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use super::*;
+
+        #[test]
+        fn dump_and_restore_use_the_configured_command_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("blocked-criu.sh");
+            fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(script, ConnectorMigrationLimits::default())
+                .with_command_limits(CriuCommandLimits {
+                    timeout: std::time::Duration::from_millis(100),
+                    max_output_bytes: 1024,
+                }).unwrap();
+            let images = dir.path().join("images");
+            let error = migrator.dump_connector(&ConnectorCheckpointRequest::new("connector", 1234, &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "dump",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::Timeout, child_reaped: true, ..
+                },
+            }));
+            let error = migrator.restore_connector(&ConnectorRestoreRequest::new("connector", &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "restore",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::Timeout, child_reaped: true, ..
+                },
+            }));
+        }
+
+        #[test]
+        fn restore_output_limit_cannot_be_reported_as_success() {
+            let dir = tempfile::tempdir().unwrap();
+            let images = dir.path().join("images");
+            fs::create_dir(&images).unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(
+                fake_criu_script(dir.path(), "unused"), ConnectorMigrationLimits::default(),
+            ).with_command_limits(CriuCommandLimits {
+                timeout: std::time::Duration::from_secs(2), max_output_bytes: 4,
+            }).unwrap();
+            let error = migrator.restore_connector(&ConnectorRestoreRequest::new("connector", &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "restore",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::OutputLimit, child_reaped: true, ..
+                },
+            }));
+        }
 
         #[test]
         fn restored_pid_file_never_follows_a_symlink() {
