@@ -58,6 +58,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Error handling
 thiserror = "2"
 
+# Private, per-attempt CRIU control files (also used by the test harness).
+tempfile = "3"
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -89,7 +92,6 @@ fcp-testkit = { path = "../fcp-testkit" }
 fcp-crypto-pq = { path = "../fcp-crypto-pq" }
 fcp-browser = { path = "../../connectors/browser", features = ["test-support"] }
 fcp-telegram = { path = "../../connectors/telegram", features = ["test-support"] }
-tempfile = "3"
 rcgen = "0.14.7"
 insta.workspace = true
 criterion.workspace = true
