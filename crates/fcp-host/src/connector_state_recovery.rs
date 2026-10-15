@@ -5,9 +5,12 @@
 //! cancellation is terminal: a durable write may already have been admitted.
 
 use std::collections::HashSet;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -24,6 +27,10 @@ pub const MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES: usize =
     MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES * (MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES + 1024) + 1024;
 /// Hard deadline covering all downloads and the single import attempt.
 pub const MAX_CONNECTOR_STATE_RECOVERY_TIMEOUT_MS: u64 = 60_000;
+
+// Revalidate a waiting donor even if its network future never wakes again.
+// This is an owned timer, not another request, task, retry, or donor attempt.
+const RECOVERY_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 const fn default_attempt_timeout_ms() -> u64 {
     10_000
@@ -154,11 +161,18 @@ impl ConnectorStateReplicationService {
     /// apply independently to each download; total work is bounded by eight
     /// attempts and one overall deadline. Admission saturation fails fast rather
     /// than trying another peer to evade the service's shared resource limits.
+    /// While a download is pending, local grant and pinned transport authority
+    /// are also rechecked on an owned 100 ms timer. Revocation discards that
+    /// download before trying the next independently authorized donor.
     ///
     /// Once import starts, no failure is retryable here, even when it appears to
     /// be validation-only. Timeout/cancellation during import may leave admitted
     /// persistent work running under the existing store contract. A caller must
     /// inspect replica state, not automatically retry an ambiguous operation.
+    /// The total budget includes initial validation and fences the final result,
+    /// including an import that returns ready after consuming its deadline.
+    /// Timers cannot preempt blocking work inside a single future poll; late
+    /// results are rejected when control returns, without claiming rollback.
     ///
     /// # Errors
     /// Rejects invalid authority, exhausted downloads, resource saturation, total
@@ -174,8 +188,8 @@ impl ConnectorStateReplicationService {
         Fut: Future<Output = HostResult<String>>,
         A: Fn(usize) -> HostResult<()> + Send + Sync,
     {
-        self.validate_recovery(request)?;
         let started = Instant::now();
+        self.validate_recovery(request)?;
         let total_budget = Duration::from_millis(request.total_timeout_ms);
         let attempt_budget = Duration::from_millis(request.attempt_timeout_ms);
         let recovery = async {
@@ -197,7 +211,13 @@ impl ConnectorStateReplicationService {
                     },
                     &permit,
                 );
-                let downloaded = fcp_async_core::time::timeout(attempt_budget, download).await;
+                let download = read_while_authorized(download, || {
+                    self.validate_pull(candidate)?;
+                    authorize_transport(index)
+                });
+                let downloaded = within_recovery_budget(
+                    attempt_started, attempt_budget, download,
+                ).await;
                 // Ready futures and synchronous callbacks need not yield to a
                 // timer. Fence admission explicitly as well as timing out waits.
                 check_deadline(started, total_budget)?;
@@ -239,9 +259,78 @@ impl ConnectorStateReplicationService {
                 "no configured donor supplied a complete state export; no replica import was attempted".to_owned(),
             ))
         };
-        fcp_async_core::time::timeout(total_budget, recovery)
+        within_recovery_budget(started, total_budget, recovery)
             .await
             .map_err(|_| deadline_error())?
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryBudgetElapsed;
+
+/// Use the caller's original elapsed budget, not a fresh budget at first poll.
+/// The clock-injected core permits deterministic ready/pending boundary tests.
+async fn within_recovery_budget<F: Future>(
+    started: Instant,
+    budget: Duration,
+    future: F,
+) -> Result<F::Output, RecoveryBudgetElapsed> {
+    within_recovery_budget_at(budget, || started.elapsed(), future).await
+}
+
+async fn within_recovery_budget_at<F, N>(
+    budget: Duration,
+    elapsed: N,
+    future: F,
+) -> Result<F::Output, RecoveryBudgetElapsed>
+where
+    F: Future,
+    N: Fn() -> Duration,
+{
+    let remaining = budget
+        .checked_sub(elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(RecoveryBudgetElapsed)?;
+    let mut future = pin!(future);
+    let guarded = poll_fn(|cx| {
+        if elapsed() >= budget {
+            return Poll::Ready(Err(RecoveryBudgetElapsed));
+        }
+        let outcome = future.as_mut().poll(cx);
+        // A synchronous callback or ready storage operation can exhaust the
+        // budget without giving the timeout future another poll. A pending
+        // result can do the same without registering any wake-up at all.
+        if elapsed() >= budget {
+            return Poll::Ready(Err(RecoveryBudgetElapsed));
+        }
+        outcome.map(Ok)
+    });
+    fcp_async_core::time::timeout(remaining, guarded)
+        .await
+        .map_err(|_| RecoveryBudgetElapsed)?
+}
+
+/// This guard is used only before import, where abandoning a download cannot
+/// leave a newly admitted local replica write. Preserve the same download
+/// future across ticks: do not restart its request or reset any deadline.
+async fn read_while_authorized<F, T, A>(read: F, authorize: A) -> HostResult<T>
+where
+    F: Future<Output = HostResult<T>>,
+    A: Fn() -> HostResult<()>,
+{
+    let mut read = pin!(read);
+    loop {
+        authorize()?;
+        let tick = pin!(fcp_async_core::time::sleep(RECOVERY_AUTHORITY_RECHECK_INTERVAL));
+        // Poll the timer first so its deadline is anchored before potentially
+        // expensive work in the read. Both futures remain owned by this scope.
+        match select(tick, read.as_mut()).await {
+            Either::Left(_) => {}
+            Either::Right((result, _)) => {
+                authorize()?;
+                return result;
+            }
+        }
     }
 }
 
@@ -277,3 +366,184 @@ fn invalid(message: &str) -> HostError {
 #[cfg(test)]
 #[path = "connector_state_recovery_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod budget_tests {
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct MarkDropped<'a>(&'a AtomicBool);
+
+    impl Drop for MarkDropped<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn revoked() -> HostError {
+        HostError::PreflightFailed("fixture donor authority revoked".to_owned())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn exhausted_budget_never_polls_work_and_drops_its_custody() {
+        let polled = AtomicUsize::new(0);
+        let dropped = AtomicBool::new(false);
+        let guard = MarkDropped(&dropped);
+        let work = async {
+            let _guard = guard;
+            polled.fetch_add(1, Ordering::SeqCst);
+            42
+        };
+        let result = within_recovery_budget_at(
+            Duration::from_millis(10),
+            || Duration::from_millis(10),
+            work,
+        ).await;
+        assert_eq!(result, Err(RecoveryBudgetElapsed));
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn unexpired_budget_preserves_success_and_failure_values() {
+        let success = within_recovery_budget_at(
+            Duration::from_secs(1), || Duration::ZERO, async { Ok::<_, u8>(42) },
+        ).await;
+        let failure = within_recovery_budget_at(
+            Duration::from_secs(1), || Duration::ZERO, async { Err::<u8, _>(7) },
+        ).await;
+        assert_eq!(success, Ok(Ok(42)));
+        assert_eq!(failure, Ok(Err(7)));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn ready_import_result_after_the_deadline_is_not_a_success() {
+        let elapsed_ms = AtomicU64::new(0);
+        let result = within_recovery_budget_at(
+            Duration::from_millis(10),
+            || Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)),
+            async {
+                // Model an admitted write returning ready after a long poll.
+                // Its completion cannot be undone by rejecting this receipt.
+                elapsed_ms.store(10, Ordering::SeqCst);
+                Ok::<_, HostError>("retained")
+            },
+        ).await;
+        assert!(matches!(result, Err(RecoveryBudgetElapsed)));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn pending_poll_that_exhausts_budget_needs_no_wake_to_be_rejected() {
+        let elapsed_ms = AtomicU64::new(0);
+        let polls = AtomicUsize::new(0);
+        let work = poll_fn(|_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            elapsed_ms.store(11, Ordering::SeqCst);
+            Poll::<u8>::Pending
+        });
+        let result = within_recovery_budget_at(
+            Duration::from_millis(10),
+            || Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)),
+            work,
+        ).await;
+        assert_eq!(result, Err(RecoveryBudgetElapsed));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn real_deadline_drops_a_never_waking_child() {
+        let dropped = AtomicBool::new(false);
+        let guard = MarkDropped(&dropped);
+        let work = async {
+            let _guard = guard;
+            pending::<u8>().await
+        };
+        let result = within_recovery_budget(
+            Instant::now(), Duration::from_millis(10), work,
+        ).await;
+        assert_eq!(result, Err(RecoveryBudgetElapsed));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn authority_denial_precedes_the_first_download_poll() {
+        let polls = AtomicUsize::new(0);
+        let result = read_while_authorized(
+            async {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            },
+            || Err(revoked()),
+        ).await;
+        assert!(matches!(result, Err(HostError::PreflightFailed(_))));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn authority_is_rechecked_after_a_ready_download() {
+        let allowed = AtomicBool::new(true);
+        let result = read_while_authorized(
+            async {
+                allowed.store(false, Ordering::SeqCst);
+                Ok("private-state")
+            },
+            || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+        ).await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, HostError::PreflightFailed(_)));
+        assert!(!error.to_string().contains("private-state"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn revoked_never_waking_donor_is_abandoned_before_its_attempt_deadline() {
+        let allowed = AtomicBool::new(true);
+        let dropped = AtomicBool::new(false);
+        let polls = AtomicUsize::new(0);
+        let guard = MarkDropped(&dropped);
+        let work = async {
+            let _guard = guard;
+            poll_fn(|_| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                allowed.store(false, Ordering::SeqCst);
+                // No wake: only the authority timer can prompt another check.
+                Poll::<HostResult<u8>>::Pending
+            }).await
+        };
+        let result = within_recovery_budget(
+            Instant::now(),
+            Duration::from_secs(5),
+            read_while_authorized(work, || {
+                if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) }
+            }),
+        ).await;
+        assert!(matches!(result, Ok(Err(HostError::PreflightFailed(_)))));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn cancelling_authority_watch_drops_its_original_read() {
+        let dropped = AtomicBool::new(false);
+        let guard = MarkDropped(&dropped);
+        let work = async {
+            let _guard = guard;
+            pending::<HostResult<u8>>().await
+        };
+        let mut watched = Box::pin(read_while_authorized(work, || Ok(())));
+        assert!(futures_util::poll!(watched.as_mut()).is_pending());
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(watched);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn budget_and_authority_futures_are_send_with_send_inputs() {
+        fn assert_send<T: Send>(_: &T) {}
+        let watched = read_while_authorized(async { Ok::<_, HostError>(42) }, || Ok(()));
+        assert_send(&watched);
+        let bounded = within_recovery_budget(Instant::now(), Duration::from_secs(1), watched);
+        assert_send(&bounded);
+    }
+}
