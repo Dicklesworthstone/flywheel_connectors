@@ -12,10 +12,14 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
+use crate::connector_state_recovery::{
+    MAX_CONNECTOR_STATE_RECOVERY_TIMEOUT_MS, read_while_authorized, within_recovery_budget,
+};
 use crate::connector_state_replication::runtime::{ExportLookup, TransferPermit};
 use crate::{
     ConnectorStateExportRequest, ConnectorStatePullRequest, ConnectorStatePullResponse,
@@ -30,6 +34,17 @@ const PAGE_BYTES: usize = 48 * 1024;
 const MAX_PAGE_WIRE_BYTES: usize = 256 * 1024;
 // The donor permits at most two service operations per authenticated peer.
 const MAX_PAGE_CONCURRENCY: usize = 2;
+const TRANSFER_BUDGET: Duration = Duration::from_millis(MAX_CONNECTOR_STATE_RECOVERY_TIMEOUT_MS);
+
+fn export_deadline_error() -> HostError {
+    HostError::Unavailable("state-export deadline elapsed; no export response was returned".to_owned())
+}
+
+fn pull_deadline_error() -> HostError {
+    HostError::Unavailable(
+        "state-transfer deadline elapsed; an admitted durable write may still complete".to_owned(),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PageConcurrency(usize);
@@ -378,6 +393,11 @@ impl ConnectorStateReplicationService {
     /// of the same export fail fast instead of repeating reads and signatures.
     /// No grant, writer pin or transport authority is inferred from the cache;
     /// replicas are still independently validated before publication.
+    /// The complete call, including decoding and serialization, has a 60 second
+    /// service ceiling; callers may impose a shorter original request deadline.
+    /// Read polls and an owned periodic timer recheck authority even while a
+    /// backing-store read is stalled. Abandonment releases the active permit
+    /// and any unfinished cache-build claim without returning state bytes.
     ///
     /// # Errors
     /// Rejects malformed requests, stale authority and all ordinary export
@@ -391,40 +411,76 @@ impl ConnectorStateReplicationService {
     where
         F: Fn() -> HostResult<()> + Send + Sync,
     {
-        if request_json.len() > MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES {
-            return Err(invalid("connector-state export request exceeds its wire limit"));
-        }
-        let request: ExportWireRequest = serde_json::from_str(request_json)
-            .map_err(|_| invalid("connector-state export request is malformed"))?;
-        match request {
-            ExportWireRequest::Complete(request) => {
-                self.export_for_peer(authenticated_peer, &request, authorize_transport).await
+        self.export_transfer_with_budget(
+            authenticated_peer, request_json, authorize_transport, Instant::now(), TRANSFER_BUDGET,
+        )
+        .await
+    }
+
+    // The private clock/budget seam exercises the exact production admission
+    // path with deterministic exhausted budgets, without waiting sixty seconds.
+    async fn export_transfer_with_budget<F>(
+        &self,
+        authenticated_peer: &str,
+        request_json: &str,
+        authorize_transport: F,
+        started: Instant,
+        budget: Duration,
+    ) -> HostResult<String>
+    where
+        F: Fn() -> HostResult<()> + Send + Sync,
+    {
+        let operation = async {
+            if request_json.len() > MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES {
+                return Err(invalid("connector-state export request exceeds its wire limit"));
             }
-            ExportWireRequest::Page(page) => {
-                page.validate()?;
-                self.validate_export(authenticated_peer, &page.export)?;
-                authorize_transport()?;
-                let permit = self.runtime.admit(authenticated_peer, page.export.limits)?;
-                let snapshot = match self.runtime.begin_export(&permit, &page.export)? {
-                    ExportLookup::Ready(snapshot) => snapshot,
-                    ExportLookup::Build(build) => {
-                        let wire = self.export_admitted(
-                            authenticated_peer, &page.export, &authorize_transport, &permit,
-                        ).await?;
-                        let wire = stable_export_wire(wire, page.export.limits.max_wire_bytes)?;
-                        self.validate_export(authenticated_peer, &page.export)?;
-                        authorize_transport()?;
-                        build.finish(wire)?
+            let request: ExportWireRequest = serde_json::from_str(request_json)
+                .map_err(|_| invalid("connector-state export request is malformed"))?;
+            let export = match &request {
+                ExportWireRequest::Complete(export) => export,
+                ExportWireRequest::Page(page) => {
+                    page.validate()?;
+                    &page.export
+                }
+            };
+            let authority = || {
+                if started.elapsed() >= budget {
+                    return Err(export_deadline_error());
+                }
+                self.validate_export(authenticated_peer, export)?;
+                authorize_transport()
+            };
+            let read = async {
+                match &request {
+                    ExportWireRequest::Complete(export) => {
+                        self.export_for_peer(authenticated_peer, export, &authority).await
                     }
-                };
-                let encoded = encode_page_with_digest(&page, snapshot.wire(), snapshot.digest())?;
-                // A cached byte string is neither a capability nor a freshness
-                // witness. Recheck after all work, including a cache hit.
-                self.validate_export(authenticated_peer, &page.export)?;
-                authorize_transport()?;
-                Ok(encoded)
-            }
-        }
+                    ExportWireRequest::Page(page) => {
+                        authority()?;
+                        let permit = self.runtime.admit(authenticated_peer, page.export.limits)?;
+                        let snapshot = match self.runtime.begin_export(&permit, &page.export)? {
+                            ExportLookup::Ready(snapshot) => snapshot,
+                            ExportLookup::Build(build) => {
+                                let wire = self.export_admitted(
+                                    authenticated_peer, &page.export, &authority, &permit,
+                                ).await?;
+                                let wire = stable_export_wire(wire, page.export.limits.max_wire_bytes)?;
+                                authority()?;
+                                build.finish(wire)?
+                            }
+                        };
+                        let encoded = encode_page_with_digest(page, snapshot.wire(), snapshot.digest())?;
+                        // A cache hit never substitutes for current authority.
+                        authority()?;
+                        Ok(encoded)
+                    }
+                }
+            };
+            read_while_authorized(read, &authority).await
+        };
+        within_recovery_budget(started, budget, operation)
+            .await
+            .map_err(|_| export_deadline_error())?
     }
 
     /// Pull one signed export in bounded pages, then import its complete history.
@@ -432,7 +488,8 @@ impl ConnectorStateReplicationService {
     /// `fetch_page` must return only the body of a successful, authenticated,
     /// nonce-bound reply from the selected donor. Each call gets a new signed
     /// request, not a retry of an earlier envelope. Never follow a peer-provided
-    /// cursor or URL. The host must bound this entire future with one deadline.
+    /// cursor or URL. One 60 second service budget covers validation, every page
+    /// and the single import; callers may impose a shorter original deadline.
     /// With two-page concurrency, fetch futures may run simultaneously and finish
     /// out of order. Their replies are verified on completion, then assembled in
     /// request order. Failure or cancellation drops every outstanding fetch.
@@ -444,6 +501,9 @@ impl ConnectorStateReplicationService {
     /// validation pass. Dropping this future before import drops only an in-memory
     /// assembly. After write admission, the existing persistent-write cancellation
     /// semantics apply. No pages are cached on disk and no automatic retries occur.
+    /// Pending downloads use the same per-poll and periodic authority guard as
+    /// multi-donor recovery. That guard ends before import: publication retains
+    /// its existing admission checks and is never retried on revocation or timeout.
     ///
     /// # Errors
     /// Refuses expired grants, transport failures, missing/reordered/changed pages,
@@ -459,15 +519,47 @@ impl ConnectorStateReplicationService {
         Fut: Future<Output = HostResult<String>>,
         A: Fn() -> HostResult<()> + Send + Sync,
     {
-        self.validate_pull(request)?;
-        authorize_transport()?;
-        // Keep the same reservation through every page and the final import.
-        // Releasing/reacquiring here would admit unbounded partial assemblies.
-        let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
-        let wire = self
-            .download_paged_admitted(request, fetch_page, &authorize_transport, &permit)
-            .await?;
-        self.import_admitted(request, &wire, authorize_transport, &permit).await
+        self.pull_paged_with_budget(
+            request, fetch_page, authorize_transport, Instant::now(), TRANSFER_BUDGET,
+        )
+        .await
+    }
+
+    async fn pull_paged_with_budget<F, Fut, A>(
+        &self,
+        request: &ConnectorStatePullRequest,
+        fetch_page: F,
+        authorize_transport: A,
+        started: Instant,
+        budget: Duration,
+    ) -> HostResult<ConnectorStatePullResponse>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = HostResult<String>>,
+        A: Fn() -> HostResult<()> + Send + Sync,
+    {
+        let operation = async {
+            let authority = || {
+                if started.elapsed() >= budget {
+                    return Err(pull_deadline_error());
+                }
+                self.validate_pull(request)?;
+                authorize_transport()
+            };
+            authority()?;
+            // One reservation owns the assembly through the final import.
+            let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
+            let download = self.download_paged_admitted(
+                request, fetch_page, &authority, &permit,
+            );
+            let wire = read_while_authorized(download, &authority).await?;
+            // No periodic authority cancellation around admitted writes.
+            // The ordinary import path rechecks at each publication boundary.
+            self.import_admitted(request, &wire, &authority, &permit).await
+        };
+        within_recovery_budget(started, budget, operation)
+            .await
+            .map_err(|_| pull_deadline_error())?
     }
 
     // Download only: this helper cannot write to a replica. Its caller must
@@ -503,11 +595,16 @@ impl ConnectorStateReplicationService {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Poll;
 
     use fcp_kernel::{ConnectorId, ObjectId, ZoneId};
+    use fcp_evidence::{ObjectHeader, ObjectIdKey, RetentionClass, StorageMeta, StoredObject};
+    use fcp_store::{FcpStoreConnectorStateStore, MemoryObjectStore, MemoryObjectStoreConfig, ObjectStore, ObjectStoreError};
+    use crate::{ConnectorStateTransferDirection, ConnectorStateTransferGrant};
     use crate::{ConnectorStateTransferLimits, ConnectorStateTransferScope};
     use super::*;
 
@@ -1139,5 +1236,227 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    struct StalledStore {
+        inner: MemoryObjectStore,
+        reads: AtomicUsize,
+        active: AtomicUsize,
+        puts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StalledStore {
+        async fn put(&self, object: StoredObject) -> Result<(), ObjectStoreError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(object).await
+        }
+
+        async fn get(&self, _id: &ObjectId) -> Result<StoredObject, ObjectStoreError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveFetch::new(&self.active);
+            pending().await
+        }
+
+        async fn exists(&self, id: &ObjectId) -> bool { self.inner.exists(id).await }
+        async fn delete(&self, id: &ObjectId) -> Result<(), ObjectStoreError> {
+            self.inner.delete(id).await
+        }
+        async fn get_header(&self, id: &ObjectId) -> Result<ObjectHeader, ObjectStoreError> {
+            self.inner.get_header(id).await
+        }
+        async fn get_storage_meta(&self, id: &ObjectId) -> Result<StorageMeta, ObjectStoreError> {
+            self.inner.get_storage_meta(id).await
+        }
+        async fn set_retention(&self, id: &ObjectId, retention: RetentionClass) -> Result<(), ObjectStoreError> {
+            self.inner.set_retention(id, retention).await
+        }
+        async fn list_zone(&self, zone: &ZoneId) -> Vec<ObjectId> { self.inner.list_zone(zone).await }
+        async fn storage_used(&self) -> u64 { self.inner.storage_used().await }
+        async fn storage_quota(&self) -> u64 { self.inner.storage_quota().await }
+    }
+
+    fn service_fixture(
+        direction: ConnectorStateTransferDirection,
+    ) -> (ConnectorStateReplicationService, ConnectorStatePullRequest, Arc<StalledStore>) {
+        let objects = Arc::new(StalledStore {
+            inner: MemoryObjectStore::new(MemoryObjectStoreConfig::default()),
+            reads: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            puts: AtomicUsize::new(0),
+        });
+        let request = ConnectorStatePullRequest {
+            peer_node: "peer".to_owned(),
+            request: request().export,
+        };
+        let writer = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x5a; 32]).unwrap();
+        let adapter = FcpStoreConnectorStateStore::new(
+            objects.clone(), ObjectIdKey::from_bytes([42; 32]),
+            request.request.scope.connector_id.clone(), request.request.scope.zone_id.clone(),
+        ).with_trusted_writer_keys([writer.verifying_key().to_bytes()]);
+        let mut service = ConnectorStateReplicationService::new();
+        service.register_store(direction, request.request.scope.clone(), Arc::new(adapter)).unwrap();
+        service.add_grant(ConnectorStateTransferGrant {
+            grant_id: request.request.grant_id.clone(),
+            direction,
+            peer_node: request.peer_node.clone(),
+            scope: request.request.scope.clone(),
+            root_object_id: request.request.root_object_id,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            limits: request.request.limits,
+        }).unwrap();
+        (service, request, objects)
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn live_export_revocation_drops_storage_reads_and_releases_cache_builds() {
+        for paged in [false, true] {
+            let (service, request, objects) = service_fixture(ConnectorStateTransferDirection::Export);
+            let wire = if paged {
+                PageRequest::first(&request.request).to_json().unwrap()
+            } else {
+                request.request.to_json().unwrap()
+            };
+            let allowed = AtomicBool::new(true);
+            let authority = || {
+                if allowed.load(Ordering::SeqCst) { Ok(()) }
+                else { Err(HostError::PreflightFailed("fixture revoked".to_owned())) }
+            };
+            let mut export = Box::pin(service.export_transfer_for_peer("peer", &wire, &authority));
+            assert!(futures_util::poll!(export.as_mut()).is_pending());
+            assert_eq!(objects.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(objects.active.load(Ordering::SeqCst), 1);
+            assert_eq!(service.runtime.active(), 1);
+            allowed.store(false, Ordering::SeqCst);
+            assert!(matches!(futures_util::poll!(export.as_mut()), Poll::Ready(Err(HostError::PreflightFailed(_)))));
+            assert_eq!(objects.active.load(Ordering::SeqCst), 0);
+            assert_eq!(service.runtime.active(), 0);
+            assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+
+            // Explicitly issue a new call to prove a cancelled builder did not
+            // strand its key. The service never initiates this second request.
+            allowed.store(true, Ordering::SeqCst);
+            let mut next = Box::pin(service.export_transfer_for_peer("peer", &wire, &authority));
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            assert_eq!(objects.reads.load(Ordering::SeqCst), 2);
+            if paged { assert_eq!(service.runtime.cache_builds_started(), 2); }
+            drop(next);
+            assert_eq!(objects.active.load(Ordering::SeqCst), 0);
+            assert_eq!(service.runtime.active(), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn single_donor_revocation_drops_parallel_pages_without_importing() {
+        for pages in [1, 2] {
+            let (service, request, objects) = service_fixture(ConnectorStateTransferDirection::Import);
+            let service = service.with_page_concurrency(pages).unwrap();
+            let wire = "x".repeat(4 * PAGE_BYTES);
+            let allowed = AtomicBool::new(true);
+            let active = AtomicUsize::new(0);
+            let constructed = AtomicUsize::new(0);
+            let mut pull = Box::pin(service.pull_paged_from_peer(
+                &request,
+                |json| {
+                    constructed.fetch_add(1, Ordering::SeqCst);
+                    let page: PageRequest = serde_json::from_str(&json).unwrap();
+                    let (wire, active) = (&wire, &active);
+                    async move {
+                        let _active = ActiveFetch::new(active);
+                        if page.offset != 0 { pending::<()>().await; }
+                        encode_page(&page, wire)
+                    }
+                },
+                || {
+                    if allowed.load(Ordering::SeqCst) { Ok(()) }
+                    else { Err(HostError::PreflightFailed("fixture revoked".to_owned())) }
+                },
+            ));
+            for _ in 0..8 { assert!(futures_util::poll!(pull.as_mut()).is_pending()); }
+            assert_eq!(active.load(Ordering::SeqCst), pages);
+            assert_eq!(constructed.load(Ordering::SeqCst), pages + 1);
+            allowed.store(false, Ordering::SeqCst);
+            assert!(matches!(futures_util::poll!(pull.as_mut()), Poll::Ready(Err(HostError::PreflightFailed(_)))));
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert_eq!(constructed.load(Ordering::SeqCst), pages + 1);
+            assert_eq!(service.runtime.active(), 0);
+            assert_eq!(objects.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn exhausted_service_budgets_do_not_admit_reads_or_network_work() {
+        let (exporter, request, objects) = service_fixture(ConnectorStateTransferDirection::Export);
+        let wire = PageRequest::first(&request.request).to_json().unwrap();
+        let result = exporter.export_transfer_with_budget(
+            "peer", &wire, || panic!("expired export reached authorization"),
+            Instant::now(), Duration::ZERO,
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("state-export deadline"));
+        assert_eq!(objects.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(exporter.runtime.cache_builds_started(), 0);
+        assert_eq!(exporter.runtime.active(), 0);
+
+        let (recipient, request, objects) = service_fixture(ConnectorStateTransferDirection::Import);
+        let result = recipient.pull_paged_with_budget(
+            &request, |_| async { panic!("expired pull reached network") },
+            || panic!("expired pull reached authorization"), Instant::now(), Duration::ZERO,
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("state-transfer deadline"));
+        assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+        assert_eq!(recipient.runtime.active(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn service_deadline_drops_a_never_waking_export_and_its_build_claim() {
+        let (service, request, objects) = service_fixture(ConnectorStateTransferDirection::Export);
+        let wire = PageRequest::first(&request.request).to_json().unwrap();
+        let mut export = Box::pin(service.export_transfer_with_budget(
+            "peer", &wire, || Ok(()), Instant::now(), Duration::from_millis(100),
+        ));
+        assert!(futures_util::poll!(export.as_mut()).is_pending());
+        assert_eq!(objects.active.load(Ordering::SeqCst), 1);
+        let error = export.await.unwrap_err();
+        assert!(error.to_string().contains("state-export deadline"));
+        assert_eq!(objects.active.load(Ordering::SeqCst), 0);
+        assert_eq!(service.runtime.active(), 0);
+        let mut next = Box::pin(service.export_transfer_for_peer("peer", &wire, || Ok(())));
+        assert!(futures_util::poll!(next.as_mut()).is_pending());
+        assert_eq!(service.runtime.cache_builds_started(), 2);
+        drop(next);
+        assert_eq!(service.runtime.active(), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn abandoning_a_single_donor_anchor_releases_its_reservation() {
+        let (service, request, objects) = service_fixture(ConnectorStateTransferDirection::Import);
+        let active = AtomicUsize::new(0);
+        let mut pull = Box::pin(service.pull_paged_from_peer(
+            &request,
+            |_| async {
+                let _active = ActiveFetch::new(&active);
+                pending::<HostResult<String>>().await
+            },
+            || Ok(()),
+        ));
+        assert!(futures_util::poll!(pull.as_mut()).is_pending());
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        assert_eq!(service.runtime.active(), 1);
+        drop(pull);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(service.runtime.active(), 0);
+        assert_eq!(objects.puts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn live_transfer_futures_remain_send_with_send_callbacks() {
+        fn assert_send<T: Send>(_: &T) {}
+        let (service, request, _) = service_fixture(ConnectorStateTransferDirection::Export);
+        let wire = request.request.to_json().unwrap();
+        assert_send(&service.export_transfer_for_peer("peer", &wire, || Ok(())));
+        assert_send(&service.pull_paged_from_peer(
+            &request, |_| pending::<HostResult<String>>(), || Ok(()),
+        ));
     }
 }
