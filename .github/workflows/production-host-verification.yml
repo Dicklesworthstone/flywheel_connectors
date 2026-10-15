@@ -1,0 +1,68 @@
+name: Production host verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'connectors/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/production-host-verification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-host-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  production:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: production-host-nightly-2026-08-31
+          cache-on-failure: true
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev libssl-dev
+      - name: Check both production binaries without resolving the lockfile
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-08-31 check --locked -p fwc -p fcp-host --bin fwc --bin fcp-host 2>&1 | tee production-check.log
+      - name: Run focused production-host regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-08-31 test --locked -p fcp-host --test production_host_cancellation -- --nocapture --test-threads=1 2>&1 | tee production-host-tests.log
+      - name: Retain compiler and process-verification output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-host-verification-${{ github.sha }}
+          path: |
+            production-check.log
+            production-host-tests.log
+          if-no-files-found: warn
+          retention-days: 7
