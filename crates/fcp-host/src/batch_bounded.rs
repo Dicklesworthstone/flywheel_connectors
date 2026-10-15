@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation,
-    BatchOperationError, HostError, HostResult, OperationResultStatus,
+    BatchOperationError, HostError, HostResult, OperationResult, OperationResultStatus,
 };
 
 /// Serialized provider-result limits, excluding fixed scheduler accounting.
@@ -194,11 +194,50 @@ impl BatchExecutor {
         request: &'a BatchInvokeRequest,
         context: Option<&ExecutionContext>,
         limits: BatchResultLimits,
-        mut handler: F,
+        handler: F,
     ) -> HostResult<BatchBoundedResponse>
     where
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<Value, BatchOperationError>>,
+    {
+        self.execute_async_bounded_observed(request, context, limits, handler, |_| Ok(()))
+            .await
+    }
+
+    /// Observe retention-checked results before dependent work can be admitted.
+    ///
+    /// This composes byte-bounded execution with the existing completion-driven
+    /// result sink. The observer sees only the retained result, never an
+    /// oversized provider payload that was withheld. Successful observation
+    /// happens before that operation releases its dependents, allowing callers
+    /// to resolve data dependencies without racing admission or bypassing quotas.
+    ///
+    /// The observer must be nonblocking and bound any additional state it keeps.
+    /// It runs without the result-budget mutex held. A refusal or unwind stops
+    /// new admission and further observation; already admitted work drains and
+    /// its known results remain in the final response. Neither handler execution
+    /// nor observation is retried. Observer failure does not undo an effect or
+    /// change a known successful provider result into a failed external action.
+    /// The batch reports aborted delivery through its existing status and
+    /// skipped-member error accounting. Cancellation and deadline semantics are
+    /// unchanged, including immediate observation of final accounting records.
+    ///
+    /// # Errors
+    /// Returns validation errors before any handler or observer is called.
+    /// Runtime, retention and observation failures remain in batch accounting.
+    #[allow(clippy::future_not_send)]
+    pub async fn execute_async_bounded_observed<'a, F, Fut, S>(
+        &self,
+        request: &'a BatchInvokeRequest,
+        context: Option<&ExecutionContext>,
+        limits: BatchResultLimits,
+        mut handler: F,
+        mut observer: S,
+    ) -> HostResult<BatchBoundedResponse>
+    where
+        F: FnMut(&'a BatchOperation) -> Fut,
+        Fut: Future<Output = Result<Value, BatchOperationError>>,
+        S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
     {
         limits.validate()?;
         let budget = Mutex::new(ResultBudget {
@@ -219,7 +258,8 @@ impl BatchExecutor {
                         shared.lock().expect("batch result budget lock").retain(result)
                     }
                 },
-                |_| {
+                |result| {
+                    observer(result)?;
                     let stop = shared.lock().expect("batch result budget lock").stop;
                     stop.map_or(Ok(()), |failure| Err(failure.error(false)))
                 },
@@ -227,8 +267,8 @@ impl BatchExecutor {
             .await?;
         let budget = budget.into_inner().expect("batch result budget lock");
         if let Some(failure) = budget.stop {
-            // The private callback is an admission stop signal, not a remote
-            // delivery sink. Report that actual reason for never-admitted work.
+            // The retention stop is an admission signal, not evidence that
+            // remote delivery failed. Report its reason for never-admitted work.
             // Cancellation and timeout codes retain their higher precedence.
             for result in &mut streamed.response.results {
                 if result.status == OperationResultStatus::Skipped
