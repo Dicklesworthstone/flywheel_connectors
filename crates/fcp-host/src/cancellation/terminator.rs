@@ -16,6 +16,7 @@ enum CallbackKind {
 struct State {
     callbacks: Option<Arc<Callbacks>>,
     abort_requested: bool,
+    disarmed: bool,
     active: Option<CallbackKind>,
     pending_abort: bool,
 }
@@ -31,13 +32,24 @@ struct CallbackLease {
 
 impl CallbackLease {
     fn release(&mut self) -> (bool, bool) {
-        // A reentrant disarm may have removed the state's last reference.
-        // Destroy captures outside the mutex, but BEFORE allowing reuse.
+        // Active disarm leaves the state's reference in place. Only this
+        // execution owner may destroy it, including when disarm arrives after
+        // we release our own reference but before clearing `active`.
         drop(self.callbacks.take());
-        let mut state = self.state.lock().expect("termination state lock");
-        state.active = None;
-        self.released = true;
-        (state.callbacks.is_none(), state.pending_abort)
+        loop {
+            let mut state = self.state.lock().expect("termination state lock");
+            if state.disarmed && state.callbacks.is_some() {
+                let captures = state.callbacks.take();
+                drop(state);
+                // Destructors may reenter. Keep execution ownership until
+                // they finish, but never run them under the decision mutex.
+                drop(captures);
+                continue;
+            }
+            state.active = None;
+            self.released = true;
+            return (state.disarmed, state.pending_abort);
+        }
     }
 }
 
@@ -83,6 +95,7 @@ impl CancellationTerminator {
                     finished: Box::new(finished),
                 })),
                 abort_requested: false,
+                disarmed: false,
                 active: None,
                 pending_abort: false,
             })),
@@ -108,7 +121,7 @@ impl CancellationTerminator {
     fn request_abort(&self, pending_only: bool) -> bool {
         let mut lease = {
             let mut state = self.state.lock().expect("termination state lock");
-            if state.callbacks.is_none() || (pending_only && !state.pending_abort) {
+            if state.disarmed || (pending_only && !state.pending_abort) {
                 return false;
             }
             state.abort_requested = true;
@@ -145,29 +158,28 @@ impl CancellationTerminator {
     /// Panics if the decision mutex is poisoned or a captured destructor panics.
     #[must_use]
     pub fn disarm(&self) -> bool {
-        let (callbacks, idle) = {
+        let mut release = {
             let mut state = self.state.lock().expect("termination state lock");
             if state.abort_requested {
                 return false;
             }
-            let idle = state.active.is_none();
-            // Fence reentrant reuse while releasing the final captures, too.
-            if idle {
-                state.active = Some(CallbackKind::Finished);
+            state.disarmed = true;
+            if state.active.is_some() {
+                // Revocation is immediate, but destruction belongs to the
+                // active lease. Taking this reference here could race its
+                // release and let another thread observe premature reuse.
+                return false;
             }
-            (state.callbacks.take(), idle)
-        };
-        if idle {
-            let mut release = CallbackLease {
+            // Fence reentrant reuse while releasing the final captures, too.
+            state.active = Some(CallbackKind::Finished);
+            CallbackLease {
                 state: Arc::clone(&self.state),
-                callbacks,
+                callbacks: state.callbacks.take(),
                 released: false,
-            };
-            release.release();
-        } else {
-            drop(callbacks);
-        }
-        idle
+            }
+        };
+        release.release();
+        true
     }
 
     /// Whether the captured runtime exited, or disarm has fully drained.
@@ -188,7 +200,7 @@ impl CancellationTerminator {
             if state.active.is_some() {
                 return false;
             }
-            if state.callbacks.is_none() {
+            if state.disarmed {
                 return true;
             }
             if state.pending_abort {
@@ -471,6 +483,86 @@ mod tests {
         let terminator = CancellationTerminator::new(move || { let _capture = &capture; }, || false);
         slot.set(Arc::downgrade(&terminator.state)).unwrap();
         assert!(terminator.disarm());
+        assert!(terminator.is_finished());
+        assert!(terminator.disarm());
+    }
+
+    #[test]
+    fn disarm_after_probe_reference_release_keeps_capture_custody_with_the_lease() {
+        let runtime = Arc::new(());
+        let weak_runtime = Arc::downgrade(&runtime);
+        let terminator = CancellationTerminator::new(
+            move || {
+                let _runtime = &runtime;
+            },
+            || false,
+        );
+        let mut lease = {
+            let mut state = terminator.state.lock().unwrap();
+            state.active = Some(CallbackKind::Finished);
+            CallbackLease {
+                state: Arc::clone(&terminator.state),
+                callbacks: state.callbacks.clone(),
+                released: false,
+            }
+        };
+        // Reproduce the exact release/disarm interleaving without relying on
+        // a scheduler hitting the gap between two consecutive instructions.
+        drop(lease.callbacks.take());
+        assert!(!terminator.disarm());
+        assert!(weak_runtime.upgrade().is_some());
+        assert!(!terminator.abort());
+        assert!(!terminator.is_finished());
+        assert_eq!(lease.release(), (true, false));
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(terminator.is_finished());
+        assert!(terminator.disarm());
+    }
+
+    #[test]
+    fn disarmed_probe_cannot_finish_while_its_capture_destructor_is_running() {
+        struct BlockingCapture {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Drop for BlockingCapture {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .get_mut()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let capture = BlockingCapture {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        };
+        let slot = Arc::new(OnceLock::new());
+        let callback_slot = Arc::clone(&slot);
+        let terminator = CancellationTerminator::new(
+            || panic!("revoked authority cannot abort"),
+            move || {
+                let _capture = &capture;
+                let reentrant = from_slot(&callback_slot);
+                assert!(!reentrant.disarm());
+                false
+            },
+        );
+        slot.set(Arc::downgrade(&terminator.state)).unwrap();
+        let probing = terminator.clone();
+        let probe = std::thread::spawn(move || probing.is_finished());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let finished = terminator.is_finished();
+        let reusable = terminator.disarm();
+        let aborted = terminator.abort();
+        // Release before asserting so failures cannot leave the probe parked.
+        release_tx.send(()).unwrap();
+        assert!(probe.join().unwrap());
+        assert!(!finished && !reusable && !aborted);
         assert!(terminator.is_finished());
         assert!(terminator.disarm());
     }
