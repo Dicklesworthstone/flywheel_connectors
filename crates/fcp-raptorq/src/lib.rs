@@ -24,6 +24,11 @@
 //! - Dedupe across versions (chunk-level content addressing)
 //! - Bounded memory (reconstruct one chunk at a time)
 //! - Smoother streaming (progressive display)
+//!
+//! Use [`ChunkedObjectManifest::start_reconstruction`] to write a large payload
+//! incrementally without a second full-payload buffer. Fetch each
+//! [`ChunkReconstructor::next_chunk_id`], supply it with [`ChunkReconstructor::push`],
+//! and publish the destination only after [`ChunkReconstructor::finish`] succeeds.
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +42,7 @@ mod error;
 mod golden;
 mod k_selector;
 mod oti;
+mod reconstruction;
 
 pub use chunk::{ChunkedObjectManifest, RawChunk};
 pub use config::{RaptorQConfig, RaptorQPathProfile, RaptorQPreset};
@@ -46,3 +52,4 @@ pub use envelope::{RaptorQSymbolFrame, SymbolEnvelope, SymbolEnvelopeError};
 pub use error::{ChunkError, DecodeError, EncodeError};
 pub use k_selector::{ArmRegistry, BetaPosterior, CodeFamily, KSelectorArm, KSelectorObservation};
 pub use oti::ObjectTransmissionInformation;
+pub use reconstruction::{ChunkReconstructionError, ChunkReconstructor};
