@@ -31,6 +31,7 @@ fcp-async-core = { path = "../fcp-async-core" }
 fcp-provider-auth = { path = "../fcp-provider-auth" }
 fcp-cbor = { path = "../fcp-cbor" }
 fcp-crypto = { path = "../fcp-crypto" }
+fcp-raptorq = { path = "../fcp-raptorq" }
 fcp-ratelimit = { path = "../fcp-ratelimit" }
 fcp-store = { path = "../fcp-store" }
 fcp-tailscale = { path = "../fcp-tailscale" }
@@ -81,7 +82,6 @@ x509-parser = "0.18.1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-fcp-raptorq = { path = "../fcp-raptorq" }
 mach2 = "0.4"
 
 [dev-dependencies]
