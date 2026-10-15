@@ -19,6 +19,8 @@ use thiserror::Error;
 
 #[path = "migration_linux/command.rs"]
 mod command;
+#[path = "migration_linux/snapshot.rs"]
+mod snapshot;
 
 pub use command::{CriuCommandError, CriuCommandLimits, CriuCommandStopReason};
 
@@ -57,6 +59,18 @@ pub enum LinuxMigrationError {
         size_bytes: u64,
         /// Configured maximum.
         max_snapshot_bytes: u64,
+    },
+    /// Image metadata exceeded a structural bound before payload allocation.
+    #[error("checkpoint image tree exceeds its {limit} limit")]
+    SnapshotStructureLimit {
+        /// Fixed classification, not source-directory contents.
+        limit: &'static str,
+    },
+    /// A source image changed during bounded inspection or copying.
+    #[error("checkpoint image tree changed during inspection: {path:?}")]
+    SnapshotChanged {
+        /// Changed entry or tree root.
+        path: PathBuf,
     },
     /// A file descriptor path was outside the caller's migration policy.
     #[error("file descriptor {fd} path is not allowed by migration policy: {path:?}")]
@@ -288,7 +302,9 @@ pub struct ConnectorCheckpointManifest {
     pub connector_id: String,
     /// Source process ID.
     pub source_pid: u32,
-    /// Content-addressed identifier for the CRIU image directory contents.
+    /// V2 content address over sorted, length-framed image paths, entry types,
+    /// file lengths and bytes, including empty directories. This is not a
+    /// signature: authenticate this manifest before using it as a restore pin.
     pub snapshot_object_id: ObjectId,
     /// Total snapshot bytes captured under the image directory.
     pub snapshot_size_bytes: u64,
@@ -428,14 +444,8 @@ impl CriuConnectorMigrator {
 
         let args = dump_args(request);
         let output = self.run_criu("dump", &args)?;
-        let snapshot_size_bytes = directory_size_bytes(&request.images_dir)?;
-        if snapshot_size_bytes > self.limits.max_snapshot_bytes {
-            return Err(LinuxMigrationError::SnapshotTooLarge {
-                size_bytes: snapshot_size_bytes,
-                max_snapshot_bytes: self.limits.max_snapshot_bytes,
-            });
-        }
-        let snapshot_object_id = object_id_for_directory(&request.images_dir)?;
+        let (snapshot_object_id, snapshot_size_bytes) =
+            snapshot::inspect(&request.images_dir, self.limits.max_snapshot_bytes)?;
 
         Ok(ConnectorCheckpointManifest {
             connector_id: request.connector_id.clone(),
@@ -610,76 +620,6 @@ fn ensure_empty_directory(path: &Path) -> Result<(), LinuxMigrationError> {
         return Err(LinuxMigrationError::ImagesDirNotEmpty {
             path: path.to_path_buf(),
         });
-    }
-    Ok(())
-}
-
-fn directory_size_bytes(path: &Path) -> Result<u64, LinuxMigrationError> {
-    let mut total = 0_u64;
-    for file in snapshot_files(path)? {
-        let len = fs::metadata(&file)
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "reading checkpoint image metadata",
-                source,
-            })?
-            .len();
-        total = total.saturating_add(len);
-    }
-    Ok(total)
-}
-
-fn object_id_for_directory(path: &Path) -> Result<ObjectId, LinuxMigrationError> {
-    let mut files = snapshot_files(path)?;
-    files.sort();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"FCP-HOST-CRIU-SNAPSHOT-V1");
-    for file in files {
-        let relative = file
-            .strip_prefix(path)
-            .map_err(|_| LinuxMigrationError::UnsupportedSnapshotEntry { path: file.clone() })?;
-        hasher.update(relative.as_os_str().as_encoded_bytes());
-        let bytes = fs::read(&file).map_err(|source| LinuxMigrationError::Io {
-            context: "reading checkpoint image bytes",
-            source,
-        })?;
-        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    Ok(ObjectId::from_unscoped_bytes(hasher.finalize().as_bytes()))
-}
-
-fn snapshot_files(root: &Path) -> Result<Vec<PathBuf>, LinuxMigrationError> {
-    let mut files = Vec::new();
-    collect_snapshot_files(root, &mut files)?;
-    Ok(files)
-}
-
-fn collect_snapshot_files(
-    path: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), LinuxMigrationError> {
-    for entry in fs::read_dir(path).map_err(|source| LinuxMigrationError::Io {
-        context: "reading checkpoint images directory",
-        source,
-    })? {
-        let entry = entry.map_err(|source| LinuxMigrationError::Io {
-            context: "reading checkpoint images directory entry",
-            source,
-        })?;
-        let file_type = entry
-            .file_type()
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "reading checkpoint image file type",
-                source,
-            })?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            collect_snapshot_files(&path, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
-        } else {
-            return Err(LinuxMigrationError::UnsupportedSnapshotEntry { path });
-        }
     }
     Ok(())
 }
