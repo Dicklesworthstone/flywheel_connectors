@@ -162,8 +162,10 @@ impl ConnectorStateReplicationService {
     /// attempts and one overall deadline. Admission saturation fails fast rather
     /// than trying another peer to evade the service's shared resource limits.
     /// While a download is pending, local grant and pinned transport authority
-    /// are also rechecked on an owned 100 ms timer. Revocation discards that
-    /// download before trying the next independently authorized donor.
+    /// are checked before and after every read poll, including wake-ups between
+    /// timer ticks. An owned 100 ms timer also checks never-waking reads.
+    /// Revocation discards that download before trying the next independently
+    /// authorized donor.
     ///
     /// Once import starts, no failure is retryable here, even when it appears to
     /// be validation-only. Timeout/cancellation during import may leave admitted
@@ -266,11 +268,11 @@ impl ConnectorStateReplicationService {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RecoveryBudgetElapsed;
+pub(super) struct RecoveryBudgetElapsed;
 
 /// Use the caller's original elapsed budget, not a fresh budget at first poll.
 /// The clock-injected core permits deterministic ready/pending boundary tests.
-async fn within_recovery_budget<F: Future>(
+pub(super) async fn within_recovery_budget<F: Future>(
     started: Instant,
     budget: Duration,
     future: F,
@@ -310,21 +312,51 @@ where
         .map_err(|_| RecoveryBudgetElapsed)?
 }
 
-/// This guard is used only before import, where abandoning a download cannot
-/// leave a newly admitted local replica write. Preserve the same download
-/// future across ticks: do not restart its request or reset any deadline.
-async fn read_while_authorized<F, T, A>(read: F, authorize: A) -> HostResult<T>
+/// Guard read-only transfer work, never replica publication. The same future
+/// survives timer ticks; neither requests nor deadlines are restarted. Every
+/// poll is fenced, including a network wake-up before the next timer tick.
+/// A denied post-poll check withholds either a ready value or a pending read;
+/// it cannot preempt synchronous work within that poll or undo admitted work.
+pub(super) async fn read_while_authorized<F, T, A>(read: F, authorize: A) -> HostResult<T>
 where
     F: Future<Output = HostResult<T>>,
     A: Fn() -> HostResult<()>,
 {
+    read_while_authorized_with_tick(read, authorize, || {
+        fcp_async_core::time::sleep(RECOVERY_AUTHORITY_RECHECK_INTERVAL)
+    })
+    .await
+}
+
+async fn read_while_authorized_with_tick<F, T, A, W, Tick>(
+    read: F,
+    authorize: A,
+    mut next_tick: W,
+) -> HostResult<T>
+where
+    F: Future<Output = HostResult<T>>,
+    A: Fn() -> HostResult<()>,
+    W: FnMut() -> Tick,
+    Tick: Future<Output = ()>,
+{
     let mut read = pin!(read);
+    let guarded = poll_fn(|cx| {
+        if let Err(error) = authorize() {
+            return Poll::Ready(Err(error));
+        }
+        let outcome = read.as_mut().poll(cx);
+        if let Err(error) = authorize() {
+            return Poll::Ready(Err(error));
+        }
+        outcome
+    });
+    let mut guarded = pin!(guarded);
     loop {
         authorize()?;
-        let tick = pin!(fcp_async_core::time::sleep(RECOVERY_AUTHORITY_RECHECK_INTERVAL));
+        let tick = pin!(next_tick());
         // Poll the timer first so its deadline is anchored before potentially
         // expensive work in the read. Both futures remain owned by this scope.
-        match select(tick, read.as_mut()).await {
+        match select(tick, guarded.as_mut()).await {
             Either::Left(_) => {}
             Either::Right((result, _)) => {
                 authorize()?;
@@ -507,7 +539,7 @@ mod budget_tests {
             poll_fn(|_| {
                 polls.fetch_add(1, Ordering::SeqCst);
                 allowed.store(false, Ordering::SeqCst);
-                // No wake: only the authority timer can prompt another check.
+                // No wake: the post-poll authority fence must reject this now.
                 Poll::<HostResult<u8>>::Pending
             }).await
         };
@@ -545,5 +577,145 @@ mod budget_tests {
         assert_send(&watched);
         let bounded = within_recovery_budget(Instant::now(), Duration::from_secs(1), watched);
         assert_send(&bounded);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn revoked_read_cannot_resume_between_authority_ticks() {
+        let allowed = AtomicBool::new(true);
+        let polls = AtomicUsize::new(0);
+        let dropped = AtomicBool::new(false);
+        let guard = MarkDropped(&dropped);
+        let read = async {
+            let _guard = guard;
+            poll_fn(|_| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Poll::<HostResult<()>>::Pending
+            })
+            .await
+        };
+        let mut watched = Box::pin(read_while_authorized_with_tick(
+            read,
+            || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+            pending::<()>,
+        ));
+        assert!(futures_util::poll!(watched.as_mut()).is_pending());
+        allowed.store(false, Ordering::SeqCst);
+        // Simulate a socket wake before the timer, which never fires here.
+        assert!(matches!(
+            futures_util::poll!(watched.as_mut()),
+            Poll::Ready(Err(HostError::PreflightFailed(_)))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn revocation_inside_a_pending_poll_does_not_wait_for_a_tick() {
+        let allowed = AtomicBool::new(true);
+        let polls = AtomicUsize::new(0);
+        let read = poll_fn(|_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            allowed.store(false, Ordering::SeqCst);
+            Poll::<HostResult<()>>::Pending
+        });
+        let mut watched = Box::pin(read_while_authorized_with_tick(
+            read,
+            || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+            pending::<()>,
+        ));
+        assert!(matches!(
+            futures_util::poll!(watched.as_mut()),
+            Poll::Ready(Err(HostError::PreflightFailed(_)))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn timer_ticks_keep_the_same_read_and_drop_it_on_independent_revocation() {
+        let allowed = AtomicBool::new(true);
+        let tick_ready = AtomicBool::new(false);
+        let trigger = &tick_ready;
+        let tick_count = AtomicUsize::new(0);
+        let read_starts = AtomicUsize::new(0);
+        let dropped = AtomicBool::new(false);
+        let guard = MarkDropped(&dropped);
+        let read = async {
+            let _guard = guard;
+            read_starts.fetch_add(1, Ordering::SeqCst);
+            pending::<HostResult<()>>().await
+        };
+        let mut watched = Box::pin(read_while_authorized_with_tick(
+            read,
+            || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+            || {
+                tick_count.fetch_add(1, Ordering::SeqCst);
+                poll_fn(move |_| {
+                    if trigger.swap(false, Ordering::SeqCst) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+            },
+        ));
+        assert!(futures_util::poll!(watched.as_mut()).is_pending());
+        tick_ready.store(true, Ordering::SeqCst);
+        assert!(futures_util::poll!(watched.as_mut()).is_pending());
+        assert_eq!(tick_count.load(Ordering::SeqCst), 2);
+        assert_eq!(read_starts.load(Ordering::SeqCst), 1);
+        assert!(!dropped.load(Ordering::SeqCst));
+        allowed.store(false, Ordering::SeqCst);
+        tick_ready.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            futures_util::poll!(watched.as_mut()),
+            Poll::Ready(Err(HostError::PreflightFailed(_)))
+        ));
+        assert_eq!(read_starts.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn authority_changed_by_tick_construction_prevents_read_admission() {
+        let allowed = AtomicBool::new(true);
+        let polls = AtomicUsize::new(0);
+        let mut watched = Box::pin(read_while_authorized_with_tick(
+            async {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+            || {
+                allowed.store(false, Ordering::SeqCst);
+                pending::<()>()
+            },
+        ));
+        assert!(matches!(
+            futures_util::poll!(watched.as_mut()),
+            Poll::Ready(Err(HostError::PreflightFailed(_)))
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn read_errors_are_preserved_only_while_authority_is_current() {
+        for revoke in [false, true] {
+            let allowed = AtomicBool::new(true);
+            let result = read_while_authorized_with_tick(
+                async {
+                    allowed.store(!revoke, Ordering::SeqCst);
+                    Err::<(), _>(HostError::Unavailable("private diagnostic".to_owned()))
+                },
+                || if allowed.load(Ordering::SeqCst) { Ok(()) } else { Err(revoked()) },
+                pending::<()>,
+            )
+            .await;
+            if revoke {
+                let error = result.unwrap_err();
+                assert!(matches!(error, HostError::PreflightFailed(_)));
+                assert!(!error.to_string().contains("private diagnostic"));
+            } else {
+                assert!(matches!(result, Err(HostError::Unavailable(message)) if message == "private diagnostic"));
+            }
+        }
     }
 }
