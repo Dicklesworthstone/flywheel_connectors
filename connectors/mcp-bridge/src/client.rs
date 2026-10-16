@@ -214,10 +214,82 @@ impl McpClient {
         if !status.is_success() {
             return Err(self.handle_http_error(status, resp).await.into());
         }
-        transport::read_rpc_response(resp, request.id, |reply| {
-            self.send_server_reply(url, session_id, reply)
-        })
-        .await.map_err(RpcFailure::from)
+        let resumed = std::sync::atomic::AtomicBool::new(false);
+        let value = transport::read_resumable_rpc_response(
+            resp,
+            request.id,
+            |reply| self.send_server_reply(url, session_id, reply),
+            |event_id| {
+                resumed.store(true, Ordering::Relaxed);
+                self.resume_server_stream(url, session, event_id)
+            },
+        ).await?;
+        if resumed.load(Ordering::Relaxed) {
+            self.check_resume_session(session).await?;
+        }
+        Ok(value)
+    }
+
+    /// Recovery is a GET for the already-issued request, not another tools/call.
+    /// Never transfer an event cursor to a replacement negotiated session, even
+    /// if the server reuses its opaque session header. No lock crosses HTTP I/O.
+    async fn check_resume_session(&self, original: Option<&McpSession>) -> McpBridgeResult<()> {
+        let closed = || transport::invalid_response(
+            "MCP session changed or closed during stream recovery; original operation outcome is unknown",
+        );
+        if self.runtime.is_shutting_down() {
+            return Err(closed());
+        }
+        let current = self.session.lock().await;
+        let same = match (original, current.as_ref()) {
+            (Some(original), Some(current)) => std::ptr::eq(original, current.as_ref()),
+            (None, None) => true,
+            _ => false,
+        };
+        if self.runtime.is_shutting_down() || !same {
+            return Err(closed());
+        }
+        Ok(())
+    }
+
+    async fn resume_server_stream(
+        &self,
+        url: &str,
+        original: Option<&McpSession>,
+        event_id: reqwest::header::HeaderValue,
+    ) -> McpBridgeResult<Response> {
+        self.check_resume_session(original).await?;
+        let mut request = self.add_auth(self.client.get(url))
+            .header("Accept", "text/event-stream")
+            .header("MCP-Protocol-Version", PROTOCOL_VERSION)
+            .header("Last-Event-ID", event_id);
+        if let Some(id) = original.and_then(|session| session.id.as_ref()) {
+            request = request.header("Mcp-Session-Id", id);
+        }
+        // This await remains inside the original operation's request context,
+        // including its deadline and cancellation. No new request budget starts.
+        let response = request.send().await.map_err(|_| {
+            transport::invalid_response("MCP stream recovery failed; original operation outcome is unknown")
+        })?;
+        self.check_resume_session(original).await?;
+        if response.status() == StatusCode::NOT_FOUND
+            && original.is_some_and(|session| session.id.is_some())
+        {
+            let mut current = self.session.lock().await;
+            if current.as_ref().is_some_and(|current| {
+                original.is_some_and(|original| std::ptr::eq(original, current.as_ref()))
+            }) {
+                *current = None;
+            }
+        }
+        if response.status() != StatusCode::OK {
+            // In particular, a 404 on the resume GET must NOT become
+            // RpcFailure::SessionExpired and replay the initiating tool POST.
+            return Err(transport::invalid_response(
+                "MCP stream recovery was refused; original operation outcome is unknown",
+            ));
+        }
+        Ok(response)
     }
 
     /// Respond on the same endpoint without forwarding a server request to any
