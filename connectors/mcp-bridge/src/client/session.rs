@@ -18,6 +18,7 @@ use crate::types::JsonRpcRequest;
 
 mod completion;
 mod discovery;
+mod termination;
 
 pub(super) const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_SESSION_ID_BYTES: usize = 1024;
