@@ -614,7 +614,11 @@ impl ConnectorStateReplicationService {
         Ok(wire)
     }
 
-    /// Validate a signed donor response and retain its state in the replica.
+    /// Validate a signed donor response and retain its exact root in the replica.
+    ///
+    /// A successful response retains the requested root even when local state
+    /// has already advanced. Historical retention reports no canonical advance
+    /// and never rolls back newer state. All ancestry and writer checks apply.
     ///
     /// Call only with the body of a reply whose signature, donor and request
     /// nonce have been verified. The transport callback is also run inside
@@ -679,8 +683,11 @@ impl ConnectorStateReplicationService {
             ));
         }
         let canonical_bytes = canonical_size(&response.bundle, request.request.limits)?;
+        // An advance-only import may skip an older comparable root entirely.
+        // A successful exact-root transfer must retain that root as well as its
+        // ancestry, without selecting it over a newer canonical head.
         let change = store
-            .import_replica_checked(
+            .retain_replica_checked(
                 response.bundle,
                 request.request.limits.store_limits(),
                 || {
@@ -1211,6 +1218,72 @@ mod tests {
             assert!(receipt.get(absent).is_none());
         }
         assert_eq!(fixture.recipient.runtime.active(), 0);
+    }
+
+    #[test]
+    fn successful_historical_pull_retains_exact_root_without_advancing_newer_state() {
+        let fixture = fixture();
+        let old_wire = export(&fixture);
+        let old_response: ConnectorStateExportResponse = serde_json::from_str(&old_wire).unwrap();
+        let old_state_object = old_response.bundle.objects[0].clone();
+        let old_state: ConnectorStateObject = CanonicalSerializer::deserialize(
+            &old_state_object.body, &FcpStoreConnectorStateStore::state_object_schema_id(),
+        ).unwrap();
+        let next_lease = ObjectId::from_bytes([0x18; 32]);
+        let mut next_state = ConnectorStateObject {
+            header: header(
+                FcpStoreConnectorStateStore::state_object_schema_id(),
+                vec![old_state_object.object_id, next_lease],
+            ),
+            prev: Some(old_state_object.object_id),
+            seq: 1,
+            lease_seq: 18,
+            lease_object_id: next_lease,
+            ..old_state
+        };
+        next_state.sign_with(&writer()).unwrap();
+        let next_state_object = stored(&next_state.header, &next_state);
+        let next_root = ConnectorStateRoot {
+            header: header(
+                FcpStoreConnectorStateStore::root_schema_id(),
+                vec![next_state_object.object_id],
+            ),
+            connector_id: scope().connector_id,
+            instance_id: None,
+            zone_id: scope().zone_id,
+            model: ConnectorStateModel::SingletonWriter,
+            head: Some(next_state_object.object_id),
+            state_schema_version: 1,
+        };
+        let next_root_object = stored(&next_root.header, &next_root);
+        let next_root_id = next_root_object.object_id;
+        let newer = ConnectorStateReplicaBundle {
+            root_object_id: next_root_id,
+            objects: vec![old_state_object, next_state_object, next_root_object],
+        };
+        run(fixture.replica.import_replica(newer, limits().store_limits())).unwrap().unwrap();
+        // An ancestry bundle includes its state objects, not earlier root
+        // envelopes. The requested historical root is therefore absent here.
+        assert_eq!(
+            run(fixture.recipient.inspect_replica(&fixture.request)).unwrap().status,
+            ConnectorStateInspectionStatus::RootNotFound,
+        );
+        let receipt = run(fixture.recipient.import_from_peer(
+            &fixture.request, &old_wire, || Ok(()),
+        )).unwrap();
+        assert_eq!(receipt.root_object_id, fixture.request.request.root_object_id);
+        assert!(!receipt.replica_root_published, "historical retention must not advertise an advance");
+        assert!(receipt.replica_only);
+        let inspected = run(fixture.recipient.inspect_replica(&fixture.request)).unwrap();
+        assert_eq!(inspected.status, ConnectorStateInspectionStatus::Verified);
+        assert_eq!(inspected.object_count, receipt.object_count);
+        assert_eq!(inspected.canonical_bytes, receipt.canonical_bytes);
+        assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, next_root_id);
+        assert_eq!(
+            run(fixture.replica.export_replica(receipt.root_object_id, limits().store_limits()))
+                .unwrap(),
+            old_response.bundle,
+        );
     }
 
     #[test]
