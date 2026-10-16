@@ -58,7 +58,8 @@ pub use connector_state::{
     CONNECTOR_STATE_READ_EVENT, CONNECTOR_STATE_SNAPSHOT_EVENT, CONNECTOR_STATE_TRACING_TARGET,
     CONNECTOR_STATE_WRITE_EVENT, CONNECTOR_STATE_WRITES_TOTAL_METRIC,
     ConnectorStateLeaseYieldFlush, ConnectorStateReplay, ConnectorStateReplicaBundle,
-    ConnectorStateReplicaLimits, ConnectorStateStoreError, FcpStoreConnectorStateStore,
+    ConnectorStateReplicaInspection, ConnectorStateReplicaLimits, ConnectorStateStoreError,
+    FcpStoreConnectorStateStore,
 };
 pub use coverage::{CoverageEvaluation, CoverageHealth, SymbolDistribution};
 pub use durable::{

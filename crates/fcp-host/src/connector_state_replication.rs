@@ -468,6 +468,9 @@ impl ConnectorStateReplicationService {
     ///
     /// Reuses full keyed-ID, writer-pin and ancestry validation with the
     /// request's object/canonical-byte limits and the shared admission quota.
+    /// The store releases each validated object instead of retaining a complete
+    /// export, and returns canonical byte counts from that same validation pass.
+    /// Grant expiry is checked between objects even when store reads stay ready.
     /// `max_wire_bytes` remains reserved conservatively, but no export payload
     /// is serialized; the metadata response has its own fixed 16 KiB bound.
     /// Missing ancestors, malformed objects and storage failures are errors,
@@ -488,14 +491,25 @@ impl ConnectorStateReplicationService {
         )?;
         let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
         let result = store
-            .export_replica(request.request.root_object_id, request.request.limits.store_limits())
+            .inspect_replica_checked(
+                request.request.root_object_id,
+                request.request.limits.store_limits(),
+                || {
+                    check_grant_expiry(grant).map_err(|_| {
+                        ConnectorStateStoreError::InvalidReplica {
+                            reason: "state-inspection authority expired during verification"
+                                .to_string(),
+                        }
+                    })
+                },
+            )
             .await;
         check_grant_expiry(grant)?;
         let (status, object_count, canonical_bytes) = match result {
-            Ok(bundle) => (
+            Ok(inspection) => (
                 ConnectorStateInspectionStatus::Verified,
-                bundle.objects.len(),
-                canonical_size(&bundle, request.request.limits)?,
+                inspection.object_count,
+                inspection.canonical_bytes,
             ),
             Err(ConnectorStateStoreError::ObjectStore(fcp_store::ObjectStoreError::NotFound(id)))
                 if id == request.request.root_object_id =>
@@ -562,12 +576,25 @@ impl ConnectorStateReplicationService {
             request,
         )?;
         authorize_transport()?;
-        let bundle = store
-            .export_replica(request.root_object_id, request.limits.store_limits())
-            .await
-            .map_err(state_transfer_error)?;
+        let result = store
+            .export_replica_checked(
+                request.root_object_id,
+                request.limits.store_limits(),
+                || {
+                    check_grant_expiry(grant)
+                        .and_then(|()| authorize_transport())
+                        .map_err(|_| ConnectorStateStoreError::InvalidReplica {
+                            reason: "state-transfer authority expired or changed during export"
+                                .to_string(),
+                        })
+                },
+            )
+            .await;
+        // Preserve the host refusal instead of relabeling an expired grant or
+        // revoked transport as a missing or corrupt replica. No bytes escape.
         check_grant_expiry(grant)?;
         authorize_transport()?;
+        let bundle = result.map_err(state_transfer_error)?;
         let response = ConnectorStateExportResponse {
             schema_version: CONNECTOR_STATE_TRANSFER_SCHEMA_VERSION.to_string(),
             request: request.clone(),
@@ -1135,6 +1162,55 @@ mod tests {
             Err(HostError::PreflightFailed(_))));
         assert_eq!(fixture.recipient.runtime.active(), 0);
         assert!(run(fixture.replica.read_root()).unwrap().is_none());
+    }
+
+    #[test]
+    fn ready_export_rechecks_transport_within_its_object_walk() {
+        let fixture = fixture();
+        let checks = AtomicUsize::new(0);
+        let result = run(fixture.donor.export_for_peer(
+            "recipient",
+            &fixture.request.request,
+            || {
+                if checks.fetch_add(1, Ordering::SeqCst) >= 5 {
+                    Err(HostError::PreflightFailed("fixture transport revoked".to_owned()))
+                } else {
+                    Ok(())
+                }
+            },
+        ));
+        // The former export performed only four transport checks, all outside
+        // its ancestry walk, and would incorrectly return this export as allowed.
+        assert!(matches!(result, Err(HostError::PreflightFailed(_))));
+        assert!(checks.load(Ordering::SeqCst) >= 6);
+        assert_eq!(fixture.donor.runtime.active(), 0);
+        assert!(run(fixture.replica.read_root()).unwrap().is_none());
+    }
+
+    #[test]
+    fn payload_heavy_inspection_preserves_receipt_and_independent_wire_budget() {
+        let state = fcp_cbor::to_canonical_cbor(&vec![7u64; 4096]).unwrap();
+        let fixture = fixture_with_state(state, limits());
+        let wire = export(&fixture);
+        let retained = run(fixture.recipient.import_from_peer(
+            &fixture.request, &wire, || Ok(()),
+        )).unwrap();
+        let mut request = fixture.request.clone();
+        request.request.limits.max_objects = retained.object_count;
+        request.request.limits.max_canonical_bytes = retained.canonical_bytes;
+        request.request.limits.max_wire_bytes = 1;
+        let inspected = run(fixture.recipient.inspect_replica(&request)).unwrap();
+        inspected.validate_for(&request).unwrap();
+        assert_eq!(inspected.status, ConnectorStateInspectionStatus::Verified);
+        assert_eq!(inspected.object_count, retained.object_count);
+        assert_eq!(inspected.canonical_bytes, retained.canonical_bytes);
+        assert!(inspected.canonical_bytes > 4096);
+        assert!(inspected.replica_only);
+        let receipt = serde_json::to_value(&inspected).unwrap();
+        for absent in ["bundle", "objects", "state_cbor", "current_root"] {
+            assert!(receipt.get(absent).is_none());
+        }
+        assert_eq!(fixture.recipient.runtime.active(), 0);
     }
 
     #[test]

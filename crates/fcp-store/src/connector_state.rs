@@ -280,6 +280,22 @@ pub struct ConnectorStateReplicaBundle {
     pub objects: Vec<StoredObject>,
 }
 
+/// A verified, exact-root inspection without retained state bodies.
+///
+/// Counts include the root and the complete authenticated singleton history.
+/// Canonical bytes exclude JSON/transport framing and are measured by the same
+/// budget as [`FcpStoreConnectorStateStore::export_replica_checked`]. This is
+/// neither a current-head assertion nor proof of mesh-wide replica attainment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectorStateReplicaInspection {
+    /// Exact immutable root selected by the caller.
+    pub root_object_id: ObjectId,
+    /// Number of validated state objects plus their single root.
+    pub object_count: usize,
+    /// Sum of canonical object-envelope lengths, including headers and bodies.
+    pub canonical_bytes: usize,
+}
+
 struct ReplicaBudget {
     limits: ConnectorStateReplicaLimits,
     objects: usize,
@@ -729,6 +745,8 @@ impl FcpStoreConnectorStateStore {
     /// It walks only that immutable history and checks the count before each
     /// object fetch. A compacted prefix is an error: snapshot-based recovery is
     /// a separate API and cannot silently weaken full canonical-root validation.
+    /// Network callers should use [`Self::export_replica_checked`] to recheck
+    /// their transfer authority while a sequence of ready reads is executing.
     ///
     /// # Errors
     /// Returns an error for a missing or invalid object, unsupported state model,
@@ -739,53 +757,155 @@ impl FcpStoreConnectorStateStore {
         root_object_id: ObjectId,
         limits: ConnectorStateReplicaLimits,
     ) -> Result<ConnectorStateReplicaBundle> {
+        self.export_replica_checked(root_object_id, limits, || Ok(()))
+            .await
+    }
+
+    /// Export one exact root while rechecking the caller's transfer authority.
+    ///
+    /// Authority is checked before reading, after every read (including errors),
+    /// after each object's validation, and before returning the complete bundle.
+    /// Rejection drops the partial in-memory export without publishing objects,
+    /// changing retention, scanning for a newer root, or invalidating caches.
+    /// All ordinary export identity, signature, ancestry and budget checks apply.
+    ///
+    /// The callback can enforce cancellation, a deadline, or an expiring grant.
+    /// It cannot preempt an individual read or synchronous validation step.
+    /// Callers must still bound pending reads with the original request deadline;
+    /// an outer future guard alone cannot fence each object in an all-ready walk.
+    ///
+    /// # Errors
+    /// Returns an export validation/storage error or the callback's rejection.
+    pub async fn export_replica_checked<F>(
+        &self,
+        root_object_id: ObjectId,
+        limits: ConnectorStateReplicaLimits,
+        authorize: F,
+    ) -> Result<ConnectorStateReplicaBundle>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        let mut objects = Vec::new();
+        self.walk_replica_checked(root_object_id, limits, &authorize, |object| {
+            objects.push(object);
+        })
+        .await?;
+        // The private walker visits root, head, then predecessors. Reversing
+        // that order preserves the wire contract: genesis through head, root last.
+        objects.reverse();
+        authorize()?;
+        Ok(ConnectorStateReplicaBundle {
+            root_object_id,
+            objects,
+        })
+    }
+
+    /// Verify one exact root without retaining or returning its complete export.
+    ///
+    /// This uses the same validator and byte accounting as checked export, but
+    /// releases each stored object after validation. Working memory contains the
+    /// current object, the previous decoded state used to validate a transition,
+    /// and an object-ID cycle set bounded by `limits.max_objects`; it does not
+    /// contain all state bodies or a serialized transfer response.
+    ///
+    /// A result describes only the requested immutable history. It establishes
+    /// neither the current root, replica count, live lease validity, nor write
+    /// authority. No storage mutation or canonical-root cache update occurs.
+    /// The callback and pending-read limitations of checked export also apply.
+    ///
+    /// # Errors
+    /// Returns an ordinary export validation/storage error or authority rejection.
+    /// A missing root or predecessor is an error, never an empty successful report.
+    pub async fn inspect_replica_checked<F>(
+        &self,
+        root_object_id: ObjectId,
+        limits: ConnectorStateReplicaLimits,
+        authorize: F,
+    ) -> Result<ConnectorStateReplicaInspection>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+    {
+        self.walk_replica_checked(root_object_id, limits, &authorize, drop)
+            .await
+    }
+
+    // Only the two read-only adapters above supply visitors. No partially
+    // validated history escapes to a network or a publishing callback.
+    async fn walk_replica_checked<F, V>(
+        &self,
+        root_object_id: ObjectId,
+        limits: ConnectorStateReplicaLimits,
+        authorize: &F,
+        mut visit: V,
+    ) -> Result<ConnectorStateReplicaInspection>
+    where
+        F: Fn() -> Result<()> + Send + Sync,
+        V: FnMut(StoredObject) + Send,
+    {
+        authorize()?;
         let mut budget = ReplicaBudget::new(limits);
         budget.check_next_object()?;
-        let root_object = self.object_store.get(&root_object_id).await?;
-        budget.charge(&root_object)?;
-        let root: ConnectorStateRoot = self.decode_stored(
-            &root_object,
-            &Self::root_schema_id(),
-            "connector state root",
-        )?;
-        self.validate_stored_root(root_object_id, &root_object, &root)?;
-        self.validate_replica_model(&root)?;
+        let loaded_root = self.object_store.get(&root_object_id).await;
+        // Do not propagate a storage error or disclose absence under authority
+        // that expired during the read. The same rule applies to every ancestor.
+        authorize()?;
+        let root_object = loaded_root?;
+        let validated_root = (|| -> Result<_> {
+            budget.charge(&root_object)?;
+            let root: ConnectorStateRoot = self.decode_stored(
+                &root_object,
+                &Self::root_schema_id(),
+                "connector state root",
+            )?;
+            self.validate_stored_root(root_object_id, &root_object, &root)?;
+            self.validate_replica_model(&root)?;
+            Ok((root.model, root.head))
+        })();
+        authorize()?;
+        let (model, mut next) = validated_root?;
+        visit(root_object);
 
-        let mut objects = Vec::new();
         let mut visited = HashSet::new();
-        let mut next = root.head;
         let mut newer: Option<ConnectorStateObject> = None;
         while let Some(object_id) = next {
+            authorize()?;
             if !visited.insert(object_id) {
                 return Err(ConnectorStateStoreError::ChainCycle(object_id));
             }
             budget.check_next_object()?;
-            let stored = self.object_store.get(&object_id).await?;
-            budget.charge(&stored)?;
-            let state: ConnectorStateObject = self.decode_stored(
-                &stored,
-                &Self::state_object_schema_id(),
-                "connector state object",
-            )?;
-            self.validate_stored_state_object(object_id, &stored, &state)?;
-            if let Some(newer) = &newer {
-                Self::validate_replay_transition(&root.model, &state, newer)?;
-            }
-            if state.prev.is_none() && state.seq != 0 {
-                return Err(ConnectorStateStoreError::SequenceMismatch {
-                    expected: 0,
-                    got: state.seq,
-                });
-            }
+            let loaded = self.object_store.get(&object_id).await;
+            authorize()?;
+            let stored = loaded?;
+            let validated = (|| -> Result<_> {
+                budget.charge(&stored)?;
+                let state: ConnectorStateObject = self.decode_stored(
+                    &stored,
+                    &Self::state_object_schema_id(),
+                    "connector state object",
+                )?;
+                self.validate_stored_state_object(object_id, &stored, &state)?;
+                if let Some(newer) = &newer {
+                    Self::validate_replay_transition(&model, &state, newer)?;
+                }
+                if state.prev.is_none() && state.seq != 0 {
+                    return Err(ConnectorStateStoreError::SequenceMismatch {
+                        expected: 0,
+                        got: state.seq,
+                    });
+                }
+                Ok(state)
+            })();
+            authorize()?;
+            let state = validated?;
             next = state.prev;
             newer = Some(state);
-            objects.push(stored);
+            visit(stored);
         }
-        objects.reverse();
-        objects.push(root_object);
-        Ok(ConnectorStateReplicaBundle {
+        authorize()?;
+        Ok(ConnectorStateReplicaInspection {
             root_object_id,
-            objects,
+            object_count: budget.objects,
+            canonical_bytes: budget.bytes,
         })
     }
 
@@ -6259,6 +6379,458 @@ mod tests {
         assert_eq!(poisoned.puts.load(Ordering::SeqCst), puts);
         assert!(!run_async(poisoned.exists(&bundle.root_object_id)));
         assert!(run_async(target.read_root()).unwrap().is_none());
+    }
+
+    /// Observe read admission and cancellation without changing source objects.
+    struct ReplicaReadProbe {
+        inner: Arc<dyn ObjectStore>,
+        gets: AtomicUsize,
+        mutations: AtomicUsize,
+        fail_on_get: AtomicUsize,
+        pause_on_get: AtomicUsize,
+        active_gets: AtomicUsize,
+    }
+
+    impl ReplicaReadProbe {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                gets: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+                fail_on_get: AtomicUsize::new(0),
+                pause_on_get: AtomicUsize::new(0),
+                active_gets: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct ActiveReplicaGet<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveReplicaGet<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ReplicaReadProbe {
+        async fn put(&self, object: StoredObject) -> std::result::Result<(), ObjectStoreError> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(object).await
+        }
+
+        async fn get(&self, id: &ObjectId) -> std::result::Result<StoredObject, ObjectStoreError> {
+            let number = self.gets.fetch_add(1, Ordering::SeqCst) + 1;
+            self.active_gets.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveReplicaGet(&self.active_gets);
+            if number == self.pause_on_get.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if number == self.fail_on_get.load(Ordering::SeqCst) {
+                return Err(ObjectStoreError::Io("private-source-path".to_owned()));
+            }
+            self.inner.get(id).await
+        }
+
+        async fn exists(&self, id: &ObjectId) -> bool {
+            self.inner.exists(id).await
+        }
+
+        async fn delete(&self, id: &ObjectId) -> std::result::Result<(), ObjectStoreError> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(id).await
+        }
+
+        async fn get_header(
+            &self,
+            id: &ObjectId,
+        ) -> std::result::Result<ObjectHeader, ObjectStoreError> {
+            self.inner.get_header(id).await
+        }
+
+        async fn get_storage_meta(
+            &self,
+            id: &ObjectId,
+        ) -> std::result::Result<StorageMeta, ObjectStoreError> {
+            self.inner.get_storage_meta(id).await
+        }
+
+        async fn set_retention(
+            &self,
+            id: &ObjectId,
+            retention: RetentionClass,
+        ) -> std::result::Result<(), ObjectStoreError> {
+            self.mutations.fetch_add(1, Ordering::SeqCst);
+            self.inner.set_retention(id, retention).await
+        }
+
+        async fn list_zone(&self, zone_id: &ZoneId) -> Vec<ObjectId> {
+            self.inner.list_zone(zone_id).await
+        }
+
+        async fn storage_used(&self) -> u64 {
+            self.inner.storage_used().await
+        }
+
+        async fn storage_quota(&self) -> u64 {
+            self.inner.storage_quota().await
+        }
+
+        fn has_object_id_verifier(&self) -> bool {
+            self.inner.has_object_id_verifier()
+        }
+    }
+
+    fn denied_replica_read() -> Result<()> {
+        Err(ConnectorStateStoreError::InvalidReplica {
+            reason: "fixture read authority revoked".to_owned(),
+        })
+    }
+
+    #[test]
+    fn checked_replica_denial_precedes_every_store_read() {
+        let objects = Arc::new(ReplicaReadProbe::new(store()));
+        let source = test_store(objects.clone());
+        let generation = source.change_bus.generation();
+        let missing = ObjectId::from_bytes([99; 32]);
+        for error in [
+            run_async(source.export_replica_checked(missing, replica_limits(), denied_replica_read))
+                .unwrap_err(),
+            run_async(source.inspect_replica_checked(missing, replica_limits(), denied_replica_read))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, ConnectorStateStoreError::InvalidReplica { .. }));
+        }
+        assert_eq!(objects.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(objects.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(source.change_bus.generation(), generation);
+    }
+
+    #[test]
+    fn replica_inspection_matches_export_counts_without_mutating_or_scanning() {
+        let objects = Arc::new(ReplicaReadProbe::new(store()));
+        let source = test_store(objects.clone());
+        let (head0, _) = append_ok(&source, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&source, state(1, Some(head0), lease_id(2)));
+        let bundle = export_test_replica(&source);
+        let mutations = objects.mutations.load(Ordering::SeqCst);
+        let generation = source.change_bus.generation();
+        objects.gets.store(0, Ordering::SeqCst);
+        let inspection = run_async(source.inspect_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )).unwrap();
+        assert_eq!(inspection.root_object_id, bundle.root_object_id);
+        assert_eq!(inspection.object_count, bundle.objects.len());
+        assert_eq!(inspection.canonical_bytes, replica_bytes(&bundle));
+        assert_eq!(objects.gets.load(Ordering::SeqCst), bundle.objects.len());
+        assert_eq!(objects.mutations.load(Ordering::SeqCst), mutations);
+        assert_eq!(source.change_bus.generation(), generation);
+        let exported = run_async(source.export_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )).unwrap();
+        assert_eq!(exported, bundle);
+        assert_eq!(exported.objects[0].object_id, head0);
+        assert_eq!(exported.objects[1].object_id, head1);
+        assert_eq!(exported.objects[2].object_id, bundle.root_object_id);
+    }
+
+    #[test]
+    fn replica_inspection_enforces_exact_count_and_canonical_byte_limits() {
+        let source = test_store(store());
+        append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        let exact = ConnectorStateReplicaLimits {
+            max_objects: bundle.objects.len(),
+            max_bytes: replica_bytes(&bundle),
+        };
+        let inspection = run_async(source.inspect_replica_checked(
+            bundle.root_object_id, exact, || Ok(()),
+        )).unwrap();
+        assert_eq!(inspection.canonical_bytes, exact.max_bytes);
+        assert_eq!(inspection.object_count, exact.max_objects);
+        for limits in [
+            ConnectorStateReplicaLimits { max_objects: exact.max_objects - 1, ..exact },
+            ConnectorStateReplicaLimits { max_bytes: exact.max_bytes - 1, ..exact },
+            ConnectorStateReplicaLimits { max_objects: 0, ..exact },
+            ConnectorStateReplicaLimits { max_bytes: 0, ..exact },
+        ] {
+            let inspected = run_async(source.inspect_replica_checked(
+                bundle.root_object_id, limits, || Ok(()),
+            )).unwrap_err();
+            let exported = run_async(source.export_replica_checked(
+                bundle.root_object_id, limits, || Ok(()),
+            )).unwrap_err();
+            assert!(matches!(inspected,
+                ConnectorStateStoreError::ReplicaObjectLimitExceeded { .. }
+                | ConnectorStateStoreError::ReplicaByteLimitExceeded { .. }));
+            assert_eq!(std::mem::discriminant(&inspected), std::mem::discriminant(&exported));
+        }
+    }
+
+    #[test]
+    fn checked_replica_reads_stop_at_each_revoked_object_boundary() {
+        let objects = Arc::new(ReplicaReadProbe::new(store()));
+        let source = test_store(objects.clone());
+        let (head0, _) = append_ok(&source, state(0, None, lease_id(1)));
+        let (head1, _) = append_ok(&source, state(1, Some(head0), lease_id(2)));
+        append_ok(&source, state(2, Some(head1), lease_id(3)));
+        let bundle = export_test_replica(&source);
+        let mutations = objects.mutations.load(Ordering::SeqCst);
+        let generation = source.change_bus.generation();
+        for inspect in [false, true] {
+            for allowed_reads in 0..=bundle.objects.len() {
+                objects.gets.store(0, Ordering::SeqCst);
+                let authorize = || {
+                    if objects.gets.load(Ordering::SeqCst) >= allowed_reads {
+                        denied_replica_read()
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = if inspect {
+                    run_async(source.inspect_replica_checked(
+                        bundle.root_object_id, replica_limits(), authorize,
+                    )).map(|_| ())
+                } else {
+                    run_async(source.export_replica_checked(
+                        bundle.root_object_id, replica_limits(), authorize,
+                    )).map(|_| ())
+                };
+                assert!(matches!(result, Err(ConnectorStateStoreError::InvalidReplica { .. })));
+                assert_eq!(objects.gets.load(Ordering::SeqCst), allowed_reads);
+                assert_eq!(objects.mutations.load(Ordering::SeqCst), mutations);
+                assert_eq!(source.change_bus.generation(), generation);
+            }
+        }
+    }
+
+    #[test]
+    fn revoked_replica_reads_withhold_errors_from_the_same_store_read() {
+        let objects = Arc::new(ReplicaReadProbe::new(store()));
+        let source = test_store(objects.clone());
+        append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        for inspect in [false, true] {
+            for failed_read in 1..=bundle.objects.len() {
+                objects.gets.store(0, Ordering::SeqCst);
+                objects.fail_on_get.store(failed_read, Ordering::SeqCst);
+                let authorize = || {
+                    if objects.gets.load(Ordering::SeqCst) >= failed_read {
+                        denied_replica_read()
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = if inspect {
+                    run_async(source.inspect_replica_checked(
+                        bundle.root_object_id, replica_limits(), authorize,
+                    )).map(|_| ())
+                } else {
+                    run_async(source.export_replica_checked(
+                        bundle.root_object_id, replica_limits(), authorize,
+                    )).map(|_| ())
+                };
+                let error = result.unwrap_err();
+                assert!(matches!(error, ConnectorStateStoreError::InvalidReplica { .. }));
+                assert!(!error.to_string().contains("private-source-path"));
+                assert_eq!(objects.gets.load(Ordering::SeqCst), failed_read);
+            }
+        }
+    }
+
+    #[test]
+    fn checked_replica_reads_recheck_before_returning_final_results() {
+        let source = test_store(store());
+        append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        for inspect in [false, true] {
+            let calls = AtomicUsize::new(0);
+            let count = || { calls.fetch_add(1, Ordering::SeqCst); Ok(()) };
+            if inspect {
+                run_async(source.inspect_replica_checked(
+                    bundle.root_object_id, replica_limits(), count,
+                )).unwrap();
+            } else {
+                run_async(source.export_replica_checked(
+                    bundle.root_object_id, replica_limits(), count,
+                )).unwrap();
+            }
+            let final_call = calls.swap(0, Ordering::SeqCst);
+            assert!(final_call > bundle.objects.len());
+            let authorize = || {
+                if calls.fetch_add(1, Ordering::SeqCst) + 1 == final_call {
+                    denied_replica_read()
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if inspect {
+                run_async(source.inspect_replica_checked(
+                    bundle.root_object_id, replica_limits(), authorize,
+                )).map(|_| ())
+            } else {
+                run_async(source.export_replica_checked(
+                    bundle.root_object_id, replica_limits(), authorize,
+                )).map(|_| ())
+            };
+            assert!(matches!(result, Err(ConnectorStateStoreError::InvalidReplica { .. })));
+            assert_eq!(calls.load(Ordering::SeqCst), final_call);
+        }
+    }
+
+    #[test]
+    fn cancelling_replica_reads_drops_pending_io_without_source_mutation() {
+        let objects = Arc::new(ReplicaReadProbe::new(store()));
+        let source = test_store(objects.clone());
+        append_ok(&source, state(0, None, lease_id(1)));
+        let bundle = export_test_replica(&source);
+        let mutations = objects.mutations.load(Ordering::SeqCst);
+        let generation = source.change_bus.generation();
+        for inspect in [false, true] {
+            objects.gets.store(0, Ordering::SeqCst);
+            objects.pause_on_get.store(2, Ordering::SeqCst);
+            run_async(async {
+                let mut operation = Box::pin(async {
+                    if inspect {
+                        source.inspect_replica_checked(
+                            bundle.root_object_id, replica_limits(), || Ok(()),
+                        ).await.map(|_| ())
+                    } else {
+                        source.export_replica_checked(
+                            bundle.root_object_id, replica_limits(), || Ok(()),
+                        ).await.map(|_| ())
+                    }
+                });
+                assert!(futures_util::poll!(operation.as_mut()).is_pending());
+                assert_eq!(objects.gets.load(Ordering::SeqCst), 2);
+                assert_eq!(objects.active_gets.load(Ordering::SeqCst), 1);
+                drop(operation);
+                assert_eq!(objects.active_gets.load(Ordering::SeqCst), 0);
+            });
+            assert_eq!(objects.mutations.load(Ordering::SeqCst), mutations);
+            assert_eq!(source.change_bus.generation(), generation);
+        }
+        objects.pause_on_get.store(0, Ordering::SeqCst);
+        assert_eq!(run_async(source.inspect_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )).unwrap().object_count, bundle.objects.len());
+    }
+
+    #[test]
+    fn replica_inspection_distinguishes_missing_root_from_missing_ancestry() {
+        let source = test_store(store());
+        let missing = ObjectId::from_bytes([99; 32]);
+        assert!(matches!(run_async(source.inspect_replica_checked(
+            missing, replica_limits(), || Ok(()),
+        )), Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::NotFound(id)))
+            if id == missing));
+        let (head0, _) = append_ok(&source, state(0, None, lease_id(1)));
+        append_ok(&source, state(1, Some(head0), lease_id(2)));
+        let bundle = export_test_replica(&source);
+        let objects = store();
+        for object in bundle.objects.iter().skip(1) {
+            run_async(objects.put(object.clone())).unwrap();
+        }
+        let incomplete = test_store(objects);
+        assert!(matches!(run_async(incomplete.inspect_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )), Err(ConnectorStateStoreError::ObjectStore(ObjectStoreError::NotFound(id)))
+            if id == head0));
+    }
+
+    #[test]
+    fn replica_inspection_remains_pinned_to_empty_and_historical_roots() {
+        let source = test_store(store());
+        let empty = run_async(source.store_root(root_with_head(None, 12))).unwrap();
+        let empty_report = run_async(source.inspect_replica_checked(
+            empty, replica_limits(), || Ok(()),
+        )).unwrap();
+        assert_eq!(empty_report.object_count, 1);
+        let (head0, _) = append_ok(&source, state(0, None, lease_id(1)));
+        let initial = export_test_replica(&source);
+        append_ok(&source, state(1, Some(head0), lease_id(2)));
+        let historical = run_async(source.inspect_replica_checked(
+            initial.root_object_id, replica_limits(), || Ok(()),
+        )).unwrap();
+        assert_eq!(historical.object_count, 2);
+        assert_eq!(historical.canonical_bytes, replica_bytes(&initial));
+        assert_eq!(run_async(source.inspect_replica_checked(
+            empty, replica_limits(), || Ok(()),
+        )).unwrap(), empty_report);
+    }
+
+    #[test]
+    fn replica_inspection_preserves_signature_lineage_fencing_and_writer_checks() {
+        let genesis = state(0, None, lease_id(1));
+        let genesis_id = replica_with_states(std::slice::from_ref(&genesis)).objects[0].object_id;
+        let mut unsigned = genesis.clone();
+        unsigned.signature = Signature::zero();
+        let mut stale = state(1, Some(genesis_id), lease_id(2));
+        stale.lease_seq = 9;
+        stale.sign_with(&test_state_signing_key()).unwrap();
+        for states in [
+            vec![unsigned],
+            vec![state(3, None, lease_id(1))],
+            vec![genesis.clone(), state(2, Some(genesis_id), lease_id(2))],
+            vec![genesis.clone(), stale],
+        ] {
+            let bundle = replica_with_states(&states);
+            let objects = store();
+            for object in &bundle.objects {
+                run_async(objects.put(object.clone())).unwrap();
+            }
+            let source = test_store(objects);
+            let inspected = run_async(source.inspect_replica_checked(
+                bundle.root_object_id, replica_limits(), || Ok(()),
+            )).unwrap_err();
+            let exported = run_async(source.export_replica_checked(
+                bundle.root_object_id, replica_limits(), || Ok(()),
+            )).unwrap_err();
+            assert!(matches!(inspected,
+                ConnectorStateStoreError::InvalidStateSignature(_)
+                | ConnectorStateStoreError::SequenceMismatch { .. }
+                | ConnectorStateStoreError::StaleLease { .. }));
+            assert_eq!(std::mem::discriminant(&inspected), std::mem::discriminant(&exported));
+        }
+        let source = test_store(store());
+        append_ok(&source, genesis);
+        let bundle = export_test_replica(&source);
+        let untrusted = source.with_trusted_writer_keys([[0xee; 32]]);
+        assert!(matches!(run_async(untrusted.inspect_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )), Err(ConnectorStateStoreError::UntrustedWriterKey { .. })));
+    }
+
+    #[test]
+    fn replica_inspection_returns_fixed_size_metadata_for_payload_heavy_history() {
+        let source = test_store(store())
+            .with_snapshot_every_entries(0)
+            .with_snapshot_every_secs(0);
+        let mut previous = None;
+        for seq in 0u64..16 {
+            let mut next = state(seq, previous, lease_id(u8::try_from(seq + 1).unwrap()));
+            next.state_cbor = fcp_cbor::to_canonical_cbor(&vec![7u64; 4096]).unwrap();
+            next.sign_with(&test_state_signing_key()).unwrap();
+            previous = Some(append_ok(&source, next).0);
+        }
+        let bundle = export_test_replica(&source);
+        let inspection = run_async(source.inspect_replica_checked(
+            bundle.root_object_id, replica_limits(), || Ok(()),
+        )).unwrap();
+        assert_eq!(inspection.object_count, 17);
+        assert_eq!(inspection.canonical_bytes, replica_bytes(&bundle));
+        assert!(inspection.canonical_bytes > 64 * 1024);
+        // This bounds the result's shape, not the backing store or allocator.
+        assert!(std::mem::size_of_val(&inspection) <= 64);
+    }
+
+    #[test]
+    fn checked_replica_read_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let source = test_store(store());
+        let root = ObjectId::from_bytes([99; 32]);
+        assert_send(&source.export_replica_checked(root, replica_limits(), || Ok(())));
+        assert_send(&source.inspect_replica_checked(root, replica_limits(), || Ok(())));
     }
 
     #[test]
