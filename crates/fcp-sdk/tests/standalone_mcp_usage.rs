@@ -84,7 +84,8 @@ impl McpProcess {
         self.result("handshake", json!({
             "protocol_version": "2.0.0", "zone": "z:work",
             "host_public_key": key.verifying_key().to_bytes(), "nonce": vec![7_u8; 32],
-            "capabilities_requested": ["mcp.server.metrics", "mcp.prompts.read"],
+            "capabilities_requested": ["mcp.server.metrics", "mcp.prompts.read",
+                "mcp.sampling.handle", "mcp.resources.read"],
         }))["instance_id"].as_str().expect("actual instance ID").to_owned()
     }
 
@@ -130,10 +131,11 @@ fn request_with_bytes(
     scoped_key: Option<&str>,
     bytes: Option<u64>,
 ) -> Value {
-    let capability = if operation == "mcp.server.metrics" {
-        "mcp.server.metrics"
-    } else {
-        "mcp.prompts.read"
+    let capability = match operation {
+        "mcp.server.metrics" => "mcp.server.metrics",
+        "mcp.sampling.handle" => "mcp.sampling.handle",
+        "mcp.resources.read" => "mcp.resources.read",
+        _ => "mcp.prompts.read",
     };
     let constraints = CapabilityConstraints {
         resource_allow: vec!["*".into()], max_calls: calls, max_bytes: bytes,
@@ -230,10 +232,10 @@ fn rejected_targets_zones_and_signatures_leave_the_real_provider_untouched() {
 #[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
 fn admitted_provider_errors_do_not_refund_the_signed_allowance() {
     let (mut process, key, instance) = established();
-    let mut invoke = request(&key, &instance, "mcp.prompts.get", 1, None);
-    // The real provider validates this before any MCP network request. It is
-    // still an admitted FCP invocation and must not earn a usage refund.
-    invoke["input"] = json!({"name": "", "arguments": {}});
+    let mut invoke = request(&key, &instance, "mcp.sampling.handle", 1, None);
+    // Schema-valid input reaches the real provider, which refuses disabled
+    // sampling locally. This admitted failure must not earn a usage refund.
+    invoke["input"] = json!({"params": {"messages": [], "maxTokens": 1}});
     let failure = process.result("invoke", invoke.clone());
     assert_eq!(failure["status"], "error");
     assert_eq!(failure["id"], invoke["id"]);
@@ -326,9 +328,9 @@ fn oversized_actual_request_cannot_spend_a_call_or_use_fake_byte_counters() {
 #[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
 fn provider_failure_returns_canonical_error_and_retains_its_byte_reservation() {
     let (mut process, key, instance) = established();
-    let mut invoke = request_with_bytes(&key, &instance, "mcp.prompts.get", None, None, Some(8 * 1024));
-    // Invalid provider parameters fail locally after admission, with no network.
-    invoke["input"] = json!({"name": "", "arguments": {}});
+    let mut invoke = request_with_bytes(&key, &instance, "mcp.sampling.handle", None, None, Some(8 * 1024));
+    // Schema-valid disabled sampling fails after admission, with no network.
+    invoke["input"] = json!({"params": {"messages": [], "maxTokens": 1}});
     let response = process.result("invoke", invoke.clone());
     assert_eq!(response["type"], "response");
     assert_eq!(response["id"], invoke["id"]);
@@ -365,4 +367,164 @@ fn oversized_provider_result_is_withheld_at_the_actual_stdio_response_boundary()
     assert_eq!(process.requests(), 1);
     assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
     assert_eq!(process.requests(), 1);
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn invalid_schema_and_simulation_do_not_spend_signed_call_or_byte_allowances() {
+    for (calls, bytes) in [(Some(1), None), (None, Some(8 * 1024))] {
+        let (mut process, key, instance) = established();
+        let mut invoke = request_with_bytes(&key, &instance, "mcp.sampling.handle", calls, None, bytes);
+        for input in [json!({"request":"private-input"}), json!({"params":42})] {
+            invoke["input"] = input;
+            let preview = process.result("simulate", simulation(&invoke));
+            assert_eq!(preview["would_succeed"], false);
+            assert!(preview.to_string().contains("declared schema"));
+            let error = process.call("invoke", invoke.clone());
+            assert_eq!(error["error"]["code"], "FCP-1003");
+            assert!(!error.to_string().contains("private-input"));
+        }
+        assert_eq!(process.requests(), 0);
+        invoke["input"] = json!({"params":{"messages":[],"maxTokens":1}});
+        // Schema and authority pass. A preview still cannot promise that the
+        // provider's sampling policy will allow the operation at execution.
+        for _ in 0..3 {
+            assert_eq!(process.result("simulate", simulation(&invoke))["would_succeed"], true);
+        }
+        assert_eq!(process.requests(), 0);
+        assert_eq!(process.result("invoke", invoke.clone())["status"], "error");
+        assert_eq!(process.requests(), 1);
+        assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+        assert_eq!(process.requests(), 1);
+    }
+}
+
+/// Own a minimal raw upstream fixture, including teardown on assertion failure.
+/// No unbounded accept/read and no detached server worker survives the test.
+struct ResourceFixture {
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<JoinHandle<Vec<String>>>,
+}
+
+impl ResourceFixture {
+    fn start(result: Value) -> Self {
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut methods = Vec::new();
+            for expected in ["initialize", "notifications/initialized", "resources/read"] {
+                let mut stream = loop {
+                    if stopped.load(Ordering::Acquire) { return methods; }
+                    assert!(started.elapsed() < Duration::from_secs(10), "upstream fixture deadline");
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0_u8];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() <= 8192);
+                }
+                let headers = std::str::from_utf8(&headers).unwrap();
+                assert!(headers.starts_with("POST /mcp HTTP/1.1\r\n"));
+                let length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap();
+                assert!(length <= 8192);
+                let mut body = vec![0_u8; length];
+                stream.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["method"], expected);
+                methods.push(expected.to_owned());
+                let (status, response) = match expected {
+                    "initialize" => ("200 OK", json!({"jsonrpc":"2.0","id":body["id"],"result":{
+                        "protocolVersion":"2025-06-18", "capabilities":{"resources":{}},
+                        "serverInfo":{"name":"contract-fixture","version":"1"}
+                    }}).to_string()),
+                    "notifications/initialized" => ("202 Accepted", String::new()),
+                    _ => {
+                        assert_eq!(body["params"]["uri"], "urn:contract-test");
+                        ("200 OK", json!({"jsonrpc":"2.0","id":body["id"],"result":result}).to_string())
+                    }
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                stream.flush().unwrap();
+            }
+            methods
+        });
+        Self { url, stop, worker: Some(worker) }
+    }
+
+    fn finish(mut self) {
+        let methods = self.worker.take().unwrap().join().unwrap();
+        assert_eq!(methods, ["initialize", "notifications/initialized", "resources/read"]);
+    }
+}
+
+impl Drop for ResourceFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn malformed_upstream_success_is_withheld_without_refunding_or_replaying() {
+    for (calls, bytes) in [(Some(1), None), (None, Some(16 * 1024))] {
+        let upstream = ResourceFixture::start(json!({"contents":"private-upstream-result"}));
+        let (mut process, key, _) = established();
+        process.result("configure", json!({"mcp_url":upstream.url}));
+        let instance = process.handshake(&key);
+        let mut invoke = request_with_bytes(&key, &instance, "mcp.resources.read", calls, None, bytes);
+        invoke["input"] = json!({"uri":"urn:contract-test"});
+        let reply = process.call("invoke", invoke.clone());
+        assert!(reply.get("result").is_none());
+        assert!(reply["error"]["message"].as_str().unwrap().contains("operation contract"));
+        assert!(reply["error"]["message"].as_str().unwrap().contains("outcome is unknown"));
+        assert!(!reply.to_string().contains("private-upstream-result"));
+        assert_eq!(process.requests(), 1);
+        assert_eq!(process.result("simulate", simulation(&invoke))["would_succeed"], false);
+        assert_eq!(process.call("invoke", invoke)["error"]["code"], "FCP-3001");
+        assert_eq!(process.requests(), 1);
+        upstream.finish();
+    }
+}
+
+#[test]
+#[ignore = "requires a built binary in FCP_MCP_BRIDGE_BIN"]
+fn valid_upstream_result_extensions_survive_contract_and_quota_checks() {
+    let expected = json!({"contents":[{"uri":"urn:contract-test","text":"exact/雪"}],
+        "_meta":{"opaque":{"keep":true}}});
+    let upstream = ResourceFixture::start(expected.clone());
+    let (mut process, key, _) = established();
+    process.result("configure", json!({"mcp_url":upstream.url}));
+    let instance = process.handshake(&key);
+    let mut invoke = request_with_bytes(&key, &instance, "mcp.resources.read", Some(1), None, Some(16 * 1024));
+    invoke["input"] = json!({"uri":"urn:contract-test"});
+    let reply = process.result("invoke", invoke.clone());
+    assert_eq!(reply["id"], invoke["id"]);
+    assert_eq!(reply["status"], "ok");
+    assert_eq!(reply["result"], expected);
+    assert_eq!(process.requests(), 1);
+    upstream.finish();
 }

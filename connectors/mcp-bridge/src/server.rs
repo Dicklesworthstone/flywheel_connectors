@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fcp_core::{FcpError, FcpResult, HandshakeRequest, HealthSnapshot, HealthState,
     InvokeRequest, InvokeResponse, OperationId, RequestId, SimulateRequest, SimulateResponse};
-use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
+use fcp_sdk::prelude::{OperationContractSet, StandaloneInvocation, StandaloneSession};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -33,6 +33,7 @@ const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 pub struct McpBridgeServer {
     connector: McpBridgeConnector,
     session: StandaloneSession,
+    contracts: OperationContractSet,
     configured: bool,
     started_at: Instant,
     stopping: bool,
@@ -44,6 +45,7 @@ impl McpBridgeServer {
         Ok(Self {
             connector: McpBridgeConnector::new(),
             session: StandaloneSession::new(MANIFEST)?,
+            contracts: OperationContractSet::from_manifest_toml(MANIFEST)?,
             configured: false,
             started_at: Instant::now(),
             stopping: false,
@@ -190,6 +192,10 @@ impl McpBridgeServer {
         let request: InvokeRequest = decode(params, "Invalid FCP invoke request")?;
         validate_request(&request.r#type, "invoke", &request.id, &request.input)?;
         request.validate_idempotency_key().map_err(|_| invalid("Invalid idempotency key"))?;
+        // A signed token does not make malformed operation arguments valid.
+        // Validation precedes both quota reservation and every provider call.
+        // Its elapsed time is included in the original invocation deadline.
+        self.contracts.validate_input(&request.operation, &request.input)?;
         let resource_uris = resource_uris(&request.operation, &request.input)?;
         let budget = request.deadline_ms.map(Duration::from_millis)
             .unwrap_or(MAX_INVOKE_TIMEOUT).min(MAX_INVOKE_TIMEOUT);
@@ -225,9 +231,13 @@ impl McpBridgeServer {
         // Admitted provider failures are canonical error responses too. Letting
         // them escape via `?` would bypass the byte boundary for error payloads.
         let response = match outcome {
-            Ok(result) => InvokeResponse::ok(id, result),
-            Err(error) => InvokeResponse::error(id, error),
+            Ok(result) => InvokeResponse::ok(id.clone(), result),
+            Err(error) => InvokeResponse::error(id.clone(), error),
         };
+        // Withhold malformed success data before settling any reservation.
+        // Dropping the charged witness on a contract failure never refunds an
+        // admitted call or its bytes and never authorizes an automatic replay.
+        self.contracts.validate_response(&operation, &id, &response)?;
         let encoded = encode(&response)?;
         // No response leaves this function until its complete envelope fits.
         // Only a successful response releases unused response capacity; failure
@@ -240,15 +250,17 @@ impl McpBridgeServer {
         self.check_ready()?;
         let request: SimulateRequest = decode(params, "Invalid FCP simulate request")?;
         validate_request(&request.r#type, "simulate", &request.id, &request.input)?;
-        let resources = resource_uris(&request.operation, &request.input)?;
-        let response = match self.session.authorize(
-            &request.connector_id, &request.zone_id, &request.operation,
-            request.capability_token, &resources,
-        ) {
+        let checked = self.contracts.validate_input(&request.operation, &request.input)
+            .and_then(|()| resource_uris(&request.operation, &request.input))
+            .and_then(|resources| self.session.authorize(
+                &request.connector_id, &request.zone_id, &request.operation,
+                request.capability_token, &resources,
+            ));
+        let response = match checked {
             Ok(_) => SimulateResponse::allowed(request.id),
             Err(error) => SimulateResponse::denied(request.id, error.to_string(), error.error_code()),
         };
-        // Authorization simulation checks remaining call/byte quota without
+        // Schema/authorization simulation checks remaining call/byte quota without
         // charging or reserving it. It does not predict the complete invocation
         // message size or provider output, and cannot guarantee later admission
         // or API success. No provider work occurs during this local preview.
@@ -319,6 +331,9 @@ async fn await_invocation(
 
 #[cfg(test)]
 mod host_contract_tests;
+
+#[cfg(test)]
+mod schema_contract_tests;
 
 #[cfg(test)]
 mod tests {
