@@ -22,6 +22,9 @@ use futures_util::future::{Either, select};
 
 use super::{CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest};
 
+#[path = "native_invocation.rs"]
+mod invocation;
+
 const MAX_NATIVE_INVOCATION_LIFETIME: Duration = Duration::from_secs(60);
 const RETIREMENT_GRACE: Duration = Duration::from_secs(2);
 // Physical exit still needs a nonblocking child probe. Ordinary cancellation
@@ -522,32 +525,6 @@ impl NativeInvocationTermination {
             ));
         }
         Ok(())
-    }
-
-    pub(super) async fn invoke<F>(&self, operation: F) -> HostResult<InvokeResponse>
-    where
-        F: Future<Output = HostResult<InvokeResponse>>,
-    {
-        let mut waiter = NativeInvocationWaiter {
-            invocation: self.clone(),
-            returned: false,
-        };
-        let result = {
-            let mut cancelled = pin!(self.cancelled());
-            let mut operation = pin!(operation);
-            match select(cancelled.as_mut(), operation.as_mut()).await {
-                Either::Left(_) => Err(HostError::RegistryError(
-                    "connector invocation cancelled or deadline expired".to_string(),
-                )),
-                Either::Right((result, _)) => result,
-            }
-        };
-        // The losing operation future is dropped before examining its RPCs.
-        // Resilience timeouts may also drop an RPC waiter before actor exit.
-        let settlement = self.ensure_settled().await;
-        waiter.returned = true;
-        settlement?;
-        result
     }
 }
 
