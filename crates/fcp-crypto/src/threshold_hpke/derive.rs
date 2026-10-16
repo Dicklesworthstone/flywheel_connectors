@@ -10,15 +10,49 @@
 use crate::{
     CryptoError, CryptoResult, Ed25519VerifyingKey, FrostPublicKeyPackage, FrostSigningShare,
 };
-use curve25519_dalek::{edwards::CompressedEdwardsY, scalar::Scalar};
+use curve25519_dalek::{
+    edwards::{CompressedEdwardsY, EdwardsPoint},
+    scalar::Scalar,
+    traits::IsIdentity,
+};
 
-/// Decompress an Ed25519 verifying key into its curve point.
+/// Admit a canonical point in the prime-order subgroup, not just any point
+/// that decompresses. Do not clear the cofactor: that changes the threshold
+/// DH value and would silently accept a different sender key.
+///
+/// The identity is permitted here for a mathematically zero participant share.
+/// Public keys and ephemeral points must use the stricter `key_point` below.
+///
+/// # Errors
+/// Rejects invalid encodings and points with a nonzero torsion component.
+pub(super) fn subgroup_point(encoded: &[u8; 32]) -> CryptoResult<EdwardsPoint> {
+    let point = CompressedEdwardsY(*encoded)
+        .decompress()
+        .ok_or(CryptoError::InvalidPublicKey)?;
+    if point.compress().to_bytes() != *encoded || !point.is_torsion_free() {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    Ok(point)
+}
+
+/// An unclamped secret scalar must only multiply a nonidentity, prime-order
+/// public point. Small-order rejection alone does not reject mixed-order points.
+///
+/// # Errors
+/// Rejects the identity in addition to the errors from `subgroup_point`.
+pub(super) fn key_point(encoded: &[u8; 32]) -> CryptoResult<EdwardsPoint> {
+    let point = subgroup_point(encoded)?;
+    if point.is_identity() {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    Ok(point)
+}
+
+/// Validate an Ed25519 verifying key before using it for threshold DH.
 fn edwards_point(
     verifying_key: &Ed25519VerifyingKey,
 ) -> CryptoResult<curve25519_dalek::edwards::EdwardsPoint> {
-    CompressedEdwardsY(verifying_key.to_bytes())
-        .decompress()
-        .ok_or(CryptoError::InvalidPublicKey)
+    key_point(&verifying_key.to_bytes())
 }
 
 /// Group keypair images of a FROST public key package:
@@ -26,7 +60,7 @@ fn edwards_point(
 ///
 /// # Errors
 ///
-/// Returns an error if the group key bytes are not decompressible.
+/// Rejects noncanonical, identity, small-order and mixed-order group keys.
 pub fn group_keypair(pkpkg: &FrostPublicKeyPackage) -> CryptoResult<([u8; 32], [u8; 32])> {
     let ed = edwards_point(pkpkg.group_public_key())?;
     Ok((ed.compress().to_bytes(), ed.to_montgomery().to_bytes()))
@@ -36,7 +70,7 @@ pub fn group_keypair(pkpkg: &FrostPublicKeyPackage) -> CryptoResult<([u8; 32], [
 ///
 /// # Errors
 ///
-/// Returns an error if the group key bytes are not decompressible.
+/// Rejects noncanonical, identity, small-order and mixed-order group keys.
 pub fn group_x25519_public_key(pkpkg: &FrostPublicKeyPackage) -> CryptoResult<[u8; 32]> {
     group_keypair(pkpkg).map(|(_, x25519)| x25519)
 }
@@ -46,7 +80,7 @@ pub fn group_x25519_public_key(pkpkg: &FrostPublicKeyPackage) -> CryptoResult<[u
 ///
 /// # Errors
 ///
-/// Returns an error if the group key bytes are not decompressible.
+/// Rejects noncanonical, identity, small-order and mixed-order group keys.
 pub fn group_x25519_public_key_from_edwards_verifying_key(
     verifying_key: &Ed25519VerifyingKey,
 ) -> CryptoResult<[u8; 32]> {

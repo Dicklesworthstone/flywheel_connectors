@@ -48,14 +48,22 @@
 //! [`ThresholdHpkeError::InsufficientShares`] below threshold. A
 //! malicious participant submitting a well-formed share for the same
 //! ciphertext is still possible; that fails closed at AEAD open.
+//!
+//! # Point admission
+//!
+//! Group and ephemeral keys must be canonical, nonidentity prime-order
+//! Edwards points before any unclamped secret-share multiplication. Merely
+//! decompressing, rejecting small-order points, or checking the final DH
+//! u-coordinate does not exclude mixed-order inputs. Decap contributions
+//! must also be canonical and torsion-free; identity contributions remain
+//! valid for zero-valued shares. These checks do not authenticate a participant
+//! or replace a proof of correct decapsulation.
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use curve25519_dalek::{
-    constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY, scalar::Scalar,
-};
+use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, scalar::Scalar};
 use hkdf::Hkdf;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -110,8 +118,7 @@ impl ThresholdHpkePublicKey {
     ///
     /// # Errors
     ///
-    /// Returns an error if the group key bytes are not a decompressible
-    /// Ed25519 point.
+    /// Rejects noncanonical, identity, small-order and mixed-order group keys.
     pub fn from_frost_pkpkg(pkpkg: &FrostPublicKeyPackage) -> CryptoResult<Self> {
         let (group_ed, group_x25519) = derive::group_keypair(pkpkg)?;
         Ok(Self {
@@ -231,17 +238,19 @@ pub enum ThresholdHpkeError {
 ///
 /// # Errors
 ///
-/// Returns an error if the wrapped signing share or the ciphertext's
-/// ephemeral point is invalid.
+/// Rejects invalid signing shares, noncanonical or non-prime-order public
+/// points, identity keys, and ciphertext bodies outside the wire bounds.
 pub fn decap_share(
     key_package: &FrostKeyPackage,
     ct: &ThresholdHpkeCiphertext,
 ) -> CryptoResult<DecapShare> {
-    let participant_scalar = derive::participant_scalar(key_package.signing_share())?;
+    // Validate all public material before accessing the signing-share scalar.
+    // Unclamped FROST scalars must never multiply a torsion-bearing input.
     let ephemeral = decompress_ephemeral(ct)?;
-    let contribution_ed = ephemeral * &participant_scalar;
     let group_x25519 =
         derive::group_x25519_public_key_from_edwards_verifying_key(key_package.group_public_key())?;
+    let participant_scalar = derive::participant_scalar(key_package.signing_share())?;
+    let contribution_ed = ephemeral * &participant_scalar;
     Ok(DecapShare {
         participant: key_package.participant(),
         contribution: contribution_ed.compress().to_bytes(),
@@ -259,7 +268,9 @@ pub fn decap_share(
 ///   `shares.len() < threshold`.
 /// - [`ThresholdHpkeError::InconsistentShares`] when shares disagree on
 ///   ciphertext binding, group key, duplicate a participant, or are not
-///   decompressible curve points.
+///   canonical points in the prime-order subgroup.
+/// - Invalid ephemeral keys or out-of-bounds bodies surface as
+///   [`CryptoError::HpkeFailed`], including directly constructed/Serde values.
 /// - AEAD open failure (wrong quorum composition, tampered share/body)
 ///   surfaces as [`CryptoError::HpkeFailed`].
 pub fn combine_decap(
@@ -281,14 +292,8 @@ pub fn combine_decap(
         .into());
     }
 
-    // All shares must bind the same ciphertext + group key and come
-    // from distinct participants.
-    let group_x25519 = shares[0].group_x25519;
-    if shares.iter().any(|share| {
-        share.group_x25519 != group_x25519 || share.binding != ct.binding(&group_x25519)
-    }) {
-        return Err(ThresholdHpkeError::InconsistentShares.into());
-    }
+    // Preserve typed threshold/participant refusals before inspecting ciphertext
+    // contents, and reject duplicates before allocating interpolation inputs.
     let mut seen = std::collections::BTreeSet::new();
     for share in shares {
         if share.participant == 0 || !seen.insert(share.participant) {
@@ -296,15 +301,31 @@ pub fn combine_decap(
         }
     }
 
+    // Serde/public fields bypass from_bytes, so every crypto entry validates.
+    // Bound the body before hashing it, and compute its binding only once.
+    let _ = decompress_ephemeral(ct)?;
+    let group_x25519 = shares[0].group_x25519;
+    let binding = ct.binding(&group_x25519);
+    if shares.iter().any(|share| {
+        share.group_x25519 != group_x25519 || share.binding != binding
+    }) {
+        return Err(ThresholdHpkeError::InconsistentShares.into());
+    }
+    let points = shares
+        .iter()
+        .map(|share| {
+            derive::subgroup_point(&share.contribution).map_err(|_| {
+                CryptoError::ThresholdHpke(ThresholdHpkeError::InconsistentShares)
+            })
+        })
+        .collect::<CryptoResult<Vec<_>>>()?;
+
     // Lagrange-combine at zero on the Edwards curve:
     // Σ λ_i · (s_i · E) = s · E.
     let indices: Vec<u16> = shares.iter().map(|share| share.participant).collect();
     let coefficients = derive::lagrange_coefficients(&indices)?;
     let mut combined_ed: Option<curve25519_dalek::edwards::EdwardsPoint> = None;
-    for (share, lambda) in shares.iter().zip(&coefficients) {
-        let point = CompressedEdwardsY(share.contribution)
-            .decompress()
-            .ok_or(ThresholdHpkeError::InconsistentShares)?;
+    for (point, lambda) in points.iter().zip(&coefficients) {
         let scaled = point * lambda;
         combined_ed = Some(match combined_ed {
             Some(accumulator) => accumulator + scaled,
@@ -339,7 +360,8 @@ pub fn combine_decap(
 ///
 /// # Errors
 ///
-/// Returns an error on RNG or AEAD failure.
+/// Rejects invalid group keys, oversized plaintext, entropy failure, a zero
+/// ephemeral scalar, or AEAD failure. No invalid-input retry is performed.
 pub fn encap(
     pk: &ThresholdHpkePublicKey,
     info: &[u8],
@@ -354,7 +376,8 @@ pub fn encap(
 ///
 /// # Errors
 ///
-/// Returns an error on RNG or AEAD failure.
+/// Rejects invalid group keys, oversized plaintext, entropy failure, a zero
+/// ephemeral scalar, or AEAD failure. No invalid-input retry is performed.
 pub fn encap_with_rng<R: CryptoRng + RngCore>(
     pk: &ThresholdHpkePublicKey,
     info: &[u8],
@@ -362,17 +385,31 @@ pub fn encap_with_rng<R: CryptoRng + RngCore>(
     aad: &[u8],
     rng: &mut R,
 ) -> CryptoResult<ThresholdHpkeCiphertext> {
+    if plaintext.len() > MAX_AEAD_BODY - 16 {
+        return Err(CryptoError::HpkeFailed(
+            "threshold plaintext exceeds body cap".into(),
+        ));
+    }
+    // Private fields can still be supplied via Deserialize. Bind the two public
+    // representations and validate the point before drawing any secret entropy.
+    let group_ed = derive::key_point(&pk.group_ed)?;
+    if group_ed.to_montgomery().to_bytes() != pk.group_x25519 {
+        return Err(CryptoError::InvalidPublicKey);
+    }
     let mut seed = [0u8; 32];
-    rng.fill_bytes(&mut seed);
+    rng.try_fill_bytes(&mut seed)
+        .map_err(|_| CryptoError::HpkeFailed("threshold entropy unavailable".into()))?;
     let ephemeral_scalar = Scalar::from_bytes_mod_order(seed);
+    if ephemeral_scalar == Scalar::ZERO {
+        return Err(CryptoError::HpkeFailed(
+            "threshold ephemeral scalar is zero".into(),
+        ));
+    }
     let ephemeral_point = ED25519_BASEPOINT_POINT * &ephemeral_scalar;
     let ephemeral_pk = ephemeral_point.compress().to_bytes();
 
     // Sealer-side DH: e · X_ed, computed on the Edwards group public
     // key point (decompressed from the stored Edwards group key).
-    let group_ed = CompressedEdwardsY(pk.group_ed)
-        .decompress()
-        .ok_or_else(|| CryptoError::HpkeFailed("threshold group key not decompressible".into()))?;
     let dh_ed = group_ed * &ephemeral_scalar;
     let dh = dh_ed.to_montgomery().to_bytes();
     if dh == [0u8; POINT_SIZE] {
@@ -407,11 +444,16 @@ pub fn encap_with_rng<R: CryptoRng + RngCore>(
 fn decompress_ephemeral(
     ct: &ThresholdHpkeCiphertext,
 ) -> CryptoResult<curve25519_dalek::edwards::EdwardsPoint> {
-    CompressedEdwardsY(ct.ephemeral_pk)
-        .decompress()
-        .ok_or_else(|| {
-            CryptoError::HpkeFailed("threshold ephemeral point is not decompressible".into())
-        })
+    if !(16..=MAX_AEAD_BODY).contains(&ct.aead_body.len()) {
+        return Err(CryptoError::HpkeFailed(
+            "threshold ciphertext body is outside wire bounds".into(),
+        ));
+    }
+    derive::key_point(&ct.ephemeral_pk).map_err(|_| {
+        CryptoError::HpkeFailed(
+            "threshold ephemeral point must be canonical, nonidentity and prime-order".into(),
+        )
+    })
 }
 
 fn group_pk_bytes(key_package: &FrostKeyPackage) -> CryptoResult<[u8; POINT_SIZE]> {
@@ -515,6 +557,213 @@ fn labeled_expand_info<const N: usize>(suite_id: &[u8], label: &[u8], context: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only RNG: any accidental use of the panicking infallible API fails
+    // the test. Invalid public input must be rejected before requesting entropy.
+    #[derive(Default)]
+    struct ProbeRng {
+        seed: [u8; 32],
+        calls: usize,
+        fail: bool,
+    }
+
+    impl RngCore for ProbeRng {
+        fn next_u32(&mut self) -> u32 {
+            panic!("encapsulation must request a complete seed");
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            panic!("encapsulation must request a complete seed");
+        }
+
+        fn fill_bytes(&mut self, _: &mut [u8]) {
+            panic!("encapsulation must use fallible entropy");
+        }
+
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rand::Error> {
+            self.calls += 1;
+            if self.fail {
+                return Err(rand::Error::new(std::io::Error::other(
+                    "private entropy provider diagnostic",
+                )));
+            }
+            destination.copy_from_slice(&self.seed);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for ProbeRng {}
+
+    fn scalar_public_key(secret: Scalar) -> ThresholdHpkePublicKey {
+        let point = ED25519_BASEPOINT_POINT * secret;
+        ThresholdHpkePublicKey {
+            group_ed: point.compress().to_bytes(),
+            group_x25519: point.to_montgomery().to_bytes(),
+        }
+    }
+
+    #[test]
+    fn key_admission_rejects_small_and_mixed_order_points_without_normalizing_them() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        for torsion in &EIGHT_TORSION {
+            assert!(derive::key_point(&torsion.compress().to_bytes()).is_err());
+        }
+        for torsion in EIGHT_TORSION.iter().skip(1) {
+            let mixed = ED25519_BASEPOINT_POINT + torsion;
+            assert!(!mixed.is_small_order(), "a low-order-only check is insufficient");
+            assert!(derive::key_point(&mixed.compress().to_bytes()).is_err());
+            assert!(derive::subgroup_point(&mixed.compress().to_bytes()).is_err());
+            assert!(derive::subgroup_point(&torsion.compress().to_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_prime_order_points_are_preserved_byte_for_byte() {
+        for scalar in [1u64, 2, 17, 1024] {
+            let encoded = (ED25519_BASEPOINT_POINT * Scalar::from(scalar))
+                .compress()
+                .to_bytes();
+            assert_eq!(derive::key_point(&encoded).unwrap().compress().to_bytes(), encoded);
+            assert_eq!(derive::subgroup_point(&encoded).unwrap().compress().to_bytes(), encoded);
+        }
+    }
+
+    #[test]
+    fn noncanonical_identity_encodings_are_not_accepted_as_zero_contributions() {
+        let mut negative_zero = [0u8; 32];
+        negative_zero[0] = 1;
+        negative_zero[31] = 0x80;
+        // y = p + 1 represents the identity after field reduction but is not
+        // its canonical field encoding. Neither alias can enter signed data.
+        let mut unreduced_identity = [0xff; 32];
+        unreduced_identity[0] = 0xee;
+        unreduced_identity[31] = 0x7f;
+        for alias in [negative_zero, unreduced_identity] {
+            assert!(derive::subgroup_point(&alias).is_err());
+            assert!(derive::key_point(&alias).is_err());
+        }
+    }
+
+    #[test]
+    fn deserialized_public_keys_are_validated_before_entropy_is_requested() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let valid = scalar_public_key(Scalar::from(17u64));
+        let mut bad_encodings = EIGHT_TORSION
+            .iter()
+            .map(|point| point.compress().to_bytes())
+            .collect::<Vec<_>>();
+        bad_encodings.extend(EIGHT_TORSION.iter().skip(1).map(|torsion| {
+            (ED25519_BASEPOINT_POINT + torsion).compress().to_bytes()
+        }));
+        for encoded in bad_encodings {
+            let key: ThresholdHpkePublicKey = serde_json::from_value(serde_json::json!({
+                "group_ed": encoded,
+                "group_x25519": valid.group_x25519,
+            })).unwrap();
+            let mut rng = ProbeRng::default();
+            assert!(matches!(encap_with_rng(&key, b"", b"", b"", &mut rng),
+                Err(CryptoError::InvalidPublicKey)));
+            assert_eq!(rng.calls, 0);
+        }
+        let mut mismatched = valid;
+        mismatched.group_x25519[0] ^= 1;
+        let mut rng = ProbeRng::default();
+        assert!(matches!(encap_with_rng(&mismatched, b"", b"", b"", &mut rng),
+            Err(CryptoError::InvalidPublicKey)));
+        assert_eq!(rng.calls, 0);
+    }
+
+    #[test]
+    fn oversized_plaintext_is_rejected_before_entropy_or_encryption() {
+        let key = scalar_public_key(Scalar::from(17u64));
+        let mut rng = ProbeRng::default();
+        let too_large = vec![0; MAX_AEAD_BODY - 16 + 1];
+        assert!(matches!(encap_with_rng(&key, b"", &too_large, b"", &mut rng),
+            Err(CryptoError::HpkeFailed(_))));
+        assert_eq!(rng.calls, 0);
+    }
+
+    #[test]
+    fn failed_entropy_and_reduced_zero_scalars_return_errors_without_retry() {
+        let key = scalar_public_key(Scalar::from(17u64));
+        let subgroup_order: [u8; 32] = hex::decode(
+            "edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010",
+        ).unwrap().try_into().unwrap();
+        for seed in [[0; 32], subgroup_order] {
+            let mut rng = ProbeRng { seed, ..ProbeRng::default() };
+            assert!(matches!(encap_with_rng(&key, b"", b"", b"", &mut rng),
+                Err(CryptoError::HpkeFailed(_))));
+            assert_eq!(rng.calls, 1);
+        }
+        let mut rng = ProbeRng { fail: true, ..ProbeRng::default() };
+        let error = encap_with_rng(&key, b"", b"", b"", &mut rng).unwrap_err();
+        assert!(matches!(error, CryptoError::HpkeFailed(_)));
+        assert!(!error.to_string().contains("private entropy provider diagnostic"));
+        assert_eq!(rng.calls, 1);
+    }
+
+    #[test]
+    fn torsion_contributions_fail_as_inconsistent_shares_before_interpolation() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let ct = ThresholdHpkeCiphertext {
+            ephemeral_pk: ED25519_BASEPOINT_POINT.compress().to_bytes(),
+            aead_body: vec![0; 16],
+        };
+        let group = scalar_public_key(Scalar::from(17u64)).group_x25519;
+        for torsion in EIGHT_TORSION.iter().skip(1) {
+            for point in [*torsion, ED25519_BASEPOINT_POINT + torsion] {
+                let share = DecapShare {
+                    participant: 1,
+                    contribution: point.compress().to_bytes(),
+                    group_x25519: group,
+                    binding: ct.binding(&group),
+                };
+                assert!(matches!(combine_decap(&[share], 1, &ct, b"", b""),
+                    Err(CryptoError::ThresholdHpke(ThresholdHpkeError::InconsistentShares))));
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_zero_share_is_allowed_but_zero_combined_dh_is_not() {
+        // f(1) = 0, f(2) = -s gives f(0) = s under weights 2 and -1.
+        // Rejecting every identity contribution would reject this valid algebra.
+        let secret = Scalar::from(17u64);
+        let key = scalar_public_key(secret);
+        let mut rng = ProbeRng { seed: [42; 32], ..ProbeRng::default() };
+        let ct = encap_with_rng(&key, b"zero-share", b"plaintext", b"aad", &mut rng).unwrap();
+        // Independent affine-Edwards/HMAC-SHA256/ChaCha20-Poly1305 vector.
+        // This is the threshold-specific wire format, not standard X25519 HPKE.
+        assert_eq!(hex::encode(key.group_ed),
+            "04be97ec9bfe6ccd01f9343b7288b117b79f91cc45c24af2f93e0060ca2b6d6f");
+        assert_eq!(hex::encode(key.group_x25519),
+            "8d1b2458343e882b5aa7f08c18e1726b64ed42f7a8e552c23bcdbdfb185b6354");
+        assert_eq!(hex::encode(ct.ephemeral_pk),
+            "5773c8a9afd05be894c5c02f1d35482fa8267bad86aba65a6713619dc55cb98f");
+        assert_eq!(hex::encode(&ct.aead_body),
+            "fe16b874629aacfd44ec797b74daea5a43c8778c9d301f5bd4");
+        let ephemeral = decompress_ephemeral(&ct).unwrap();
+        let identity = (ED25519_BASEPOINT_POINT * Scalar::ZERO).compress().to_bytes();
+        let binding = ct.binding(&key.group_x25519);
+        let first = DecapShare {
+            participant: 1, contribution: identity,
+            group_x25519: key.group_x25519, binding,
+        };
+        let mut second = DecapShare {
+            participant: 2, contribution: (ephemeral * -secret).compress().to_bytes(),
+            group_x25519: key.group_x25519, binding,
+        };
+        let opened = combine_decap(
+            &[first.clone(), second.clone()], 2, &ct, b"zero-share", b"aad",
+        ).unwrap();
+        assert_eq!(opened.as_slice(), b"plaintext");
+        second.contribution = identity;
+        assert!(matches!(combine_decap(&[first, second], 2, &ct, b"zero-share", b"aad"),
+            Err(CryptoError::HpkeFailed(_))));
+    }
 
     #[test]
     fn labeled_extract_and_expand_have_exact_rfc_9180_layouts() {

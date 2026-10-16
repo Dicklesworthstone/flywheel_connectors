@@ -210,3 +210,75 @@ fn deterministic_encap_is_reproducible_with_seeded_rng() {
     let ct_b = encap_with_rng(&public_key, INFO, PLAINTEXT, AAD, &mut rng_b).expect("encap b");
     assert_eq!(ct_a, ct_b, "same seed MUST reproduce the same ciphertext");
 }
+
+#[test]
+fn public_decap_rejects_torsion_inputs_from_struct_wire_and_serde() {
+    use curve25519_dalek::constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION};
+    use fcp_crypto::{CryptoError, ThresholdHpkeCiphertext};
+
+    let (keys, _) = execute_dkg_2_of_3();
+    let mut rejected = EIGHT_TORSION.iter()
+        .map(|point| point.compress().to_bytes()).collect::<Vec<_>>();
+    rejected.extend(EIGHT_TORSION.iter().skip(1).map(|torsion| {
+        (ED25519_BASEPOINT_POINT + torsion).compress().to_bytes()
+    }));
+    let mut negative_identity = [0; 32];
+    negative_identity[0] = 1;
+    negative_identity[31] = 0x80;
+    rejected.push(negative_identity);
+    let mut unreduced_identity = [0xff; 32];
+    unreduced_identity[0] = 0xee;
+    unreduced_identity[31] = 0x7f;
+    rejected.push(unreduced_identity);
+    for ephemeral_pk in rejected {
+        let direct = ThresholdHpkeCiphertext { ephemeral_pk, aead_body: vec![0; 16] };
+        // from_bytes is a structural parser; cryptographic entry points must
+        // validate even when a caller bypasses it with public fields or Serde.
+        let wire = ThresholdHpkeCiphertext::from_bytes(&direct.to_bytes()).unwrap();
+        let serde: ThresholdHpkeCiphertext =
+            serde_json::from_value(serde_json::to_value(&direct).unwrap()).unwrap();
+        for ct in [&direct, &wire, &serde] {
+            assert!(matches!(decap_share(&keys[&1], ct), Err(CryptoError::HpkeFailed(_))),
+                "an invalid public point must never produce a decap contribution");
+        }
+    }
+}
+
+#[test]
+fn public_crypto_entry_points_enforce_body_bounds_after_deserialization() {
+    use fcp_crypto::{CryptoError, ThresholdHpkeCiphertext};
+
+    let (keys, public) = execute_dkg_2_of_3();
+    let key = ThresholdHpkePublicKey::from_frost_pkpkg(&public).unwrap();
+    let valid = encap(&key, INFO, PLAINTEXT, AAD).unwrap();
+    let shares = [decap_share(&keys[&1], &valid).unwrap(), decap_share(&keys[&2], &valid).unwrap()];
+    for length in [0, 15, 64 * 1024 + 1] {
+        let direct = ThresholdHpkeCiphertext {
+            ephemeral_pk: valid.ephemeral_pk, aead_body: vec![0; length],
+        };
+        let ct: ThresholdHpkeCiphertext =
+            serde_json::from_value(serde_json::to_value(&direct).unwrap()).unwrap();
+        assert!(matches!(decap_share(&keys[&1], &ct), Err(CryptoError::HpkeFailed(_))));
+        assert!(matches!(combine_decap(&shares, 2, &ct, INFO, AAD), Err(CryptoError::HpkeFailed(_))));
+    }
+}
+
+#[test]
+fn empty_and_maximum_plaintexts_roundtrip_for_every_real_dkg_quorum() {
+    use fcp_crypto::ThresholdHpkeCiphertext;
+
+    let (keys, public) = execute_dkg_2_of_3();
+    let key = ThresholdHpkePublicKey::from_frost_pkpkg(&public).unwrap();
+    for length in [0, 64 * 1024 - 16] {
+        let plaintext = vec![0x5a; length];
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0x5a77);
+        let ct = encap_with_rng(&key, INFO, &plaintext, AAD, &mut rng).unwrap();
+        assert_eq!(ct.aead_body.len(), length + 16);
+        assert_eq!(ThresholdHpkeCiphertext::from_bytes(&ct.to_bytes()).unwrap(), ct);
+        for subset in [[1u16, 2], [1, 3], [2, 3]] {
+            let shares = subset.iter().map(|id| decap_share(&keys[id], &ct).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(combine_decap(&shares, 2, &ct, INFO, AAD).unwrap(), plaintext);
+        }
+    }
+}
