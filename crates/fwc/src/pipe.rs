@@ -73,7 +73,7 @@ pub fn parse_map_expression(expr: &str) -> Result<MappingSpec, String> {
         if segment.is_empty() {
             continue;
         }
-        let Some((source, target)) = segment.split_once("->") else {
+        let Some((source, target)) = segment.rsplit_once("->") else {
             return Err(format!("invalid mapping rule (missing ->): '{segment}'"));
         };
         let source = source.trim().to_owned();
@@ -86,9 +86,7 @@ pub fn parse_map_expression(expr: &str) -> Result<MappingSpec, String> {
         }
         rules.push(MapRule { source, target });
     }
-    if rules.is_empty() {
-        return Err("no mapping rules found".to_owned());
-    }
+    validate_mapping_rules(&rules)?;
     Ok(MappingSpec { rules })
 }
 
@@ -101,8 +99,14 @@ fn split_top_level_commas(expr: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let mut escaped = false;
     for (idx, ch) in expr.char_indices() {
+        if in_quotes && escaped {
+            escaped = false;
+            continue;
+        }
         match ch {
+            '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
             ',' if !in_quotes => {
                 segments.push(&expr[start..idx]);
@@ -128,7 +132,40 @@ pub fn parse_map_file(content: &str) -> Result<MappingSpec, String> {
     if rules.is_empty() {
         return Err("map file contains no rules".to_owned());
     }
+    validate_mapping_rules(&rules)?;
     Ok(MappingSpec { rules })
+}
+
+fn validate_mapping_rules(rules: &[MapRule]) -> Result<(), String> {
+    if rules.is_empty() {
+        return Err("no mapping rules found".to_owned());
+    }
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.source.trim().is_empty() || rule.target.split('.').any(str::is_empty) {
+            return Err("mapping sources and target path segments must not be empty".to_owned());
+        }
+        if rule.source.starts_with('"') && serde_json::from_str::<String>(&rule.source).is_err() {
+            return Err("quoted mapping sources must be valid JSON strings".to_owned());
+        }
+        for previous in &rules[..index] {
+            if rule.target == previous.target
+                || rule
+                    .target
+                    .strip_prefix(&previous.target)
+                    .is_some_and(|tail| tail.starts_with('.'))
+                || previous
+                    .target
+                    .strip_prefix(&rule.target)
+                    .is_some_and(|tail| tail.starts_with('.'))
+            {
+                return Err(format!(
+                    "mapping targets '{}' and '{}' overlap",
+                    previous.target, rule.target
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Evaluation ──────────────────────────────────────────────────────────
@@ -138,6 +175,17 @@ pub fn parse_map_file(content: &str) -> Result<MappingSpec, String> {
 pub fn apply_mapping(source_output: &Value, spec: &MappingSpec) -> MappingResult {
     let mut output = Map::new();
     let mut errors = Vec::new();
+
+    if let Err(message) = validate_mapping_rules(&spec.rules) {
+        return MappingResult {
+            output: Value::Object(output),
+            errors: vec![MappingError {
+                source: String::new(),
+                target: String::new(),
+                message,
+            }],
+        };
+    }
 
     for rule in &spec.rules {
         match resolve_source(&rule.source, source_output) {
@@ -167,13 +215,16 @@ pub fn apply_mapping(source_output: &Value, spec: &MappingSpec) -> MappingResult
 fn resolve_source(source: &str, output: &Value) -> Option<Value> {
     // Check for literal string (quoted).
     if source.starts_with('"') && source.ends_with('"') && source.len() >= 2 {
-        let literal = &source[1..source.len() - 1];
-        return Some(Value::String(literal.to_owned()));
+        let literal: String = serde_json::from_str(source).ok()?;
+        return render_mapping_literal(&literal, output).map(Value::String);
     }
 
     // Check for literal number.
     if let Ok(n) = source.parse::<i64>() {
         return Some(Value::Number(n.into()));
+    }
+    if let Ok(Value::Number(number)) = serde_json::from_str(source) {
+        return Some(Value::Number(number));
     }
 
     // Check for literal boolean.
@@ -186,6 +237,29 @@ fn resolve_source(source: &str, output: &Value) -> Option<Value> {
 
     // Path resolution.
     resolve_json_path(output, source)
+}
+
+/// Only templates explicitly authored in the mapping are interpolated. Values
+/// extracted from provider JSON remain literal, including braces and quotes.
+fn render_mapping_literal(template: &str, output: &Value) -> Option<String> {
+    let mut rendered = String::new();
+    let mut remaining = template;
+    while let Some((prefix, tail)) = remaining.split_once("{{") {
+        rendered.push_str(prefix);
+        let (path, rest) = tail.split_once("}}")?;
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let value = resolve_json_path(output, path)?;
+        match value {
+            Value::String(text) => rendered.push_str(&text),
+            value => rendered.push_str(&value.to_string()),
+        }
+        remaining = rest;
+    }
+    rendered.push_str(remaining);
+    Some(rendered)
 }
 
 /// Resolve a dotted JSON path with array index support.
@@ -2179,6 +2253,92 @@ mod tests {
     fn parse_file_empty_rules() {
         let err = parse_map_file("[]").unwrap_err();
         assert!(err.contains("no rules"));
+    }
+
+    #[test]
+    fn mapping_rejects_overlapping_targets_from_expressions_and_files() {
+        for expression in [
+            "title -> text, body -> text",
+            "title -> text, body -> text.child",
+            "title -> text.child, body -> text",
+            "title -> .text",
+            "title -> text.",
+            "title -> parent..text",
+        ] {
+            assert!(parse_map_expression(expression).is_err(), "{expression}");
+        }
+        for rules in [
+            json!([
+                {"source": "title", "target": "a"},
+                {"source": "body", "target": "a.b"},
+            ]),
+            json!([
+                {"source": "title", "target": "a.b"},
+                {"source": "body", "target": "a"},
+            ]),
+            json!([{"source": "", "target": "a"}]),
+            json!([{"source": "title", "target": ""}]),
+        ] {
+            assert!(parse_map_file(&rules.to_string()).is_err(), "{rules}");
+        }
+        let invalid = MappingSpec {
+            rules: vec![
+                MapRule {
+                    source: "title".to_owned(),
+                    target: "a".to_owned(),
+                },
+                MapRule {
+                    source: "body".to_owned(),
+                    target: "a.b".to_owned(),
+                },
+            ],
+        };
+        let result = apply_mapping(&json!({"title": "one", "body": "two"}), &invalid);
+        assert!(!result.errors.is_empty());
+        assert_eq!(result.output, json!({}));
+    }
+
+    #[test]
+    fn mapping_literals_handle_escaped_quotes_arrows_and_typed_numbers() {
+        let mapping = parse_map_expression(
+            r#""a\", b -> c" -> text, 1.25 -> amount, 18446744073709551615 -> counter"#,
+        )
+        .unwrap();
+        assert_eq!(mapping.rules.len(), 3);
+        let result = apply_mapping(&json!({}), &mapping);
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            result.output,
+            json!({"text": "a\", b -> c", "amount": 1.25, "counter": u64::MAX})
+        );
+        assert!(parse_map_expression(r#""unterminated -> text"#).is_err());
+    }
+
+    #[test]
+    fn mapping_only_interpolates_user_authored_templates() {
+        let source = json!({
+            "title": "{{other}}",
+            "items": [{"count": 3}],
+            "other": "must not expand",
+        });
+        let mapping = parse_map_expression(
+            r#"title -> literal, "Issue: {{title}} ({{items[0].count}})" -> rendered"#,
+        )
+        .unwrap();
+        let result = apply_mapping(&source, &mapping);
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            result.output,
+            json!({"literal": "{{other}}", "rendered": "Issue: {{other}} (3)"})
+        );
+        for expression in [
+            r#""{{missing}}" -> text"#,
+            r#""{{title" -> text"#,
+            r#""{{}}" -> text"#,
+        ] {
+            let mapping = parse_map_expression(expression).unwrap();
+            assert_eq!(apply_mapping(&source, &mapping).errors.len(), 1);
+        }
     }
 
     // ── resolve_source ──────────────────────────────────────────────

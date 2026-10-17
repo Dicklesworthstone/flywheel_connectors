@@ -3011,6 +3011,56 @@ struct PipeArgs {
     #[arg(long, value_name = "PATH")]
     map_file: Option<PathBuf>,
 
+    /// Source operation input as JSON. Defaults to an empty object.
+    #[arg(long, conflicts_with_all = ["file", "stdin"])]
+    input: Option<String>,
+
+    /// Read source operation input from a JSON file.
+    #[arg(long, conflicts_with = "stdin")]
+    file: Option<PathBuf>,
+
+    /// Read source operation input from stdin.
+    #[arg(long)]
+    stdin: bool,
+
+    /// Execution zone shared by both operations.
+    #[arg(long)]
+    zone: Option<String>,
+
+    /// Source capability token; required when the operations use different connectors.
+    #[arg(
+        long,
+        conflicts_with = "source_capability_token_file",
+        value_name = "TOKEN"
+    )]
+    #[serde(skip_serializing)]
+    source_capability_token: Option<String>,
+
+    /// Read the source connector's instance-bound capability token from a file.
+    #[arg(long, value_name = "PATH")]
+    source_capability_token_file: Option<PathBuf>,
+
+    /// Node signing key for a holder-bound source capability.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    source_holder_key_file: Option<PathBuf>,
+
+    /// Expected singleton-writer lease sequence for the source operation.
+    #[arg(long)]
+    source_lease_seq: Option<u64>,
+
+    /// Expected singleton-writer lease sequence for the target operation.
+    #[arg(long)]
+    target_lease_seq: Option<u64>,
+
+    /// Stable key for deliberately retrying this pipe. Each stage gets its own derived key.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+
+    /// Target capability and approvals. Approval tokens are checked separately for each stage.
+    #[command(flatten)]
+    auth: LiveAuthArgs,
+
     /// Preview the mapped input without executing the target operation.
     #[arg(long)]
     dry_run: bool,
@@ -4308,7 +4358,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Compare(args) => compare_dispatch(&args)?,
         Commands::Undo(args) => undo_dispatch(&args)?,
         Commands::Approvals(args) => approvals_dispatch(&args)?,
-        Commands::Pipe(args) => pipe_dispatch(args)?,
+        Commands::Pipe(args) => pipe_dispatch(args, cli.host.as_deref())?,
         Commands::Pipeline(args) => pipeline_dispatch(args, cli.host.as_deref())?,
         Commands::Recipe(args) => recipe_dispatch(args, cli.host.as_deref())?,
         Commands::Map(args) => map_dispatch(args, cli.host.as_deref())?,
@@ -27530,60 +27580,395 @@ fn capability_export_payload(
     })
 }
 
-fn pipe_dispatch(args: &PipeArgs) -> Result<DispatchOutcome> {
-    // Parse the mapping spec.
-    let spec = if let Some(ref map_expr) = args.map {
-        pipe::parse_map_expression(map_expr).map_err(|e| anyhow::anyhow!("{e}"))?
-    } else if let Some(ref path) = args.map_file {
-        let content = std::fs::read_to_string(path)?;
-        pipe::parse_map_file(&content).map_err(|e| anyhow::anyhow!("{e}"))?
+fn pipe_error(stage: &str, error_type: &str, message: impl Into<String>) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "pipe",
+            "stage": stage,
+            "error": { "type": error_type, "message": message.into() },
+        }),
+        exit_code: CliExitCode::Validation,
+    }
+}
+
+struct PipeStageOutcome {
+    exit_code: CliExitCode,
+    evidence: Value,
+    output: Option<Value>,
+}
+
+/// Execute one literal JSON input through the same admission and invoke routes
+/// used by pipelines. Provider strings are data: never render them as templates.
+#[allow(clippy::too_many_arguments)]
+fn execute_pipe_stage(
+    client: &HostAdminClient,
+    resolved: &ResolvedHostOperation,
+    stage: &str,
+    input: &Value,
+    zone: &str,
+    auth: &ResolvedLiveAuth,
+    run_key: &str,
+    lease_seq: Option<u64>,
+    preflight_only: bool,
+) -> Result<PipeStageOutcome> {
+    let request_id = derive_live_request_id(
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        zone,
+        input,
+        Some(run_key),
+        Some(stage),
+    )?;
+    let idempotency_key = (!preflight_only).then(|| request_id.to_string());
+    let request = build_live_invoke_request(
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        zone,
+        input.clone(),
+        request_id.clone(),
+        auth,
+        idempotency_key.clone(),
+        lease_seq,
+        None,
+    )?;
+    let preflight = client.preflight(&HostPreflightRequest {
+        holder_proof: request.holder_proof.clone(),
+        request_id: request_id.clone(),
+        connector_id: request.connector_id.clone(),
+        operation: resolved.operation.name.clone(),
+        params: Some(input.clone()),
+        principal: auth.principal_hint.clone(),
+        zone_id: Some(request.zone_id.clone()),
+        lease_seq,
+        capability_token: Some(auth.capability_token.clone()),
+        approval_tokens: auth.approval_tokens.clone(),
+    })?;
+    let preflight_value = serde_json::to_value(&preflight)?;
+    let mut evidence = json!({
+        "stage": stage,
+        "connector_id": resolved.connector.summary.id.as_str(),
+        "operation": resolved.operation.name,
+        "request_id": request_id.to_string(),
+        "idempotency_key": idempotency_key,
+        "lease_seq": lease_seq,
+        "preflight": preflight_value,
+    });
+    if !preflight.allowed {
+        evidence["status"] = json!("denied");
+        let _ = append_history_entry(
+            history::OpStatus::Denied,
+            resolved.connector.summary.id.as_str(),
+            &resolved.operation.name,
+            Some(zone),
+            input,
+            Some(&preflight_value),
+            preflight.reason,
+            idempotency_key.as_deref(),
+            0,
+        );
+        return Ok(PipeStageOutcome {
+            exit_code: CliExitCode::PolicyDenied,
+            evidence,
+            output: None,
+        });
+    }
+    if preflight_only {
+        evidence["status"] = json!("preflight");
+        return Ok(PipeStageOutcome {
+            exit_code: CliExitCode::Success,
+            evidence,
+            output: None,
+        });
+    }
+    let started = std::time::Instant::now();
+    let response = client.invoke(&request)?;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response_value = serde_json::to_value(&response)?;
+    let success = response.status == InvokeStatus::Ok;
+    let _ = append_history_entry(
+        if success {
+            history::OpStatus::Success
+        } else {
+            history::OpStatus::Error
+        },
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        Some(zone),
+        input,
+        Some(&response_value),
+        response.error.as_ref().map(ToString::to_string),
+        idempotency_key.as_deref(),
+        latency_ms,
+    );
+    evidence["status"] = json!(if success { "ok" } else { "error" });
+    evidence["response"] = response_value;
+    // Output is returned separately so --include-intermediate controls whether
+    // the successful source result appears in the user-facing response.
+    if let Some(object) = evidence["response"].as_object_mut() {
+        object.remove("result");
+    }
+    Ok(PipeStageOutcome {
+        exit_code: if success {
+            CliExitCode::Success
+        } else {
+            CliExitCode::Connector
+        },
+        evidence,
+        output: success.then_some(response.result).flatten(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    let mapping = match (&args.map, &args.map_file) {
+        (Some(expression), None) => pipe::parse_map_expression(expression),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|error| format!("Could not read mapping file: {error}"))
+            .and_then(|content| pipe::parse_map_file(&content)),
+        (Some(_), Some(_)) => Err("Choose --map or --map-file, not both.".to_owned()),
+        (None, None) => Err("No mapping provided. Use --map or --map-file.".to_owned()),
+    };
+    let mapping = match mapping {
+        Ok(mapping) => mapping,
+        Err(message) => return Ok(pipe_error("mapping", "invalid-mapping", message)),
+    };
+    let Some((source_connector, source_operation)) = parse_operation_reference(&args.source) else {
+        return Ok(invalid_operation_reference_dispatch("pipe", &args.source));
+    };
+    let Some((target_connector, target_operation)) = parse_operation_reference(&args.target) else {
+        return Ok(invalid_operation_reference_dispatch("pipe", &args.target));
+    };
+    let input_text = if let Some(input) = &args.input {
+        Ok(input.clone())
+    } else if let Some(path) = &args.file {
+        std::fs::read_to_string(path)
+    } else if args.stdin {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).map(|_| input)
     } else {
+        Ok("{}".to_owned())
+    };
+    let source_input = match input_text
+        .map_err(|error| error.to_string())
+        .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|error| error.to_string()))
+    {
+        Ok(input) => input,
+        Err(message) => return Ok(pipe_error("source", "invalid-source-input", message)),
+    };
+    let mut plan = json!({
+        "source_operation": args.source,
+        "target_operation": args.target,
+        "mapping": mapping,
+        "requires_approval": null,
+    });
+    // An unauthenticated dry-run remains an explicit offline plan. A live
+    // dry-run below materializes only a safe source and preflights the target.
+    let has_live_auth = args.auth.capability_token.is_some()
+        || args.auth.capability_token_file.is_some()
+        || args.auth.holder_key_file.is_some()
+        || args.source_capability_token.is_some()
+        || args.source_capability_token_file.is_some()
+        || args.source_holder_key_file.is_some()
+        || !args.auth.approval_token.is_empty()
+        || !args.auth.approval_token_file.is_empty();
+    if args.dry_run && !has_live_auth {
+        let mut payload = json!({
+            "status": "planned", "command": "pipe", "dry_run": true,
+            "plan": plan,
+            "message": "Offline pipe plan. Live validation and approval requirements need a host and capability tokens.",
+        });
+        CommandEnvelope::new(CommandAvailability::OfflineArtifact, "pipe")
+            .inject_into(&mut payload);
+        return Ok(DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        });
+    }
+    let Some(host) = resolve_host_config(explicit_host)? else {
+        return Ok(missing_host_dispatch(
+            "pipe",
+            plan,
+            vec![
+                "Provide --host and instance-bound capability tokens for both connectors."
+                    .to_owned(),
+            ],
+        ));
+    };
+    let target_auth = match resolve_live_auth(&args.auth) {
+        Ok(auth) => auth,
+        Err(error) => return Ok(live_auth_dispatch("pipe", &error, &[])),
+    };
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let source = match resolve_host_operation_from_catalog(
+        "pipe",
+        &client,
+        &catalog,
+        source_connector,
+        source_operation,
+    ) {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
+    };
+    let target = match resolve_host_operation_from_catalog(
+        "pipe",
+        &client,
+        &catalog,
+        target_connector,
+        target_operation,
+    ) {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
+    };
+    let source_auth = if args.source_capability_token.is_some()
+        || args.source_capability_token_file.is_some()
+    {
+        match resolve_live_auth(&LiveAuthArgs {
+            capability_token: args.source_capability_token.clone(),
+            capability_token_file: args.source_capability_token_file.clone(),
+            holder_key_file: args.source_holder_key_file.clone(),
+            approval_token: args.auth.approval_token.clone(),
+            approval_token_file: args.auth.approval_token_file.clone(),
+        }) {
+            Ok(auth) => auth,
+            Err(error) => return Ok(live_auth_dispatch("pipe", &error, &[])),
+        }
+    } else if source.connector.summary.id == target.connector.summary.id
+        && args.source_holder_key_file.is_none()
+    {
+        target_auth.clone()
+    } else {
+        return Ok(pipe_error(
+            "source",
+            "missing-source-capability-token",
+            "Provide --source-capability-token or --source-capability-token-file for the source instance; --capability-token authorizes the target.",
+        ));
+    };
+    let (valid, errors) =
+        validate_payload_against_schema(&source_input, &source.operation.input_schema);
+    if !valid {
+        let mut outcome = pipe_error(
+            "source",
+            "invalid-source-input",
+            "Source input does not match its live schema.",
+        );
+        outcome.payload["validation_errors"] = json!(errors);
+        return Ok(outcome);
+    }
+    if args.dry_run && !pipeline_dry_run_can_materialize_output(&source.operation) {
+        return Ok(pipe_error(
+            "source",
+            "unsafe-dry-run-source",
+            "A live pipe dry-run requires a safe, idempotent source with no approval requirement. Use an offline dry-run to inspect this plan.",
+        ));
+    }
+    plan["requires_approval"] = json!(host_tool_requires_approval(&target.operation));
+    let zone = resolved_zone(args.zone.as_deref(), &host);
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
+    let source_result = match execute_pipe_stage(
+        &client,
+        &source,
+        "source",
+        &source_input,
+        &zone,
+        &source_auth,
+        &run_key,
+        args.source_lease_seq,
+        false,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut outcome = pipe_error("source", "source-transport-error", error.to_string());
+            outcome.exit_code = CliExitCode::Transport;
+            return Ok(outcome);
+        }
+    };
+    if !source_result.exit_code.is_success() {
         return Ok(DispatchOutcome {
             payload: json!({
-                "status": "error",
+                "status": source_result.evidence["status"],
                 "command": "pipe",
-                "error": {
-                    "type": "missing-mapping",
-                    "message": "No mapping provided. Use --map or --map-file.",
-                },
-                "next_actions": [
-                    format!("fwc pipe {} {} --map 'field_a -> field_b'", args.source, args.target),
-                ],
+                "stage": "source",
+                "source": "host-admin-api",
+                "execution": { "source": source_result.evidence },
             }),
-            exit_code: CliExitCode::Validation,
+            exit_code: source_result.exit_code,
         });
+    }
+    let Some(source_output) = source_result.output else {
+        let mut outcome = pipe_error(
+            "source",
+            "missing-source-output",
+            "The source returned no output; the target was not attempted.",
+        );
+        outcome.exit_code = CliExitCode::Connector;
+        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        return Ok(outcome);
     };
-
-    // Build pipe plan.
-    let plan = pipe::PipePlan {
-        source_operation: args.source.clone(),
-        target_operation: args.target.clone(),
-        mapping: spec,
-        requires_approval: false,
-        preview_input: None,
+    let mapped = pipe::apply_mapping(&source_output, &mapping);
+    let (valid, errors) =
+        validate_payload_against_schema(&mapped.output, &target.operation.input_schema);
+    if !mapped.errors.is_empty() || !valid {
+        let mut outcome = pipe_error(
+            "mapping",
+            "invalid-target-input",
+            "The source output could not produce valid target input; the target was not attempted.",
+        );
+        outcome.payload["mapping_errors"] = json!(mapped.errors);
+        outcome.payload["validation_errors"] = json!(errors);
+        outcome.payload["intermediate"] = source_output;
+        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        return Ok(outcome);
+    }
+    let target_result = match execute_pipe_stage(
+        &client,
+        &target,
+        "target",
+        &mapped.output,
+        &zone,
+        &target_auth,
+        &run_key,
+        args.target_lease_seq,
+        args.dry_run,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut outcome = pipe_error("target", "target-transport-error", error.to_string());
+            outcome.exit_code = CliExitCode::Transport;
+            outcome.payload["execution"] = json!({"source": source_result.evidence});
+            outcome.payload["intermediate"] = source_output;
+            return Ok(outcome);
+        }
     };
-
-    let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "pipe");
     let mut payload = json!({
-        "status": "planned",
+        "status": if target_result.exit_code.is_success() {
+            "ok"
+        } else {
+            target_result.evidence["status"].as_str().unwrap_or("error")
+        },
         "command": "pipe",
-        "message": format!(
-            "Pipe plan: {} -> {} ({} mapping rule(s)). \
-             Execution requires host integration (not yet available).",
-            args.source, args.target, plan.mapping.rules.len()
-        ),
-        "plan": plan,
         "dry_run": args.dry_run,
-        "include_intermediate": args.include_intermediate,
-        "next_actions": [
-            format!("fwc schema {} --scaffold", args.source),
-            format!("fwc schema {} --required-only", args.target),
-        ],
+        "zone": zone,
+        "plan": plan,
+        "source": "host-admin-api",
+        "execution": { "source": source_result.evidence, "target": target_result.evidence },
     });
-    envelope.inject_into(&mut payload);
+    if args.dry_run {
+        payload["plan"]["preview_input"] = mapped.output;
+    } else if let Some(output) = target_result.output {
+        payload["result"] = output;
+    }
+    if args.include_intermediate || !target_result.exit_code.is_success() {
+        payload["intermediate"] = source_output;
+    }
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "pipe").inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: target_result.exit_code,
     })
 }
 
@@ -37027,12 +37412,13 @@ deny_ptrace = true
             ]),
             3,
         );
-        let args = ShowArgs {
+        let args = super::ShowArgs {
             connector: "github".to_owned(),
             offline: false,
             require_source: Some(RequiredTruthSource::Mesh),
         };
-        let error = show_dispatch_host(&args, &host).expect_err("same-node evidence is not mesh");
+        let error =
+            super::show_dispatch_host(&args, &host).expect_err("same-node evidence is not mesh");
         assert!(
             error
                 .to_string()
@@ -44791,6 +45177,391 @@ deny_ptrace = true
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["command"], "map");
         assert_eq!(payload["response"]["completed"], 1);
+    }
+
+    fn pipe_mock_catalog(source_risky: bool) -> Vec<(String, Value)> {
+        let github =
+            mock_connector_summary_custom_json("fcp.github:enterprise:v1", "GitHub", 1, "safe");
+        let slack = mock_connector_summary_custom_json("fcp.slack:team:v1", "Slack", 1, "safe");
+        let source = mock_tool_descriptor_json(
+            "github.search_issues",
+            "github.read",
+            "low",
+            if source_risky { "risky" } else { "safe" },
+            "strict",
+            None,
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            }),
+            json!({"type": "object"}),
+        );
+        // Even a safe target must remain uninvoked during a live pipe dry-run.
+        let target = mock_tool_descriptor_json(
+            "slack.post_message",
+            "slack.write",
+            "low",
+            "safe",
+            "strict",
+            None,
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"],
+            }),
+            json!({"type": "object"}),
+        );
+        vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_with_connectors(vec![github.clone(), slack.clone()]),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_with_tools(github, vec![source]),
+            ),
+            (
+                "GET /rpc/introspect/fcp.slack:team:v1".to_owned(),
+                mock_introspection_response_with_tools(slack, vec![target]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn execute_pipe_binds_real_requests_separate_authority_and_literal_output() {
+        use base64::Engine as _;
+
+        let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+        let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+        let (target_token, key_path, signing_key) = test_live_holder_auth(temp_dir.path());
+        let key_path_text = key_path.display().to_string();
+        let source_instance = fcp_core::InstanceId::new();
+        let claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .expect("source claims")
+            .target_instance(source_instance.as_str());
+        let issuer = Ed25519SigningKey::from_bytes(&[0x42; 32]).expect("test issuer");
+        let source_token =
+            fcp_crypto::cose::CoseToken::sign(&issuer, &claims).expect("source token should sign");
+        let source_token = base64::engine::general_purpose::STANDARD
+            .encode(source_token.to_cbor().expect("source token should encode"));
+        let title = "Untrusted {{steps.any.output}} and \"quotes\" stay literal";
+        let mut routes = pipe_mock_catalog(false);
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"title": title})),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"delivered": true})),
+            ),
+        ]);
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+            "--input",
+            r#"{"query":"open"}"#,
+            "--map",
+            "title -> text",
+            "--source-capability-token",
+            &source_token,
+            "--capability-token",
+            &target_token,
+            "--holder-key-file",
+            &key_path_text,
+            "--source-lease-seq",
+            "42",
+            "--target-lease-seq",
+            "7",
+            "--idempotency-key",
+            "pipe-fixture",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["result"]["delivered"], true);
+        assert!(payload.get("intermediate").is_none());
+        assert!(
+            payload["execution"]["source"]["response"]
+                .get("result")
+                .is_none()
+        );
+
+        let requests = request_log.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 7);
+        let source_preflight: Value = serde_json::from_str(&requests[3].1).unwrap();
+        let source_invoke: Value = serde_json::from_str(&requests[4].1).unwrap();
+        let target_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+        let target_invoke: Value = serde_json::from_str(&requests[6].1).unwrap();
+        assert_eq!(source_preflight["params"], json!({"query": "open"}));
+        assert_eq!(source_preflight["params"], source_invoke["input"]);
+        assert_eq!(target_preflight["params"], json!({"text": title}));
+        assert_eq!(target_preflight["params"], target_invoke["input"]);
+        assert_eq!(source_preflight["request_id"], source_invoke["id"]);
+        assert_eq!(target_preflight["request_id"], target_invoke["id"]);
+        assert_ne!(source_invoke["id"], target_invoke["id"]);
+        assert_eq!(source_preflight["lease_seq"], 42);
+        assert_eq!(source_invoke["lease_seq"], 42);
+        assert_eq!(target_preflight["lease_seq"], 7);
+        assert_eq!(target_invoke["lease_seq"], 7);
+        assert_ne!(
+            source_preflight["capability_token"],
+            target_preflight["capability_token"]
+        );
+        assert_eq!(
+            source_preflight["capability_token"],
+            source_invoke["capability_token"]
+        );
+        assert_eq!(
+            target_preflight["capability_token"],
+            target_invoke["capability_token"]
+        );
+        assert!(source_preflight["holder_proof"].is_null());
+        assert!(source_invoke["holder_proof"].is_null());
+        assert_live_holder_request(&target_preflight, &signing_key);
+        assert_live_holder_request(&target_invoke, &signing_key);
+        assert_eq!(
+            target_preflight["holder_proof"],
+            target_invoke["holder_proof"]
+        );
+    }
+
+    #[test]
+    fn execute_pipe_stops_after_each_failure_without_sending_the_next_stage() {
+        for failure in [
+            "source-denied",
+            "source-error",
+            "missing-path",
+            "wrong-type",
+            "target-denied",
+            "target-error",
+        ] {
+            let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+            let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+            let token = test_capability_token_arg();
+            let source_output = if failure == "wrong-type" {
+                json!({"title": 17})
+            } else {
+                json!({"title": "An issue"})
+            };
+            let provider_error = serde_json::to_value(InvokeResponse::error(
+                RequestId::random(),
+                fcp_core::FcpError::Internal {
+                    message: "provider failure".to_owned(),
+                },
+            ))
+            .expect("provider error should serialize");
+            let mut routes = pipe_mock_catalog(false);
+            routes.push((
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(failure != "source-denied"),
+            ));
+            if failure != "source-denied" {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    if failure == "source-error" {
+                        provider_error.clone()
+                    } else {
+                        mock_invoke_response_json(source_output.clone())
+                    },
+                ));
+            }
+            if failure.starts_with("target-") {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(failure != "target-denied"),
+                ));
+                if failure == "target-error" {
+                    routes.push(("POST /rpc/invoke".to_owned(), provider_error));
+                }
+            }
+            let expected_requests = routes.len();
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipe",
+                "github.search_issues",
+                "slack.post_message",
+                "--input",
+                r#"{"query":"open"}"#,
+                "--map",
+                if failure == "missing-path" {
+                    "missing -> text"
+                } else {
+                    "title -> text"
+                },
+                "--source-capability-token",
+                &token,
+                "--capability-token",
+                &token,
+            ]);
+            server.join().expect("mock host thread should complete");
+            let expected_exit = if failure.ends_with("denied") {
+                CliExitCode::PolicyDenied
+            } else if failure.ends_with("error") {
+                CliExitCode::Connector
+            } else {
+                CliExitCode::Validation
+            };
+            assert_eq!(exit_code, expected_exit.into(), "{failure}: {payload}");
+            assert_ne!(exit_code, CliExitCode::Success.into());
+            assert_eq!(
+                request_log.lock().unwrap().len(),
+                expected_requests,
+                "{failure}"
+            );
+            if !failure.starts_with("source-") {
+                assert_eq!(payload["intermediate"], source_output, "{failure}");
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipe_live_dry_run_reads_source_and_only_preflights_safe_target() {
+        let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+        let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+        let token = test_capability_token_arg();
+        let mut routes = pipe_mock_catalog(false);
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"title": "An issue"})),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+        ]);
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+            "--input",
+            r#"{"query":"open"}"#,
+            "--map",
+            "title -> text",
+            "--source-capability-token",
+            &token,
+            "--capability-token",
+            &token,
+            "--dry-run",
+            "--include-intermediate",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(
+            payload["plan"]["preview_input"],
+            json!({"text": "An issue"})
+        );
+        assert_eq!(payload["intermediate"], json!({"title": "An issue"}));
+        assert_eq!(payload["execution"]["target"]["status"], "preflight");
+        assert!(payload.get("result").is_none());
+        assert_eq!(
+            request_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn execute_pipe_checks_auth_and_source_schema_before_any_invoke() {
+        for case in ["missing-source-auth", "invalid-source", "unsafe-dry-run"] {
+            let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+            let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+            let token = test_capability_token_arg();
+            let (host, server, request_log) =
+                spawn_mock_host_sequence_with_body_log(pipe_mock_catalog(case == "unsafe-dry-run"));
+            let mut args = vec![
+                "fwc",
+                "--json",
+                "--host",
+                host.as_str(),
+                "pipe",
+                "github.search_issues",
+                "slack.post_message",
+                "--input",
+                if case == "invalid-source" {
+                    "{}"
+                } else {
+                    r#"{"query":"open"}"#
+                },
+                "--map",
+                "title -> text",
+                "--capability-token",
+                token.as_str(),
+            ];
+            if case != "missing-source-auth" {
+                args.extend(["--source-capability-token", token.as_str()]);
+            }
+            if case == "unsafe-dry-run" {
+                args.push("--dry-run");
+            }
+            let (exit_code, payload) = execute_json(&args);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{case}: {payload}"
+            );
+            assert_eq!(request_log.lock().unwrap().len(), 3, "{case}");
+        }
+    }
+
+    #[test]
+    fn execute_pipe_offline_dry_run_and_mapping_validation_do_not_contact_host() {
+        let common = [
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:1",
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+        ];
+        let mut offline = common.to_vec();
+        offline.extend(["--map", "title -> text", "--dry-run"]);
+        let (exit_code, payload) = execute_json(&offline);
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["status"], "planned");
+        assert!(payload["plan"]["requires_approval"].is_null());
+
+        let mut invalid = common.to_vec();
+        invalid.extend(["--map", "title -> text, body -> text.child"]);
+        let (exit_code, payload) = execute_json(&invalid);
+        assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "invalid-mapping");
     }
 
     #[test]
