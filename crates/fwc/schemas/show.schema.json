@@ -100,6 +100,22 @@
         }
       }
     },
+    "mesh_read_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truth_source", "entry_node", "served_by", "hop_count", "decision"],
+      "properties": {
+        "truth_source": { "const": "mesh-backed" },
+        "entry_node": { "$ref": "#/$defs/non_empty_string" },
+        "served_by": { "$ref": "#/$defs/non_empty_string" },
+        "hop_count": { "const": 1 },
+        "decision": { "$ref": "#/$defs/non_empty_string" },
+        "failed_attempts": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
@@ -112,7 +128,12 @@
         },
         "authoritative": { "type": "boolean" },
         "caveat": { "$ref": "#/$defs/non_empty_string" },
-        "fetched_at": { "$ref": "#/$defs/nullable_non_empty_string" }
+        "fetched_at": { "$ref": "#/$defs/nullable_non_empty_string" },
+        "read_routes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/mesh_read_route" }
+        }
       }
     },
     "cache_evidence": {

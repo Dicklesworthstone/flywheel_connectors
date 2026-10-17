@@ -56,6 +56,7 @@ use fcp_evidence::{
     OwnerMigrationVerificationContext, SoftwareBillOfMaterials, SupplyChainAttestation,
     TrustedV3OwnerMap, verify_hybrid_owner_object,
 };
+use fcp_host::discovery::RoutedReadResponse;
 use fcp_host::{
     AdaptiveWarmPoolConfig, AdaptiveWarmPoolController, BatchExecutor, BatchInvokeRequest,
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
@@ -8753,9 +8754,12 @@ async fn route_connector_self_check(
     )
     .await
     {
-        Ok(response) => response,
+        Ok(response) => response.response,
         Err((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, message)) => {
-            return Ok(Some(SelfCheckReport::failed("self_check_zone_denied", message)));
+            return Ok(Some(SelfCheckReport::failed(
+                "self_check_zone_denied",
+                message,
+            )));
         }
         Err((_, message)) => return Err(HostError::RegistryError(message)),
     };
@@ -10285,14 +10289,14 @@ async fn introspect_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(connector_id): Path<String>,
-) -> Result<(HeaderMap, Json<IntrospectionResponse>), (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<RoutedReadResponse<IntrospectionResponse>>), (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
     if let Some(router) = state.mesh.clone() {
         let decision = mesh_route_decision(&state, &router, &connector_id, None, None)
             .await
             .map_err(map_host_error)?;
         if decision.is_forward() {
-            let response: IntrospectionResponse = mesh_forward_query(
+            let mut response = mesh_forward_query::<IntrospectionResponse>(
                 &router,
                 decision,
                 fcp_mesh::invoke_route::MeshForwardBody::Introspect {
@@ -10300,14 +10304,17 @@ async fn introspect_handler(
                 },
             )
             .await?;
-            let response_headers = cache_headers(response.cache.as_ref());
-            return Ok((response_headers, Json(response)));
+            // Peer cache validators do not describe this routed representation.
+            response.response.cache = None;
+            return Ok((HeaderMap::new(), Json(response)));
         }
     }
     let cache_validator = cache_validator_from_headers(&headers);
     local_introspection(&state, &connector_id, cache_validator)
         .await
-        .map(|(response_headers, response)| (response_headers, Json(response)))
+        .map(|(response_headers, response)| {
+            (response_headers, Json(RoutedReadResponse::local(response)))
+        })
 }
 
 /// Introspection served from this host's own registry.
@@ -10365,14 +10372,20 @@ async fn connector_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(connector_id): Path<String>,
-) -> Result<(HeaderMap, Json<ConnectorInventoryResponse>), (StatusCode, String)> {
+) -> Result<
+    (
+        HeaderMap,
+        Json<RoutedReadResponse<ConnectorInventoryResponse>>,
+    ),
+    (StatusCode, String),
+> {
     let connector_id = parse_connector_id(&connector_id)?;
     if let Some(router) = state.mesh.clone() {
         let decision = mesh_route_decision(&state, &router, &connector_id, None, None)
             .await
             .map_err(map_host_error)?;
         if decision.is_forward() {
-            let response: ConnectorInventoryResponse = mesh_forward_query(
+            let mut response = mesh_forward_query::<ConnectorInventoryResponse>(
                 &router,
                 decision,
                 fcp_mesh::invoke_route::MeshForwardBody::Inventory {
@@ -10380,20 +10393,22 @@ async fn connector_handler(
                 },
             )
             .await?;
-            if response.connector.id != connector_id {
+            if response.response.connector.id != connector_id {
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     "mesh executor returned inventory for a different connector".to_string(),
                 ));
             }
-            let response_headers = cache_headers(response.cache.as_ref());
-            return Ok((response_headers, Json(response)));
+            response.response.cache = None;
+            return Ok((HeaderMap::new(), Json(response)));
         }
     }
     let cache_validator = cache_validator_from_headers(&headers);
     local_connector_inventory(&state, &connector_id, cache_validator)
         .await
-        .map(|(response_headers, response)| (response_headers, Json(response)))
+        .map(|(response_headers, response)| {
+            (response_headers, Json(RoutedReadResponse::local(response)))
+        })
 }
 
 /// Inventory served from this host's own registry, without another mesh hop.
@@ -10440,13 +10455,13 @@ async fn local_connector_inventory(
 async fn connector_status_handler(
     State(state): State<Arc<AppState>>,
     Path(connector_id): Path<String>,
-) -> Result<Json<ConnectorAdminStatus>, (StatusCode, String)> {
+) -> Result<Json<RoutedReadResponse<ConnectorAdminStatus>>, (StatusCode, String)> {
     let connector_id = parse_connector_id(&connector_id)?;
     // Admin state outlives registration so operators can still inspect a
     // removed connector's stopped/missing state and recovery diagnosis.
     // A remote advertisement must not hide that existing local record.
     let local_not_found = match local_connector_status(&state, &connector_id).await {
-        Ok(status) => return Ok(Json(status)),
+        Ok(status) => return Ok(Json(RoutedReadResponse::local(status))),
         Err(error) if error.0 == StatusCode::NOT_FOUND => error,
         Err(error) => return Err(error),
     };
@@ -10455,7 +10470,7 @@ async fn connector_status_handler(
             .await
             .map_err(map_host_error)?;
         if decision.is_forward() {
-            let response: ConnectorAdminStatus = mesh_forward_query(
+            let response = mesh_forward_query::<ConnectorAdminStatus>(
                 &router,
                 decision,
                 fcp_mesh::invoke_route::MeshForwardBody::Status {
@@ -10463,7 +10478,7 @@ async fn connector_status_handler(
                 },
             )
             .await?;
-            if response.connector_id != connector_id {
+            if response.response.connector_id != connector_id {
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     "mesh executor returned status for a different connector".to_string(),
@@ -11582,6 +11597,7 @@ async fn preflight_handler(
                         },
                     )
                     .await
+                    .map(|response| response.response)
                 }
                 Err(error) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -11689,7 +11705,7 @@ async fn simulate_handler(
                     "simulation request could not be encoded for mesh forwarding: {error}"
                 )))
             })?;
-            return mesh_forward_query(
+            return mesh_forward_query::<HostSimulateResponse>(
                 &router,
                 decision,
                 fcp_mesh::invoke_route::MeshForwardBody::Simulate {
@@ -11698,7 +11714,7 @@ async fn simulate_handler(
                 },
             )
             .await
-            .map(Json);
+            .map(|response| Json(response.response));
         }
     }
     local_simulate(&state, &request, asserted_principal.as_deref())
@@ -15158,7 +15174,7 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
     router: &fcp_host::mesh_routing::MeshRouter,
     decision: fcp_mesh::invoke_route::InvokeRouteDecision,
     body: fcp_mesh::invoke_route::MeshForwardBody,
-) -> Result<T, (StatusCode, String)> {
+) -> Result<RoutedReadResponse<T>, (StatusCode, String)> {
     let fcp_mesh::invoke_route::InvokeRouteDecision::Forward {
         target,
         alternates,
@@ -15178,8 +15194,12 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
             Ok(reply) if reply.is_success() => {
                 let decoded = serde_json::from_str::<Value>(&reply.body_json)
                     .map_err(|_| "response is not valid JSON")
-                    .and_then(|value| {
+                    .and_then(|mut value| {
                         validate_mesh_query_response(&body, &bindings, &value)?;
+                        // Only this entry host can attest to the verified executor.
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("read_route");
+                        }
                         serde_json::from_value::<T>(value)
                             .map_err(|_| "response does not match the expected schema")
                     });
@@ -15195,7 +15215,17 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
                         );
                         // A valid preflight or simulation denial is authoritative.
                         // Never retry it to search for a more permissive executor.
-                        return Ok(response);
+                        let mut route = InvokeRouteProvenance::mesh_backed(
+                            router.local_node().as_str().to_owned(),
+                            candidate.as_str().to_owned(),
+                            1,
+                            code,
+                        );
+                        route.failed_attempts = failures;
+                        return Ok(RoutedReadResponse {
+                            response,
+                            read_route: Some(route),
+                        });
                     }
                     Err(reason) => {
                         failure_status = StatusCode::BAD_GATEWAY;
@@ -15204,8 +15234,7 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
                 }
             }
             Ok(reply) => {
-                let status = StatusCode::from_u16(reply.status)
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 if !mesh_query_status_allows_failover(status) {
                     tracing::warn!(
                         event = "mesh_query_denied",
@@ -20974,6 +21003,198 @@ deny_ptrace = true
     }
 
     #[fcp_async_core::runtime::test]
+    async fn mesh_reads_bind_route_evidence_to_the_verified_executor() {
+        use fcp_host::mesh_routing::{
+            MESH_ADVERTISEMENT_ROUTE, MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings,
+        };
+        use fcp_mesh::invoke_route::{
+            AdvertisedConnector, InvokeRouteDecision, MeshForwardBody, MeshForwardEnvelope,
+            MeshForwardReply, MeshPeerAdvertisement,
+        };
+
+        const CONNECTOR: &str = "fcp.test.routed-read:utility:1.0.0";
+        let peer_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let peer_node = fcp_core::TailscaleNodeId::new("verified-reader");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind read peer");
+        let endpoint = format!("http://{}", listener.local_addr().expect("peer address"));
+        let peers_json = json!([{
+            "node_id": peer_node.as_str(),
+            "endpoint": endpoint,
+            "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+        }])
+        .to_string();
+        let advertisement = MeshPeerAdvertisement::sign(
+            &peer_key,
+            peer_node.clone(),
+            fcp_host::mesh_routing::unix_now_ms(),
+            vec![AdvertisedConnector {
+                connector_id: CONNECTOR.to_owned(),
+                zones: vec![ZoneId::work().to_string()],
+                singleton_writer: false,
+                summary_json: None,
+            }],
+        );
+        let summary = connector_summary_from_config(&dispatcher_test_config(CONNECTOR))
+            .expect("connector summary");
+        let peer_lifecycle = HostAdminStateStore::new();
+        peer_lifecycle
+            .reconcile_registered_connectors(std::slice::from_ref(&summary))
+            .await
+            .expect("seed peer status");
+        let status = serde_json::to_value(
+            peer_lifecycle
+                .connector_status(&ConnectorId::from_static(CONNECTOR))
+                .await
+                .expect("peer status"),
+        )
+        .expect("status JSON");
+        let summary = serde_json::to_value(summary).expect("summary JSON");
+        let forwards = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_forwards = Arc::clone(&forwards);
+        let app = Router::new()
+            .route(
+                MESH_ADVERTISEMENT_ROUTE,
+                get(move || {
+                    let advertisement = advertisement.clone();
+                    async move { Json(advertisement) }
+                }),
+            )
+            .route(
+                MESH_FORWARD_ROUTE,
+                post(move |Json(envelope): Json<MeshForwardEnvelope>| {
+                    observed_forwards.fetch_add(1, Ordering::SeqCst);
+                    let mut body = match &envelope.body {
+                        MeshForwardBody::Inventory { connector_id } => {
+                            assert_eq!(connector_id, CONNECTOR);
+                            json!({ "connector": summary, "registry_version": 7 })
+                        }
+                        MeshForwardBody::Introspect { connector_id } => {
+                            assert_eq!(connector_id, CONNECTOR);
+                            json!({
+                                "connector": summary,
+                                "tools": [],
+                                "rate_limits": null,
+                                "archetype": "request_response",
+                                "introspection": {
+                                    "operations": [],
+                                    "events": [],
+                                    "resource_types": [],
+                                    "auth_caps": null,
+                                    "event_caps": null,
+                                },
+                            })
+                        }
+                        MeshForwardBody::Status { connector_id } => {
+                            assert_eq!(connector_id, CONNECTOR);
+                            status.clone()
+                        }
+                        other => panic!("unexpected forwarded method: {}", other.method()),
+                    };
+                    // A peer can sign this JSON, but cannot name the executor
+                    // or entry host that our operator should trust.
+                    body["read_route"] = json!({
+                        "truth_source": "mesh-backed",
+                        "entry_node": "forged-entry",
+                        "served_by": "forged-executor",
+                        "hop_count": 9,
+                        "decision": "peer-assertion",
+                        "failed_attempts": ["forged-failure"],
+                    });
+                    let reply = MeshForwardReply::sign(
+                        &peer_key,
+                        peer_node.clone(),
+                        &envelope,
+                        StatusCode::OK.as_u16(),
+                        body.to_string(),
+                    );
+                    async move { Json(reply) }
+                }),
+            );
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+        let server = task::spawn(async move { serve_tcp(listener, app, shutdown_rx).await });
+        let tempdir = tempfile::tempdir().expect("test directory");
+        let base_state = test_app_state_with_connectors_file(
+            Vec::new(),
+            tempdir.path().join("connectors.json"),
+            Arc::new(HostAdminStateStore::new()),
+        )
+        .await;
+        let router = Arc::new(
+            MeshRouter::new(MeshRoutingSettings {
+                node_id: fcp_core::TailscaleNodeId::new("entry-reader"),
+                signing_key: fcp_crypto::ed25519::Ed25519SigningKey::generate(),
+                peers_json,
+                forward_timeout: Duration::from_secs(5),
+            })
+            .expect("mesh router"),
+        );
+        let state = Arc::new(AppState {
+            mesh: Some(Arc::clone(&router)),
+            ..(*base_state).clone()
+        });
+        let (headers, Json(inventory)) = connector_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(CONNECTOR.to_owned()),
+        )
+        .await
+        .expect("routed inventory");
+        assert!(!headers.contains_key(ETAG));
+        assert!(!headers.contains_key(CACHE_CONTROL));
+        assert!(inventory.response.cache.is_none());
+        let (headers, Json(introspection)) = introspect_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Path(CONNECTOR.to_owned()),
+        )
+        .await
+        .expect("routed introspection");
+        assert!(!headers.contains_key(ETAG));
+        assert!(introspection.response.cache.is_none());
+        let Json(status) = connector_status_handler(State(state), Path(CONNECTOR.to_owned()))
+            .await
+            .expect("routed status");
+        for route in [
+            inventory.read_route.as_ref(),
+            introspection.read_route.as_ref(),
+            status.read_route.as_ref(),
+        ] {
+            let route = route.expect("verified remote response must carry route evidence");
+            assert_eq!(route.entry_node.as_deref(), Some("entry-reader"));
+            assert_eq!(route.served_by.as_deref(), Some("verified-reader"));
+            assert_eq!(route.hop_count, 1);
+            assert!(route.failed_attempts.is_empty());
+        }
+        let serialized = serde_json::to_value(&inventory).expect("flat inventory JSON");
+        assert_eq!(serialized["connector"]["id"], CONNECTOR);
+        assert!(serialized.get("response").is_none());
+
+        let alternate = mesh_forward_query::<ConnectorInventoryResponse>(
+            &router,
+            InvokeRouteDecision::Forward {
+                target: fcp_core::TailscaleNodeId::new("unknown-reader"),
+                alternates: vec![fcp_core::TailscaleNodeId::new("verified-reader")],
+                code: "read-failover-test",
+            },
+            MeshForwardBody::Inventory {
+                connector_id: CONNECTOR.to_owned(),
+            },
+        )
+        .await
+        .expect("verified alternate answers the query");
+        let route = alternate.read_route.expect("alternate route");
+        assert_eq!(route.served_by.as_deref(), Some("verified-reader"));
+        assert_eq!(route.failed_attempts.len(), 1);
+        assert!(route.failed_attempts[0].contains("unknown-reader"));
+        assert_eq!(forwards.load(Ordering::SeqCst), 4);
+
+        shutdown_tx.send(true).expect("stop read peer");
+        server.await.expect("peer task").expect("peer shutdown");
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn mesh_connector_reads_reject_wrong_ids_and_preserve_unregistered_local_status() {
         use fcp_host::mesh_routing::{
             MESH_ADVERTISEMENT_ROUTE, MESH_FORWARD_ROUTE, MeshRouter, MeshRoutingSettings,
@@ -21124,6 +21345,8 @@ deny_ptrace = true
         let Json(status) = connector_status_handler(State(state), Path(REQUESTED.to_string()))
             .await
             .expect("retained local status remains readable");
+        assert!(status.read_route.is_none());
+        let status = status.response;
         assert_eq!(status.connector_id.as_str(), REQUESTED);
         assert_eq!(
             status.observed_state,

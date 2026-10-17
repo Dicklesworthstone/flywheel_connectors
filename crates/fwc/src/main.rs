@@ -5300,6 +5300,27 @@ impl HostAdminClient {
         self.get_json(&format!("/rpc/introspect/{connector_id}"))
     }
 
+    fn routed_connector(
+        &self,
+        connector_id: &str,
+    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostConnectorInventoryResponse>> {
+        self.get_json(&format!("/rpc/connectors/{connector_id}"))
+    }
+
+    fn routed_introspection(
+        &self,
+        connector_id: &str,
+    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostIntrospectionResponse>> {
+        self.get_json(&format!("/rpc/introspect/{connector_id}"))
+    }
+
+    fn routed_connector_status(
+        &self,
+        connector_id: &str,
+    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostConnectorAdminStatus>> {
+        self.get_json(&format!("/rpc/connectors/{connector_id}/status"))
+    }
+
     fn doctor(&self, request: &HostDoctorRequest) -> Result<HostDoctorReport> {
         self.post_read_json("/doctor", request)
     }
@@ -7720,12 +7741,6 @@ fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
 }
 
 fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("show", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
@@ -7736,8 +7751,20 @@ fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
             return Ok(outcome);
         }
     };
-    let inventory = client.connector(connector.summary.id.as_str())?;
-    let introspection = client.introspect(connector.summary.id.as_str())?;
+    let inventory = client.routed_connector(connector.summary.id.as_str())?;
+    let introspection = client.routed_introspection(connector.summary.id.as_str())?;
+    let routes = [
+        inventory.read_route.as_ref(),
+        introspection.read_route.as_ref(),
+    ];
+    let knowledge_state = read_response_knowledge_state(&routes)?;
+    if let Some(outcome) =
+        enforce_required_truth_source("show", args.require_source, knowledge_state)
+    {
+        return Ok(outcome);
+    }
+    let inventory = &inventory.response;
+    let introspection = &introspection.response;
     let preview = introspection
         .tools
         .iter()
@@ -7763,15 +7790,16 @@ fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
     let mut payload = serde_json::to_value(build_live_show_operator_contract(
         host,
         connector,
-        &inventory,
-        &introspection,
+        inventory,
+        introspection,
         preview,
         preview_truncated,
         risky_count,
         &example_operation,
     ))?;
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    attach_read_route_evidence(&mut payload, &routes);
+    inject_truth_source_metadata(&mut payload, knowledge_state);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -7837,12 +7865,6 @@ fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
 
 #[allow(clippy::too_many_lines)]
 fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("schema", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
@@ -7853,9 +7875,21 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             return Ok(outcome);
         }
     };
-    let inventory = client.connector(connector.summary.id.as_str())?;
-    let introspection = client.introspect(connector.summary.id.as_str())?;
-    let metadata_gaps = host_metadata_gaps(&introspection);
+    let inventory = client.routed_connector(connector.summary.id.as_str())?;
+    let introspection = client.routed_introspection(connector.summary.id.as_str())?;
+    let routes = [
+        inventory.read_route.as_ref(),
+        introspection.read_route.as_ref(),
+    ];
+    let knowledge_state = read_response_knowledge_state(&routes)?;
+    if let Some(outcome) =
+        enforce_required_truth_source("schema", args.require_source, knowledge_state)
+    {
+        return Ok(outcome);
+    }
+    let inventory = &inventory.response;
+    let introspection = &introspection.response;
+    let metadata_gaps = host_metadata_gaps(introspection);
 
     if let Some(operation_selector) = args.operation.as_deref() {
         let operation = match resolve_host_tool(&introspection.tools, operation_selector) {
@@ -7867,7 +7901,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
                     operation_selector,
                     &error,
                 );
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+                attach_read_route_evidence(&mut outcome.payload, &routes);
+                inject_truth_source_metadata(&mut outcome.payload, knowledge_state);
                 return Ok(outcome);
             }
         };
@@ -7890,7 +7925,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
                 catalog::DiscoveryDataSource::LiveHostIntrospection,
             );
             envelope.inject_into(&mut payload);
-            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+            attach_read_route_evidence(&mut payload, &routes);
+            inject_truth_source_metadata(&mut payload, knowledge_state);
             return Ok(DispatchOutcome {
                 payload,
                 exit_code: CliExitCode::Success,
@@ -7919,8 +7955,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             "message": "Loaded operation schemas from `fcp-host` introspection.",
             "connector": {
                 "slug": &connector.slug,
-                "canonical_id": connector.summary.id.as_str(),
-                "name": &connector.summary.name,
+                "canonical_id": inventory.connector.id.as_str(),
+                "name": &inventory.connector.name,
             },
             "operation": {
                 "requested_selector": operation_selector,
@@ -7956,7 +7992,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             catalog::DiscoveryDataSource::LiveHostIntrospection,
         );
         envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+        attach_read_route_evidence(&mut payload, &routes);
+        inject_truth_source_metadata(&mut payload, knowledge_state);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
@@ -7972,10 +8009,10 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
         "message": "Loaded the connector inventory/introspection field glossary from `fcp-host`.",
         "connector": {
             "slug": &connector.slug,
-            "canonical_id": connector.summary.id.as_str(),
-            "name": &connector.summary.name,
+            "canonical_id": inventory.connector.id.as_str(),
+            "name": &inventory.connector.name,
         },
-        "schema": host_connector_schema_glossary(&inventory, &introspection, &metadata_gaps),
+        "schema": host_connector_schema_glossary(inventory, introspection, &metadata_gaps),
         "next_actions": [
             format!("fwc ops {} --host {host}", connector.slug),
             format!("fwc schema {} <operation> --host {host}", connector.slug),
@@ -7987,7 +8024,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
         catalog::DiscoveryDataSource::LiveHostIntrospection,
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    attach_read_route_evidence(&mut payload, &routes);
+    inject_truth_source_metadata(&mut payload, knowledge_state);
     Ok(DispatchOutcome {
         payload,
         exit_code: CliExitCode::Success,
@@ -13243,17 +13281,18 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // show cache; Degraded/FallbackDerived are resolver-assigned outcomes,
-        // never queryable sources.
+        // Mesh reads use the host transport and carry per-response executor
+        // evidence. There is no independent node-local show cache.
         _ => QueryResult::NotConfigured,
     });
 
     match resolution {
         Ok(resolved) => {
-            if let Some(outcome) =
-                enforce_required_truth_source("show", args.require_source, resolved.knowledge_state)
-            {
+            if let Some(outcome) = enforce_required_truth_source(
+                "show",
+                args.require_source,
+                resolved_read_knowledge_state(&resolved.value, resolved.knowledge_state),
+            ) {
                 return Ok(outcome);
             }
             Ok(DispatchOutcome {
@@ -13520,9 +13559,8 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // schema cache; Degraded/FallbackDerived are resolver-assigned
-        // outcomes, never queryable sources.
+        // Mesh reads use the host transport and carry per-response executor
+        // evidence. There is no independent node-local schema cache.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13531,7 +13569,7 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
             if let Some(outcome) = enforce_required_truth_source(
                 "schema",
                 args.require_source,
-                resolved.knowledge_state,
+                resolved_read_knowledge_state(&resolved.value.payload, resolved.knowledge_state),
             ) {
                 return Ok(outcome);
             }
@@ -15592,10 +15630,14 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
         return Ok(outcome);
     };
 
-    if let Some(outcome) =
-        enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
+    // Fleet discovery mixes local and advertised records. Only a selected
+    // connector's verified response can establish a mesh source.
+    if args.connector.is_none() {
+        if let Some(outcome) =
+            enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
+        {
+            return Ok(outcome);
+        }
     }
 
     let client = HostAdminClient::new(&host.endpoint)?;
@@ -15611,18 +15653,26 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
                 return Ok(outcome);
             }
         };
-        let admin = client.connector_status(connector.summary.id.as_str())?;
+        let admin = client.routed_connector_status(connector.summary.id.as_str())?;
+        let routes = [admin.read_route.as_ref()];
+        let knowledge_state = read_response_knowledge_state(&routes)?;
+        if let Some(outcome) =
+            enforce_required_truth_source("status", args.require_source, knowledge_state)
+        {
+            return Ok(outcome);
+        }
 
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "status");
         let mut payload = serde_json::to_value(build_connector_status_operator_contract(
             &host.endpoint,
             connector,
-            admin,
+            admin.response,
             &health,
             discovery.registry_version,
         ))?;
         envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+        attach_read_route_evidence(&mut payload, &routes);
+        inject_truth_source_metadata(&mut payload, knowledge_state);
         return Ok(DispatchOutcome {
             payload,
             exit_code: CliExitCode::Success,
@@ -24427,6 +24477,79 @@ fn invoke_response_knowledge_state(response: &InvokeResponse) -> KnowledgeState 
     match invoke_response_route(response).map(|route| route.truth_source) {
         Some(InvokeTruthSource::MeshBacked) => KnowledgeState::MeshBacked,
         Some(InvokeTruthSource::HostBacked) | None => KnowledgeState::HostBacked,
+    }
+}
+
+/// Classify the responses used to build a read result, after checking the entry
+/// host's executor evidence. Mixed local/remote reads remain host-backed.
+fn read_response_knowledge_state(
+    routes: &[Option<&fcp_kernel::InvokeRouteProvenance>],
+) -> Result<KnowledgeState> {
+    let mut all_mesh = !routes.is_empty();
+    for route in routes {
+        let Some(route) = route else {
+            all_mesh = false;
+            continue;
+        };
+        if route.truth_source != InvokeTruthSource::MeshBacked {
+            bail!("host read response contains an unexpected route truth source");
+        }
+        let entry = route
+            .entry_node
+            .as_deref()
+            .filter(|node| !node.trim().is_empty());
+        let executor = route
+            .served_by
+            .as_deref()
+            .filter(|node| !node.trim().is_empty());
+        if entry.is_none()
+            || executor.is_none()
+            || entry == executor
+            || route.hop_count != 1
+            || route.decision.trim().is_empty()
+        {
+            bail!("host read response contains incomplete mesh executor evidence");
+        }
+    }
+    Ok(if all_mesh {
+        KnowledgeState::MeshBacked
+    } else {
+        KnowledgeState::HostBacked
+    })
+}
+
+fn attach_read_route_evidence(
+    payload: &mut Value,
+    routes: &[Option<&fcp_kernel::InvokeRouteProvenance>],
+) {
+    let routes = routes.iter().flatten().collect::<Vec<_>>();
+    if routes.is_empty() {
+        return;
+    }
+    if let Some(handles) = payload
+        .get_mut("evidence_handles")
+        .and_then(Value::as_array_mut)
+    {
+        handles.extend(routes.iter().map(|route| {
+            json!({
+                "kind": "mesh-read",
+                "route": route,
+            })
+        }));
+    } else if let Some(provenance) = payload.get_mut("provenance").and_then(Value::as_object_mut) {
+        provenance.insert("read_routes".to_owned(), json!(routes));
+    }
+}
+
+/// The resolver chooses how to reach the host; the authenticated response can
+/// establish that a remote executor actually answered this particular read.
+fn resolved_read_knowledge_state(payload: &Value, transport: KnowledgeState) -> KnowledgeState {
+    if transport == KnowledgeState::HostBacked
+        && payload.get("_truth_source").and_then(Value::as_str) == Some("mesh")
+    {
+        KnowledgeState::MeshBacked
+    } else {
+        transport
     }
 }
 
@@ -36772,6 +36895,152 @@ deny_ptrace = true
         assert_eq!(payload["tool_provenance"][0]["availability"], "live");
     }
 
+    fn mock_mesh_read_response(mut response: Value) -> Value {
+        response["read_route"] = json!({
+            "truth_source": "mesh-backed",
+            "entry_node": "entry-host",
+            "served_by": "executor-peer",
+            "hop_count": 1,
+            "decision": "remote-advertisement",
+            "failed_attempts": ["unavailable-peer: transport failure"],
+        });
+        response
+    }
+
+    #[test]
+    fn execute_mesh_reads_preserve_executor_and_satisfy_required_source() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_inventory_response_json()),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            12,
+        );
+        for suffix in [
+            &["show", "github"][..],
+            &["schema", "github"][..],
+            &["schema", "github", "create_issue"][..],
+            &["schema", "github", "create_issue", "--scaffold"][..],
+        ] {
+            let mut arguments = vec!["fwc", "--json", "--host", host.as_str()];
+            arguments.extend_from_slice(suffix);
+            arguments.extend_from_slice(&["--require-source", "mesh"]);
+            let (exit_code, payload) = execute_json(&arguments);
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["_truth_source"], "mesh");
+            let routes = payload["provenance"]["read_routes"].as_array().unwrap();
+            assert_eq!(routes.len(), 2);
+            for route in routes {
+                assert_eq!(route["entry_node"], "entry-host");
+                assert_eq!(route["served_by"], "executor-peer");
+                assert_eq!(route["hop_count"], 1);
+                assert_eq!(route["failed_attempts"].as_array().unwrap().len(), 1);
+            }
+            let schema: Value = serde_json::from_str(if suffix[0] == "show" {
+                include_str!("../schemas/show.schema.json")
+            } else {
+                include_str!("../schemas/schema.schema.json")
+            })
+            .unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap_or_else(|error| panic!("mesh read violates output schema: {error}"));
+        }
+        server.join().expect("mock host thread should complete");
+    }
+
+    #[test]
+    fn execute_show_mixed_read_sources_preserve_evidence_without_claiming_mesh() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            6,
+        );
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "--host", &host, "show", "github"]);
+        assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(
+            payload["provenance"]["read_routes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (exit_code, refusal) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "show",
+            "github",
+            "--require-source",
+            "mesh",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Transport.into());
+        assert_eq!(refusal["error"]["type"], "truth-source-unavailable");
+        assert_eq!(refusal["error"]["actual"], "host");
+        server.join().expect("mock host thread should complete");
+    }
+
+    #[test]
+    fn execute_show_rejects_incomplete_mesh_executor_evidence() {
+        let mut inventory = mock_mesh_read_response(mock_inventory_response_json());
+        inventory["read_route"]["served_by"] = json!("entry-host");
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    inventory,
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            3,
+        );
+        let args = ShowArgs {
+            connector: "github".to_owned(),
+            offline: false,
+            require_source: Some(RequiredTruthSource::Mesh),
+        };
+        let error = show_dispatch_host(&args, &host).expect_err("same-node evidence is not mesh");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete mesh executor evidence")
+        );
+        server.join().expect("mock host thread should complete");
+    }
+
     #[test]
     fn execute_show_with_host_uses_inventory_and_introspection() {
         let (host, server) = spawn_mock_host(
@@ -36819,17 +37088,35 @@ deny_ptrace = true
 
     #[test]
     fn execute_show_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ]),
+            3,
+        );
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
-            "http://127.0.0.1:1",
+            &host,
             "show",
             "github",
             "--require-source",
             "mesh",
         ]);
 
+        server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "show");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -43248,11 +43535,28 @@ deny_ptrace = true
 
     #[test]
     fn execute_schema_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ]),
+            3,
+        );
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
-            "http://127.0.0.1:1",
+            &host,
             "schema",
             "github",
             "issues.create",
@@ -43260,6 +43564,7 @@ deny_ptrace = true
             "mesh",
         ]);
 
+        server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "schema");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -49064,6 +49369,70 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert!(output.ends_with("(answer source: host)\n"));
+    }
+
+    #[test]
+    fn status_connector_mesh_response_satisfies_required_source() {
+        let cid = "fcp.github:enterprise:v1";
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/health".to_owned(),
+                    json!({
+                        "status": "healthy",
+                        "connectors": {},
+                        "uptime_seconds": 3600,
+                        "active_connections": 2,
+                        "timestamp": "2026-03-12T00:00:00Z",
+                    }),
+                ),
+                (
+                    format!("GET /rpc/connectors/{cid}/status"),
+                    mock_mesh_read_response(json!({
+                        "connector_id": cid,
+                        "desired_state": "enabled",
+                        "observed_state": "running",
+                        "pinned_version": null,
+                        "lifecycle": null,
+                        "config_revision_count": 1,
+                        "last_journal_sequence": 9,
+                        "evaluated_at": "2026-03-12T00:00:00Z",
+                    })),
+                ),
+            ]),
+            3,
+        );
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "status",
+            "github",
+            "--require-source",
+            "mesh",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["_truth_source"], "mesh");
+        let route = payload["evidence_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|handle| handle["kind"] == "mesh-read")
+            .expect("status carries executor evidence");
+        assert_eq!(route["route"]["served_by"], "executor-peer");
+        assert_eq!(payload["admin"]["connector_id"], cid);
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/status.schema.json")).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&payload)
+            .unwrap_or_else(|error| panic!("mesh status violates output schema: {error}"));
     }
 
     #[test]
