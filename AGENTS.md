@@ -657,13 +657,13 @@ bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It 
 
 ### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns:
-- `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
-- `quick_wins`: low-effort high-impact items
-- `blockers_to_clear`: items that unblock the most downstream work
-- `project_health`: status/type/priority distributions, graph metrics
-- `commands`: copy-paste shell commands for next steps
+**`bv --robot-triage` is your single entry point.** It returns (under `.triage`):
+- `triage.quick_ref`: at-a-glance counts + top 3 picks
+- `triage.recommendations`: ranked actionable items with scores, reasons, unblock info
+- `triage.quick_wins`: low-effort high-impact items
+- `triage.blockers_to_clear`: items that unblock the most downstream work
+- `triage.project_health`: status/type/priority distributions, graph metrics
+- `triage.commands`: copy-paste shell commands for next steps
 
 ```bash
 bv --robot-triage        # THE MEGA-COMMAND: start here
@@ -727,8 +727,8 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 ### jq Quick Reference
 
 ```bash
-bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
-bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
+bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
+bv --robot-triage | jq '.triage.recommendations[0]'        # Top recommendation
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)

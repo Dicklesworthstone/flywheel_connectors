@@ -1138,8 +1138,8 @@ fwc export-tools --offline --format openai --risk-max medium --output tools.json
 
 | Crate | Purpose |
 |-------|---------|
-| `fcp-host` | Node-local supervisor + admin API + credential pooling + drift detection + rollout + OTLP readiness |
-| `fwc` | Sole supported Flywheel connectors CLI |
+| `fcp-host` | Node-local supervisor + admin API + credential pooling + drift detection + rollout + OTLP readiness (binaries: `fcp-host`, `fcp-mesh-directory`, `fcp-test-connector`) |
+| `fwc` | Sole supported Flywheel connectors CLI (binaries: `fwc`, `fwc-audit-export`) |
 
 ### Connector Authoring and Provider Helpers
 
@@ -1169,7 +1169,7 @@ fwc export-tools --offline --format openai --risk-max medium --output tools.json
 | `fcp-e2e` | End-to-end compliance and host-backed scenarios |
 | `fcp-bench` | Criterion benches across mesh, audit, raptorq, crypto, host hot paths |
 | `fcp-chaos` | Chaos-testing harness |
-| `br-tools` | Beads helper utilities for Flywheel connector maintenance |
+| `br-tools` | Beads helper utilities for Flywheel connector maintenance (binaries: `scheduled-reality-check`, `readme-drift-check`) |
 
 ---
 
