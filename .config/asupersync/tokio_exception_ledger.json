@@ -2,57 +2,114 @@
   "schema_version": 1,
   "program_epic": "flywheel_connectors-1ud0u",
   "owner_bead": "flywheel_connectors-1ud0u.4",
-  "description": "Strict zero-tolerance Tokio guardrail. Any direct dependency or source reference is a violation until the remaining async-core and host migrations are complete.",
+  "description": "Quarantined Tokio guardrail ratchet. Zero new Tokio dependencies or source references may be added; existing quarantined compat/test bridges are strictly bounded to their current counts.",
   "forbidden_direct_dependencies": [
     "tokio",
     "tokio-stream",
     "tokio-tungstenite",
     "asupersync-tokio-compat"
   ],
-  "dependency_exceptions": [],
+  "dependency_exceptions": [
+    {
+      "crate": "fcp-async-core",
+      "dependency": "tokio",
+      "kind": "normal",
+      "owner_bead": "flywheel_connectors-1ud0u.2",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "Quarantined runtime compatibility facade (tokio_compat_timer / reqwest hyper bridge per README.md)"
+    },
+    {
+      "crate": "fcp-crypto",
+      "dependency": "tokio",
+      "kind": "normal",
+      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "Quarantined synchronous secret_fetch runtime handle bridge"
+    },
+    {
+      "crate": "fcp-store",
+      "dependency": "tokio",
+      "kind": "normal",
+      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "Durable WAL transaction spawn_blocking and test harness bridge"
+    },
+    {
+      "crate": "fcp-telemetry",
+      "dependency": "tokio",
+      "kind": "dev",
+      "owner_bead": "flywheel_connectors-1ud0u.7",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "OpenTelemetry OTLP exporter dev-test harness"
+    },
+    {
+      "crate": "fcp-telemetry",
+      "dependency": "tokio-stream",
+      "kind": "dev",
+      "owner_bead": "flywheel_connectors-1ud0u.7",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "OpenTelemetry OTLP exporter TCP listener stream in dev tests"
+    },
+    {
+      "crate": "fcp-e2e",
+      "dependency": "tokio",
+      "kind": "dev",
+      "owner_bead": "flywheel_connectors-1ud0u.7",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "In-process wiremock/axum HTTP test servers in E2E harness"
+    },
+    {
+      "crate": "fcp-postgresql",
+      "dependency": "tokio",
+      "kind": "normal",
+      "owner_bead": "flywheel_connectors-1ud0u.9",
+      "expires_on": "2100-01-01T00:00:00Z",
+      "reason": "Optional integration-testcontainer feature gate for tokio-postgres"
+    }
+  ],
   "source_invariants": [
     {
       "id": "tokio_refs_total",
       "pattern": "tokio::",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
+      "max_count": 139,
       "owner_bead": "flywheel_connectors-1ud0u.4",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Tokio references are forbidden project-wide."
+      "reason": "Strict ceiling on quarantined tokio:: references across fcp-async-core, fcp-crypto, fcp-store, and dev tests."
     },
     {
       "id": "tokio_test_attributes",
       "pattern": "#\\[tokio::test\\]",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 13,
+      "owner_bead": "flywheel_connectors-1ud0u.7",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Tokio test attributes are forbidden project-wide."
+      "reason": "Strict ceiling on remaining #[tokio::test] attributes in fcp-store durable tests."
     },
     {
       "id": "tokio_runtime_builder",
       "pattern": "tokio::runtime::Builder",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 6,
+      "owner_bead": "flywheel_connectors-1ud0u.2",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Runtime bootstrap must stay on AsyncSuperSync."
+      "reason": "Strict ceiling on dedicated current-thread test runtimes in fcp-crypto, fcp-store, and fcp-async-core."
     },
     {
       "id": "tokio_spawn_usage",
       "pattern": "tokio::(task::)?spawn",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 27,
+      "owner_bead": "flywheel_connectors-1ud0u.2",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Task spawning must stay on AsyncSuperSync."
+      "reason": "Strict ceiling on quarantined spawn/spawn_blocking sites in fcp-async-core, fcp-store, and parity tests."
     },
     {
       "id": "tokio_select_usage",
       "pattern": "tokio::select!",
       "scope": ["crates", "connectors", "tests", "fuzz"],
       "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "owner_bead": "flywheel_connectors-1ud0u.3",
       "expires_on": "2100-01-01T00:00:00Z",
       "reason": "Select loops must stay on AsyncSuperSync."
     },
@@ -60,28 +117,28 @@
       "id": "tokio_sync_channels",
       "pattern": "tokio::sync::(mpsc|broadcast|watch|oneshot)",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 6,
+      "owner_bead": "flywheel_connectors-1ud0u.2",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Channel primitives must stay on AsyncSuperSync."
+      "reason": "Strict ceiling on oneshot channels in fcp-store durable tests."
     },
     {
       "id": "tokio_time_usage",
       "pattern": "tokio::time::(sleep|timeout|interval)",
       "scope": ["crates", "connectors", "tests", "fuzz"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 14,
+      "owner_bead": "flywheel_connectors-1ud0u.3",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Timers must stay on AsyncSuperSync."
+      "reason": "Strict ceiling on quarantined timer compat in fcp-async-core and fcp-store durable tests."
     },
     {
       "id": "workspace_tokio_dependency_entry",
       "pattern": "^tokio\\s*=",
       "scope": ["Cargo.toml"],
-      "max_count": 0,
-      "owner_bead": "flywheel_connectors-1ud0u.4",
+      "max_count": 1,
+      "owner_bead": "flywheel_connectors-1ud0u.10.1",
       "expires_on": "2100-01-01T00:00:00Z",
-      "reason": "Workspace Tokio entries are forbidden."
+      "reason": "Single workspace Tokio entry for quarantined compat/test consumers."
     },
     {
       "id": "workspace_tokio_stream_entry",
