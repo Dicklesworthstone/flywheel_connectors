@@ -79,7 +79,7 @@ jobs:
             br --version
             exit 0
           fi
-          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag v0.5.7 --locked
+          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag v0.5.7 --locked beads_rust
           br --version
 
       - name: File monthly bead when br is available
@@ -89,21 +89,24 @@ jobs:
           if [ "$count" -eq 0 ]; then
             exit 0
           fi
-          title="$(jq -r '.[0].title' artifacts/reality-check/proposed-beads.json)"
-          issue_type="$(jq -r '.[0].issue_type' artifacts/reality-check/proposed-beads.json)"
-          priority="$(jq -r '.[0].priority' artifacts/reality-check/proposed-beads.json)"
-          description="$(jq -r '.[0].description' artifacts/reality-check/proposed-beads.json)"
-          labels="$(jq -r '.[0].labels | join(",")' artifacts/reality-check/proposed-beads.json)"
-          if ! br create \
-            --title "$title" \
-            --type "$issue_type" \
-            --priority "P$priority" \
-            --description "$description" \
-            --labels "$labels" \
-            --json | tee artifacts/reality-check/filed-bead.json; then
-            echo "::warning title=br filing failed::Cadence proposal generated, but br create failed in this runner"
-            exit 0
-          fi
+          : > artifacts/reality-check/filed-bead.json
+          jq -c '.[]' artifacts/reality-check/proposed-beads.json | while IFS= read -r proposal; do
+            title="$(printf '%s' "$proposal" | jq -r '.title')"
+            issue_type="$(printf '%s' "$proposal" | jq -r '.issue_type')"
+            priority="$(printf '%s' "$proposal" | jq -r '.priority')"
+            description="$(printf '%s' "$proposal" | jq -r '.description')"
+            labels="$(printf '%s' "$proposal" | jq -r '.labels | join(",")')"
+            if ! br create \
+              --title "$title" \
+              --type "$issue_type" \
+              --priority "P$priority" \
+              --description "$description" \
+              --labels "$labels" \
+              --json >> artifacts/reality-check/filed-bead.json; then
+              echo "::warning title=br filing failed::Cadence proposal generated, but br create failed in this runner"
+              exit 0
+            fi
+          done
           if ! br sync --flush-only --json | tee artifacts/reality-check/br-sync.json; then
             echo "::warning title=br sync failed::Cadence bead was created locally, but br sync failed in this runner"
           fi
