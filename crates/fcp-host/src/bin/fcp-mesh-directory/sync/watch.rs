@@ -20,11 +20,15 @@ impl WatchConfig {
         let seconds = |name: &str, default: u64| {
             let value = match options.get(name) {
                 None => default,
-                Some(raw) => raw.to_str().and_then(|text| text.parse::<u64>().ok())
+                Some(raw) => raw
+                    .to_str()
+                    .and_then(|text| text.parse::<u64>().ok())
                     .ok_or_else(|| format!("{name} must be an integer number of seconds"))?,
             };
             if !(1..=MAX_POLL_SECS).contains(&value) {
-                return Err(format!("{name} must be between 1 and {MAX_POLL_SECS} seconds"));
+                return Err(format!(
+                    "{name} must be between 1 and {MAX_POLL_SECS} seconds"
+                ));
             }
             Ok(value)
         };
@@ -55,17 +59,29 @@ struct PollSchedule {
 
 impl PollSchedule {
     const fn new(config: WatchConfig) -> Self {
-        Self { config, failures: 0, retry_delay: config.interval }
+        Self {
+            config,
+            failures: 0,
+            retry_delay: config.interval,
+        }
     }
 
-    fn completed(&mut self, succeeded: bool, installed: Option<Installed>, now_ms: u64) -> Duration {
+    fn completed(
+        &mut self,
+        succeeded: bool,
+        installed: Option<Installed>,
+        now_ms: u64,
+    ) -> Duration {
         let base = if succeeded {
             self.failures = 0;
             self.retry_delay = self.config.interval;
             self.config.interval
         } else {
             if self.failures > 0 {
-                self.retry_delay = self.retry_delay.saturating_mul(2).min(self.config.max_backoff);
+                self.retry_delay = self
+                    .retry_delay
+                    .saturating_mul(2)
+                    .min(self.config.max_backoff);
             }
             self.failures = self.failures.saturating_add(1);
             self.retry_delay
@@ -102,7 +118,9 @@ struct WatchEvent<'a> {
 
 fn ensure_unchanged(installer: &disk::Installer, expected: &Option<String>) -> SyncResult<()> {
     if installer.read_installed()? != *expected {
-        return Err(SyncError::Local("source changed outside its continuous installer; restart required"));
+        return Err(SyncError::Local(
+            "source changed outside its continuous installer; restart required",
+        ));
     }
     Ok(())
 }
@@ -118,7 +136,8 @@ fn drive(
     mut wait: impl FnMut(Duration) -> bool,
 ) -> SyncResult<()> {
     let mut expected = installer.read_installed()?;
-    let mut installed = expected.as_deref()
+    let mut installed = expected
+        .as_deref()
         .map(|text| trust.installed(text, unix_now_ms()))
         .transpose()?
         .map(|verified| Installed {
@@ -150,18 +169,22 @@ fn drive(
         // never resume with an older in-memory high-water mark in that case.
         let result = match result {
             Ok(report) => ensure_unchanged(installer, &expected).map(|()| report),
-            Err(error @ SyncError::Remote(_)) => {
-                match ensure_unchanged(installer, &expected) {
-                    Ok(()) => Err(error),
-                    Err(local) => Err(local),
-                }
-            }
+            Err(error @ SyncError::Remote(_)) => match ensure_unchanged(installer, &expected) {
+                Ok(()) => Err(error),
+                Err(local) => Err(local),
+            },
             Err(error) => Err(error),
         };
         let now_ms = unix_now_ms();
         let (outcome, delay) = match &result {
-            Ok(report) => (report.action, Some(schedule.completed(true, installed, now_ms))),
-            Err(SyncError::Remote(_)) => ("retrying", Some(schedule.completed(false, installed, now_ms))),
+            Ok(report) => (
+                report.action,
+                Some(schedule.completed(true, installed, now_ms)),
+            ),
+            Err(SyncError::Remote(_)) => (
+                "retrying",
+                Some(schedule.completed(false, installed, now_ms)),
+            ),
             Err(_) => ("fatal", None),
         };
         let event = WatchEvent {
@@ -180,7 +203,8 @@ fn drive(
         };
         serde_json::to_writer(&mut *output, &event)
             .map_err(|_| SyncError::Local("watch report serialization or output failed"))?;
-        writeln!(output).and_then(|()| output.flush())
+        writeln!(output)
+            .and_then(|()| output.flush())
             .map_err(|error| storage("watch_output", &error))?;
         if let Some(delay) = delay {
             if !wait(delay) {
@@ -189,13 +213,18 @@ fn drive(
         } else {
             return match result {
                 Err(error) => Err(error),
-                Ok(_) => Err(SyncError::Local("watch terminated without a scheduling decision")),
+                Ok(_) => Err(SyncError::Local(
+                    "watch terminated without a scheduling decision",
+                )),
             };
         }
     }
 }
 
-pub(super) fn run(options: &BTreeMap<String, OsString>, output: &mut impl io::Write) -> super::super::Result<()> {
+pub(super) fn run(
+    options: &BTreeMap<String, OsString>,
+    output: &mut impl io::Write,
+) -> super::super::Result<()> {
     let config = WatchConfig::from_options(options)?;
     // Trust and all source URLs are pinned for this process. A downloaded key
     // or rewritten public-key file cannot silently replace its roots during a run.
@@ -203,10 +232,18 @@ pub(super) fn run(options: &BTreeMap<String, OsString>, output: &mut impl io::Wr
     let sources = sources::SourceSet::from_options(options)?;
     let mut installer = disk::Installer::open(Path::new(&options["--directory"]))
         .map_err(|error| error.to_string())?;
-    drive(&mut installer, &trust, config, output, || sources.fetch(&trust, FETCH_TIMEOUT), |delay| {
-        std::thread::sleep(delay);
-        true
-    }).map_err(|error| error.to_string())
+    drive(
+        &mut installer,
+        &trust,
+        config,
+        output,
+        || sources.fetch(&trust, FETCH_TIMEOUT),
+        |delay| {
+            std::thread::sleep(delay);
+            true
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -264,17 +301,26 @@ mod tests {
         }
 
         fn wire(&self) -> String {
-            serde_json::to_string(&SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap()).unwrap()
+            serde_json::to_string(
+                &SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap(),
+            )
+            .unwrap()
         }
     }
 
     fn config() -> WatchConfig {
-        WatchConfig { interval: Duration::from_secs(1), max_backoff: Duration::from_secs(4) }
+        WatchConfig {
+            interval: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(4),
+        }
     }
 
     fn events(output: &[u8]) -> Vec<serde_json::Value> {
-        std::str::from_utf8(output).unwrap().lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect()
+        std::str::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[test]
@@ -283,9 +329,12 @@ mod tests {
         assert_eq!(defaults.interval, Duration::from_secs(30));
         assert_eq!(defaults.max_backoff, Duration::from_secs(300));
         for (name, value) in [
-            ("--interval-secs", "0"), ("--interval-secs", "3601"),
-            ("--interval-secs", "SECRET"), ("--max-backoff-secs", "0"),
-            ("--max-backoff-secs", "1"), ("--max-backoff-secs", "18446744073709551615"),
+            ("--interval-secs", "0"),
+            ("--interval-secs", "3601"),
+            ("--interval-secs", "SECRET"),
+            ("--max-backoff-secs", "0"),
+            ("--max-backoff-secs", "1"),
+            ("--max-backoff-secs", "18446744073709551615"),
         ] {
             let options = BTreeMap::from([(name.to_owned(), OsString::from(value))]);
             let error = WatchConfig::from_options(&options).unwrap_err();
@@ -295,7 +344,10 @@ mod tests {
             ("--interval-secs".to_owned(), OsString::from("3600")),
             ("--max-backoff-secs".to_owned(), OsString::from("3600")),
         ]);
-        assert_eq!(WatchConfig::from_options(&options).unwrap().interval, Duration::from_secs(3600));
+        assert_eq!(
+            WatchConfig::from_options(&options).unwrap().interval,
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
@@ -310,34 +362,63 @@ mod tests {
             Err(SyncError::Remote("offline".to_owned())),
             Ok(wire.clone()),
             Err(SyncError::Remote("offline".to_owned())),
-        ].into_iter();
+        ]
+        .into_iter();
         let mut waits = Vec::new();
         let mut output = Vec::new();
-        drive(&mut installer, &fixture.trust, config(), &mut output,
+        drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut output,
             || responses.next().unwrap(),
-            |delay| { waits.push(delay.as_secs()); waits.len() < 6 },
-        ).unwrap();
+            |delay| {
+                waits.push(delay.as_secs());
+                waits.len() < 6
+            },
+        )
+        .unwrap();
         assert_eq!(waits, [1, 2, 4, 4, 1, 1]);
         assert_eq!(fs::read_to_string(fixture.path()).unwrap(), wire);
         let records = events(&output);
         assert_eq!(records[4]["outcome"], "installed");
         assert_eq!(records[4]["consecutive_failures"], 0);
         assert_eq!(records[5]["consecutive_failures"], 1);
-        assert!(records.iter().all(|record| record["host_activation_verified"] == false));
+        assert!(
+            records
+                .iter()
+                .all(|record| record["host_activation_verified"] == false)
+        );
     }
 
     #[test]
     fn expiry_adjusts_polling_without_extending_authority_or_busy_looping() {
         let mut schedule = PollSchedule::new(WatchConfig {
-            interval: Duration::from_secs(30), max_backoff: Duration::from_secs(300),
+            interval: Duration::from_secs(30),
+            max_backoff: Duration::from_secs(300),
         });
-        let installed = Some(Installed { generation: 7, expires_at_ms: 5000 });
-        assert_eq!(schedule.completed(true, installed, 1000), Duration::from_secs(2));
-        assert_eq!(schedule.completed(false, installed, 4500), Duration::from_secs(1));
-        assert_eq!(schedule.completed(false, installed, 5000), Duration::from_secs(60));
+        let installed = Some(Installed {
+            generation: 7,
+            expires_at_ms: 5000,
+        });
+        assert_eq!(
+            schedule.completed(true, installed, 1000),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            schedule.completed(false, installed, 4500),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            schedule.completed(false, installed, 5000),
+            Duration::from_secs(60)
+        );
         schedule.failures = u64::MAX;
         schedule.retry_delay = Duration::from_secs(300);
-        assert_eq!(schedule.completed(false, installed, u64::MAX), Duration::from_secs(300));
+        assert_eq!(
+            schedule.completed(false, installed, u64::MAX),
+            Duration::from_secs(300)
+        );
         assert_eq!(schedule.failures, u64::MAX);
     }
 
@@ -350,11 +431,19 @@ mod tests {
         fixture.payload.generation = 8;
         fixture.payload.expires_at_ms = unix_now_ms() + 300_000;
         let fresh = fixture.wire();
-        let mut responses = vec![Err(SyncError::Remote("offline".to_owned())), Ok(fresh.clone())].into_iter();
+        let mut responses = vec![
+            Err(SyncError::Remote("offline".to_owned())),
+            Ok(fresh.clone()),
+        ]
+        .into_iter();
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         let mut output = Vec::new();
         let mut waits = 0;
-        drive(&mut installer, &fixture.trust, config(), &mut output,
+        drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut output,
             || responses.next().unwrap(),
             |_| {
                 waits += 1;
@@ -363,7 +452,8 @@ mod tests {
                 }
                 waits < 2
             },
-        ).unwrap();
+        )
+        .unwrap();
         let records = events(&output);
         assert_eq!(records[0]["installed_expired"], true);
         assert_eq!(records[0]["installed_generation"], 7);
@@ -377,8 +467,15 @@ mod tests {
         fs::write(fixture.path(), "{corrupt}").unwrap();
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         let calls = AtomicUsize::new(0);
-        let result = drive(&mut installer, &fixture.trust, config(), &mut Vec::new(),
-            || { calls.fetch_add(1, Ordering::SeqCst); Ok(fixture.wire()) },
+        let result = drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut Vec::new(),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fixture.wire())
+            },
             |_| panic!("local failures cannot retry"),
         );
         assert!(matches!(result, Err(SyncError::Local(_))));
@@ -392,7 +489,11 @@ mod tests {
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         installer.install(&fixture.wire(), &fixture.trust).unwrap();
         let mut output = Vec::new();
-        let result = drive(&mut installer, &fixture.trust, config(), &mut output,
+        let result = drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut output,
             || {
                 fs::rename(fixture.path(), fixture.dir.path().join("retained")).unwrap();
                 Err(SyncError::Remote("offline".to_owned()))
@@ -410,14 +511,19 @@ mod tests {
         let fixture = Fixture::new();
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         let mut waits = 0;
-        drive(&mut installer, &fixture.trust, config(), &mut Vec::new(),
+        drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut Vec::new(),
             || Err(SyncError::Remote("offline".to_owned())),
             |_| {
                 assert!(disk::Installer::open(&fixture.path()).is_err());
                 waits += 1;
                 waits < 3
             },
-        ).unwrap();
+        )
+        .unwrap();
         drop(installer);
         assert!(disk::Installer::open(&fixture.path()).is_ok());
     }
@@ -430,13 +536,19 @@ mod tests {
         fixture.payload.generation = 8;
         let next = fixture.wire();
         let mut output = Vec::new();
-        let result = drive(&mut installer, &fixture.trust, config(), &mut output,
+        let result = drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut output,
             || {
                 // Model the filesystem-visible ambiguity of a completed replace
                 // followed by an unsuccessful result; the real installer and
                 // watcher comparison are used, not a successful-state substitute.
                 fs::write(fixture.path(), &next).unwrap();
-                Err(SyncError::Remote("candidate expired during install".to_owned()))
+                Err(SyncError::Remote(
+                    "candidate expired during install".to_owned(),
+                ))
             },
             |_| panic!("ambiguous writes require restart"),
         );
@@ -449,17 +561,34 @@ mod tests {
     fn failed_report_flush_stops_without_issuing_another_fetch() {
         struct BrokenOutput;
         impl Write for BrokenOutput {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
-            fn flush(&mut self) -> io::Result<()> { Err(io::Error::from(io::ErrorKind::BrokenPipe)) }
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
         }
         let fixture = Fixture::new();
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         let calls = AtomicUsize::new(0);
-        let result = drive(&mut installer, &fixture.trust, config(), &mut BrokenOutput,
-            || { calls.fetch_add(1, Ordering::SeqCst); Ok(fixture.wire()) },
+        let result = drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut BrokenOutput,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fixture.wire())
+            },
             |_| panic!("failed output must stop"),
         );
-        assert!(matches!(result, Err(SyncError::Storage("watch_output", io::ErrorKind::BrokenPipe))));
+        assert!(matches!(
+            result,
+            Err(SyncError::Storage(
+                "watch_output",
+                io::ErrorKind::BrokenPipe
+            ))
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read_to_string(fixture.path()).unwrap(), fixture.wire());
     }
@@ -472,13 +601,19 @@ mod tests {
         let next = fixture.wire();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let url = source_url(&format!("http://{}/members", listener.local_addr().unwrap())).unwrap();
+        let url = source_url(&format!(
+            "http://{}/members",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
         let mut forged: SignedMeshPeerDirectory = serde_json::from_str(&next).unwrap();
         forged.payload_json.push(' ');
         let responses = vec![
             (503, "untrusted-error-body".to_owned()),
             (200, serde_json::to_string(&forged).unwrap()),
-            (200, first.clone()), (200, next.clone()), (200, first),
+            (200, first.clone()),
+            (200, next.clone()),
+            (200, first),
         ];
         let server = thread::spawn(move || {
             for (status, body) in responses {
@@ -493,8 +628,12 @@ mod tests {
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
-                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut reader = BufReader::new(&mut socket);
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -505,24 +644,43 @@ mod tests {
                     reader.read_line(&mut line).unwrap();
                     total += line.len();
                     assert!(!line.is_empty() && total <= 8192);
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                     assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
                 }
-                let _ = write!(socket, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             }
         });
         let mut installer = disk::Installer::open(&fixture.path()).unwrap();
         let mut output = Vec::new();
         let mut waits = 0;
-        let result = drive(&mut installer, &fixture.trust, config(), &mut output,
+        let result = drive(
+            &mut installer,
+            &fixture.trust,
+            config(),
+            &mut output,
             || fetch(&url, FETCH_TIMEOUT),
-            |_| { waits += 1; waits < 5 },
+            |_| {
+                waits += 1;
+                waits < 5
+            },
         );
         server.join().unwrap();
         result.unwrap();
         let records = events(&output);
-        let outcomes: Vec<_> = records.iter().map(|record| record["outcome"].as_str().unwrap()).collect();
-        assert_eq!(outcomes, ["retrying", "retrying", "installed", "installed", "retrying"]);
+        let outcomes: Vec<_> = records
+            .iter()
+            .map(|record| record["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes,
+            ["retrying", "retrying", "installed", "installed", "retrying"]
+        );
         assert_eq!(records[4]["installed_generation"], 8);
         assert_eq!(fs::read_to_string(fixture.path()).unwrap(), next);
         let text = String::from_utf8(output).unwrap();

@@ -326,9 +326,8 @@ use fcp_host::{
     DoctorReport as HostDoctorReport, DoctorRequest as HostDoctorRequest,
     EventQueryRequest as HostEventQueryRequest, EventQueryResponse as HostEventQueryResponse,
     HostEvent as HostAdminEvent, HostEventKind, HostHealthResponse, HostPreflightRequest,
-    HostSimulateRequest, HostSimulateResponse,
-    IntrospectionResponse as HostIntrospectionResponse, LifecycleTransitionRequest,
-    LifecycleTransitionResponse, ManagedConnectorConfig,
+    HostSimulateRequest, HostSimulateResponse, IntrospectionResponse as HostIntrospectionResponse,
+    LifecycleTransitionRequest, LifecycleTransitionResponse, ManagedConnectorConfig,
     PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement, SimulatePhase,
     ToolDescriptor as HostToolDescriptor,
 };
@@ -5248,14 +5247,9 @@ impl HostAdminClient {
         {
             if endpoint.starts_with("unix://") || endpoint.starts_with('/') {
                 let socket_path = endpoint.strip_prefix("unix://").unwrap_or(&endpoint);
-                let client = builder
-                    .unix_socket(socket_path)
-                    .build()
-                    .with_context(|| {
-                        format!(
-                            "failed to build Unix-socket client for host endpoint `{socket_path}`"
-                        )
-                    })?;
+                let client = builder.unix_socket(socket_path).build().with_context(|| {
+                    format!("failed to build Unix-socket client for host endpoint `{socket_path}`")
+                })?;
                 return Ok(Self {
                     client,
                     base_url: "http://localhost".to_owned(),
@@ -5431,8 +5425,7 @@ impl HostAdminClient {
         );
         anyhow::ensure!(
             response.preflight_allowed == (response.phase != SimulatePhase::PreflightOnly)
-                && (!response.would_succeed
-                    || response.phase == SimulatePhase::ConnectorReached),
+                && (!response.would_succeed || response.phase == SimulatePhase::ConnectorReached),
             "host returned a simulation verdict inconsistent with its admission phase"
         );
         Ok(response)
@@ -8202,7 +8195,14 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
             if let Some(error) = offline_error {
                 return Err(error);
             }
-            drop(resolution_error);
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
             let mut outcome = missing_host_dispatch(
                 "list",
                 json!({
@@ -8602,6 +8602,34 @@ fn audit_matrix_dispatch(args: &audit_chain::MatrixArgs) -> Result<DispatchOutco
         return Ok(outcome);
     }
 
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution =
+        resolver.resolve_with_partials(ResolutionStrategy::OfflineOnly, |source| match source {
+            KnowledgeState::Offline => match audit_matrix_offline_payload(args) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            _ => QueryResult::NotConfigured,
+        });
+
+    match resolution {
+        Ok(resolved) => Ok(resolved.value),
+        Err(resolution_error) => {
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn audit_matrix_offline_payload(args: &audit_chain::MatrixArgs) -> Result<DispatchOutcome> {
     let connectors_root = match audit_connectors_root() {
         Ok(root) => root,
         Err(error) => {
@@ -8712,6 +8740,34 @@ fn audit_gaps_dispatch(args: &audit_chain::GapsArgs) -> Result<DispatchOutcome> 
         return Ok(outcome);
     }
 
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution =
+        resolver.resolve_with_partials(ResolutionStrategy::OfflineOnly, |source| match source {
+            KnowledgeState::Offline => match audit_gaps_offline_payload(args) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            _ => QueryResult::NotConfigured,
+        });
+
+    match resolution {
+        Ok(resolved) => Ok(resolved.value),
+        Err(resolution_error) => {
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn audit_gaps_offline_payload(args: &audit_chain::GapsArgs) -> Result<DispatchOutcome> {
     let connectors_root = match audit_connectors_root() {
         Ok(root) => root,
         Err(error) => {
@@ -9074,7 +9130,9 @@ fn connector_state_dispatch(
         ConnectorStateCommand::Explain(args) => {
             connector_state_explain_dispatch(args, explicit_host)
         }
-        ConnectorStateCommand::Pull(args) => connector_state_pull_cmd::dispatch(args, explicit_host),
+        ConnectorStateCommand::Pull(args) => {
+            connector_state_pull_cmd::dispatch(args, explicit_host)
+        }
     }
 }
 
@@ -9082,96 +9140,160 @@ fn connector_state_explain_dispatch(
     args: &ConnectorStateExplainArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
-    if !args.offline
-        && let Some(host) = resolve_host_config(explicit_host)?
-    {
-        if let Some(outcome) = enforce_required_truth_source_with_subcommand(
-            "connector",
-            "state explain",
-            args.require_source,
-            KnowledgeState::HostBacked,
-        ) {
-            return Ok(outcome);
-        }
+    let resolved_host = if args.offline {
+        None
+    } else {
+        resolve_host_config(explicit_host)?
+    };
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
-        let client = HostAdminClient::new(&host.endpoint)?;
-        let (catalog, discovery) = client.catalog(None)?;
-        let connector = match catalog.resolve_connector(&args.connector) {
-            Ok(connector) => connector,
-            Err(error) => {
-                let mut outcome = connector_resolution_dispatch(
-                    "connector state explain",
-                    &args.connector,
-                    &error,
-                );
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match connector_state_explain_host_dispatch(args, host) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline || resolved_host.is_none() => {
+            match connector_state_explain_offline_dispatch(args) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            }
+        }
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+                "connector",
+                "state explain",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
                 return Ok(outcome);
             }
-        };
-        let zone = args
-            .zone
-            .as_deref()
-            .map(str::trim)
-            .filter(|zone| !zone.is_empty())
-            .or(host.default_zone.as_deref());
-        let mut payload = client.connector_state_explain(connector.summary.id.as_str(), zone)?;
-        let host_payload_source = payload
-            .get("source")
-            .cloned()
-            .unwrap_or_else(|| Value::String("host-admin-api".to_owned()));
-        let host_evidence_description = match host_payload_source.as_str() {
-            Some("host-canonical-state") => "live fcp-host canonical fcp-store state",
-            Some("host-cache-markers") => "live fcp-host cache-marker evidence",
-            _ => "live fcp-host admin API evidence",
-        };
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("command".to_owned(), Value::String("connector".to_owned()));
-            object.insert(
-                "subcommand".to_owned(),
-                Value::String("state explain".to_owned()),
-            );
-            object.insert(
-                "source".to_owned(),
-                Value::String("host-admin-api".to_owned()),
-            );
-            object.insert("host_payload_source".to_owned(), host_payload_source);
-            object.insert(
-                "message".to_owned(),
-                Value::String(format!(
-                    "Explained connector state storage for `{}` from {host_evidence_description}.",
-                    connector.slug,
-                )),
-            );
-            object.insert(
-                "connector".to_owned(),
-                json!({
-                    "requested_selector": &args.connector,
-                    "slug": &connector.slug,
-                    "canonical_id": connector.summary.id.as_str(),
-                    "name": &connector.summary.name,
-                    "version": connector.summary.version.to_string(),
-                }),
-            );
-            object.insert(
-                "host_registry_version".to_owned(),
-                json!(discovery.registry_version),
-            );
-            if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
-                live_host.insert(
-                    "endpoint_hash".to_owned(),
-                    Value::String(sha256_prefixed(host.endpoint.as_bytes())),
-                );
-            }
+            Ok(resolved.value)
         }
-        let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector");
-        envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+fn connector_state_explain_host_dispatch(
+    args: &ConnectorStateExplainArgs,
+    host: &ResolvedHostConfig,
+) -> Result<DispatchOutcome> {
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "connector",
+        "state explain",
+        args.require_source,
+        KnowledgeState::HostBacked,
+    ) {
+        return Ok(outcome);
     }
 
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, discovery) = client.catalog(None)?;
+    let connector = match catalog.resolve_connector(&args.connector) {
+        Ok(connector) => connector,
+        Err(error) => {
+            let mut outcome =
+                connector_resolution_dispatch("connector state explain", &args.connector, &error);
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+            return Ok(outcome);
+        }
+    };
+    let zone = args
+        .zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|zone| !zone.is_empty())
+        .or(host.default_zone.as_deref());
+    let mut payload = client.connector_state_explain(connector.summary.id.as_str(), zone)?;
+    let host_payload_source = payload
+        .get("source")
+        .cloned()
+        .unwrap_or_else(|| Value::String("host-admin-api".to_owned()));
+    let host_evidence_description = match host_payload_source.as_str() {
+        Some("host-canonical-state") => "live fcp-host canonical fcp-store state",
+        Some("host-cache-markers") => "live fcp-host cache-marker evidence",
+        _ => "live fcp-host admin API evidence",
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("command".to_owned(), Value::String("connector".to_owned()));
+        object.insert(
+            "subcommand".to_owned(),
+            Value::String("state explain".to_owned()),
+        );
+        object.insert(
+            "source".to_owned(),
+            Value::String("host-admin-api".to_owned()),
+        );
+        object.insert("host_payload_source".to_owned(), host_payload_source);
+        object.insert(
+            "message".to_owned(),
+            Value::String(format!(
+                "Explained connector state storage for `{}` from {host_evidence_description}.",
+                connector.slug,
+            )),
+        );
+        object.insert(
+            "connector".to_owned(),
+            json!({
+                "requested_selector": &args.connector,
+                "slug": &connector.slug,
+                "canonical_id": connector.summary.id.as_str(),
+                "name": &connector.summary.name,
+                "version": connector.summary.version.to_string(),
+            }),
+        );
+        object.insert(
+            "host_registry_version".to_owned(),
+            json!(discovery.registry_version),
+        );
+        if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
+            live_host.insert(
+                "endpoint_hash".to_owned(),
+                Value::String(sha256_prefixed(host.endpoint.as_bytes())),
+            );
+        }
+    }
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector");
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
+}
+
+fn connector_state_explain_offline_dispatch(
+    args: &ConnectorStateExplainArgs,
+) -> Result<DispatchOutcome> {
     if let Some(outcome) = enforce_required_truth_source_with_subcommand(
         "connector",
         "state explain",
@@ -9216,99 +9338,166 @@ fn connector_lease_status_dispatch(
     args: &ConnectorLeaseStatusArgs,
     explicit_host: Option<&str>,
 ) -> Result<DispatchOutcome> {
-    if !args.offline
-        && let Some(host) = resolve_host_config(explicit_host)?
-    {
-        if let Some(outcome) = enforce_required_truth_source_with_subcommand(
-            "connector",
-            "lease status",
-            args.require_source,
-            KnowledgeState::HostBacked,
-        ) {
-            return Ok(outcome);
-        }
+    let resolved_host = if args.offline {
+        None
+    } else {
+        resolve_host_config(explicit_host)?
+    };
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = if args.offline {
+        ResolutionStrategy::OfflineOnly
+    } else {
+        resolver.config().default_strategy
+    };
 
-        let client = HostAdminClient::new(&host.endpoint)?;
-        let (catalog, discovery) = client.catalog(None)?;
-        let connector = match catalog.resolve_connector(&args.connector) {
-            Ok(connector) => connector,
-            Err(error) => {
-                let mut outcome = connector_lease_resolution_dispatch(
-                    "connector lease status",
-                    &args.connector,
-                    &error,
-                );
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match connector_lease_status_host_dispatch(args, host) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if args.offline || resolved_host.is_none() => {
+            match connector_lease_status_offline_dispatch(args) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            }
+        }
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+                "connector",
+                "lease status",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
                 return Ok(outcome);
             }
-        };
-        let (zone, effective_target) =
-            host_connector_lease_status_zone(args.zone.as_deref(), connector, &args.connector)?;
-        let mut payload =
-            client.connector_lease_status(connector.summary.id.as_str(), Some(zone.as_str()))?;
-        let host_payload_source = payload
-            .get("source")
-            .cloned()
-            .unwrap_or_else(|| Value::String("host-admin-api".to_owned()));
-        if let Some(object) = payload.as_object_mut() {
-            object
-                .entry("zone_id".to_owned())
-                .or_insert_with(|| Value::String(zone.clone()));
-            object.insert("command".to_owned(), Value::String("connector".to_owned()));
-            object.insert(
-                "subcommand".to_owned(),
-                Value::String("lease status".to_owned()),
-            );
-            object.insert(
-                "source".to_owned(),
-                Value::String("host-admin-api".to_owned()),
-            );
-            object.insert("host_payload_source".to_owned(), host_payload_source);
-            object.insert(
-                "message".to_owned(),
-                Value::String(format!(
-                    "Loaded singleton-writer lease status for `{}` from live fcp-host evidence.",
-                    connector.slug,
-                )),
-            );
-            object.insert(
-                "connector".to_owned(),
-                json!({
-                    "requested_selector": &args.connector,
-                    "slug": &connector.slug,
-                    "canonical_id": connector.summary.id.as_str(),
-                    "name": &connector.summary.name,
-                    "version": connector.summary.version.to_string(),
-                }),
-            );
-            object.insert(
-                "host_registry_version".to_owned(),
-                json!(discovery.registry_version),
-            );
-            if !effective_target.is_null() {
-                object
-                    .entry("effective_target".to_owned())
-                    .or_insert(effective_target);
-            }
-            object
-                .entry("live_host".to_owned())
-                .or_insert_with(|| json!({}));
-            if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
-                live_host.insert(
-                    "endpoint_hash".to_owned(),
-                    Value::String(sha256_prefixed(host.endpoint.as_bytes())),
-                );
-            }
+            Ok(resolved.value)
         }
-        let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector");
-        envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+fn connector_lease_status_host_dispatch(
+    args: &ConnectorLeaseStatusArgs,
+    host: &ResolvedHostConfig,
+) -> Result<DispatchOutcome> {
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "connector",
+        "lease status",
+        args.require_source,
+        KnowledgeState::HostBacked,
+    ) {
+        return Ok(outcome);
     }
 
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, discovery) = client.catalog(None)?;
+    let connector = match catalog.resolve_connector(&args.connector) {
+        Ok(connector) => connector,
+        Err(error) => {
+            let mut outcome = connector_lease_resolution_dispatch(
+                "connector lease status",
+                &args.connector,
+                &error,
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
+            return Ok(outcome);
+        }
+    };
+    let (zone, effective_target) =
+        host_connector_lease_status_zone(args.zone.as_deref(), connector, &args.connector)?;
+    let mut payload =
+        client.connector_lease_status(connector.summary.id.as_str(), Some(zone.as_str()))?;
+    let host_payload_source = payload
+        .get("source")
+        .cloned()
+        .unwrap_or_else(|| Value::String("host-admin-api".to_owned()));
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("zone_id".to_owned())
+            .or_insert_with(|| Value::String(zone.clone()));
+        object.insert("command".to_owned(), Value::String("connector".to_owned()));
+        object.insert(
+            "subcommand".to_owned(),
+            Value::String("lease status".to_owned()),
+        );
+        object.insert(
+            "source".to_owned(),
+            Value::String("host-admin-api".to_owned()),
+        );
+        object.insert("host_payload_source".to_owned(), host_payload_source);
+        object.insert(
+            "message".to_owned(),
+            Value::String(format!(
+                "Loaded singleton-writer lease status for `{}` from live fcp-host evidence.",
+                connector.slug,
+            )),
+        );
+        object.insert(
+            "connector".to_owned(),
+            json!({
+                "requested_selector": &args.connector,
+                "slug": &connector.slug,
+                "canonical_id": connector.summary.id.as_str(),
+                "name": &connector.summary.name,
+                "version": connector.summary.version.to_string(),
+            }),
+        );
+        object.insert(
+            "host_registry_version".to_owned(),
+            json!(discovery.registry_version),
+        );
+        if !effective_target.is_null() {
+            object
+                .entry("effective_target".to_owned())
+                .or_insert(effective_target);
+        }
+        object
+            .entry("live_host".to_owned())
+            .or_insert_with(|| json!({}));
+        if let Some(live_host) = object.get_mut("live_host").and_then(Value::as_object_mut) {
+            live_host.insert(
+                "endpoint_hash".to_owned(),
+                Value::String(sha256_prefixed(host.endpoint.as_bytes())),
+            );
+        }
+    }
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "connector");
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
+}
+
+fn connector_lease_status_offline_dispatch(
+    args: &ConnectorLeaseStatusArgs,
+) -> Result<DispatchOutcome> {
     if let Some(outcome) = enforce_required_truth_source_with_subcommand(
         "connector",
         "lease status",
@@ -10879,80 +11068,137 @@ fn mesh_availability_dispatch(
 ) -> Result<DispatchOutcome> {
     let resolved_host = resolve_host_config(explicit_host)?;
     let subcommand = mesh_availability_subcommand(explain, hints_only);
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = resolver.config().default_strategy;
 
-    if let Some(host) = resolved_host {
-        if let Some(zone) = args.zone.as_deref() {
-            return Ok(mesh_live_zone_filter_dispatch(
-                subcommand,
-                &args.connector,
-                zone,
-            ));
-        }
-
-        let client = HostAdminClient::new(&host.endpoint)?;
-        let (catalog, _) = client.catalog(None)?;
-        let connector = match catalog.resolve_connector(&args.connector) {
-            Ok(connector) => connector,
-            Err(error) => {
-                return Ok(connector_resolution_dispatch(
-                    "mesh",
-                    &args.connector,
-                    &error,
-                ));
+    let mut host_error: Option<anyhow::Error> = None;
+    let mut offline_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => {
+                match mesh_availability_host_dispatch(args, host, subcommand, explain, hints_only) {
+                    Ok(outcome) => QueryResult::Complete(outcome),
+                    Err(error) => {
+                        let detail = format!("{error:#}");
+                        host_error = Some(error);
+                        QueryResult::Unavailable(detail)
+                    }
+                }
             }
-        };
-        let status = client.connector_status(connector.summary.id.as_str())?;
-
-        let message = if hints_only {
-            format!(
-                "Derived repair guidance for `{}` from live host status and recorded artifact provenance.",
-                connector.slug
-            )
-        } else if explain {
-            format!(
-                "Explained live availability for `{}` from `fcp-host` status and artifact metadata.",
-                connector.slug
-            )
-        } else {
-            format!(
-                "Loaded live availability for `{}` from `fcp-host` status and artifact metadata.",
-                connector.slug
-            )
-        };
-
-        let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "mesh");
-        let explanation = explain.then_some(vec![
-            "This answer is authoritative for the current host because it comes from live connector status, not workspace manifests.".to_owned(),
-            "Artifact provenance shows where the installed runtime bundle came from and whether hash/signature checks passed.".to_owned(),
-            "Per-zone mesh inventory is still unavailable on the live host API, so node/zone-specific placement cannot be proven on this route yet.".to_owned(),
-        ]);
-        let contract = build_mesh_live_operator_contract(
-            &subcommand,
-            &host.endpoint,
-            connector,
-            &args.connector,
-            &status,
-            message,
-            explanation,
-        );
-        let truth_source = contract.resolution.operator_knowledge_state();
-        if let Some(outcome) = enforce_required_truth_source_with_subcommand(
-            "mesh",
-            subcommand,
-            args.require_source,
-            truth_source,
-        ) {
-            return Ok(outcome);
+            None => QueryResult::NotConfigured,
+        },
+        KnowledgeState::Offline if resolved_host.is_none() => {
+            match mesh_availability_offline_dispatch(args, subcommand, explain, hints_only) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    offline_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            }
         }
-        let mut payload = serde_json::to_value(contract)?;
-        envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, truth_source);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => Ok(resolved.value),
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if let Some(error) = offline_error {
+                return Err(error);
+            }
+            Err(resolution_error.into())
+        }
+    }
+}
+
+fn mesh_availability_host_dispatch(
+    args: &MeshAvailabilityArgs,
+    host: &ResolvedHostConfig,
+    subcommand: &'static str,
+    explain: bool,
+    hints_only: bool,
+) -> Result<DispatchOutcome> {
+    if let Some(zone) = args.zone.as_deref() {
+        return Ok(mesh_live_zone_filter_dispatch(
+            subcommand,
+            &args.connector,
+            zone,
+        ));
     }
 
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let connector = match catalog.resolve_connector(&args.connector) {
+        Ok(connector) => connector,
+        Err(error) => {
+            return Ok(connector_resolution_dispatch(
+                "mesh",
+                &args.connector,
+                &error,
+            ));
+        }
+    };
+    let status = client.connector_status(connector.summary.id.as_str())?;
+
+    let message = if hints_only {
+        format!(
+            "Derived repair guidance for `{}` from live host status and recorded artifact provenance.",
+            connector.slug
+        )
+    } else if explain {
+        format!(
+            "Explained live availability for `{}` from `fcp-host` status and artifact metadata.",
+            connector.slug
+        )
+    } else {
+        format!(
+            "Loaded live availability for `{}` from `fcp-host` status and artifact metadata.",
+            connector.slug
+        )
+    };
+
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "mesh");
+    let explanation = explain.then_some(vec![
+        "This answer is authoritative for the current host because it comes from live connector status, not workspace manifests.".to_owned(),
+        "Artifact provenance shows where the installed runtime bundle came from and whether hash/signature checks passed.".to_owned(),
+        "Per-zone mesh inventory is still unavailable on the live host API, so node/zone-specific placement cannot be proven on this route yet.".to_owned(),
+    ]);
+    let contract = build_mesh_live_operator_contract(
+        &subcommand,
+        &host.endpoint,
+        connector,
+        &args.connector,
+        &status,
+        message,
+        explanation,
+    );
+    let truth_source = contract.resolution.operator_knowledge_state();
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        subcommand,
+        args.require_source,
+        truth_source,
+    ) {
+        return Ok(outcome);
+    }
+    let mut payload = serde_json::to_value(contract)?;
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, truth_source);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
+}
+
+fn mesh_availability_offline_dispatch(
+    args: &MeshAvailabilityArgs,
+    subcommand: &'static str,
+    explain: bool,
+    hints_only: bool,
+) -> Result<DispatchOutcome> {
     let catalog = DiscoveryCatalog::load_for_connector_filter(Some(args.connector.as_str()))?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
@@ -13042,7 +13288,14 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
             if let Some(error) = offline_error {
                 return Err(error);
             }
-            drop(resolution_error);
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
             // Preserve the pre-resolver no-source surface: a `--require-source`
             // floor the offline artifact cannot satisfy refuses before the
             // missing-host payload is emitted.
@@ -13268,7 +13521,14 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
             if let Some(error) = offline_error {
                 return Err(error);
             }
-            drop(resolution_error);
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
             if let Some(outcome) =
                 enforce_required_truth_source("show", args.require_source, KnowledgeState::Offline)
             {
@@ -13544,7 +13804,14 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
             if let Some(error) = offline_error {
                 return Err(error);
             }
-            drop(resolution_error);
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
             // No source could answer: reproduce the pre-resolver refusal
             // surface byte-for-byte (`--require-source` check first, then the
             // missing-host payload).
@@ -14060,25 +14327,77 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
         return Ok(outcome);
     };
 
-    let Some(host) = resolve_host_config(explicit_host)? else {
-        if let Some(outcome) =
-            enforce_required_truth_source("doctor", args.require_source, KnowledgeState::Offline)
-        {
-            return Ok(outcome);
-        }
+    let resolved_host = resolve_host_config(explicit_host)?;
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = resolver.config().default_strategy;
 
-        let mut outcome = missing_host_dispatch(
-            "doctor",
-            serde_json::to_value(args)?,
-            vec![
-                format!("fwc doctor --zone {zone_arg} --host <endpoint>"),
-                "Set `FWC_HOST` or `FCP_HOST_ENDPOINT`, or configure an active FCP context."
-                    .to_owned(),
-            ],
-        );
-        inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-        return Ok(outcome);
-    };
+    let mut host_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match doctor_dispatch_host(args, zone_arg, host) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "doctor",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(resolved.value)
+        }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
+            if let Some(outcome) = enforce_required_truth_source(
+                "doctor",
+                args.require_source,
+                KnowledgeState::Offline,
+            ) {
+                return Ok(outcome);
+            }
+
+            let mut outcome = missing_host_dispatch(
+                "doctor",
+                serde_json::to_value(args)?,
+                vec![
+                    format!("fwc doctor --zone {zone_arg} --host <endpoint>"),
+                    "Set `FWC_HOST` or `FCP_HOST_ENDPOINT`, or configure an active FCP context."
+                        .to_owned(),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
+
+fn doctor_dispatch_host(
+    args: &DoctorArgs,
+    zone_arg: &str,
+    host: &ResolvedHostConfig,
+) -> Result<DispatchOutcome> {
     if let Some(outcome) =
         enforce_required_truth_source("doctor", args.require_source, KnowledgeState::HostBacked)
     {
@@ -15568,30 +15887,77 @@ fn symptoms_from_connector_health(health: &ConnectorHealth, enabled: bool) -> do
 }
 
 fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
-    let Some(host) = resolve_host_config(explicit_host)? else {
-        if let Some(outcome) =
-            enforce_required_truth_source("status", args.require_source, KnowledgeState::Offline)
-        {
-            return Ok(outcome);
+    let resolved_host = resolve_host_config(explicit_host)?;
+    let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
+    let strategy = resolver.config().default_strategy;
+
+    let mut host_error: Option<anyhow::Error> = None;
+    let resolution = resolver.resolve_with_partials(strategy, |source| match source {
+        KnowledgeState::HostBacked => match resolved_host.as_ref() {
+            Some(host) => match status_dispatch_host(args, host) {
+                Ok(outcome) => QueryResult::Complete(outcome),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    host_error = Some(error);
+                    QueryResult::Unavailable(detail)
+                }
+            },
+            None => QueryResult::NotConfigured,
+        },
+        _ => QueryResult::NotConfigured,
+    });
+
+    match resolution {
+        Ok(resolved) => {
+            if let Some(outcome) = enforce_required_truth_source(
+                "status",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
+                return Ok(outcome);
+            }
+            Ok(resolved.value)
         }
+        Err(resolution_error) => {
+            if let Some(error) = host_error {
+                return Err(error);
+            }
+            if resolution_error.attempts.is_empty()
+                || resolution_error
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome != SourceOutcome::NotConfigured)
+            {
+                return Err(resolution_error.into());
+            }
+            if let Some(outcome) = enforce_required_truth_source(
+                "status",
+                args.require_source,
+                KnowledgeState::Offline,
+            ) {
+                return Ok(outcome);
+            }
 
-        let mut outcome = missing_host_dispatch(
-            "status",
-            json!({
-                "scope": if args.connector.is_some() { "connector" } else { "fleet" },
-                "connector": args.connector.as_deref(),
-                "require_source": args.require_source.map(RequiredTruthSource::label),
-            }),
-            vec![
-                "fwc status --host <endpoint>".to_owned(),
-                "Set `FWC_HOST` or `FCP_HOST_ENDPOINT`, or configure an active FCP context."
-                    .to_owned(),
-            ],
-        );
-        inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
-        return Ok(outcome);
-    };
+            let mut outcome = missing_host_dispatch(
+                "status",
+                json!({
+                    "scope": if args.connector.is_some() { "connector" } else { "fleet" },
+                    "connector": args.connector.as_deref(),
+                    "require_source": args.require_source.map(RequiredTruthSource::label),
+                }),
+                vec![
+                    "fwc status --host <endpoint>".to_owned(),
+                    "Set `FWC_HOST` or `FCP_HOST_ENDPOINT`, or configure an active FCP context."
+                        .to_owned(),
+                ],
+            );
+            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::Offline);
+            Ok(outcome)
+        }
+    }
+}
 
+fn status_dispatch_host(args: &StatusArgs, host: &ResolvedHostConfig) -> Result<DispatchOutcome> {
     if let Some(outcome) =
         enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
     {
@@ -23205,15 +23571,22 @@ impl ResolvedLiveAuth {
         let operation_id: OperationId = operation.parse().map_err(|error| {
             anyhow::anyhow!("cannot sign holder proof for invalid operation: {error}")
         })?;
-        let bytes = fcp_core::HolderProof::signable_bytes(
-            request_id,
-            &operation_id,
-            &signer.token_jti,
-        );
+        let bytes =
+            fcp_core::HolderProof::signable_bytes(request_id, &operation_id, &signer.token_jti);
         Ok(Some(fcp_core::HolderProof::new(
             signer.key.sign(&bytes).to_bytes(),
             signer.holder_node.clone(),
         )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_token(capability_token: CapabilityToken) -> Self {
+        Self {
+            capability_token,
+            approval_tokens: Vec::new(),
+            principal_hint: None,
+            holder_signer: None,
+        }
     }
 }
 
@@ -23340,14 +23713,19 @@ fn read_live_holder_signing_key(
         message: message.to_owned(),
     };
     let file = std::fs::File::open(path).map_err(|error| LiveAuthError::InvalidHolderProof {
-        message: format!("Cannot open holder signing key at `{}`: {error}", path.display()),
+        message: format!(
+            "Cannot open holder signing key at `{}`: {error}",
+            path.display()
+        ),
     })?;
     let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(129));
     file.take(129).read_to_end(&mut bytes).map_err(|_| {
         invalid("Cannot read holder signing key; expected 32 raw bytes or 64 hexadecimal digits.")
     })?;
     if bytes.len() > 128 {
-        return Err(invalid("Holder signing key file exceeds the 128-byte limit."));
+        return Err(invalid(
+            "Holder signing key file exceeds the 128-byte limit.",
+        ));
     }
     let mut secret = zeroize::Zeroizing::new([0_u8; 32]);
     if bytes.len() == 32 {
@@ -23358,11 +23736,12 @@ fn read_live_holder_signing_key(
         })?;
         let encoded = encoded.trim();
         if encoded.len() != 64 {
-            return Err(invalid("Holder signing key must be 32 raw bytes or 64 hexadecimal digits."));
+            return Err(invalid(
+                "Holder signing key must be 32 raw bytes or 64 hexadecimal digits.",
+            ));
         }
-        hex::decode_to_slice(encoded, &mut *secret).map_err(|_| {
-            invalid("Holder signing key contains invalid hexadecimal encoding.")
-        })?;
+        hex::decode_to_slice(encoded, &mut *secret)
+            .map_err(|_| invalid("Holder signing key contains invalid hexadecimal encoding."))?;
     }
     fcp_crypto::Ed25519SigningKey::from_bytes(&secret)
         .map_err(|_| invalid("Holder signing key is not a valid Ed25519 secret key."))
@@ -26730,8 +27109,8 @@ fn capability_replay_exit_code(error: &capability_replay::CapabilityReplayError)
         capability_replay::CapabilityReplayError::Replay(
             fcp_audit::replay::ReplayError::TokenNotFoundInAuditChain { .. },
         ) => CliExitCode::UnknownCommand,
-        capability_replay::CapabilityReplayError::ReadAuditChain { .. }
-        | capability_replay::CapabilityReplayError::ParseAuditChain(_)
+        capability_replay::CapabilityReplayError::InvalidTrustPolicy(_)
+        | capability_replay::CapabilityReplayError::UnverifiedChain(_)
         | capability_replay::CapabilityReplayError::Serialize(_)
         | capability_replay::CapabilityReplayError::Replay(
             fcp_audit::replay::ReplayError::AuditChainUnavailable(_)
@@ -26760,8 +27139,8 @@ fn capability_replay_next_actions(error: &capability_replay::CapabilityReplayErr
             "Retry with a wider `--since` window and `--confirm` if the token is older than seven days."
                 .to_owned(),
         ],
-        capability_replay::CapabilityReplayError::ReadAuditChain { .. }
-        | capability_replay::CapabilityReplayError::ParseAuditChain(_)
+        capability_replay::CapabilityReplayError::InvalidTrustPolicy(_)
+        | capability_replay::CapabilityReplayError::UnverifiedChain(_)
         | capability_replay::CapabilityReplayError::Serialize(_)
         | capability_replay::CapabilityReplayError::Replay(
             fcp_audit::replay::ReplayError::AuditChainUnavailable(_)
@@ -32131,10 +32510,9 @@ mod tests {
         FwcMetadataCacheKey, HostConnectorCatalog, KnowledgeState, LiveAuthArgs,
         LiveTruthResolverBranch, MetadataField, PACKAGE_OUTPUT_FILENAME, PackageBuildMetadata,
         PackageOutput, PrepareCliError, ResolvedHostConfig, ResolvedHostOperation,
-        TRUTH_SOURCE_SCHEMA_VERSION, catalog, doctor_hlc_probe_warnings,
+        TRUTH_SOURCE_SCHEMA_VERSION, catalog, derive_live_request_id, doctor_hlc_probe_warnings,
         doctor_iblt_probe_warnings, doctor_migration_probe_warnings, doctor_reality_cadence_report,
-        derive_live_request_id, execute, host_discovered_connector, host_discovered_operation,
-        host_mcp_tool_definitions,
+        execute, host_discovered_connector, host_discovered_operation, host_mcp_tool_definitions,
         host_tool_summary_entry, host_tool_when_to_use, live_pipeline_operation_metadata,
         mcp_tool_invoke_args, normalize_args, pipeline_dry_run_can_materialize_output, prepare_cli,
         resolve_install_activation_truth, resolve_mesh_live_truth, serve_mcp,
@@ -34487,12 +34865,10 @@ max_state_replication_staleness_secs = 120
                 .clone(),
         )
         .expect("wire request ID should decode");
-        let operation: fcp_core::OperationId =
-            serde_json::from_value(request["operation"].clone())
-                .expect("wire operation should decode");
-        let proof: fcp_core::HolderProof =
-            serde_json::from_value(request["holder_proof"].clone())
-                .expect("wire request should contain a holder proof");
+        let operation: fcp_core::OperationId = serde_json::from_value(request["operation"].clone())
+            .expect("wire operation should decode");
+        let proof: fcp_core::HolderProof = serde_json::from_value(request["holder_proof"].clone())
+            .expect("wire request should contain a holder proof");
         let token: super::CapabilityToken =
             serde_json::from_value(request["capability_token"].clone())
                 .expect("wire capability should decode");
@@ -34506,11 +34882,8 @@ max_state_replication_staleness_secs = 120
             proof.holder_node,
             fcp_core::TailscaleNodeId::new(TEST_LIVE_HOLDER_NODE)
         );
-        let signable = fcp_core::HolderProof::signable_bytes(
-            &request_id,
-            &operation,
-            TEST_LIVE_HOLDER_JTI,
-        );
+        let signable =
+            fcp_core::HolderProof::signable_bytes(&request_id, &operation, TEST_LIVE_HOLDER_JTI);
         signing_key
             .verifying_key()
             .verify(
@@ -34656,11 +35029,8 @@ max_state_replication_staleness_secs = 120
         );
         let signature = fcp_crypto::Ed25519Signature::from_bytes(&proof.signature);
         let verifier = signing_key.verifying_key();
-        let signable = fcp_core::HolderProof::signable_bytes(
-            &request_id,
-            &operation,
-            TEST_LIVE_HOLDER_JTI,
-        );
+        let signable =
+            fcp_core::HolderProof::signable_bytes(&request_id, &operation, TEST_LIVE_HOLDER_JTI);
         verifier
             .verify(&signable, &signature)
             .expect("holder proof signature should verify");
@@ -34673,11 +35043,7 @@ max_state_replication_staleness_secs = 120
         let other_request = RequestId::new("holder-request-two");
         let other_operation: fcp_core::OperationId = "issues.get".parse().unwrap();
         for changed in [
-            fcp_core::HolderProof::signable_bytes(
-                &other_request,
-                &operation,
-                TEST_LIVE_HOLDER_JTI,
-            ),
+            fcp_core::HolderProof::signable_bytes(&other_request, &operation, TEST_LIVE_HOLDER_JTI),
             fcp_core::HolderProof::signable_bytes(
                 &request_id,
                 &other_operation,
@@ -34754,7 +35120,11 @@ max_state_replication_staleness_secs = 120
                 &key_path_text,
             ]);
             server.join().expect("mock host thread should complete");
-            assert_eq!(exit_code, CliExitCode::Success.into(), "{command}: {payload}");
+            assert_eq!(
+                exit_code,
+                CliExitCode::Success.into(),
+                "{command}: {payload}"
+            );
             let requests = request_log.lock().expect("request log should lock");
             let bodies = requests[2..]
                 .iter()
@@ -40559,6 +40929,9 @@ deny_ptrace = true
                         assert!(args.state_root.is_none());
                         assert_eq!(args.require_source, Some(RequiredTruthSource::AnyLive));
                     }
+                    command => {
+                        panic!("expected connector state explain command, got {command:?}")
+                    }
                 },
                 command => panic!("expected connector state command, got {command:?}"),
             },
@@ -40752,10 +41125,7 @@ deny_ptrace = true
             for explicit_host in [false, true] {
                 let mut args = vec!["fwc", "--json"];
                 if explicit_host {
-                    args.extend([
-                        "--host",
-                        "http://127.0.0.1?invalid-explicit-endpoint=true",
-                    ]);
+                    args.extend(["--host", "http://127.0.0.1?invalid-explicit-endpoint=true"]);
                 }
                 args.extend([
                     "connector",
@@ -44248,7 +44618,10 @@ deny_ptrace = true
                     assert!(request.get("lease_seq").is_none());
                 }
             }
-            assert_ne!(operations[0]["request"]["id"], operations[1]["request"]["id"]);
+            assert_ne!(
+                operations[0]["request"]["id"],
+                operations[1]["request"]["id"]
+            );
             assert_ne!(signatures[0], signatures[1]);
         }
         for invalid in ["-1", "18446744073709551616", "latest"] {
@@ -45256,8 +45629,14 @@ depends_on = ["missing"]
         assert_live_holder_request(&fetch_invoke, &signing_key);
         let notify_proof = assert_live_holder_request(&notify_preflight, &signing_key);
         assert_eq!(fetch_preflight["request_id"], fetch_invoke["id"]);
-        assert_eq!(fetch_preflight["holder_proof"], fetch_invoke["holder_proof"]);
-        assert_ne!(fetch_preflight["request_id"], notify_preflight["request_id"]);
+        assert_eq!(
+            fetch_preflight["holder_proof"],
+            fetch_invoke["holder_proof"]
+        );
+        assert_ne!(
+            fetch_preflight["request_id"],
+            notify_preflight["request_id"]
+        );
         assert_ne!(fetch_proof.signature, notify_proof.signature);
     }
 
@@ -46773,7 +47152,10 @@ depends_on = ["missing"]
         assert_eq!(payload["phase"], "connector_reached");
         assert_eq!(payload["command"], "simulate");
         assert_eq!(payload["preflight"]["allowed"], true);
-        assert_eq!(payload["simulation"]["receipt"]["receipt_id"], "sim-test-receipt");
+        assert_eq!(
+            payload["simulation"]["receipt"]["receipt_id"],
+            "sim-test-receipt"
+        );
         assert_eq!(payload["simulation"]["duration_ms"], 42);
     }
 
@@ -46800,7 +47182,10 @@ depends_on = ["missing"]
             "rate_limit_reset_at": 1_700_000_000,
         });
         let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
-            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
             (
                 "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
                 mock_introspection_response_json(),
@@ -46831,8 +47216,14 @@ depends_on = ["missing"]
         assert_eq!(payload["phase"], "connector_reached");
         assert_eq!(payload["would_succeed"], true);
         assert_eq!(payload["_truth_source"], "simulated");
-        assert_eq!(payload["simulation"]["cost_estimate"], response["cost_estimate"]);
-        assert_eq!(payload["simulation"]["availability"], response["availability"]);
+        assert_eq!(
+            payload["simulation"]["cost_estimate"],
+            response["cost_estimate"]
+        );
+        assert_eq!(
+            payload["simulation"]["availability"],
+            response["availability"]
+        );
         assert_eq!(payload["simulation"]["receipt"], response["receipt"]);
 
         let requests = request_log.lock().expect("request log should lock");
@@ -46988,7 +47379,9 @@ depends_on = ["missing"]
             let mut response =
                 mock_simulate_response_json(&input, SimulatePhase::ConnectorReached, true);
             for (path, replacement) in mutations {
-                *response.pointer_mut(path).expect("simulation fixture field") = replacement;
+                *response
+                    .pointer_mut(path)
+                    .expect("simulation fixture field") = replacement;
             }
             let (host, server) = spawn_mock_host(
                 mock_github_host_routes(StdBTreeMap::from([(
@@ -47806,7 +48199,10 @@ depends_on = ["missing"]
             "title": "private-issue-payload",
         });
         let (host, server, requests) = spawn_mock_host_sequence_with_body_log(vec![
-            ("POST /rpc/discover".to_owned(), mock_discovery_response_json()),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
             (
                 "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
                 mock_introspection_response_json(),
@@ -47842,7 +48238,11 @@ depends_on = ["missing"]
         server.join().expect("mock host completed");
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4, "the uncertain invoke must not be repeated");
+        assert_eq!(
+            requests.len(),
+            4,
+            "the uncertain invoke must not be repeated"
+        );
         let sent: Value = serde_json::from_str(&requests[3].1).unwrap();
         assert_eq!(sent["input"], private_input);
         assert_eq!(payload["request_id"], sent["id"]);
@@ -54940,8 +55340,15 @@ require_attestation_types = ["in-toto"]"#,
         );
         assert_eq!(resolution.authoritative_scope, "host-admin-status");
         assert!(!resolution.mesh_backed);
-        for required in [RequiredTruthSource::AnyLive, RequiredTruthSource::MeshOrHost] {
-            assert!(required.validate(resolution.operator_knowledge_state()).is_ok());
+        for required in [
+            RequiredTruthSource::AnyLive,
+            RequiredTruthSource::MeshOrHost,
+        ] {
+            assert!(
+                required
+                    .validate(resolution.operator_knowledge_state())
+                    .is_ok()
+            );
         }
     }
 

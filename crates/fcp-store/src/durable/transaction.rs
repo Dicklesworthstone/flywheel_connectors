@@ -44,29 +44,21 @@ mod tests {
         let writer = Arc::new(Mutex::new(()));
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, resume) = mpsc::channel();
-        let waiter = tokio::spawn(run(
-            Arc::clone(&state),
-            Arc::clone(&writer),
-            move |state| {
-                entered.send(()).unwrap();
-                resume.recv_timeout(Duration::from_secs(5)).unwrap();
-                state.push(1);
-            },
-        ));
+        let waiter = tokio::spawn(run(Arc::clone(&state), Arc::clone(&writer), move |state| {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            state.push(1);
+        }));
         started.await.unwrap();
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         assert!(state.try_lock().is_err());
         assert!(writer.try_lock().is_err());
 
-        let mut next = Box::pin(run(
-            Arc::clone(&state),
-            Arc::clone(&writer),
-            |state| {
-                assert_eq!(state.as_slice(), &[1]);
-                state.push(2);
-            },
-        ));
+        let mut next = Box::pin(run(Arc::clone(&state), Arc::clone(&writer), |state| {
+            assert_eq!(state.as_slice(), &[1]);
+            state.push(2);
+        }));
         poll_fn(|cx| {
             assert!(next.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -86,11 +78,9 @@ mod tests {
         let state = Arc::new(Mutex::new(0));
         let writer = Arc::new(Mutex::new(()));
         let held = Arc::clone(&writer).lock_owned().await;
-        let mut waiter = Box::pin(run(
-            Arc::clone(&state),
-            Arc::clone(&writer),
-            |state| *state = 1,
-        ));
+        let mut waiter = Box::pin(run(Arc::clone(&state), Arc::clone(&writer), |state| {
+            *state = 1
+        }));
         poll_fn(|cx| {
             assert!(waiter.as_mut().poll(cx).is_pending());
             Poll::Ready(())

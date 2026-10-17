@@ -47,10 +47,14 @@ fn require_live_times(claims: &CwtClaims, now: i64) -> HostResult<()> {
         return Err(refusal("capability dispatch clock is invalid"));
     }
     if claims.get_expiration().is_none_or(|expires| now >= expires) {
-        return Err(refusal("capability expired or lacks a valid expiry at dispatch"));
+        return Err(refusal(
+            "capability expired or lacks a valid expiry at dispatch",
+        ));
     }
     if claims.get(cwt_claims::NBF).is_some()
-        && claims.get_not_before().is_none_or(|not_before| now < not_before)
+        && claims
+            .get_not_before()
+            .is_none_or(|not_before| now < not_before)
     {
         return Err(refusal("capability not-before claim rejected at dispatch"));
     }
@@ -80,7 +84,9 @@ fn check_policy(
     let receipt = simulate_policy_decision(input)
         .map_err(|_| refusal("current zone policy could not be evaluated at dispatch"))?;
     if receipt.decision != Decision::Allow {
-        return Err(refusal("current zone policy or approval scope denied dispatch"));
+        return Err(refusal(
+            "current zone policy or approval scope denied dispatch",
+        ));
     }
     Ok(())
 }
@@ -98,12 +104,17 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
         .introspect(&request.connector_id)
         .await
         .map_err(|_| refusal("connector operation catalog unavailable at dispatch"))?;
-    let mut matching = introspection.tools.iter()
+    let mut matching = introspection
+        .tools
+        .iter()
         .filter(|tool| tool.name == request.operation.as_str());
-    let tool = matching.next()
+    let tool = matching
+        .next()
         .ok_or_else(|| refusal("connector no longer exposes the admitted operation"))?;
     if matching.next().is_some() {
-        return Err(refusal("connector operation catalog is ambiguous at dispatch"));
+        return Err(refusal(
+            "connector operation catalog is ambiguous at dispatch",
+        ));
     }
     let verification = state
         .lifecycle
@@ -124,22 +135,32 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
         )
         .is_some()
     {
-        return Err(refusal("persisted capability state rejected the admitted request at dispatch"));
+        return Err(refusal(
+            "persisted capability state rejected the admitted request at dispatch",
+        ));
     }
-    let zone_policy = state.lookup_zone_policy(&request.zone_id).await
+    let zone_policy = state
+        .lookup_zone_policy(&request.zone_id)
+        .await
         .map_err(|_| refusal("current zone policy unavailable at dispatch"))?;
     // Every async lookup completes before the final clock-sensitive checks.
     // None of these checks consumes/inspects quota or creates a new admission.
     let claims = check_current_token(state, request)?;
     let resource_uri = live_constraint_resource_uri(&request.input);
     let resources = resource_uri.iter().cloned().collect::<Vec<_>>();
-    let key = state.capability_verifying_key.as_ref()
+    let key = state
+        .capability_verifying_key
+        .as_ref()
         .ok_or_else(|| refusal("capability verification key unavailable at dispatch"))?;
-    let _verified_scope = CapabilityVerifier::without_instance_binding(key.to_bytes(), request.zone_id.clone())
-        .verify_unbound(
-            request.capability_token.clone(), &tool.capability, &request.operation, &resources,
-        )
-        .map_err(|_| refusal("capability scope no longer matches the dispatch operation"))?;
+    let _verified_scope =
+        CapabilityVerifier::without_instance_binding(key.to_bytes(), request.zone_id.clone())
+            .verify_unbound(
+                request.capability_token.clone(),
+                &tool.capability,
+                &request.operation,
+                &resources,
+            )
+            .map_err(|_| refusal("capability scope no longer matches the dispatch operation"))?;
     let principal = claims_principal(&claims)
         .filter(|principal| !principal.trim().is_empty())
         .ok_or_else(|| refusal("verified dispatch principal is missing"))?;
@@ -147,27 +168,31 @@ pub(super) async fn revalidate(state: &AppState, request: &InvokeRequest) -> Hos
         .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
     let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
         .map_err(|_| refusal("policy dispatch clock is invalid"))?;
-    check_policy(&PolicySimulationInput {
-        zone_policy,
-        invoke_request: request.clone(),
-        transport: TransportMode::Lan,
-        // Retain the live preflight's host-local policy inputs. These are not
-        // new claims of a mesh-wide checkpoint/freshness proof.
-        checkpoint_fresh: true,
-        revocation_fresh: true,
-        execution_approval_required: tool.approval_mode
-            .is_some_and(|mode| !matches!(mode, ApprovalMode::None)),
-        sanitizer_receipts: Vec::new(),
-        related_object_ids: Vec::new(),
-        request_object_id: None,
-        request_input_hash: Some(request_input_hash(&request.input)?),
-        safety_tier: tool.safety_tier,
-        principal: Some(principal.to_owned()),
-        capability_id: Some(tool.capability.to_string()),
-        provenance_record: None,
-        now_ms: Some(now_ms),
-        posture_attestation: None,
-    }, state.approval_verifying_key.as_ref())?;
+    check_policy(
+        &PolicySimulationInput {
+            zone_policy,
+            invoke_request: request.clone(),
+            transport: TransportMode::Lan,
+            // Retain the live preflight's host-local policy inputs. These are not
+            // new claims of a mesh-wide checkpoint/freshness proof.
+            checkpoint_fresh: true,
+            revocation_fresh: true,
+            execution_approval_required: tool
+                .approval_mode
+                .is_some_and(|mode| !matches!(mode, ApprovalMode::None)),
+            sanitizer_receipts: Vec::new(),
+            related_object_ids: Vec::new(),
+            request_object_id: None,
+            request_input_hash: Some(request_input_hash(&request.input)?),
+            safety_tier: tool.safety_tier,
+            principal: Some(principal.to_owned()),
+            capability_id: Some(tool.capability.to_string()),
+            provenance_record: None,
+            now_ms: Some(now_ms),
+            posture_attestation: None,
+        },
+        state.approval_verifying_key.as_ref(),
+    )?;
     enforce_live_capability_constraints(request, &claims, principal, resource_uri.as_deref())
         .map_err(|_| refusal("capability constraints rejected the request at dispatch"))?;
     require_live_times(&claims, chrono::Utc::now().timestamp())
@@ -190,7 +215,10 @@ mod tests {
 
     fn claims() -> CwtClaims {
         CwtClaims::default()
-            .custom(cwt_claims::SUB, ciborium::Value::Text("private-subject-marker".to_owned()))
+            .custom(
+                cwt_claims::SUB,
+                ciborium::Value::Text("private-subject-marker".to_owned()),
+            )
             .custom(cwt_claims::EXP, ciborium::Value::Integer(2000.into()))
             .custom(cwt_claims::NBF, ciborium::Value::Integer(1000.into()))
     }
@@ -241,7 +269,10 @@ mod tests {
     #[test]
     fn dispatch_rejects_malformed_not_before_instead_of_treating_it_as_absent() {
         let verifying_key = key().verifying_key();
-        for value in [ciborium::Value::Text("1000".to_owned()), ciborium::Value::Null] {
+        for value in [
+            ciborium::Value::Text("1000".to_owned()),
+            ciborium::Value::Null,
+        ] {
             let token = token(&claims().custom(cwt_claims::NBF, value));
             assert!(verified_claims_at(&token, Some(&verifying_key), 1500).is_err());
         }
@@ -249,9 +280,10 @@ mod tests {
 
     #[test]
     fn dispatch_allows_absent_not_before_but_not_an_invalid_clock() {
-        let token = token(&CwtClaims::default().custom(
-            cwt_claims::EXP, ciborium::Value::Integer(i64::MAX.into()),
-        ));
+        let token = token(
+            &CwtClaims::default()
+                .custom(cwt_claims::EXP, ciborium::Value::Integer(i64::MAX.into())),
+        );
         let verifying_key = key().verifying_key();
         assert!(verified_claims_at(&token, Some(&verifying_key), 0).is_ok());
         assert!(verified_claims_at(&token, Some(&verifying_key), i64::MAX - 1).is_ok());
@@ -272,7 +304,8 @@ mod tests {
     fn policy_input() -> PolicySimulationInput {
         let zone = ZoneId::work();
         let claims = claims().custom(
-            cwt_claims::SUB, ciborium::Value::Text("user:alice".to_owned()),
+            cwt_claims::SUB,
+            ciborium::Value::Text("user:alice".to_owned()),
         );
         let request = InvokeRequest {
             r#type: "invoke".to_owned(),
@@ -312,7 +345,9 @@ mod tests {
     }
 
     fn pattern(value: &str) -> fcp_core::PolicyPattern {
-        fcp_core::PolicyPattern { pattern: value.to_owned() }
+        fcp_core::PolicyPattern {
+            pattern: value.to_owned(),
+        }
     }
 
     fn sign_approval(approval: &mut ApprovalToken) {
@@ -357,7 +392,10 @@ mod tests {
     fn dispatch_rechecks_a_new_connector_deny() {
         let mut input = policy_input();
         check_policy(&input, None).expect("initial policy allowed");
-        input.zone_policy.connector_deny.push(pattern("connector:test"));
+        input
+            .zone_policy
+            .connector_deny
+            .push(pattern("connector:test"));
         assert!(check_policy(&input, None).is_err());
     }
 
@@ -365,7 +403,10 @@ mod tests {
     fn dispatch_rechecks_a_new_capability_deny() {
         let mut input = policy_input();
         check_policy(&input, None).expect("initial policy allowed");
-        input.zone_policy.capability_deny.push(pattern("cap.test.read"));
+        input
+            .zone_policy
+            .capability_deny
+            .push(pattern("cap.test.read"));
         assert!(check_policy(&input, None).is_err());
     }
 
@@ -404,7 +445,10 @@ mod tests {
     fn dispatch_rechecks_signed_approval_expiry_after_admission() {
         let mut input = policy_input();
         input.execution_approval_required = true;
-        input.invoke_request.approval_tokens.push(execution_approval(&input));
+        input
+            .invoke_request
+            .approval_tokens
+            .push(execution_approval(&input));
         let key = key().verifying_key();
         check_policy(&input, Some(&key)).expect("signed approval initially live");
         input.now_ms = Some(POLICY_NOW_MS + 11);
@@ -415,7 +459,10 @@ mod tests {
     fn dispatch_approval_requires_signature_and_configured_key() {
         let mut input = policy_input();
         input.execution_approval_required = true;
-        input.invoke_request.approval_tokens.push(execution_approval(&input));
+        input
+            .invoke_request
+            .approval_tokens
+            .push(execution_approval(&input));
         let key = key().verifying_key();
         check_policy(&input, Some(&key)).expect("signature verifies");
         assert!(check_policy(&input, None).is_err());

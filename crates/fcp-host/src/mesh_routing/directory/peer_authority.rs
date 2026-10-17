@@ -80,7 +80,10 @@ impl PeerContinuity {
                     .entries
                     .get(peer.node_id.as_str())
                     .filter(|previous| &previous.peer == peer)
-                    .map_or_else(|| Arc::new(PeerEpoch), |previous| Arc::clone(&previous.epoch));
+                    .map_or_else(
+                        || Arc::new(PeerEpoch),
+                        |previous| Arc::clone(&previous.epoch),
+                    );
                 (
                     peer.node_id.as_str().to_owned(),
                     PeerEntry {
@@ -206,7 +209,9 @@ mod tests {
         assert!(removed.check(&snapshot).is_err());
         let restored = removed.successor(&first);
         assert!(restored.check(&snapshot).is_err());
-        restored.check(&restored.snapshot(first, &peer()).unwrap()).unwrap();
+        restored
+            .check(&restored.snapshot(first, &peer()).unwrap())
+            .unwrap();
     }
 
     #[test]

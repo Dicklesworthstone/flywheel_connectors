@@ -59,6 +59,7 @@ fn make_object(seed: u8, payload: &[u8]) -> StoredObject {
     StoredObject {
         object_id: ObjectId::from_bytes([seed; 32]),
         header: fcp_core::ObjectHeader {
+            encryption_kind: fcp_core::ObjectEncryptionKind::default(),
             schema: SchemaId::new("fcp.test", "DurabilityPayload", Version::new(0, 1, 0)),
             zone_id: test_zone(),
             created_at: 1_000_000,
@@ -133,6 +134,7 @@ fn build_durability_object(
     StoredObject {
         object_id,
         header: fcp_core::ObjectHeader {
+            encryption_kind: fcp_core::ObjectEncryptionKind::default(),
             schema: SchemaId::new("fcp.test", "DurabilityPayload", Version::new(0, 1, 0)),
             zone_id: zone.clone(),
             created_at: 1_700_000_000,

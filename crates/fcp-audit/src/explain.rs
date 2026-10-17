@@ -71,7 +71,10 @@ impl CausalExplanation {
             let _ = writeln!(
                 out,
                 "Captured host request {}: connector {}, operation {}, outcome {}. Associated evidence:",
-                request.request_id, self.connector_id, self.operation_id, request.outcome.as_str()
+                request.request_id,
+                self.connector_id,
+                self.operation_id,
+                request.outcome.as_str()
             );
         } else {
             let _ = writeln!(
@@ -399,9 +402,7 @@ where
         return serde_json::from_str(trimmed).map_err(|err| parse_error(&err));
     }
 
-    if trimmed.starts_with('{')
-        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
-    {
+    if trimmed.starts_with('{') && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok() {
         // A valid document with invalid fields remains an error, not a reason
         // to downgrade to a different input shape or accept a partial prefix.
         // Deserialize the original text so duplicate fields remain errors.
@@ -531,19 +532,16 @@ fn select_receipt<'a>(
 }
 
 fn token_matches_invocation(token: &Value, invocation: &AuditEntry) -> bool {
-    if token_field(token, &["connector_id", "connector"])
-        != Ok(invocation.connector_id.as_deref())
+    if token_field(token, &["connector_id", "connector"]) != Ok(invocation.connector_id.as_deref())
         || token_field(token, &["operation_id", "operation", "op"])
             != Ok(invocation.operation_id.as_deref())
         || token_field(token, &["zone_id", "zone"]) != Ok(Some(invocation.zone_id.as_str()))
-        || token_field(token, &["actor", "principal", "sub"])
-            != Ok(Some(invocation.actor.as_str()))
+        || token_field(token, &["actor", "principal", "sub"]) != Ok(Some(invocation.actor.as_str()))
         || !matches!(token_field(token, &["id", "token_id", "jti"]), Ok(Some(_)))
     {
         return false;
     }
-    let Ok(reference) = token_field(token, &["audit_entry_id", "invocation_audit_entry_id"])
-    else {
+    let Ok(reference) = token_field(token, &["audit_entry_id", "invocation_audit_entry_id"]) else {
         return false;
     };
     let Ok(correlation) = token_field(token, &["correlation_id", "correlation"]) else {
@@ -571,12 +569,14 @@ fn entry_matches_invocation(entry: &AuditEntry, invocation: &AuditEntry) -> bool
 fn receipt_matches_invocation(receipt: &DecisionReceipt, invocation: &AuditEntry) -> bool {
     if receipt.zone_id != invocation.zone_id
         || receipt.decided_at > invocation.occurred_at
-        || receipt.connector_id.as_ref().is_some_and(|id| {
-            Some(id) != invocation.connector_id.as_ref()
-        })
-        || receipt.operation_id.as_ref().is_some_and(|id| {
-            Some(id) != invocation.operation_id.as_ref()
-        })
+        || receipt
+            .connector_id
+            .as_ref()
+            .is_some_and(|id| Some(id) != invocation.connector_id.as_ref())
+        || receipt
+            .operation_id
+            .as_ref()
+            .is_some_and(|id| Some(id) != invocation.operation_id.as_ref())
         || receipt
             .correlation_id
             .as_ref()
@@ -590,8 +590,7 @@ fn receipt_matches_invocation(receipt: &DecisionReceipt, invocation: &AuditEntry
         Some(id) => id == invocation.id,
         None => {
             !invocation.correlation_id.is_empty()
-                && receipt.correlation_id.as_deref()
-                    == Some(invocation.correlation_id.as_str())
+                && receipt.correlation_id.as_deref() == Some(invocation.correlation_id.as_str())
                 && receipt.connector_id == invocation.connector_id
                 && receipt.operation_id == invocation.operation_id
         }
@@ -616,9 +615,13 @@ fn admission_allows(entry: &AuditEntry) -> bool {
         if let Some(value) = entry.metadata.get(key) {
             let allowed = if key == "admitted" {
                 value.as_bool() == Some(true)
-                    || value.as_str().is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                    || value
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
             } else {
-                value.as_str().is_some_and(|value| value.eq_ignore_ascii_case("allow"))
+                value
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("allow"))
             };
             if !allowed {
                 return false;
@@ -701,10 +704,7 @@ fn receipt_reason(receipt: &DecisionReceipt) -> CausalReason {
     }
 }
 
-fn revocation_reason(
-    bundle: &ReplayBundle,
-    invocation: &AuditEntry,
-) -> Option<CausalReason> {
+fn revocation_reason(bundle: &ReplayBundle, invocation: &AuditEntry) -> Option<CausalReason> {
     let relevant_revocations: Vec<&AuditEntry> = bundle
         .audit_entries
         .iter()
@@ -778,7 +778,13 @@ fn token_field_at_depth<'a>(
             selected = Some(field);
         }
     }
-    for wrapper in ["claims", "payload", "token", "capability_token", "capability"] {
+    for wrapper in [
+        "claims",
+        "payload",
+        "token",
+        "capability_token",
+        "capability",
+    ] {
         if let Some(nested) = object.get(wrapper).filter(|value| value.is_object())
             && let Some(field) = token_field_at_depth(nested, keys, depth + 1)?
         {
@@ -1079,10 +1085,16 @@ mod tests {
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap(),
         );
-        assert_eq!(parse_decision_receipts(&input).unwrap(), vec![first, second]);
+        assert_eq!(
+            parse_decision_receipts(&input).unwrap(),
+            vec![first, second]
+        );
         assert_eq!(
             parse_capability_tokens("{\"id\":\"a\"}\n\n{\"id\":\"b\"}\n").unwrap(),
-            vec![serde_json::json!({"id": "a"}), serde_json::json!({"id": "b"})]
+            vec![
+                serde_json::json!({"id": "a"}),
+                serde_json::json!({"id": "b"})
+            ]
         );
     }
 
@@ -1185,18 +1197,33 @@ mod tests {
             audit_entries: vec![older.clone(), newer.clone()],
             ..ReplayBundle::default()
         };
-        assert_eq!(explain_bundle(&bundle).unwrap().invocation_audit_entry_id, newer.id);
         assert_eq!(
-            explain_invocation(&bundle, &older.id).unwrap().invocation_audit_entry_id,
+            explain_bundle(&bundle).unwrap().invocation_audit_entry_id,
+            newer.id
+        );
+        assert_eq!(
+            explain_invocation(&bundle, &older.id)
+                .unwrap()
+                .invocation_audit_entry_id,
             older.id
         );
-        assert_eq!(explain_invocation(&bundle, "missing"), Err(ExplainError::NoInvocation));
+        assert_eq!(
+            explain_invocation(&bundle, "missing"),
+            Err(ExplainError::NoInvocation)
+        );
     }
 
     #[test]
     fn non_invocation_events_and_incomplete_scope_are_not_invocations() {
         let valid = invocation();
-        for field in ["event_type", "id", "actor", "zone_id", "connector_id", "operation_id"] {
+        for field in [
+            "event_type",
+            "id",
+            "actor",
+            "zone_id",
+            "connector_id",
+            "operation_id",
+        ] {
             let mut entry = valid.clone();
             match field {
                 "event_type" => entry.event_type = event_types::SECRET_ACCESS.to_string(),
@@ -1206,8 +1233,15 @@ mod tests {
                 "connector_id" => entry.connector_id = None,
                 _ => entry.operation_id = Some(String::new()),
             }
-            let bundle = ReplayBundle { audit_entries: vec![entry], ..ReplayBundle::default() };
-            assert_eq!(explain_bundle(&bundle), Err(ExplainError::NoInvocation), "{field}");
+            let bundle = ReplayBundle {
+                audit_entries: vec![entry],
+                ..ReplayBundle::default()
+            };
+            assert_eq!(
+                explain_bundle(&bundle),
+                Err(ExplainError::NoInvocation),
+                "{field}"
+            );
         }
     }
 
@@ -1220,8 +1254,14 @@ mod tests {
         };
         assert!(explain_invocation(&bundle, &entry.id).is_ok());
         bundle.audit_entries[1].actor = "user:mallory".to_string();
-        assert_eq!(explain_bundle(&bundle), Err(ExplainError::ConflictingInvocation));
-        assert_eq!(explain_invocation(&bundle, &entry.id), Err(ExplainError::ConflictingInvocation));
+        assert_eq!(
+            explain_bundle(&bundle),
+            Err(ExplainError::ConflictingInvocation)
+        );
+        assert_eq!(
+            explain_invocation(&bundle, &entry.id),
+            Err(ExplainError::ConflictingInvocation)
+        );
     }
 
     #[test]
@@ -1230,20 +1270,42 @@ mod tests {
         let token = bound_token(&entry);
         assert!(token_matches_invocation(&token, &entry));
         assert!(!token_matches_invocation(&serde_json::json!({}), &entry));
-        for field in ["id", "connector_id", "operation_id", "zone_id", "actor", "correlation_id"] {
+        for field in [
+            "id",
+            "connector_id",
+            "operation_id",
+            "zone_id",
+            "actor",
+            "correlation_id",
+        ] {
             let mut missing = token.clone();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(!token_matches_invocation(&missing, &entry), "missing {field}");
+            assert!(
+                !token_matches_invocation(&missing, &entry),
+                "missing {field}"
+            );
             for value in [Value::Null, serde_json::json!(17), serde_json::json!("")] {
                 let mut malformed = token.clone();
                 malformed[field] = value;
-                assert!(!token_matches_invocation(&malformed, &entry), "malformed {field}");
+                assert!(
+                    !token_matches_invocation(&malformed, &entry),
+                    "malformed {field}"
+                );
             }
         }
-        for field in ["connector_id", "operation_id", "zone_id", "actor", "correlation_id"] {
+        for field in [
+            "connector_id",
+            "operation_id",
+            "zone_id",
+            "actor",
+            "correlation_id",
+        ] {
             let mut other = token.clone();
             other[field] = serde_json::json!("another-request");
-            assert!(!token_matches_invocation(&other, &entry), "mismatched {field}");
+            assert!(
+                !token_matches_invocation(&other, &entry),
+                "mismatched {field}"
+            );
         }
     }
 
@@ -1251,7 +1313,10 @@ mod tests {
     fn token_aliases_cannot_hide_conflicting_nested_scope() {
         let entry = invocation();
         let token = bound_token(&entry);
-        assert!(token_matches_invocation(&serde_json::json!({"claims": token}), &entry));
+        assert!(token_matches_invocation(
+            &serde_json::json!({"claims": token}),
+            &entry
+        ));
         for nested in [
             serde_json::json!({"zone": "z:private"}),
             serde_json::json!({"sub": "user:mallory"}),
@@ -1302,11 +1367,15 @@ mod tests {
     fn admission_requires_explicit_allow_without_conflicting_flags() {
         let mut entry = admission();
         assert!(admission_allows(&entry));
-        entry.metadata.insert("admitted".to_string(), serde_json::json!(false));
+        entry
+            .metadata
+            .insert("admitted".to_string(), serde_json::json!(false));
         assert!(!admission_allows(&entry));
         entry.metadata.clear();
         assert!(!admission_allows(&entry));
-        entry.metadata.insert("admitted".to_string(), serde_json::json!(true));
+        entry
+            .metadata
+            .insert("admitted".to_string(), serde_json::json!(true));
         assert!(admission_allows(&entry));
     }
 
@@ -1325,7 +1394,10 @@ mod tests {
                 "sequence" => other.seq = target.seq,
                 _ => other.event_type = "capability.admission.denied".to_string(),
             }
-            assert!(select_admission_entry(&[other, target.clone()], &target).is_none(), "{field}");
+            assert!(
+                select_admission_entry(&[other, target.clone()], &target).is_none(),
+                "{field}"
+            );
         }
         let mut self_admitted = target.clone();
         self_admitted.metadata = valid.metadata;
@@ -1339,7 +1411,9 @@ mod tests {
         allowed.seq = 8;
         let mut denied = admission();
         denied.id = "denied-admission".to_string();
-        denied.metadata.insert("decision".to_string(), serde_json::json!("deny"));
+        denied
+            .metadata
+            .insert("decision".to_string(), serde_json::json!("deny"));
         assert!(select_admission_entry(&[allowed, denied, target.clone()], &target).is_none());
     }
 
@@ -1348,7 +1422,14 @@ mod tests {
         let target = invocation();
         let receipt = allow_receipt(&target);
         assert!(receipt_matches_invocation(&receipt, &target));
-        for field in ["reference", "zone", "connector", "operation", "correlation", "time"] {
+        for field in [
+            "reference",
+            "zone",
+            "connector",
+            "operation",
+            "correlation",
+            "time",
+        ] {
             let mut other = receipt.clone();
             match field {
                 "reference" => other.audit_entry_id = Some("foreign-id".to_string()),
@@ -1415,8 +1496,15 @@ mod tests {
             ..ReplayBundle::default()
         };
         let explanation = explain_bundle(&bundle).unwrap();
-        assert!(!has_reason(&explanation, CausalReasonKind::RevocationCascade));
-        assert!(explanation.render_human().contains("revocation status is unknown"));
+        assert!(!has_reason(
+            &explanation,
+            CausalReasonKind::RevocationCascade
+        ));
+        assert!(
+            explanation
+                .render_human()
+                .contains("revocation status is unknown")
+        );
         assert!(!explanation.render_human().contains("remained intact"));
     }
 
@@ -1430,9 +1518,11 @@ mod tests {
             ..ReplayBundle::default()
         };
         let explanation = explain_bundle(&bundle).unwrap();
-        let reason = explanation.reasons.iter().find(|reason| {
-            reason.kind == CausalReasonKind::RevocationCascade
-        }).unwrap();
+        let reason = explanation
+            .reasons
+            .iter()
+            .find(|reason| reason.kind == CausalReasonKind::RevocationCascade)
+            .unwrap();
         assert_eq!(reason.evidence.len(), 1);
         bundle.audit_entries.reverse();
         assert_eq!(explain_bundle(&bundle).unwrap(), explanation);

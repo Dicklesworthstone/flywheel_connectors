@@ -1077,7 +1077,10 @@ mod tests {
         assert_eq!(report.connector_self_checks.len(), 1);
         assert_eq!(report.overall_status, OverallStatus::Fail);
         assert_eq!(
-            report.connector_self_checks[0].report.reason_code.as_deref(),
+            report.connector_self_checks[0]
+                .report
+                .reason_code
+                .as_deref(),
             Some("self_check_timeout")
         );
     }

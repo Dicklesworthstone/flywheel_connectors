@@ -22,6 +22,7 @@ use fcp_prelude::{
     IdempotencyClass, ObjectId, RateLimitDeclarationError, RateLimitDeclarations, RateLimitPool,
     RevocationFreshnessClass, RiskLevel, SafetyTier, ZoneId, ZoneIdError, validate_canonical_id,
 };
+pub use fcp_core::{CoordinationClass, CoordinationClassError};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -1768,7 +1769,7 @@ impl ProvidesSection {
         }
         for (op_id, op) in &self.operations {
             validate_canonical_id(op_id)?;
-            op.validate()?;
+            op.validate_for_id(op_id)?;
         }
         for (event_id, event) in &self.events {
             validate_canonical_id(event_id)?;
@@ -1789,6 +1790,13 @@ pub struct OperationSection {
     pub requires_approval: ManifestApprovalMode,
     pub rate_limit: Option<RateLimit>,
     pub idempotency: IdempotencyClass,
+    /// Optional explicit I-CONFLUENCE coordination class (`i_confluent`, `requires_quorum`, `requires_fencing`).
+    /// When omitted in TOML, derived deterministically via the 2026.Q3.v1 rubric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_class: Option<fcp_core::CoordinationClass>,
+    /// Optional explicit side-effects declaration (`true` or `false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<bool>,
     /// Whether this operation may participate in computation migration flows.
     #[serde(default, skip_serializing_if = "is_false")]
     pub migration_supported: bool,
@@ -1807,6 +1815,45 @@ pub struct OperationSection {
 }
 
 impl OperationSection {
+    /// Effective `side_effects` boolean for this operation.
+    #[must_use]
+    pub fn effective_side_effects(&self, op_id: &str) -> bool {
+        self.side_effects.unwrap_or_else(|| {
+            if fcp_core::CoordinationClass::is_read_named_operation(op_id) {
+                false
+            } else if fcp_core::CoordinationClass::is_mutating_named_operation(op_id) {
+                true
+            } else {
+                self.safety_tier != SafetyTier::Safe
+            }
+        })
+    }
+
+    /// Effective I-CONFLUENCE [`CoordinationClass`](fcp_core::CoordinationClass) for this operation.
+    #[must_use]
+    pub fn effective_coordination_class(&self, op_id: &str) -> fcp_core::CoordinationClass {
+        self.coordination_class.unwrap_or_else(|| {
+            fcp_core::CoordinationClass::classify(
+                op_id,
+                self.effective_side_effects(op_id),
+                self.idempotency,
+            )
+        })
+    }
+
+    fn validate_for_id(&self, op_id: &str) -> Result<(), ManifestError> {
+        self.validate()?;
+        let side_effects = self.effective_side_effects(op_id);
+        let class = self.effective_coordination_class(op_id);
+        class
+            .validate_classification(op_id, side_effects)
+            .map_err(|err| ManifestError::Invalid {
+                field: "provides.operations.*.coordination_class",
+                message: format!("{} ({})", err, err.code()),
+            })?;
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ManifestError> {
         if self.description.trim().is_empty() {
             return Err(ManifestError::Invalid {

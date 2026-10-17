@@ -67,6 +67,7 @@ use crate::{
 };
 
 pub(crate) mod derive;
+pub use derive::group_x25519_public_key;
 
 /// HPKE ciphersuite identifiers (RFC 9180): KEM=X25519 (0x0020),
 /// KDF=HKDF-SHA256 (0x0001), AEAD=ChaCha20Poly1305 (0x0003).
@@ -78,7 +79,7 @@ const N_KEY: usize = 32;
 const N_NONCE: usize = 12;
 /// Compressed Edwards / Montgomery point size (RFC 7748).
 const POINT_SIZE: usize = 32;
-/// Maximum sealed body size, mirroring [`crate::hpke_seal`]'s cap.
+/// Maximum sealed body size, mirroring [`fn@crate::hpke_seal`]'s cap.
 const MAX_AEAD_BODY: usize = 64 * 1024;
 
 /// Group X25519 public key of a threshold quorum (opaque).
@@ -240,8 +241,7 @@ pub fn decap_share(
     let participant_scalar = derive::participant_scalar(key_package.signing_share())?;
     let ephemeral = decompress_ephemeral(ct)?;
     let contribution_ed = ephemeral * &participant_scalar;
-    let group_x25519 =
-        derive::group_x25519_public_key_from_edwards_verifying_key(key_package.group_public_key())?;
+    let group_x25519 = group_pk_bytes(key_package)?;
     Ok(DecapShare {
         participant: key_package.participant(),
         contribution: contribution_ed.compress().to_bytes(),
@@ -456,10 +456,8 @@ fn key_schedule(shared_secret: &[u8; N_SECRET], info: &[u8]) -> ([u8; N_KEY], [u
     // RFC 9180 §5.1: LabeledExtract(shared_secret, "secret", psk).
     // Base mode has an empty PSK; the DH-derived shared secret is the
     // EXTRACT SALT, not the input key material.
-    let secret = hkdf_extract_to_prk_bytes(
-        Some(shared_secret),
-        &labeled_ikm(&suite, b"secret", &[]),
-    );
+    let secret =
+        hkdf_extract_to_prk_bytes(Some(shared_secret), &labeled_ikm(&suite, b"secret", &[]));
     let secret_hk = Hkdf::<Sha256>::from_prk(&secret).expect("secret is 32 bytes of Hash output");
 
     let mut key = [0u8; N_KEY];
@@ -521,10 +519,7 @@ mod tests {
         let ikm = labeled_ikm(b"KEM\x00\x20", b"eae_prk", &[0xaa]);
         assert_eq!(ikm, b"HPKE-v1KEM\x00\x20eae_prk\xaa");
         let info = labeled_expand_info::<32>(b"KEM\x00\x20", b"shared_secret", b"context");
-        assert_eq!(
-            info,
-            b"\x00\x20HPKE-v1KEM\x00\x20shared_secretcontext"
-        );
+        assert_eq!(info, b"\x00\x20HPKE-v1KEM\x00\x20shared_secretcontext");
     }
 
     #[test]
@@ -559,10 +554,8 @@ mod tests {
             hex::encode(info_hash),
             "9e65c73cb8a26de07c5b5a304ae3441968d2be51ea1801a739b57e45bad390b4"
         );
-        let secret = hkdf_extract_to_prk_bytes(
-            Some(&shared_secret),
-            &labeled_ikm(suite, b"secret", b""),
-        );
+        let secret =
+            hkdf_extract_to_prk_bytes(Some(&shared_secret), &labeled_ikm(suite, b"secret", b""));
         assert_eq!(
             hex::encode(secret),
             "f42474629ca273df3c095c777df8229321002b0e565ba48fa7eb11fea41bfdea"
@@ -611,8 +604,7 @@ mod tests {
             group_x25519: group,
             binding: ct.binding(&group),
         };
-        let error = combine_decap(&[share.clone(), share.clone()], 2, &ct, b"", b"")
-            .unwrap_err();
+        let error = combine_decap(&[share.clone(), share.clone()], 2, &ct, b"", b"").unwrap_err();
         assert!(matches!(
             error,
             CryptoError::ThresholdHpke(ThresholdHpkeError::InconsistentShares)
@@ -628,8 +620,8 @@ mod tests {
     #[test]
     fn malformed_ciphertext_boundaries_are_rejected() {
         assert!(ThresholdHpkeCiphertext::from_bytes(&[0; POINT_SIZE + 15]).is_err());
-        assert!(ThresholdHpkeCiphertext::from_bytes(
-            &vec![0; POINT_SIZE + MAX_AEAD_BODY + 1]
-        ).is_err());
+        assert!(
+            ThresholdHpkeCiphertext::from_bytes(&vec![0; POINT_SIZE + MAX_AEAD_BODY + 1]).is_err()
+        );
     }
 }

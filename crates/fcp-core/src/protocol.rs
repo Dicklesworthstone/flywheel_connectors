@@ -2105,7 +2105,7 @@ pub struct Introspection {
 /// Per FCP Specification Section 8.2 and 9.6:
 /// - Operations MUST declare capability, `risk_level`, `safety_tier`, and `idempotency`
 /// - `risk_level` is for UX/prioritization; `safety_tier` is normative enforcement
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OperationInfo {
     /// Operation ID (e.g., "gmail.search")
     pub id: OperationId,
@@ -2145,6 +2145,341 @@ pub struct OperationInfo {
     /// Approval mode required
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_approval: Option<ApprovalMode>,
+}
+
+impl Serialize for OperationInfo {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct OperationInfoWire<'a> {
+            id: &'a OperationId,
+            summary: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: &'a Option<String>,
+            input_schema: &'a serde_json::Value,
+            output_schema: &'a serde_json::Value,
+            capability: &'a CapabilityId,
+            risk_level: RiskLevel,
+            safety_tier: SafetyTier,
+            idempotency: IdempotencyClass,
+            coordination_class: CoordinationClass,
+            ai_hints: &'a AgentHint,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rate_limit: &'a Option<crate::RateLimit>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            requires_approval: &'a Option<ApprovalMode>,
+        }
+
+        let wire = OperationInfoWire {
+            id: &self.id,
+            summary: &self.summary,
+            description: &self.description,
+            input_schema: &self.input_schema,
+            output_schema: &self.output_schema,
+            capability: &self.capability,
+            risk_level: self.risk_level,
+            safety_tier: self.safety_tier,
+            idempotency: self.idempotency,
+            coordination_class: self.coordination_class(),
+            ai_hints: &self.ai_hints,
+            rate_limit: &self.rate_limit,
+            requires_approval: &self.requires_approval,
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl OperationInfo {
+    /// Whether this operation has external side effects based on its safety tier and name.
+    #[must_use]
+    pub fn has_side_effects(&self) -> bool {
+        if CoordinationClass::is_read_named_operation(self.id.as_str())
+            && self.safety_tier == SafetyTier::Safe
+        {
+            false
+        } else if CoordinationClass::is_mutating_named_operation(self.id.as_str()) {
+            true
+        } else {
+            self.safety_tier != SafetyTier::Safe
+        }
+    }
+
+    /// Derive the I-CONFLUENCE [`CoordinationClass`] for this operation.
+    #[must_use]
+    pub fn coordination_class(&self) -> CoordinationClass {
+        CoordinationClass::classify(self.id.as_str(), self.has_side_effects(), self.idempotency)
+    }
+}
+
+/// Coordination class for mesh-native operation dispatch (Bailis et al. 2014 I-CONFLUENCE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationClass {
+    /// Read-only or commutative; safe to execute on any peer without coordination.
+    IConfluent,
+    /// Mutating; requires a t-of-n quorum of peers before dispatch commits.
+    RequiresQuorum,
+    /// Exclusive-write; requires an HRW lease + epoch fencing token per resource.
+    RequiresFencing,
+}
+
+impl CoordinationClass {
+    /// Canonical `snake_case` wire string (`"i_confluent"`, `"requires_quorum"`, `"requires_fencing"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IConfluent => "i_confluent",
+            Self::RequiresQuorum => "requires_quorum",
+            Self::RequiresFencing => "requires_fencing",
+        }
+    }
+
+    /// Extract the leaf action token from an operation name (e.g. `"stripe.charges.list_charges"` -> `"list"`).
+    fn action_tokens(op_name: &str) -> impl Iterator<Item = &str> {
+        op_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(op_name)
+            .split(['_', '-'])
+            .filter(|token| !token.is_empty())
+    }
+
+    /// Whether an operation name matches the canonical read-shaped prefix pattern
+    /// `^(get|list|read|count|describe|head|fetch|search|introspect|check|verify|validate|status|info|show|find|query|lookup|inspect|explain|ping|health|whoami)`.
+    #[must_use]
+    pub fn is_read_named_operation(op_name: &str) -> bool {
+        const READ_PREFIXES: &[&str] = &[
+            "get",
+            "list",
+            "read",
+            "count",
+            "describe",
+            "head",
+            "fetch",
+            "search",
+            "introspect",
+            "check",
+            "verify",
+            "validate",
+            "status",
+            "info",
+            "show",
+            "find",
+            "query",
+            "lookup",
+            "inspect",
+            "explain",
+            "ping",
+            "health",
+            "whoami",
+        ];
+        if let Some(first) = Self::action_tokens(op_name).next() {
+            let lower = first.to_ascii_lowercase();
+            READ_PREFIXES.contains(&lower.as_str())
+        } else {
+            false
+        }
+    }
+
+    /// Whether an operation name starts with an explicit per-resource serialization verb
+    /// requiring HRW lease fencing (`refund`, `update`, `delete`, `patch`, `modify`, `cancel`, `revoke`, `rotate`, etc.).
+    #[must_use]
+    pub fn is_fencing_named_operation(op_name: &str) -> bool {
+        const FENCING_PREFIXES: &[&str] = &[
+            "refund",
+            "update",
+            "delete",
+            "remove",
+            "patch",
+            "modify",
+            "cancel",
+            "revoke",
+            "rotate",
+            "transfer",
+            "move",
+            "rename",
+            "replace",
+            "set",
+            "close",
+            "archive",
+            "lock",
+            "unlock",
+            "assign",
+            "unassign",
+            "merge",
+            "rebase",
+            "reset",
+            "capture",
+            "void",
+            "disable",
+            "enable",
+            "suspend",
+            "resume",
+        ];
+        if let Some(first) = Self::action_tokens(op_name).next() {
+            let lower = first.to_ascii_lowercase();
+            FENCING_PREFIXES.contains(&lower.as_str())
+        } else {
+            false
+        }
+    }
+
+    /// Whether an operation name starts with a mutating verb (`create`, `send`, `refund`, `update`, `delete`, etc.).
+    #[must_use]
+    pub fn is_mutating_named_operation(op_name: &str) -> bool {
+        const QUORUM_WRITE_PREFIXES: &[&str] = &[
+            "create",
+            "send",
+            "post",
+            "publish",
+            "emit",
+            "trigger",
+            "execute",
+            "run",
+            "invoke",
+            "add",
+            "append",
+            "upload",
+            "import",
+            "export",
+            "write",
+            "insert",
+            "submit",
+            "start",
+            "stop",
+            "restart",
+            "deploy",
+        ];
+        if Self::is_fencing_named_operation(op_name) {
+            return true;
+        }
+        if let Some(first) = Self::action_tokens(op_name).next() {
+            let lower = first.to_ascii_lowercase();
+            QUORUM_WRITE_PREFIXES.contains(&lower.as_str())
+        } else {
+            false
+        }
+    }
+
+    /// Classify an operation per the 2026.Q3.v1 I-CONFLUENCE rubric.
+    #[must_use]
+    pub fn classify(
+        operation_name: &str,
+        side_effects: bool,
+        _idempotency_class: IdempotencyClass,
+    ) -> Self {
+        if !side_effects {
+            return Self::IConfluent;
+        }
+        if Self::is_fencing_named_operation(operation_name) {
+            Self::RequiresFencing
+        } else {
+            Self::RequiresQuorum
+        }
+    }
+
+    /// Validate that an explicit [`CoordinationClass`] assignment satisfies the safety rubric.
+    ///
+    /// # Errors
+    /// Returns [`CoordinationClassError`] when the classification contradicts `side_effects`
+    /// or the operation's read-shaped naming contract.
+    pub fn validate_classification(
+        self,
+        operation_name: &str,
+        side_effects: bool,
+    ) -> Result<(), CoordinationClassError> {
+        match (self, side_effects) {
+            (Self::IConfluent, true) => {
+                Err(CoordinationClassError::IConfluentMustHaveSideEffectsFalse {
+                    operation: operation_name.to_owned(),
+                })
+            }
+            (Self::RequiresQuorum, false) => Err(
+                CoordinationClassError::RequiresQuorumMustHaveSideEffectsTrue {
+                    operation: operation_name.to_owned(),
+                },
+            ),
+            (Self::RequiresFencing, false) => Err(
+                CoordinationClassError::RequiresFencingMustHaveSideEffectsTrue {
+                    operation: operation_name.to_owned(),
+                },
+            ),
+            _ => {
+                if !side_effects
+                    && Self::is_read_named_operation(operation_name)
+                    && self != Self::IConfluent
+                {
+                    return Err(CoordinationClassError::ReadNamedOperationMustBeIConfluent {
+                        operation: operation_name.to_owned(),
+                        actual: self,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CoordinationClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validation error when an operation's [`CoordinationClass`] violates the I-CONFLUENCE rubric.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CoordinationClassError {
+    /// `i_confluent` was paired with `side_effects = true`.
+    #[error("operation `{operation}` classified as i_confluent must have side_effects = false")]
+    IConfluentMustHaveSideEffectsFalse {
+        /// Operation name.
+        operation: String,
+    },
+    /// `requires_quorum` was paired with `side_effects = false`.
+    #[error("operation `{operation}` classified as requires_quorum must have side_effects = true")]
+    RequiresQuorumMustHaveSideEffectsTrue {
+        /// Operation name.
+        operation: String,
+    },
+    /// `requires_fencing` was paired with `side_effects = false`.
+    #[error(
+        "operation `{operation}` classified as requires_fencing must have side_effects = true"
+    )]
+    RequiresFencingMustHaveSideEffectsTrue {
+        /// Operation name.
+        operation: String,
+    },
+    /// A read-named operation without side effects was not classified as `i_confluent`.
+    #[error("read-named operation `{operation}` must be classified i_confluent (got `{actual}`)")]
+    ReadNamedOperationMustBeIConfluent {
+        /// Operation name.
+        operation: String,
+        /// Actual class provided.
+        actual: CoordinationClass,
+    },
+}
+
+impl CoordinationClassError {
+    /// Machine-readable error code matching `operation_classification.json`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::IConfluentMustHaveSideEffectsFalse { .. } => {
+                "i_confluent_must_have_side_effects_false"
+            }
+            Self::RequiresQuorumMustHaveSideEffectsTrue { .. } => {
+                "requires_quorum_must_have_side_effects_true"
+            }
+            Self::RequiresFencingMustHaveSideEffectsTrue { .. } => {
+                "requires_fencing_must_have_side_effects_true"
+            }
+            Self::ReadNamedOperationMustBeIConfluent { .. } => {
+                "read_named_operation_must_be_i_confluent"
+            }
+        }
+    }
 }
 
 /// Approval mode for operations.

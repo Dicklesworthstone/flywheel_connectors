@@ -24,3 +24,8 @@ serde_json.workspace = true
 [[bench]]
 name = "chacha20_dispatch"
 harness = false
+
+[[bench]]
+name = "blake3"
+harness = false
+

@@ -8,8 +8,8 @@ use fcp_crypto::ed25519::Ed25519SigningKey;
 use fcp_mesh::invoke_route::MeshPeerConfig;
 use fcp_mesh::peer_manifest::MESH_PEER_DIRECTORY_SCHEMA;
 
-use super::*;
 use super::disk::Installer;
+use super::*;
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -64,7 +64,8 @@ impl Fixture {
     }
 
     fn wire(&self) -> String {
-        serde_json::to_string(&SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap()).unwrap()
+        serde_json::to_string(&SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap())
+            .unwrap()
     }
 
     fn options(&self, url: &str) -> BTreeMap<String, OsString> {
@@ -86,7 +87,11 @@ impl Fixture {
 fn serve(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> (Url, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let url = source_url(&format!("http://{}/membership.json", listener.local_addr().unwrap())).unwrap();
+    let url = source_url(&format!(
+        "http://{}/membership.json",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
     let thread = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut socket = loop {
@@ -99,8 +104,12 @@ fn serve(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> (Url, JoinHan
                 Err(error) => panic!("accept failed: {error}"),
             }
         };
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut reader = BufReader::new(&mut socket);
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -109,7 +118,9 @@ fn serve(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> (Url, JoinHan
             line.clear();
             reader.read_line(&mut line).unwrap();
             assert!(!line.is_empty());
-            if line == "\r\n" { break; }
+            if line == "\r\n" {
+                break;
+            }
             assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
         }
         respond(&mut socket);
@@ -120,7 +131,8 @@ fn serve(respond: impl FnOnce(&mut TcpStream) + Send + 'static) -> (Url, JoinHan
 fn serve_json(text: String) -> (Url, JoinHandle<()>) {
     serve(move |socket| {
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len(),
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            text.len(),
         );
         let _ = socket.write_all(response.as_bytes());
     })
@@ -142,39 +154,66 @@ fn sync_command_fetches_authenticates_installs_and_reports_without_host_claims()
     server.join().unwrap();
     result.unwrap();
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), wire);
-    assert_eq!(fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o077, 0);
+    assert_eq!(
+        fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o077,
+        0
+    );
     let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(report["generation"], 7);
     assert_eq!(report["action"], "installed");
     assert_eq!(report["rollback_checked"], false);
     assert_eq!(report["host_activation_verified"], false);
-    assert!(!String::from_utf8(output).unwrap().contains(&hex::encode(fixture.owner.to_bytes())));
+    assert!(
+        !String::from_utf8(output)
+            .unwrap()
+            .contains(&hex::encode(fixture.owner.to_bytes()))
+    );
 }
 
 #[test]
 fn accepted_generation_survives_installer_restart_and_identical_fetch_does_not_replace_inode() {
     let mut fixture = Fixture::new();
     let first = fixture.wire();
-    Installer::open(&fixture.path()).unwrap().install(&first, &fixture.trust()).unwrap();
+    Installer::open(&fixture.path())
+        .unwrap()
+        .install(&first, &fixture.trust())
+        .unwrap();
     let ino = fs::metadata(fixture.path()).unwrap().ino();
-    let report = Installer::open(&fixture.path()).unwrap().install(&first, &fixture.trust()).unwrap();
+    let report = Installer::open(&fixture.path())
+        .unwrap()
+        .install(&first, &fixture.trust())
+        .unwrap();
     assert_eq!(report.action, "unchanged");
     assert!(report.rollback_checked);
     assert_eq!(fs::metadata(fixture.path()).unwrap().ino(), ino);
     fixture.payload.generation += 1;
     fixture.payload.peers.truncate(1);
     let second = fixture.wire();
-    let report = Installer::open(&fixture.path()).unwrap().install(&second, &fixture.trust()).unwrap();
+    let report = Installer::open(&fixture.path())
+        .unwrap()
+        .install(&second, &fixture.trust())
+        .unwrap();
     assert_eq!(report.previous_generation, Some(7));
     assert_eq!(report.member_count, 1);
-    let error = Installer::open(&fixture.path()).unwrap().install(&first, &fixture.trust()).unwrap_err();
+    let error = Installer::open(&fixture.path())
+        .unwrap()
+        .install(&first, &fixture.trust())
+        .unwrap_err();
     assert!(error.to_string().contains("precedes accepted"));
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), second);
 }
 
 #[test]
 fn forged_wrong_scope_wrong_key_expired_rollback_and_equivocating_sources_preserve_file() {
-    for scenario in ["signature", "owner", "mesh", "key", "expired", "rollback", "reuse"] {
+    for scenario in [
+        "signature",
+        "owner",
+        "mesh",
+        "key",
+        "expired",
+        "rollback",
+        "reuse",
+    ] {
         let mut fixture = Fixture::new();
         let trust = fixture.trust();
         let first = fixture.wire();
@@ -183,7 +222,10 @@ fn forged_wrong_scope_wrong_key_expired_rollback_and_equivocating_sources_preser
         match scenario {
             "owner" => fixture.owner = Ed25519SigningKey::from_bytes(&[91; 32]).unwrap(),
             "mesh" => fixture.payload.mesh_id = "another-mesh".to_owned(),
-            "key" => fixture.payload.peers[0].public_key_hex = hex::encode(fixture.owner.verifying_key().to_bytes()),
+            "key" => {
+                fixture.payload.peers[0].public_key_hex =
+                    hex::encode(fixture.owner.verifying_key().to_bytes())
+            }
             "expired" => fixture.payload.expires_at_ms = unix_now_ms() - 1,
             "rollback" => fixture.payload.generation -= 1,
             "reuse" => fixture.payload.expires_at_ms += 1000,
@@ -195,7 +237,10 @@ fn forged_wrong_scope_wrong_key_expired_rollback_and_equivocating_sources_preser
             signed.payload_json.push(' ');
             candidate = serde_json::to_string(&signed).unwrap();
         }
-        assert!(installer.install(&candidate, &trust).is_err(), "{scenario} must fail");
+        assert!(
+            installer.install(&candidate, &trust).is_err(),
+            "{scenario} must fail"
+        );
         assert_eq!(fs::read_to_string(fixture.path()).unwrap(), first);
     }
 }
@@ -210,10 +255,16 @@ fn expired_installed_authority_still_prevents_rollback_but_allows_a_fresh_succes
     assert!(installer.install(&expired, &fixture.trust()).is_err());
     fixture.payload.generation = 6;
     fixture.payload.expires_at_ms = unix_now_ms() + 300_000;
-    assert!(installer.install(&fixture.wire(), &fixture.trust()).is_err());
+    assert!(
+        installer
+            .install(&fixture.wire(), &fixture.trust())
+            .is_err()
+    );
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), expired);
     fixture.payload.generation = 8;
-    let report = installer.install(&fixture.wire(), &fixture.trust()).unwrap();
+    let report = installer
+        .install(&fixture.wire(), &fixture.trust())
+        .unwrap();
     assert_eq!(report.previous_generation, Some(7));
     assert_eq!(report.generation, 8);
 }
@@ -223,25 +274,37 @@ fn one_installer_owns_the_path_and_missing_initialized_sources_cannot_reset_gene
     let fixture = Fixture::new();
     let mut installer = Installer::open(&fixture.path()).unwrap();
     assert!(Installer::open(&fixture.path()).is_err());
-    installer.install(&fixture.wire(), &fixture.trust()).unwrap();
+    installer
+        .install(&fixture.wire(), &fixture.trust())
+        .unwrap();
     fs::rename(fixture.path(), fixture.dir.path().join("retained-source")).unwrap();
     drop(installer);
-    let error = Installer::open(&fixture.path()).unwrap().install(&fixture.wire(), &fixture.trust()).unwrap_err();
+    let error = Installer::open(&fixture.path())
+        .unwrap()
+        .install(&fixture.wire(), &fixture.trust())
+        .unwrap_err();
     assert!(error.to_string().contains("refusing generation reset"));
     assert!(!fixture.path().exists());
 }
 
 #[test]
 fn unsafe_destination_staging_and_lock_inodes_never_overwrite_unrelated_files() {
-    for name in ["membership.json", "membership.json.sync-next", "membership.json.sync-lock"] {
+    for name in [
+        "membership.json",
+        "membership.json.sync-next",
+        "membership.json.sync-lock",
+    ] {
         for hardlink in [false, true] {
             let fixture = Fixture::new();
             let protected = fixture.dir.path().join("protected");
             fs::write(&protected, "do-not-overwrite").unwrap();
             fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
             let alias = fixture.dir.path().join(name);
-            if hardlink { fs::hard_link(&protected, &alias).unwrap(); }
-            else { symlink(&protected, &alias).unwrap(); }
+            if hardlink {
+                fs::hard_link(&protected, &alias).unwrap();
+            } else {
+                symlink(&protected, &alias).unwrap();
+            }
             let result = Installer::open(&fixture.path())
                 .and_then(|mut installer| installer.install(&fixture.wire(), &fixture.trust()));
             assert!(result.is_err(), "{name}, hardlink={hardlink}");
@@ -256,10 +319,18 @@ fn incomplete_reserved_staging_is_recovered_but_corrupt_source_or_marker_is_pres
     let staging = fixture.dir.path().join("membership.json.sync-next");
     fs::write(&staging, "interrupted write").unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
-    Installer::open(&fixture.path()).unwrap().install(&fixture.wire(), &fixture.trust()).unwrap();
+    Installer::open(&fixture.path())
+        .unwrap()
+        .install(&fixture.wire(), &fixture.trust())
+        .unwrap();
     assert!(!staging.exists());
     fs::write(fixture.path(), "{broken}").unwrap();
-    assert!(Installer::open(&fixture.path()).unwrap().install(&fixture.wire(), &fixture.trust()).is_err());
+    assert!(
+        Installer::open(&fixture.path())
+            .unwrap()
+            .install(&fixture.wire(), &fixture.trust())
+            .is_err()
+    );
     assert_eq!(fs::read_to_string(fixture.path()).unwrap(), "{broken}");
     let lock = fixture.dir.path().join("membership.json.sync-lock");
     fs::write(&lock, "broken marker").unwrap();
@@ -270,9 +341,13 @@ fn incomplete_reserved_staging_is_recovered_but_corrupt_source_or_marker_is_pres
 #[test]
 fn source_urls_disallow_credentials_plaintext_nonloopback_and_redirect_targets() {
     for url in [
-        "http://example.com/members", "http://localhost/members", "ftp://127.0.0.1/members",
-        "https://user:SECRET@example.com/members", "https://example.com/members?SECRET",
-        "https://example.com/members#SECRET", " https://example.com/members",
+        "http://example.com/members",
+        "http://localhost/members",
+        "ftp://127.0.0.1/members",
+        "https://user:SECRET@example.com/members",
+        "https://example.com/members?SECRET",
+        "https://example.com/members#SECRET",
+        " https://example.com/members",
     ] {
         let error = source_url(url).unwrap_err().to_string();
         assert!(!error.contains("SECRET"));
@@ -288,7 +363,10 @@ fn http_refusals_redirects_encoding_and_oversized_content_never_supply_a_documen
         "302 Found\r\nLocation: https://example.com/SECRET\r\nContent-Length: 0".to_owned(),
         "503 Unavailable\r\nContent-Length: 0".to_owned(),
         "200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0".to_owned(),
-        format!("200 OK\r\nContent-Length: {}", MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES + 1),
+        format!(
+            "200 OK\r\nContent-Length: {}",
+            MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES + 1
+        ),
     ] {
         let (url, server) = serve(move |socket| {
             let _ = write!(socket, "HTTP/1.1 {headers}\r\nConnection: close\r\n\r\n");
@@ -303,7 +381,11 @@ fn http_refusals_redirects_encoding_and_oversized_content_never_supply_a_documen
 fn chunked_bodies_are_bounded_without_trusting_content_length() {
     let (url, server) = serve(|socket| {
         let body = "x".repeat(MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES + 1);
-        let _ = write!(socket, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
     });
     let error = fetch(&url, FETCH_TIMEOUT).unwrap_err().to_string();
     server.join().unwrap();
@@ -313,11 +395,18 @@ fn chunked_bodies_are_bounded_without_trusting_content_length() {
 #[test]
 fn deadline_applies_while_waiting_for_body_after_successful_headers() {
     let (url, server) = serve(|socket| {
-        write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n").unwrap();
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
         thread::sleep(Duration::from_secs(1));
         let _ = socket.write_all(b"x");
     });
     let result = fetch(&url, Duration::from_millis(250));
     server.join().unwrap();
-    assert!(result.is_err(), "a successful status cannot disable the total deadline");
+    assert!(
+        result.is_err(),
+        "a successful status cannot disable the total deadline"
+    );
 }

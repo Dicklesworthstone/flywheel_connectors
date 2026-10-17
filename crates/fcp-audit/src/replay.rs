@@ -237,13 +237,7 @@ pub fn reconstruct_predicate_trace_from_reader(
     let bundle = parse_replay_bundle(&input).map_err(|_| {
         ReplayError::AuditChainCorrupted("invalid JSON/JSONL audit-chain artifact".to_owned())
     })?;
-    reconstruct_predicate_trace_from_entries(
-        token,
-        since,
-        confirm,
-        now_unix,
-        &bundle.audit_entries,
-    )
+    reconstruct_predicate_trace_from_entries(token, since, confirm, now_unix, &bundle.audit_entries)
 }
 
 /// Reconstruct a predicate trace from captured audit entries.
@@ -445,8 +439,7 @@ fn predicate_steps_from_entry(
     if let Some(trace) = consistent_alias(
         entry.metadata.get("predicate_trace"),
         entry.metadata.get("trace"),
-    )?
-    {
+    )? {
         let trace = trace
             .as_array()
             .filter(|steps| !steps.is_empty())
@@ -461,7 +454,9 @@ fn predicate_steps_from_entry(
             .collect();
     }
 
-    Ok(direct_predicate_step(entry, raw_token)?.into_iter().collect())
+    Ok(direct_predicate_step(entry, raw_token)?
+        .into_iter()
+        .collect())
 }
 
 fn predicate_step_from_value(
@@ -508,9 +503,16 @@ fn direct_predicate_step(
     entry: &AuditEntry,
     raw_token: &str,
 ) -> Result<Option<PredicateStep>, ReplayError> {
-    if !["rule_name", "predicate", "name", "output", "result", "allowed"]
-        .iter()
-        .any(|key| entry.metadata.contains_key(*key))
+    if ![
+        "rule_name",
+        "predicate",
+        "name",
+        "output",
+        "result",
+        "allowed",
+    ]
+    .iter()
+    .any(|key| entry.metadata.contains_key(*key))
     {
         return Ok(None);
     }
@@ -521,8 +523,8 @@ fn direct_predicate_step(
                 "predicate entry has missing or invalid rule_name".to_owned(),
             )
         })?;
-    let output = metadata_bool(&entry.metadata, &["output", "result", "allowed"])
-        .ok_or_else(|| {
+    let output =
+        metadata_bool(&entry.metadata, &["output", "result", "allowed"]).ok_or_else(|| {
             ReplayError::AuditChainCorrupted(
                 "predicate entry has missing, invalid, or conflicting boolean output".to_owned(),
             )
@@ -629,9 +631,12 @@ fn metadata_verdict(metadata: &MapLike) -> Result<Option<FinalVerdict>, ReplayEr
         .iter()
         .filter_map(|key| metadata.get(*key))
     {
-        let verdict = value.as_str().and_then(parse_final_verdict).ok_or_else(|| {
-            ReplayError::AuditChainCorrupted("invalid explicit verdict".to_owned())
-        })?;
+        let verdict = value
+            .as_str()
+            .and_then(parse_final_verdict)
+            .ok_or_else(|| {
+                ReplayError::AuditChainCorrupted("invalid explicit verdict".to_owned())
+            })?;
         if result.is_some_and(|previous| previous != verdict) {
             return Err(ReplayError::AuditChainCorrupted(
                 "conflicting explicit verdict aliases".to_owned(),
@@ -684,16 +689,22 @@ fn object_witness_indices(
     object: &Map<String, Value>,
     fallback_seq: u64,
 ) -> Result<Vec<u64>, ReplayError> {
-    consistent_alias(object.get("witness_chain_indices"), object.get("witness_seq"))?
-        .map_or_else(|| Ok(vec![fallback_seq]), witness_indices)
+    consistent_alias(
+        object.get("witness_chain_indices"),
+        object.get("witness_seq"),
+    )?
+    .map_or_else(|| Ok(vec![fallback_seq]), witness_indices)
 }
 
 fn metadata_witness_indices(
     metadata: &MapLike,
     fallback_seq: u64,
 ) -> Result<Vec<u64>, ReplayError> {
-    consistent_alias(metadata.get("witness_chain_indices"), metadata.get("witness_seq"))?
-        .map_or_else(|| Ok(vec![fallback_seq]), witness_indices)
+    consistent_alias(
+        metadata.get("witness_chain_indices"),
+        metadata.get("witness_seq"),
+    )?
+    .map_or_else(|| Ok(vec![fallback_seq]), witness_indices)
 }
 
 fn consistent_alias<'a>(
@@ -716,12 +727,14 @@ fn witness_indices(value: &Value) -> Result<Vec<u64>, ReplayError> {
         Value::Array(values) => values.iter().map(Value::as_u64).collect::<Option<Vec<_>>>(),
         _ => None,
     };
-    indices.filter(|indices| !indices.is_empty()).ok_or_else(|| {
-        ReplayError::AuditChainCorrupted(
+    indices
+        .filter(|indices| !indices.is_empty())
+        .ok_or_else(|| {
+            ReplayError::AuditChainCorrupted(
             "witness indices must be an unsigned integer or a non-empty array of unsigned integers"
                 .to_owned(),
         )
-    })
+        })
 }
 
 fn chain_range(trace: &[PredicateStep]) -> Option<AuditChainRange> {
@@ -842,12 +855,24 @@ mod tests {
         let entries = vec![accepted_entry(1), accepted_entry(2)];
         let expected = replay(&entries).expect("entry-backed replay");
         let array = serde_json::to_string(&entries).expect("serialize entries");
-        assert_eq!(read_artifact(array.as_bytes()).expect("array replay"), expected);
+        assert_eq!(
+            read_artifact(array.as_bytes()).expect("array replay"),
+            expected
+        );
 
-        for key in ["audit_entries", "audit_events", "audit_event_chain", "events", "entries"] {
-            let bundle = serde_json::to_string_pretty(&json!({ (key): entries }))
-                .expect("serialize bundle");
-            assert_eq!(read_artifact(bundle.as_bytes()).expect("bundle replay"), expected);
+        for key in [
+            "audit_entries",
+            "audit_events",
+            "audit_event_chain",
+            "events",
+            "entries",
+        ] {
+            let bundle =
+                serde_json::to_string_pretty(&json!({ (key): entries })).expect("serialize bundle");
+            assert_eq!(
+                read_artifact(bundle.as_bytes()).expect("bundle replay"),
+                expected
+            );
         }
 
         let single = serde_json::to_string_pretty(&entries[0]).expect("serialize entry");
@@ -875,10 +900,16 @@ mod tests {
 
         let tokens = vec![json!({"jti": "first"}), json!({"jti": "second"})];
         let jsonl = format!("{}\n{}\n", tokens[0], tokens[1]);
-        assert_eq!(parse_capability_tokens(&jsonl).expect("token JSONL"), tokens);
-        let wrapper = serde_json::to_string_pretty(&json!({"tokens": tokens}))
-            .expect("token wrapper");
-        assert_eq!(parse_capability_tokens(&wrapper).expect("token wrapper"), tokens);
+        assert_eq!(
+            parse_capability_tokens(&jsonl).expect("token JSONL"),
+            tokens
+        );
+        let wrapper =
+            serde_json::to_string_pretty(&json!({"tokens": tokens})).expect("token wrapper");
+        assert_eq!(
+            parse_capability_tokens(&wrapper).expect("token wrapper"),
+            tokens
+        );
         assert!(parse_capability_tokens(&format!("{jsonl}{{")).is_err());
     }
 
@@ -940,13 +971,15 @@ mod tests {
             NOW,
             MustNotRead,
         );
-        assert!(matches!(result, Err(ReplayError::WideWindowRequiresConfirm { .. })));
+        assert!(matches!(
+            result,
+            Err(ReplayError::WideWindowRequiresConfirm { .. })
+        ));
     }
 
     #[test]
     fn reader_accepts_exact_limit_but_confirmation_never_bypasses_size_cap() {
-        let exact = Cursor::new(b"[]")
-            .chain(io::repeat(b' ').take(MAX_REPLAY_ARTIFACT_BYTES - 2));
+        let exact = Cursor::new(b"[]").chain(io::repeat(b' ').take(MAX_REPLAY_ARTIFACT_BYTES - 2));
         assert!(matches!(
             read_artifact(exact),
             Err(ReplayError::TokenNotFoundInAuditChain { .. })
@@ -973,20 +1006,31 @@ mod tests {
 
     #[test]
     fn exact_typed_identity_aliases_select_evidence() {
-        for key in ["token_hash", "capability_token_hash", "capability_hash", "capability_token_digest"] {
-            let evidence = entry(1, vec![
-                (key, json!(token_hash(TOKEN))),
-                ("rule_name", json!("zone_match")),
-                ("output", json!(true)),
-            ]);
+        for key in [
+            "token_hash",
+            "capability_token_hash",
+            "capability_hash",
+            "capability_token_digest",
+        ] {
+            let evidence = entry(
+                1,
+                vec![
+                    (key, json!(token_hash(TOKEN))),
+                    ("rule_name", json!("zone_match")),
+                    ("output", json!(true)),
+                ],
+            );
             assert_eq!(replay(&[evidence]).expect("hash alias").total_steps, 1);
         }
         for key in ["token_id", "capability_token_id", "jti"] {
-            let evidence = entry(1, vec![
-                (key, json!(TOKEN)),
-                ("rule_name", json!("zone_match")),
-                ("output", json!(true)),
-            ]);
+            let evidence = entry(
+                1,
+                vec![
+                    (key, json!(TOKEN)),
+                    ("rule_name", json!("zone_match")),
+                    ("output", json!(true)),
+                ],
+            );
             assert_eq!(replay(&[evidence]).expect("identity alias").total_steps, 1);
         }
     }
@@ -1001,22 +1045,30 @@ mod tests {
             vec![("trace", json!([{ "inputs": [TOKEN, token_hash(TOKEN)] }]))],
         ] {
             let mut evidence = entry(1, metadata);
-            evidence.metadata.insert("rule_name".into(), json!("revocation_check"));
+            evidence
+                .metadata
+                .insert("rule_name".into(), json!("revocation_check"));
             evidence.metadata.insert("output".into(), json!(false));
             let result = replay(&[evidence]);
-            assert!(matches!(result, Err(ReplayError::TokenNotFoundInAuditChain { .. })));
+            assert!(matches!(
+                result,
+                Err(ReplayError::TokenNotFoundInAuditChain { .. })
+            ));
         }
     }
 
     #[test]
     fn unrelated_entry_cannot_poison_matching_tokens_verdict() {
-        let unrelated = entry(2, vec![
-            ("token_hash", json!(token_hash("other-token"))),
-            ("inputs_json", json!({"message": TOKEN})),
-            ("rule_name", json!("revocation_check")),
-            ("output", json!(false)),
-            ("final_verdict", json!("rejected_revocation")),
-        ]);
+        let unrelated = entry(
+            2,
+            vec![
+                ("token_hash", json!(token_hash("other-token"))),
+                ("inputs_json", json!({"message": TOKEN})),
+                ("rule_name", json!("revocation_check")),
+                ("output", json!(false)),
+                ("final_verdict", json!("rejected_revocation")),
+            ],
+        );
         let trace = replay(&[accepted_entry(1), unrelated]).expect("isolated token");
         assert_eq!(trace.final_verdict, FinalVerdict::Accepted);
         assert_eq!(trace.total_steps, 1);
@@ -1026,43 +1078,74 @@ mod tests {
     #[test]
     fn explicit_digest_cannot_be_overridden_by_raw_id_or_conflicting_alias() {
         for digest in [json!(token_hash("other-token")), json!(null), json!(17)] {
-            let evidence = entry(1, vec![
-                ("token_hash", digest),
-                ("token_id", json!(TOKEN)),
-                ("rule_name", json!("zone_match")),
-                ("output", json!(true)),
-            ]);
-            assert!(matches!(replay(&[evidence]), Err(ReplayError::TokenNotFoundInAuditChain { .. })));
+            let evidence = entry(
+                1,
+                vec![
+                    ("token_hash", digest),
+                    ("token_id", json!(TOKEN)),
+                    ("rule_name", json!("zone_match")),
+                    ("output", json!(true)),
+                ],
+            );
+            assert!(matches!(
+                replay(&[evidence]),
+                Err(ReplayError::TokenNotFoundInAuditChain { .. })
+            ));
         }
         let mut evidence = accepted_entry(1);
-        evidence.metadata.insert("capability_token_digest".into(), json!(token_hash("other-token")));
-        assert!(matches!(replay(&[evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+        evidence.metadata.insert(
+            "capability_token_digest".into(),
+            json!(token_hash("other-token")),
+        );
+        assert!(matches!(
+            replay(&[evidence]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
     }
 
     #[test]
     fn conflicting_identity_aliases_cannot_hide_rejected_evidence() {
         let mut rejected = accepted_entry(2);
         rejected.metadata.insert("output".into(), json!(false));
-        rejected.metadata.insert("capability_hash".into(), json!(null));
-        assert!(matches!(replay(&[accepted_entry(1), rejected]),
-            Err(ReplayError::AuditChainCorrupted(_))));
-        let ambiguous_id = entry(2, vec![
-            ("token_id", json!(TOKEN)),
-            ("jti", json!("other-token")),
-            ("rule_name", json!("revocation_check")),
-            ("output", json!(false)),
-        ]);
-        assert!(matches!(replay(&[accepted_entry(1), ambiguous_id]),
-            Err(ReplayError::AuditChainCorrupted(_))));
+        rejected
+            .metadata
+            .insert("capability_hash".into(), json!(null));
+        assert!(matches!(
+            replay(&[accepted_entry(1), rejected]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
+        let ambiguous_id = entry(
+            2,
+            vec![
+                ("token_id", json!(TOKEN)),
+                ("jti", json!("other-token")),
+                ("rule_name", json!("revocation_check")),
+                ("output", json!(false)),
+            ],
+        );
+        assert!(matches!(
+            replay(&[accepted_entry(1), ambiguous_id]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
     }
 
     #[test]
     fn empty_token_does_not_match_empty_identity_or_its_hash() {
-        for identity in [vec![("token_id", json!(""))], vec![("token_hash", json!(token_hash("")))]] {
+        for identity in [
+            vec![("token_id", json!(""))],
+            vec![("token_hash", json!(token_hash("")))],
+        ] {
             let result = reconstruct_predicate_trace_from_entries(
-                "", std::time::Duration::from_secs(60), false, NOW, &[entry(1, identity)],
+                "",
+                std::time::Duration::from_secs(60),
+                false,
+                NOW,
+                &[entry(1, identity)],
             );
-            assert!(matches!(result, Err(ReplayError::TokenNotFoundInAuditChain { .. })));
+            assert!(matches!(
+                result,
+                Err(ReplayError::TokenNotFoundInAuditChain { .. })
+            ));
         }
     }
 
@@ -1078,9 +1161,13 @@ mod tests {
         future.occurred_at = NOW + 1;
         future.metadata.insert("output".into(), json!(false));
         let result = reconstruct_predicate_trace_from_entries(
-            TOKEN, std::time::Duration::from_secs(60), false, NOW,
+            TOKEN,
+            std::time::Duration::from_secs(60),
+            false,
+            NOW,
             &[future, end, before, start],
-        ).expect("bounded time window");
+        )
+        .expect("bounded time window");
         assert_eq!(result.total_steps, 2);
         assert_eq!(result.final_verdict, FinalVerdict::Accepted);
         assert_eq!(result.audit_chain_range.start_seq, 2);
@@ -1089,13 +1176,19 @@ mod tests {
 
     #[test]
     fn accepted_verdict_cannot_override_rejected_predicate() {
-        let evidence = entry(1, vec![
-            ("token_hash", json!(token_hash(TOKEN))),
-            ("rule_name", json!("revocation_check")),
-            ("output", json!(false)),
-            ("final_verdict", json!("accepted")),
-        ]);
-        assert!(matches!(replay(&[evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+        let evidence = entry(
+            1,
+            vec![
+                ("token_hash", json!(token_hash(TOKEN))),
+                ("rule_name", json!("revocation_check")),
+                ("output", json!(false)),
+                ("final_verdict", json!("accepted")),
+            ],
+        );
+        assert!(matches!(
+            replay(&[evidence]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
     }
 
     #[test]
@@ -1103,39 +1196,74 @@ mod tests {
         for verdict in [json!("acceptedd"), json!(true), json!(null)] {
             let mut evidence = accepted_entry(1);
             evidence.metadata.insert("final_verdict".into(), verdict);
-            assert!(matches!(replay(&[evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+            assert!(matches!(
+                replay(&[evidence]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
         let mut evidence = accepted_entry(1);
-        evidence.metadata.insert("final_verdict".into(), json!("accepted"));
-        evidence.metadata.insert("verdict".into(), json!("rejected_expired"));
-        assert!(matches!(replay(&[evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+        evidence
+            .metadata
+            .insert("final_verdict".into(), json!("accepted"));
+        evidence
+            .metadata
+            .insert("verdict".into(), json!("rejected_expired"));
+        assert!(matches!(
+            replay(&[evidence]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
     }
 
     #[test]
     fn conflicting_decisions_require_a_narrower_artifact() {
         let mut first = accepted_entry(1);
-        first.metadata.insert("final_verdict".into(), json!("accepted"));
-        let second = entry(2, vec![
-            ("token_hash", json!(token_hash(TOKEN))),
-            ("final_verdict", json!("rejected_expired")),
-        ]);
-        assert!(matches!(replay(&[first, second]), Err(ReplayError::AuditChainCorrupted(_))));
+        first
+            .metadata
+            .insert("final_verdict".into(), json!("accepted"));
+        let second = entry(
+            2,
+            vec![
+                ("token_hash", json!(token_hash(TOKEN))),
+                ("final_verdict", json!("rejected_expired")),
+            ],
+        );
+        assert!(matches!(
+            replay(&[first, second]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
     }
 
     #[test]
     fn explicit_rejection_is_retained_when_predicate_capture_is_partial() {
         let mut evidence = accepted_entry(1);
-        evidence.metadata.insert("final_verdict".into(), json!("rejected_expired"));
-        assert_eq!(replay(&[evidence]).expect("explicit rejection").final_verdict,
-            FinalVerdict::RejectedExpired);
+        evidence
+            .metadata
+            .insert("final_verdict".into(), json!("rejected_expired"));
+        assert_eq!(
+            replay(&[evidence])
+                .expect("explicit rejection")
+                .final_verdict,
+            FinalVerdict::RejectedExpired
+        );
     }
 
     #[test]
     fn malformed_trace_cannot_fall_back_to_an_accepting_direct_step() {
-        for malformed in [json!(null), json!({}), json!(true), json!([]), json!([null])] {
+        for malformed in [
+            json!(null),
+            json!({}),
+            json!(true),
+            json!([]),
+            json!([null]),
+        ] {
             let mut evidence = accepted_entry(1);
-            evidence.metadata.insert("predicate_trace".into(), malformed);
-            assert!(matches!(replay(&[evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+            evidence
+                .metadata
+                .insert("predicate_trace".into(), malformed);
+            assert!(matches!(
+                replay(&[evidence]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
     }
 
@@ -1145,11 +1273,19 @@ mod tests {
             vec![("rule_name", json!("revocation_check"))],
             vec![("output", json!(false))],
             vec![("rule_name", json!("")), ("output", json!(true))],
-            vec![("rule_name", json!("revocation_check")), ("output", json!("not-a-bool"))],
+            vec![
+                ("rule_name", json!("revocation_check")),
+                ("output", json!("not-a-bool")),
+            ],
         ] {
             let mut evidence = entry(2, malformed);
-            evidence.metadata.insert("token_hash".into(), json!(token_hash(TOKEN)));
-            assert!(matches!(replay(&[accepted_entry(1), evidence]), Err(ReplayError::AuditChainCorrupted(_))));
+            evidence
+                .metadata
+                .insert("token_hash".into(), json!(token_hash(TOKEN)));
+            assert!(matches!(
+                replay(&[accepted_entry(1), evidence]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
     }
 
@@ -1158,30 +1294,66 @@ mod tests {
         for conflicting in [json!(false), json!(null), json!("garbage")] {
             let mut direct = accepted_entry(1);
             direct.metadata.insert("result".into(), conflicting.clone());
-            assert!(matches!(replay(&[direct]), Err(ReplayError::AuditChainCorrupted(_))));
-            let nested = entry(1, vec![
-                ("token_hash", json!(token_hash(TOKEN))),
-                ("predicate_trace", json!([{"rule_name": "zone_match", "output": true, "allowed": conflicting}])),
-            ]);
-            assert!(matches!(replay(&[nested]), Err(ReplayError::AuditChainCorrupted(_))));
+            assert!(matches!(
+                replay(&[direct]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
+            let nested = entry(
+                1,
+                vec![
+                    ("token_hash", json!(token_hash(TOKEN))),
+                    (
+                        "predicate_trace",
+                        json!([{"rule_name": "zone_match", "output": true, "allowed": conflicting}]),
+                    ),
+                ],
+            );
+            assert!(matches!(
+                replay(&[nested]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
         let mut consistent = accepted_entry(1);
         consistent.metadata.insert("result".into(), json!("TRUE"));
-        assert_eq!(replay(&[consistent]).expect("consistent aliases").final_verdict,
-            FinalVerdict::Accepted);
+        assert_eq!(
+            replay(&[consistent])
+                .expect("consistent aliases")
+                .final_verdict,
+            FinalVerdict::Accepted
+        );
     }
 
     #[test]
     fn witness_arrays_never_silently_drop_invalid_elements_or_use_fallback() {
-        for invalid in [json!([]), json!([1, "secret"]), json!([-1]), json!(1.5), json!(null)] {
+        for invalid in [
+            json!([]),
+            json!([1, "secret"]),
+            json!([-1]),
+            json!(1.5),
+            json!(null),
+        ] {
             let mut direct = accepted_entry(1);
-            direct.metadata.insert("witness_chain_indices".into(), invalid.clone());
-            assert!(matches!(replay(&[direct]), Err(ReplayError::AuditChainCorrupted(_))));
-            let nested = entry(1, vec![
-                ("token_hash", json!(token_hash(TOKEN))),
-                ("predicate_trace", json!([{"rule_name": "zone_match", "output": true, "witness_seq": invalid}])),
-            ]);
-            assert!(matches!(replay(&[nested]), Err(ReplayError::AuditChainCorrupted(_))));
+            direct
+                .metadata
+                .insert("witness_chain_indices".into(), invalid.clone());
+            assert!(matches!(
+                replay(&[direct]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
+            let nested = entry(
+                1,
+                vec![
+                    ("token_hash", json!(token_hash(TOKEN))),
+                    (
+                        "predicate_trace",
+                        json!([{"rule_name": "zone_match", "output": true, "witness_seq": invalid}]),
+                    ),
+                ],
+            );
+            assert!(matches!(
+                replay(&[nested]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
     }
 
@@ -1190,26 +1362,39 @@ mod tests {
         for (value, expected) in [(json!(9), vec![9]), (json!([2, 9]), vec![2, 9])] {
             let mut evidence = accepted_entry(1);
             evidence.metadata.insert("witness_seq".into(), value);
-            assert_eq!(replay(&[evidence]).expect("explicit witnesses").trace[0].witness_chain_indices,
-                expected);
+            assert_eq!(
+                replay(&[evidence]).expect("explicit witnesses").trace[0].witness_chain_indices,
+                expected
+            );
         }
-        assert_eq!(replay(&[accepted_entry(1)]).expect("fallback witness").trace[0].witness_chain_indices,
-            vec![1]);
+        assert_eq!(
+            replay(&[accepted_entry(1)])
+                .expect("fallback witness")
+                .trace[0]
+                .witness_chain_indices,
+            vec![1]
+        );
     }
 
     #[test]
     fn redacts_labels_object_keys_and_authorization_cookie_fields() {
-        let evidence = entry(1, vec![
-            ("token_hash", json!(token_hash(TOKEN))),
-            ("rule_name", json!(format!("revocation_check:{TOKEN}"))),
-            ("evaluator_version", json!(format!("v1:{TOKEN}"))),
-            ("inputs_json", json!({
-                "headers": {"Authorization": "Bearer private-credential", "Cookie": "sid=session-secret"},
-                "nested": {(TOKEN): "value"},
-                "safe": "visible"
-            })),
-            ("output", json!(false)),
-        ]);
+        let evidence = entry(
+            1,
+            vec![
+                ("token_hash", json!(token_hash(TOKEN))),
+                ("rule_name", json!(format!("revocation_check:{TOKEN}"))),
+                ("evaluator_version", json!(format!("v1:{TOKEN}"))),
+                (
+                    "inputs_json",
+                    json!({
+                        "headers": {"Authorization": "Bearer private-credential", "Cookie": "sid=session-secret"},
+                        "nested": {(TOKEN): "value"},
+                        "safe": "visible"
+                    }),
+                ),
+                ("output", json!(false)),
+            ],
+        );
         let trace = replay(&[evidence]).expect("redacted replay");
         assert_eq!(trace.final_verdict, FinalVerdict::RejectedRevocation);
         let serialized = serde_json::to_string(&trace).expect("trace JSON");
@@ -1221,24 +1406,35 @@ mod tests {
 
     #[test]
     fn redaction_does_not_change_inferred_verdict_when_token_overlaps_rule() {
-        let evidence = entry(1, vec![
-            ("token_id", json!("revocation")),
-            ("rule_name", json!("revocation_check")),
-            ("output", json!(false)),
-        ]);
+        let evidence = entry(
+            1,
+            vec![
+                ("token_id", json!("revocation")),
+                ("rule_name", json!("revocation_check")),
+                ("output", json!(false)),
+            ],
+        );
         let trace = reconstruct_predicate_trace_from_entries(
-            "revocation", std::time::Duration::from_secs(60), false, NOW, &[evidence],
-        ).expect("inference precedes redaction");
+            "revocation",
+            std::time::Duration::from_secs(60),
+            false,
+            NOW,
+            &[evidence],
+        )
+        .expect("inference precedes redaction");
         assert_eq!(trace.final_verdict, FinalVerdict::RejectedRevocation);
         assert_eq!(trace.trace[0].rule_name, "<redacted>_check");
     }
 
     #[test]
     fn malformed_predicate_diagnostic_does_not_echo_secret_rule_name() {
-        let evidence = entry(1, vec![
-            ("token_hash", json!(token_hash(TOKEN))),
-            ("predicate_trace", json!([{"rule_name": TOKEN}])),
-        ]);
+        let evidence = entry(
+            1,
+            vec![
+                ("token_hash", json!(token_hash(TOKEN))),
+                ("predicate_trace", json!([{"rule_name": TOKEN}])),
+            ],
+        );
         let error = replay(&[evidence]).expect_err("missing output");
         assert!(matches!(error, ReplayError::AuditChainCorrupted(_)));
         assert!(!error.to_string().contains(TOKEN));
@@ -1294,7 +1490,11 @@ mod tests {
             replay(&[first.clone(), second]),
             Err(ReplayError::AuditChainCorrupted(_))
         ));
-        for (left, right) in [("request-a", "request-b"), ("", "request-b"), ("request-a", "")] {
+        for (left, right) in [
+            ("request-a", "request-b"),
+            ("", "request-b"),
+            ("request-a", ""),
+        ] {
             let mut first = first.clone();
             let mut second = accepted_entry(2);
             first.correlation_id = left.to_owned();
@@ -1322,24 +1522,40 @@ mod tests {
             "trace".to_owned(),
             json!([{"rule_name": "zone", "output": false}]),
         );
-        assert!(matches!(replay(&[captured]), Err(ReplayError::AuditChainCorrupted(_))));
+        assert!(matches!(
+            replay(&[captured]),
+            Err(ReplayError::AuditChainCorrupted(_))
+        ));
 
         for nested in [false, true] {
             let captured = if nested {
-                entry(1, vec![
-                    ("token_hash", json!(token_hash(TOKEN))),
-                    ("predicate_trace", json!([{
-                        "rule_name": "zone", "output": true,
-                        "witness_chain_indices": [1], "witness_seq": [2]
-                    }])),
-                ])
+                entry(
+                    1,
+                    vec![
+                        ("token_hash", json!(token_hash(TOKEN))),
+                        (
+                            "predicate_trace",
+                            json!([{
+                                "rule_name": "zone", "output": true,
+                                "witness_chain_indices": [1], "witness_seq": [2]
+                            }]),
+                        ),
+                    ],
+                )
             } else {
                 let mut captured = accepted_entry(1);
-                captured.metadata.insert("witness_chain_indices".to_owned(), json!([1]));
-                captured.metadata.insert("witness_seq".to_owned(), json!([2]));
+                captured
+                    .metadata
+                    .insert("witness_chain_indices".to_owned(), json!([1]));
+                captured
+                    .metadata
+                    .insert("witness_seq".to_owned(), json!([2]));
                 captured
             };
-            assert!(matches!(replay(&[captured]), Err(ReplayError::AuditChainCorrupted(_))));
+            assert!(matches!(
+                replay(&[captured]),
+                Err(ReplayError::AuditChainCorrupted(_))
+            ));
         }
     }
 

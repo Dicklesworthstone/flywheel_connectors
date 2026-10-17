@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use fcp_async_core::sync::Mutex as AsyncMutex;
+use fcp_async_core::sync::Semaphore;
 use fcp_mesh::invoke_route::{
     DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS, MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
 };
@@ -44,9 +44,12 @@ impl DiscoveryClock {
             self.anchor = Some((wall_ms, monotonic_now));
             return wall_ms;
         };
-        let elapsed_ms =
-            u64::try_from(monotonic_now.saturating_duration_since(anchor_at).as_millis())
-                .unwrap_or(u64::MAX);
+        let elapsed_ms = u64::try_from(
+            monotonic_now
+                .saturating_duration_since(anchor_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let projected_ms = anchor_ms.saturating_add(elapsed_ms);
         if wall_ms > projected_ms {
             self.anchor = Some((wall_ms, monotonic_now));
@@ -126,14 +129,14 @@ impl AdvertisementCache {
 #[derive(Debug)]
 pub(super) struct PeerDiscovery {
     cache: Mutex<AdvertisementCache>,
-    refresh: AsyncMutex<()>,
+    refresh: Semaphore,
 }
 
 impl PeerDiscovery {
     pub(super) fn new() -> Self {
         Self {
             cache: Mutex::new(AdvertisementCache::default()),
-            refresh: AsyncMutex::new(()),
+            refresh: Semaphore::new(1),
         }
     }
 
@@ -152,27 +155,14 @@ impl PeerDiscovery {
         // Start elapsed-time accounting before any lock or network wait.
         self.freshness_now();
         let refresh = async {
-            // Recheck after acquiring the async lock: another caller may
-            // have refreshed everything while this caller was waiting.
-            let _refresh_guard = self.refresh.lock().await;
-            let (generation, stale_peers) = {
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Repeated additions/removals must not grow an unbounded cache.
-                // Also remove old negative entries when a peer's endpoint/key
-                // changes, so recovery does not wait for the old failure TTL.
-                cache.entries.retain(|_, entry| {
-                    directory.peer(&entry.peer.node_id) == Some(&entry.peer)
-                });
-                let now_ms = unix_now_ms();
-                let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
-                (
-                    cache.generation,
-                    cache.stale_peers(directory, now_ms, freshness_floor_ms),
-                )
-            };
+            // Recheck after acquiring the async single-flight permit: another
+            // caller may have refreshed everything while this caller waited.
+            let _refresh_guard = self
+                .refresh
+                .acquire()
+                .await
+                .expect("discovery refresh semaphore is never closed");
+            let (generation, stale_peers) = self.prepare_refresh(directory);
             let mut pending = stream::iter(stale_peers)
                 .map(|(index, peer)| {
                     self.record_attempt(generation, index, directory.len());
@@ -197,40 +187,16 @@ impl PeerDiscovery {
                         > DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
                     {
                         return Err(
-                            "mesh advertisement expired under monotonic freshness".to_owned(),
+                            "mesh advertisement expired under monotonic freshness".to_owned()
                         );
                     }
                     Ok(advertisement)
                 });
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cache.generation != generation {
+                if !self.record_refresh_result(generation, peer, result) {
                     // Invalidation must also fence a fetch that started before
                     // the cache was cleared, not just erase existing entries.
                     break;
                 }
-                let advertisement = match result {
-                    Ok(advertisement) => Some(advertisement),
-                    Err(detail) => {
-                        tracing::warn!(
-                            event = "mesh_advertisement_unavailable",
-                            peer = peer.node_id.as_str(),
-                            detail = %detail,
-                            "skipping mesh peer advertisement"
-                        );
-                        None
-                    }
-                };
-                cache.entries.insert(
-                    peer.node_id.as_str().to_owned(),
-                    CachedAdvertisement {
-                        peer,
-                        checked_at: Instant::now(),
-                        advertisement,
-                    },
-                );
             }
         };
         if fcp_async_core::time::timeout(REFRESH_TIMEOUT, refresh)
@@ -246,6 +212,61 @@ impl PeerDiscovery {
         // Re-evaluate signed age after the refresh. A still-live local TTL
         // must never extend the authority of an expired signed advertisement.
         self.snapshot(directory, unix_now_ms())
+    }
+
+    fn prepare_refresh(&self, directory: &MeshPeerDirectory) -> (u64, Vec<(usize, MeshPeer)>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Repeated additions/removals must not grow an unbounded cache.
+        // Also remove old negative entries when a peer's endpoint/key
+        // changes, so recovery does not wait for the old failure TTL.
+        cache
+            .entries
+            .retain(|_, entry| directory.peer(&entry.peer.node_id) == Some(&entry.peer));
+        let now_ms = unix_now_ms();
+        let freshness_floor_ms = cache.clock.observe(now_ms, Instant::now());
+        (
+            cache.generation,
+            cache.stale_peers(directory, now_ms, freshness_floor_ms),
+        )
+    }
+
+    fn record_refresh_result(
+        &self,
+        generation: u64,
+        peer: MeshPeer,
+        result: Result<MeshPeerAdvertisement, String>,
+    ) -> bool {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.generation != generation {
+            return false;
+        }
+        let advertisement = match result {
+            Ok(advertisement) => Some(advertisement),
+            Err(detail) => {
+                tracing::warn!(
+                    event = "mesh_advertisement_unavailable",
+                    peer = peer.node_id.as_str(),
+                    detail = %detail,
+                    "skipping mesh peer advertisement"
+                );
+                None
+            }
+        };
+        cache.entries.insert(
+            peer.node_id.as_str().to_owned(),
+            CachedAdvertisement {
+                peer,
+                checked_at: Instant::now(),
+                advertisement,
+            },
+        );
+        true
     }
 
     fn freshness_now(&self) -> (u64, u64) {
@@ -277,7 +298,9 @@ impl PeerDiscovery {
         directory
             .peers()
             .filter_map(|peer| {
-                cache.entries.get(peer.node_id.as_str())
+                cache
+                    .entries
+                    .get(peer.node_id.as_str())
                     .filter(|entry| {
                         entry.is_reusable(peer, now_ms)
                             && entry.is_reusable(peer, freshness_floor_ms)
@@ -376,7 +399,10 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) > 1);
         assert!(peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_FETCHES);
         let actual: Vec<_> = result.iter().map(|ad| ad.node_id.as_str()).collect();
-        let expected: Vec<_> = directory.peers().map(|peer| peer.node_id.as_str()).collect();
+        let expected: Vec<_> = directory
+            .peers()
+            .map(|peer| peer.node_id.as_str())
+            .collect();
         assert_eq!(actual, expected);
     }
 
@@ -426,7 +452,11 @@ mod tests {
             })
             .await;
         assert!(invalid.is_empty());
-        assert!(discovery.cache.lock().unwrap().entries["peer-000"].advertisement.is_none());
+        assert!(
+            discovery.cache.lock().unwrap().entries["peer-000"]
+                .advertisement
+                .is_none()
+        );
         discovery.invalidate();
         let wrong_node = discovery
             .collect(&directory, |_| {
@@ -461,7 +491,10 @@ mod tests {
         assert_eq!(discovery.snapshot(&directory, issued_at_ms).len(), 1);
         assert!(
             discovery
-                .snapshot(&directory, issued_at_ms + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS + 1)
+                .snapshot(
+                    &directory,
+                    issued_at_ms + DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS + 1
+                )
                 .is_empty()
         );
         assert!(
@@ -476,8 +509,14 @@ mod tests {
         let mut clock = DiscoveryClock::default();
         assert_eq!(clock.observe(1_000, start), 1_000);
         assert_eq!(clock.observe(900, start + Duration::from_millis(5)), 1_005);
-        assert_eq!(clock.observe(1_000, start + Duration::from_millis(10)), 1_010);
-        assert_eq!(clock.observe(1_001, start + Duration::from_millis(20)), 1_020);
+        assert_eq!(
+            clock.observe(1_000, start + Duration::from_millis(10)),
+            1_010
+        );
+        assert_eq!(
+            clock.observe(1_001, start + Duration::from_millis(20)),
+            1_020
+        );
     }
 
     #[test]
@@ -498,8 +537,14 @@ mod tests {
         let start = Instant::now();
         let mut clock = DiscoveryClock::default();
         assert_eq!(clock.observe(1_000, start), 1_000);
-        assert_eq!(clock.observe(5_000, start + Duration::from_millis(1)), 5_000);
-        assert_eq!(clock.observe(1_000, start + Duration::from_millis(11)), 5_010);
+        assert_eq!(
+            clock.observe(5_000, start + Duration::from_millis(1)),
+            5_000
+        );
+        assert_eq!(
+            clock.observe(1_000, start + Duration::from_millis(11)),
+            5_010
+        );
     }
 
     #[test]
@@ -561,7 +606,11 @@ mod tests {
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(replayed.is_empty());
-        assert!(discovery.cache.lock().unwrap().entries["peer-000"].advertisement.is_none());
+        assert!(
+            discovery.cache.lock().unwrap().entries["peer-000"]
+                .advertisement
+                .is_none()
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -573,13 +622,16 @@ mod tests {
         discovery.cache.lock().unwrap().clock.anchor = Some((future_ms, Instant::now()));
         let result = discovery
             .collect(&directory, |peer| {
-                let ad =
-                    MeshPeerAdvertisement::sign(&key, peer.node_id, future_ms, Vec::new());
+                let ad = MeshPeerAdvertisement::sign(&key, peer.node_id, future_ms, Vec::new());
                 async move { Ok(ad) }
             })
             .await;
         assert!(result.is_empty());
-        assert!(discovery.cache.lock().unwrap().entries["peer-000"].advertisement.is_none());
+        assert!(
+            discovery.cache.lock().unwrap().entries["peer-000"]
+                .advertisement
+                .is_none()
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -594,7 +646,10 @@ mod tests {
                 async move { Ok(ad) }
             })
             .await;
-        assert!(result.is_empty(), "pre-invalidation fetch must not repopulate the cache");
+        assert!(
+            result.is_empty(),
+            "pre-invalidation fetch must not repopulate the cache"
+        );
         assert!(discovery.cache.lock().unwrap().entries.is_empty());
         let recovered = discovery
             .collect(&directory, |peer| {
@@ -643,7 +698,10 @@ mod tests {
         let attempted = Mutex::new(Vec::new());
         for _ in 0..3 {
             let mut refresh = Box::pin(discovery.collect(&directory, |peer| {
-                attempted.lock().unwrap().push(peer.node_id.as_str().to_owned());
+                attempted
+                    .lock()
+                    .unwrap()
+                    .push(peer.node_id.as_str().to_owned());
                 pending::<Result<MeshPeerAdvertisement, String>>()
             }));
             assert!(futures_util::poll!(refresh.as_mut()).is_pending());
@@ -652,7 +710,11 @@ mod tests {
         let attempted = attempted.into_inner().unwrap();
         assert_eq!(attempted.len(), MAX_CONCURRENT_FETCHES * 3);
         let distinct: std::collections::BTreeSet<_> = attempted.into_iter().collect();
-        assert_eq!(distinct.len(), directory.len(), "a dead prefix must not starve later peers");
+        assert_eq!(
+            distinct.len(),
+            directory.len(),
+            "a dead prefix must not starve later peers"
+        );
         assert!(discovery.snapshot(&directory, unix_now_ms()).is_empty());
     }
 
@@ -670,12 +732,10 @@ mod tests {
                 Ok(ad)
             }
         });
-        let result = fcp_async_core::time::timeout(
-            REFRESH_TIMEOUT + Duration::from_secs(2),
-            refresh,
-        )
-        .await
-        .expect("discovery must enforce its own total deadline");
+        let result =
+            fcp_async_core::time::timeout(REFRESH_TIMEOUT + Duration::from_secs(2), refresh)
+                .await
+                .expect("discovery must enforce its own total deadline");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id.as_str(), "peer-000");
         let recovered = discovery
@@ -695,25 +755,33 @@ mod tests {
         let old_directory = directory(1, &old_key);
         let new_directory = directory(1, &new_key);
         let discovery = PeerDiscovery::new();
-        let old = discovery.collect(&old_directory, |peer| {
-            let ad = advertisement(&peer, &old_key);
-            async move { Ok(ad) }
-        }).await;
+        let old = discovery
+            .collect(&old_directory, |peer| {
+                let ad = advertisement(&peer, &old_key);
+                async move { Ok(ad) }
+            })
+            .await;
         assert_eq!(old.len(), 1);
         assert!(discovery.snapshot(&new_directory, unix_now_ms()).is_empty());
         let calls = AtomicUsize::new(0);
-        let current = discovery.collect(&new_directory, |peer| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            let ad = advertisement(&peer, &new_key);
-            async move { Ok(ad) }
-        }).await;
+        let current = discovery
+            .collect(&new_directory, |peer| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let ad = advertisement(&peer, &new_key);
+                async move { Ok(ad) }
+            })
+            .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(current.len(), 1);
         assert_ne!(current[0].signature, old[0].signature);
-        current[0].verify(
-            &TailscaleNodeId::new("peer-000"), &new_directory,
-            unix_now_ms(), DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
-        ).unwrap();
+        current[0]
+            .verify(
+                &TailscaleNodeId::new("peer-000"),
+                &new_directory,
+                unix_now_ms(),
+                DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS,
+            )
+            .unwrap();
     }
 
     #[fcp_async_core::runtime::test]
@@ -727,23 +795,32 @@ mod tests {
                 endpoint: "http://127.0.0.1:29999".to_owned(),
                 public_key_hex: hex::encode(key.verifying_key().to_bytes()),
             }],
-        ).unwrap();
+        )
+        .unwrap();
         for initially_available in [false, true] {
             let discovery = PeerDiscovery::new();
-            discovery.collect(&old_directory, |peer| {
-                let ad = advertisement(&peer, &key);
-                async move {
-                    if initially_available { Ok(ad) } else { Err("unreachable".to_owned()) }
-                }
-            }).await;
+            discovery
+                .collect(&old_directory, |peer| {
+                    let ad = advertisement(&peer, &key);
+                    async move {
+                        if initially_available {
+                            Ok(ad)
+                        } else {
+                            Err("unreachable".to_owned())
+                        }
+                    }
+                })
+                .await;
             assert!(discovery.snapshot(&new_directory, unix_now_ms()).is_empty());
             let calls = AtomicUsize::new(0);
-            let current = discovery.collect(&new_directory, |peer| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(peer.endpoint, "http://127.0.0.1:29999");
-                let ad = advertisement(&peer, &key);
-                async move { Ok(ad) }
-            }).await;
+            let current = discovery
+                .collect(&new_directory, |peer| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(peer.endpoint, "http://127.0.0.1:29999");
+                    let ad = advertisement(&peer, &key);
+                    async move { Ok(ad) }
+                })
+                .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(current.len(), 1);
         }
@@ -755,15 +832,19 @@ mod tests {
         let initial = directory(4, &key);
         let reduced = directory(1, &key);
         let discovery = PeerDiscovery::new();
-        discovery.collect(&initial, |peer| {
-            let ad = advertisement(&peer, &key);
-            async move { Ok(ad) }
-        }).await;
+        discovery
+            .collect(&initial, |peer| {
+                let ad = advertisement(&peer, &key);
+                async move { Ok(ad) }
+            })
+            .await;
         let calls = AtomicUsize::new(0);
-        let result = discovery.collect(&reduced, |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async { Err("unchanged peer should not be fetched".to_owned()) }
-        }).await;
+        let result = discovery
+            .collect(&reduced, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err("unchanged peer should not be fetched".to_owned()) }
+            })
+            .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id.as_str(), "peer-000");

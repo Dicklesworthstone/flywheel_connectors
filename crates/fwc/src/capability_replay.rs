@@ -182,7 +182,9 @@ impl fmt::Display for CapabilityReplayError {
             Self::InvalidTrustPolicy(message) => {
                 write!(formatter, "invalid audit trust policy: {message}")
             }
-            Self::UnverifiedChain(message) => write!(formatter, "audit chain unverified: {message}"),
+            Self::UnverifiedChain(message) => {
+                write!(formatter, "audit chain unverified: {message}")
+            }
             Self::Replay(error) => write!(formatter, "{error}"),
             Self::Serialize(message) => {
                 write!(formatter, "failed to render replay output: {message}")
@@ -280,7 +282,13 @@ pub fn build_replay_payload_from_paths(
             ReplayError::AuditChainUnavailable("cannot open audit-chain artifact".to_string())
         })?;
         return build_authenticated_replay_payload_from_reader(
-            token, since_seconds, confirm, file, output, now_unix, &policy,
+            token,
+            since_seconds,
+            confirm,
+            file,
+            output,
+            now_unix,
+            &policy,
         );
     }
     let trace = reconstruct_predicate_trace_from_path(
@@ -423,7 +431,11 @@ pub fn build_authenticated_replay_payload_from_entries(
     )?;
     // Verified chains start at zero and contain every sequence exactly once.
     // A signed trace must not cite a nonexistent witness outside that chain.
-    for sequence in trace.trace.iter().flat_map(|step| &step.witness_chain_indices) {
+    for sequence in trace
+        .trace
+        .iter()
+        .flat_map(|step| &step.witness_chain_indices)
+    {
         if usize::try_from(*sequence)
             .ok()
             .and_then(|index| entries.get(index))
@@ -601,8 +613,8 @@ mod tests {
         CapabilityReplayError, ReplayOutput, ReplayTrustPolicy,
         build_authenticated_replay_payload_from_entries,
         build_authenticated_replay_payload_from_reader, build_replay_payload,
-        build_replay_payload_from_entries, build_replay_payload_from_paths,
-        parse_since_seconds, read_bounded_artifact, read_replay_trust_policy,
+        build_replay_payload_from_entries, build_replay_payload_from_paths, parse_since_seconds,
+        read_bounded_artifact, read_replay_trust_policy,
     };
 
     const NOW: u64 = 1_700_000_100;
@@ -729,17 +741,26 @@ mod tests {
 
     #[test]
     fn all_output_modes_redact_labels_and_nested_secret_keys() {
-        let evidence = entry(1, vec![
-            ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
-            ("rule_name", json!(format!("zone_match:{TOKEN}"))),
-            ("evaluator_version", json!(format!("v1:{TOKEN}"))),
-            ("inputs_json", json!({"nested": {(TOKEN): "value"}})),
-            ("output", json!(true)),
-        ]);
+        let evidence = entry(
+            1,
+            vec![
+                ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
+                ("rule_name", json!(format!("zone_match:{TOKEN}"))),
+                ("evaluator_version", json!(format!("v1:{TOKEN}"))),
+                ("inputs_json", json!({"nested": {(TOKEN): "value"}})),
+                ("output", json!(true)),
+            ],
+        );
         for output in [ReplayOutput::Json, ReplayOutput::Jsonl, ReplayOutput::Human] {
             let payload = build_replay_payload_from_entries(
-                TOKEN, 60, false, std::slice::from_ref(&evidence), output, NOW,
-            ).expect("redacted payload");
+                TOKEN,
+                60,
+                false,
+                std::slice::from_ref(&evidence),
+                output,
+                NOW,
+            )
+            .expect("redacted payload");
             assert!(!payload.to_string().contains(TOKEN));
             assert_eq!(payload["status"], "ok");
             if output == ReplayOutput::Jsonl {
@@ -752,15 +773,24 @@ mod tests {
 
     #[test]
     fn contradictory_evidence_is_reported_as_corruption_not_success() {
-        let evidence = entry(1, vec![
-            ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
-            ("rule_name", json!("revocation_check")),
-            ("output", json!(false)),
-            ("final_verdict", json!("accepted")),
-        ]);
+        let evidence = entry(
+            1,
+            vec![
+                ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
+                ("rule_name", json!("revocation_check")),
+                ("output", json!(false)),
+                ("final_verdict", json!("accepted")),
+            ],
+        );
         let error = build_replay_payload_from_entries(
-            TOKEN, 60, false, &[evidence], ReplayOutput::Json, NOW,
-        ).expect_err("cannot render contradictory evidence as success");
+            TOKEN,
+            60,
+            false,
+            &[evidence],
+            ReplayOutput::Json,
+            NOW,
+        )
+        .expect_err("cannot render contradictory evidence as success");
         assert_eq!(error.error_type(), "audit-chain-corrupted");
         assert!(!error.to_string().contains(TOKEN));
     }
@@ -809,12 +839,15 @@ mod tests {
         let key = Ed25519SigningKey::from_bytes(&[7_u8; 32]).unwrap();
         let mut entries: Vec<_> = (0..2)
             .map(|seq| {
-                entry(seq, vec![
-                    ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
-                    ("rule_name", json!(format!("predicate-{seq}"))),
-                    ("output", json!(true)),
-                    ("inputs_json", json!({"request": format!("Bearer {TOKEN}")})),
-                ])
+                entry(
+                    seq,
+                    vec![
+                        ("token_hash", json!(fcp_audit::replay::token_hash(TOKEN))),
+                        ("rule_name", json!(format!("predicate-{seq}"))),
+                        ("output", json!(true)),
+                        ("inputs_json", json!({"request": format!("Bearer {TOKEN}")})),
+                    ],
+                )
             })
             .collect();
         sign_entries(&mut entries, &key);
@@ -827,7 +860,13 @@ mod tests {
         policy: &ReplayTrustPolicy,
     ) -> Result<Value, CapabilityReplayError> {
         build_authenticated_replay_payload_from_entries(
-            TOKEN, 60, false, entries, ReplayOutput::Json, NOW, policy,
+            TOKEN,
+            60,
+            false,
+            entries,
+            ReplayOutput::Json,
+            NOW,
+            policy,
         )
     }
 
@@ -843,17 +882,26 @@ mod tests {
         for mode in [ReplayOutput::Json, ReplayOutput::Jsonl, ReplayOutput::Human] {
             let payload = build_authenticated_replay_payload_from_entries(
                 TOKEN, 60, false, &entries, mode, NOW, &policy,
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(payload["status"], "ok");
             assert_eq!(payload["total_steps"], 2);
             assert_eq!(payload["source"]["live"], false);
             assert_eq!(payload["source"]["chain_integrity_verified"], true);
             assert_eq!(payload["source"]["entry_signatures_verified"], true);
             assert_eq!(payload["source"]["head_signatures_verified"], true);
-            assert_eq!(payload["source"]["trusted_head"]["entry"], policy.expected_head.head_entry);
+            assert_eq!(
+                payload["source"]["trusted_head"]["entry"],
+                policy.expected_head.head_entry
+            );
             assert!(!payload.to_string().contains(TOKEN));
             if mode == ReplayOutput::Human {
-                assert!(payload["human"].as_str().unwrap().contains("not live state"));
+                assert!(
+                    payload["human"]
+                        .as_str()
+                        .unwrap()
+                        .contains("not live state")
+                );
             }
         }
     }
@@ -861,14 +909,19 @@ mod tests {
     #[test]
     fn raw_replay_never_labels_signed_looking_input_as_verified() {
         let (entries, _, _) = signed_fixture();
-        let payload = build_replay_payload_from_entries(
-            TOKEN, 60, false, &entries, ReplayOutput::Human, NOW,
-        ).unwrap();
+        let payload =
+            build_replay_payload_from_entries(TOKEN, 60, false, &entries, ReplayOutput::Human, NOW)
+                .unwrap();
         assert_eq!(payload["source"]["chain_integrity_verified"], false);
         assert_eq!(payload["source"]["entry_signatures_verified"], false);
         assert_eq!(payload["source"]["head_signatures_verified"], false);
         assert!(payload["source"]["trusted_head"].is_null());
-        assert!(payload["human"].as_str().unwrap().contains("unverified captured artifact"));
+        assert!(
+            payload["human"]
+                .as_str()
+                .unwrap()
+                .contains("unverified captured artifact")
+        );
     }
 
     #[test]
@@ -888,7 +941,9 @@ mod tests {
         unknown.public_keys_hex = vec![hex::encode(other.verifying_key().to_bytes())];
         assert_unverified(authenticated(&entries, &unknown));
         let mut tampered = entries;
-        tampered[1].metadata.insert("output".to_string(), json!(false));
+        tampered[1]
+            .metadata
+            .insert("output".to_string(), json!(false));
         assert_unverified(authenticated(&tampered, &policy));
     }
 
@@ -897,12 +952,25 @@ mod tests {
         let (mut entries, policy, _) = signed_fixture();
         let now = entries[1].occurred_at;
         let payload = build_authenticated_replay_payload_from_entries(
-            TOKEN, 0, false, &entries, ReplayOutput::Json, now, &policy,
-        ).unwrap();
+            TOKEN,
+            0,
+            false,
+            &entries,
+            ReplayOutput::Json,
+            now,
+            &policy,
+        )
+        .unwrap();
         assert_eq!(payload["total_steps"], 1);
         entries[0].actor = format!("forged-{TOKEN}");
         assert_unverified(build_authenticated_replay_payload_from_entries(
-            TOKEN, 0, false, &entries, ReplayOutput::Json, now, &policy,
+            TOKEN,
+            0,
+            false,
+            &entries,
+            ReplayOutput::Json,
+            now,
+            &policy,
         ));
     }
 
@@ -956,9 +1024,12 @@ mod tests {
         let policy = pin_head(&entries, &[&key]);
         let keys = policy.trusted_keys().unwrap();
         let report = fcp_audit::verify_chain_with_required_signed_head(
-            &entries, Some(&policy.expected_head), Some(&policy.zone_id),
+            &entries,
+            Some(&policy.expected_head),
+            Some(&policy.zone_id),
             |kid| keys.get(kid).cloned(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(report.status, fcp_audit::VerifyStatus::Warn);
         assert_unverified(authenticated(&entries, &policy));
     }
@@ -978,7 +1049,9 @@ mod tests {
     #[test]
     fn signed_predicate_cannot_cite_a_nonexistent_chain_witness() {
         let (mut entries, _, key) = signed_fixture();
-        entries[1].metadata.insert("witness_seq".to_string(), json!(999));
+        entries[1]
+            .metadata
+            .insert("witness_seq".to_string(), json!(999));
         sign_entries(&mut entries, &key);
         let policy = pin_head(&entries, &[&key]);
         assert_unverified(authenticated(&entries, &policy));
@@ -998,10 +1071,16 @@ mod tests {
                 5 => invalid.public_keys_hex.clear(),
                 6 => invalid.public_keys_hex[0] = "0".repeat(64),
                 7 => invalid.public_keys_hex[0] = TOKEN.to_string(),
-                _ => invalid.public_keys_hex.push(invalid.public_keys_hex[0].to_uppercase()),
+                _ => invalid
+                    .public_keys_hex
+                    .push(invalid.public_keys_hex[0].to_uppercase()),
             }
             let error = invalid.trusted_keys().unwrap_err();
-            assert_eq!(error.error_type(), "invalid-audit-trust-policy", "case {case}");
+            assert_eq!(
+                error.error_type(),
+                "invalid-audit-trust-policy",
+                "case {case}"
+            );
             assert!(!error.to_string().contains(TOKEN));
         }
     }
@@ -1036,13 +1115,27 @@ mod tests {
     fn window_and_policy_gates_precede_evidence_io() {
         let (_, mut policy, _) = signed_fixture();
         let error = build_authenticated_replay_payload_from_reader(
-            TOKEN, 604_801, false, MustNotRead, ReplayOutput::Json, NOW, &policy,
-        ).unwrap_err();
+            TOKEN,
+            604_801,
+            false,
+            MustNotRead,
+            ReplayOutput::Json,
+            NOW,
+            &policy,
+        )
+        .unwrap_err();
         assert_eq!(error.error_type(), "wide-window-requires-confirm");
         policy.minimum_head_signers = 0;
         let error = build_authenticated_replay_payload_from_reader(
-            TOKEN, 60, false, MustNotRead, ReplayOutput::Json, NOW, &policy,
-        ).unwrap_err();
+            TOKEN,
+            60,
+            false,
+            MustNotRead,
+            ReplayOutput::Json,
+            NOW,
+            &policy,
+        )
+        .unwrap_err();
         assert_eq!(error.error_type(), "invalid-audit-trust-policy");
     }
 
@@ -1050,31 +1143,53 @@ mod tests {
     fn explicitly_invalid_policy_paths_do_not_downgrade_or_read_stdin() {
         for policy_path in ["", "-"] {
             let error = build_replay_payload_from_paths(
-                TOKEN, 60, false, Path::new("-"), ReplayOutput::Json, NOW,
+                TOKEN,
+                60,
+                false,
+                Path::new("-"),
+                ReplayOutput::Json,
+                NOW,
                 Some(Path::new(policy_path)),
-            ).unwrap_err();
+            )
+            .unwrap_err();
             assert_eq!(error.error_type(), "invalid-audit-trust-policy");
         }
         let error = build_replay_payload_from_paths(
-            TOKEN, 604_801, false, Path::new("-"), ReplayOutput::Json, NOW,
+            TOKEN,
+            604_801,
+            false,
+            Path::new("-"),
+            ReplayOutput::Json,
+            NOW,
             Some(Path::new("")),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(error.error_type(), "wide-window-requires-confirm");
     }
 
     #[test]
     fn signed_jsonl_array_and_bundle_readers_share_the_authenticated_path() {
         let (entries, policy, _) = signed_fixture();
-        let jsonl = entries.iter().map(|entry| serde_json::to_string(entry).unwrap())
-            .collect::<Vec<_>>().join("\n");
+        let jsonl = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
         for text in [
             jsonl,
             serde_json::to_string_pretty(&entries).unwrap(),
             json!({"audit_entries": entries}).to_string(),
         ] {
             let payload = build_authenticated_replay_payload_from_reader(
-                TOKEN, 60, false, text.as_bytes(), ReplayOutput::Json, NOW, &policy,
-            ).unwrap();
+                TOKEN,
+                60,
+                false,
+                text.as_bytes(),
+                ReplayOutput::Json,
+                NOW,
+                &policy,
+            )
+            .unwrap();
             assert_eq!(payload["total_steps"], 2);
             assert_eq!(payload["source"]["entry_signatures_verified"], true);
         }
@@ -1111,13 +1226,27 @@ mod tests {
         let valid = serde_json::to_string(&entries).unwrap();
         let malformed = format!("{valid}\n{{\"{TOKEN}\":");
         let error = build_authenticated_replay_payload_from_reader(
-            TOKEN, 60, false, malformed.as_bytes(), ReplayOutput::Json, NOW, &policy,
-        ).unwrap_err();
+            TOKEN,
+            60,
+            false,
+            malformed.as_bytes(),
+            ReplayOutput::Json,
+            NOW,
+            &policy,
+        )
+        .unwrap_err();
         assert_eq!(error.error_type(), "audit-chain-corrupted");
         assert!(!error.to_string().contains(TOKEN));
         let error = build_authenticated_replay_payload_from_reader(
-            TOKEN, 60, false, valid.as_bytes().chain(FailedRead), ReplayOutput::Json, NOW, &policy,
-        ).unwrap_err();
+            TOKEN,
+            60,
+            false,
+            valid.as_bytes().chain(FailedRead),
+            ReplayOutput::Json,
+            NOW,
+            &policy,
+        )
+        .unwrap_err();
         assert_eq!(error.error_type(), "audit-chain-unavailable");
     }
 }

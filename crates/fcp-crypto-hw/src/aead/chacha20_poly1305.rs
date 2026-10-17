@@ -209,7 +209,7 @@ impl Chacha20Poly1305Dispatch {
     }
 }
 
-/// Seal through the scalar backend label.
+/// Seal through the portable scalar RFC 8439 backend.
 ///
 /// # Errors
 ///
@@ -220,10 +220,10 @@ pub fn seal_scalar(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, Chacha20Poly1305Error> {
-    seal_with_rustcrypto(key, nonce, plaintext, aad)
+    Ok(seal_with_portable_scalar(key, nonce, plaintext, aad))
 }
 
-/// Open through the scalar backend label.
+/// Open through the portable scalar RFC 8439 backend.
 ///
 /// # Errors
 ///
@@ -234,7 +234,7 @@ pub fn open_scalar(
     ciphertext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, Chacha20Poly1305Error> {
-    open_with_rustcrypto(key, nonce, ciphertext, aad)
+    open_with_portable_scalar(key, nonce, ciphertext, aad)
 }
 
 /// Seal through the SSE3 backend label.
@@ -337,4 +337,223 @@ fn open_with_rustcrypto(
             },
         )
         .map_err(|_| Chacha20Poly1305Error::TagMismatch)
+}
+
+#[inline(never)]
+fn quarter_round_scalar(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    let mut sa = std::hint::black_box(state[a]);
+    let mut sb = std::hint::black_box(state[b]);
+    let mut sc = std::hint::black_box(state[c]);
+    let mut sd = std::hint::black_box(state[d]);
+
+    sa = sa.wrapping_add(sb);
+    sd = (sd ^ sa).rotate_left(16);
+    sc = sc.wrapping_add(sd);
+    sb = (sb ^ sc).rotate_left(12);
+    sa = sa.wrapping_add(sb);
+    sd = (sd ^ sa).rotate_left(8);
+    sc = sc.wrapping_add(sd);
+    sb = (sb ^ sc).rotate_left(7);
+
+    state[a] = std::hint::black_box(sa);
+    state[b] = std::hint::black_box(sb);
+    state[c] = std::hint::black_box(sc);
+    state[d] = std::hint::black_box(sd);
+}
+
+#[inline(never)]
+fn chacha20_block_scalar(
+    key: &[u8; CHACHA20POLY1305_KEY_SIZE],
+    counter: u32,
+    nonce: &[u8; CHACHA20POLY1305_NONCE_SIZE],
+) -> [u8; 64] {
+    let mut initial = [0u32; 16];
+    initial[0] = 0x6170_7865;
+    initial[1] = 0x3320_646e;
+    initial[2] = 0x7962_2d32;
+    initial[3] = 0x6b20_6574;
+
+    for (idx, chunk) in key.chunks_exact(4).enumerate() {
+        initial[4 + idx] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    initial[12] = counter;
+    for (idx, chunk) in nonce.chunks_exact(4).enumerate() {
+        initial[13 + idx] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+
+    let mut working = initial;
+    for _ in 0..10 {
+        quarter_round_scalar(&mut working, 0, 4, 8, 12);
+        quarter_round_scalar(&mut working, 1, 5, 9, 13);
+        quarter_round_scalar(&mut working, 2, 6, 10, 14);
+        quarter_round_scalar(&mut working, 3, 7, 11, 15);
+        quarter_round_scalar(&mut working, 0, 5, 10, 15);
+        quarter_round_scalar(&mut working, 1, 6, 11, 12);
+        quarter_round_scalar(&mut working, 2, 7, 8, 13);
+        quarter_round_scalar(&mut working, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for (idx, (work_word, init_word)) in working.iter().zip(initial.iter()).enumerate() {
+        let word = work_word.wrapping_add(*init_word).to_le_bytes();
+        out[idx * 4..(idx + 1) * 4].copy_from_slice(&word);
+    }
+    out
+}
+
+fn chacha20_xor_scalar(
+    key: &[u8; CHACHA20POLY1305_KEY_SIZE],
+    initial_counter: u32,
+    nonce: &[u8; CHACHA20POLY1305_NONCE_SIZE],
+    input: &[u8],
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for (block_idx, chunk) in input.chunks(64).enumerate() {
+        let counter = initial_counter.wrapping_add(u32::try_from(block_idx).unwrap_or(0));
+        let keystream = chacha20_block_scalar(key, counter, nonce);
+        for (&in_byte, &ks_byte) in chunk.iter().zip(keystream.iter()) {
+            output.push(in_byte ^ ks_byte);
+        }
+    }
+    output
+}
+
+fn poly1305_accumulate_block(h_lo: &mut u128, h_hi: &mut u64, block: &[u8], r: u128) {
+    let mut padded = [0u8; 17];
+    padded[..block.len()].copy_from_slice(block);
+    padded[block.len()] = 1;
+
+    let mut lo_bytes = [0u8; 16];
+    lo_bytes.copy_from_slice(&padded[..16]);
+    let n_lo = u128::from_le_bytes(lo_bytes);
+    let n_hi = u64::from(padded[16]);
+
+    let (sum_lo, carry) = h_lo.overflowing_add(n_lo);
+    let sum_hi = *h_hi + n_hi + u64::from(carry);
+
+    let s0 = u128::from(sum_lo as u64);
+    let s1 = sum_lo >> 64;
+    let s2 = u128::from(sum_hi);
+
+    let r0 = u128::from(r as u64);
+    let r1 = r >> 64;
+
+    let d0 = s0 * r0;
+    let d1 = s0 * r1 + s1 * r0;
+    let d2 = s1 * r1 + s2 * r0;
+    let d3 = s2 * r1;
+
+    let w0 = d0 as u64;
+    let c0 = d0 >> 64;
+    let t1 = d1 + c0;
+    let w1 = t1 as u64;
+    let c1 = t1 >> 64;
+    let t2 = d2 + c1;
+    let w2 = t2 as u64;
+    let c2 = t2 >> 64;
+    let t3 = d3 + c2;
+
+    let l_lo = u128::from(w0) | (u128::from(w1) << 64);
+    let l_hi = w2 & 3;
+    let h_shifted = (u128::from(w2) >> 2) | (t3 << 62);
+
+    let (m_lo, carry1) = l_lo.overflowing_add(h_shifted * 5);
+    let m_hi = l_hi + u64::from(carry1);
+
+    let extra = u128::from(m_hi >> 2) * 5;
+    let (f_lo, carry2) = m_lo.overflowing_add(extra);
+    *h_lo = f_lo;
+    *h_hi = (m_hi & 3) + u64::from(carry2);
+}
+
+fn poly1305_feed_padded(h_lo: &mut u128, h_hi: &mut u64, data: &[u8], r: u128) {
+    let full_chunks = data.len() / 16;
+    for idx in 0..full_chunks {
+        poly1305_accumulate_block(h_lo, h_hi, &data[idx * 16..(idx + 1) * 16], r);
+    }
+    let rem = data.len() % 16;
+    if rem != 0 {
+        let mut last = [0u8; 16];
+        last[..rem].copy_from_slice(&data[full_chunks * 16..]);
+        poly1305_accumulate_block(h_lo, h_hi, &last, r);
+    }
+}
+
+fn poly1305_aead_tag_scalar(otk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+    let mut r_bytes = [0u8; 16];
+    r_bytes.copy_from_slice(&otk[..16]);
+    r_bytes[3] &= 15;
+    r_bytes[7] &= 15;
+    r_bytes[11] &= 15;
+    r_bytes[15] &= 15;
+    r_bytes[4] &= 252;
+    r_bytes[8] &= 252;
+    r_bytes[12] &= 252;
+    let r = u128::from_le_bytes(r_bytes);
+
+    let mut s_bytes = [0u8; 16];
+    s_bytes.copy_from_slice(&otk[16..32]);
+    let s = u128::from_le_bytes(s_bytes);
+
+    let mut h_lo = 0u128;
+    let mut h_hi = 0u64;
+
+    poly1305_feed_padded(&mut h_lo, &mut h_hi, aad, r);
+    poly1305_feed_padded(&mut h_lo, &mut h_hi, ciphertext, r);
+
+    let mut lengths = [0u8; 16];
+    lengths[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    lengths[8..16].copy_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    poly1305_accumulate_block(&mut h_lo, &mut h_hi, &lengths, r);
+
+    let (g_lo, carry) = h_lo.overflowing_add(5);
+    let g_hi = h_hi + u64::from(carry);
+    let final_lo = if g_hi >= 4 { g_lo } else { h_lo };
+
+    final_lo.wrapping_add(s).to_le_bytes()
+}
+
+fn seal_with_portable_scalar(
+    key: &[u8; CHACHA20POLY1305_KEY_SIZE],
+    nonce: &[u8; CHACHA20POLY1305_NONCE_SIZE],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Vec<u8> {
+    let block0 = chacha20_block_scalar(key, 0, nonce);
+    let mut otk = [0u8; 32];
+    otk.copy_from_slice(&block0[..32]);
+
+    let mut out = chacha20_xor_scalar(key, 1, nonce, plaintext);
+    let tag = poly1305_aead_tag_scalar(&otk, aad, &out);
+    out.extend_from_slice(&tag);
+    out
+}
+
+fn open_with_portable_scalar(
+    key: &[u8; CHACHA20POLY1305_KEY_SIZE],
+    nonce: &[u8; CHACHA20POLY1305_NONCE_SIZE],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, Chacha20Poly1305Error> {
+    if ciphertext.len() < CHACHA20POLY1305_TAG_SIZE {
+        return Err(Chacha20Poly1305Error::TagMismatch);
+    }
+    let body_len = ciphertext.len() - CHACHA20POLY1305_TAG_SIZE;
+    let body = &ciphertext[..body_len];
+    let provided_tag = &ciphertext[body_len..];
+
+    let block0 = chacha20_block_scalar(key, 0, nonce);
+    let mut otk = [0u8; 32];
+    otk.copy_from_slice(&block0[..32]);
+
+    let expected_tag = poly1305_aead_tag_scalar(&otk, aad, body);
+    let mut diff = 0u8;
+    for (&lhs, &rhs) in expected_tag.iter().zip(provided_tag.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    if diff != 0 {
+        return Err(Chacha20Poly1305Error::TagMismatch);
+    }
+
+    Ok(chacha20_xor_scalar(key, 1, nonce, body))
 }

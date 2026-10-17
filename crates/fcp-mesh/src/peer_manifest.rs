@@ -15,9 +15,7 @@ use fcp_core::TailscaleNodeId;
 use fcp_crypto::ed25519::{Ed25519Signature, Ed25519SigningKey, Ed25519VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::invoke_route::{
-    DEFAULT_MESH_FORWARD_MAX_SKEW_MS, MeshPeerConfig, MeshPeerDirectory,
-};
+use crate::invoke_route::{DEFAULT_MESH_FORWARD_MAX_SKEW_MS, MeshPeerConfig, MeshPeerDirectory};
 
 /// Signed payload schema, covered by the owner's signature.
 pub const MESH_PEER_DIRECTORY_SCHEMA: &str = "fcp.mesh.peer-directory.v1";
@@ -139,8 +137,8 @@ impl SignedMeshPeerDirectory {
         payload: &MeshPeerDirectoryPayload,
     ) -> Result<Self, MeshPeerDirectoryError> {
         validate_payload(payload)?;
-        let payload_json = serde_json::to_string(payload)
-            .map_err(|_| invalid("payload cannot be serialized"))?;
+        let payload_json =
+            serde_json::to_string(payload).map_err(|_| invalid("payload cannot be serialized"))?;
         if payload_json.len() > MAX_MESH_PEER_DIRECTORY_BYTES {
             return Err(invalid("payload exceeds byte limit"));
         }
@@ -191,8 +189,8 @@ impl SignedMeshPeerDirectory {
             .iter()
             .find(|key| key.to_bytes() == signer_bytes)
             .ok_or(MeshPeerDirectoryError::UntrustedOwner)?;
-        let signature_bytes = decode_hex::<64>(&self.signature_hex)
-            .ok_or_else(|| invalid("malformed signature"))?;
+        let signature_bytes =
+            decode_hex::<64>(&self.signature_hex).ok_or_else(|| invalid("malformed signature"))?;
         owner
             .verify_with_context(
                 SIGNING_CONTEXT,

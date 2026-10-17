@@ -69,7 +69,9 @@ where
         .checked_add(2)
         .filter(|_| config.max_request_bytes > 0)
         .and_then(|limit| u64::try_from(limit).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid JSONL request limit"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid JSONL request limit")
+        })?;
     let mut frame = Vec::new();
 
     loop {

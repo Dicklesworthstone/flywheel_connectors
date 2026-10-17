@@ -28,11 +28,15 @@ pub(super) struct FollowOptions {
 impl FollowOptions {
     pub(super) fn validate(&self, format: Format) -> Result<(), ExportError> {
         if (self.follow && format != Format::Jsonl)
-            || (!self.follow && (self.limit.is_some() || self.poll_interval_ms.is_some()
-                || self.idle_timeout_ms.is_some()))
+            || (!self.follow
+                && (self.limit.is_some()
+                    || self.poll_interval_ms.is_some()
+                    || self.idle_timeout_ms.is_some()))
             || self.limit == Some(0)
             || self.idle_timeout_ms == Some(0)
-            || self.poll_interval_ms.is_some_and(|value| !(1..=60_000).contains(&value))
+            || self
+                .poll_interval_ms
+                .is_some_and(|value| !(1..=60_000).contains(&value))
         {
             return Err(ExportError::Usage);
         }
@@ -48,12 +52,24 @@ pub(super) fn run(
     validate_selection(args)?;
     let mut follower = InvokeAuditFollower::open(&args.journal).map_err(ExportError::Follow)?;
     let start = Instant::now();
-    run_loop(args, output, diagnostics, || follower.poll(), || start.elapsed(), std::thread::sleep)
+    run_loop(
+        args,
+        output,
+        diagnostics,
+        || follower.poll(),
+        || start.elapsed(),
+        std::thread::sleep,
+    )
 }
 
 fn matches(entry: &fcp_audit::AuditEntry, args: &Args) -> bool {
-    args.zone.as_deref().is_none_or(|zone| entry.zone_id == zone)
-        && args.request_id.as_deref().is_none_or(|id| entry.operation_id.as_deref() == Some(id))
+    args.zone
+        .as_deref()
+        .is_none_or(|zone| entry.zone_id == zone)
+        && args
+            .request_id
+            .as_deref()
+            .is_none_or(|id| entry.operation_id.as_deref() == Some(id))
         && args.from_seq.is_none_or(|seq| entry.seq >= seq)
 }
 
@@ -64,26 +80,29 @@ fn progress(
     stopped: Option<&str>,
     diagnostics: &mut impl Write,
 ) -> Result<(), ExportError> {
-    json_line(diagnostics, &json!({
-        "schema_version": "fcp.fwc.invoke_audit_follow.v1",
-        "kind": "local-invoke-journal-follow",
-        "live": false,
-        "integrity": "observed-prefix-canonical-ids-and-per-zone-lineage",
-        "authenticity": "not-verified",
-        "durability": "not-assessed",
-        "validated_prefix_bytes": batch.bytes(),
-        "observed_bytes": batch.observed_bytes(),
-        "observed_prefix_digest": batch.digest(),
-        "validated_records": batch.total_records(),
-        "emitted_records": emitted,
-        "pending_frame": batch.pending_frame(),
-        "caught_up_to_sample": batch.caught_up(),
-        "selection": selection(args),
-        "limit": args.stream.limit,
-        "filtered": args.zone.is_some() || args.request_id.is_some()
-            || args.from_seq.is_some() || args.stream.limit.is_some(),
-        "stop_reason": stopped,
-    }))?;
+    json_line(
+        diagnostics,
+        &json!({
+            "schema_version": "fcp.fwc.invoke_audit_follow.v1",
+            "kind": "local-invoke-journal-follow",
+            "live": false,
+            "integrity": "observed-prefix-canonical-ids-and-per-zone-lineage",
+            "authenticity": "not-verified",
+            "durability": "not-assessed",
+            "validated_prefix_bytes": batch.bytes(),
+            "observed_bytes": batch.observed_bytes(),
+            "observed_prefix_digest": batch.digest(),
+            "validated_records": batch.total_records(),
+            "emitted_records": emitted,
+            "pending_frame": batch.pending_frame(),
+            "caught_up_to_sample": batch.caught_up(),
+            "selection": selection(args),
+            "limit": args.stream.limit,
+            "filtered": args.zone.is_some() || args.request_id.is_some()
+                || args.from_seq.is_some() || args.stream.limit.is_some(),
+            "stop_reason": stopped,
+        }),
+    )?;
     diagnostics.flush().map_err(|_| ExportError::Output)
 }
 
@@ -123,7 +142,12 @@ fn run_loop(
         if emitted != before {
             last_match = elapsed();
         }
-        let current = (batch.bytes(), batch.observed_bytes(), batch.pending_frame(), emitted);
+        let current = (
+            batch.bytes(),
+            batch.observed_bytes(),
+            batch.pending_frame(),
+            emitted,
+        );
         if last_progress != Some(current) {
             progress(args, &batch, emitted, None, diagnostics)?;
             last_progress = Some(current);
@@ -155,20 +179,23 @@ fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::fs::OpenOptions;
+    use super::*;
     use clap::Parser;
     use fcp_audit::AuditEntry;
     use fcp_audit::explain::{explain_bundle, parse_replay_bundle};
     use fcp_host::{InvokeAuditChain, InvokeAuditContext, InvokePhase};
     use serde_json::Value;
-    use super::*;
+    use std::cell::Cell;
+    use std::fs::OpenOptions;
 
     fn context(zone: &str, request: &str) -> InvokeAuditContext {
         InvokeAuditContext {
-            zone_id: zone.to_owned(), actor: "agent:follow-cli".to_owned(),
-            connector_id: "github".to_owned(), operation: "issues.create".to_owned(),
-            operation_id: request.to_owned(), correlation_id: Some("shared".to_owned()),
+            zone_id: zone.to_owned(),
+            actor: "agent:follow-cli".to_owned(),
+            connector_id: "github".to_owned(),
+            operation: "issues.create".to_owned(),
+            operation_id: request.to_owned(),
+            correlation_id: Some("shared".to_owned()),
             occurred_at: 1_700_000_000,
         }
     }
@@ -178,20 +205,41 @@ mod tests {
         let path = directory.path().join("journal");
         let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
         let entries = vec![
-            chain.append(&context("z:work", "a"), InvokePhase::PreflightAllow).unwrap(),
-            chain.append(&context("z:work", "b"), InvokePhase::PreflightDeny {
-                reason: "preflight_denied".to_owned(),
-            }).unwrap(),
-            chain.append(&context("z:private", "a"), InvokePhase::PreflightAllow).unwrap(),
-            chain.append(&context("z:work", "a"), InvokePhase::DispatchResult {
-                receipt_id: None, success: true, duration_ms: 10,
-            }).unwrap(),
+            chain
+                .append(&context("z:work", "a"), InvokePhase::PreflightAllow)
+                .unwrap(),
+            chain
+                .append(
+                    &context("z:work", "b"),
+                    InvokePhase::PreflightDeny {
+                        reason: "preflight_denied".to_owned(),
+                    },
+                )
+                .unwrap(),
+            chain
+                .append(&context("z:private", "a"), InvokePhase::PreflightAllow)
+                .unwrap(),
+            chain
+                .append(
+                    &context("z:work", "a"),
+                    InvokePhase::DispatchResult {
+                        receipt_id: None,
+                        success: true,
+                        duration_ms: 10,
+                    },
+                )
+                .unwrap(),
         ];
         drop(chain);
         let args = Args::try_parse_from([
-            "fwc-audit-export", "--journal", path.to_str().unwrap(),
-            "--format", "jsonl", "--follow",
-        ]).unwrap();
+            "fwc-audit-export",
+            "--journal",
+            path.to_str().unwrap(),
+            "--format",
+            "jsonl",
+            "--follow",
+        ])
+        .unwrap();
         (directory, args, entries)
     }
 
@@ -203,7 +251,9 @@ mod tests {
     }
 
     fn transcript(output: &[u8]) -> Vec<AuditEntry> {
-        parse_replay_bundle(std::str::from_utf8(output).unwrap()).unwrap().audit_entries
+        parse_replay_bundle(std::str::from_utf8(output).unwrap())
+            .unwrap()
+            .audit_entries
     }
 
     fn last_progress(bytes: &[u8]) -> Value {
@@ -220,8 +270,13 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         super::super::run(&args, &mut out, &mut err).unwrap();
-        assert_eq!(transcript(&out), vec![entries[0].clone(), entries[3].clone()]);
-        let explanation = explain_bundle(&parse_replay_bundle(std::str::from_utf8(&out).unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            transcript(&out),
+            vec![entries[0].clone(), entries[3].clone()]
+        );
+        let explanation =
+            explain_bundle(&parse_replay_bundle(std::str::from_utf8(&out).unwrap()).unwrap())
+                .unwrap();
         assert_eq!(explanation.operation_id, "issues.create");
         let progress = last_progress(&err);
         assert_eq!(progress["emitted_records"], 2);
@@ -230,14 +285,22 @@ mod tests {
         assert_eq!(progress["live"], false);
         assert_eq!(progress["authenticity"], "not-verified");
         assert_eq!(progress["durability"], "not-assessed");
-        assert!(!std::str::from_utf8(&out).unwrap().contains("local-invoke-journal-follow"));
+        assert!(
+            !std::str::from_utf8(&out)
+                .unwrap()
+                .contains("local-invoke-journal-follow")
+        );
         assert_eq!(std::fs::read(&args.journal).unwrap(), before);
     }
 
     #[test]
     fn partial_appends_wait_and_each_record_is_emitted_once() {
         let (_directory, mut args, entries) = fixture();
-        let bytes: Vec<u8> = b"FCPAUD1\n".iter().copied().chain(entries.iter().flat_map(frame)).collect();
+        let bytes: Vec<u8> = b"FCPAUD1\n"
+            .iter()
+            .copied()
+            .chain(entries.iter().flat_map(frame))
+            .collect();
         std::fs::write(&args.journal, &bytes[..8]).unwrap();
         let mut writer = OpenOptions::new().append(true).open(&args.journal).unwrap();
         let mut follower = InvokeAuditFollower::open(&args.journal).unwrap();
@@ -247,17 +310,25 @@ mod tests {
         let now = Cell::new(Duration::ZERO);
         let mut waits = 0;
         let mut out = Vec::new();
-        run_loop(&args, &mut out, &mut Vec::new(), || follower.poll(), || now.get(), |delay| {
-            now.set(now.get() + delay);
-            waits += 1;
-            match waits {
-                1 => writer.write_all(&bytes[8..11]).unwrap(),
-                2 => writer.write_all(&bytes[11..bytes.len() - 1]).unwrap(),
-                3 => writer.write_all(&bytes[bytes.len() - 1..]).unwrap(),
-                _ => panic!("finished stream must not keep waiting"),
-            }
-            writer.flush().unwrap();
-        }).unwrap();
+        run_loop(
+            &args,
+            &mut out,
+            &mut Vec::new(),
+            || follower.poll(),
+            || now.get(),
+            |delay| {
+                now.set(now.get() + delay);
+                waits += 1;
+                match waits {
+                    1 => writer.write_all(&bytes[8..11]).unwrap(),
+                    2 => writer.write_all(&bytes[11..bytes.len() - 1]).unwrap(),
+                    3 => writer.write_all(&bytes[bytes.len() - 1..]).unwrap(),
+                    _ => panic!("finished stream must not keep waiting"),
+                }
+                writer.flush().unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(waits, 3);
         assert_eq!(transcript(&out), entries);
     }
@@ -272,12 +343,27 @@ mod tests {
         let mut waits = Vec::new();
         let mut out = Vec::new();
         let mut diagnostics = Vec::new();
-        run_loop(&args, &mut out, &mut diagnostics, || follower.poll(), || now.get(), |delay| {
-            waits.push(delay);
-            assert!(waits.len() <= 3);
-            now.set(now.get() + delay);
-        }).unwrap();
-        assert_eq!(waits, vec![Duration::from_millis(10), Duration::from_millis(10), Duration::from_millis(5)]);
+        run_loop(
+            &args,
+            &mut out,
+            &mut diagnostics,
+            || follower.poll(),
+            || now.get(),
+            |delay| {
+                waits.push(delay);
+                assert!(waits.len() <= 3);
+                now.set(now.get() + delay);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(5)
+            ]
+        );
         assert_eq!(transcript(&out).len(), 4);
         assert_eq!(last_progress(&diagnostics)["stop_reason"], "idle-timeout");
     }
@@ -295,9 +381,17 @@ mod tests {
         let mut follower = InvokeAuditFollower::open(&args.journal).unwrap();
         let mut out = Vec::new();
         let mut diagnostics = Vec::new();
-        let error = run_loop(&args, &mut out, &mut diagnostics, || follower.poll(), || now.get(), |delay| {
-            now.set(now.get() + delay);
-        }).unwrap_err();
+        let error = run_loop(
+            &args,
+            &mut out,
+            &mut diagnostics,
+            || follower.poll(),
+            || now.get(),
+            |delay| {
+                now.set(now.get() + delay);
+            },
+        )
+        .unwrap_err();
         assert!(matches!(error, ExportError::FollowIncomplete));
         assert_eq!(transcript(&out).len(), 4);
         assert_eq!(last_progress(&diagnostics)["pending_frame"], true);
@@ -314,9 +408,17 @@ mod tests {
         let now = Cell::new(Duration::ZERO);
         let mut follower = InvokeAuditFollower::open(&args.journal).unwrap();
         let mut out = Vec::new();
-        let error = run_loop(&args, &mut out, &mut Vec::new(), || follower.poll(), || now.get(), |delay| {
-            now.set(now.get() + delay);
-        }).unwrap_err();
+        let error = run_loop(
+            &args,
+            &mut out,
+            &mut Vec::new(),
+            || follower.poll(),
+            || now.get(),
+            |delay| {
+                now.set(now.get() + delay);
+            },
+        )
+        .unwrap_err();
         assert!(matches!(error, ExportError::FollowNoMatch));
         assert!(out.is_empty());
     }
@@ -328,11 +430,16 @@ mod tests {
         args.stream.limit = Some(1);
         entries[2].actor = "secret-corrupt-actor".to_owned();
         let mut bytes = b"FCPAUD1\n".to_vec();
-        for entry in entries { bytes.extend_from_slice(&frame(&entry)); }
+        for entry in entries {
+            bytes.extend_from_slice(&frame(&entry));
+        }
         std::fs::write(&args.journal, bytes).unwrap();
         let mut out = Vec::new();
         let error = run(&args, &mut out, &mut Vec::new()).unwrap_err();
-        assert!(matches!(error, ExportError::Follow(InvokeAuditSnapshotError::InvalidRecord { .. })));
+        assert!(matches!(
+            error,
+            ExportError::Follow(InvokeAuditSnapshotError::InvalidRecord { .. })
+        ));
         assert!(out.is_empty());
         assert!(!error.message().contains("secret-corrupt"));
     }
@@ -341,14 +448,24 @@ mod tests {
     fn output_and_provenance_failures_stop_following() {
         struct Broken;
         impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let (_directory, mut args, _) = fixture();
         args.stream.limit = Some(1);
-        assert!(matches!(run(&args, &mut Broken, &mut Vec::new()), Err(ExportError::Output)));
+        assert!(matches!(
+            run(&args, &mut Broken, &mut Vec::new()),
+            Err(ExportError::Output)
+        ));
         let mut out = Vec::new();
-        assert!(matches!(run(&args, &mut out, &mut Broken), Err(ExportError::Output)));
+        assert!(matches!(
+            run(&args, &mut out, &mut Broken),
+            Err(ExportError::Output)
+        ));
         assert!(out.is_empty());
     }
 
@@ -356,13 +473,24 @@ mod tests {
     fn unread_backlog_does_not_sleep_between_bounded_batches() {
         let (_directory, mut args, _) = fixture();
         let chain = InvokeAuditChain::open_with_journal(&args.journal).unwrap();
-        for _ in 0..260 { chain.append(&context("z:work", "other"), InvokePhase::PreflightAllow).unwrap(); }
+        for _ in 0..260 {
+            chain
+                .append(&context("z:work", "other"), InvokePhase::PreflightAllow)
+                .unwrap();
+        }
         drop(chain);
         args.stream.limit = Some(264);
         let mut follower = InvokeAuditFollower::open(&args.journal).unwrap();
         let mut out = Vec::new();
-        run_loop(&args, &mut out, &mut Vec::new(), || follower.poll(), || Duration::ZERO,
-            |_| panic!("ready backlog must drain without a polling sleep")).unwrap();
+        run_loop(
+            &args,
+            &mut out,
+            &mut Vec::new(),
+            || follower.poll(),
+            || Duration::ZERO,
+            |_| panic!("ready backlog must drain without a polling sleep"),
+        )
+        .unwrap();
         assert_eq!(transcript(&out).len(), 264);
     }
 
@@ -372,7 +500,10 @@ mod tests {
         args.journal = "missing-source-must-not-be-opened".into();
         for format in [Format::Bundle, Format::Explanation] {
             args.format = format;
-            assert!(matches!(run(&args, &mut Vec::new(), &mut Vec::new()), Err(ExportError::Usage)));
+            assert!(matches!(
+                run(&args, &mut Vec::new(), &mut Vec::new()),
+                Err(ExportError::Usage)
+            ));
         }
         args.format = Format::Jsonl;
         for interval in [0, 60_001, u64::MAX] {
@@ -390,12 +521,25 @@ mod tests {
     #[test]
     fn cli_requires_explicit_follow_for_stream_only_options() {
         for flag in ["--limit", "--poll-interval-ms", "--idle-timeout-ms"] {
-            assert!(Args::try_parse_from(["fwc-audit-export", "--journal", "file", flag, "1"]).is_err());
+            assert!(
+                Args::try_parse_from(["fwc-audit-export", "--journal", "file", flag, "1"]).is_err()
+            );
         }
         let args = Args::try_parse_from([
-            "fwc-audit-export", "--journal", "file", "--follow", "--format", "jsonl",
-            "--limit", "20", "--idle-timeout-ms", "2000", "--poll-interval-ms", "100",
-        ]).unwrap();
+            "fwc-audit-export",
+            "--journal",
+            "file",
+            "--follow",
+            "--format",
+            "jsonl",
+            "--limit",
+            "20",
+            "--idle-timeout-ms",
+            "2000",
+            "--poll-interval-ms",
+            "100",
+        ])
+        .unwrap();
         assert!(validate_selection(&args).is_ok());
     }
 
@@ -408,7 +552,10 @@ mod tests {
         let mut out = Vec::new();
         let mut diagnostics = Vec::new();
         run(&args, &mut out, &mut diagnostics).unwrap();
-        assert_eq!(transcript(&out), vec![entries[1].clone(), entries[3].clone()]);
+        assert_eq!(
+            transcript(&out),
+            vec![entries[1].clone(), entries[3].clone()]
+        );
         assert_eq!(last_progress(&diagnostics)["validated_records"], 4);
     }
 

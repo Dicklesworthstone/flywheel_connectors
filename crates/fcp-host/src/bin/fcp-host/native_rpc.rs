@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use fcp_async_core::CancellationToken;
 use fcp_async_core::channel::mpsc;
 use fcp_async_core::process::Child;
-use fcp_async_core::CancellationToken;
 use fcp_core::InvokeResponse;
 use fcp_host::{
     CancellationController, CancellationRegistration, CancellationTerminator, HostError, HostResult,
@@ -569,7 +569,8 @@ mod tests {
 
     #[test]
     fn cancelled_invocation_cannot_enqueue_a_later_handshake_rpc() {
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let introspect = invocation.register_rpc();
         assert!(introspect.try_begin());
         assert!(introspect.try_settle_reply());
@@ -729,7 +730,8 @@ exec sleep 30
     #[cfg(unix)]
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn draining_rejected_candidate_preserves_fresh_success_and_stop_latch() {
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let rejected = invocation.register_rpc();
         assert!(rejected.try_begin());
         let mut command = fcp_async_core::process::Command::new("/bin/sh");
@@ -776,7 +778,8 @@ exec sleep 30
         use fcp_host::{CancellationScope, ConnectorArchetype};
 
         let controller = Arc::new(CancellationController::new());
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let registration = controller
             .track_operation(
                 "native-drop",
@@ -853,7 +856,10 @@ mod notification_tests {
     }
 
     impl WakeProbe {
-        fn new(rpc: Option<&NativeRpc>, invocation: Option<&NativeInvocationTermination>) -> Arc<Self> {
+        fn new(
+            rpc: Option<&NativeRpc>,
+            invocation: Option<&NativeInvocationTermination>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 wakes: AtomicUsize::new(0),
                 ownership_locks_free: AtomicBool::new(true),
@@ -863,17 +869,30 @@ mod notification_tests {
         }
 
         fn observe(&self) {
-            let rpc_free = self.rpc.as_ref().and_then(Weak::upgrade)
+            let rpc_free = self
+                .rpc
+                .as_ref()
+                .and_then(Weak::upgrade)
                 .is_none_or(|state| state.try_lock().is_ok());
-            let invocation_free = self.invocation.as_ref().and_then(Weak::upgrade)
+            let invocation_free = self
+                .invocation
+                .as_ref()
+                .and_then(Weak::upgrade)
                 .is_none_or(|state| state.commands.try_lock().is_ok());
-            self.ownership_locks_free.fetch_and(rpc_free && invocation_free, Ordering::SeqCst);
+            self.ownership_locks_free
+                .fetch_and(rpc_free && invocation_free, Ordering::SeqCst);
             self.wakes.fetch_add(1, Ordering::SeqCst);
         }
 
         fn assert_notified(&self) {
-            assert!(self.wakes.load(Ordering::SeqCst) > 0, "cancellation must wake a parked task");
-            assert!(self.ownership_locks_free.load(Ordering::SeqCst), "wake ran under an ownership lock");
+            assert!(
+                self.wakes.load(Ordering::SeqCst) > 0,
+                "cancellation must wake a parked task"
+            );
+            assert!(
+                self.ownership_locks_free.load(Ordering::SeqCst),
+                "wake ran under an ownership lock"
+            );
         }
     }
 
@@ -914,7 +933,8 @@ mod notification_tests {
 
     #[fcp_async_core::runtime::test]
     async fn logical_cancel_notifies_command_and_invocation_outside_both_locks() {
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let rpc = invocation.register_rpc();
         assert!(rpc.try_begin());
         let command_probe = WakeProbe::new(Some(&rpc), Some(&invocation));
@@ -935,12 +955,16 @@ mod notification_tests {
         invocation.cancel();
         rpc.cancel();
         assert_eq!(command_probe.wakes.load(Ordering::SeqCst), command_wakes);
-        assert_eq!(invocation_probe.wakes.load(Ordering::SeqCst), invocation_wakes);
+        assert_eq!(
+            invocation_probe.wakes.load(Ordering::SeqCst),
+            invocation_wakes
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn cancellation_before_subscription_is_sticky() {
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let rpc = invocation.register_rpc();
         invocation.cancel();
         let probe = WakeProbe::new(Some(&rpc), Some(&invocation));
@@ -968,7 +992,8 @@ mod notification_tests {
 
     #[fcp_async_core::runtime::test]
     async fn candidate_drain_does_not_signal_logical_cancellation() {
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let rejected = invocation.register_rpc();
         let probe = WakeProbe::new(Some(&rejected), Some(&invocation));
         let mut logical = Box::pin(invocation.cancelled());
@@ -993,7 +1018,8 @@ mod notification_tests {
             }
         }
 
-        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = Dropped(Arc::clone(&dropped));
         let mut running = Box::pin(invocation.invoke(async move {
@@ -1004,7 +1030,10 @@ mod notification_tests {
         assert!(poll_once(running.as_mut(), &probe).is_pending());
         invocation.cancel();
         probe.assert_notified();
-        assert!(matches!(poll_once(running.as_mut(), &probe), Poll::Ready(Err(_))));
+        assert!(matches!(
+            poll_once(running.as_mut(), &probe),
+            Poll::Ready(Err(_))
+        ));
         assert!(dropped.load(Ordering::SeqCst));
         assert!(invocation.is_finished());
     }
@@ -1031,7 +1060,8 @@ mod notification_tests {
     #[test]
     fn racing_registration_cannot_escape_logical_cancellation() {
         for _ in 0..64 {
-            let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            let invocation =
+                NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
             let cancelling = invocation.clone();
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let other_barrier = Arc::clone(&barrier);
@@ -1056,10 +1086,15 @@ mod notification_tests {
         fcp_async_core::time::timeout(
             Duration::from_secs(3),
             futures_util::future::join(rpc.cancelled(), invocation.cancelled()),
-        ).await.expect("absolute deadline must release both parked waiters");
+        )
+        .await
+        .expect("absolute deadline must release both parked waiters");
         assert!(rpc.is_cancelled());
         assert!(invocation.is_cancel_requested());
-        assert!(!rpc.cancellation.is_cancelled(), "deadline is not an explicit cancellation");
+        assert!(
+            !rpc.cancellation.is_cancelled(),
+            "deadline is not an explicit cancellation"
+        );
         assert!(!invocation.state.cancellation.is_cancelled());
         assert!(!rpc.try_begin());
     }
@@ -1067,30 +1102,47 @@ mod notification_tests {
     #[cfg(unix)]
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn production_dispatcher_keeps_deadline_and_child_retirement_without_duplicate_timeout() {
-        use std::collections::BTreeMap;
         use fcp_async_core::channel::oneshot;
+        use std::collections::BTreeMap;
 
         let runner = ConnectorProcessRunner::spawn(
             "/bin/sh",
-            &["-c".to_owned(), "IFS= read -r request || exit 1; exec sleep 30".to_owned()],
+            &[
+                "-c".to_owned(),
+                "IFS= read -r request || exit 1; exec sleep 30".to_owned(),
+            ],
             &BTreeMap::new(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let (sender, receiver) = mpsc::channel(1);
         let actor = fcp_async_core::task::try_spawn(run_dispatcher(runner, receiver)).unwrap();
         let rpc = NativeRpc::new(deadline_after(Instant::now(), Duration::from_secs(1)));
         let _waiter = rpc.waiter();
         let (response_tx, response_rx) = oneshot::channel();
-        sender.send(ConnectorRpcRequest {
-            method: "blocked".to_owned(),
-            params: serde_json::json!({}),
-            response_tx,
-            rpc: rpc.clone(),
-        }).await.unwrap();
+        sender
+            .send(ConnectorRpcRequest {
+                method: "blocked".to_owned(),
+                params: serde_json::json!({}),
+                response_tx,
+                rpc: rpc.clone(),
+            })
+            .await
+            .unwrap();
         let error = fcp_async_core::time::timeout(Duration::from_secs(5), response_rx)
-            .await.unwrap().unwrap().unwrap_err();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        fcp_async_core::time::timeout(Duration::from_secs(3), actor).await.unwrap().unwrap();
-        assert!(rpc.transport_retired(), "selected timeout must retire its transport");
+        fcp_async_core::time::timeout(Duration::from_secs(3), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rpc.transport_retired(),
+            "selected timeout must retire its transport"
+        );
         assert!(rpc.is_settled(), "actual child exit is still required");
     }
 }

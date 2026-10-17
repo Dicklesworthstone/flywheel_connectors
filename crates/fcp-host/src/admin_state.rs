@@ -2990,7 +2990,10 @@ impl Default for HostAdminStateSnapshot {
 
 impl HostAdminStateSnapshot {
     fn recover_invocations_after_restart(&mut self, now: DateTime<Utc>) -> HostResult<bool> {
-        if self.invocations.len().saturating_add(self.mesh_invocations.len())
+        if self
+            .invocations
+            .len()
+            .saturating_add(self.mesh_invocations.len())
             > MAX_RETAINED_INVOCATIONS
         {
             return Err(HostError::Internal(
@@ -3030,7 +3033,8 @@ impl HostAdminStateSnapshot {
                 && !unresolved_operations.insert(record.ticket.operation_id.clone())
             {
                 return Err(HostError::Internal(
-                    "persisted invocation identifier has overlapping unresolved attempts".to_string(),
+                    "persisted invocation identifier has overlapping unresolved attempts"
+                        .to_string(),
                 ));
             }
             if let Some(binding) = &record.admission.idempotency {
@@ -3058,7 +3062,8 @@ impl HostAdminStateSnapshot {
             if let Some(binding) = &record.admission.transport_idempotency {
                 if record.admission.idempotency.is_none() {
                     return Err(HostError::Internal(
-                        "persisted local transport alias has no principal-scoped binding".to_string(),
+                        "persisted local transport alias has no principal-scoped binding"
+                            .to_string(),
                     ));
                 }
                 mesh_invocations::recover_transport_idempotency(
@@ -5039,7 +5044,9 @@ impl HostAdminStateStore {
         self.apply_mutation(|snapshot| {
             let now = Utc::now();
             if admission.deadline_at <= now {
-                return Err(invocation_state_error("invocation admission deadline expired"));
+                return Err(invocation_state_error(
+                    "invocation admission deadline expired",
+                ));
             }
             // Check every applicable scope before reclaiming history. The
             // opaque alias fences the same token across local and relay paths.
@@ -5058,9 +5065,9 @@ impl HostAdminStateStore {
             // incomplete finalization are never reclaimed to admit more work.
             snapshot.reserve_invocation_history_slot()?;
             let attempt_id = snapshot.next_invocation_attempt_id;
-            let next_attempt_id = attempt_id.checked_add(1).ok_or_else(|| {
-                invocation_state_error("invocation attempt generation exhausted")
-            })?;
+            let next_attempt_id = attempt_id
+                .checked_add(1)
+                .ok_or_else(|| invocation_state_error("invocation attempt generation exhausted"))?;
             let ticket = InvocationTicket {
                 operation_id: admission.operation_id.clone(),
                 attempt_id,

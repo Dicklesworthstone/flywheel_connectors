@@ -4,8 +4,8 @@
 //! The ordinary invoke path continues to enforce signatures, policy, leases,
 //! approval, revocation and admission independently.
 
-use fcp_core::CapabilityId;
 use super::*;
+use fcp_core::CapabilityId;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,12 +34,18 @@ pub(super) fn requested_capabilities(catalog: &Introspection) -> HostResult<Vec<
     let mut operations = BTreeMap::new();
     let mut capabilities = BTreeMap::new();
     for operation in &catalog.operations {
-        if operations.insert(operation.id.as_str(), operation.capability.as_str()).is_some() {
+        if operations
+            .insert(operation.id.as_str(), operation.capability.as_str())
+            .is_some()
+        {
             return Err(HostError::RegistryError(
                 "connector declared duplicate operation IDs".into(),
             ));
         }
-        capabilities.insert(operation.capability.as_str().to_owned(), operation.capability.clone());
+        capabilities.insert(
+            operation.capability.as_str().to_owned(),
+            operation.capability.clone(),
+        );
     }
     Ok(capabilities.into_values().collect())
 }
@@ -87,12 +93,13 @@ fn prepared_from_health(
     zone_id: ZoneId,
     value: Value,
 ) -> Result<PreparedSession, HttpFailure> {
-    let invalid = || failure(
-        StatusCode::BAD_GATEWAY,
-        "connector did not report a ready, authenticated native instance",
-    );
-    let snapshot: HealthSnapshot =
-        serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+    let invalid = || {
+        failure(
+            StatusCode::BAD_GATEWAY,
+            "connector did not report a ready, authenticated native instance",
+        )
+    };
+    let snapshot: HealthSnapshot = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
     if !snapshot.is_ready() {
         return Err(invalid());
     }
@@ -102,9 +109,9 @@ fn prepared_from_health(
     {
         return Err(invalid());
     }
-    let instance_id: InstanceId = serde_json::from_value(
-        details.get("instance_id").cloned().ok_or_else(invalid)?,
-    ).map_err(|_| invalid())?;
+    let instance_id: InstanceId =
+        serde_json::from_value(details.get("instance_id").cloned().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
     if let Some(flat) = value.get("instance_id") {
         let flat: InstanceId = serde_json::from_value(flat.clone()).map_err(|_| invalid())?;
         if flat != instance_id {
@@ -112,7 +119,10 @@ fn prepared_from_health(
         }
     }
     for field in ["configured", "handshaken"] {
-        if value.get(field).is_some_and(|flag| flag.as_bool() != Some(true)) {
+        if value
+            .get(field)
+            .is_some_and(|flag| flag.as_bool() != Some(true))
+        {
             return Err(invalid());
         }
     }
@@ -139,15 +149,19 @@ pub(super) async fn prepare_handler(
     let connector_id = parse_connector_id(&connector_id)?;
     let connector = {
         let registry = state.registry.state.read().await;
-        let entry = registry.connectors.get(&connector_id)
+        let entry = registry
+            .connectors
+            .get(&connector_id)
             .ok_or_else(|| failure(StatusCode::NOT_FOUND, "connector is not registered"))?;
         require_zone(&entry.config.allowed_zones, &request.zone_id)?;
         match &entry.connector {
             ConnectorRuntime::Native(native) => Arc::clone(native),
-            _ => return Err(failure(
-                StatusCode::CONFLICT,
-                "on-demand native connector required; warm-pool and WASI sessions unsupported",
-            )),
+            _ => {
+                return Err(failure(
+                    StatusCode::CONFLICT,
+                    "on-demand native connector required; warm-pool and WASI sessions unsupported",
+                ));
+            }
         }
     };
     if connector.capability_verifying_key.is_none() {
@@ -158,29 +172,33 @@ pub(super) async fn prepare_handler(
     }
     // This holds the same connector session lock through handshake + health.
     // Failed or cancelled preparation cannot publish cached authority.
-    let health = connector.rpc_in_handshaken_zone(
-        &request.zone_id, "health", json!({}),
-    ).await.map_err(|_| failure(
-        StatusCode::BAD_GATEWAY,
-        "connector session preparation failed; no instance authority was returned",
-    ))?;
-    let prepared = prepared_from_health(
-        connector_id.clone(), request.zone_id.clone(), health,
-    )?;
+    let health = connector
+        .rpc_in_handshaken_zone(&request.zone_id, "health", json!({}))
+        .await
+        .map_err(|_| {
+            failure(
+                StatusCode::BAD_GATEWAY,
+                "connector session preparation failed; no instance authority was returned",
+            )
+        })?;
+    let prepared = prepared_from_health(connector_id.clone(), request.zone_id.clone(), health)?;
     // Ensure the process wasn't replaced during I/O. No registry lock is
     // held across subprocess I/O, and no snapshot can guarantee future life.
     {
         let registry = state.registry.state.read().await;
-        let entry = registry.connectors.get(&connector_id)
-            .ok_or_else(|| failure(
-                StatusCode::CONFLICT, "connector changed during session preparation",
-            ))?;
+        let entry = registry.connectors.get(&connector_id).ok_or_else(|| {
+            failure(
+                StatusCode::CONFLICT,
+                "connector changed during session preparation",
+            )
+        })?;
         require_zone(&entry.config.allowed_zones, &request.zone_id)?;
         if !matches!(&entry.connector, ConnectorRuntime::Native(current)
             if Arc::ptr_eq(current, &connector))
         {
             return Err(failure(
-                StatusCode::CONFLICT, "connector changed during session preparation",
+                StatusCode::CONFLICT,
+                "connector changed during session preparation",
             ));
         }
     }
@@ -190,4 +208,5 @@ pub(super) async fn prepare_handler(
 }
 
 #[cfg(test)]
+#[path = "session/tests.rs"]
 mod tests;

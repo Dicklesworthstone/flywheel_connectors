@@ -151,6 +151,7 @@ fn zone_policy_with_ceiling(caps: &[&str]) -> ZonePolicyObject {
     let zone = ZoneId::work();
     ZonePolicyObject {
         header: fcp_core::ObjectHeader {
+            encryption_kind: fcp_core::ObjectEncryptionKind::default(),
             schema: fcp_cbor::SchemaId::new("fcp.test", "ZonePolicyObject", Version::new(1, 0, 0)),
             zone_id: zone.clone(),
             created_at: 1_700_000_000,

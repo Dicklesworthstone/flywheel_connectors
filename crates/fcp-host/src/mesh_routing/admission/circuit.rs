@@ -373,8 +373,13 @@ mod tests {
         );
         for ticket in old {
             assert!(
-                book.complete("a", &ticket, Some(ForwardOutcome::InvalidReply), recovered_at)
-                    .is_none()
+                book.complete(
+                    "a",
+                    &ticket,
+                    Some(ForwardOutcome::InvalidReply),
+                    recovered_at
+                )
+                .is_none()
             );
         }
         assert!(book.reserve("a", recovered_at).is_ok());
@@ -490,7 +495,8 @@ mod tests {
         let later = now + IDLE_HISTORY_RETENTION;
         let probe = book.reserve("a", later).unwrap();
         assert_eq!(
-            book.reserve("b", later + IDLE_HISTORY_RETENTION).unwrap_err(),
+            book.reserve("b", later + IDLE_HISTORY_RETENTION)
+                .unwrap_err(),
             "peer_circuit_capacity",
             "a live recovery probe must never be reclaimed"
         );
@@ -501,7 +507,10 @@ mod tests {
             book.reserve("b", cancelled_at + BASE_COOLDOWN).unwrap_err(),
             "peer_circuit_capacity"
         );
-        assert!(book.reserve("b", cancelled_at + IDLE_HISTORY_RETENTION).is_ok());
+        assert!(
+            book.reserve("b", cancelled_at + IDLE_HISTORY_RETENTION)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -512,7 +521,12 @@ mod tests {
         fail_three(&mut book, "a", now);
         let recovered_at = now + BASE_COOLDOWN;
         let probe = book.reserve("a", recovered_at).unwrap();
-        book.complete("a", &probe, Some(ForwardOutcome::AuthenticatedReply), recovered_at);
+        book.complete(
+            "a",
+            &probe,
+            Some(ForwardOutcome::AuthenticatedReply),
+            recovered_at,
+        );
         drop(probe);
         assert!(!Arc::ptr_eq(&book.peers["a"].generation, &old.generation));
         assert_eq!(
@@ -540,7 +554,10 @@ mod tests {
         book.complete("a", &first, Some(ForwardOutcome::Unavailable), now);
         drop(first);
         assert_eq!(book.peers["a"].last_activity, later);
-        assert_eq!(book.reserve("b", later).unwrap_err(), "peer_circuit_capacity");
+        assert_eq!(
+            book.reserve("b", later).unwrap_err(),
+            "peer_circuit_capacity"
+        );
         assert!(book.reserve("b", later + IDLE_HISTORY_RETENTION).is_ok());
     }
 
@@ -552,10 +569,18 @@ mod tests {
         for index in 0..1000 {
             let peer = format!("rotating-peer-{index}");
             let ticket = book.reserve(&peer, now).unwrap();
-            book.complete(&peer, &ticket, Some(ForwardOutcome::AuthenticatedReply), now);
+            book.complete(
+                &peer,
+                &ticket,
+                Some(ForwardOutcome::AuthenticatedReply),
+                now,
+            );
             drop(ticket);
             assert!(book.peers.len() <= 3);
-            assert!(Arc::ptr_eq(&book.peers["pinned"].activity, &pinned.activity));
+            assert!(Arc::ptr_eq(
+                &book.peers["pinned"].activity,
+                &pinned.activity
+            ));
         }
         assert_eq!(book.peers.len(), 3);
     }
@@ -566,14 +591,22 @@ mod tests {
         let now = Instant::now();
         fail_three(&mut book, "a", now);
         let retry_at = now + BASE_COOLDOWN;
-        assert_eq!(book.reserve("b", retry_at).unwrap_err(), "peer_circuit_capacity");
+        assert_eq!(
+            book.reserve("b", retry_at).unwrap_err(),
+            "peer_circuit_capacity"
+        );
         let probe = book.reserve("a", retry_at).unwrap();
         assert!(probe.probe);
         assert_eq!(
             book.reserve("a", retry_at).unwrap_err(),
             "peer_recovery_probe_in_flight"
         );
-        book.complete("a", &probe, Some(ForwardOutcome::AuthenticatedReply), retry_at);
+        book.complete(
+            "a",
+            &probe,
+            Some(ForwardOutcome::AuthenticatedReply),
+            retry_at,
+        );
         drop(probe);
         assert!(book.reserve("b", retry_at).is_ok());
     }

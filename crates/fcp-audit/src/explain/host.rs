@@ -139,7 +139,10 @@ pub(super) fn explain_request_at_entry(
     selected: &AuditEntry,
 ) -> Result<CausalExplanation, ExplainError> {
     validate_identity(selected)?;
-    let request_id = selected.operation_id.as_deref().ok_or(invalid("missing request ID"))?;
+    let request_id = selected
+        .operation_id
+        .as_deref()
+        .ok_or(invalid("missing request ID"))?;
     let operation = required_string(selected, "operation")?;
     let entries = request_entries(bundle, selected, operation)?;
     let first = entries.first().ok_or(ExplainError::NoInvocation)?;
@@ -180,14 +183,21 @@ pub(super) fn explain_request_at_entry(
     }
     // Native phases do not carry capability predicate traces. Never fabricate
     // a grant, verified receipt, or revocation verdict from coarse phase flags.
-    warnings.push("capability predicates and revocation status are not established by host lifecycle events".to_owned());
+    warnings.push(
+        "capability predicates and revocation status are not established by host lifecycle events"
+            .to_owned(),
+    );
     Ok(CausalExplanation {
-        connector_id: selected.connector_id.clone().ok_or(invalid("missing connector ID"))?,
+        connector_id: selected
+            .connector_id
+            .clone()
+            .ok_or(invalid("missing connector ID"))?,
         operation_id: operation.to_owned(),
         occurred_at: selected.occurred_at,
         actor: selected.actor.clone(),
         zone_id: selected.zone_id.clone(),
-        correlation_id: (!selected.correlation_id.is_empty()).then(|| selected.correlation_id.clone()),
+        correlation_id: (!selected.correlation_id.is_empty())
+            .then(|| selected.correlation_id.clone()),
         invocation_audit_entry_id: selected.id.clone(),
         reasons,
         warnings,
@@ -219,16 +229,24 @@ fn observe_phase(
         }
         "invoke.result" => {
             if summary.relay.is_some() {
-                return Err(invalid("local dispatch result cannot complete an entry-host relay"));
+                return Err(invalid(
+                    "local dispatch result cannot complete an entry-host relay",
+                ));
             }
-            let success = entry.metadata.get("success").and_then(Value::as_bool)
+            let success = entry
+                .metadata
+                .get("success")
+                .and_then(Value::as_bool)
                 .ok_or(invalid("dispatch result requires a boolean success flag"))?;
             summary.duration_ms = Some(required_duration(entry)?);
             summary.reported_receipt_id = optional_string(entry, "receipt_id")?.map(str::to_owned);
             summary.reported_success = Some(success);
             summary.terminal_observed = true;
             summary.outcome = if !summary.admission_observed {
-                warnings.push("dispatch result has no captured admission; the authorization path is unknown".to_owned());
+                warnings.push(
+                    "dispatch result has no captured admission; the authorization path is unknown"
+                        .to_owned(),
+                );
                 HostRequestOutcome::Incomplete
             } else if success {
                 HostRequestOutcome::ReportedSuccess
@@ -265,7 +283,9 @@ fn observe_relay_attempt(
 ) -> Result<&'static str, ExplainError> {
     let target = required_string(entry, "target_node")?;
     required_string(entry, "decision")?;
-    relay_summary(summary).observed_targets.push(target.to_owned());
+    relay_summary(summary)
+        .observed_targets
+        .push(target.to_owned());
     summary.outcome = HostRequestOutcome::RelayPending;
     Ok("entry host recorded a relay attempt; this is not delivery or executor-admission evidence")
 }
@@ -279,15 +299,29 @@ fn observe_relay_response(
     required_string(entry, "decision")?;
     let status = match entry.metadata.get("executor_status") {
         Some(Value::Null) => None,
-        Some(value) => Some(value.as_u64().filter(|status| (100..=599).contains(status))
-            .and_then(|status| u16::try_from(status).ok())
-            .ok_or(invalid("relay executor_status must be null or a valid HTTP status"))?),
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|status| (100..=599).contains(status))
+                .and_then(|status| u16::try_from(status).ok())
+                .ok_or(invalid(
+                    "relay executor_status must be null or a valid HTTP status",
+                ))?,
+        ),
         None => return Err(invalid("relay record is missing executor_status")),
     };
-    let failures = entry.metadata.get("failed_attempts").and_then(Value::as_array)
+    let failures = entry
+        .metadata
+        .get("failed_attempts")
+        .and_then(Value::as_array)
         .ok_or(invalid("relay record requires a failed_attempts array"))?;
-    if failures.iter().any(|value| value.as_str().is_none_or(|value| value.trim().is_empty())) {
-        return Err(invalid("relay failed_attempts must contain nonempty strings"));
+    if failures
+        .iter()
+        .any(|value| value.as_str().is_none_or(|value| value.trim().is_empty()))
+    {
+        return Err(invalid(
+            "relay failed_attempts must contain nonempty strings",
+        ));
     }
     summary.duration_ms = Some(required_duration(entry)?);
     let relay = relay_summary(summary);
@@ -307,9 +341,14 @@ fn observe_relay_response(
     };
     warnings.push("entry-host relay evidence does not establish executor authorization or connector completion; inspect the executor's independently verified chain".to_owned());
     if status.is_none() {
-        warnings.push("no peer response was recorded; delivery, side effects and retry safety remain unknown".to_owned());
+        warnings.push(
+            "no peer response was recorded; delivery, side effects and retry safety remain unknown"
+                .to_owned(),
+        );
     }
-    Ok("entry host recorded a relay outcome; a peer HTTP response is not a connector success receipt")
+    Ok(
+        "entry host recorded a relay outcome; a peer HTTP response is not a connector success receipt",
+    )
 }
 
 fn request_entries<'a>(
@@ -320,13 +359,15 @@ fn request_entries<'a>(
     let mut by_seq = BTreeMap::new();
     let mut by_id = BTreeMap::new();
     for entry in &bundle.audit_entries {
-        if !is_host_event(entry) || entry.zone_id != selected.zone_id
+        if !is_host_event(entry)
+            || entry.zone_id != selected.zone_id
             || entry.operation_id != selected.operation_id
         {
             continue;
         }
         validate_identity(entry)?;
-        if entry.actor != selected.actor || entry.connector_id != selected.connector_id
+        if entry.actor != selected.actor
+            || entry.connector_id != selected.connector_id
             || entry.correlation_id != selected.correlation_id
             || required_string(entry, "operation")? != operation
         {
@@ -352,16 +393,27 @@ fn request_entries<'a>(
         }
     }
     let entries: Vec<_> = by_seq.into_values().collect();
-    if entries.windows(2).any(|pair| pair[1].occurred_at < pair[0].occurred_at) {
+    if entries
+        .windows(2)
+        .any(|pair| pair[1].occurred_at < pair[0].occurred_at)
+    {
         return Err(invalid("request timestamps regress in chain order"));
     }
     Ok(entries)
 }
 
 fn validate_identity(entry: &AuditEntry) -> Result<(), ExplainError> {
-    if entry.id.trim().is_empty() || entry.actor.trim().is_empty() || entry.zone_id.trim().is_empty()
-        || entry.connector_id.as_deref().is_none_or(|value| value.trim().is_empty())
-        || entry.operation_id.as_deref().is_none_or(|value| value.trim().is_empty())
+    if entry.id.trim().is_empty()
+        || entry.actor.trim().is_empty()
+        || entry.zone_id.trim().is_empty()
+        || entry
+            .connector_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || entry
+            .operation_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Err(invalid("host phase requires complete request identity"));
     }
@@ -373,15 +425,26 @@ fn required_string<'a>(entry: &'a AuditEntry, key: &str) -> Result<&'a str, Expl
 }
 
 fn optional_string<'a>(entry: &'a AuditEntry, key: &str) -> Result<Option<&'a str>, ExplainError> {
-    entry.metadata.get(key).map(|value| {
-        value.as_str().filter(|value| !value.trim().is_empty())
-            .ok_or(invalid("host phase has an invalid string field"))
-    }).transpose()
+    entry
+        .metadata
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(invalid("host phase has an invalid string field"))
+        })
+        .transpose()
 }
 
 fn required_duration(entry: &AuditEntry) -> Result<u64, ExplainError> {
-    entry.metadata.get("duration_ms").and_then(Value::as_u64)
-        .ok_or(invalid("terminal host phase requires an unsigned duration_ms"))
+    entry
+        .metadata
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .ok_or(invalid(
+            "terminal host phase requires an unsigned duration_ms",
+        ))
 }
 
 const fn invalid(reason: &'static str) -> ExplainError {
@@ -390,8 +453,8 @@ const fn invalid(reason: &'static str) -> ExplainError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{explain_bundle, explain_invocation, parse_replay_bundle};
+    use super::*;
     use crate::{Severity, audit_entry_hlc_from_occurred_at};
     use serde_json::json;
 
@@ -421,7 +484,10 @@ mod tests {
     }
 
     fn bundle(entries: Vec<AuditEntry>) -> ReplayBundle {
-        ReplayBundle { audit_entries: entries, ..ReplayBundle::default() }
+        ReplayBundle {
+            audit_entries: entries,
+            ..ReplayBundle::default()
+        }
     }
 
     #[test]
@@ -434,17 +500,32 @@ mod tests {
         assert_eq!(result.operation_id, "issues.create");
         assert_eq!(summary.duration_ms, Some(17));
         assert!(result.correlation_id.is_none());
-        assert!(!result.render_human().contains("invoked operation request-a"));
-        assert!(result.reasons.iter().all(|reason| reason.kind == CausalReasonKind::HostLifecycle));
+        assert!(
+            !result
+                .render_human()
+                .contains("invoked operation request-a")
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .all(|reason| reason.kind == CausalReasonKind::HostLifecycle)
+        );
     }
 
     #[test]
     fn admission_and_denial_do_not_claim_completed_dispatch() {
-        for (event, outcome) in [("invoke.allow", HostRequestOutcome::Admitted), ("invoke.deny", HostRequestOutcome::Denied)] {
+        for (event, outcome) in [
+            ("invoke.allow", HostRequestOutcome::Admitted),
+            ("invoke.deny", HostRequestOutcome::Denied),
+        ] {
             let result = explain_bundle(&bundle(vec![phase(0, event)])).unwrap();
             assert_eq!(result.host_request.as_ref().unwrap().outcome, outcome);
             assert!(!result.render_human().contains("invoked operation"));
-            assert_eq!(result.host_request.as_ref().unwrap().terminal_observed, event == "invoke.deny");
+            assert_eq!(
+                result.host_request.as_ref().unwrap().terminal_observed,
+                event == "invoke.deny"
+            );
         }
     }
 
@@ -462,15 +543,26 @@ mod tests {
         let mut failed = phase(2, "invoke.result");
         failed.metadata.insert("success".to_owned(), json!(false));
         let result = explain_bundle(&bundle(vec![phase(0, "invoke.allow"), failed])).unwrap();
-        assert_eq!(result.host_request.unwrap().outcome, HostRequestOutcome::ReportedFailure);
+        assert_eq!(
+            result.host_request.unwrap().outcome,
+            HostRequestOutcome::ReportedFailure
+        );
         let error = explain_bundle(&bundle(vec![phase(1, "invoke.error")])).unwrap();
-        assert_eq!(error.host_request.as_ref().unwrap().outcome, HostRequestOutcome::DispatchError);
+        assert_eq!(
+            error.host_request.as_ref().unwrap().outcome,
+            HostRequestOutcome::DispatchError
+        );
         assert!(error.render_human().contains("retry safety are unknown"));
     }
 
     #[test]
     fn malformed_payloads_fail_without_falling_back_to_admission() {
-        for (key, value) in [("success", json!("true")), ("duration_ms", json!(-1)), ("receipt_id", Value::Null), ("operation", json!(false))] {
+        for (key, value) in [
+            ("success", json!("true")),
+            ("duration_ms", json!(-1)),
+            ("receipt_id", Value::Null),
+            ("operation", json!(false)),
+        ] {
             let mut result = phase(2, "invoke.result");
             result.metadata.insert(key.to_owned(), value);
             assert!(explain_bundle(&bundle(vec![phase(0, "invoke.allow"), result])).is_err());
@@ -479,8 +571,16 @@ mod tests {
 
     #[test]
     fn contradictory_and_reused_lifecycles_fail() {
-        for events in [["invoke.allow", "invoke.deny"], ["invoke.deny", "invoke.result"], ["invoke.result", "invoke.result"], ["invoke.allow", "invoke.allow"], ["invoke.error", "invoke.allow"]] {
-            assert!(explain_bundle(&bundle(vec![phase(0, events[0]), phase(1, events[1])])).is_err());
+        for events in [
+            ["invoke.allow", "invoke.deny"],
+            ["invoke.deny", "invoke.result"],
+            ["invoke.result", "invoke.result"],
+            ["invoke.allow", "invoke.allow"],
+            ["invoke.error", "invoke.allow"],
+        ] {
+            assert!(
+                explain_bundle(&bundle(vec![phase(0, events[0]), phase(1, events[1])])).is_err()
+            );
         }
     }
 
@@ -490,7 +590,10 @@ mod tests {
         let mut second = phase(2, "invoke.allow");
         second.operation_id = Some("request-b".to_owned());
         let result = explain_bundle(&bundle(vec![first, second])).unwrap();
-        assert_eq!(result.host_request.as_ref().unwrap().request_id, "request-b");
+        assert_eq!(
+            result.host_request.as_ref().unwrap().request_id,
+            "request-b"
+        );
         assert_eq!(result.host_request.unwrap().observed_phase_count, 1);
     }
 
@@ -502,7 +605,11 @@ mod tests {
                 "actor" => result.actor = "user:bob".to_owned(),
                 "connector" => result.connector_id = Some("slack".to_owned()),
                 "correlation" => result.correlation_id = "other".to_owned(),
-                _ => { result.metadata.insert("operation".to_owned(), json!("issues.delete")); }
+                _ => {
+                    result
+                        .metadata
+                        .insert("operation".to_owned(), json!("issues.delete"));
+                }
             }
             assert!(explain_bundle(&bundle(vec![phase(0, "invoke.allow"), result])).is_err());
         }
@@ -513,7 +620,16 @@ mod tests {
         let admitted = phase(0, "invoke.allow");
         let finished = phase(3, "invoke.result");
         let expected = explain_bundle(&bundle(vec![admitted.clone(), finished.clone()])).unwrap();
-        assert_eq!(explain_bundle(&bundle(vec![finished.clone(), admitted.clone(), finished, admitted])).unwrap(), expected);
+        assert_eq!(
+            explain_bundle(&bundle(vec![
+                finished.clone(),
+                admitted.clone(),
+                finished,
+                admitted
+            ]))
+            .unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -536,9 +652,24 @@ mod tests {
         let mut other = phase(4, "invoke.result");
         other.zone_id = "z:private".to_owned();
         let evidence = bundle(vec![first.clone(), other]);
-        assert_eq!(explain_host_request(&evidence, "z:work", "request-a").unwrap().zone_id, "z:work");
-        assert_eq!(explain_invocation(&evidence, &first.id).unwrap().host_request.unwrap().outcome, HostRequestOutcome::Denied);
-        assert_eq!(explain_host_request(&evidence, "z:work", "missing"), Err(ExplainError::NoInvocation));
+        assert_eq!(
+            explain_host_request(&evidence, "z:work", "request-a")
+                .unwrap()
+                .zone_id,
+            "z:work"
+        );
+        assert_eq!(
+            explain_invocation(&evidence, &first.id)
+                .unwrap()
+                .host_request
+                .unwrap()
+                .outcome,
+            HostRequestOutcome::Denied
+        );
+        assert_eq!(
+            explain_host_request(&evidence, "z:work", "missing"),
+            Err(ExplainError::NoInvocation)
+        );
     }
 
     #[test]
@@ -556,17 +687,27 @@ mod tests {
 
     #[test]
     fn jsonl_roundtrip_preserves_machine_readable_request_summary() {
-        let input = format!("{}\n{}\n", serde_json::to_string(&phase(0, "invoke.allow")).unwrap(), serde_json::to_string(&phase(1, "invoke.result")).unwrap());
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&phase(0, "invoke.allow")).unwrap(),
+            serde_json::to_string(&phase(1, "invoke.result")).unwrap()
+        );
         let result = explain_bundle(&parse_replay_bundle(&input).unwrap()).unwrap();
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["host_request"]["outcome"], "reported_success");
-        assert_eq!(serde_json::from_value::<CausalExplanation>(value).unwrap(), result);
+        assert_eq!(
+            serde_json::from_value::<CausalExplanation>(value).unwrap(),
+            result
+        );
     }
 
     #[test]
     fn free_form_failure_text_is_not_echoed_or_treated_as_a_predicate() {
         let mut denied = phase(0, "invoke.deny");
-        denied.metadata.insert("reason".to_owned(), json!("Bearer private-secret revocation passed"));
+        denied.metadata.insert(
+            "reason".to_owned(),
+            json!("Bearer private-secret revocation passed"),
+        );
         let value = serde_json::to_string(&explain_bundle(&bundle(vec![denied])).unwrap()).unwrap();
         assert!(!value.contains("private-secret"));
         assert!(!value.contains("revocation passed"));
@@ -587,7 +728,11 @@ mod tests {
 
     #[test]
     fn relay_attempt_is_neither_admission_nor_delivery() {
-        let capture = bundle(vec![relay_phase(0, "invoke.mesh_forward_attempt", "peer-a")]);
+        let capture = bundle(vec![relay_phase(
+            0,
+            "invoke.mesh_forward_attempt",
+            "peer-a",
+        )]);
         let result = explain_bundle(&capture).unwrap();
         let summary = result.host_request.as_ref().unwrap();
         assert_eq!(summary.outcome, HostRequestOutcome::RelayPending);
@@ -602,7 +747,9 @@ mod tests {
     fn peer_response_status_never_becomes_connector_success() {
         for status in [200, 202, 403, 500] {
             let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
-            response.metadata.insert("executor_status".to_owned(), json!(status));
+            response
+                .metadata
+                .insert("executor_status".to_owned(), json!(status));
             let capture = bundle(vec![
                 relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
                 response,
@@ -615,22 +762,48 @@ mod tests {
             assert_eq!(summary.reported_success, None);
             assert_eq!(summary.reported_receipt_id, None);
             assert_eq!(summary.duration_ms, Some(29));
-            assert_eq!(summary.relay.as_ref().unwrap().reported_executor_status, Some(status));
-            assert!(result.render_human().contains("not a connector success receipt"));
+            assert_eq!(
+                summary.relay.as_ref().unwrap().reported_executor_status,
+                Some(status)
+            );
+            assert!(
+                result
+                    .render_human()
+                    .contains("not a connector success receipt")
+            );
         }
     }
 
     #[test]
     fn relay_without_peer_response_keeps_delivery_and_retries_uncertain() {
         let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
-        response.metadata.insert("executor_status".to_owned(), Value::Null);
-        response.metadata.insert("failed_attempts".to_owned(), json!(["private-relay-error"]));
+        response
+            .metadata
+            .insert("executor_status".to_owned(), Value::Null);
+        response
+            .metadata
+            .insert("failed_attempts".to_owned(), json!(["private-relay-error"]));
         let result = explain_bundle(&bundle(vec![response])).unwrap();
         let summary = result.host_request.as_ref().unwrap();
         assert_eq!(summary.outcome, HostRequestOutcome::RelayUnconfirmed);
-        assert_eq!(summary.relay.as_ref().unwrap().reported_failed_attempt_count, Some(1));
-        assert!(result.render_human().contains("retry safety remain unknown"));
-        assert!(!serde_json::to_string(&result).unwrap().contains("private-relay-error"));
+        assert_eq!(
+            summary
+                .relay
+                .as_ref()
+                .unwrap()
+                .reported_failed_attempt_count,
+            Some(1)
+        );
+        assert!(
+            result
+                .render_human()
+                .contains("retry safety remain unknown")
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private-relay-error")
+        );
     }
 
     #[test]
@@ -642,8 +815,17 @@ mod tests {
             }
             entries.push(relay_phase(2, "invoke.mesh_forwarded", "peer-b"));
             let result = explain_bundle(&bundle(entries)).unwrap();
-            let relay = result.host_request.as_ref().unwrap().relay.as_ref().unwrap();
-            assert_eq!(relay.observed_targets.len(), if captured_attempt.is_some() { 1 } else { 0 });
+            let relay = result
+                .host_request
+                .as_ref()
+                .unwrap()
+                .relay
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                relay.observed_targets.len(),
+                if captured_attempt.is_some() { 1 } else { 0 }
+            );
             assert_eq!(relay.reported_terminal_target.as_deref(), Some("peer-b"));
             assert!(result.warnings.iter().any(|warning| {
                 warning.contains("routing history is incomplete")
@@ -669,10 +851,14 @@ mod tests {
         for (field, value) in invalid_fields {
             let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
             response.metadata.insert(field.to_owned(), value);
-            assert!(explain_bundle(&bundle(vec![
-                relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
-                response,
-            ])).is_err(), "{field}");
+            assert!(
+                explain_bundle(&bundle(vec![
+                    relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+                    response,
+                ]))
+                .is_err(),
+                "{field}"
+            );
         }
         let mut response = relay_phase(2, "invoke.mesh_forwarded", "peer-a");
         response.metadata.remove("executor_status");
@@ -682,20 +868,30 @@ mod tests {
     #[test]
     fn relay_and_local_completion_cannot_be_spliced_into_success() {
         for phase_name in ["invoke.allow", "invoke.deny", "invoke.result"] {
-            assert!(explain_bundle(&bundle(vec![
-                relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
-                phase(2, phase_name),
-            ])).is_err());
+            assert!(
+                explain_bundle(&bundle(vec![
+                    relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
+                    phase(2, phase_name),
+                ]))
+                .is_err()
+            );
         }
-        assert!(explain_bundle(&bundle(vec![
-            relay_phase(0, "invoke.mesh_forwarded", "peer-a"),
-            relay_phase(2, "invoke.mesh_forward_attempt", "peer-b"),
-        ])).is_err());
+        assert!(
+            explain_bundle(&bundle(vec![
+                relay_phase(0, "invoke.mesh_forwarded", "peer-a"),
+                relay_phase(2, "invoke.mesh_forward_attempt", "peer-b"),
+            ]))
+            .is_err()
+        );
         let result = explain_bundle(&bundle(vec![
             relay_phase(0, "invoke.mesh_forward_attempt", "peer-a"),
             phase(2, "invoke.error"),
-        ])).unwrap();
-        assert_eq!(result.host_request.unwrap().outcome, HostRequestOutcome::DispatchError);
+        ]))
+        .unwrap();
+        assert_eq!(
+            result.host_request.unwrap().outcome,
+            HostRequestOutcome::DispatchError
+        );
     }
 
     #[test]
@@ -703,7 +899,12 @@ mod tests {
         let first = relay_phase(0, "invoke.mesh_forward_attempt", "peer-a");
         let second = relay_phase(2, "invoke.mesh_forward_attempt", "peer-b");
         let response = relay_phase(4, "invoke.mesh_forwarded", "peer-b");
-        let expected = explain_bundle(&bundle(vec![first.clone(), second.clone(), response.clone()])).unwrap();
+        let expected = explain_bundle(&bundle(vec![
+            first.clone(),
+            second.clone(),
+            response.clone(),
+        ]))
+        .unwrap();
         let shuffled = bundle(vec![response, second.clone(), first.clone(), second, first]);
         assert_eq!(explain_bundle(&shuffled).unwrap(), expected);
         let relay = expected.host_request.unwrap().relay.unwrap();
@@ -716,13 +917,20 @@ mod tests {
             phase(0, "invoke.allow"),
             relay_phase(1, "invoke.mesh_forward_attempt", "peer-a"),
             relay_phase(2, "invoke.mesh_forwarded", "peer-a"),
-        ])).unwrap();
+        ]))
+        .unwrap();
         let summary = result.host_request.as_ref().unwrap();
         assert!(summary.admission_observed);
         assert_eq!(summary.outcome, HostRequestOutcome::RelayResponse);
         assert_eq!(summary.reported_success, None);
         let value = serde_json::to_value(&result).unwrap();
-        assert_eq!(value["host_request"]["relay"]["reported_executor_status"], 200);
-        assert_eq!(serde_json::from_value::<CausalExplanation>(value).unwrap(), result);
+        assert_eq!(
+            value["host_request"]["relay"]["reported_executor_status"],
+            200
+        );
+        assert_eq!(
+            serde_json::from_value::<CausalExplanation>(value).unwrap(),
+            result
+        );
     }
 }

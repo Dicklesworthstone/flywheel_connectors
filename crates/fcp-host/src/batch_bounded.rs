@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation,
-    BatchOperationError, HostError, HostResult, OperationResultStatus,
+    BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation, BatchOperationError,
+    HostError, HostResult, OperationResultStatus,
 };
 
 /// Serialized provider-result limits, excluding fixed scheduler accounting.
@@ -216,7 +216,10 @@ impl BatchExecutor {
                     let future = handler(operation);
                     async move {
                         let result = future.await;
-                        shared.lock().expect("batch result budget lock").retain(result)
+                        shared
+                            .lock()
+                            .expect("batch result budget lock")
+                            .retain(result)
                     }
                 },
                 |_| {
@@ -232,9 +235,10 @@ impl BatchExecutor {
             // Cancellation and timeout codes retain their higher precedence.
             for result in &mut streamed.response.results {
                 if result.status == OperationResultStatus::Skipped
-                    && result.error.as_ref().is_some_and(|error| {
-                        error.code == "BATCH_RESULT_DELIVERY_FAILED"
-                    })
+                    && result
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.code == "BATCH_RESULT_DELIVERY_FAILED")
                 {
                     result.error = Some(failure.error(false));
                 }
@@ -281,7 +285,10 @@ mod tests {
     }
 
     fn limits(per_result_bytes: usize, total_result_bytes: usize) -> BatchResultLimits {
-        BatchResultLimits { per_result_bytes, total_result_bytes }
+        BatchResultLimits {
+            per_result_bytes,
+            total_result_bytes,
+        }
     }
 
     #[test]
@@ -289,12 +296,18 @@ mod tests {
         let value = json!("\"\n世界");
         let size = serde_json::to_vec(&value).unwrap().len();
         let mut budget = ResultBudget {
-            limits: limits(size, size), retained: 0, withheld: 0, stop: None,
+            limits: limits(size, size),
+            retained: 0,
+            withheld: 0,
+            stop: None,
         };
         assert_eq!(budget.retain(Ok(value.clone())).unwrap(), value);
         assert_eq!(budget.retained, size);
         assert_eq!(budget.withheld, 0);
-        assert_eq!(budget.retain(Ok(Value::Null)).unwrap_err().code, "BATCH_RESULT_LIMIT");
+        assert_eq!(
+            budget.retain(Ok(Value::Null)).unwrap_err().code,
+            "BATCH_RESULT_LIMIT"
+        );
         assert_eq!(budget.retained, size);
         assert_eq!(budget.withheld, 1);
     }
@@ -302,13 +315,19 @@ mod tests {
     #[test]
     fn rejected_measurement_does_not_consume_remaining_retention_capacity() {
         let mut budget = ResultBudget {
-            limits: limits(8, 8), retained: 0, withheld: 0, stop: None,
+            limits: limits(8, 8),
+            retained: 0,
+            withheld: 0,
+            stop: None,
         };
         assert!(budget.retain(Ok(json!(["too large"]))).is_err());
         assert_eq!(budget.retained, 0);
         assert_eq!(budget.retain(Ok(Value::Null)).unwrap(), Value::Null);
         assert_eq!(budget.retained, 4);
-        assert!(budget.stop.is_some(), "successful draining cannot reopen admission");
+        assert!(
+            budget.stop.is_some(),
+            "successful draining cannot reopen admission"
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -317,10 +336,12 @@ mod tests {
         let request = request(1, 1);
         for limits in [limits(0, 8), limits(8, 0), limits(9, 8)] {
             let calls = Cell::new(0);
-            let result = executor.execute_async_bounded(&request, None, limits, |_| {
-                calls.set(calls.get() + 1);
-                ready(Ok(Value::Null))
-            }).await;
+            let result = executor
+                .execute_async_bounded(&request, None, limits, |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Ok(Value::Null))
+                })
+                .await;
             assert!(result.is_err());
             assert_eq!(calls.get(), 0);
         }
@@ -331,15 +352,25 @@ mod tests {
         let executor = BatchExecutor::new();
         let request = request(4, 1);
         let calls = Cell::new(0);
-        let bounded = executor.execute_async_bounded(&request, None, limits(6, 6), |_| {
-            calls.set(calls.get() + 1);
-            ready(Ok(Value::Null))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(6, 6), |_| {
+                calls.set(calls.get() + 1);
+                ready(Ok(Value::Null))
+            })
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 2);
         assert_eq!(bounded.retained_result_bytes, 4);
         assert_eq!(bounded.withheld_results, 1);
         assert_eq!(bounded.response.status, BatchStatus::Aborted);
-        assert_eq!((bounded.response.completed, bounded.response.failed, bounded.response.skipped), (1, 1, 2));
+        assert_eq!(
+            (
+                bounded.response.completed,
+                bounded.response.failed,
+                bounded.response.skipped
+            ),
+            (1, 1, 2)
+        );
         assert_eq!(bounded.response.results[0].output, Some(Value::Null));
         assert!(bounded.response.results[1].output.is_none());
         for result in &bounded.response.results[1..] {
@@ -354,29 +385,50 @@ mod tests {
         let executor = BatchExecutor::new();
         let request = request(3, 2);
         let calls = RefCell::new(Vec::new());
-        let bounded = executor.execute_async_bounded(&request, None, limits(8, 8), |op| {
-            calls.borrow_mut().push(op.id.clone());
-            ready(Ok(if op.id == "op-0" { json!("large private payload") } else { Value::Null }))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(8, 8), |op| {
+                calls.borrow_mut().push(op.id.clone());
+                ready(Ok(if op.id == "op-0" {
+                    json!("large private payload")
+                } else {
+                    Value::Null
+                }))
+            })
+            .await
+            .unwrap();
         assert_eq!(*calls.borrow(), ["op-0", "op-1"]);
         assert_eq!(bounded.retained_result_bytes, 4);
         assert_eq!(bounded.withheld_results, 1);
-        assert_eq!((bounded.response.completed, bounded.response.failed, bounded.response.skipped), (1, 1, 1));
+        assert_eq!(
+            (
+                bounded.response.completed,
+                bounded.response.failed,
+                bounded.response.skipped
+            ),
+            (1, 1, 1)
+        );
         assert_eq!(bounded.response.results[1].output, Some(Value::Null));
-        assert!(!serde_json::to_string(&bounded).unwrap().contains("private payload"));
+        assert!(
+            !serde_json::to_string(&bounded)
+                .unwrap()
+                .contains("private payload")
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn oversized_provider_errors_are_withheld_without_retry_hints_or_payloads() {
         let executor = BatchExecutor::new();
         let request = request(2, 1);
-        let bounded = executor.execute_async_bounded(&request, None, limits(16, 16), |_| {
-            ready(Err(BatchOperationError {
-                code: "PROVIDER_ERROR".into(),
-                message: "private provider details".repeat(10),
-                retry_after_ms: Some(5_000),
-            }))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(16, 16), |_| {
+                ready(Err(BatchOperationError {
+                    code: "PROVIDER_ERROR".into(),
+                    message: "private provider details".repeat(10),
+                    retry_after_ms: Some(5_000),
+                }))
+            })
+            .await
+            .unwrap();
         assert_eq!(bounded.retained_result_bytes, 0);
         assert_eq!(bounded.withheld_results, 1);
         let error = bounded.response.results[0].error.as_ref().unwrap();
@@ -392,12 +444,17 @@ mod tests {
         let executor = BatchExecutor::new();
         let request = request(1, 1);
         let error = BatchOperationError {
-            code: "RATE_LIMITED".into(), message: "provider refused".into(), retry_after_ms: Some(17),
+            code: "RATE_LIMITED".into(),
+            message: "provider refused".into(),
+            retry_after_ms: Some(17),
         };
         let expected_size = serde_json::to_vec(&error).unwrap().len();
-        let bounded = executor.execute_async_bounded(
-            &request, None, limits(expected_size, expected_size), |_| ready(Err(error.clone())),
-        ).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(expected_size, expected_size), |_| {
+                ready(Err(error.clone()))
+            })
+            .await
+            .unwrap();
         assert_eq!(bounded.retained_result_bytes, expected_size);
         assert_eq!(bounded.withheld_results, 0);
         assert_eq!(bounded.response.status, BatchStatus::AllFailed);
@@ -412,12 +469,18 @@ mod tests {
         let mut request = request(2, 2);
         request.operations[1].depends_on = vec!["op-0".into()];
         let calls = Cell::new(0);
-        let bounded = executor.execute_async_bounded(&request, None, limits(4, 4), |_| {
-            calls.set(calls.get() + 1);
-            ready(Ok(json!("too large")))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(4, 4), |_| {
+                calls.set(calls.get() + 1);
+                ready(Ok(json!("too large")))
+            })
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 1);
-        assert_eq!(bounded.response.results[1].status, OperationResultStatus::Skipped);
+        assert_eq!(
+            bounded.response.results[1].status,
+            OperationResultStatus::Skipped
+        );
         assert_eq!(bounded.withheld_results, 1);
     }
 
@@ -428,15 +491,24 @@ mod tests {
         let context = ExecutionContext::background();
         context.cancel();
         let calls = Cell::new(0);
-        let bounded = executor.execute_async_bounded(&request, Some(&context), limits(8, 8), |_| {
-            calls.set(calls.get() + 1);
-            ready(Ok(Value::Null))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, Some(&context), limits(8, 8), |_| {
+                calls.set(calls.get() + 1);
+                ready(Ok(Value::Null))
+            })
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 0);
         assert_eq!(bounded.retained_result_bytes, 0);
         assert_eq!(bounded.withheld_results, 0);
         assert_eq!(bounded.response.skipped, 2);
-        assert!(bounded.response.results.iter().all(|result| result.error.as_ref().unwrap().code == "BATCH_CANCELLED"));
+        assert!(
+            bounded
+                .response
+                .results
+                .iter()
+                .all(|result| result.error.as_ref().unwrap().code == "BATCH_CANCELLED")
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -445,8 +517,13 @@ mod tests {
         let request = request(3, 2);
         let context = ExecutionContext::background();
         let mut run = Box::pin(executor.execute_async_bounded(
-            &request, Some(&context), limits(8, 8), |op| async move {
-                if op.id == "op-1" { pending::<()>().await; }
+            &request,
+            Some(&context),
+            limits(8, 8),
+            |op| async move {
+                if op.id == "op-1" {
+                    pending::<()>().await;
+                }
                 Ok(json!("oversized"))
             },
         ));
@@ -454,9 +531,18 @@ mod tests {
         context.cancel();
         let bounded = run.await.unwrap();
         assert_eq!(bounded.withheld_results, 1);
-        assert_eq!(bounded.response.results[0].error.as_ref().unwrap().code, "BATCH_RESULT_LIMIT");
-        assert_eq!(bounded.response.results[1].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
-        assert_eq!(bounded.response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(
+            bounded.response.results[0].error.as_ref().unwrap().code,
+            "BATCH_RESULT_LIMIT"
+        );
+        assert_eq!(
+            bounded.response.results[1].error.as_ref().unwrap().code,
+            "BATCH_OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            bounded.response.results[2].error.as_ref().unwrap().code,
+            "BATCH_CANCELLED"
+        );
     }
 
     #[test]
@@ -465,13 +551,20 @@ mod tests {
         let executor = BatchExecutor::new();
         let request = request(1, 1);
         assert_send(executor.execute_async_bounded(
-            &request, None, BatchResultLimits::default(), |_| ready(Ok(Value::Null)),
+            &request,
+            None,
+            BatchResultLimits::default(),
+            |_| ready(Ok(Value::Null)),
         ));
     }
 
     #[test]
     fn byte_counter_refuses_overflow_without_wrapping_or_partial_accounting() {
-        let mut counter = ByteCounter { limit: usize::MAX, written: usize::MAX - 1, exceeded: false };
+        let mut counter = ByteCounter {
+            limit: usize::MAX,
+            written: usize::MAX - 1,
+            exceeded: false,
+        };
         assert!(counter.write_all(b"12").is_err());
         assert_eq!(counter.written, usize::MAX - 1);
         assert!(counter.exceeded);
@@ -480,7 +573,10 @@ mod tests {
     #[test]
     fn per_result_limit_applies_even_when_aggregate_budget_has_room() {
         let mut budget = ResultBudget {
-            limits: limits(4, 1000), retained: 0, withheld: 0, stop: None,
+            limits: limits(4, 1000),
+            retained: 0,
+            withheld: 0,
+            stop: None,
         };
         let error = budget.retain(Ok(json!([1, 2, 3]))).unwrap_err();
         assert_eq!(error.code, "BATCH_RESULT_LIMIT");
@@ -494,10 +590,12 @@ mod tests {
         let mut request = request(2, 1);
         request.operations[1].depends_on = vec!["absent".into()];
         let calls = Cell::new(0);
-        let result = executor.execute_async_bounded(&request, None, limits(8, 8), |_| {
-            calls.set(calls.get() + 1);
-            ready(Ok(Value::Null))
-        }).await;
+        let result = executor
+            .execute_async_bounded(&request, None, limits(8, 8), |_| {
+                calls.set(calls.get() + 1);
+                ready(Ok(Value::Null))
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(calls.get(), 0);
     }
@@ -508,14 +606,23 @@ mod tests {
         let mut request = request(2, 1);
         request.options.timeout_ms = 0;
         let calls = Cell::new(0);
-        let bounded = executor.execute_async_bounded(&request, None, limits(8, 8), |_| {
-            calls.set(calls.get() + 1);
-            ready(Ok(Value::Null))
-        }).await.unwrap();
+        let bounded = executor
+            .execute_async_bounded(&request, None, limits(8, 8), |_| {
+                calls.set(calls.get() + 1);
+                ready(Ok(Value::Null))
+            })
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 0);
         assert_eq!(bounded.withheld_results, 0);
         assert_eq!(bounded.retained_result_bytes, 0);
         assert_eq!(bounded.response.status, BatchStatus::Aborted);
-        assert!(bounded.response.results.iter().all(|result| result.error.as_ref().unwrap().code == "BATCH_TIMEOUT"));
+        assert!(
+            bounded
+                .response
+                .results
+                .iter()
+                .all(|result| result.error.as_ref().unwrap().code == "BATCH_TIMEOUT")
+        );
     }
 }

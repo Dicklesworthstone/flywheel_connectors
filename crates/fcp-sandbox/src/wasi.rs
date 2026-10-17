@@ -968,7 +968,6 @@ impl WasiRuntime {
         // Configure wasmtime engine
         let mut engine_config = Config::new();
         engine_config.wasm_component_model(true);
-        engine_config.async_support(true);
 
         // ALWAYS enable fuel metering to ensure async yielding and timeout enforcement
         engine_config.consume_fuel(true);
@@ -1216,11 +1215,6 @@ impl WasiRuntime {
         fcp_async_core::time::timeout(self.config.wall_clock_timeout, async {
             func.call_async(&mut store, ()).await.map_err(|e| {
                 WasiError::Execution(format!("component export `{export_name}` failed: {e}"))
-            })?;
-            func.post_return_async(&mut store).await.map_err(|e| {
-                WasiError::Execution(format!(
-                    "component export `{export_name}` post-return cleanup failed: {e}"
-                ))
             })?;
             Ok::<(), WasiError>(())
         })

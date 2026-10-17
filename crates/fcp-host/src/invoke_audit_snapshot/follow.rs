@@ -48,7 +48,8 @@ pub struct InvokeAuditFollowBatch {
 
 impl std::fmt::Debug for InvokeAuditFollowBatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("InvokeAuditFollowBatch")
+        formatter
+            .debug_struct("InvokeAuditFollowBatch")
             .field("entries", &self.entries.len())
             .field("bytes", &self.bytes)
             .field("pending_frame", &self.pending_frame)
@@ -59,27 +60,39 @@ impl std::fmt::Debug for InvokeAuditFollowBatch {
 impl InvokeAuditFollowBatch {
     /// Records that became available since the preceding successful poll.
     #[must_use]
-    pub fn entries(&self) -> &[AuditEntry] { &self.entries }
+    pub fn entries(&self) -> &[AuditEntry] {
+        &self.entries
+    }
 
     /// Cumulative length of the validated complete prefix, including its header.
     #[must_use]
-    pub const fn bytes(&self) -> u64 { self.bytes }
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
 
     /// BLAKE3 fingerprint of the observed complete prefix, not a signature.
     #[must_use]
-    pub fn digest(&self) -> &str { &self.digest }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 
     /// Source length sampled for this poll; bytes after `bytes()` are unchecked.
     #[must_use]
-    pub const fn observed_bytes(&self) -> u64 { self.observed_bytes }
+    pub const fn observed_bytes(&self) -> u64 {
+        self.observed_bytes
+    }
 
     /// Cumulative validated records across all zones and successful batches.
     #[must_use]
-    pub const fn total_records(&self) -> u64 { self.total_records }
+    pub const fn total_records(&self) -> u64 {
+        self.total_records
+    }
 
     /// Whether a sampled header or final frame is waiting for more bytes.
     #[must_use]
-    pub const fn pending_frame(&self) -> bool { self.pending_frame }
+    pub const fn pending_frame(&self) -> bool {
+        self.pending_frame
+    }
 
     /// Whether the reader reached its sampled extent, not necessarily current EOF.
     #[must_use]
@@ -113,7 +126,8 @@ pub struct InvokeAuditFollower {
 
 impl std::fmt::Debug for InvokeAuditFollower {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("InvokeAuditFollower")
+        formatter
+            .debug_struct("InvokeAuditFollower")
             .field("bytes", &self.offset)
             .field("records", &self.records)
             .field("zones", &self.tips.len())
@@ -180,7 +194,11 @@ impl InvokeAuditFollower {
     }
 
     fn poll_inner(&mut self) -> Result<InvokeAuditFollowBatch, InvokeAuditSnapshotError> {
-        let length = self.file.metadata().map_err(|error| source_io(&error))?.len();
+        let length = self
+            .file
+            .metadata()
+            .map_err(|error| source_io(&error))?
+            .len();
         if length < self.high_watermark {
             return Err(InvokeAuditSnapshotError::SourceChanged);
         }
@@ -188,7 +206,9 @@ impl InvokeAuditFollower {
             return Err(InvokeAuditSnapshotError::LimitExceeded);
         }
         self.high_watermark = length;
-        self.file.seek(SeekFrom::Start(self.offset)).map_err(|error| source_io(&error))?;
+        self.file
+            .seek(SeekFrom::Start(self.offset))
+            .map_err(|error| source_io(&error))?;
         let mut entries = Vec::new();
         let mut pending_frame = false;
         if self.offset == 0 {
@@ -215,14 +235,19 @@ impl InvokeAuditFollower {
             read_exact_at(&mut self.file, &mut prefix, self.offset)?;
             let size = u32::from_le_bytes(prefix);
             if size == 0 || u64::from(size) > INVOKE_AUDIT_MAX_RECORD_BYTES as u64 {
-                return Err(InvokeAuditSnapshotError::InvalidRecord { offset: self.offset });
+                return Err(InvokeAuditSnapshotError::InvalidRecord {
+                    offset: self.offset,
+                });
             }
             if u64::from(size) > length - self.offset - 4 {
                 pending_frame = true;
                 break;
             }
-            let mut payload = vec![0; usize::try_from(size)
-                .map_err(|_| InvokeAuditSnapshotError::LimitExceeded)?];
+            let mut payload = vec![
+                0;
+                usize::try_from(size)
+                    .map_err(|_| InvokeAuditSnapshotError::LimitExceeded)?
+            ];
             read_exact_at(&mut self.file, &mut payload, self.offset + 4)?;
             let entry = decode_record(&payload, self.offset)?;
             let valid = self.tips.get(&entry.zone_id).map_or_else(
@@ -230,9 +255,12 @@ impl InvokeAuditFollower {
                 |tip| valid_successor(&entry, tip.seq, &tip.id, tip.occurred_at, &tip.hlc),
             );
             if !valid {
-                return Err(InvokeAuditSnapshotError::InvalidLineage { offset: self.offset });
+                return Err(InvokeAuditSnapshotError::InvalidLineage {
+                    offset: self.offset,
+                });
             }
-            self.tips.insert(entry.zone_id.clone(), ZoneTip::from(&entry));
+            self.tips
+                .insert(entry.zone_id.clone(), ZoneTip::from(&entry));
             self.digest.update(&prefix);
             self.digest.update(&payload);
             self.offset += 4 + u64::from(size);
@@ -248,7 +276,11 @@ impl InvokeAuditFollower {
         observed_bytes: u64,
         pending_frame: bool,
     ) -> Result<InvokeAuditFollowBatch, InvokeAuditSnapshotError> {
-        let after = self.file.metadata().map_err(|error| source_io(&error))?.len();
+        let after = self
+            .file
+            .metadata()
+            .map_err(|error| source_io(&error))?
+            .len();
         if after < self.high_watermark {
             return Err(InvokeAuditSnapshotError::SourceChanged);
         }
@@ -269,15 +301,18 @@ impl InvokeAuditFollower {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use super::*;
     use crate::{InvokeAuditChain, InvokeAuditContext, InvokePhase, read_invoke_audit_snapshot};
+    use std::io::Write;
 
     fn context(zone: &str) -> InvokeAuditContext {
         InvokeAuditContext {
-            zone_id: zone.to_owned(), actor: "agent:follow-test".to_owned(),
-            connector_id: "github".to_owned(), operation: "issues.create".to_owned(),
-            operation_id: "request-a".to_owned(), correlation_id: None,
+            zone_id: zone.to_owned(),
+            actor: "agent:follow-test".to_owned(),
+            connector_id: "github".to_owned(),
+            operation: "issues.create".to_owned(),
+            operation_id: "request-a".to_owned(),
+            correlation_id: None,
             occurred_at: 1_700_000_000,
         }
     }
@@ -294,7 +329,12 @@ mod tests {
         file.flush().unwrap();
     }
 
-    fn source() -> (tempfile::TempDir, std::path::PathBuf, File, InvokeAuditFollower) {
+    fn source() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        File,
+        InvokeAuditFollower,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("journal");
         let writer = File::create(&path).unwrap();
@@ -311,7 +351,9 @@ mod tests {
         append(&mut writer, &JOURNAL_V1_MAGIC[3..]);
         assert!(follower.poll().unwrap().caught_up());
         let chain = InvokeAuditChain::new();
-        let entry = chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap();
+        let entry = chain
+            .append(&context("z:work"), InvokePhase::PreflightAllow)
+            .unwrap();
         let bytes = frame(&entry);
         for part in [&bytes[..1], &bytes[1..3], &bytes[3..bytes.len() - 1]] {
             append(&mut writer, part);
@@ -324,7 +366,10 @@ mod tests {
         let batch = follower.poll().unwrap();
         assert_eq!(batch.entries(), &[entry]);
         assert!(batch.caught_up());
-        assert_eq!(batch.digest(), read_invoke_audit_snapshot(&path).unwrap().digest());
+        assert_eq!(
+            batch.digest(),
+            read_invoke_audit_snapshot(&path).unwrap().digest()
+        );
         assert!(follower.poll().unwrap().entries().is_empty());
     }
 
@@ -336,9 +381,14 @@ mod tests {
         let chain = InvokeAuditChain::open_with_journal(&path).unwrap();
         let mut follower = InvokeAuditFollower::open(&path).unwrap();
         assert!(follower.poll().unwrap().caught_up());
-        for phase in [InvokePhase::PreflightAllow, InvokePhase::DispatchResult {
-            success: true, receipt_id: None, duration_ms: 4,
-        }] {
+        for phase in [
+            InvokePhase::PreflightAllow,
+            InvokePhase::DispatchResult {
+                success: true,
+                receipt_id: None,
+                duration_ms: 4,
+            },
+        ] {
             let entry = chain.append(&context("z:work"), phase).unwrap();
             assert_eq!(follower.poll().unwrap().entries(), &[entry]);
         }
@@ -353,8 +403,14 @@ mod tests {
         let chain = InvokeAuditChain::new();
         let count = INVOKE_AUDIT_FOLLOW_BATCH_RECORDS * 2 + 1;
         for index in 0..count {
-            let zone = if index % 2 == 0 { "z:work" } else { "z:private" };
-            let entry = chain.append(&context(zone), InvokePhase::PreflightAllow).unwrap();
+            let zone = if index % 2 == 0 {
+                "z:work"
+            } else {
+                "z:private"
+            };
+            let entry = chain
+                .append(&context(zone), InvokePhase::PreflightAllow)
+                .unwrap();
             append(&mut writer, &frame(&entry));
         }
         let mut all = Vec::new();
@@ -379,13 +435,20 @@ mod tests {
         let (_directory, _path, mut writer, mut follower) = source();
         append(&mut writer, JOURNAL_V1_MAGIC);
         let chain = InvokeAuditChain::new();
-        let entry = chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap();
+        let entry = chain
+            .append(&context("z:work"), InvokePhase::PreflightAllow)
+            .unwrap();
         append(&mut writer, &frame(&entry));
-        let mut bad = chain.append(&context("z:private"), InvokePhase::PreflightAllow).unwrap();
+        let mut bad = chain
+            .append(&context("z:private"), InvokePhase::PreflightAllow)
+            .unwrap();
         bad.actor = "must-not-leak".to_owned();
         append(&mut writer, &frame(&bad));
         let error = follower.poll().unwrap_err();
-        assert!(matches!(error, InvokeAuditSnapshotError::InvalidRecord { .. }));
+        assert!(matches!(
+            error,
+            InvokeAuditSnapshotError::InvalidRecord { .. }
+        ));
         assert!(!error.to_string().contains("must-not-leak"));
         assert_eq!(follower.poll().unwrap_err(), error);
     }
@@ -396,10 +459,14 @@ mod tests {
             let (_directory, _path, mut writer, mut follower) = source();
             append(&mut writer, JOURNAL_V1_MAGIC);
             let chain = InvokeAuditChain::new();
-            let first = chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap();
+            let first = chain
+                .append(&context("z:work"), InvokePhase::PreflightAllow)
+                .unwrap();
             append(&mut writer, &frame(&first));
             follower.poll().unwrap();
-            let mut next = chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap();
+            let mut next = chain
+                .append(&context("z:work"), InvokePhase::PreflightAllow)
+                .unwrap();
             match mutation {
                 "sequence" => next.seq += 1,
                 "prev" => next.prev = None,
@@ -409,7 +476,13 @@ mod tests {
             }
             next.id = next.computed_id().unwrap();
             append(&mut writer, &frame(&next));
-            assert!(matches!(follower.poll(), Err(InvokeAuditSnapshotError::InvalidLineage { .. })), "{mutation}");
+            assert!(
+                matches!(
+                    follower.poll(),
+                    Err(InvokeAuditSnapshotError::InvalidLineage { .. })
+                ),
+                "{mutation}"
+            );
         }
     }
 
@@ -420,14 +493,23 @@ mod tests {
         append(&mut writer, &[1, 0]);
         assert!(follower.poll().unwrap().pending_frame());
         writer.set_len(JOURNAL_V1_MAGIC.len() as u64).unwrap();
-        assert_eq!(follower.poll().unwrap_err(), InvokeAuditSnapshotError::SourceChanged);
-        assert_eq!(follower.poll().unwrap_err(), InvokeAuditSnapshotError::SourceChanged);
+        assert_eq!(
+            follower.poll().unwrap_err(),
+            InvokeAuditSnapshotError::SourceChanged
+        );
+        assert_eq!(
+            follower.poll().unwrap_err(),
+            InvokeAuditSnapshotError::SourceChanged
+        );
     }
 
     #[test]
     fn complete_bad_headers_and_frame_lengths_are_terminal() {
-        for bytes in [b"FCPAUD9\n".to_vec(), [JOURNAL_V1_MAGIC.as_slice(), &[0, 0, 0, 0]].concat(),
-            [JOURNAL_V1_MAGIC.as_slice(), &u32::MAX.to_le_bytes()].concat()] {
+        for bytes in [
+            b"FCPAUD9\n".to_vec(),
+            [JOURNAL_V1_MAGIC.as_slice(), &[0, 0, 0, 0]].concat(),
+            [JOURNAL_V1_MAGIC.as_slice(), &u32::MAX.to_le_bytes()].concat(),
+        ] {
             let (_directory, _path, mut writer, mut follower) = source();
             append(&mut writer, &bytes);
             let error = follower.poll().unwrap_err();
@@ -442,10 +524,16 @@ mod tests {
         follower.poll().unwrap();
         follower.records = INVOKE_AUDIT_MAX_ENTRIES;
         append(&mut writer, &[1]);
-        assert_eq!(follower.poll().unwrap_err(), InvokeAuditSnapshotError::LimitExceeded);
+        assert_eq!(
+            follower.poll().unwrap_err(),
+            InvokeAuditSnapshotError::LimitExceeded
+        );
         let (_directory, _path, writer, mut follower) = source();
         writer.set_len(INVOKE_AUDIT_MAX_JOURNAL_BYTES + 1).unwrap();
-        assert_eq!(follower.poll().unwrap_err(), InvokeAuditSnapshotError::LimitExceeded);
+        assert_eq!(
+            follower.poll().unwrap_err(),
+            InvokeAuditSnapshotError::LimitExceeded
+        );
     }
 
     #[cfg(unix)]
@@ -457,7 +545,9 @@ mod tests {
         std::fs::rename(&path, path.with_extension("old")).unwrap();
         std::fs::write(&path, b"not-the-original-source").unwrap();
         let chain = InvokeAuditChain::new();
-        let entry = chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap();
+        let entry = chain
+            .append(&context("z:work"), InvokePhase::PreflightAllow)
+            .unwrap();
         append(&mut writer, &frame(&entry));
         assert_eq!(follower.poll().unwrap().entries(), &[entry]);
     }
@@ -470,7 +560,14 @@ mod tests {
         assert!(!missing.parent().unwrap().exists());
         append(&mut writer, JOURNAL_V1_MAGIC);
         let chain = InvokeAuditChain::new();
-        append(&mut writer, &frame(&chain.append(&context("z:work"), InvokePhase::PreflightAllow).unwrap()));
+        append(
+            &mut writer,
+            &frame(
+                &chain
+                    .append(&context("z:work"), InvokePhase::PreflightAllow)
+                    .unwrap(),
+            ),
+        );
         let batch = follower.poll().unwrap();
         for text in [format!("{follower:?}"), format!("{batch:?}")] {
             assert!(!text.contains("agent:follow-test"));

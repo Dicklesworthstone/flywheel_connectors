@@ -4049,6 +4049,7 @@ fn command_contract(command: &str) -> Option<Value> {
             "family": "execution",
             "summary": "Inspect a retained local host invocation attempt by its stable request ID.",
             "intended_shape": "Read-only admin lookup that keeps the observed source outcome, host-job liveness and response finalization separate. Missing local history never proves absence of effects.",
+            "next_beads": ["flywheel_connectors-1g7z0.10", "flywheel_connectors-1g7z0.4"],
             "workflow_handoff": [
                 "Use fwc invocation <request-id> --host <executor-host> --admin-token-file <path> after an uncertain invoke response.",
                 "Supply --attempt-id to inspect one exact attempt; a mesh gateway may not retain the executor's record.",

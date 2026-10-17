@@ -740,6 +740,7 @@ mod adversarial {
         // In FCP, NodeAttestation scope is used for device removal
         let revocation = RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.core",
                     "RevocationObject",
@@ -1503,6 +1504,7 @@ mod device_removal {
 
         let revocation = RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.core",
                     "RevocationObject",
@@ -1566,6 +1568,7 @@ mod device_removal {
 
         let revocation = RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.core",
                     "RevocationObject",
@@ -1684,6 +1687,7 @@ mod device_removal {
         // Create single revocation for all devices
         let revocation = RevocationObject {
             header: fcp_core::ObjectHeader {
+                encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                 schema: fcp_cbor::SchemaId::new(
                     "fcp.core",
                     "RevocationObject",

@@ -91,7 +91,8 @@ pub struct InvokeAuditSnapshot {
 
 impl std::fmt::Debug for InvokeAuditSnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("InvokeAuditSnapshot")
+        formatter
+            .debug_struct("InvokeAuditSnapshot")
             .field("entries", &self.entries.len())
             .field("bytes", &self.bytes)
             .field("zones", &self.tips.len())
@@ -165,7 +166,11 @@ fn open_snapshot_source(path: &Path) -> Result<File, InvokeAuditSnapshotError> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path).map_err(|error| source_io(&error))?;
-    if !file.metadata().map_err(|error| source_io(&error))?.is_file() {
+    if !file
+        .metadata()
+        .map_err(|error| source_io(&error))?
+        .is_file()
+    {
         return Err(InvokeAuditSnapshotError::NotRegularFile);
     }
     Ok(file)
@@ -190,7 +195,8 @@ pub fn read_invoke_audit_snapshot_from_file(
     }
     let length = metadata.len();
     validate_extent(length)?;
-    file.seek(SeekFrom::Start(0)).map_err(|error| source_io(&error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| source_io(&error))?;
     let snapshot = decode_snapshot(&mut *file, length)?;
     if file.metadata().map_err(|error| source_io(&error))?.len() < length {
         return Err(InvokeAuditSnapshotError::SourceChanged);
@@ -225,7 +231,8 @@ fn read_exact_at(
 fn decode_record(payload: &[u8], offset: u64) -> Result<AuditEntry, InvokeAuditSnapshotError> {
     let entry: AuditEntry = serde_json::from_slice(payload)
         .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
-    let id = entry.computed_id()
+    let id = entry
+        .computed_id()
         .map_err(|_| InvokeAuditSnapshotError::InvalidRecord { offset })?;
     if entry.id != id {
         return Err(InvokeAuditSnapshotError::InvalidRecord { offset });
@@ -278,8 +285,8 @@ fn decode_snapshot(
         if u64::from(size) > length - offset - 4 {
             return Err(InvokeAuditSnapshotError::Incomplete { offset });
         }
-        let size_usize = usize::try_from(size)
-            .map_err(|_| InvokeAuditSnapshotError::LimitExceeded)?;
+        let size_usize =
+            usize::try_from(size).map_err(|_| InvokeAuditSnapshotError::LimitExceeded)?;
         let mut payload = vec![0; size_usize];
         read_exact_at(&mut reader, &mut payload, offset + 4)?;
         let entry = decode_record(&payload, offset)?;
@@ -287,7 +294,13 @@ fn decode_snapshot(
             || entry.seq == 0 && entry.prev.is_none(),
             |index| {
                 let previous = &entries[*index];
-                valid_successor(&entry, previous.seq, &previous.id, previous.occurred_at, &previous.hlc)
+                valid_successor(
+                    &entry,
+                    previous.seq,
+                    &previous.id,
+                    previous.occurred_at,
+                    &previous.hlc,
+                )
             },
         );
         if !lineage_valid {
@@ -343,9 +356,16 @@ mod tests {
         let request = context("z:work", "request-a");
         vec![
             chain.append(&request, InvokePhase::PreflightAllow).unwrap(),
-            chain.append(&request, InvokePhase::DispatchResult {
-                receipt_id: None, success: true, duration_ms: 12,
-            }).unwrap(),
+            chain
+                .append(
+                    &request,
+                    InvokePhase::DispatchResult {
+                        receipt_id: None,
+                        success: true,
+                        duration_ms: 12,
+                    },
+                )
+                .unwrap(),
         ]
     }
 
@@ -355,21 +375,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("invoke.journal");
         let writer = InvokeAuditChain::open_with_journal(&path).unwrap();
-        let first = writer.append(&context("z:work", "a"), InvokePhase::PreflightAllow).unwrap();
-        let second = writer.append(&context("z:private", "b"), InvokePhase::PreflightAllow).unwrap();
+        let first = writer
+            .append(&context("z:work", "a"), InvokePhase::PreflightAllow)
+            .unwrap();
+        let second = writer
+            .append(&context("z:private", "b"), InvokePhase::PreflightAllow)
+            .unwrap();
         let before = std::fs::read(&path).unwrap();
         let snapshot = read_invoke_audit_snapshot(&path).unwrap();
         assert_eq!(snapshot.entries(), &[first, second]);
         assert_eq!(snapshot.zone_heads().count(), 2);
         assert_eq!(snapshot.bytes(), before.len() as u64);
-        assert_eq!(snapshot.digest(), format!("blake3:{}", blake3::hash(&before).to_hex()));
+        assert_eq!(
+            snapshot.digest(),
+            format!("blake3:{}", blake3::hash(&before).to_hex())
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(InvokeAuditChain::open_with_journal(&path).is_err());
-        writer.append(&context("z:work", "a"), InvokePhase::DispatchError {
-            error: "dispatch_failed".to_owned(), duration_ms: 20,
-        }).unwrap();
+        writer
+            .append(
+                &context("z:work", "a"),
+                InvokePhase::DispatchError {
+                    error: "dispatch_failed".to_owned(),
+                    duration_ms: 20,
+                },
+            )
+            .unwrap();
         assert_eq!(snapshot.entries().len(), 2);
-        assert_eq!(read_invoke_audit_snapshot(&path).unwrap().entries().len(), 3);
+        assert_eq!(
+            read_invoke_audit_snapshot(&path).unwrap().entries().len(),
+            3
+        );
     }
 
     #[test]
@@ -377,7 +413,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("closed.journal");
         let writer = InvokeAuditChain::open_with_journal(&path).unwrap();
-        let entry = writer.append(&context("z:work", "a"), InvokePhase::PreflightAllow).unwrap();
+        let entry = writer
+            .append(&context("z:work", "a"), InvokePhase::PreflightAllow)
+            .unwrap();
         drop(writer);
         let before = std::fs::read(&path).unwrap();
         let snapshot = read_invoke_audit_snapshot(&path).unwrap();
@@ -404,19 +442,34 @@ mod tests {
         let first_length = frames(&entries[..1]).len();
         let bytes = frames(&entries);
         for end in [0, 3, 7, first_length + 1, first_length + 3, bytes.len() - 1] {
-            assert!(matches!(decode(&bytes[..end]), Err(InvokeAuditSnapshotError::Incomplete { .. })));
+            assert!(matches!(
+                decode(&bytes[..end]),
+                Err(InvokeAuditSnapshotError::Incomplete { .. })
+            ));
         }
-        assert!(matches!(decode_snapshot(&bytes[..first_length], bytes.len() as u64),
-            Err(InvokeAuditSnapshotError::Incomplete { .. })));
+        assert!(matches!(
+            decode_snapshot(&bytes[..first_length], bytes.len() as u64),
+            Err(InvokeAuditSnapshotError::Incomplete { .. })
+        ));
     }
 
     #[test]
     fn rejects_unsupported_format_zero_and_oversized_frames() {
-        assert_eq!(decode(b"FCPAUD2\n").unwrap_err(), InvokeAuditSnapshotError::UnsupportedFormat);
-        for size in [0, u32::try_from(INVOKE_AUDIT_MAX_RECORD_BYTES + 1).unwrap(), u32::MAX] {
+        assert_eq!(
+            decode(b"FCPAUD2\n").unwrap_err(),
+            InvokeAuditSnapshotError::UnsupportedFormat
+        );
+        for size in [
+            0,
+            u32::try_from(INVOKE_AUDIT_MAX_RECORD_BYTES + 1).unwrap(),
+            u32::MAX,
+        ] {
             let mut bytes = JOURNAL_V1_MAGIC.to_vec();
             bytes.extend_from_slice(&size.to_le_bytes());
-            assert!(matches!(decode(&bytes), Err(InvokeAuditSnapshotError::InvalidRecord { .. })));
+            assert!(matches!(
+                decode(&bytes),
+                Err(InvokeAuditSnapshotError::InvalidRecord { .. })
+            ));
         }
     }
 
@@ -428,19 +481,26 @@ mod tests {
                 panic!("over-budget input must not be read");
             }
         }
-        assert_eq!(decode_snapshot(Unreadable, INVOKE_AUDIT_MAX_JOURNAL_BYTES + 1).unwrap_err(),
-            InvokeAuditSnapshotError::LimitExceeded);
+        assert_eq!(
+            decode_snapshot(Unreadable, INVOKE_AUDIT_MAX_JOURNAL_BYTES + 1).unwrap_err(),
+            InvokeAuditSnapshotError::LimitExceeded
+        );
     }
 
     #[test]
     fn corrupted_identity_in_any_zone_refuses_the_whole_snapshot() {
         let mut entries = entries();
         let other = InvokeAuditChain::new();
-        let mut unrelated = other.append(&context("z:private", "other"), InvokePhase::PreflightAllow).unwrap();
+        let mut unrelated = other
+            .append(&context("z:private", "other"), InvokePhase::PreflightAllow)
+            .unwrap();
         unrelated.actor = "untrusted-secret-actor".to_owned();
         entries.insert(1, unrelated);
         let error = decode(&frames(&entries)).unwrap_err();
-        assert!(matches!(error, InvokeAuditSnapshotError::InvalidRecord { .. }));
+        assert!(matches!(
+            error,
+            InvokeAuditSnapshotError::InvalidRecord { .. }
+        ));
         assert!(!error.to_string().contains("untrusted-secret"));
     }
 
@@ -458,7 +518,13 @@ mod tests {
             for entry in &mut entries {
                 entry.id = entry.computed_id().unwrap();
             }
-            assert!(matches!(decode(&frames(&entries)), Err(InvokeAuditSnapshotError::InvalidLineage { .. })), "{mutation}");
+            assert!(
+                matches!(
+                    decode(&frames(&entries)),
+                    Err(InvokeAuditSnapshotError::InvalidLineage { .. })
+                ),
+                "{mutation}"
+            );
         }
     }
 
@@ -466,7 +532,10 @@ mod tests {
     fn duplicate_frames_are_not_silently_deduplicated() {
         let mut entries = entries();
         entries.push(entries[1].clone());
-        assert!(matches!(decode(&frames(&entries)), Err(InvokeAuditSnapshotError::InvalidLineage { .. })));
+        assert!(matches!(
+            decode(&frames(&entries)),
+            Err(InvokeAuditSnapshotError::InvalidLineage { .. })
+        ));
     }
 
     #[test]
@@ -478,7 +547,10 @@ mod tests {
         let missing = directory.path().join("missing").join("journal");
         assert!(read_invoke_audit_snapshot(&missing).is_err());
         assert!(!missing.parent().unwrap().exists());
-        assert!(matches!(read_invoke_audit_snapshot(directory.path()), Err(InvokeAuditSnapshotError::NotRegularFile)));
+        assert!(matches!(
+            read_invoke_audit_snapshot(directory.path()),
+            Err(InvokeAuditSnapshotError::NotRegularFile)
+        ));
     }
 
     #[test]
@@ -487,7 +559,11 @@ mod tests {
         impl Read for FailsAfterPrefix {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 let count = self.0.read(buffer)?;
-                if count == 0 { Err(io::Error::other("payload-and-path-secret")) } else { Ok(count) }
+                if count == 0 {
+                    Err(io::Error::other("payload-and-path-secret"))
+                } else {
+                    Ok(count)
+                }
             }
         }
         let bytes = frames(&entries()[..1]);
@@ -505,7 +581,10 @@ mod tests {
         std::fs::write(&source, JOURNAL_V1_MAGIC).unwrap();
         let link = directory.path().join("link");
         std::os::unix::fs::symlink(&source, &link).unwrap();
-        assert_eq!(read_invoke_audit_snapshot(&link).unwrap_err(), InvokeAuditSnapshotError::NotRegularFile);
+        assert_eq!(
+            read_invoke_audit_snapshot(&link).unwrap_err(),
+            InvokeAuditSnapshotError::NotRegularFile
+        );
         assert_eq!(std::fs::read(source).unwrap(), JOURNAL_V1_MAGIC.as_slice());
     }
 

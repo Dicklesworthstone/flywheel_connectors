@@ -24,10 +24,8 @@ const MAX_OPERATION_ID_BYTES: usize = 512;
 const MAX_MESH_INVOCATION_ATTEMPTS: usize = 256;
 const INVOCATION_QUERY_PATH: &str = "/rpc/admin/invocations";
 const HISTORY_SCOPE: &str = "selected-host-invocation-history";
-const MISSING_HISTORY_CAVEAT: &str =
-    "A missing retained record does not prove that the operation had no effects. Origin forwarding and executor-local histories are distinct, and completed history is bounded.";
-const MESH_HISTORY_CAVEAT: &str =
-    "Origin forwarding evidence covers this host's retained attempt. It does not establish remote cancellation, provide a replayable result, or guarantee mesh-wide exactly-once execution.";
+const MISSING_HISTORY_CAVEAT: &str = "A missing retained record does not prove that the operation had no effects. Origin forwarding and executor-local histories are distinct, and completed history is bounded.";
+const MESH_HISTORY_CAVEAT: &str = "Origin forwarding evidence covers this host's retained attempt. It does not establish remote cancellation, provide a replayable result, or guarantee mesh-wide exactly-once execution.";
 
 #[derive(Args, Debug)]
 pub(crate) struct InvocationArgs {
@@ -186,7 +184,9 @@ fn read_admin_token(path: Option<&std::path::Path>) -> std::result::Result<Strin
     let token = value.trim();
     if token.is_empty()
         || !token.is_ascii()
-        || token.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return Err(LookupFailure::InvalidCredential);
     }
@@ -250,7 +250,9 @@ fn query_invocation(
         record.ticket.operation_id != request.operation_id
             || record.admission.operation_id != request.operation_id
             || record.ticket.attempt_id == 0
-            || request.attempt_id.is_some_and(|attempt| attempt != record.ticket.attempt_id)
+            || request
+                .attempt_id
+                .is_some_and(|attempt| attempt != record.ticket.attempt_id)
     }) || response
         .mesh_invocation
         .as_ref()
@@ -268,7 +270,9 @@ fn mesh_record_matches_query(
     if record.ticket.operation_id != request.operation_id
         || record.intent.operation_id != request.operation_id
         || record.ticket.attempt_id == 0
-        || request.attempt_id.is_some_and(|attempt| attempt != record.ticket.attempt_id)
+        || request
+            .attempt_id
+            .is_some_and(|attempt| attempt != record.ticket.attempt_id)
         || record.attempts.len() > MAX_MESH_INVOCATION_ATTEMPTS
         || record.terminal.is_some() != record.finished_at.is_some()
         || record
@@ -377,11 +381,21 @@ fn lookup_result(
         "active-record-unavailable" => {
             "The host reports an active job without a retained attempt. Local execution or forwarding to a mesh executor may still be awaiting admission. This liveness observation does not establish execution effects or promise a record."
         }
-        "running" => "The host reports an active job and a retained admission without a terminal observation.",
-        "outcome-unknown" => "The host cannot establish the operation's final effects. This record does not authorize another execution.",
-        "source-observed-finalizing" => "The source outcome was recorded and the host job is still active. Response, audit, or sampling finalization is not yet complete.",
-        "source-observed-finalization-incomplete" => "The source outcome was recorded, but response, audit, or sampling finalization did not finish. Inspect the source outcome separately from finalization.",
-        _ => "The host retained both the source outcome and final response status. A successful lookup does not mean the invocation itself succeeded.",
+        "running" => {
+            "The host reports an active job and a retained admission without a terminal observation."
+        }
+        "outcome-unknown" => {
+            "The host cannot establish the operation's final effects. This record does not authorize another execution."
+        }
+        "source-observed-finalizing" => {
+            "The source outcome was recorded and the host job is still active. Response, audit, or sampling finalization is not yet complete."
+        }
+        "source-observed-finalization-incomplete" => {
+            "The source outcome was recorded, but response, audit, or sampling finalization did not finish. Inspect the source outcome separately from finalization."
+        }
+        _ => {
+            "The host retained both the source outcome and final response status. A successful lookup does not mean the invocation itself succeeded."
+        }
     };
     let mut payload = json!({
         "status": "ok",
@@ -460,7 +474,10 @@ fn mesh_lookup_result(
             "The origin retained a validated connector error response from the selected mesh executor. The lookup succeeded; the recorded invocation did not succeed.",
         ),
     };
-    let (identity_basis, origin_principal_verified, identity_message) = match &record.intent.identity {
+    let (identity_basis, origin_principal_verified, identity_message) = match &record
+        .intent
+        .identity
+    {
         MeshInvocationIdentity::VerifiedPrincipal { .. } => (
             "verified-principal",
             true,
@@ -654,7 +671,8 @@ impl InvokeOutcomeUnknown {
         });
         let mut envelope = CommandEnvelope::new(CommandAvailability::Unknown, command);
         envelope.explanation =
-            "The invoke outcome is unknown; repeating the execution may duplicate effects.".to_owned();
+            "The invoke outcome is unknown; repeating the execution may duplicate effects."
+                .to_owned();
         envelope.recoverable = false;
         envelope.next_actions = next_actions;
         envelope.inject_into(&mut payload);
@@ -752,8 +770,12 @@ mod tests {
                     }
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -832,7 +854,11 @@ mod tests {
         fn finish(mut self) -> CapturedRequest {
             let captured = self.observed.recv_timeout(Duration::from_secs(5)).unwrap();
             let _ = self.release.send(());
-            self.worker.take().unwrap().join().expect("test host completed");
+            self.worker
+                .take()
+                .unwrap()
+                .join()
+                .expect("test host completed");
             captured
         }
     }
@@ -944,7 +970,10 @@ mod tests {
         }
     }
 
-    fn execute_lookup(host: &str, attempt: Option<&str>) -> (std::process::ExitCode, Value, String) {
+    fn execute_lookup(
+        host: &str,
+        attempt: Option<&str>,
+    ) -> (std::process::ExitCode, Value, String) {
         let directory = tempfile::tempdir().unwrap();
         let token_path = directory.path().join("admin.token");
         std::fs::write(&token_path, "fixture-admin-secret\n").unwrap();
@@ -979,9 +1008,15 @@ mod tests {
         let captured = host.finish();
 
         assert_eq!(captured.line, "POST /rpc/admin/invocations HTTP/1.1");
-        assert_eq!(captured.headers["authorization"], "Bearer fixture-admin-secret");
+        assert_eq!(
+            captured.headers["authorization"],
+            "Bearer fixture-admin-secret"
+        );
         assert_eq!(captured.headers["x-fcp-zone"], "z:owner");
-        assert_eq!(captured.body, json!({"operation_id": "req-inspect", "attempt_id": 7}));
+        assert_eq!(
+            captured.body,
+            json!({"operation_id": "req-inspect", "attempt_id": 7})
+        );
         assert_eq!(exit, CliExitCode::Success.into());
         assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["scope"], HISTORY_SCOPE);
@@ -989,7 +1024,10 @@ mod tests {
         assert_eq!(payload["source_outcome_known"], true);
         assert_eq!(payload["finalization_complete"], true);
         assert_eq!(payload["invocation"]["terminal"]["outcome"], "succeeded");
-        assert_eq!(payload["invocation"]["finalization"]["response_http_status"], 502);
+        assert_eq!(
+            payload["invocation"]["finalization"]["response_http_status"],
+            502
+        );
         assert_eq!(payload["automatic_retry_allowed"], false);
         assert!(!rendered.contains("fixture-admin-secret"));
     }
@@ -1010,7 +1048,12 @@ mod tests {
             assert_eq!(payload["execution_state"], "not-retained");
             assert_eq!(payload["source_outcome_known"], false);
             assert_eq!(payload["automatic_retry_allowed"], false);
-            assert!(payload["caveats"][0].as_str().unwrap().contains("does not prove"));
+            assert!(
+                payload["caveats"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("does not prove")
+            );
         }
     }
 
@@ -1064,9 +1107,15 @@ mod tests {
         let captured = host.finish();
 
         assert_eq!(captured.line, "POST /rpc/admin/invocations HTTP/1.1");
-        assert_eq!(captured.headers["authorization"], "Bearer fixture-admin-secret");
+        assert_eq!(
+            captured.headers["authorization"],
+            "Bearer fixture-admin-secret"
+        );
         assert_eq!(captured.headers["x-fcp-zone"], "z:owner");
-        assert_eq!(captured.body, json!({"operation_id": "req-inspect", "attempt_id": 8}));
+        assert_eq!(
+            captured.body,
+            json!({"operation_id": "req-inspect", "attempt_id": 8})
+        );
         assert_eq!(exit, CliExitCode::Success.into());
         assert_eq!(payload["_truth_source"], "host");
         assert_eq!(payload["scope"], HISTORY_SCOPE);
@@ -1082,7 +1131,12 @@ mod tests {
         assert_eq!(payload["selected_executor"], "peer-executor");
         assert_eq!(payload["identity_basis"], "exact-token-relay");
         assert_eq!(payload["origin_principal_verified"], false);
-        assert!(payload["identity_message"].as_str().unwrap().contains("not a verified identity"));
+        assert!(
+            payload["identity_message"]
+                .as_str()
+                .unwrap()
+                .contains("not a verified identity")
+        );
         assert_eq!(payload["automatic_retry_allowed"], false);
         assert!(!rendered.contains("fixture-admin-secret"));
     }
@@ -1090,35 +1144,47 @@ mod tests {
     #[test]
     fn invocation_lookup_mesh_reply_observations_keep_read_status_separate() {
         for (outcome, expected_state, source_known) in [
-            (MeshInvocationOutcome::Succeeded, "mesh-response-observed", true),
-            (MeshInvocationOutcome::ConnectorError, "mesh-response-observed", true),
-            (MeshInvocationOutcome::NotDelivered, "mesh-not-delivered", false),
+            (
+                MeshInvocationOutcome::Succeeded,
+                "mesh-response-observed",
+                true,
+            ),
+            (
+                MeshInvocationOutcome::ConnectorError,
+                "mesh-response-observed",
+                true,
+            ),
+            (
+                MeshInvocationOutcome::NotDelivered,
+                "mesh-not-delivered",
+                false,
+            ),
         ] {
-            let host = TestHost::start(Reply::Json(
-                200,
-                {
-                    let mut record = forwarded_record(Some(outcome), true);
-                    if source_known {
-                        // A peer's successful HTTP code can differ from the
-                        // origin's final response status without changing the
-                        // validated connector outcome.
-                        record.attempts.last_mut().unwrap().observation =
-                            Some(MeshInvocationObservation::ResponseObserved { http_status: 201 });
-                    }
-                    json!({
-                        "invocation": null,
-                        "mesh_invocation": record,
-                        "host_job_active": false,
-                    })
-                },
-            ));
+            let host = TestHost::start(Reply::Json(200, {
+                let mut record = forwarded_record(Some(outcome), true);
+                if source_known {
+                    // A peer's successful HTTP code can differ from the
+                    // origin's final response status without changing the
+                    // validated connector outcome.
+                    record.attempts.last_mut().unwrap().observation =
+                        Some(MeshInvocationObservation::ResponseObserved { http_status: 201 });
+                }
+                json!({
+                    "invocation": null,
+                    "mesh_invocation": record,
+                    "host_job_active": false,
+                })
+            }));
             let (exit, payload, _) = execute_lookup(&host.endpoint, Some("8"));
             host.finish();
 
             assert_eq!(exit, CliExitCode::Success.into());
             assert_eq!(payload["status"], "ok");
             assert_eq!(payload["lookup_succeeded"], true);
-            assert_eq!(payload["mesh_invocation"]["terminal"]["outcome"], json!(outcome));
+            assert_eq!(
+                payload["mesh_invocation"]["terminal"]["outcome"],
+                json!(outcome)
+            );
             assert_eq!(payload["execution_state"], expected_state);
             assert_eq!(payload["source_outcome_known"], source_known);
             assert_eq!(payload["finalization_complete"], false);
@@ -1172,7 +1238,9 @@ mod tests {
                 1 => response["mesh_invocation"]["intent"]["operation_id"] = json!("other-request"),
                 2 => response["mesh_invocation"]["ticket"]["attempt_id"] = json!(0),
                 3 => {}
-                4 => response["invocation"] = json!(record(Some(InvocationOutcome::Succeeded), true)),
+                4 => {
+                    response["invocation"] = json!(record(Some(InvocationOutcome::Succeeded), true))
+                }
                 5 => {
                     response["mesh_invocation"]["attempts"][1]["observation"] =
                         json!({"kind": "outcome_unknown"});
@@ -1217,7 +1285,10 @@ mod tests {
             let (exit, payload, rendered) = execute_lookup(&host.endpoint, requested_attempt);
             host.finish();
             assert_eq!(exit, CliExitCode::Transport.into(), "case {case}");
-            assert_eq!(payload["error"]["type"], "invalid-invocation-query-response");
+            assert_eq!(
+                payload["error"]["type"],
+                "invalid-invocation-query-response"
+            );
             assert_eq!(payload["automatic_retry_allowed"], false);
             assert!(payload.get("mesh_invocation").is_none());
             assert!(!rendered.contains("other-request"));
@@ -1229,8 +1300,16 @@ mod tests {
         for (terminal, active, expected) in [
             (None, true, "running"),
             (None, false, "outcome-unknown"),
-            (Some(InvocationOutcome::OutcomeUnknown), true, "outcome-unknown"),
-            (Some(InvocationOutcome::Succeeded), true, "source-observed-finalizing"),
+            (
+                Some(InvocationOutcome::OutcomeUnknown),
+                true,
+                "outcome-unknown",
+            ),
+            (
+                Some(InvocationOutcome::Succeeded),
+                true,
+                "source-observed-finalizing",
+            ),
             (
                 Some(InvocationOutcome::Succeeded),
                 false,
@@ -1262,11 +1341,7 @@ mod tests {
             (false, "source-observed-finalization-incomplete"),
         ] {
             let mut incomplete = record(Some(InvocationOutcome::Succeeded), true);
-            incomplete
-                .finalization
-                .as_mut()
-                .unwrap()
-                .sampling_completed = Some(false);
+            incomplete.finalization.as_mut().unwrap().sampling_completed = Some(false);
             let outcome = lookup_result(
                 &args(None),
                 "http://127.0.0.1:8787",
@@ -1323,7 +1398,10 @@ mod tests {
             let (exit, payload, rendered) = execute_lookup(&host.endpoint, requested_attempt);
             host.finish();
             assert_eq!(exit, CliExitCode::Transport.into());
-            assert_eq!(payload["error"]["type"], "invalid-invocation-query-response");
+            assert_eq!(
+                payload["error"]["type"],
+                "invalid-invocation-query-response"
+            );
             assert!(payload.get("invocation").is_none());
             assert!(!rendered.contains("other-request"));
         }
@@ -1407,7 +1485,13 @@ mod tests {
         host.finish();
         assert_eq!(exit, CliExitCode::Success.into());
         assert_eq!(payload["found"], true);
-        assert_eq!(payload["mesh_invocation"]["attempts"].as_array().unwrap().len(), 256);
+        assert_eq!(
+            payload["mesh_invocation"]["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            256
+        );
         assert_eq!(payload["execution_state"], "outcome-unknown");
         assert_eq!(payload["automatic_retry_allowed"], false);
     }
@@ -1435,7 +1519,9 @@ mod tests {
         invalid.attempt_id = None;
         invalid.operation_id = "x".repeat(MAX_OPERATION_ID_BYTES + 1);
         assert_eq!(
-            dispatch(&invalid, Some("http://127.0.0.1:1")).unwrap().exit_code,
+            dispatch(&invalid, Some("http://127.0.0.1:1"))
+                .unwrap()
+                .exit_code,
             CliExitCode::Validation
         );
 
@@ -1465,14 +1551,14 @@ mod tests {
     }
 
     fn invoke_request() -> InvokeRequest {
+        let auth = crate::ResolvedLiveAuth::for_test_token(crate::CapabilityToken::test_token());
         crate::build_live_invoke_request(
             "fcp.github:enterprise:v1",
             "github.create_issue",
             "z:work",
             json!({"private_input": "raw-private-payload"}),
             crate::RequestId::new("req-inspect"),
-            crate::CapabilityToken::test_token(),
-            Vec::new(),
+            &auth,
             None,
             None,
             None,
@@ -1485,25 +1571,34 @@ mod tests {
         let host = TestHost::start(Reply::Disconnect);
         let client = HostAdminClient::new(&host.endpoint).unwrap();
         let request = invoke_request();
-        let error = client.invoke(&request).expect_err("server drops response after reading body");
+        let error = client
+            .invoke(&request)
+            .expect_err("server drops response after reading body");
         let captured = host.finish();
         assert_eq!(captured.line, "POST /rpc/invoke HTTP/1.1");
         assert_eq!(captured.body["id"], "req-inspect");
         assert!(captured.headers.get("authorization").is_none());
         assert!(captured.headers.get("x-fcp-zone").is_none());
 
-        let args = ["fwc", "--json", "pipeline", "run", "pipeline.toml"]
-            .map(str::to_owned);
+        let args = ["fwc", "--json", "pipeline", "run", "pipeline.toml"].map(str::to_owned);
         let dispatch = crate::internal_error_dispatch(&args, &error);
         assert_eq!(dispatch.exit_code, CliExitCode::Transport);
         assert_eq!(dispatch.payload["request_id"], "req-inspect");
         assert_eq!(dispatch.payload["request"]["request_id"], "req-inspect");
         assert_eq!(dispatch.payload["outcome"], "outcome_unknown");
         assert_eq!(dispatch.payload["automatic_retry_allowed"], false);
-        assert_eq!(dispatch.payload["inspection"]["operation_id"], "req-inspect");
+        assert_eq!(
+            dispatch.payload["inspection"]["operation_id"],
+            "req-inspect"
+        );
         assert_eq!(dispatch.payload["_truth_source"], "unavailable");
         assert_eq!(dispatch.payload["availability"]["recoverable"], false);
-        assert!(dispatch.payload["next_actions"][0].as_str().unwrap().starts_with("fwc invocation "));
+        assert!(
+            dispatch.payload["next_actions"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("fwc invocation ")
+        );
         assert!(!dispatch.payload.to_string().contains("raw-private-payload"));
         assert!(!error.to_string().contains("raw-private-payload"));
         assert!(dispatch.payload["error"].get("debug_chain").is_none());
@@ -1517,7 +1612,9 @@ mod tests {
         );
         let host = TestHost::start(Reply::Json(200, serde_json::to_value(response).unwrap()));
         let client = HostAdminClient::new(&host.endpoint).unwrap();
-        let error = client.invoke(&invoke_request()).expect_err("wrong response ID");
+        let error = client
+            .invoke(&invoke_request())
+            .expect_err("wrong response ID");
         host.finish();
         let unknown = error.downcast_ref::<InvokeOutcomeUnknown>().unwrap();
         let outcome = unknown.dispatch("invoke");

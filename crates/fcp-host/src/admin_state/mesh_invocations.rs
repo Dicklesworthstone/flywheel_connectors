@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     HostAdminStateSnapshot, HostAdminStateStore, InvocationIdempotency, InvocationQueryResponse,
     InvocationTicket, MAX_RETAINED_INVOCATIONS, invocation_idempotency_conflict,
-    invocation_relay_capability_digest, invocation_state_error,
-    validate_invocation_metadata,
+    invocation_relay_capability_digest, invocation_state_error, validate_invocation_metadata,
 };
 use crate::{HostError, HostResult};
 
@@ -116,7 +115,8 @@ impl MeshInvocationIntent {
                 validate_invocation_metadata(principal, "verified principal")?;
                 if asserted_principal.is_some_and(|asserted| asserted != principal) {
                     return Err(HostError::InvalidFilter(
-                        "mesh invocation asserted principal differs from verified principal".to_string(),
+                        "mesh invocation asserted principal differs from verified principal"
+                            .to_string(),
                     ));
                 }
                 (
@@ -214,7 +214,10 @@ impl MeshInvocationIntent {
     }
 
     const fn has_verified_scope(&self) -> bool {
-        matches!(self.identity, MeshInvocationIdentity::VerifiedPrincipal { .. })
+        matches!(
+            self.identity,
+            MeshInvocationIdentity::VerifiedPrincipal { .. }
+        )
     }
 }
 
@@ -364,7 +367,10 @@ impl MeshInvocationRecord {
                 }
             }
             MeshInvocationOutcome::Succeeded | MeshInvocationOutcome::ConnectorError => {
-                let observed = self.attempts.last().and_then(|attempt| attempt.observation.as_ref());
+                let observed = self
+                    .attempts
+                    .last()
+                    .and_then(|attempt| attempt.observation.as_ref());
                 if !matches!(
                     observed,
                     Some(MeshInvocationObservation::ResponseObserved { http_status })
@@ -586,7 +592,8 @@ impl HostAdminStateSnapshot {
                     },
                     http_status: 503,
                     duration_ms: u64::try_from(
-                        now.signed_duration_since(record.admitted_at).num_milliseconds(),
+                        now.signed_duration_since(record.admitted_at)
+                            .num_milliseconds(),
                     )
                     .unwrap_or(0),
                     receipt_id: None,
@@ -598,7 +605,8 @@ impl HostAdminStateSnapshot {
                 && !unresolved_operations.insert(record.ticket.operation_id.clone())
             {
                 return Err(HostError::Internal(
-                    "persisted invocation identifier has overlapping unresolved attempts".to_string(),
+                    "persisted invocation identifier has overlapping unresolved attempts"
+                        .to_string(),
                 ));
             }
             if record.intent.has_verified_scope()
@@ -609,11 +617,11 @@ impl HostAdminStateSnapshot {
                     .is_some_and(|previous| previous != binding.effect_digest)
                 {
                     return Err(HostError::Internal(
-                        "persisted mesh invocation idempotency effects are inconsistent".to_string(),
+                        "persisted mesh invocation idempotency effects are inconsistent"
+                            .to_string(),
                     ));
                 }
-                if record.is_unresolved()
-                    && !unresolved_scopes.insert(binding.scope_digest.clone())
+                if record.is_unresolved() && !unresolved_scopes.insert(binding.scope_digest.clone())
                 {
                     return Err(HostError::Internal(
                         "persisted mesh invocation idempotency scope has overlapping unresolved attempts"
@@ -638,7 +646,8 @@ impl HostAdminStateSnapshot {
             > MAX_UNVERIFIED_MESH_INVOCATIONS
         {
             return Err(HostError::Internal(
-                "persisted unresolved opaque mesh history exceeds its reserved capacity".to_string(),
+                "persisted unresolved opaque mesh history exceeds its reserved capacity"
+                    .to_string(),
             ));
         }
         Ok(changed)
@@ -792,13 +801,17 @@ impl HostAdminStateStore {
                 .find(|record| record.ticket == *ticket)
                 .ok_or_else(|| invocation_state_error("unknown mesh invocation ticket"))?;
             if record.terminal.is_some() {
-                return Err(invocation_state_error("mesh invocation already has a terminal outcome"));
+                return Err(invocation_state_error(
+                    "mesh invocation already has a terminal outcome",
+                ));
             }
             let attempt = record.attempts.last_mut().ok_or_else(|| {
                 invocation_state_error("mesh invocation has no selected executor")
             })?;
             if attempt.target_node != target_node {
-                return Err(invocation_state_error("mesh observation targets a stale executor"));
+                return Err(invocation_state_error(
+                    "mesh observation targets a stale executor",
+                ));
             }
             if let Some(previous) = &attempt.observation {
                 if previous == &observation {
@@ -836,9 +849,9 @@ impl HostAdminStateStore {
                 .iter_mut()
                 .find(|record| record.ticket == *ticket)
                 .ok_or_else(|| invocation_state_error("unknown mesh invocation ticket"))?;
-            record.validate_terminal(&terminal).map_err(|error| {
-                invocation_state_error(&error.to_string())
-            })?;
+            record
+                .validate_terminal(&terminal)
+                .map_err(|error| invocation_state_error(&error.to_string()))?;
             if let Some(previous) = &record.terminal {
                 if previous == &terminal {
                     return Ok(());
@@ -965,7 +978,8 @@ mod tests {
             correlation_id: None,
             deadline_at: Utc::now() + chrono::Duration::seconds(60),
             idempotency: InvocationIdempotency::from_request(request, "owner").unwrap(),
-            transport_idempotency: InvocationIdempotency::from_relay_request(request, None).unwrap(),
+            transport_idempotency: InvocationIdempotency::from_relay_request(request, None)
+                .unwrap(),
         }
     }
 
@@ -1029,11 +1043,11 @@ mod tests {
         match mode {
             EntryMode::Local => store.admit_invocation(local_admission(source)).await,
             EntryMode::VerifiedMesh => {
-                store.reserve_mesh_invocation(intent(source, Some("owner"))).await
+                store
+                    .reserve_mesh_invocation(intent(source, Some("owner")))
+                    .await
             }
-            EntryMode::OpaqueMesh => {
-                store.reserve_mesh_invocation(intent(source, None)).await
-            }
+            EntryMode::OpaqueMesh => store.reserve_mesh_invocation(intent(source, None)).await,
         }
     }
 
@@ -1071,7 +1085,9 @@ mod tests {
         ));
         assert_eq!(
             verified.identity,
-            MeshInvocationIdentity::VerifiedPrincipal { principal: "owner".to_string() },
+            MeshInvocationIdentity::VerifiedPrincipal {
+                principal: "owner".to_string()
+            },
         );
         assert_ne!(
             relay.idempotency.as_ref().unwrap().scope_digest,
@@ -1130,7 +1146,11 @@ mod tests {
             .is_err()
         );
         let json = serde_json::to_string(&relay).unwrap();
-        for secret in ["private-mesh-input", "private-mesh-idempotency-key", "capability_token"] {
+        for secret in [
+            "private-mesh-input",
+            "private-mesh-idempotency-key",
+            "capability_token",
+        ] {
             assert!(!json.contains(secret));
         }
     }
@@ -1141,10 +1161,17 @@ mod tests {
         let path = directory.path().join("state.json");
         let source = request("mesh-origin");
         let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let ticket = store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
         assert_eq!(ticket.attempt_id, 1);
         assert_eq!(
-            store.mesh_invocation_record("mesh-origin", None).await.unwrap().durable,
+            store
+                .mesh_invocation_record("mesh-origin", None)
+                .await
+                .unwrap()
+                .durable,
             cfg!(unix),
         );
         store
@@ -1155,11 +1182,17 @@ mod tests {
             )
             .await
             .unwrap();
-        store.select_mesh_invocation_target(&ticket, "executor-two").await.unwrap();
+        store
+            .select_mesh_invocation_target(&ticket, "executor-two")
+            .await
+            .unwrap();
         drop(store);
 
         let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let record = reopened.mesh_invocation_record("mesh-origin", None).await.unwrap();
+        let record = reopened
+            .mesh_invocation_record("mesh-origin", None)
+            .await
+            .unwrap();
         assert_eq!(record.ticket, ticket);
         assert_eq!(record.attempts.len(), 2);
         assert_eq!(
@@ -1174,10 +1207,18 @@ mod tests {
             record.terminal.as_ref().unwrap().outcome,
             MeshInvocationOutcome::OutcomeUnknown,
         );
-        assert!(reopened.admit_invocation(local_admission(&source)).await.is_err());
+        assert!(
+            reopened
+                .admit_invocation(local_admission(&source))
+                .await
+                .is_err()
+        );
         let mut retry = source.clone();
         retry.id = RequestId::new("new-mesh-request");
-        let refusal = reopened.reserve_mesh_invocation(intent(&retry, None)).await.unwrap_err();
+        let refusal = reopened
+            .reserve_mesh_invocation(intent(&retry, None))
+            .await
+            .unwrap_err();
         assert!(refusal.to_string().contains("mesh-origin"));
         assert!(refusal.to_string().contains("attempt_id=1"));
         assert!(
@@ -1190,7 +1231,10 @@ mod tests {
 
         let reopened = HostAdminStateStore::with_state_path(path.clone()).unwrap();
         assert_eq!(
-            reopened.mesh_invocation_record("mesh-origin", None).await.unwrap(),
+            reopened
+                .mesh_invocation_record("mesh-origin", None)
+                .await
+                .unwrap(),
             record,
         );
         let persisted = std::fs::read_to_string(path).unwrap();
@@ -1204,7 +1248,10 @@ mod tests {
         let path = directory.path().join("state.json");
         let source = request("never-delivered");
         let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let ticket = store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
         store
             .observe_mesh_invocation(
                 &ticket,
@@ -1216,12 +1263,18 @@ mod tests {
         // Crash after durable proof but before a final HTTP response.
         drop(store);
         let reopened = HostAdminStateStore::with_state_path(path).unwrap();
-        let record = reopened.mesh_invocation_record("never-delivered", None).await.unwrap();
+        let record = reopened
+            .mesh_invocation_record("never-delivered", None)
+            .await
+            .unwrap();
         assert_eq!(
             record.terminal.unwrap().outcome,
             MeshInvocationOutcome::NotDelivered,
         );
-        let retry = reopened.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
+        let retry = reopened
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
         assert!(retry.attempt_id > ticket.attempt_id);
     }
 
@@ -1251,7 +1304,10 @@ mod tests {
                 assert!(mesh.is_err());
             }
             let snapshot = store.state.read().await;
-            assert_eq!(snapshot.invocations.len() + snapshot.mesh_invocations.len(), 1);
+            assert_eq!(
+                snapshot.invocations.len() + snapshot.mesh_invocations.len(),
+                1
+            );
             assert_eq!(snapshot.next_invocation_attempt_id, 2);
         }
     }
@@ -1262,7 +1318,10 @@ mod tests {
         let path = directory.path().join("state.json");
         let source = request("shared-id");
         let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
-        let local = store.admit_invocation(local_admission(&source)).await.unwrap();
+        let local = store
+            .admit_invocation(local_admission(&source))
+            .await
+            .unwrap();
         complete_local(&store, &local).await;
         let mesh = store
             .reserve_mesh_invocation(intent(&source, Some("owner")))
@@ -1272,11 +1331,15 @@ mod tests {
         let latest = store.invocation_observation("shared-id", None).await;
         assert!(latest.invocation.is_none());
         assert_eq!(latest.mesh_invocation.unwrap().ticket, mesh);
-        let historical = store.invocation_observation("shared-id", Some(local.attempt_id)).await;
+        let historical = store
+            .invocation_observation("shared-id", Some(local.attempt_id))
+            .await;
         assert_eq!(historical.invocation.unwrap().ticket, local);
         assert!(historical.mesh_invocation.is_none());
         assert!(!historical.host_job_active);
-        let absent = store.invocation_observation("different-id", Some(mesh.attempt_id)).await;
+        let absent = store
+            .invocation_observation("different-id", Some(mesh.attempt_id))
+            .await;
         assert!(absent.invocation.is_none());
         assert!(absent.mesh_invocation.is_none());
 
@@ -1290,7 +1353,10 @@ mod tests {
             .unwrap();
         let mut success = terminal(MeshInvocationOutcome::Succeeded);
         success.receipt_id = Some("remote-receipt".to_string());
-        store.finish_mesh_invocation(&mesh, success.clone()).await.unwrap();
+        store
+            .finish_mesh_invocation(&mesh, success.clone())
+            .await
+            .unwrap();
         drop(store);
         let reopened = HostAdminStateStore::with_state_path(path).unwrap();
         let latest = reopened.invocation_observation("shared-id", None).await;
@@ -1311,8 +1377,16 @@ mod tests {
     async fn transport_evidence_is_monotone_and_signed_errors_remain_uncertain() {
         let store = HostAdminStateStore::new();
         let source = request("monotone");
-        let ticket = store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
-        assert!(store.select_mesh_invocation_target(&ticket, "executor-two").await.is_err());
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .select_mesh_invocation_target(&ticket, "executor-two")
+                .await
+                .is_err()
+        );
         assert!(
             store
                 .observe_mesh_invocation(
@@ -1364,9 +1438,20 @@ mod tests {
                 .is_err()
         );
         let unknown = terminal(MeshInvocationOutcome::OutcomeUnknown);
-        store.finish_mesh_invocation(&ticket, unknown.clone()).await.unwrap();
-        store.finish_mesh_invocation(&ticket, unknown).await.unwrap();
-        assert!(store.select_mesh_invocation_target(&ticket, "executor-two").await.is_err());
+        store
+            .finish_mesh_invocation(&ticket, unknown.clone())
+            .await
+            .unwrap();
+        store
+            .finish_mesh_invocation(&ticket, unknown)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .select_mesh_invocation_target(&ticket, "executor-two")
+                .await
+                .is_err()
+        );
         assert!(
             store
                 .finish_mesh_invocation(&ticket, terminal(MeshInvocationOutcome::Succeeded))
@@ -1396,7 +1481,10 @@ mod tests {
                 .unwrap();
             drop(store);
             let reopened = HostAdminStateStore::with_state_path(path).unwrap();
-            let record = reopened.mesh_invocation_record("observed-reply", None).await.unwrap();
+            let record = reopened
+                .mesh_invocation_record("observed-reply", None)
+                .await
+                .unwrap();
             assert_eq!(
                 record.attempts[0].observation,
                 Some(MeshInvocationObservation::ResponseObserved { http_status }),
@@ -1407,8 +1495,18 @@ mod tests {
             );
             let mut new_id = source.clone();
             new_id.id = RequestId::new("same-effects-new-id");
-            assert!(reopened.admit_invocation(local_admission(&new_id)).await.is_err());
-            assert!(reopened.reserve_mesh_invocation(intent(&new_id, Some("owner"))).await.is_err());
+            assert!(
+                reopened
+                    .admit_invocation(local_admission(&new_id))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                reopened
+                    .reserve_mesh_invocation(intent(&new_id, Some("owner")))
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -1420,26 +1518,55 @@ mod tests {
         let mut store =
             HostAdminStateStore::with_state_path(obstruction.join("state.json")).unwrap();
         let source = request("persistence-failed");
-        assert!(store.reserve_mesh_invocation(intent(&source, None)).await.is_err());
-        assert!(store.mesh_invocation_record("persistence-failed", None).await.is_none());
+        assert!(
+            store
+                .reserve_mesh_invocation(intent(&source, None))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .mesh_invocation_record("persistence-failed", None)
+                .await
+                .is_none()
+        );
         assert_eq!(store.state.read().await.next_invocation_attempt_id, 1);
         store.state_path = Some(directory.path().join("repaired.json"));
-        assert!(store.admit_invocation(local_admission(&source)).await.is_err());
-        assert!(store.reserve_mesh_invocation(intent(&source, None)).await.is_err());
+        assert!(
+            store
+                .admit_invocation(local_admission(&source))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reserve_mesh_invocation(intent(&source, None))
+                .await
+                .is_err()
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn retention_is_shared_and_never_discards_uncertain_forwards() {
         let store = HostAdminStateStore::new();
         let source = request("uncertain");
-        let ticket = store.reserve_mesh_invocation(intent(&source, Some("owner"))).await.unwrap();
-        let template = store.mesh_invocation_record("uncertain", None).await.unwrap();
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, Some("owner")))
+            .await
+            .unwrap();
+        let template = store
+            .mesh_invocation_record("uncertain", None)
+            .await
+            .unwrap();
         {
             let mut snapshot = store.state.write().await;
             for index in 1..MAX_RETAINED_INVOCATIONS {
                 let mut record = template.clone();
                 record.ticket.operation_id = format!("retained-{index}");
-                record.intent.operation_id.clone_from(&record.ticket.operation_id);
+                record
+                    .intent
+                    .operation_id
+                    .clone_from(&record.ticket.operation_id);
                 record.intent.idempotency = None;
                 record.intent.transport_idempotency = None;
                 record.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
@@ -1450,8 +1577,18 @@ mod tests {
         }
         let mut independent = request("independent");
         independent.idempotency_key = None;
-        assert!(store.admit_invocation(local_admission(&independent)).await.is_err());
-        assert!(store.reserve_mesh_invocation(intent(&independent, None)).await.is_err());
+        assert!(
+            store
+                .admit_invocation(local_admission(&independent))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reserve_mesh_invocation(intent(&independent, None))
+                .await
+                .is_err()
+        );
         {
             let mut snapshot = store.state.write().await;
             let completed = &mut snapshot.mesh_invocations[1];
@@ -1459,11 +1596,31 @@ mod tests {
             completed.terminal = Some(terminal(MeshInvocationOutcome::NotDelivered));
             completed.finished_at = Some(Utc::now());
         }
-        let local = store.admit_invocation(local_admission(&independent)).await.unwrap();
+        let local = store
+            .admit_invocation(local_admission(&independent))
+            .await
+            .unwrap();
         assert!(local.attempt_id > ticket.attempt_id);
-        assert!(store.mesh_invocation_record("retained-1", None).await.is_none());
-        assert_eq!(store.mesh_invocation_record("uncertain", None).await.unwrap().ticket, ticket);
-        assert!(store.mesh_invocation_record("retained-2", None).await.is_some());
+        assert!(
+            store
+                .mesh_invocation_record("retained-1", None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .mesh_invocation_record("uncertain", None)
+                .await
+                .unwrap()
+                .ticket,
+            ticket
+        );
+        assert!(
+            store
+                .mesh_invocation_record("retained-2", None)
+                .await
+                .is_some()
+        );
         assert_eq!(
             store.state.read().await.mesh_invocations.len() + 1,
             MAX_RETAINED_INVOCATIONS,
@@ -1474,41 +1631,71 @@ mod tests {
     async fn recovery_rejects_cross_kind_generation_and_scope_corruption() {
         let store = HostAdminStateStore::new();
         let local_request = request("local");
-        let local = store.admit_invocation(local_admission(&local_request)).await.unwrap();
+        let local = store
+            .admit_invocation(local_admission(&local_request))
+            .await
+            .unwrap();
         let mut remote_request = local_request.clone();
         remote_request.id = RequestId::new("remote");
         remote_request.idempotency_key = None;
-        let mesh = store.reserve_mesh_invocation(intent(&remote_request, Some("owner"))).await.unwrap();
+        let mesh = store
+            .reserve_mesh_invocation(intent(&remote_request, Some("owner")))
+            .await
+            .unwrap();
         let original = store.state.read().await.clone();
 
         let mut duplicate_generation = original.clone();
         duplicate_generation.mesh_invocations[0].ticket.attempt_id = local.attempt_id;
-        assert!(duplicate_generation.recover_invocations_after_restart(Utc::now()).is_err());
+        assert!(
+            duplicate_generation
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
 
         let mut duplicate_identifier = original.clone();
-        duplicate_identifier.mesh_invocations[0].ticket.operation_id.clone_from(&local.operation_id);
-        duplicate_identifier.mesh_invocations[0].intent.operation_id.clone_from(&local.operation_id);
-        assert!(duplicate_identifier.recover_invocations_after_restart(Utc::now()).is_err());
+        duplicate_identifier.mesh_invocations[0]
+            .ticket
+            .operation_id
+            .clone_from(&local.operation_id);
+        duplicate_identifier.mesh_invocations[0]
+            .intent
+            .operation_id
+            .clone_from(&local.operation_id);
+        assert!(
+            duplicate_identifier
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
 
         let mut duplicate_scope = original.clone();
         duplicate_scope.mesh_invocations[0].intent.idempotency =
             original.invocations[0].admission.idempotency.clone();
-        assert!(duplicate_scope.recover_invocations_after_restart(Utc::now()).is_err());
+        assert!(
+            duplicate_scope
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
 
         let mut invented_non_delivery = original;
         invented_non_delivery.mesh_invocations[0].terminal =
             Some(terminal(MeshInvocationOutcome::NotDelivered));
         invented_non_delivery.mesh_invocations[0].finished_at = Some(Utc::now());
-        assert!(invented_non_delivery.recover_invocations_after_restart(Utc::now()).is_err());
+        assert!(
+            invented_non_delivery
+                .recover_invocations_after_restart(Utc::now())
+                .is_err()
+        );
         assert!(mesh.attempt_id > local.attempt_id);
     }
-
 
     #[fcp_async_core::runtime::test]
     async fn changing_asserted_identity_cannot_escape_an_unresolved_relay_key() {
         let store = HostAdminStateStore::new();
         let source = request("opaque-owner");
-        let ticket = store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
         let mut retry = source.clone();
         retry.id = RequestId::new("new-opaque-id");
         let changed_assertion = MeshInvocationIntent::from_request(
@@ -1520,11 +1707,30 @@ mod tests {
             Utc::now() + chrono::Duration::seconds(60),
         )
         .unwrap();
-        let refusal = store.reserve_mesh_invocation(changed_assertion).await.unwrap_err();
-        assert!(refusal.to_string().contains("different mesh invocation effects"));
+        let refusal = store
+            .reserve_mesh_invocation(changed_assertion)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("different mesh invocation effects")
+        );
         assert!(refusal.to_string().contains("opaque-owner"));
-        assert!(store.mesh_invocation_record("new-opaque-id", None).await.is_none());
-        assert_eq!(store.mesh_invocation_record("opaque-owner", None).await.unwrap().ticket, ticket);
+        assert!(
+            store
+                .mesh_invocation_record("new-opaque-id", None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .mesh_invocation_record("opaque-owner", None)
+                .await
+                .unwrap()
+                .ticket,
+            ticket
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -1533,14 +1739,23 @@ mod tests {
         let path = directory.path().join("state.json");
         let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
         let source = request("opaque-first");
-        store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
-        let template = store.mesh_invocation_record("opaque-first", None).await.unwrap();
+        store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
+        let template = store
+            .mesh_invocation_record("opaque-first", None)
+            .await
+            .unwrap();
         {
             let mut snapshot = store.state.write().await;
             for index in 1..MAX_UNVERIFIED_MESH_INVOCATIONS {
                 let mut record = template.clone();
                 record.ticket.operation_id = format!("opaque-{index}");
-                record.intent.operation_id.clone_from(&record.ticket.operation_id);
+                record
+                    .intent
+                    .operation_id
+                    .clone_from(&record.ticket.operation_id);
                 record.intent.idempotency = None;
                 record.ticket.attempt_id = u64::try_from(index).unwrap() + 1;
                 snapshot.mesh_invocations.push(record);
@@ -1551,31 +1766,68 @@ mod tests {
         let mut extra = source.clone();
         extra.id = RequestId::new("extra-opaque");
         extra.idempotency_key = None;
-        let denied = store.reserve_mesh_invocation(intent(&extra, None)).await.unwrap_err();
-        assert!(denied.to_string().contains("unverified mesh invocation capacity"));
-        assert!(store.mesh_invocation_record("extra-opaque", None).await.is_none());
+        let denied = store
+            .reserve_mesh_invocation(intent(&extra, None))
+            .await
+            .unwrap_err();
+        assert!(
+            denied
+                .to_string()
+                .contains("unverified mesh invocation capacity")
+        );
+        assert!(
+            store
+                .mesh_invocation_record("extra-opaque", None)
+                .await
+                .is_none()
+        );
 
         let mut trusted_local = extra.clone();
         trusted_local.id = RequestId::new("trusted-local");
-        assert!(store.admit_invocation(local_admission(&trusted_local)).await.is_ok());
+        assert!(
+            store
+                .admit_invocation(local_admission(&trusted_local))
+                .await
+                .is_ok()
+        );
         let mut trusted_remote = extra;
         trusted_remote.id = RequestId::new("trusted-remote");
-        assert!(store.reserve_mesh_invocation(intent(&trusted_remote, Some("owner"))).await.is_ok());
+        assert!(
+            store
+                .reserve_mesh_invocation(intent(&trusted_remote, Some("owner")))
+                .await
+                .is_ok()
+        );
         drop(store);
 
         // Persisted trusted work also commits the saturated opaque history.
         let reopened = HostAdminStateStore::with_state_path(path).unwrap();
         assert_eq!(
-            reopened.mesh_invocation_record("opaque-first", None).await.unwrap()
-                .terminal.unwrap().outcome,
+            reopened
+                .mesh_invocation_record("opaque-first", None)
+                .await
+                .unwrap()
+                .terminal
+                .unwrap()
+                .outcome,
             MeshInvocationOutcome::OutcomeUnknown,
         );
         let mut retry = source;
         retry.id = RequestId::new("still-bounded-after-restart");
         retry.idempotency_key = None;
-        assert!(reopened.reserve_mesh_invocation(intent(&retry, None)).await.is_err());
+        assert!(
+            reopened
+                .reserve_mesh_invocation(intent(&retry, None))
+                .await
+                .is_err()
+        );
         retry.id = RequestId::new("trusted-after-restart");
-        assert!(reopened.admit_invocation(local_admission(&retry)).await.is_ok());
+        assert!(
+            reopened
+                .admit_invocation(local_admission(&retry))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1612,7 +1864,10 @@ mod tests {
             InvocationIdempotency::from_relay_request(&source, None).unwrap(),
             Some(legacy_binding.clone()),
         );
-        assert_eq!(intent(&source, None).idempotency, Some(legacy_binding.clone()));
+        assert_eq!(
+            intent(&source, None).idempotency,
+            Some(legacy_binding.clone())
+        );
         assert_eq!(
             intent(&source, Some("owner")).transport_idempotency,
             Some(legacy_binding.clone()),
@@ -1621,14 +1876,23 @@ mod tests {
             local_admission(&source).transport_idempotency,
             Some(legacy_binding.clone()),
         );
-        let asserted =
-            InvocationIdempotency::from_relay_request(&source, Some("owner")).unwrap().unwrap();
+        let asserted = InvocationIdempotency::from_relay_request(&source, Some("owner"))
+            .unwrap()
+            .unwrap();
         assert_eq!(asserted.scope_digest, legacy_binding.scope_digest);
         assert_ne!(asserted.effect_digest, legacy_binding.effect_digest);
         let mut no_key = source;
         no_key.idempotency_key = None;
-        assert!(InvocationIdempotency::from_relay_request(&no_key, None).unwrap().is_none());
-        assert!(intent(&no_key, Some("owner")).transport_idempotency.is_none());
+        assert!(
+            InvocationIdempotency::from_relay_request(&no_key, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            intent(&no_key, Some("owner"))
+                .transport_idempotency
+                .is_none()
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -1643,12 +1907,18 @@ mod tests {
             retry.id = RequestId::new("new-id-other-mode");
             let refusal = admit_entry(&store, &retry, retry_mode).await.unwrap_err();
             assert!(refusal.to_string().contains(&ticket.operation_id));
-            assert!(refusal.to_string().contains(&format!("attempt_id={}", ticket.attempt_id)));
+            assert!(
+                refusal
+                    .to_string()
+                    .contains(&format!("attempt_id={}", ticket.attempt_id))
+            );
             assert_eq!(store.state.read().await.next_invocation_attempt_id, 2);
             drop(store);
 
             let reopened = HostAdminStateStore::with_state_path(path).unwrap();
-            let refusal = admit_entry(&reopened, &retry, retry_mode).await.unwrap_err();
+            let refusal = admit_entry(&reopened, &retry, retry_mode)
+                .await
+                .unwrap_err();
             assert!(refusal.to_string().contains(&ticket.operation_id));
             assert!(refusal.to_string().contains("unresolved"));
             let observation = reopened
@@ -1695,9 +1965,16 @@ mod tests {
                 _ => panic!("exact-token aliases admitted zero or two owners"),
             };
             assert!(refusal.to_string().contains(&ticket.operation_id));
-            assert!(refusal.to_string().contains(&format!("attempt_id={}", ticket.attempt_id)));
+            assert!(
+                refusal
+                    .to_string()
+                    .contains(&format!("attempt_id={}", ticket.attempt_id))
+            );
             let snapshot = store.state.read().await;
-            assert_eq!(snapshot.invocations.len() + snapshot.mesh_invocations.len(), 1);
+            assert_eq!(
+                snapshot.invocations.len() + snapshot.mesh_invocations.len(),
+                1
+            );
             assert_eq!(snapshot.next_invocation_attempt_id, 2);
         }
     }
@@ -1740,14 +2017,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(changed_assertion.idempotency, original.idempotency);
-        let refusal = store.reserve_mesh_invocation(changed_assertion).await.unwrap_err();
+        let refusal = store
+            .reserve_mesh_invocation(changed_assertion)
+            .await
+            .unwrap_err();
         assert!(refusal.to_string().contains("different invocation effects"));
         assert!(refusal.to_string().contains(&ticket.operation_id));
 
         // A matching completed primary also cannot hide another mode's
         // currently unresolved exact-token reservation.
         retry.id = RequestId::new("opaque-pending");
-        let opaque = store.reserve_mesh_invocation(intent(&retry, None)).await.unwrap();
+        let opaque = store
+            .reserve_mesh_invocation(intent(&retry, None))
+            .await
+            .unwrap();
         retry.id = RequestId::new("verified-after-opaque");
         let refusal = store
             .reserve_mesh_invocation(intent(&retry, Some("owner")))
@@ -1772,29 +2055,43 @@ mod tests {
             assert!(valid.recover_invocations_after_restart(Utc::now()).is_ok());
 
             let mut overlap = original.clone();
-            if let Some(record) = overlap.invocations.iter_mut().find(|record| record.ticket == first) {
+            if let Some(record) = overlap
+                .invocations
+                .iter_mut()
+                .find(|record| record.ticket == first)
+            {
                 record.terminal = None;
                 record.finished_at = None;
                 record.finalization = None;
             } else {
-                let record = overlap.mesh_invocations.iter_mut()
-                    .find(|record| record.ticket == first).unwrap();
+                let record = overlap
+                    .mesh_invocations
+                    .iter_mut()
+                    .find(|record| record.ticket == first)
+                    .unwrap();
                 record.terminal = None;
                 record.finished_at = None;
                 // A successful reply without finalization becomes unknown.
             }
-            let refusal = overlap.recover_invocations_after_restart(Utc::now()).unwrap_err();
+            let refusal = overlap
+                .recover_invocations_after_restart(Utc::now())
+                .unwrap_err();
             assert!(refusal.to_string().contains("transport idempotency scope"));
             assert!(refusal.to_string().contains("overlapping unresolved"));
 
             let mut conflicting_effects = original;
-            let binding = if let Some(record) = conflicting_effects.invocations.iter_mut()
+            let binding = if let Some(record) = conflicting_effects
+                .invocations
+                .iter_mut()
                 .find(|record| record.ticket == second)
             {
                 record.admission.transport_idempotency.as_mut().unwrap()
             } else {
-                let record = conflicting_effects.mesh_invocations.iter_mut()
-                    .find(|record| record.ticket == second).unwrap();
+                let record = conflicting_effects
+                    .mesh_invocations
+                    .iter_mut()
+                    .find(|record| record.ticket == second)
+                    .unwrap();
                 if record.intent.has_verified_scope() {
                     record.intent.transport_idempotency.as_mut().unwrap()
                 } else {
@@ -1807,14 +2104,23 @@ mod tests {
                 "0".repeat(64)
             };
             let refusal = conflicting_effects
-                .recover_invocations_after_restart(Utc::now()).unwrap_err();
-            assert!(refusal.to_string().contains("transport idempotency effects"));
+                .recover_invocations_after_restart(Utc::now())
+                .unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("transport idempotency effects")
+            );
         }
     }
 
     #[fcp_async_core::runtime::test]
     async fn malformed_transport_alias_linkage_is_rejected_on_admission_and_recovery() {
-        for mode in [EntryMode::Local, EntryMode::VerifiedMesh, EntryMode::OpaqueMesh] {
+        for mode in [
+            EntryMode::Local,
+            EntryMode::VerifiedMesh,
+            EntryMode::OpaqueMesh,
+        ] {
             let store = HostAdminStateStore::new();
             let source = request("invalid-alias");
             let refusal = match mode {
@@ -1846,7 +2152,11 @@ mod tests {
                     intent.transport_idempotency = intent.idempotency.clone();
                 }
             }
-            assert!(persisted.recover_invocations_after_restart(Utc::now()).is_err());
+            assert!(
+                persisted
+                    .recover_invocations_after_restart(Utc::now())
+                    .is_err()
+            );
         }
     }
 
@@ -1870,7 +2180,11 @@ mod tests {
                 }
                 EntryMode::OpaqueMesh => unreachable!(),
             };
-            assert!(!std::fs::read_to_string(&path).unwrap().contains("transport_idempotency"));
+            assert!(
+                !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("transport_idempotency")
+            );
             drop(store);
             let reopened = HostAdminStateStore::with_state_path(path).unwrap();
             let observation = reopened
@@ -1879,7 +2193,14 @@ mod tests {
             if let Some(record) = observation.invocation {
                 assert!(record.admission.transport_idempotency.is_none());
             } else {
-                assert!(observation.mesh_invocation.unwrap().intent.transport_idempotency.is_none());
+                assert!(
+                    observation
+                        .mesh_invocation
+                        .unwrap()
+                        .intent
+                        .transport_idempotency
+                        .is_none()
+                );
             }
             let mut retry = source;
             retry.id = RequestId::new("legacy-same-principal-new-id");
@@ -1900,7 +2221,10 @@ mod tests {
         malformed.target_node = "invalid\nnode".to_string();
         assert!(store.reserve_mesh_invocation(malformed).await.is_err());
         assert_eq!(store.state.read().await.next_invocation_attempt_id, 1);
-        let ticket = store.reserve_mesh_invocation(intent(&source, None)).await.unwrap();
+        let ticket = store
+            .reserve_mesh_invocation(intent(&source, None))
+            .await
+            .unwrap();
         {
             let mut snapshot = store.state.write().await;
             let record = &mut snapshot.mesh_invocations[0];
@@ -1913,14 +2237,27 @@ mod tests {
                 });
             }
         }
-        assert!(store.select_mesh_invocation_target(&ticket, "one-too-many").await.is_err());
+        assert!(
+            store
+                .select_mesh_invocation_target(&ticket, "one-too-many")
+                .await
+                .is_err()
+        );
         let record = store.mesh_invocation_record("bounded", None).await.unwrap();
         assert_eq!(record.attempts.len(), MAX_MESH_INVOCATION_TARGETS);
-        store.finish_mesh_invocation(&ticket, terminal(MeshInvocationOutcome::NotDelivered)).await.unwrap();
+        store
+            .finish_mesh_invocation(&ticket, terminal(MeshInvocationOutcome::NotDelivered))
+            .await
+            .unwrap();
         {
             let mut snapshot = store.state.write().await;
             snapshot.next_invocation_attempt_id = u64::MAX;
         }
-        assert!(store.reserve_mesh_invocation(intent(&source, None)).await.is_err());
+        assert!(
+            store
+                .reserve_mesh_invocation(intent(&source, None))
+                .await
+                .is_err()
+        );
     }
 }

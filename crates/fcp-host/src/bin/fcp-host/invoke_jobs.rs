@@ -262,18 +262,24 @@ impl InvocationJobs {
         let activity = if let Some(job) = state.jobs.get_mut(&ticket.operation_id) {
             &mut job.activity
         } else {
-            state.draining.get_mut(&ticket.operation_id).ok_or_else(|| {
-                HostError::Unavailable(
-                    "invocation lost host ownership before attempt binding".to_string(),
-                )
-            })?
+            state
+                .draining
+                .get_mut(&ticket.operation_id)
+                .ok_or_else(|| {
+                    HostError::Unavailable(
+                        "invocation lost host ownership before attempt binding".to_string(),
+                    )
+                })?
         };
         if !activity.alive.load(Ordering::Acquire) {
             return Err(HostError::Unavailable(
                 "invocation owner ended before attempt binding".to_string(),
             ));
         }
-        if activity.attempt_id.is_some_and(|previous| previous != ticket.attempt_id) {
+        if activity
+            .attempt_id
+            .is_some_and(|previous| previous != ticket.attempt_id)
+        {
             return Err(HostError::Internal(
                 "refusing to replace an owned invocation attempt".to_string(),
             ));
@@ -310,10 +316,7 @@ impl InvocationJobs {
     }
 
     pub(super) fn stop_accepting(&self) {
-        self.state
-            .lock()
-            .expect("invocation jobs lock")
-            .accepting = false;
+        self.state.lock().expect("invocation jobs lock").accepting = false;
     }
 
     /// Stop admission before draining. Timed-out handles are dropped only
@@ -443,9 +446,7 @@ pub(super) fn execute<'a>(
             })?;
         audit.actor = super::claims_principal(&claims)
             .filter(|principal| !principal.trim().is_empty())
-            .ok_or_else(|| {
-                HostError::Internal("verified invoke lost its principal".to_string())
-            })?
+            .ok_or_else(|| HostError::Internal("verified invoke lost its principal".to_string()))?
             .to_string();
         state
             .invoke_audit
@@ -454,10 +455,9 @@ pub(super) fn execute<'a>(
 
         let job_state = std::sync::Arc::clone(state);
         let job_audit = audit.clone();
-        let receiver = match state.invoke_jobs.spawn(
-            request.id.to_string(),
-            deadline,
-            async move {
+        let receiver = match state
+            .invoke_jobs
+            .spawn(request.id.to_string(), deadline, async move {
                 run_owned(
                     &job_state,
                     request,
@@ -467,8 +467,7 @@ pub(super) fn execute<'a>(
                     job_audit,
                 )
                 .await
-            },
-        ) {
+            }) {
             Ok(receiver) => receiver,
             Err(error) => {
                 let _ = append_dispatch_audit(
@@ -572,7 +571,9 @@ async fn dispatch(
 ) -> (HostResult<InvokeResponse>, bool) {
     let target = before_deadline(
         deadline,
-        state.registry.cancellation_target(&request.connector_id, deadline),
+        state
+            .registry
+            .cancellation_target(&request.connector_id, deadline),
         "runtime selection",
     )
     .await
@@ -731,7 +732,9 @@ async fn run_owned(
     audit: fcp_host::InvokeAuditContext,
 ) -> HostResult<InvokeResponse> {
     let remaining_ms = u64::try_from(
-        deadline.saturating_duration_since(Instant::now()).as_millis(),
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
     )
     .unwrap_or(u64::MAX);
     let admission = fcp_host::InvocationAdmission {
@@ -910,7 +913,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn reply() -> InvokeResponse {
-        InvokeResponse::ok(fcp_kernel::RequestId::new("owned-job"), serde_json::json!({}))
+        InvokeResponse::ok(
+            fcp_kernel::RequestId::new("owned-job"),
+            serde_json::json!({}),
+        )
     }
 
     #[fcp_async_core::runtime::test]
@@ -937,8 +943,10 @@ mod tests {
         };
         assert!(jobs.bind_attempt(&ticket).is_err());
         ticket.attempt_id = 17;
-        jobs.bind_attempt(&ticket).expect("bind durable reservation");
-        jobs.bind_attempt(&ticket).expect("repeat identical binding");
+        jobs.bind_attempt(&ticket)
+            .expect("bind durable reservation");
+        jobs.bind_attempt(&ticket)
+            .expect("repeat identical binding");
         let mut replacement = ticket.clone();
         replacement.attempt_id = 18;
         assert!(jobs.bind_attempt(&replacement).is_err());
@@ -948,9 +956,8 @@ mod tests {
         );
 
         let draining_jobs = Arc::clone(&jobs);
-        let draining = task::spawn(async move {
-            draining_jobs.shutdown(Duration::from_secs(2)).await
-        });
+        let draining =
+            task::spawn(async move { draining_jobs.shutdown(Duration::from_secs(2)).await });
         fcp_async_core::time::timeout(Duration::from_secs(1), async {
             loop {
                 let handed_off = jobs
@@ -967,14 +974,18 @@ mod tests {
         })
         .await
         .expect("shutdown takes ownership");
-        jobs.bind_attempt(&ticket).expect("binding remains in draining owner");
+        jobs.bind_attempt(&ticket)
+            .expect("binding remains in draining owner");
         assert!(jobs.bind_attempt(&replacement).is_err());
         assert_eq!(
             jobs.active_observation("bound-forward"),
             Some((InvocationJobKind::Forward, Some(17)))
         );
         release_tx.send(()).expect("release draining job");
-        receiver.await.expect("response channel").expect("forward result");
+        receiver
+            .await
+            .expect("response channel")
+            .expect("forward result");
         draining.await.expect("drain task").expect("drain complete");
         assert_eq!(jobs.active_observation("bound-forward"), None);
         assert!(jobs.bind_attempt(&ticket).is_err());
@@ -1000,7 +1011,9 @@ mod tests {
             .expect("admit");
         started_rx.await.expect("job started");
         drop(receiver);
-        release_tx.send(()).expect("job still owned after disconnect");
+        release_tx
+            .send(())
+            .expect("job still owned after disconnect");
         finalized_rx.await.expect("host finalized after disconnect");
         jobs.shutdown(Duration::from_secs(1)).await.expect("drain");
     }
@@ -1428,5 +1441,4 @@ mod tests {
         assert!(receiver.await.is_err());
         assert!(!jobs.is_active("panicked-job"));
     }
-
 }

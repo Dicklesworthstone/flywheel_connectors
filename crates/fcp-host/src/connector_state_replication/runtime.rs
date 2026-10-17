@@ -39,7 +39,9 @@ impl Usage {
         Ok(Self {
             active: bounded_add(self.active, 1, MAX_ACTIVE)?,
             canonical_bytes: bounded_add(
-                self.canonical_bytes, limits.max_canonical_bytes, MAX_CANONICAL_BYTES,
+                self.canonical_bytes,
+                limits.max_canonical_bytes,
+                MAX_CANONICAL_BYTES,
             )?,
             wire_bytes: bounded_add(self.wire_bytes, limits.max_wire_bytes, MAX_WIRE_BYTES)?,
             objects: bounded_add(self.objects, limits.max_objects, MAX_OBJECTS)?,
@@ -49,7 +51,9 @@ impl Usage {
     fn release(self, limits: ConnectorStateTransferLimits) -> Option<Self> {
         Some(Self {
             active: self.active.checked_sub(1)?,
-            canonical_bytes: self.canonical_bytes.checked_sub(limits.max_canonical_bytes)?,
+            canonical_bytes: self
+                .canonical_bytes
+                .checked_sub(limits.max_canonical_bytes)?,
             wire_bytes: self.wire_bytes.checked_sub(limits.max_wire_bytes)?,
             objects: self.objects.checked_sub(limits.max_objects)?,
         })
@@ -65,7 +69,10 @@ fn unavailable() -> HostError {
 }
 
 fn bounded_add(current: usize, requested: usize, maximum: usize) -> HostResult<usize> {
-    current.checked_add(requested).filter(|next| *next <= maximum).ok_or_else(exhausted)
+    current
+        .checked_add(requested)
+        .filter(|next| *next <= maximum)
+        .ok_or_else(exhausted)
 }
 
 #[derive(Default)]
@@ -107,12 +114,20 @@ impl TransferRuntime {
         // partial reservation or grow the active-peer map.
         state.peers.insert(peer.to_owned(), next_peer);
         state.usage = next_usage;
-        Ok(TransferPermit { runtime: self, peer: peer.to_owned(), limits })
+        Ok(TransferPermit {
+            runtime: self,
+            peer: peer.to_owned(),
+            limits,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
-        self.state.lock().expect("test admission state").usage.active
+        self.state
+            .lock()
+            .expect("test admission state")
+            .usage
+            .active
     }
 }
 
@@ -131,8 +146,12 @@ pub(crate) struct ExportSnapshot {
 }
 
 impl ExportSnapshot {
-    pub(crate) fn wire(&self) -> &str { &self.wire }
-    pub(crate) fn digest(&self) -> &str { &self.digest }
+    pub(crate) fn wire(&self) -> &str {
+        &self.wire
+    }
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 #[derive(Default)]
@@ -150,9 +169,12 @@ impl ExportCache {
         self.ready.retain(|_, snapshot| {
             // A caller may have sampled now just before another builder
             // published under the cache lock. That is age zero, not expiry.
-            let fresh = now.checked_duration_since(snapshot.created_at)
+            let fresh = now
+                .checked_duration_since(snapshot.created_at)
                 .is_none_or(|age| age < CACHE_MAX_AGE);
-            if fresh { bytes += snapshot.wire.len(); }
+            if fresh {
+                bytes += snapshot.wire.len();
+            }
             fresh
         });
         self.bytes = bytes;
@@ -166,10 +188,14 @@ impl ExportCache {
         while self.ready.len() >= MAX_CACHE_ENTRIES
             || self.bytes + snapshot.wire.len() > MAX_CACHE_BYTES
         {
-            let oldest = self.ready.iter()
+            let oldest = self
+                .ready
+                .iter()
                 .min_by_key(|(key, value)| (value.created_at, *key))
                 .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else { break; };
+            let Some(oldest) = oldest else {
+                break;
+            };
             if let Some(removed) = self.ready.remove(&oldest) {
                 self.bytes -= removed.wire.len();
             }
@@ -209,7 +235,10 @@ impl TransferRuntime {
         now: Instant,
     ) -> HostResult<ExportLookup<'a>> {
         permit.check(self, &permit.peer, request.limits)?;
-        let key = ExportKey { peer: permit.peer.clone(), request_json: request.to_json()? };
+        let key = ExportKey {
+            peer: permit.peer.clone(),
+            request_json: request.to_json()?,
+        };
         let mut cache = self.cache.lock().map_err(|_| unavailable())?;
         cache.expire(now);
         if let Some(snapshot) = cache.ready.get(&key) {
@@ -220,9 +249,13 @@ impl TransferRuntime {
         }
         cache.building.insert(key.clone());
         #[cfg(test)]
-        { cache.builds_started += 1; }
+        {
+            cache.builds_started += 1;
+        }
         Ok(ExportLookup::Build(ExportBuild {
-            runtime: self, key, max_wire_bytes: request.limits.max_wire_bytes,
+            runtime: self,
+            key,
+            max_wire_bytes: request.limits.max_wire_bytes,
         }))
     }
 
@@ -237,7 +270,9 @@ impl ExportBuild<'_> {
     /// here. Hash once before locking; neither I/O nor callbacks run in a lock.
     pub(crate) fn finish(self, wire: String) -> HostResult<Arc<ExportSnapshot>> {
         if wire.is_empty() || wire.len() > self.max_wire_bytes || wire.len() > MAX_CACHE_BYTES {
-            return Err(HostError::InvalidFilter("connector-state snapshot exceeds its bounds".to_owned()));
+            return Err(HostError::InvalidFilter(
+                "connector-state snapshot exceeds its bounds".to_owned(),
+            ));
         }
         let digest = blake3::hash(wire.as_bytes()).to_hex().to_string();
         let mut cache = self.runtime.cache.lock().map_err(|_| unavailable())?;
@@ -302,7 +337,10 @@ impl Drop for TransferPermit<'_> {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let next_peer = state.peers.get(&self.peer).and_then(|count| count.checked_sub(1));
+        let next_peer = state
+            .peers
+            .get(&self.peer)
+            .and_then(|count| count.checked_sub(1));
         let next_usage = state.usage.release(self.limits);
         let (Some(next_peer), Some(next_usage)) = (next_peer, next_usage) else {
             state.failed = true;
@@ -320,14 +358,18 @@ impl Drop for TransferPermit<'_> {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll, Wake, Waker};
 
     use super::*;
 
     fn small() -> ConnectorStateTransferLimits {
-        ConnectorStateTransferLimits { max_objects: 1, max_canonical_bytes: 1, max_wire_bytes: 1 }
+        ConnectorStateTransferLimits {
+            max_objects: 1,
+            max_canonical_bytes: 1,
+            max_wire_bytes: 1,
+        }
     }
 
     fn empty(runtime: &TransferRuntime) {
@@ -354,7 +396,9 @@ mod tests {
     #[test]
     fn service_slot_limit_bounds_active_peer_metadata() {
         let runtime = TransferRuntime::default();
-        let permits: Vec<_> = (0..MAX_ACTIVE).map(|n| runtime.admit(&n.to_string(), small()).unwrap()).collect();
+        let permits: Vec<_> = (0..MAX_ACTIVE)
+            .map(|n| runtime.admit(&n.to_string(), small()).unwrap())
+            .collect();
         assert!(runtime.admit("new-peer", small()).is_err());
         assert_eq!(runtime.lock().unwrap().peers.len(), MAX_ACTIVE);
         drop(permits);
@@ -367,11 +411,22 @@ mod tests {
             let runtime = TransferRuntime::default();
             let mut limits = small();
             let count = match dimension {
-                0 => { limits.max_canonical_bytes = 4 * 1024 * 1024; 4 },
-                1 => { limits.max_wire_bytes = 4 * 1024 * 1024; 4 },
-                _ => { limits.max_objects = 4096; 2 },
+                0 => {
+                    limits.max_canonical_bytes = 4 * 1024 * 1024;
+                    4
+                }
+                1 => {
+                    limits.max_wire_bytes = 4 * 1024 * 1024;
+                    4
+                }
+                _ => {
+                    limits.max_objects = 4096;
+                    2
+                }
             };
-            let mut permits: Vec<_> = (0..count).map(|n| runtime.admit(&n.to_string(), limits).unwrap()).collect();
+            let mut permits: Vec<_> = (0..count)
+                .map(|n| runtime.admit(&n.to_string(), limits).unwrap())
+                .collect();
             let before = runtime.lock().unwrap().usage;
             assert!(runtime.admit("extra", small()).is_err());
             assert_eq!(runtime.lock().unwrap().usage, before);
@@ -387,22 +442,47 @@ mod tests {
     fn invalid_reservations_do_not_grow_state() {
         let runtime = TransferRuntime::default();
         assert!(runtime.admit("", small()).is_err());
-        assert!(runtime.admit("peer", ConnectorStateTransferLimits { max_objects: 0, ..small() }).is_err());
-        assert!(runtime.admit("peer", ConnectorStateTransferLimits { max_wire_bytes: usize::MAX, ..small() }).is_err());
+        assert!(
+            runtime
+                .admit(
+                    "peer",
+                    ConnectorStateTransferLimits {
+                        max_objects: 0,
+                        ..small()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .admit(
+                    "peer",
+                    ConnectorStateTransferLimits {
+                        max_wire_bytes: usize::MAX,
+                        ..small()
+                    }
+                )
+                .is_err()
+        );
         empty(&runtime);
     }
 
     #[test]
     fn dropping_a_pending_future_releases_its_reservation() {
         struct Noop;
-        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
         let runtime = TransferRuntime::default();
         let mut future = Box::pin(async {
             let _permit = runtime.admit("peer", small()).unwrap();
             std::future::pending::<()>().await;
         });
         let waker = Waker::from(Arc::new(Noop));
-        assert_eq!(future.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending);
+        assert_eq!(
+            future.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        );
         assert_eq!(runtime.active(), 1);
         drop(future);
         empty(&runtime);
@@ -411,10 +491,13 @@ mod tests {
     #[test]
     fn unwinding_outside_the_lock_releases_the_permit() {
         let runtime = TransferRuntime::default();
-        assert!(std::panic::catch_unwind(|| {
-            let _permit = runtime.admit("peer", small()).unwrap();
-            panic!("fixture future panicked");
-        }).is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _permit = runtime.admit("peer", small()).unwrap();
+                panic!("fixture future panicked");
+            })
+            .is_err()
+        );
         empty(&runtime);
     }
 
@@ -422,10 +505,13 @@ mod tests {
     fn poison_never_turns_cleanup_into_new_admission() {
         let runtime = TransferRuntime::default();
         let permit = runtime.admit("peer", small()).unwrap();
-        assert!(std::panic::catch_unwind(|| {
-            let _lock = runtime.state.lock().unwrap();
-            panic!("fixture poisoned state");
-        }).is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _lock = runtime.state.lock().unwrap();
+                panic!("fixture poisoned state");
+            })
+            .is_err()
+        );
         drop(permit);
         assert!(runtime.admit("peer", small()).is_err());
         let state = runtime.state.lock().err().unwrap().into_inner();
@@ -448,7 +534,9 @@ mod tests {
                 scope.spawn(move || {
                     start.wait();
                     let permit = runtime.admit(&n.to_string(), small()).ok();
-                    if permit.is_some() { successes.fetch_add(1, Ordering::SeqCst); }
+                    if permit.is_some() {
+                        successes.fetch_add(1, Ordering::SeqCst);
+                    }
                     admitted.wait();
                     release.wait();
                     drop(permit);
@@ -480,7 +568,11 @@ mod tests {
         }
     }
 
-    fn build<'a>(runtime: &'a TransferRuntime, permit: &'a TransferPermit<'_>, request: &ConnectorStateExportRequest) -> ExportBuild<'a> {
+    fn build<'a>(
+        runtime: &'a TransferRuntime,
+        permit: &'a TransferPermit<'_>,
+        request: &ConnectorStateExportRequest,
+    ) -> ExportBuild<'a> {
         match runtime.begin_export(permit, request).unwrap() {
             ExportLookup::Build(build) => build,
             ExportLookup::Ready(_) => panic!("expected a cache miss"),
@@ -492,20 +584,35 @@ mod tests {
         let runtime = TransferRuntime::default();
         let request = export_request("grant");
         let permit = runtime.admit("peer", request.limits).unwrap();
-        let original = build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
-        let earlier_sample = original.created_at.checked_sub(Duration::from_nanos(1)).unwrap();
-        let ExportLookup::Ready(newer_publication) = runtime.begin_export_at(&permit, &request, earlier_sample).unwrap() else {
-            panic!("a sample taken before cache-lock acquisition cannot expire a newer publication");
+        let original = build(&runtime, &permit, &request)
+            .finish("x".to_owned())
+            .unwrap();
+        let earlier_sample = original
+            .created_at
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap();
+        let ExportLookup::Ready(newer_publication) = runtime
+            .begin_export_at(&permit, &request, earlier_sample)
+            .unwrap()
+        else {
+            panic!(
+                "a sample taken before cache-lock acquisition cannot expire a newer publication"
+            );
         };
         assert!(Arc::ptr_eq(&original, &newer_publication));
         let before_expiry = original.created_at + CACHE_MAX_AGE - Duration::from_nanos(1);
-        let ExportLookup::Ready(reused) = runtime.begin_export_at(&permit, &request, before_expiry).unwrap() else {
+        let ExportLookup::Ready(reused) = runtime
+            .begin_export_at(&permit, &request, before_expiry)
+            .unwrap()
+        else {
             panic!("snapshot must remain available before its fixed expiry");
         };
         assert!(Arc::ptr_eq(&original, &reused));
         assert_eq!(reused.digest(), blake3::hash(b"x").to_hex().as_str());
         assert!(matches!(
-            runtime.begin_export_at(&permit, &request, original.created_at + CACHE_MAX_AGE).unwrap(),
+            runtime
+                .begin_export_at(&permit, &request, original.created_at + CACHE_MAX_AGE)
+                .unwrap(),
             ExportLookup::Build(_)
         ));
         assert_eq!(runtime.cache.lock().unwrap().bytes, 0);
@@ -518,10 +625,20 @@ mod tests {
         let request = export_request("grant");
         let permit = runtime.admit("peer", request.limits).unwrap();
         drop(build(&runtime, &permit, &request));
-        assert!(build(&runtime, &permit, &request).finish("too long".to_owned()).is_err());
+        assert!(
+            build(&runtime, &permit, &request)
+                .finish("too long".to_owned())
+                .is_err()
+        );
         assert!(runtime.cache.lock().unwrap().ready.is_empty());
         assert!(runtime.cache.lock().unwrap().building.is_empty());
-        assert_eq!(build(&runtime, &permit, &request).finish("x".to_owned()).unwrap().wire(), "x");
+        assert_eq!(
+            build(&runtime, &permit, &request)
+                .finish("x".to_owned())
+                .unwrap()
+                .wire(),
+            "x"
+        );
         assert!(runtime.cache.lock().unwrap().building.is_empty());
     }
 
@@ -552,20 +669,26 @@ mod tests {
         let runtime = TransferRuntime::default();
         let request = export_request("grant");
         let permit = runtime.admit("peer", request.limits).unwrap();
-        build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
+        build(&runtime, &permit, &request)
+            .finish("x".to_owned())
+            .unwrap();
         let original = serde_json::to_value(&request).unwrap();
         for (pointer, value) in [
             ("/grant_id", serde_json::json!("other-grant")),
             ("/root_object_id", serde_json::json!("2".repeat(64))),
             ("/scope/zone_id", serde_json::json!("z:private")),
-            ("/scope/connector_id", serde_json::json!("github:request_response:v1")),
+            (
+                "/scope/connector_id",
+                serde_json::json!("github:request_response:v1"),
+            ),
             ("/limits/max_objects", serde_json::json!(2)),
             ("/limits/max_canonical_bytes", serde_json::json!(2)),
             ("/limits/max_wire_bytes", serde_json::json!(2)),
         ] {
             let mut value_copy = original.clone();
             *value_copy.pointer_mut(pointer).unwrap() = value;
-            let different: ConnectorStateExportRequest = serde_json::from_value(value_copy).unwrap();
+            let different: ConnectorStateExportRequest =
+                serde_json::from_value(value_copy).unwrap();
             let other_permit = runtime.admit("peer", different.limits).unwrap();
             drop(build(&runtime, &other_permit, &different));
         }
@@ -587,11 +710,20 @@ mod tests {
                 let mut request = export_request(&format!("grant-{index}"));
                 request.limits.max_wire_bytes = bytes;
                 let permit = runtime.admit("peer", request.limits).unwrap();
-                build(&runtime, &permit, &request).finish("x".repeat(bytes)).unwrap();
+                build(&runtime, &permit, &request)
+                    .finish("x".repeat(bytes))
+                    .unwrap();
                 let cache = runtime.cache.lock().unwrap();
                 assert!(cache.ready.len() <= MAX_CACHE_ENTRIES);
                 assert!(cache.bytes <= MAX_CACHE_BYTES);
-                assert_eq!(cache.bytes, cache.ready.values().map(|snapshot| snapshot.wire.len()).sum::<usize>());
+                assert_eq!(
+                    cache.bytes,
+                    cache
+                        .ready
+                        .values()
+                        .map(|snapshot| snapshot.wire.len())
+                        .sum::<usize>()
+                );
             }
             let expected_entries = MAX_CACHE_ENTRIES.min(MAX_CACHE_BYTES / bytes);
             assert_eq!(runtime.cache.lock().unwrap().ready.len(), expected_entries);
@@ -604,11 +736,16 @@ mod tests {
         let runtime = TransferRuntime::default();
         let request = export_request("grant");
         let permit = runtime.admit("peer", request.limits).unwrap();
-        build(&runtime, &permit, &request).finish("x".to_owned()).unwrap();
-        assert!(std::panic::catch_unwind(|| {
-            let _lock = runtime.cache.lock().unwrap();
-            panic!("fixture poisoned export cache");
-        }).is_err());
+        build(&runtime, &permit, &request)
+            .finish("x".to_owned())
+            .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _lock = runtime.cache.lock().unwrap();
+                panic!("fixture poisoned export cache");
+            })
+            .is_err()
+        );
         assert!(runtime.begin_export(&permit, &request).is_err());
         drop(permit);
         empty(&runtime);

@@ -1000,9 +1000,7 @@ mod tests {
                 .with_deadline_override_ms(Some(1))
                 .with_terminator(CancellationTerminator::new(|| {}, || true))
         };
-        let old_registration = controller
-            .track_operation("reused", None, scope())
-            .unwrap();
+        let old_registration = controller.track_operation("reused", None, scope()).unwrap();
         controller
             .cancel(
                 &cancel_request("reused", CancelReason::UserRequested),
@@ -1014,9 +1012,7 @@ mod tests {
         assert_eq!(old_expired.len(), 1);
 
         controller.complete_registration(&old_registration);
-        let replacement = controller
-            .track_operation("reused", None, scope())
-            .unwrap();
+        let replacement = controller.track_operation("reused", None, scope()).unwrap();
         assert!(!old_expired[0].terminator.as_ref().unwrap().abort());
         controller.complete_registration(&old_registration);
         assert_eq!(

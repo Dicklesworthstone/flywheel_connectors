@@ -21,7 +21,8 @@ pub const CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION: &str = "fcp.host.state-recove
 pub const MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES: usize = 8;
 /// Hard bound on an operator's complete recovery request, including wrappers.
 pub const MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES: usize =
-    MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES * (MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES + 1024) + 1024;
+    MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES * (MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES + 1024)
+        + 1024;
 /// Hard deadline covering all downloads and the single import attempt.
 pub const MAX_CONNECTOR_STATE_RECOVERY_TIMEOUT_MS: u64 = 60_000;
 
@@ -67,7 +68,9 @@ impl ConnectorStateRecoveryRequest {
             || self.attempt_timeout_ms > self.total_timeout_ms
             || self.total_timeout_ms > MAX_CONNECTOR_STATE_RECOVERY_TIMEOUT_MS
         {
-            return Err(invalid("invalid state-recovery donor count or deadline budget"));
+            return Err(invalid(
+                "invalid state-recovery donor count or deadline budget",
+            ));
         }
         let first = &self.candidates[0].request;
         let mut peers = HashSet::new();
@@ -78,14 +81,19 @@ impl ConnectorStateRecoveryRequest {
                 || candidate.peer_node.len() > 512
                 || candidate.peer_node.trim() != candidate.peer_node.as_str()
                 || candidate.peer_node.chars().any(char::is_control)
-                || candidate.peer_node.parse::<fcp_core::TailscaleNodeId>().is_err()
+                || candidate
+                    .peer_node
+                    .parse::<fcp_core::TailscaleNodeId>()
+                    .is_err()
                 || !peers.insert(candidate.peer_node.as_str())
                 || !grants.insert(candidate.request.grant_id.as_str())
                 || candidate.request.scope != first.scope
                 || candidate.request.root_object_id != first.root_object_id
                 || candidate.request.limits != first.limits
             {
-                return Err(invalid("state recovery requires distinct donors and grants for one exact scope, root and set of limits"));
+                return Err(invalid(
+                    "state recovery requires distinct donors and grants for one exact scope, root and set of limits",
+                ));
             }
         }
         Ok(())
@@ -185,7 +193,9 @@ impl ConnectorStateReplicationService {
                 // Recheck local authority after prior attempts and before new
                 // admission. A malformed/expired local grant is not a retry hint.
                 self.validate_pull(candidate)?;
-                let permit = self.runtime.admit(&candidate.peer_node, candidate.request.limits)?;
+                let permit = self
+                    .runtime
+                    .admit(&candidate.peer_node, candidate.request.limits)?;
                 let attempt_started = Instant::now();
                 let download = self.download_paged_admitted(
                     candidate,
@@ -206,10 +216,15 @@ impl ConnectorStateReplicationService {
                         // Deliberately outside the retryable download result.
                         // Keep this SAME permit until import ends or is dropped.
                         let replica = self
-                            .import_admitted(candidate, &wire, || {
-                                authorize_transport(index)?;
-                                check_deadline(started, total_budget)
-                            }, &permit)
+                            .import_admitted(
+                                candidate,
+                                &wire,
+                                || {
+                                    authorize_transport(index)?;
+                                    check_deadline(started, total_budget)
+                                },
+                                &permit,
+                            )
                             .await?;
                         attempts.push(attempt(candidate, ConnectorStateRecoveryOutcome::Retained));
                         return Ok(ConnectorStateRecoveryResponse {
@@ -255,7 +270,8 @@ fn check_deadline(started: Instant, budget: Duration) -> HostResult<()> {
 
 fn deadline_error() -> HostError {
     HostError::Unavailable(
-        "state-recovery total deadline elapsed; an admitted durable write may still complete".to_owned(),
+        "state-recovery total deadline elapsed; an admitted durable write may still complete"
+            .to_owned(),
     )
 }
 

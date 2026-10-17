@@ -2301,7 +2301,9 @@ mod tests {
             }
         }
 
-        async fn bounded(future: impl Future<Output = Result<(), TestError>>) -> Result<(), TestError> {
+        async fn bounded(
+            future: impl Future<Output = Result<(), TestError>>,
+        ) -> Result<(), TestError> {
             fcp_async_core::time::timeout(Duration::from_secs(5), future)
                 .await
                 .expect("retry loop ignored its context and hit the watchdog")

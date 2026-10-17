@@ -4,7 +4,7 @@
 // inventory-apply → registry-build → connector-spawn chain, which exceeds the
 // default trait-solver depth (future-incompat `overflow evaluating the
 // requirement` on the axum `Handler` bound).
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -56,14 +56,15 @@ use fcp_evidence::{
     OwnerMigrationVerificationContext, SoftwareBillOfMaterials, SupplyChainAttestation,
     TrustedV3OwnerMap, verify_hybrid_owner_object,
 };
+#[cfg(test)]
+use fcp_host::BatchStatus;
 use fcp_host::{
     AdaptiveWarmPoolConfig, AdaptiveWarmPoolController, BatchExecutor, BatchInvokeRequest,
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
-    BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
-    BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
-    CancellationController, CancellationRegistration, CancellationRequest, CancellationResponse,
-    CancellationScope, CancellationTerminator, CapabilityTokenVerifyRequest, ConfigRevisionRecord,
-    ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
+    BudgetAction, BudgetPolicyEngine, BudgetReportRequest, BudgetReportResponse, CacheMetadata,
+    CacheValidator, CancellationController, CancellationRegistration, CancellationRequest,
+    CancellationResponse, CancellationScope, CancellationTerminator, CapabilityTokenVerifyRequest,
+    ConfigRevisionRecord, ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
     ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
     ConnectorConfigApplyResponse, ConnectorConfigDiffRequest, ConnectorConfigDiffResponse,
@@ -149,6 +150,7 @@ use fcp_sandbox::{
     WasiConnectorRunner, host_matches_allow_list,
 };
 use fcp_telemetry::{TelemetryConfig, TelemetryError, metrics, otlp_readiness};
+#[cfg(test)]
 use futures_util::future::join_all;
 use futures_util::future::{AbortHandle, Abortable};
 use hyper::body::Incoming;
@@ -160,14 +162,16 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tower::ServiceExt;
 
+#[path = "fcp-host/connector_state_transfer.rs"]
+mod connector_state_transfer;
+#[path = "fcp-host/http_batch.rs"]
+mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
 mod session;
-#[path = "fcp-host/connector_state_transfer.rs"]
-mod connector_state_transfer;
 
 use native_rpc::{NativeInvocationTermination, NativeRpc, invocation_deadline};
 
@@ -586,8 +590,8 @@ impl SubprocessConnector {
         let state_root = configured_connector_state_root(&config);
         let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
-        let runner_task = task::try_spawn(native_rpc::run_dispatcher(runner, runner_rx))
-            .map_err(|error| {
+        let runner_task =
+            task::try_spawn(native_rpc::run_dispatcher(runner, runner_rx)).map_err(|error| {
                 HostError::Internal(format!("connector dispatcher admission failed: {error}"))
             })?;
 
@@ -8066,9 +8070,7 @@ fn open_host_invoke_audit(
     let mut filename = lifecycle_path
         .file_name()
         .ok_or_else(|| {
-            HostError::InvalidFilter(
-                "lifecycle persistence path must name a file".to_string(),
-            )
+            HostError::InvalidFilter("lifecycle persistence path must name a file".to_string())
         })?
         .to_os_string();
     filename.push(".invoke-audit.journal");
@@ -8505,7 +8507,10 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     .await;
 
     state.invoke_jobs.stop_accepting();
-    let drain_result = state.invoke_jobs.shutdown(invoke_jobs::SHUTDOWN_GRACE).await;
+    let drain_result = state
+        .invoke_jobs
+        .shutdown(invoke_jobs::SHUTDOWN_GRACE)
+        .await;
     serve_result?;
     drain_result?;
     tracing::info!(event = "host_shutdown_complete", "fcp-host exiting cleanly");
@@ -8731,15 +8736,17 @@ async fn route_connector_self_check(
         Ok(response) => return Ok(Some(response.report)),
         Err((StatusCode::NOT_FOUND, _)) => {}
         Err((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, message)) => {
-            return Ok(Some(SelfCheckReport::failed("self_check_zone_denied", message)));
+            return Ok(Some(SelfCheckReport::failed(
+                "self_check_zone_denied",
+                message,
+            )));
         }
         Err((_, message)) => return Err(HostError::RegistryError(message)),
     }
     let Some(router) = state.mesh.clone() else {
         return Ok(None);
     };
-    let decision =
-        mesh_route_decision(state, &router, connector_id, Some(zone_id), None).await?;
+    let decision = mesh_route_decision(state, &router, connector_id, Some(zone_id), None).await?;
     if !decision.is_forward() {
         return Ok(None);
     }
@@ -8755,7 +8762,10 @@ async fn route_connector_self_check(
     {
         Ok(response) => response,
         Err((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, message)) => {
-            return Ok(Some(SelfCheckReport::failed("self_check_zone_denied", message)));
+            return Ok(Some(SelfCheckReport::failed(
+                "self_check_zone_denied",
+                message,
+            )));
         }
         Err((_, message)) => return Err(HostError::RegistryError(message)),
     };
@@ -8782,10 +8792,15 @@ async fn local_connector_self_check(
         (entry.connector.clone(), entry.config.allowed_zones.clone())
     };
     require_allowed_zones_configured(connector_id, &allowed_zones).map_err(map_host_error)?;
-    if !allowed_zones.iter().any(|allowed| allowed == zone_id.as_str()) {
+    if !allowed_zones
+        .iter()
+        .any(|allowed| allowed == zone_id.as_str())
+    {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("self-check denied: connector `{connector_id}` is not admitted to zone `{zone_id}`"),
+            format!(
+                "self-check denied: connector `{connector_id}` is not admitted to zone `{zone_id}`"
+            ),
         ));
     }
     let timeout = state.doctor.self_check_timeout();
@@ -11646,14 +11661,9 @@ async fn simulate_handler(
         {
             Ok(decision) => decision,
             Err(error) => {
-                return simulate_preflight_denial(
-                    &state,
-                    &request,
-                    started_at,
-                    error.to_string(),
-                )
-                .await
-                .map(Json);
+                return simulate_preflight_denial(&state, &request, started_at, error.to_string())
+                    .await
+                    .map(Json);
             }
         };
         if let fcp_mesh::invoke_route::InvokeRouteDecision::Forward { target, .. } = &decision {
@@ -11782,8 +11792,7 @@ async fn local_simulate(
         }
     };
 
-    let preflight =
-        evaluate_live_preflight(state, &preflight_request, asserted_principal).await;
+    let preflight = evaluate_live_preflight(state, &preflight_request, asserted_principal).await;
     if !preflight.allowed {
         return simulate_preflight_denial(
             state,
@@ -14317,10 +14326,21 @@ async fn invoke_handler(
 /// Other requests use verified peer advertisements (answer stamped `mesh-backed`).
 async fn route_invoke(
     state: &Arc<AppState>,
-    mut request: InvokeRequest,
+    request: InvokeRequest,
     asserted_principal: Option<String>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    let deadline = invocation_deadline(Instant::now(), request.deadline_ms);
+    route_invoke_with_deadline(state, request, asserted_principal, None).await
+}
+
+/// Batch callers inherit an absolute deadline rather than creating a fresh
+/// routing budget after dependency or capacity waits. Single calls use None.
+async fn route_invoke_with_deadline(
+    state: &Arc<AppState>,
+    mut request: InvokeRequest,
+    asserted_principal: Option<String>,
+    parent_deadline: Option<Instant>,
+) -> Result<InvokeResponse, (StatusCode, String)> {
+    let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, parent_deadline);
     let Some(router) = state.mesh.clone() else {
         constrain_invoke_deadline(&mut request, deadline);
         return invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
@@ -14358,13 +14378,8 @@ async fn route_invoke(
         }
         Ok(Err(error)) => {
             let reason = error.to_string();
-            append_mesh_preflight_denial(
-                state,
-                &request,
-                asserted_principal.as_deref(),
-                &reason,
-            )
-            .map_err(map_host_error)?;
+            append_mesh_preflight_denial(state, &request, asserted_principal.as_deref(), &reason)
+                .map_err(map_host_error)?;
             return Err(map_host_error(HostError::PreflightFailed(reason)));
         }
     };
@@ -14542,7 +14557,8 @@ async fn mesh_route_decision(
         if let Some(routing) = current_hrw_lease_routing_config()? {
             if &routing.local_node != router.local_node() {
                 return Err(HostError::InvalidFilter(
-                    "mesh routing and HRW lease routing must use the same local node id".to_string(),
+                    "mesh routing and HRW lease routing must use the same local node id"
+                        .to_string(),
                 ));
             }
             enforce_hrw_singleton_writer_quorum_config("route", &routing)?;
@@ -14758,7 +14774,9 @@ async fn run_mesh_forward_job(
     let request = &request;
     let asserted_principal = asserted_principal.as_deref();
     let remaining_ms = u64::try_from(
-        deadline.saturating_duration_since(Instant::now()).as_millis(),
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
     )
     .unwrap_or(u64::MAX);
     // This is origin routing evidence. Only completed local preflight supplies
@@ -14781,7 +14799,10 @@ async fn run_mesh_forward_job(
     .await
     .and_then(std::convert::identity)
     .map_err(map_host_error)?;
-    state.invoke_jobs.bind_attempt(&ticket).map_err(map_host_error)?;
+    state
+        .invoke_jobs
+        .bind_attempt(&ticket)
+        .map_err(map_host_error)?;
 
     let terminal = |outcome, http_status, receipt_id| fcp_host::MeshInvocationTerminal {
         outcome,
@@ -14859,8 +14880,7 @@ async fn run_mesh_forward_job(
                     "invoke request could not be encoded for mesh forwarding: {error}"
                 )))
             })?;
-            if registered_locally
-                && let Err(error) = recheck_admitted_holder_proof(state, request)
+            if registered_locally && let Err(error) = recheck_admitted_holder_proof(state, request)
             {
                 append_mesh_preflight_denial(
                     state,
@@ -15204,8 +15224,7 @@ async fn mesh_forward_query<T: serde::de::DeserializeOwned>(
                 }
             }
             Ok(reply) => {
-                let status = StatusCode::from_u16(reply.status)
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 if !mesh_query_status_allows_failover(status) {
                     tracing::warn!(
                         event = "mesh_query_denied",
@@ -15310,12 +15329,13 @@ fn mesh_query_response_bindings(
             ),
         ]),
         MeshForwardBody::Simulate { request_json, .. } => {
-            let request: HostSimulateRequest = serde_json::from_str(request_json).map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "cannot forward an invalid simulation request".to_string(),
-                )
-            })?;
+            let request: HostSimulateRequest =
+                serde_json::from_str(request_json).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "cannot forward an invalid simulation request".to_string(),
+                    )
+                })?;
             let input_digest = hex::encode(
                 request_input_hash(request.input.as_ref().unwrap_or(&Value::Null))
                     .map_err(map_host_error)?,
@@ -15365,7 +15385,10 @@ fn validate_mesh_query_response(
             return Err(binding.mismatch);
         }
     }
-    if matches!(body, fcp_mesh::invoke_route::MeshForwardBody::Simulate { .. }) {
+    if matches!(
+        body,
+        fcp_mesh::invoke_route::MeshForwardBody::Simulate { .. }
+    ) {
         for (response_pointer, receipt_pointer, mismatch) in [
             (
                 "/phase",
@@ -15395,9 +15418,7 @@ fn validate_mesh_query_response(
             Some("preflight_only") => {
                 preflight_allowed == Some(false) && would_succeed == Some(false)
             }
-            Some("connector_reached") => {
-                preflight_allowed == Some(true) && would_succeed.is_some()
-            }
+            Some("connector_reached") => preflight_allowed == Some(true) && would_succeed.is_some(),
             Some("connector_unsupported" | "timed_out") => {
                 preflight_allowed == Some(true) && would_succeed == Some(false)
             }
@@ -15554,9 +15575,9 @@ async fn mesh_forward_handler(
                 mesh_reply_body(local_connector_self_check(&state, &connector_id, &zone_id).await)
             }
             (Err(error), _) => mesh_reply_body::<()>(Err(error)),
-            (_, Err(error)) => mesh_reply_body::<()>(Err(map_host_error(HostError::InvalidFilter(
-                format!("invalid self-check zone_id: {error}"),
-            )))),
+            (_, Err(error)) => mesh_reply_body::<()>(Err(map_host_error(
+                HostError::InvalidFilter(format!("invalid self-check zone_id: {error}")),
+            ))),
         },
     };
     tracing::info!(
@@ -15689,22 +15710,6 @@ async fn record_invoke_budget_usage(
     true
 }
 
-fn batch_timeout_error() -> BatchOperationError {
-    BatchOperationError {
-        code: "BATCH_TIMEOUT".to_string(),
-        message: "batch timeout exceeded".to_string(),
-        retry_after_ms: None,
-    }
-}
-
-fn dependency_failed_error() -> BatchOperationError {
-    BatchOperationError {
-        code: "DEP_FAILED".to_string(),
-        message: "dependency failed".to_string(),
-        retry_after_ms: None,
-    }
-}
-
 fn batch_error_from_host_error(err: HostError) -> BatchOperationError {
     let code = match err {
         HostError::ConnectorNotFound(_) => "CONNECTOR_NOT_FOUND",
@@ -15724,82 +15729,8 @@ fn batch_error_from_host_error(err: HostError) -> BatchOperationError {
     }
 }
 
-fn skipped_batch_result(id: String, error: Option<BatchOperationError>) -> OperationResult {
-    OperationResult {
-        id,
-        status: OperationResultStatus::Skipped,
-        output: None,
-        error,
-        duration_ms: 0,
-    }
-}
-
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-fn dependency_failed_in_batch(
-    operation: &HttpBatchOperation,
-    results_map: &HashMap<String, OperationResult>,
-) -> bool {
-    operation.depends_on.iter().any(|dependency_id| {
-        results_map
-            .get(dependency_id.as_str())
-            .is_some_and(|result| result.status != OperationResultStatus::Success)
-    })
-}
-
-fn batch_status(aborted: bool, completed: usize, failed: usize) -> BatchStatus {
-    if aborted && failed > 0 {
-        BatchStatus::Aborted
-    } else if failed == 0 {
-        BatchStatus::Success
-    } else if completed == 0 {
-        BatchStatus::AllFailed
-    } else {
-        BatchStatus::PartialSuccess
-    }
-}
-
-fn build_batch_response(
-    request: &HttpBatchInvokeRequest,
-    mut results_map: HashMap<String, OperationResult>,
-    aborted: bool,
-    started_at: Instant,
-    schedule_report: Option<BatchScheduleReport>,
-) -> BatchInvokeResponse {
-    let results: Vec<OperationResult> = request
-        .operations
-        .iter()
-        .map(|operation| {
-            results_map
-                .remove(operation.id.as_str())
-                .unwrap_or_else(|| skipped_batch_result(operation.id.clone(), None))
-        })
-        .collect();
-
-    let completed = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Success)
-        .count();
-    let failed = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Error)
-        .count();
-    let skipped = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Skipped)
-        .count();
-
-    BatchInvokeResponse {
-        status: batch_status(aborted, completed, failed),
-        completed,
-        failed,
-        skipped,
-        results,
-        total_duration_ms: elapsed_millis(started_at),
-        schedule_report,
-    }
 }
 
 async fn execute_batch_operation(
@@ -15811,13 +15742,25 @@ async fn execute_batch_operation(
     let started_at = Instant::now();
     // Each admitted member owns its result/finalization even if the batch's
     // HTTP waiter disappears. Unstarted members remain with the scheduler.
-    let result = invoke_jobs::execute(
-        &state,
-        operation.request,
-        principal_override.as_deref().map(ToOwned::to_owned),
-        batch_deadline,
-    )
-    .await;
+    let principal = principal_override.as_deref().map(ToOwned::to_owned);
+    let result = if state.mesh.is_some() {
+        // Use the same discovery, holder selection, live admission, signed
+        // forward and durable origin ownership as a single HTTP invoke.
+        // This path never downgrades an uncertain remote result to a local retry.
+        Box::pin(route_invoke_with_deadline(
+            &state,
+            operation.request,
+            principal,
+            batch_deadline,
+        ))
+        .await
+        .map_err(http_batch::route_failure)
+    } else {
+        // Preserve the existing typed local errors when mesh is not configured.
+        invoke_jobs::execute(&state, operation.request, principal, batch_deadline)
+            .await
+            .map_err(batch_error_from_host_error)
+    };
     let duration_ms = elapsed_millis(started_at);
     match result {
         Ok(response) if matches!(response.status, InvokeStatus::Error) => {
@@ -15858,7 +15801,7 @@ async fn execute_batch_operation(
             id: operation.id,
             status: OperationResultStatus::Error,
             output: None,
-            error: Some(batch_error_from_host_error(error)),
+            error: Some(error),
             duration_ms,
         },
     }
@@ -15869,135 +15812,7 @@ async fn batch_invoke_handler(
     headers: HeaderMap,
     Json(request): Json<HttpBatchInvokeRequest>,
 ) -> Result<Json<BatchInvokeResponse>, (StatusCode, String)> {
-    let started_at = Instant::now();
-    let asserted_principal = extract_principal_header(&headers).map(Arc::<str>::from);
-    tracing::debug!(
-        event = "batch_invoke_request",
-        operation_count = request.operations.len(),
-        max_parallelism = request.options.max_parallelism,
-        stop_on_first_error = request.options.stop_on_first_error,
-        timeout_ms = request.options.timeout_ms,
-        asserted_principal = asserted_principal.as_deref(),
-        "processing batch invoke request"
-    );
-
-    let executor = BatchExecutor::new();
-    let planning_request = request.planning_request();
-    let (plan, schedule_report) = executor
-        .plan_with_schedule_report(&planning_request)
-        .map_err(map_host_error)?;
-    let schedule_report = matches!(request.options.scheduler.mode, BatchSchedulerMode::Adaptive)
-        .then_some(schedule_report);
-    let timeout = Duration::from_millis(request.options.timeout_ms);
-    // Preserve the original batch budget through every member's preflight,
-    // queue and IO. An unrepresentable huge timeout still uses the elapsed
-    // checks below; it must not become an already-expired Instant.
-    let batch_deadline = started_at.checked_add(timeout);
-    let max_parallelism = usize::try_from(request.options.max_parallelism)
-        .unwrap_or(usize::MAX)
-        .max(1);
-
-    let operation_map: HashMap<String, HttpBatchOperation> = request
-        .operations
-        .iter()
-        .cloned()
-        .map(|operation| (operation.id.clone(), operation))
-        .collect();
-    let mut results_map: HashMap<String, OperationResult> =
-        HashMap::with_capacity(request.operations.len());
-    let mut aborted = false;
-
-    for tier in &plan.tiers {
-        if aborted {
-            for operation_id in &tier.operation_ids {
-                results_map.insert(
-                    operation_id.clone(),
-                    skipped_batch_result(operation_id.clone(), None),
-                );
-            }
-            continue;
-        }
-
-        for chunk in tier.operation_ids.chunks(max_parallelism) {
-            if started_at.elapsed() >= timeout {
-                aborted = true;
-                let timeout_error = batch_timeout_error();
-                for operation_id in chunk {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), Some(timeout_error.clone())),
-                    );
-                }
-                continue;
-            }
-
-            // stop_on_first_error tripped in an earlier chunk of this tier:
-            // short-circuit the remaining chunks instead of executing them
-            // (the tier-level check above only catches subsequent tiers).
-            if aborted {
-                for operation_id in chunk {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), None),
-                    );
-                }
-                continue;
-            }
-
-            let mut ready = Vec::new();
-            for operation_id in chunk {
-                let operation = operation_map
-                    .get(operation_id.as_str())
-                    .expect("planned batch operation must exist");
-                if dependency_failed_in_batch(operation, &results_map) {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), Some(dependency_failed_error())),
-                    );
-                } else {
-                    ready.push(operation.clone());
-                }
-            }
-
-            if ready.is_empty() {
-                continue;
-            }
-
-            let chunk_results = join_all(ready.into_iter().map(|operation| {
-                execute_batch_operation(
-                    Arc::clone(&state),
-                    operation,
-                    asserted_principal.clone(),
-                    batch_deadline,
-                )
-            }))
-            .await;
-
-            let chunk_failed = chunk_results
-                .iter()
-                .any(|result| result.status == OperationResultStatus::Error);
-            for result in chunk_results {
-                results_map.insert(result.id.clone(), result);
-            }
-            if request.options.stop_on_first_error && chunk_failed {
-                aborted = true;
-            }
-        }
-    }
-
-    let response =
-        build_batch_response(&request, results_map, aborted, started_at, schedule_report);
-    tracing::info!(
-        event = "batch_invoke_response",
-        operation_count = request.operations.len(),
-        completed = response.completed,
-        failed = response.failed,
-        skipped = response.skipped,
-        status = ?response.status,
-        duration_ms = started_at.elapsed().as_millis() as u64,
-        "batch invoke request complete"
-    );
-    Ok(Json(response))
+    http_batch::execute(state, headers, request).await.map(Json)
 }
 
 async fn supply_chain_verify_handler(
@@ -16564,7 +16379,10 @@ async fn invocation_query_handler(
         let selected_attempt = match kind {
             invoke_jobs::InvocationJobKind::Local => {
                 observation.mesh_invocation = None;
-                observation.invocation.as_ref().map(|record| record.ticket.attempt_id)
+                observation
+                    .invocation
+                    .as_ref()
+                    .map(|record| record.ticket.attempt_id)
             }
             invoke_jobs::InvocationJobKind::Forward => {
                 observation.invocation = None;
@@ -17794,8 +17612,9 @@ deny_ptrace = true
             Some(signing_key.verifying_key()),
             HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
         );
-        Arc::get_mut(&mut state).expect("unshared app state").invoke_audit =
-            Arc::new(invoke_audit);
+        Arc::get_mut(&mut state)
+            .expect("unshared app state")
+            .invoke_audit = Arc::new(invoke_audit);
         let request = InvokeRequest {
             r#type: "invoke".to_string(),
             id: RequestId::new("terminal-audit-failure"),
@@ -17818,13 +17637,9 @@ deny_ptrace = true
             provenance: None,
             approval_tokens: Vec::new(),
         };
-        let error = invoke_handler(
-            State(Arc::clone(&state)),
-            HeaderMap::new(),
-            Json(request),
-        )
-        .await
-        .expect_err("an observed result without persisted audit cannot finalize");
+        let error = invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request))
+            .await
+            .expect_err("an observed result without persisted audit cannot finalize");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("dispatch outcome"));
         assert_eq!(invokes.load(Ordering::SeqCst), 1);
@@ -17963,8 +17778,9 @@ deny_ptrace = true
             Some(signing_key.verifying_key()),
             HashMap::from([(ZoneId::work(), host_runtime_policy(ZoneId::work()))]),
         );
-        Arc::get_mut(&mut state).expect("unshared app state").invoke_audit =
-            Arc::new(invoke_audit);
+        Arc::get_mut(&mut state)
+            .expect("unshared app state")
+            .invoke_audit = Arc::new(invoke_audit);
         state
             .budget
             .upsert_policy(
@@ -18016,8 +17832,17 @@ deny_ptrace = true
         .expect("invalid audit context must fail before connector dispatch")
         .expect_err("allow evidence must be persisted before admission");
         assert_eq!(audit_error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(audit_error.1.contains("invoke audit could not be persisted"));
-        assert!(lifecycle.invocation_record(&invalid_audit_id, None).await.is_none());
+        assert!(
+            audit_error
+                .1
+                .contains("invoke audit could not be persisted")
+        );
+        assert!(
+            lifecycle
+                .invocation_record(&invalid_audit_id, None)
+                .await
+                .is_none()
+        );
 
         let mut retry = request.clone();
         retry.id = RequestId::new("owned-disconnect-retry");
@@ -18036,9 +17861,17 @@ deny_ptrace = true
         .expect("retry must reach admission while the first effect is unresolved")
         .expect_err("a fresh request ID must not bypass a retained idempotency key");
         assert_eq!(retry_error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(retry_error.1.contains("idempotency key has an unresolved attempt"));
+        assert!(
+            retry_error
+                .1
+                .contains("idempotency key has an unresolved attempt")
+        );
         assert!(retry_error.1.contains("operation_id=\"owned-disconnect\""));
-        assert!(retry_error.1.contains(&format!("attempt_id={}", ticket.attempt_id)));
+        assert!(
+            retry_error
+                .1
+                .contains(&format!("attempt_id={}", ticket.attempt_id))
+        );
         assert!(
             lifecycle.invocation_record(&retry_id, None).await.is_none(),
             "rejected retries must not create a second admission"
@@ -18071,7 +17904,10 @@ deny_ptrace = true
         assert!(finalization.receipt_recorded);
         assert_eq!(finalization.sampling_completed, None);
         assert_eq!(finalization.response_http_status, Some(200));
-        let audit_id = finalization.audit_event_id.as_ref().expect("terminal audit");
+        let audit_id = finalization
+            .audit_event_id
+            .as_ref()
+            .expect("terminal audit");
         assert!(
             state
                 .invoke_audit
@@ -18382,9 +18218,9 @@ deny_ptrace = true
             HeaderMap::new(),
             Json(request.clone()),
         )
-            .await
-            .expect("host-orchestrated sampling invoke should succeed")
-            .0;
+        .await
+        .expect("host-orchestrated sampling invoke should succeed")
+        .0;
 
         assert_eq!(response.status, InvokeStatus::Ok);
         let result = response.result.expect("sampling response result");
@@ -18412,7 +18248,11 @@ deny_ptrace = true
             .await
             .expect("source ownership record");
         assert_eq!(
-            source_record.terminal.as_ref().expect("source terminal").outcome,
+            source_record
+                .terminal
+                .as_ref()
+                .expect("source terminal")
+                .outcome,
             fcp_host::InvocationOutcome::Succeeded
         );
         assert_eq!(
@@ -18442,7 +18282,11 @@ deny_ptrace = true
             .expect("separate child ownership record");
         assert_eq!(child_record.admission.connector_id, "groq");
         assert_eq!(
-            child_record.terminal.as_ref().expect("child terminal").outcome,
+            child_record
+                .terminal
+                .as_ref()
+                .expect("child terminal")
+                .outcome,
             fcp_host::InvocationOutcome::Succeeded
         );
         assert_eq!(
@@ -18474,10 +18318,16 @@ deny_ptrace = true
             .await
             .expect("source observed before failed sampling");
         assert_eq!(
-            failed_source.terminal.as_ref().expect("source terminal").outcome,
+            failed_source
+                .terminal
+                .as_ref()
+                .expect("source terminal")
+                .outcome,
             fcp_host::InvocationOutcome::Succeeded
         );
-        let finalization = failed_source.finalization.expect("failed enrichment metadata");
+        let finalization = failed_source
+            .finalization
+            .expect("failed enrichment metadata");
         assert_eq!(finalization.sampling_completed, Some(false));
         assert_eq!(finalization.response_http_status, None);
         assert_eq!(mcp_invokes.load(Ordering::SeqCst), 2);
@@ -18555,7 +18405,11 @@ deny_ptrace = true
             fcp_host::InvocationOutcome::OutcomeUnknown
         );
         assert_eq!(
-            ambiguous_source.terminal.as_ref().expect("source terminal").outcome,
+            ambiguous_source
+                .terminal
+                .as_ref()
+                .expect("source terminal")
+                .outcome,
             fcp_host::InvocationOutcome::Succeeded
         );
         let finalization = ambiguous_source
@@ -19726,7 +19580,10 @@ deny_ptrace = true
         );
         assert_eq!(completed_record.attempts[1].target_node, "available");
         assert_eq!(
-            completed_record.terminal.expect("completed forward").outcome,
+            completed_record
+                .terminal
+                .expect("completed forward")
+                .outcome,
             fcp_host::MeshInvocationOutcome::Succeeded
         );
 
@@ -19775,7 +19632,11 @@ deny_ptrace = true
             .await
             .expect("retained uncertain forward");
         assert_eq!(
-            uncertain.terminal.as_ref().expect("uncertain outcome").outcome,
+            uncertain
+                .terminal
+                .as_ref()
+                .expect("uncertain outcome")
+                .outcome,
             fcp_host::MeshInvocationOutcome::OutcomeUnknown
         );
         assert_eq!(uncertain.attempts.len(), 1);
@@ -19793,7 +19654,9 @@ deny_ptrace = true
             HostAdminStateStore::with_state_path(state_path).expect("replacement origin store"),
         );
         assert_eq!(
-            reopened.mesh_invocation_record(&uncertain.ticket.operation_id, None).await,
+            reopened
+                .mesh_invocation_record(&uncertain.ticket.operation_id, None)
+                .await,
             Some(uncertain.clone())
         );
         let replacement = dispatcher_app_state(
@@ -19824,16 +19687,18 @@ deny_ptrace = true
         )
         .await
         .expect_err("new request ID must not bypass an unresolved exact-token key");
-        assert!(key_error.1.contains("idempotency key has an unresolved mesh forward"));
+        assert!(
+            key_error
+                .1
+                .contains("idempotency key has an unresolved mesh forward")
+        );
         assert_eq!(pending.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 1);
 
         let local_invokes = Arc::new(AtomicU64::new(0));
-        for (reuse_operation_id, asserted_principal) in [
-            (true, None),
-            (false, None),
-            (false, Some("user:test")),
-        ] {
+        for (reuse_operation_id, asserted_principal) in
+            [(true, None), (false, None), (false, Some("user:test"))]
+        {
             // Give each admission a fresh rate-limit pool so the assertion
             // proves the durable replay fence, not incidental quota denial.
             let local_base = invoke_token_bucket_state(
@@ -19857,13 +19722,12 @@ deny_ptrace = true
             if let Some(principal) = asserted_principal {
                 headers.insert("x-principal", HeaderValue::from_static(principal));
             }
-            let local_error = invoke_handler(
-                State(Arc::clone(&local)),
-                headers,
-                Json(request.clone()),
-            )
-            .await
-            .expect_err("moving the operation locally must preserve the origin replay fence");
+            let local_error =
+                invoke_handler(State(Arc::clone(&local)), headers, Json(request.clone()))
+                    .await
+                    .expect_err(
+                        "moving the operation locally must preserve the origin replay fence",
+                    );
             if asserted_principal.is_some() {
                 assert!(local_error.1.contains("idempotency key"));
                 assert!(local_error.1.contains("different"));
@@ -20035,7 +19899,10 @@ deny_ptrace = true
         });
         let admin_app = Router::new()
             .route("/rpc/admin/invocations", post(invocation_query_handler))
-            .route_layer(from_fn_with_state(Arc::clone(&state), admin_auth_middleware))
+            .route_layer(from_fn_with_state(
+                Arc::clone(&state),
+                admin_auth_middleware,
+            ))
             .with_state(Arc::clone(&state));
         let caller_state = Arc::clone(&state);
         let caller = task::spawn(async move {
@@ -20080,7 +19947,10 @@ deny_ptrace = true
             active["invocation"].is_null(),
             "older local completion must not masquerade as the active remote result"
         );
-        assert_eq!(active["mesh_invocation"]["intent"]["target_node"], "executor");
+        assert_eq!(
+            active["mesh_invocation"]["intent"]["target_node"],
+            "executor"
+        );
         assert_eq!(
             active["mesh_invocation"]["intent"]["identity"]["kind"],
             "token_bound_relay"
@@ -20093,7 +19963,10 @@ deny_ptrace = true
         assert!(active_attempt > previous.ticket.attempt_id);
         assert_eq!(
             state.invoke_jobs.active_observation(OPERATION_ID),
-            Some((invoke_jobs::InvocationJobKind::Forward, Some(active_attempt)))
+            Some((
+                invoke_jobs::InvocationJobKind::Forward,
+                Some(active_attempt)
+            ))
         );
         let historical = response_body_json_ok(
             send_json_request(
@@ -20188,7 +20061,9 @@ deny_ptrace = true
                 OPERATION_ID.to_string(),
                 Instant::now() + Duration::from_secs(5),
                 async move {
-                    pending_release_rx.await.expect("release pending reservation");
+                    pending_release_rx
+                        .await
+                        .expect("release pending reservation");
                     Ok(InvokeResponse::ok(RequestId::new(OPERATION_ID), json!({})))
                 },
             )
@@ -20220,11 +20095,18 @@ deny_ptrace = true
         .expect("exact previous forwarding attempt")
         .0;
         assert_eq!(
-            exact_lookup.mesh_invocation.expect("historical mesh record").ticket.attempt_id,
+            exact_lookup
+                .mesh_invocation
+                .expect("historical mesh record")
+                .ticket
+                .attempt_id,
             active_attempt
         );
         pending_release_tx.send(()).expect("release pending owner");
-        pending_waiter.await.expect("pending waiter").expect("pending job");
+        pending_waiter
+            .await
+            .expect("pending waiter")
+            .expect("pending job");
         pending_state
             .invoke_jobs
             .shutdown(Duration::from_secs(1))
@@ -20489,10 +20371,14 @@ deny_ptrace = true
             lease_seq: request.lease_seq,
         };
         assert!(
-            preflight_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(preflight.clone()))
-                .await
-                .0
-                .allowed
+            preflight_handler(
+                State(Arc::clone(&state)),
+                HeaderMap::new(),
+                Json(preflight.clone())
+            )
+            .await
+            .0
+            .allowed
         );
         assert_eq!(forwards.load(Ordering::SeqCst), 3);
 
@@ -20514,7 +20400,11 @@ deny_ptrace = true
         };
         let mut denial_receipt_ids = Vec::new();
         for (request_id, deny_operation, expected_reason) in [
-            ("mesh-simulate-route-denied", true, "does not allow operation"),
+            (
+                "mesh-simulate-route-denied",
+                true,
+                "does not allow operation",
+            ),
             ("mesh-simulate-principal-denied", false, "request principal"),
         ] {
             state
@@ -20686,9 +20576,13 @@ deny_ptrace = true
         }
         assert_eq!(forwards.load(Ordering::SeqCst), 3);
         request.lease_seq = Some(8);
-        invoke_handler(State(Arc::clone(&state)), HeaderMap::new(), Json(request.clone()))
-            .await
-            .expect("current lease boundary forwards");
+        invoke_handler(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .expect("current lease boundary forwards");
         assert_eq!(forwards.load(Ordering::SeqCst), 4);
         assert_eq!(local_invokes.load(Ordering::SeqCst), 0);
 
@@ -20751,8 +20645,7 @@ deny_ptrace = true
                 .await
                 .expect("entry budget snapshot");
             assert_eq!(
-                snapshot.budgets[0].used,
-                used,
+                snapshot.budgets[0].used, used,
                 "charge each forwarded invoke exactly once"
             );
             assert_eq!(forwards.load(Ordering::SeqCst), 6 + used);
@@ -20808,7 +20701,10 @@ deny_ptrace = true
                 .as_deref()
                 .is_some_and(|reason| reason.contains("usage budget exceeded"))
         );
-        assert_eq!(denied_simulation.receipt.phase, SimulatePhase::PreflightOnly);
+        assert_eq!(
+            denied_simulation.receipt.phase,
+            SimulatePhase::PreflightOnly
+        );
         assert!(!denied_simulation.receipt.would_succeed);
         let receipts = state
             .lifecycle
@@ -20819,9 +20715,12 @@ deny_ptrace = true
                 limit: 10,
             })
             .await;
-        assert!(receipts.receipts.iter().any(|receipt| {
-            receipt.receipt_id == denied_simulation.receipt.receipt_id
-        }));
+        assert!(
+            receipts
+                .receipts
+                .iter()
+                .any(|receipt| { receipt.receipt_id == denied_simulation.receipt.receipt_id })
+        );
         assert_eq!(
             forwards.load(Ordering::SeqCst),
             8,
@@ -25634,27 +25533,16 @@ deny_ptrace = true
             .expect("forward to elected holder must flush durable state before yielding");
         let mut stale = request.clone();
         stale.lease_seq = Some(9);
-        let fenced = enforce_hrw_lease_route(
-            &state,
-            &stale,
-            routing.as_ref(),
-            true,
-            Some(&expected),
-        )
-        .await
-        .expect_err("forwarding must not bypass the old holder's lease fence");
+        let fenced =
+            enforce_hrw_lease_route(&state, &stale, routing.as_ref(), true, Some(&expected))
+                .await
+                .expect_err("forwarding must not bypass the old holder's lease fence");
         assert!(fenced.to_string().contains("LeaseFenced"));
         assert!(fenced.to_string().contains("yield_flush"));
         assert!(
-            enforce_hrw_lease_route(
-                &state,
-                &request,
-                routing.as_ref(),
-                true,
-                Some(&local_node),
-            )
-            .await
-            .is_err()
+            enforce_hrw_lease_route(&state, &request, routing.as_ref(), true, Some(&local_node),)
+                .await
+                .is_err()
         );
 
         let (status, message) = invoke_handler(State(state), HeaderMap::new(), Json(request))
@@ -27353,7 +27241,6 @@ deny_ptrace = true
         );
     }
 
-
     fn holder_test_router(
         directory: &std::path::Path,
         holder_key: &fcp_crypto::ed25519::Ed25519SigningKey,
@@ -27499,11 +27386,14 @@ deny_ptrace = true
         let directory = tempfile::tempdir().expect("signed membership directory");
         Arc::get_mut(&mut state).expect("exclusive state").mesh =
             Some(Arc::new(holder_test_router(directory.path(), &holder)));
-        recheck_admitted_holder_proof(&state, &request)
-            .expect("owner-authenticated holder proof");
+        recheck_admitted_holder_proof(&state, &request).expect("owner-authenticated holder proof");
 
         let mut forged = request.clone();
-        forged.holder_proof.as_mut().expect("holder proof").signature[0] ^= 1;
+        forged
+            .holder_proof
+            .as_mut()
+            .expect("holder proof")
+            .signature[0] ^= 1;
         assert!(recheck_admitted_holder_proof(&state, &forged).is_err());
         let mut replay = request.clone();
         replay.id = RequestId::random();
@@ -27551,7 +27441,10 @@ deny_ptrace = true
                         let incoming: InvokeRequest =
                             serde_json::from_value(rpc.params).expect("invoke request");
                         assert!(incoming.holder_proof.is_some());
-                        json!(InvokeResponse::ok(incoming.id, json!({ "authorized": true })))
+                        json!(InvokeResponse::ok(
+                            incoming.id,
+                            json!({ "authorized": true })
+                        ))
                     }
                     method => panic!("unexpected holder test method {method}"),
                 };
@@ -28429,7 +28322,10 @@ deny_ptrace = true
         .expect("structured stopped batch")
         .0;
         assert_eq!(stopped.status, BatchStatus::Aborted);
-        assert_eq!((stopped.completed, stopped.failed, stopped.skipped), (0, 1, 2));
+        assert_eq!(
+            (stopped.completed, stopped.failed, stopped.skipped),
+            (0, 1, 2)
+        );
         assert_eq!(stopped.results[0].status, OperationResultStatus::Error);
         assert!(stopped.results[0].output.is_none());
         let error = stopped.results[0].error.as_ref().expect("connector error");
@@ -28465,12 +28361,19 @@ deny_ptrace = true
         );
         assert_eq!(continued.results[1].status, OperationResultStatus::Success);
         assert_eq!(
-            continued.results[1].output.as_ref().expect("successful output")["result"]["finished"],
+            continued.results[1]
+                .output
+                .as_ref()
+                .expect("successful output")["result"]["finished"],
             true
         );
         assert_eq!(continued.results[2].status, OperationResultStatus::Skipped);
         assert_eq!(
-            continued.results[2].error.as_ref().expect("dependency denial").code,
+            continued.results[2]
+                .error
+                .as_ref()
+                .expect("dependency denial")
+                .code,
             "DEP_FAILED"
         );
         let incomplete_error = batch_invoke_handler(
@@ -28550,13 +28453,22 @@ deny_ptrace = true
             "32-dependent",
         ] {
             assert!(
-                lifecycle.invocation_record(never_admitted, None).await.is_none(),
+                lifecycle
+                    .invocation_record(never_admitted, None)
+                    .await
+                    .is_none(),
                 "{never_admitted} must never acquire ownership or dispatch"
             );
         }
         assert_eq!(
             *observed_ids.lock().expect("observed ids"),
-            ["00-limit", "10-limit", "11-independent", "20-missing", "30-blocked"]
+            [
+                "00-limit",
+                "10-limit",
+                "11-independent",
+                "20-missing",
+                "30-blocked"
+            ]
         );
         assert_eq!(
             state

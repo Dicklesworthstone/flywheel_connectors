@@ -168,6 +168,7 @@ fn execution_approval(invoke: &InvokeRequest) -> ApprovalToken {
 
 fn test_header(kind: &str, zone: ZoneId) -> fcp_core::ObjectHeader {
     fcp_core::ObjectHeader {
+        encryption_kind: fcp_core::ObjectEncryptionKind::default(),
         schema: fcp_cbor::SchemaId::new("fcp.core", kind, semver::Version::new(1, 0, 0)),
         zone_id: zone.clone(),
         created_at: NOW_MS / 1000,

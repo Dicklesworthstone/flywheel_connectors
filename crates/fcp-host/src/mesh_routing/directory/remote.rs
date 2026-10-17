@@ -40,7 +40,11 @@ struct Source {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureKind { Local, Unavailable, Rejected }
+enum FailureKind {
+    Local,
+    Unavailable,
+    Rejected,
+}
 
 struct FetchFailure {
     kind: FailureKind,
@@ -52,7 +56,11 @@ type FetchResult = Result<String, FetchFailure>;
 
 impl FetchFailure {
     const fn new(kind: FailureKind, detail: &'static str) -> Self {
-        Self { kind, detail, status: None }
+        Self {
+            kind,
+            detail,
+            status: None,
+        }
     }
 
     fn http(status: u16) -> Self {
@@ -86,14 +94,20 @@ pub(super) fn resolve_file_source(json: String) -> HostResult<String> {
     resolve_with_fetch(json, fetch_remote)
 }
 
-fn resolve_with_fetch(json: String, fetch_source: impl FnOnce(url::Url) -> FetchResult) -> HostResult<String> {
+fn resolve_with_fetch(
+    json: String,
+    fetch_source: impl FnOnce(url::Url) -> FetchResult,
+) -> HostResult<String> {
     let Some(source) = parse_source(&json)? else {
         return Ok(json);
     };
     // Acquire and inspect local storage before any network work. Corrupt state
     // cannot silently become an empty cache merely because the publisher works.
-    let mut cache = source.retained_source_file.as_deref()
-        .map(|path| retained::SourceCache::open(path, &source.endpoint)).transpose()?;
+    let mut cache = source
+        .retained_source_file
+        .as_deref()
+        .map(|path| retained::SourceCache::open(path, &source.endpoint))
+        .transpose()?;
     match fetch_source(source.endpoint) {
         Ok(document) => {
             if let Some(cache) = &mut cache {
@@ -133,12 +147,22 @@ fn fetch_remote(endpoint: url::Url) -> FetchResult {
     let worker = std::thread::Builder::new()
         .name("fcp-mesh-directory-fetch".to_owned())
         .spawn(move || {
-            fcp_async_core::runtime::block_on_sync(fetch(endpoint))
-                .map_err(|_| FetchFailure::new(FailureKind::Local, "remote directory runtime is unavailable"))?
+            fcp_async_core::runtime::block_on_sync(fetch(endpoint)).map_err(|_| {
+                FetchFailure::new(
+                    FailureKind::Local,
+                    "remote directory runtime is unavailable",
+                )
+            })?
         })
-        .map_err(|_| FetchFailure::new(FailureKind::Local, "remote directory fetch worker could not start"))?;
-    worker.join()
-        .map_err(|_| FetchFailure::new(FailureKind::Local, "remote directory fetch worker failed"))?
+        .map_err(|_| {
+            FetchFailure::new(
+                FailureKind::Local,
+                "remote directory fetch worker could not start",
+            )
+        })?;
+    worker.join().map_err(|_| {
+        FetchFailure::new(FailureKind::Local, "remote directory fetch worker failed")
+    })?
 }
 
 fn parse_source(json: &str) -> HostResult<Option<Source>> {
@@ -147,18 +171,27 @@ fn parse_source(json: &str) -> HostResult<Option<Source>> {
     };
     let is_reference = value.get("directory_url").is_some()
         || value.get("retained_source_file").is_some()
-        || value.get("schema_version").and_then(serde_json::Value::as_str) == Some(SOURCE_SCHEMA);
-    if !is_reference { return Ok(None); }
+        || value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            == Some(SOURCE_SCHEMA);
+    if !is_reference {
+        return Ok(None);
+    }
     if json.len() > MAX_SOURCE_BYTES {
-        return Err(invalid("remote directory descriptor exceeds its byte limit"));
+        return Err(invalid(
+            "remote directory descriptor exceeds its byte limit",
+        ));
     }
     // Deserialize the original bytes: duplicate fields must fail.
-    let source: SourceDescriptor = serde_json::from_str(json)
-        .map_err(|_| invalid("malformed remote directory descriptor"))?;
+    let source: SourceDescriptor =
+        serde_json::from_str(json).map_err(|_| invalid("malformed remote directory descriptor"))?;
     if source.schema_version != SOURCE_SCHEMA {
         return Err(invalid("unsupported remote directory descriptor schema"));
     }
-    if let Some(path) = &source.retained_source_file { retained::validate_path(path)?; }
+    if let Some(path) = &source.retained_source_file {
+        retained::validate_path(path)?;
+    }
     Ok(Some(Source {
         endpoint: validate_endpoint(&source.directory_url)?,
         retained_source_file: source.retained_source_file,
@@ -171,9 +204,11 @@ fn source_endpoint(json: &str) -> HostResult<Option<url::Url>> {
 }
 
 fn validate_endpoint(raw: &str) -> HostResult<url::Url> {
-    let refused = || invalid(
-        "remote directory URL requires HTTPS (or literal loopback HTTP), without credentials, query, fragment or whitespace",
-    );
+    let refused = || {
+        invalid(
+            "remote directory URL requires HTTPS (or literal loopback HTTP), without credentials, query, fragment or whitespace",
+        )
+    };
     if raw.is_empty() || raw.len() > MAX_URL_BYTES || raw.chars().any(char::is_whitespace) {
         return Err(refused());
     }
@@ -184,21 +219,30 @@ fn validate_endpoint(raw: &str) -> HostResult<url::Url> {
         || endpoint.query().is_some()
         || endpoint.fragment().is_some()
         || endpoint.port() == Some(0)
-    { return Err(refused()); }
+    {
+        return Err(refused());
+    }
     let loopback_http = endpoint.scheme() == "http"
         && match endpoint.host() {
             Some(url::Host::Ipv4(address)) => address.is_loopback(),
             Some(url::Host::Ipv6(address)) => address.is_loopback(),
             _ => false,
         };
-    if endpoint.scheme() != "https" && !loopback_http { return Err(refused()); }
+    if endpoint.scheme() != "https" && !loopback_http {
+        return Err(refused());
+    }
     Ok(endpoint)
 }
 
 async fn fetch(endpoint: url::Url) -> FetchResult {
     fcp_async_core::time::timeout(FETCH_DEADLINE, fetch_document(endpoint))
         .await
-        .map_err(|_| FetchFailure::new(FailureKind::Unavailable, "remote directory fetch deadline expired"))?
+        .map_err(|_| {
+            FetchFailure::new(
+                FailureKind::Unavailable,
+                "remote directory fetch deadline expired",
+            )
+        })?
 }
 
 async fn fetch_document(endpoint: url::Url) -> FetchResult {
@@ -208,39 +252,72 @@ async fn fetch_document(endpoint: url::Url) -> FetchResult {
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .no_proxy()
-        .no_gzip().no_brotli().no_deflate().no_zstd()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .build()
-        .map_err(|_| FetchFailure::new(FailureKind::Local, "remote directory HTTP client is unavailable"))?;
-    let mut response = client.get(endpoint)
+        .map_err(|_| {
+            FetchFailure::new(
+                FailureKind::Local,
+                "remote directory HTTP client is unavailable",
+            )
+        })?;
+    let mut response = client
+        .get(endpoint)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
-        .send().await
-        .map_err(|_| FetchFailure::new(FailureKind::Unavailable, "remote directory transport failed"))?;
+        .send()
+        .await
+        .map_err(|_| {
+            FetchFailure::new(
+                FailureKind::Unavailable,
+                "remote directory transport failed",
+            )
+        })?;
     if response.status() != reqwest::StatusCode::OK {
         return Err(FetchFailure::http(response.status().as_u16()));
     }
-    if response.headers().get(reqwest::header::CONTENT_ENCODING)
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
         .is_some_and(|encoding| encoding.as_bytes() != b"identity")
     {
-        return Err(FetchFailure::new(FailureKind::Rejected, "encoded remote directory response is not accepted"));
+        return Err(FetchFailure::new(
+            FailureKind::Rejected,
+            "encoded remote directory response is not accepted",
+        ));
     }
     if response.content_length().is_some_and(|length| {
         length > u64::try_from(MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES).unwrap_or(u64::MAX)
     }) {
-        return Err(FetchFailure::new(FailureKind::Rejected, "remote directory exceeds its byte limit"));
+        return Err(FetchFailure::new(
+            FailureKind::Rejected,
+            "remote directory exceeds its byte limit",
+        ));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await
-        .map_err(|_| FetchFailure::new(FailureKind::Unavailable, "remote directory body read failed"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        FetchFailure::new(
+            FailureKind::Unavailable,
+            "remote directory body read failed",
+        )
+    })? {
         if chunk.len() > MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES.saturating_sub(bytes.len()) {
-            return Err(FetchFailure::new(FailureKind::Rejected, "remote directory exceeds its byte limit"));
+            return Err(FetchFailure::new(
+                FailureKind::Rejected,
+                "remote directory exceeds its byte limit",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
-    decode_document(bytes)
-        .map_err(|_| FetchFailure::new(FailureKind::Rejected, "remote directory must contain a valid signed membership envelope"))
+    decode_document(bytes).map_err(|_| {
+        FetchFailure::new(
+            FailureKind::Rejected,
+            "remote directory must contain a valid signed membership envelope",
+        )
+    })
 }
 
 fn decode_document(bytes: Vec<u8>) -> HostResult<String> {
@@ -267,15 +344,20 @@ mod retention_tests {
             "schema_version": SOURCE_SCHEMA,
             "directory_url": "https://source.example/members",
             "retained_source_file": path,
-        }).to_string()
+        })
+        .to_string()
     }
 
     fn candidate() -> String {
-        "{\"signer_public_key_hex\":\"00\",\"payload_json\":\"{}\",\"signature_hex\":\"00\"}".to_owned()
+        "{\"signer_public_key_hex\":\"00\",\"payload_json\":\"{}\",\"signature_hex\":\"00\"}"
+            .to_owned()
     }
 
     fn unavailable() -> FetchResult {
-        Err(FetchFailure::new(FailureKind::Unavailable, "publisher unavailable"))
+        Err(FetchFailure::new(
+            FailureKind::Unavailable,
+            "publisher unavailable",
+        ))
     }
 
     #[test]
@@ -283,8 +365,14 @@ mod retention_tests {
         let dir = tempfile::tempdir().unwrap();
         let source = descriptor(&dir.path().join("retained"));
         assert!(resolve_with_fetch(source.clone(), |_| unavailable()).is_err());
-        assert_eq!(resolve_with_fetch(source.clone(), |_| Ok(candidate())).unwrap(), candidate());
-        assert_eq!(resolve_with_fetch(source, |_| unavailable()).unwrap(), candidate());
+        assert_eq!(
+            resolve_with_fetch(source.clone(), |_| Ok(candidate())).unwrap(),
+            candidate()
+        );
+        assert_eq!(
+            resolve_with_fetch(source, |_| unavailable()).unwrap(),
+            candidate()
+        );
     }
 
     #[test]
@@ -295,7 +383,10 @@ mod retention_tests {
         assert!(resolve_with_fetch(source.clone(), |_| Err(FetchFailure::http(403))).is_err());
         assert!(resolve_with_fetch(source.clone(), |_| unavailable()).is_err());
         resolve_with_fetch(source.clone(), |_| Ok(candidate())).unwrap();
-        assert_eq!(resolve_with_fetch(source, |_| unavailable()).unwrap(), candidate());
+        assert_eq!(
+            resolve_with_fetch(source, |_| unavailable()).unwrap(),
+            candidate()
+        );
     }
 
     #[test]
@@ -307,7 +398,10 @@ mod retention_tests {
         resolve_with_fetch(source.clone(), |_| Ok(changed.clone())).unwrap();
         // The host's owner verifier will reject these fake signatures. Retention
         // must not hide that rejection by substituting the earlier source.
-        assert_eq!(resolve_with_fetch(source, |_| unavailable()).unwrap(), changed);
+        assert_eq!(
+            resolve_with_fetch(source, |_| unavailable()).unwrap(),
+            changed
+        );
     }
 
     #[test]
@@ -315,9 +409,10 @@ mod retention_tests {
         let dir = tempfile::tempdir().unwrap();
         let source = descriptor(&dir.path().join("retained"));
         resolve_with_fetch(source.clone(), |_| Ok(candidate())).unwrap();
-        let error = resolve_with_fetch(source, |_| Err(FetchFailure::new(
-            FailureKind::Local, "runtime unavailable",
-        ))).unwrap_err();
+        let error = resolve_with_fetch(source, |_| {
+            Err(FetchFailure::new(FailureKind::Local, "runtime unavailable"))
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("runtime unavailable"));
     }
 
@@ -329,8 +424,12 @@ mod retention_tests {
         resolve_with_fetch(source.clone(), |_| Ok(candidate())).unwrap();
         std::fs::write(&path, b"corrupt").unwrap();
         assert!(resolve_with_fetch(source, |_| panic!("must not contact publisher")).is_err());
-        assert!(resolve_with_fetch(descriptor(std::path::Path::new("relative")),
-            |_| panic!("must validate configuration first")).is_err());
+        assert!(
+            resolve_with_fetch(descriptor(std::path::Path::new("relative")), |_| panic!(
+                "must validate configuration first"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

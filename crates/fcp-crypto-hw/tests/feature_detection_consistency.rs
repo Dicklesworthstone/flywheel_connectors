@@ -56,18 +56,42 @@ fn test_unknown_tier_override_is_rejected() {
 }
 
 #[test]
+fn test_blake3_portable_matches_reference_on_test_vectors() {
+    assert_tier_matches_reference_on_test_vectors(Blake3Tier::Portable);
+}
+
+#[test]
+fn test_blake3_x86_avx2_matches_reference_on_test_vectors() {
+    assert_tier_matches_reference_on_test_vectors(Blake3Tier::X86Avx2);
+}
+
+#[test]
+fn test_blake3_x86_avx512_matches_reference_on_test_vectors() {
+    assert_tier_matches_reference_on_test_vectors(Blake3Tier::X86Avx512);
+}
+
+#[test]
+fn test_blake3_neon_matches_reference_on_test_vectors() {
+    assert_tier_matches_reference_on_test_vectors(Blake3Tier::Neon);
+}
+
+#[test]
 fn test_each_declared_blake3_tier_matches_reference_on_test_vectors() {
+    for tier in declared_tiers() {
+        assert_tier_matches_reference_on_test_vectors(tier);
+    }
+}
+
+fn assert_tier_matches_reference_on_test_vectors(tier: Blake3Tier) {
     for input in test_vectors() {
         let reference = blake3::hash(&input);
-        for tier in declared_tiers() {
-            assert_eq!(
-                Blake3Hasher::with_tier(tier).hash(&input),
-                *reference.as_bytes(),
-                "tier {} diverged for {} bytes",
-                tier.as_str(),
-                input.len()
-            );
-        }
+        assert_eq!(
+            Blake3Hasher::with_tier(tier).hash(&input),
+            *reference.as_bytes(),
+            "tier {} diverged for {} bytes",
+            tier.as_str(),
+            input.len()
+        );
     }
 }
 
@@ -92,7 +116,7 @@ fn test_available_runner_tiers_match_reference_on_test_vectors() {
 }
 
 #[test]
-fn test_all_declared_tiers_produce_identical_output_for_generated_inputs() {
+fn test_all_tiers_produce_identical_output() {
     for seed in 0_u64..1000 {
         let input = deterministic_bytes(seed, usize::try_from(seed % 4097).unwrap());
         let mut outputs = declared_tiers()
@@ -109,6 +133,11 @@ fn test_all_declared_tiers_produce_identical_output_for_generated_inputs() {
             );
         }
     }
+}
+
+#[test]
+fn test_all_declared_tiers_produce_identical_output_for_generated_inputs() {
+    test_all_tiers_produce_identical_output();
 }
 
 #[test]

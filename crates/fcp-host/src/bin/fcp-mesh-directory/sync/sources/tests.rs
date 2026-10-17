@@ -45,7 +45,8 @@ impl Fixture {
     }
 
     fn wire(&self) -> String {
-        serde_json::to_string(&SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap()).unwrap()
+        serde_json::to_string(&SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap())
+            .unwrap()
     }
 
     fn choose(&self, responses: Vec<SyncResult<String>>) -> SyncResult<String> {
@@ -60,10 +61,26 @@ impl Fixture {
 
 #[test]
 fn source_sets_validate_all_urls_before_network_and_bound_their_count() {
-    assert_eq!(SourceSet::parse("https://publisher.example/members").unwrap().urls.len(), 1);
-    assert_eq!(SourceSet::parse(r#"["https://a.example/a","https://b.example/b"]"#).unwrap().urls.len(), 2);
+    assert_eq!(
+        SourceSet::parse("https://publisher.example/members")
+            .unwrap()
+            .urls
+            .len(),
+        1
+    );
+    assert_eq!(
+        SourceSet::parse(r#"["https://a.example/a","https://b.example/b"]"#)
+            .unwrap()
+            .urls
+            .len(),
+        2
+    );
     for value in [
-        "[]", "[null]", "[42]", "[true]", "[\"https://a.example\",",
+        "[]",
+        "[null]",
+        "[42]",
+        "[true]",
+        "[\"https://a.example\",",
         r#"["https://a.example","http://remote.example"]"#,
         r#"["https://a.example","https://a.example/"]"#,
         r#"["https://a.example","https://b.example","https://c.example","https://d.example","https://e.example"]"#,
@@ -71,9 +88,10 @@ fn source_sets_validate_all_urls_before_network_and_bound_their_count() {
         assert!(SourceSet::parse(value).is_err(), "{value}");
     }
     assert!(SourceSet::parse(&"x".repeat(MAX_SOURCE_ARGUMENT_BYTES + 1)).is_err());
-    let options = BTreeMap::from([("--url".to_owned(), OsString::from(
-        r#"["https://a.example","https://user:secret@b.example"]"#,
-    ))]);
+    let options = BTreeMap::from([(
+        "--url".to_owned(),
+        OsString::from(r#"["https://a.example","https://user:secret@b.example"]"#),
+    )]);
     let error = SourceSet::from_options(&options).err().unwrap();
     assert!(!error.contains("secret"));
     assert!(!error.contains("b.example"));
@@ -98,13 +116,26 @@ fn unreachable_publisher_does_not_hide_a_healthy_mirror() {
     let fixture = Fixture::new();
     let current = fixture.wire();
     for responses in [
-        vec![Err(SyncError::Remote("unreachable".to_owned())), Ok(current.clone())],
-        vec![Ok(current.clone()), Err(SyncError::Remote("unreachable".to_owned()))],
+        vec![
+            Err(SyncError::Remote("unreachable".to_owned())),
+            Ok(current.clone()),
+        ],
+        vec![
+            Ok(current.clone()),
+            Err(SyncError::Remote("unreachable".to_owned())),
+        ],
     ] {
         assert_eq!(fixture.choose(responses).unwrap(), current);
     }
-    assert!(fixture.choose(vec![Err(SyncError::Remote("private-upstream-body".to_owned()))])
-        .unwrap_err().to_string().contains("no membership source"));
+    assert!(
+        fixture
+            .choose(vec![Err(SyncError::Remote(
+                "private-upstream-body".to_owned()
+            ))])
+            .unwrap_err()
+            .to_string()
+            .contains("no membership source")
+    );
 }
 
 #[test]
@@ -115,14 +146,20 @@ fn unauthenticated_high_generations_and_other_meshes_cannot_veto_valid_membershi
     let other_owner = Ed25519SigningKey::from_bytes(&[99; 32]).unwrap();
     let untrusted = serde_json::to_string(
         &SignedMeshPeerDirectory::sign(&other_owner, &fixture.payload).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     let mut forged = SignedMeshPeerDirectory::sign(&fixture.owner, &fixture.payload).unwrap();
     forged.payload_json.push(' ');
     let forged = serde_json::to_string(&forged).unwrap();
     fixture.payload.mesh_id = "another-mesh".to_owned();
     let other_mesh = fixture.wire();
     for rejected in [untrusted, forged, other_mesh, "[]".to_owned()] {
-        assert_eq!(fixture.choose(vec![Ok(rejected), Ok(current.clone())]).unwrap(), current);
+        assert_eq!(
+            fixture
+                .choose(vec![Ok(rejected), Ok(current.clone())])
+                .unwrap(),
+            current
+        );
     }
 }
 
@@ -136,11 +173,18 @@ fn same_generation_equivocation_refuses_selection_without_touching_installed_his
     installer.install(&current, &fixture.trust).unwrap();
     fixture.payload.expires_at_ms += 1000;
     let conflict = fixture.wire();
-    let error = fixture.choose(vec![Ok(current.clone()), Ok(conflict)])
-        .unwrap_err().to_string();
+    let error = fixture
+        .choose(vec![Ok(current.clone()), Ok(conflict)])
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("equivocate"));
     assert_eq!(fs::read_to_string(&path).unwrap(), current);
-    assert_eq!(fixture.choose(vec![Ok(current.clone()), Ok(current.clone())]).unwrap(), current);
+    assert_eq!(
+        fixture
+            .choose(vec![Ok(current.clone()), Ok(current.clone())])
+            .unwrap(),
+        current
+    );
 }
 
 #[test]
@@ -154,7 +198,13 @@ fn a_newer_authenticated_local_revocation_prevents_fallback_to_an_older_grant() 
         vec![Ok(old.clone()), Ok(revoked.clone())],
         vec![Ok(revoked.clone()), Ok(old.clone())],
     ] {
-        assert!(fixture.choose(responses).unwrap_err().to_string().contains("does not authorize"));
+        assert!(
+            fixture
+                .choose(responses)
+                .unwrap_err()
+                .to_string()
+                .contains("does not authorize")
+        );
     }
 }
 
@@ -169,8 +219,13 @@ fn newer_expired_or_future_authority_cannot_be_hidden_by_a_stale_mirror() {
     fixture.payload.expires_at_ms = fixture.payload.issued_at_ms + 600_000;
     let future = fixture.wire();
     for rejected in [expired, future] {
-        assert!(fixture.choose(vec![Ok(old.clone()), Ok(rejected)])
-            .unwrap_err().to_string().contains("validity window"));
+        assert!(
+            fixture
+                .choose(vec![Ok(old.clone()), Ok(rejected)])
+                .unwrap_err()
+                .to_string()
+                .contains("validity window")
+        );
     }
 }
 
@@ -181,7 +236,10 @@ fn an_older_refused_generation_does_not_override_a_newer_valid_renewal() {
     fixture.payload.generation = 6;
     fixture.payload.peers[0].node_id = "different-node".to_owned();
     let old = fixture.wire();
-    assert_eq!(fixture.choose(vec![Ok(old), Ok(current.clone())]).unwrap(), current);
+    assert_eq!(
+        fixture.choose(vec![Ok(old), Ok(current.clone())]).unwrap(),
+        current
+    );
 }
 
 #[test]
@@ -189,31 +247,41 @@ fn each_remaining_source_gets_a_share_of_the_total_deadline() {
     let fixture = Fixture::new();
     let sources = SourceSet::parse(
         r#"["https://a.example","https://b.example","https://c.example","https://d.example"]"#,
-    ).unwrap();
+    )
+    .unwrap();
     let mut allowances = Vec::new();
-    sources.fetch_with(&fixture.trust, Duration::from_secs(4), |_, timeout| {
-        allowances.push(timeout);
-        assert!(!timeout.is_zero());
-        Ok(fixture.wire())
-    }).unwrap();
+    sources
+        .fetch_with(&fixture.trust, Duration::from_secs(4), |_, timeout| {
+            allowances.push(timeout);
+            assert!(!timeout.is_zero());
+            Ok(fixture.wire())
+        })
+        .unwrap();
     assert_eq!(allowances.len(), 4);
     for (index, allowance) in allowances.into_iter().enumerate() {
         assert!(allowance <= Duration::from_secs(4) / u32::try_from(4 - index).unwrap());
     }
     let called = Cell::new(false);
-    assert!(sources.fetch_with(&fixture.trust, Duration::ZERO, |_, _| {
-        called.set(true);
-        Ok(fixture.wire())
-    }).is_err());
+    assert!(
+        sources
+            .fetch_with(&fixture.trust, Duration::ZERO, |_, _| {
+                called.set(true);
+                Ok(fixture.wire())
+            })
+            .is_err()
+    );
     assert!(!called.get());
 }
 
 #[test]
 fn local_runtime_failure_stops_selection_instead_of_claiming_remote_recovery() {
     let fixture = Fixture::new();
-    let error = fixture.choose(vec![
-        Ok(fixture.wire()), Err(SyncError::Local("runtime unavailable")),
-    ]).unwrap_err();
+    let error = fixture
+        .choose(vec![
+            Ok(fixture.wire()),
+            Err(SyncError::Local("runtime unavailable")),
+        ])
+        .unwrap_err();
     assert!(matches!(error, SyncError::Local("runtime unavailable")));
 }
 
@@ -227,14 +295,21 @@ fn serve_once(status: u16, body: String) -> (String, thread::JoinHandle<()>) {
             match listener.accept() {
                 Ok((socket, _)) => break socket,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(started.elapsed() < Duration::from_secs(10), "publisher never contacted");
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "publisher never contacted"
+                    );
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("loopback accept: {error}"),
             }
         };
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         {
             let mut reader = BufReader::new(&mut socket);
             let mut line = String::new();
@@ -246,14 +321,17 @@ fn serve_once(status: u16, body: String) -> (String, thread::JoinHandle<()>) {
                 reader.read_line(&mut line).unwrap();
                 total += line.len();
                 assert!(!line.is_empty() && total < 8192);
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
                 let name = line.split_once(':').unwrap().0;
                 assert!(!name.eq_ignore_ascii_case("authorization"));
                 assert!(!name.eq_ignore_ascii_case("cookie"));
                 assert!(!name.eq_ignore_ascii_case("proxy-authorization"));
             }
         }
-        let _ = write!(socket,
+        let _ = write!(
+            socket,
             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
         );
@@ -275,7 +353,9 @@ fn real_http_mirrors_install_the_newest_signed_document_and_reject_later_rollbac
     let urls: Vec<_> = servers.iter().map(|(url, _)| url).collect();
     let sources = SourceSet::parse(&serde_json::to_string(&urls).unwrap()).unwrap();
     let result = sources.fetch(&fixture.trust, FETCH_TIMEOUT);
-    for (_, server) in servers { server.join().unwrap(); }
+    for (_, server) in servers {
+        server.join().unwrap();
+    }
     let chosen = result.unwrap();
     assert_eq!(chosen, current);
     let dir = tempfile::tempdir().unwrap();

@@ -1494,14 +1494,19 @@ mod tests {
             },
         )
         .unwrap();
-        envelope.verify(&mesh.directory("node-b"), NOW, 30_000).unwrap();
+        envelope
+            .verify(&mesh.directory("node-b"), NOW, 30_000)
+            .unwrap();
         let decoded: MeshForwardEnvelope =
             serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
         assert_eq!(decoded, envelope);
         assert_eq!(envelope.body.method(), "connector_state_export");
         for (pointer, replacement) in [
             ("/grant_id", serde_json::json!("other-grant")),
-            ("/scope/connector_id", serde_json::json!("fcp.other:utility:1.0.0")),
+            (
+                "/scope/connector_id",
+                serde_json::json!("fcp.other:utility:1.0.0"),
+            ),
             ("/scope/zone_id", serde_json::json!("z:private")),
             ("/scope/instance_id", serde_json::json!("instance-b")),
             ("/root_object_id", serde_json::json!("b".repeat(64))),
@@ -1540,7 +1545,11 @@ mod tests {
         assert_eq!(body.body_len(), MAX_MESH_FORWARD_BODY_BYTES + 1);
         assert!(matches!(
             MeshForwardEnvelope::sign(
-                mesh.key("node-a"), node("node-a"), node("node-b"), NOW, body
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                body
             ),
             Err(MeshForwardError::BodyTooLarge { .. })
         ));
@@ -1963,14 +1972,21 @@ mod tests {
         later.verify(&directory, NOW + 21, 10).unwrap();
         guard.check_and_record(&later, NOW + 21).unwrap();
         assert_eq!(guard.len(), 1);
-        assert!(!guard.seen.contains_key(&("node-a".to_owned(), first.nonce.clone())));
+        assert!(
+            !guard
+                .seen
+                .contains_key(&("node-a".to_owned(), first.nonce.clone()))
+        );
 
         // A real, still-valid signature becomes wall-clock-fresh again. The
         // replay guard, not signature verification, must prevent redispatch.
         first.verify(&directory, NOW, 10).unwrap();
         assert!(matches!(
             guard.check_and_record(&first, NOW),
-            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+            Err(MeshForwardError::Malformed {
+                field: "replay_clock",
+                ..
+            })
         ));
         assert_eq!(guard.len(), 1);
         assert!(matches!(
@@ -2008,7 +2024,9 @@ mod tests {
         let mesh = Mesh::new(&["node-a", "node-b"]);
         let mut guard = MeshForwardReplayGuard::new(10, 2);
         let future = signed_forward_at(&mesh, NOW + 11);
-        future.verify(&mesh.directory("node-b"), NOW, 30_000).unwrap();
+        future
+            .verify(&mesh.directory("node-b"), NOW, 30_000)
+            .unwrap();
         assert!(matches!(
             guard.check_and_record(&future, NOW),
             Err(MeshForwardError::Stale { .. })
@@ -2051,7 +2069,10 @@ mod tests {
         ));
         assert!(matches!(
             guard.check_and_record(&second, NOW),
-            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+            Err(MeshForwardError::Malformed {
+                field: "replay_clock",
+                ..
+            })
         ));
         assert_eq!(guard.len(), 1);
         let fresh = signed_forward_at(&mesh, NOW + 21);
@@ -2088,7 +2109,10 @@ mod tests {
         ));
         assert!(matches!(
             guard.check_and_record(&first, 0),
-            Err(MeshForwardError::Malformed { field: "replay_clock", .. })
+            Err(MeshForwardError::Malformed {
+                field: "replay_clock",
+                ..
+            })
         ));
         assert_eq!(guard.len(), 1);
 

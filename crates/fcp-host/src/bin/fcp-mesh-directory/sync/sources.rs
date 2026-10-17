@@ -20,7 +20,8 @@ pub(super) struct SourceSet {
 
 impl SourceSet {
     pub(super) fn from_options(options: &BTreeMap<String, OsString>) -> super::super::Result<Self> {
-        let raw = options.get("--url")
+        let raw = options
+            .get("--url")
             .and_then(|value| value.to_str())
             .ok_or_else(|| "source URL argument is missing or is not UTF-8".to_owned())?;
         Self::parse(raw).map_err(|error| error.to_string())
@@ -30,7 +31,9 @@ impl SourceSet {
     /// Parse and validate the entire set before making any network request.
     fn parse(raw: &str) -> SyncResult<Self> {
         if raw.len() > MAX_SOURCE_ARGUMENT_BYTES {
-            return Err(SyncError::Local("source URL argument exceeds its byte limit"));
+            return Err(SyncError::Local(
+                "source URL argument exceeds its byte limit",
+            ));
         }
         let sources: Vec<String> = if raw.trim_start().starts_with('[') {
             serde_json::from_str(raw)
@@ -39,7 +42,9 @@ impl SourceSet {
             vec![raw.to_owned()]
         };
         if sources.is_empty() || sources.len() > MAX_SOURCES {
-            return Err(SyncError::Local("configure between one and four membership sources"));
+            return Err(SyncError::Local(
+                "configure between one and four membership sources",
+            ));
         }
         let mut seen = BTreeSet::new();
         let mut urls = Vec::with_capacity(sources.len());
@@ -89,7 +94,9 @@ impl SourceSet {
             };
             let now_ms = unix_now_ms();
             if now_ms < started_ms {
-                return Err(SyncError::Remote("clock regressed during source selection".to_owned()));
+                return Err(SyncError::Remote(
+                    "clock regressed during source selection".to_owned(),
+                ));
             }
             let candidate = match Candidate::authenticate(trust, text, index, now_ms) {
                 Ok(candidate) => candidate,
@@ -102,7 +109,9 @@ impl SourceSet {
         let chosen = selection.finish()?;
         let now_ms = unix_now_ms();
         if now_ms < started_ms {
-            return Err(SyncError::Remote("clock regressed during source selection".to_owned()));
+            return Err(SyncError::Remote(
+                "clock regressed during source selection".to_owned(),
+            ));
         }
         // The chosen document may have expired while another source was being
         // contacted. Never replace it with a lower generation on that account.
@@ -129,22 +138,34 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn authenticate(trust: &Trust, text: String, source_index: usize, now_ms: u64) -> SyncResult<Self> {
+    fn authenticate(
+        trust: &Trust,
+        text: String,
+        source_index: usize,
+        now_ms: u64,
+    ) -> SyncResult<Self> {
         let signed = SignedMeshPeerDirectory::from_json(&text)
             .map_err(|_| SyncError::Remote("source envelope is malformed".to_owned()))?;
         let (generation, refusal) = match signed.verify(
-            std::slice::from_ref(&trust.owner), &trust.mesh_id,
-            trust.node.clone(), &trust.local, now_ms,
+            std::slice::from_ref(&trust.owner),
+            &trust.mesh_id,
+            trust.node.clone(),
+            &trust.local,
+            now_ms,
         ) {
             Ok(verified) => (verified.payload().generation, None),
-            Err(error @ (MeshPeerDirectoryError::LocalIdentityMismatch
-                | MeshPeerDirectoryError::OutsideValidityWindow)) => {
+            Err(
+                error @ (MeshPeerDirectoryError::LocalIdentityMismatch
+                | MeshPeerDirectoryError::OutsideValidityWindow),
+            ) => {
                 // These typed failures occur ONLY AFTER independent owner
                 // signature, payload structure and mesh-scope verification.
                 // Their authenticated generation cannot be hidden by falling
                 // back to an older publisher that still authorizes this node.
                 let payload: MeshPeerDirectoryPayload = serde_json::from_str(&signed.payload_json)
-                    .map_err(|_| SyncError::Remote("authenticated source payload is malformed".to_owned()))?;
+                    .map_err(|_| {
+                        SyncError::Remote("authenticated source payload is malformed".to_owned())
+                    })?;
                 let reason = if matches!(error, MeshPeerDirectoryError::LocalIdentityMismatch) {
                     "highest authenticated generation does not authorize this node's key"
                 } else {
@@ -152,9 +173,11 @@ impl Candidate {
                 };
                 (payload.generation, Some(reason))
             }
-            Err(_) => return Err(SyncError::Remote(
-                "source did not pass owner, scope and membership authentication".to_owned(),
-            )),
+            Err(_) => {
+                return Err(SyncError::Remote(
+                    "source did not pass owner, scope and membership authentication".to_owned(),
+                ));
+            }
         };
         Ok(Self {
             payload_hash: *blake3::hash(signed.payload_json.as_bytes()).as_bytes(),
@@ -174,24 +197,34 @@ struct Selection {
 
 impl Selection {
     fn observe(&mut self, candidate: Candidate) -> SyncResult<()> {
-        if self.payloads.get(&candidate.generation)
+        if self
+            .payloads
+            .get(&candidate.generation)
             .is_some_and(|hash| hash != &candidate.payload_hash)
         {
             return Err(SyncError::Remote(
                 "owner-signed sources equivocate at the same membership generation".to_owned(),
             ));
         }
-        self.payloads.insert(candidate.generation, candidate.payload_hash);
-        if self.highest.as_ref().is_none_or(|current| candidate.generation > current.generation) {
+        self.payloads
+            .insert(candidate.generation, candidate.payload_hash);
+        if self
+            .highest
+            .as_ref()
+            .is_none_or(|current| candidate.generation > current.generation)
+        {
             self.highest = Some(candidate);
         }
         Ok(())
     }
 
     fn finish(self) -> SyncResult<Candidate> {
-        let chosen = self.highest.ok_or_else(|| SyncError::Remote(
-            "no membership source supplied an authenticated document within the fetch budget".to_owned(),
-        ))?;
+        let chosen = self.highest.ok_or_else(|| {
+            SyncError::Remote(
+                "no membership source supplied an authenticated document within the fetch budget"
+                    .to_owned(),
+            )
+        })?;
         if let Some(reason) = chosen.refusal {
             return Err(SyncError::Remote(reason.to_owned()));
         }
@@ -200,4 +233,5 @@ impl Selection {
 }
 
 #[cfg(test)]
+#[path = "sources/tests.rs"]
 mod tests;

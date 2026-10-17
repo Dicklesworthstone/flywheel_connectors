@@ -220,7 +220,10 @@ impl InvokePhase {
                 ("error".into(), json!(error)),
                 ("duration_ms".into(), json!(duration_ms)),
             ],
-            Self::MeshForwardAttempt { target_node, decision } => vec![
+            Self::MeshForwardAttempt {
+                target_node,
+                decision,
+            } => vec![
                 ("target_node".into(), json!(target_node)),
                 ("decision".into(), json!(decision)),
             ],
@@ -616,18 +619,20 @@ impl InvokeAuditChain {
     /// Report local persistence and write availability without exposing paths.
     #[must_use]
     pub fn durability_status(&self) -> InvokeAuditDurabilityStatus {
-        self.journal.as_ref().map_or_else(
-            InvokeAuditDurabilityStatus::default,
-            |journal| match journal.lock() {
-                Ok(journal) => journal.status(),
-                Err(_) => InvokeAuditDurabilityStatus {
-                    storage: "local_journal".to_string(),
-                    writable: false,
-                    unavailable_reason: Some("journal_lock_poisoned".to_string()),
-                    ..InvokeAuditDurabilityStatus::default()
+        self.journal
+            .as_ref()
+            .map_or_else(
+                InvokeAuditDurabilityStatus::default,
+                |journal| match journal.lock() {
+                    Ok(journal) => journal.status(),
+                    Err(_) => InvokeAuditDurabilityStatus {
+                        storage: "local_journal".to_string(),
+                        writable: false,
+                        unavailable_reason: Some("journal_lock_poisoned".to_string()),
+                        ..InvokeAuditDurabilityStatus::default()
+                    },
                 },
-            },
-        )
+            )
     }
 
     fn persist_entry(&self, entry: &AuditEntry) -> Result<(), AuditError> {
@@ -1002,9 +1007,8 @@ impl InvokeAuditChain {
         let tip_entry = entries.last();
         let mut warnings = Vec::new();
         if durability.storage == "memory" {
-            warnings.push(
-                "invoke audit history is in memory and will not survive restart".to_string(),
-            );
+            warnings
+                .push("invoke audit history is in memory and will not survive restart".to_string());
         } else {
             warnings.push(
                 "local audit history is persisted and hash-verified; it is unsigned and cannot prove quorum or prevent rollback"

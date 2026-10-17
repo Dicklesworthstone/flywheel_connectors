@@ -3843,10 +3843,8 @@ mod tests {
                 .expect("serialized signature field");
             unsigned_fields.remove(signature_index);
             let unsigned_cbor = to_canonical_cbor(&Value::Map(unsigned_fields)).unwrap();
-            let signing_bytes = canonical_signing_bytes(
-                CONNECTOR_STATE_SNAPSHOT_SIGNING_SCHEMA_ID,
-                &unsigned_cbor,
-            );
+            let signing_bytes =
+                canonical_signing_bytes(CONNECTOR_STATE_SNAPSHOT_SIGNING_SCHEMA_ID, &unsigned_cbor);
             assert_eq!(snapshot.signing_bytes().unwrap(), signing_bytes);
 
             snapshot.sign_with(&signing_key).unwrap();

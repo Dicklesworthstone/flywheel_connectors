@@ -78,7 +78,8 @@ impl DurableMeshReplayGuard {
         self.record_count += staged.len();
         for (key, entry) in staged {
             self.entries.insert(key, entry);
-            self.expirations.push(std::cmp::Reverse((entry.expires_at_ms, key)));
+            self.expirations
+                .push(std::cmp::Reverse((entry.expires_at_ms, key)));
         }
         self.io_failed = false;
         outcomes
@@ -150,8 +151,13 @@ mod tests {
 
     fn open(path: &Path, capacity: usize, now: u64) -> DurableMeshReplayGuard {
         DurableMeshReplayGuard::open(
-            path, &TailscaleNodeId::new("executor"), WINDOW, capacity, now,
-        ).unwrap()
+            path,
+            &TailscaleNodeId::new("executor"),
+            WINDOW,
+            capacity,
+            now,
+        )
+        .unwrap()
     }
 
     fn identity_for(target: &str, issued: u64) -> VerifiedMeshReplayNonce {
@@ -162,8 +168,10 @@ mod tests {
                 "node_id": "origin",
                 "endpoint": "http://127.0.0.1:1",
                 "public_key_hex": hex::encode(key.verifying_key().to_bytes()),
-            }]).to_string(),
-        ).unwrap();
+            }])
+            .to_string(),
+        )
+        .unwrap();
         let envelope = MeshForwardEnvelope::sign(
             &key,
             TailscaleNodeId::new("origin"),
@@ -172,7 +180,8 @@ mod tests {
             MeshForwardBody::Introspect {
                 connector_id: "fcp.test:utility:1.0.0".to_owned(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         VerifiedMeshReplayNonce::verify(&envelope, &directory, issued, WINDOW).unwrap()
     }
 
@@ -190,7 +199,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal");
         let mut guard = open(&path, MAX_REPLAY_GROUP_SIZE, NOW);
-        let identities = (0..MAX_REPLAY_GROUP_SIZE).map(|_| identity(NOW)).collect::<Vec<_>>();
+        let identities = (0..MAX_REPLAY_GROUP_SIZE)
+            .map(|_| identity(NOW))
+            .collect::<Vec<_>>();
         let refs = identities.iter().collect::<Vec<_>>();
         let syncs = Cell::new(0);
         let results = guard.accept_batch_with_sync(&refs, NOW, |file| {
@@ -201,13 +212,17 @@ mod tests {
         assert!(results.iter().all(Result::is_ok));
         assert_eq!(syncs.get(), 1);
         assert_eq!(guard.record_count, MAX_REPLAY_GROUP_SIZE);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(),
-            u64::try_from(HEADER_LEN + MAX_REPLAY_GROUP_SIZE * RECORD_LEN).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN + MAX_REPLAY_GROUP_SIZE * RECORD_LEN).unwrap()
+        );
         drop(guard);
         let mut restored = open(&path, MAX_REPLAY_GROUP_SIZE, NOW + 1);
         for nonce in &identities {
-            assert!(matches!(restored.accept_verified(nonce, NOW + 1),
-                Err(MeshForwardError::Replayed { .. })));
+            assert!(matches!(
+                restored.accept_verified(nonce, NOW + 1),
+                Err(MeshForwardError::Replayed { .. })
+            ));
         }
     }
 
@@ -222,16 +237,24 @@ mod tests {
         let stale = identity(NOW - WINDOW - 1);
         let wrong = identity_for("other-executor", NOW);
         let overflow = identity(NOW);
-        let results = guard.accept_verified_batch(
-            &[&prior, &fresh, &fresh, &stale, &wrong, &overflow], NOW,
-        );
+        let results =
+            guard.accept_verified_batch(&[&prior, &fresh, &fresh, &stale, &wrong, &overflow], NOW);
         assert_eq!(results.len(), 6);
-        assert!(matches!(&results[0], Err(MeshForwardError::Replayed { .. })));
+        assert!(matches!(
+            &results[0],
+            Err(MeshForwardError::Replayed { .. })
+        ));
         assert_eq!(results[1], Ok(()));
-        assert!(matches!(&results[2], Err(MeshForwardError::Replayed { .. })));
+        assert!(matches!(
+            &results[2],
+            Err(MeshForwardError::Replayed { .. })
+        ));
         assert!(matches!(&results[3], Err(MeshForwardError::Stale { .. })));
         assert!(unavailable(&results[4], "node_scope_mismatch"));
-        assert!(matches!(&results[5], Err(MeshForwardError::ReplayCacheSaturated { capacity: 2 })));
+        assert!(matches!(
+            &results[5],
+            Err(MeshForwardError::ReplayCacheSaturated { capacity: 2 })
+        ));
         assert_eq!(guard.entries.len(), 2);
         assert_eq!(guard.record_count, 2);
     }
@@ -250,8 +273,11 @@ mod tests {
             |_| panic!("rejected group must not sync"),
         );
         assert!(results.iter().all(Result::is_err));
-        assert!(guard.accept_batch_with_sync(&[], u64::MAX,
-            |_| panic!("empty group must not sync")).is_empty());
+        assert!(
+            guard
+                .accept_batch_with_sync(&[], u64::MAX, |_| panic!("empty group must not sync"))
+                .is_empty()
+        );
         assert_eq!(guard.high_water_ms, NOW);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
         assert!(!guard.io_failed);
@@ -269,17 +295,24 @@ mod tests {
             file.sync_all()?;
             Err(io::Error::other("injected uncertain sync result"))
         });
-        assert!(results.iter().all(|result| unavailable(result, "commit_failed")));
+        assert!(
+            results
+                .iter()
+                .all(|result| unavailable(result, "commit_failed"))
+        );
         assert!(guard.io_failed);
         assert!(guard.entries.is_empty());
-        let later = guard.accept_batch_with_sync(&[&identity(NOW)], NOW,
-            |_| panic!("failed journal must not attempt another sync"));
+        let later = guard.accept_batch_with_sync(&[&identity(NOW)], NOW, |_| {
+            panic!("failed journal must not attempt another sync")
+        });
         assert!(unavailable(&later[0], "storage_failed"));
         drop(guard);
         let mut restored = open(&path, 4, NOW);
         for nonce in [&first, &second] {
-            assert!(matches!(restored.accept_verified(nonce, NOW),
-                Err(MeshForwardError::Replayed { .. })));
+            assert!(matches!(
+                restored.accept_verified(nonce, NOW),
+                Err(MeshForwardError::Replayed { .. })
+            ));
         }
     }
 
@@ -289,12 +322,20 @@ mod tests {
         let path = dir.path().join("journal");
         let mut guard = open(&path, 4, NOW);
         guard.file = File::open(&path).unwrap();
-        let results = guard.accept_batch_with_sync(&[&identity(NOW), &identity(NOW)], NOW,
-            |_| panic!("append failure must not call sync"));
-        assert!(results.iter().all(|result| unavailable(result, "commit_failed")));
+        let results = guard.accept_batch_with_sync(&[&identity(NOW), &identity(NOW)], NOW, |_| {
+            panic!("append failure must not call sync")
+        });
+        assert!(
+            results
+                .iter()
+                .all(|result| unavailable(result, "commit_failed"))
+        );
         assert!(guard.io_failed);
         assert!(guard.entries.is_empty());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), u64::try_from(HEADER_LEN).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN).unwrap()
+        );
     }
 
     #[test]
@@ -311,18 +352,28 @@ mod tests {
         assert_eq!(guard.record_count, 8);
         let now = NOW + 71;
         let group = (0..3).map(|_| identity(now)).collect::<Vec<_>>();
-        assert!(guard.accept_verified_batch(&group.iter().collect::<Vec<_>>(), now)
-            .iter().all(Result::is_ok));
+        assert!(
+            guard
+                .accept_verified_batch(&group.iter().collect::<Vec<_>>(), now)
+                .iter()
+                .all(Result::is_ok)
+        );
         assert_eq!(guard.record_count, 4);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(),
-            u64::try_from(HEADER_LEN + 4 * RECORD_LEN).unwrap());
-        assert!(DurableMeshReplayGuard::open(&path, &TailscaleNodeId::new("executor"),
-            WINDOW, 4, now).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN + 4 * RECORD_LEN).unwrap()
+        );
+        assert!(
+            DurableMeshReplayGuard::open(&path, &TailscaleNodeId::new("executor"), WINDOW, 4, now)
+                .is_err()
+        );
         drop(guard);
         let mut restored = open(&path, 4, now + 1);
         for nonce in std::iter::once(&future).chain(group.iter()) {
-            assert!(matches!(restored.accept_verified(nonce, now + 1),
-                Err(MeshForwardError::Replayed { .. })));
+            assert!(matches!(
+                restored.accept_verified(nonce, now + 1),
+                Err(MeshForwardError::Replayed { .. })
+            ));
         }
     }
 
@@ -333,13 +384,22 @@ mod tests {
         let mut guard = open(&path, 4, NOW);
         let oldest = identity(NOW - WINDOW);
         let future = identity(NOW + WINDOW);
-        assert_eq!(guard.accept_verified_batch(&[&oldest, &future], NOW), vec![Ok(()), Ok(())]);
-        assert!(matches!(guard.accept_verified(&oldest, NOW),
-            Err(MeshForwardError::Replayed { .. })));
-        assert!(matches!(guard.accept_verified(&future, NOW + 2 * WINDOW),
-            Err(MeshForwardError::Replayed { .. })));
-        assert!(matches!(guard.accept_verified(&future, NOW + 2 * WINDOW + 1),
-            Err(MeshForwardError::Stale { .. })));
+        assert_eq!(
+            guard.accept_verified_batch(&[&oldest, &future], NOW),
+            vec![Ok(()), Ok(())]
+        );
+        assert!(matches!(
+            guard.accept_verified(&oldest, NOW),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert!(matches!(
+            guard.accept_verified(&future, NOW + 2 * WINDOW),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert!(matches!(
+            guard.accept_verified(&future, NOW + 2 * WINDOW + 1),
+            Err(MeshForwardError::Stale { .. })
+        ));
     }
 
     #[test]
@@ -348,15 +408,22 @@ mod tests {
         let path = dir.path().join("journal");
         let mut guard = open(&path, 4, NOW);
         let fresh = identity(NOW);
-        let rollback = guard.accept_batch_with_sync(&[&fresh], NOW - 1,
-            |_| panic!("rollback must not sync"));
+        let rollback =
+            guard.accept_batch_with_sync(&[&fresh], NOW - 1, |_| panic!("rollback must not sync"));
         assert!(unavailable(&rollback[0], "clock_rollback"));
         let oversized = vec![&fresh; MAX_REPLAY_GROUP_SIZE + 1];
-        let results = guard.accept_batch_with_sync(&oversized, NOW,
-            |_| panic!("oversized group must not sync"));
+        let results = guard
+            .accept_batch_with_sync(&oversized, NOW, |_| panic!("oversized group must not sync"));
         assert_eq!(results.len(), oversized.len());
-        assert!(results.iter().all(|result| unavailable(result, "replay_batch_too_large")));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), u64::try_from(HEADER_LEN).unwrap());
+        assert!(
+            results
+                .iter()
+                .all(|result| unavailable(result, "replay_batch_too_large"))
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN).unwrap()
+        );
         assert!(guard.entries.is_empty());
     }
 
@@ -371,12 +438,18 @@ mod tests {
         for now in [NOW, NOW + 50, NOW + 101, NOW + 202] {
             let fresh = identity(now);
             let group = [&first, &future, &fresh, &fresh, &wrong];
-            let expected = group.iter().map(|identity| serial.accept_verified(identity, now))
+            let expected = group
+                .iter()
+                .map(|identity| serial.accept_verified(identity, now))
                 .collect::<Vec<_>>();
             assert_eq!(grouped.accept_verified_batch(&group, now), expected);
-            let snapshot = |guard: &DurableMeshReplayGuard| guard.entries.iter()
-                .map(|(key, entry)| (*key, entry.expires_at_ms, entry.observed_at_ms))
-                .collect::<Vec<_>>();
+            let snapshot = |guard: &DurableMeshReplayGuard| {
+                guard
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (*key, entry.expires_at_ms, entry.observed_at_ms))
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(snapshot(&serial), snapshot(&grouped));
             assert_eq!(serial.high_water_ms, grouped.high_water_ms);
         }
@@ -392,10 +465,11 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let results = guard.accept_batch_with_sync(&group.iter().collect::<Vec<_>>(), NOW,
-                |file| {
+            let results =
+                guard.accept_batch_with_sync(&group.iter().collect::<Vec<_>>(), NOW, |file| {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(5))
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
                         .map_err(|_| io::Error::other("test sync barrier timed out"))?;
                     file.sync_all()
                 });

@@ -5,15 +5,22 @@ use chrono::Utc;
 use fcp_cbor::{CanonicalSerializer, SchemaId};
 use fcp_crypto::Ed25519SigningKey;
 use fcp_evidence::{ObjectHeader, ObjectIdKey, RetentionClass, StorageMeta, StoredObject};
-use fcp_kernel::{ConnectorId, ConnectorStateModel, ConnectorStateObject, ConnectorStateRoot, ObjectId, ZoneId};
+use fcp_kernel::{
+    ConnectorId, ConnectorStateModel, ConnectorStateObject, ConnectorStateRoot, ObjectId, ZoneId,
+};
 use fcp_policy::Provenance;
 use fcp_prelude::Signature;
-use fcp_store::{FcpStoreConnectorStateStore, MemoryObjectStore, MemoryObjectStoreConfig, ObjectStore};
+use fcp_store::{
+    FcpStoreConnectorStateStore, MemoryObjectStore, MemoryObjectStoreConfig, ObjectStore,
+};
 use futures_util::future::pending;
 use serde_json::{Value, json};
 
-use crate::{ConnectorStateExportRequest, ConnectorStateTransferDirection, ConnectorStateTransferGrant, ConnectorStateTransferLimits, ConnectorStateTransferScope};
 use super::*;
+use crate::{
+    ConnectorStateExportRequest, ConnectorStateTransferDirection, ConnectorStateTransferGrant,
+    ConnectorStateTransferLimits, ConnectorStateTransferScope,
+};
 
 fn run<F: Future>(future: F) -> F::Output {
     fcp_async_core::runtime::block_on_sync(future).expect("test runtime")
@@ -36,9 +43,10 @@ fn writer() -> Ed25519SigningKey {
 }
 
 fn adapter(objects: Arc<dyn ObjectStore>) -> Arc<FcpStoreConnectorStateStore> {
-    Arc::new(FcpStoreConnectorStateStore::new(
-        objects, key(), scope().connector_id, scope().zone_id,
-    ).with_trusted_writer_keys([writer().verifying_key().to_bytes()]))
+    Arc::new(
+        FcpStoreConnectorStateStore::new(objects, key(), scope().connector_id, scope().zone_id)
+            .with_trusted_writer_keys([writer().verifying_key().to_bytes()]),
+    )
 }
 
 fn header(schema: SchemaId, refs: Vec<ObjectId>) -> ObjectHeader {
@@ -61,7 +69,9 @@ fn stored(header: &ObjectHeader, value: &impl Serialize) -> StoredObject {
         object_id: StoredObject::derive_id(header, &body, &key()).unwrap(),
         header: header.clone(),
         body,
-        storage: StorageMeta { retention: RetentionClass::Pinned },
+        storage: StorageMeta {
+            retention: RetentionClass::Pinned,
+        },
     }
 }
 
@@ -84,7 +94,10 @@ fn fixture(large: bool) -> Fixture {
         vec![0xa1, 0x61, b'n', 0x00]
     };
     let mut state = ConnectorStateObject {
-        header: header(FcpStoreConnectorStateStore::state_object_schema_id(), vec![lease_id]),
+        header: header(
+            FcpStoreConnectorStateStore::state_object_schema_id(),
+            vec![lease_id],
+        ),
         connector_id: scope().connector_id,
         instance_id: None,
         zone_id: scope().zone_id,
@@ -100,7 +113,10 @@ fn fixture(large: bool) -> Fixture {
     state.sign_with(&writer()).unwrap();
     let state_object = stored(&state.header, &state);
     let root = ConnectorStateRoot {
-        header: header(FcpStoreConnectorStateStore::root_schema_id(), vec![state_object.object_id]),
+        header: header(
+            FcpStoreConnectorStateStore::root_schema_id(),
+            vec![state_object.object_id],
+        ),
         connector_id: scope().connector_id,
         instance_id: None,
         zone_id: scope().zone_id,
@@ -113,11 +129,17 @@ fn fixture(large: bool) -> Fixture {
     run(source_objects.put(state_object)).unwrap();
     run(source_objects.put(root_object)).unwrap();
     let source = adapter(source_objects);
-    let replica = adapter(Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default())));
+    let replica = adapter(Arc::new(MemoryObjectStore::new(
+        MemoryObjectStoreConfig::default(),
+    )));
     let mut recipient = ConnectorStateReplicationService::new();
-    recipient.register_store(
-        ConnectorStateTransferDirection::Import, scope(), Arc::clone(&replica),
-    ).unwrap();
+    recipient
+        .register_store(
+            ConnectorStateTransferDirection::Import,
+            scope(),
+            Arc::clone(&replica),
+        )
+        .unwrap();
     let limits = ConnectorStateTransferLimits {
         max_objects: 16,
         max_canonical_bytes: 128 * 1024,
@@ -137,9 +159,13 @@ fn fixture(large: bool) -> Fixture {
             limits,
         };
         let mut donor = ConnectorStateReplicationService::new();
-        donor.register_store(
-            ConnectorStateTransferDirection::Export, scope(), Arc::clone(&source),
-        ).unwrap();
+        donor
+            .register_store(
+                ConnectorStateTransferDirection::Export,
+                scope(),
+                Arc::clone(&source),
+            )
+            .unwrap();
         donor.add_grant(grant.clone()).unwrap();
         candidates.push(ConnectorStatePullRequest {
             peer_node: peer.clone(),
@@ -150,17 +176,23 @@ fn fixture(large: bool) -> Fixture {
                 limits,
             },
         });
-        recipient.add_grant(ConnectorStateTransferGrant {
-            direction: ConnectorStateTransferDirection::Import,
-            peer_node: peer,
-            ..grant
-        }).unwrap();
+        recipient
+            .add_grant(ConnectorStateTransferGrant {
+                direction: ConnectorStateTransferDirection::Import,
+                peer_node: peer,
+                ..grant
+            })
+            .unwrap();
         donors.push(donor);
     }
     Fixture {
-        donors, recipient, replica,
+        donors,
+        recipient,
+        replica,
         request: ConnectorStateRecoveryRequest {
-            candidates, attempt_timeout_ms: 1_000, total_timeout_ms: 5_000,
+            candidates,
+            attempt_timeout_ms: 1_000,
+            total_timeout_ms: 5_000,
         },
     }
 }
@@ -170,13 +202,22 @@ fn unavailable() -> HostError {
 }
 
 fn assert_retained(fixture: &Fixture, response: &ConnectorStateRecoveryResponse, donor: usize) {
-    assert_eq!(response.schema_version, CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION);
+    assert_eq!(
+        response.schema_version,
+        CONNECTOR_STATE_RECOVERY_SCHEMA_VERSION
+    );
     assert_eq!(response.replica.peer_node, format!("donor-{donor}"));
     assert_eq!(response.replica.grant_id, format!("restore-{donor}"));
-    assert_eq!(response.replica.root_object_id, fixture.request.candidates[donor].request.root_object_id);
+    assert_eq!(
+        response.replica.root_object_id,
+        fixture.request.candidates[donor].request.root_object_id
+    );
     assert!(response.replica.replica_only);
     assert!(response.replica.replica_root_published);
-    assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, response.replica.root_object_id);
+    assert_eq!(
+        run(fixture.replica.read_root()).unwrap().unwrap().0,
+        response.replica.root_object_id
+    );
 }
 
 #[test]
@@ -189,7 +230,10 @@ fn recovery_plan_rejects_scope_root_limits_and_duplicate_changes() {
         match change {
             0 => request.candidates.clear(),
             1 => request.candidates[1].peer_node = request.candidates[0].peer_node.clone(),
-            2 => request.candidates[1].request.grant_id = request.candidates[0].request.grant_id.clone(),
+            2 => {
+                request.candidates[1].request.grant_id =
+                    request.candidates[0].request.grant_id.clone()
+            }
             3 => request.candidates[1].request.scope.zone_id = ZoneId::private(),
             4 => request.candidates[1].request.root_object_id = ObjectId::from_bytes([0xee; 32]),
             5 => request.candidates[1].request.limits.max_objects += 1,
@@ -206,12 +250,14 @@ fn recovery_plan_bounds_donors_and_all_deadlines() {
     let fixture = fixture(false);
     let mut request = fixture.request;
     let candidate = request.candidates[0].clone();
-    request.candidates = (0..MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES).map(|index| {
-        let mut candidate = candidate.clone();
-        candidate.peer_node = format!("peer-{index}");
-        candidate.request.grant_id = format!("grant-{index}");
-        candidate
-    }).collect();
+    request.candidates = (0..MAX_CONNECTOR_STATE_RECOVERY_CANDIDATES)
+        .map(|index| {
+            let mut candidate = candidate.clone();
+            candidate.peer_node = format!("peer-{index}");
+            candidate.request.grant_id = format!("grant-{index}");
+            candidate
+        })
+        .collect();
     request.validate().unwrap();
     request.candidates.push(candidate);
     assert!(request.validate().is_err());
@@ -234,7 +280,9 @@ fn recovery_wire_defaults_are_bounded_and_unknown_fields_rejected() {
     assert_eq!(decoded.attempt_timeout_ms, 10_000);
     assert_eq!(decoded.total_timeout_ms, 60_000);
     decoded.validate().unwrap();
-    assert!(serde_json::to_vec(&decoded).unwrap().len() <= MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES);
+    assert!(
+        serde_json::to_vec(&decoded).unwrap().len() <= MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES
+    );
     let mut unknown = wire;
     unknown["allow_untrusted_donors"] = json!(true);
     assert!(serde_json::from_value::<ConnectorStateRecoveryRequest>(unknown).is_err());
@@ -260,16 +308,31 @@ fn unreachable_primary_recovers_from_independently_granted_alternate() {
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            if index == 0 { return Err(unavailable()); }
-            donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await
+            if index == 0 {
+                return Err(unavailable());
+            }
+            donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
     assert_eq!(response.attempts.len(), 2);
-    assert_eq!(response.attempts[0].outcome, ConnectorStateRecoveryOutcome::DownloadFailed);
-    assert_eq!(response.attempts[1].outcome, ConnectorStateRecoveryOutcome::Retained);
-    assert!(!serde_json::to_string(&response).unwrap().contains("secret-state"));
+    assert_eq!(
+        response.attempts[0].outcome,
+        ConnectorStateRecoveryOutcome::DownloadFailed
+    );
+    assert_eq!(
+        response.attempts[1].outcome,
+        ConnectorStateRecoveryOutcome::Retained
+    );
+    assert!(
+        !serde_json::to_string(&response)
+            .unwrap()
+            .contains("secret-state")
+    );
 }
 
 #[test]
@@ -282,20 +345,34 @@ fn interrupted_history_is_discarded_and_alternate_starts_at_zero() {
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            assert!(replica.read_root().await.unwrap().is_none(), "published before download finished");
+            assert!(
+                replica.read_root().await.unwrap().is_none(),
+                "published before download finished"
+            );
             let page: Value = serde_json::from_str(&wire).unwrap();
             let offset = page["offset"].as_u64().unwrap();
             seen.lock().unwrap().push((index, offset));
-            if index == 0 && offset > 0 { return Err(unavailable()); }
-            if index == 1 && offset == 0 { assert!(page["wire_digest"].is_null()); }
-            donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await
+            if index == 0 && offset > 0 {
+                return Err(unavailable());
+            }
+            if index == 1 && offset == 0 {
+                assert!(page["wire_digest"].is_null());
+            }
+            donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
     let offsets = offsets.into_inner().unwrap();
     assert_eq!(&offsets[..3], &[(0, 0), (0, 48 * 1024), (1, 0)]);
-    assert!(offsets.iter().any(|(index, offset)| *index == 1 && *offset > 0));
+    assert!(
+        offsets
+            .iter()
+            .any(|(index, offset)| *index == 1 && *offset > 0)
+    );
 }
 
 #[test]
@@ -307,16 +384,28 @@ fn changed_transport_discards_download_but_does_not_authorize_a_new_incarnation(
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            let reply = donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await?;
-            if index == 0 { changed.store(true, Ordering::SeqCst); }
+            let reply = donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await?;
+            if index == 0 {
+                changed.store(true, Ordering::SeqCst);
+            }
             Ok(reply)
         },
         |index| {
-            if index == 0 && revoked.load(Ordering::SeqCst) { Err(unavailable()) } else { Ok(()) }
+            if index == 0 && revoked.load(Ordering::SeqCst) {
+                Err(unavailable())
+            } else {
+                Ok(())
+            }
         },
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
-    assert_eq!(response.attempts[0].outcome, ConnectorStateRecoveryOutcome::DownloadFailed);
+    assert_eq!(
+        response.attempts[0].outcome,
+        ConnectorStateRecoveryOutcome::DownloadFailed
+    );
 }
 
 #[test]
@@ -326,7 +415,9 @@ fn tampered_download_digest_can_fall_back_before_import() {
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            let reply = donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await?;
+            let reply = donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await?;
             if index == 0 {
                 let mut value: Value = serde_json::from_str(&reply).unwrap();
                 let length = value["data_hex"].as_str().unwrap().len();
@@ -336,7 +427,8 @@ fn tampered_download_digest_can_fall_back_before_import() {
             Ok(reply)
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
 }
 
@@ -352,13 +444,16 @@ fn complete_export_import_failure_is_terminal_even_with_a_healthy_alternate() {
             // A complete, digest-valid download is NOT necessarily valid state.
             // The ordinary import validator rejects this; it must be terminal.
             let page: Value = serde_json::from_str(&wire).unwrap();
-            async move { Ok(json!({
-                "schema_version": "fcp.host.state-transfer-page.v1",
-                "request": page,
-                "total_bytes": 2,
-                "wire_digest": blake3::hash(b"{}").to_hex().to_string(),
-                "data_hex": hex::encode(b"{}"),
-            }).to_string()) }
+            async move {
+                Ok(json!({
+                    "schema_version": "fcp.host.state-transfer-page.v1",
+                    "request": page,
+                    "total_bytes": 2,
+                    "wire_digest": blake3::hash(b"{}").to_hex().to_string(),
+                    "data_hex": hex::encode(b"{}"),
+                })
+                .to_string())
+            }
         },
         |_| Ok(()),
     ));
@@ -369,7 +464,9 @@ fn complete_export_import_failure_is_terminal_even_with_a_healthy_alternate() {
 
 struct MarkDropped<'a>(&'a AtomicBool);
 impl Drop for MarkDropped<'_> {
-    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -387,12 +484,18 @@ fn stalled_download_is_cancelled_before_next_donor_starts() {
                 return pending::<HostResult<String>>().await;
             }
             assert!(was_dropped.load(Ordering::SeqCst));
-            donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await
+            donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
-    assert_eq!(response.attempts[0].outcome, ConnectorStateRecoveryOutcome::DownloadDeadline);
+    assert_eq!(
+        response.attempts[0].outcome,
+        ConnectorStateRecoveryOutcome::DownloadDeadline
+    );
 }
 
 #[test]
@@ -406,10 +509,15 @@ fn exhausting_donors_is_redacted_and_never_imports() {
             async { Err(unavailable()) }
         },
         |_| Ok(()),
-    )).unwrap_err();
+    ))
+    .unwrap_err();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(!error.to_string().contains("secret-state"));
-    assert!(error.to_string().contains("no replica import was attempted"));
+    assert!(
+        error
+            .to_string()
+            .contains("no replica import was attempted")
+    );
     assert!(run(fixture.replica.read_root()).unwrap().is_none());
 }
 
@@ -422,7 +530,8 @@ fn total_deadline_is_shared_across_donors() {
         &fixture.request,
         |_, _| pending::<HostResult<String>>(),
         |_| Ok(()),
-    )).unwrap_err();
+    ))
+    .unwrap_err();
     assert!(error.to_string().contains("total deadline"));
     assert!(run(fixture.replica.read_root()).unwrap().is_none());
 }
@@ -437,12 +546,15 @@ fn ready_download_cannot_bypass_total_deadline_before_import() {
         &fixture.request,
         |index, wire| async move {
             assert_eq!(index, 0, "expired total budget admitted another donor");
-            let reply = donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await?;
+            let reply = donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await?;
             std::thread::sleep(Duration::from_millis(30));
             Ok(reply)
         },
         |_| Ok(()),
-    )).unwrap_err();
+    ))
+    .unwrap_err();
     assert!(error.to_string().contains("total deadline"));
     assert!(run(fixture.replica.read_root()).unwrap().is_none());
 }
@@ -455,14 +567,22 @@ fn ready_download_cannot_bypass_attempt_deadline() {
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            let reply = donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await?;
-            if index == 0 { std::thread::sleep(Duration::from_millis(75)); }
+            let reply = donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await?;
+            if index == 0 {
+                std::thread::sleep(Duration::from_millis(75));
+            }
             Ok(reply)
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 1);
-    assert_eq!(response.attempts[0].outcome, ConnectorStateRecoveryOutcome::DownloadDeadline);
+    assert_eq!(
+        response.attempts[0].outcome,
+        ConnectorStateRecoveryOutcome::DownloadDeadline
+    );
 }
 
 #[test]
@@ -470,18 +590,25 @@ fn cancellation_releases_admission_and_saturation_is_not_a_failover_hint() {
     let fixture = fixture(false);
     run(async {
         let mut first = Box::pin(fixture.recipient.recover_from_peers(
-            &fixture.request, |_, _| pending::<HostResult<String>>(), |_| Ok(()),
+            &fixture.request,
+            |_, _| pending::<HostResult<String>>(),
+            |_| Ok(()),
         ));
         let mut second = Box::pin(fixture.recipient.recover_from_peers(
-            &fixture.request, |_, _| pending::<HostResult<String>>(), |_| Ok(()),
+            &fixture.request,
+            |_, _| pending::<HostResult<String>>(),
+            |_| Ok(()),
         ));
         assert!(futures_util::poll!(first.as_mut()).is_pending());
         assert!(futures_util::poll!(second.as_mut()).is_pending());
-        let refused = fixture.recipient.recover_from_peers(
-            &fixture.request,
-            |_, _| async { panic!("shared admission refusal must not try another peer") },
-            |_| Ok(()),
-        ).await;
+        let refused = fixture
+            .recipient
+            .recover_from_peers(
+                &fixture.request,
+                |_, _| async { panic!("shared admission refusal must not try another peer") },
+                |_| Ok(()),
+            )
+            .await;
         assert!(refused.is_err());
         drop(first);
         drop(second);
@@ -491,10 +618,13 @@ fn cancellation_releases_admission_and_saturation_is_not_a_failover_hint() {
     let response = run(fixture.recipient.recover_from_peers(
         &fixture.request,
         |index, wire| async move {
-            donors[index].export_transfer_for_peer("recipient", &wire, || Ok(())).await
+            donors[index]
+                .export_transfer_for_peer("recipient", &wire, || Ok(()))
+                .await
         },
         |_| Ok(()),
-    )).unwrap();
+    ))
+    .unwrap();
     assert_retained(&fixture, &response, 0);
     assert_eq!(response.attempts.len(), 1);
 }
@@ -504,9 +634,13 @@ fn recovery_future_is_send_with_send_transport() {
     fn assert_send<T: Send>(_: T) {}
     let service = ConnectorStateReplicationService::new();
     let request = ConnectorStateRecoveryRequest {
-        candidates: Vec::new(), attempt_timeout_ms: 1, total_timeout_ms: 1,
+        candidates: Vec::new(),
+        attempt_timeout_ms: 1,
+        total_timeout_ms: 1,
     };
     assert_send(service.recover_from_peers(
-        &request, |_, _| async { Err(unavailable()) }, |_| Ok(()),
+        &request,
+        |_, _| async { Err(unavailable()) },
+        |_| Ok(()),
     ));
 }

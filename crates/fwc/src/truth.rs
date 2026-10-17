@@ -791,6 +791,29 @@ pub fn mesh_backed_from_healthy_peers(healthy_peers: u32) -> bool {
     healthy_peers >= fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE
 }
 
+/// Environment variable used by end-to-end tests (`resolver_internal_error_e2e`)
+/// to deterministically force an internal [`ResolutionError`] before querying
+/// any source, exercising the `_truth_source: "unavailable"` /
+/// `truth-resolver-internal-error` failure contract.
+pub const FORCE_RESOLVER_INTERNAL_ERROR_ENV: &str = "FWC_TEST_FORCE_RESOLVER_INTERNAL_ERROR";
+
+fn forced_resolver_internal_error(strategy: ResolutionStrategy) -> Option<ResolutionError> {
+    let raw = std::env::var(FORCE_RESOLVER_INTERNAL_ERROR_ENV).ok()?;
+    if matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    ) {
+        Some(ResolutionError {
+            strategy,
+            attempts: Vec::new(),
+            reason: "forced internal resolver error via FWC_TEST_FORCE_RESOLVER_INTERNAL_ERROR"
+                .into(),
+        })
+    } else {
+        None
+    }
+}
+
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
@@ -924,6 +947,10 @@ impl LiveTruthResolver {
     where
         F: FnMut(KnowledgeState) -> Option<T>,
     {
+        if let Some(error) = forced_resolver_internal_error(strategy) {
+            return Err(error);
+        }
+
         let start = Instant::now();
         let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
@@ -985,6 +1012,10 @@ impl LiveTruthResolver {
     where
         F: FnMut(KnowledgeState) -> QueryResult<T>,
     {
+        if let Some(error) = forced_resolver_internal_error(strategy) {
+            return Err(error);
+        }
+
         let start = Instant::now();
         let sources = self.effective_sources(strategy);
         let mut attempts = Vec::with_capacity(sources.len());
@@ -1740,10 +1771,22 @@ impl LiveTruthResolver {
         }
     }
 
+    fn effective_policy_sources(&self, policy: &TruthPrecedencePolicy) -> Vec<KnowledgeState> {
+        policy
+            .source_order()
+            .iter()
+            .copied()
+            .filter(|source| {
+                self.config.mesh_backed_enabled || *source != KnowledgeState::MeshBacked
+            })
+            .collect()
+    }
+
     /// Resolve truth using a zone-wide precedence policy.
     ///
     /// This is the policy-aware resolution path. The resolver queries
-    /// sources in the policy's precedence order and rejects answers
+    /// sources in the policy's precedence order (gated by `mesh_backed_enabled`,
+    /// matching [`Self::effective_sources`]) and rejects answers
     /// that fall below the policy's minimum acceptable threshold.
     pub fn resolve_with_policy<T, F>(
         &self,
@@ -1754,11 +1797,11 @@ impl LiveTruthResolver {
         F: FnMut(KnowledgeState) -> Option<T>,
     {
         let start = Instant::now();
-        let sources = policy.source_order();
+        let sources = self.effective_policy_sources(policy);
         let strategy = policy.to_resolution_strategy();
         let mut attempts = Vec::with_capacity(sources.len());
 
-        for source in sources {
+        for source in &sources {
             let attempt_start = Instant::now();
             let result = query_fn(*source);
             let attempt_elapsed = attempt_start.elapsed();
@@ -3905,7 +3948,7 @@ mod tests {
             model_version: OperationalModelVersion::V1HostFirst,
         };
 
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
 
         // Mesh unavailable → resolution should fail
         let result = resolver.resolve_with_policy(&strict_policy, |source| match source {
@@ -3935,7 +3978,7 @@ mod tests {
         // When higher-precedence source is unavailable and fallback is allowed,
         // the policy should fall back to the next source in order.
         let policy = TruthPrecedencePolicy::v1_default();
-        let resolver = LiveTruthResolver::with_defaults();
+        let resolver = mesh_enabled_resolver();
 
         // Host unavailable, but mesh and offline available
         let result = resolver
@@ -4187,5 +4230,45 @@ mod tests {
             result.is_err(),
             "no-fallback policy should not try lower sources"
         );
+    }
+
+    #[test]
+    fn resolver_with_default_v2_policy_still_requires_mesh_enablement() {
+        let policy = TruthPrecedencePolicy::v2_default();
+        let single_host_resolver = LiveTruthResolver::with_defaults();
+
+        // When mesh_backed_enabled is false (default single-host mode),
+        // resolve_with_policy must skip MeshBacked without recording a false
+        // failed attempt and resolve directly to HostBacked.
+        let resolution = single_host_resolver
+            .resolve_with_policy(&policy, |source| match source {
+                KnowledgeState::MeshBacked => {
+                    panic!("MeshBacked must not be queried when mesh_backed_enabled is false")
+                }
+                KnowledgeState::HostBacked => Some("host-answer"),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(resolution.knowledge_state, KnowledgeState::HostBacked);
+        assert_eq!(resolution.value, "host-answer");
+        assert!(!resolution.trace.used_fallback);
+        assert_eq!(resolution.trace.attempts.len(), 1);
+        assert_eq!(
+            resolution.trace.attempts[0].source,
+            KnowledgeState::HostBacked
+        );
+
+        // When mesh_backed_enabled is true, MeshBacked is queried first.
+        let mesh_resolver = mesh_enabled_resolver();
+        let mesh_resolution = mesh_resolver
+            .resolve_with_policy(&policy, |source| match source {
+                KnowledgeState::MeshBacked => Some("mesh-answer"),
+                KnowledgeState::HostBacked => Some("host-answer"),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mesh_resolution.knowledge_state, KnowledgeState::MeshBacked);
+        assert_eq!(mesh_resolution.value, "mesh-answer");
+        assert!(!mesh_resolution.trace.used_fallback);
     }
 }

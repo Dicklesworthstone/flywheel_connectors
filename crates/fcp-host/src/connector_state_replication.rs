@@ -387,7 +387,8 @@ impl ConnectorStateReplicationService {
         self.validate_export(authenticated_peer, request)?;
         authorize_transport()?;
         let permit = self.runtime.admit(authenticated_peer, request.limits)?;
-        self.export_admitted(authenticated_peer, request, authorize_transport, &permit).await
+        self.export_admitted(authenticated_peer, request, authorize_transport, &permit)
+            .await
     }
 
     pub(super) async fn export_admitted<F>(
@@ -454,8 +455,11 @@ impl ConnectorStateReplicationService {
     {
         self.validate_pull(request)?;
         authorize_transport()?;
-        let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
-        self.import_admitted(request, wire, authorize_transport, &permit).await
+        let permit = self
+            .runtime
+            .admit(&request.peer_node, request.request.limits)?;
+        self.import_admitted(request, wire, authorize_transport, &permit)
+            .await
     }
 
     pub(super) async fn import_admitted<F>(
@@ -542,7 +546,9 @@ impl ConnectorStateReplicationService {
         request: &ConnectorStateExportRequest,
     ) -> HostResult<()> {
         self.authorize(
-            ConnectorStateTransferDirection::Export, authenticated_peer, request,
+            ConnectorStateTransferDirection::Export,
+            authenticated_peer,
+            request,
         )?;
         Ok(())
     }
@@ -1249,14 +1255,18 @@ mod tests {
         let first = fixture.donor.runtime.admit("recipient", limits()).unwrap();
         let second = fixture.donor.runtime.admit("recipient", limits()).unwrap();
         assert!(matches!(
-            run(fixture.donor.export_for_peer("recipient", &fixture.request.request, || Ok(()))),
+            run(fixture
+                .donor
+                .export_for_peer("recipient", &fixture.request.request, || Ok(()))),
             Err(HostError::Unavailable(_))
         ));
         assert_eq!(fixture.donor.runtime.active(), 2);
         // Grant failure takes precedence over capacity: unknown callers do not
         // learn whether an authorized peer is currently consuming its budget.
         assert!(matches!(
-            run(fixture.donor.export_for_peer("unknown", &fixture.request.request, || Ok(()))),
+            run(fixture
+                .donor
+                .export_for_peer("unknown", &fixture.request.request, || Ok(()))),
             Err(HostError::PreflightFailed(_))
         ));
         drop(first);
@@ -1267,12 +1277,19 @@ mod tests {
         let first = fixture.recipient.runtime.admit("donor", limits()).unwrap();
         let second = fixture.recipient.runtime.admit("donor", limits()).unwrap();
         assert!(matches!(
-            run(fixture.recipient.import_from_peer(&fixture.request, &wire, || Ok(()))),
+            run(fixture
+                .recipient
+                .import_from_peer(&fixture.request, &wire, || Ok(()))),
             Err(HostError::Unavailable(_))
         ));
         assert!(run(fixture.replica.read_root()).unwrap().is_none());
         drop(first);
-        assert!(run(fixture.recipient.import_from_peer(&fixture.request, &wire, || Ok(()))).is_ok());
+        assert!(
+            run(fixture
+                .recipient
+                .import_from_peer(&fixture.request, &wire, || Ok(())))
+            .is_ok()
+        );
         assert_eq!(fixture.recipient.runtime.active(), 1);
         drop(second);
         assert_eq!(fixture.recipient.runtime.active(), 0);
@@ -1285,7 +1302,12 @@ mod tests {
         let first = fixture.donor.runtime.admit("recipient", limits()).unwrap();
         let second = fixture.donor.runtime.admit("recipient", limits()).unwrap();
         for _ in 0..4 {
-            assert!(run(fixture.recipient.import_from_peer(&fixture.request, "invalid", || Ok(()))).is_err());
+            assert!(
+                run(fixture
+                    .recipient
+                    .import_from_peer(&fixture.request, "invalid", || Ok(())))
+                .is_err()
+            );
             assert_eq!(fixture.recipient.runtime.active(), 0);
         }
         assert_eq!(fixture.donor.runtime.active(), 2);
@@ -1298,11 +1320,14 @@ mod tests {
         // not fabricated export bytes, forces more than one wire page.
         let mut state = vec![0xa1, 0x61, b'n', 0x79, 0xea, 0x60];
         state.resize(state.len() + 60_000, b'x');
-        fixture_with_state(state, ConnectorStateTransferLimits {
-            max_objects: 16,
-            max_canonical_bytes: 256 * 1024,
-            max_wire_bytes: 1024 * 1024,
-        })
+        fixture_with_state(
+            state,
+            ConnectorStateTransferLimits {
+                max_objects: 16,
+                max_canonical_bytes: 256 * 1024,
+                max_wire_bytes: 1024 * 1024,
+            },
+        )
     }
 
     fn first_page_request(request: &ConnectorStateExportRequest) -> String {
@@ -1311,13 +1336,18 @@ mod tests {
             "export": request,
             "offset": 0,
             "wire_digest": null,
-        }).to_string()
+        })
+        .to_string()
     }
 
     #[test]
     fn paged_recovery_reuses_one_snapshot_and_one_import_reservation() {
         let fixture = large_fixture();
-        let held = fixture.recipient.runtime.admit("donor", fixture.request.request.limits).unwrap();
+        let held = fixture
+            .recipient
+            .runtime
+            .admit("donor", fixture.request.request.limits)
+            .unwrap();
         let pages = AtomicUsize::new(0);
         let result = run(fixture.recipient.pull_paged_from_peer(
             &fixture.request,
@@ -1326,16 +1356,25 @@ mod tests {
                 async move {
                     assert_eq!(recipient.runtime.active(), 2);
                     pages.fetch_add(1, Ordering::SeqCst);
-                    donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await
+                    donor
+                        .export_transfer_for_peer("recipient", &request_json, || Ok(()))
+                        .await
                 }
             },
             || Ok(()),
-        )).unwrap();
+        ))
+        .unwrap();
         assert!(pages.load(Ordering::SeqCst) > 1);
         assert!(result.wire_bytes > 48 * 1024);
         assert!(result.replica_root_published);
-        assert_eq!(result.root_object_id, fixture.request.request.root_object_id);
-        assert_eq!(run(fixture.replica.read_root()).unwrap().unwrap().0, result.root_object_id);
+        assert_eq!(
+            result.root_object_id,
+            fixture.request.request.root_object_id
+        );
+        assert_eq!(
+            run(fixture.replica.read_root()).unwrap().unwrap().0,
+            result.root_object_id
+        );
         assert_eq!(fixture.donor.runtime.cache_builds_started(), 1);
         assert_eq!(fixture.donor.runtime.active(), 0);
         assert_eq!(fixture.recipient.runtime.active(), 1);
@@ -1364,7 +1403,9 @@ mod tests {
         use std::future::Future;
         use std::task::{Context, Poll, Wake, Waker};
         struct Noop;
-        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
         let fixture = fixture();
         let mut future = Box::pin(fixture.recipient.pull_paged_from_peer(
             &fixture.request,
@@ -1372,7 +1413,10 @@ mod tests {
             || Ok(()),
         ));
         let waker = Waker::from(Arc::new(Noop));
-        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending));
+        assert!(matches!(
+            future.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
         assert_eq!(fixture.recipient.runtime.active(), 1);
         drop(future);
         assert_eq!(fixture.recipient.runtime.active(), 0);
@@ -1389,9 +1433,13 @@ mod tests {
                 let (donor, attempts) = (&fixture.donor, &attempts);
                 async move {
                     if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
-                        return Err(HostError::Unavailable("fixture continuation failed".to_owned()));
+                        return Err(HostError::Unavailable(
+                            "fixture continuation failed".to_owned(),
+                        ));
                     }
-                    donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await
+                    donor
+                        .export_transfer_for_peer("recipient", &request_json, || Ok(()))
+                        .await
                 }
             },
             || Ok(()),
@@ -1407,10 +1455,15 @@ mod tests {
             &fixture.request,
             |request_json| {
                 let donor = &fixture.donor;
-                async move { donor.export_transfer_for_peer("recipient", &request_json, || Ok(())).await }
+                async move {
+                    donor
+                        .export_transfer_for_peer("recipient", &request_json, || Ok(()))
+                        .await
+                }
             },
             || Ok(()),
-        )).unwrap();
+        ))
+        .unwrap();
         assert!(result.replica_root_published);
         assert_eq!(fixture.donor.runtime.cache_builds_started(), 1);
     }
@@ -1419,20 +1472,52 @@ mod tests {
     fn cached_pages_still_require_current_peer_and_grant_authority() {
         let mut fixture = fixture();
         let request = first_page_request(&fixture.request.request);
-        let first = run(fixture.donor.export_transfer_for_peer("recipient", &request, || Ok(()))).unwrap();
-        let again = run(fixture.donor.export_transfer_for_peer("recipient", &request, || Ok(()))).unwrap();
+        let first = run(fixture
+            .donor
+            .export_transfer_for_peer("recipient", &request, || Ok(())))
+        .unwrap();
+        let again = run(fixture
+            .donor
+            .export_transfer_for_peer("recipient", &request, || Ok(())))
+        .unwrap();
         assert_eq!(first, again);
         assert_eq!(fixture.donor.runtime.cache_builds_started(), 1);
         // Rejection AFTER a cache hit must still prevent disclosure.
         let checks = AtomicUsize::new(0);
-        assert!(run(fixture.donor.export_transfer_for_peer("recipient", &request, || {
-            if checks.fetch_add(1, Ordering::SeqCst) == 0 { Ok(()) }
-            else { Err(HostError::PreflightFailed("fixture peer revoked".to_owned())) }
-        })).is_err());
+        assert!(
+            run(fixture
+                .donor
+                .export_transfer_for_peer("recipient", &request, || {
+                    if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(())
+                    } else {
+                        Err(HostError::PreflightFailed(
+                            "fixture peer revoked".to_owned(),
+                        ))
+                    }
+                }))
+            .is_err()
+        );
         assert_eq!(checks.load(Ordering::SeqCst), 2);
-        assert!(run(fixture.donor.export_transfer_for_peer("other-peer", &request, || Ok(()))).is_err());
-        fixture.donor.grants.get_mut("restore-state").unwrap().expired.store(true, Ordering::Release);
-        assert!(run(fixture.donor.export_transfer_for_peer("recipient", &request, || Ok(()))).is_err());
+        assert!(
+            run(fixture
+                .donor
+                .export_transfer_for_peer("other-peer", &request, || Ok(())))
+            .is_err()
+        );
+        fixture
+            .donor
+            .grants
+            .get_mut("restore-state")
+            .unwrap()
+            .expired
+            .store(true, Ordering::Release);
+        assert!(
+            run(fixture
+                .donor
+                .export_transfer_for_peer("recipient", &request, || Ok(())))
+            .is_err()
+        );
         assert_eq!(fixture.donor.runtime.cache_builds_started(), 1);
         assert_eq!(fixture.donor.runtime.active(), 0);
     }
@@ -1441,22 +1526,37 @@ mod tests {
     fn cached_export_never_satisfies_changed_limits_or_a_wrong_digest() {
         let fixture = large_fixture();
         let first = run(fixture.donor.export_transfer_for_peer(
-            "recipient", &first_page_request(&fixture.request.request), || Ok(()),
-        )).unwrap();
+            "recipient",
+            &first_page_request(&fixture.request.request),
+            || Ok(()),
+        ))
+        .unwrap();
         let mut continuation: serde_json::Value = serde_json::from_str(&first).unwrap();
         continuation["request"]["offset"] = serde_json::json!(48 * 1024);
         let digest = continuation["wire_digest"].as_str().unwrap();
-        continuation["request"]["wire_digest"] = serde_json::json!(
-            if digest == "0".repeat(64) { "1".repeat(64) } else { "0".repeat(64) }
+        continuation["request"]["wire_digest"] = serde_json::json!(if digest == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        });
+        assert!(
+            run(fixture.donor.export_transfer_for_peer(
+                "recipient",
+                &continuation["request"].to_string(),
+                || Ok(()),
+            ))
+            .is_err()
         );
-        assert!(run(fixture.donor.export_transfer_for_peer(
-            "recipient", &continuation["request"].to_string(), || Ok(()),
-        )).is_err());
         let mut narrower = fixture.request.request.clone();
         narrower.limits.max_wire_bytes = 1;
-        assert!(run(fixture.donor.export_transfer_for_peer(
-            "recipient", &first_page_request(&narrower), || Ok(()),
-        )).is_err());
+        assert!(
+            run(fixture.donor.export_transfer_for_peer(
+                "recipient",
+                &first_page_request(&narrower),
+                || Ok(()),
+            ))
+            .is_err()
+        );
         assert_eq!(fixture.donor.runtime.cache_builds_started(), 2);
         assert_eq!(fixture.donor.runtime.active(), 0);
         assert!(run(fixture.replica.read_root()).unwrap().is_none());

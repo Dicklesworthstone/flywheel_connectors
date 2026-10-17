@@ -170,3 +170,34 @@ fn test_combined_cadence_files_monthly_and_quarterly_beads() {
         "[reality-check] 2026-Q3 claims-vs-reality pass overdue"
     );
 }
+
+#[test]
+fn test_mid_month_replay_detects_missing_monthly_and_quarterly_artifacts() {
+    let reality = tempdir().expect("reality tempdir");
+    let quarterly = tempdir().expect("quarterly tempdir");
+
+    let proposed = check_reality_cadence_with_existing(
+        date(2026, 10, 13),
+        reality.path(),
+        quarterly.path(),
+        &[],
+    );
+
+    assert_eq!(proposed.len(), 2);
+    assert_eq!(
+        proposed[0].title,
+        "[reality-check] 2026-10 reality-check pass overdue"
+    );
+    assert_eq!(
+        proposed[1].title,
+        "[reality-check] 2026-Q4 claims-vs-reality pass overdue"
+    );
+}
+
+#[test]
+fn test_quarterly_skips_weekend_before_first_business_day() {
+    let tmp = tempdir().expect("tempdir");
+    let proposed = check_quarterly_cadence(date(2028, 1, 1), tmp.path());
+
+    assert!(proposed.is_empty());
+}

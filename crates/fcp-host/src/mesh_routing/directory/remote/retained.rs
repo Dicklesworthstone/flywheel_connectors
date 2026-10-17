@@ -41,7 +41,9 @@ impl Record {
                 hash.update(&[1]);
                 hash.update(document.as_bytes());
             }
-            None => { hash.update(&[0]); }
+            None => {
+                hash.update(&[0]);
+            }
         }
         hash.finalize().to_hex().to_string()
     }
@@ -49,10 +51,13 @@ impl Record {
     fn decode(bytes: &[u8], binding: &str) -> HostResult<Self> {
         let record: Self = serde_json::from_slice(bytes)
             .map_err(|_| invalid("retained membership source is corrupt"))?;
-        if record.schema_version != 1 || record.source_digest != binding
+        if record.schema_version != 1
+            || record.source_digest != binding
             || record.checksum_hex != record.checksum()
         {
-            return Err(invalid("retained membership source is corrupt or belongs to another publisher"));
+            return Err(invalid(
+                "retained membership source is corrupt or belongs to another publisher",
+            ));
         }
         if let Some(document) = &record.document {
             SignedMeshPeerDirectory::from_json(document)
@@ -78,8 +83,13 @@ impl Journal {
         hash.update(&[self.schema_version]);
         for digest in [&self.ready, &self.pending] {
             match digest {
-                Some(digest) => { hash.update(&[1]); hash.update(digest.as_bytes()); }
-                None => { hash.update(&[0]); }
+                Some(digest) => {
+                    hash.update(&[1]);
+                    hash.update(digest.as_bytes());
+                }
+                None => {
+                    hash.update(&[0]);
+                }
             }
         }
         hash.finalize().to_hex().to_string()
@@ -88,10 +98,13 @@ impl Journal {
     fn decode(bytes: &[u8]) -> HostResult<Self> {
         let journal: Self = serde_json::from_slice(bytes)
             .map_err(|_| invalid("retained source journal is corrupt"))?;
-        let digest_valid = |digest: &Option<String>| digest.as_ref().is_none_or(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
-        if journal.schema_version != 1 || !digest_valid(&journal.ready)
+        let digest_valid = |digest: &Option<String>| {
+            digest.as_ref().is_none_or(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        };
+        if journal.schema_version != 1
+            || !digest_valid(&journal.ready)
             || !digest_valid(&journal.pending)
             || (journal.ready.is_none() && journal.pending.is_none())
             || journal.checksum_hex != journal.checksum()
@@ -114,10 +127,15 @@ pub(super) struct SourceCache {
 }
 
 pub(super) fn validate_path(path: &Path) -> HostResult<()> {
-    if !path.is_absolute() || path.file_name().is_none()
-        || path.components().any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
     {
-        return Err(invalid("retained_source_file must be an absolute file path without traversal"));
+        return Err(invalid(
+            "retained_source_file must be an absolute file path without traversal",
+        ));
     }
     Ok(())
 }
@@ -134,7 +152,8 @@ fn options() -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600)
+        options
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     options
@@ -149,16 +168,23 @@ fn private_regular(file: &File) -> io::Result<()> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
-            return Err(io::Error::other("retained source must be private and not hard-linked"));
+            return Err(io::Error::other(
+                "retained source must be private and not hard-linked",
+            ));
         }
         Ok(())
     }
     #[cfg(not(unix))]
-    Err(io::Error::other("retained source requires Unix filesystem guarantees"))
+    Err(io::Error::other(
+        "retained source requires Unix filesystem guarantees",
+    ))
 }
 
 fn storage(stage: &'static str, error: io::Error) -> HostError {
-    HostError::Internal(format!("retained membership source {stage} failed ({:?})", error.kind()))
+    HostError::Internal(format!(
+        "retained membership source {stage} failed ({:?})",
+        error.kind()
+    ))
 }
 
 fn read_file(path: &Path) -> HostResult<Option<Vec<u8>>> {
@@ -169,7 +195,9 @@ fn read_file(path: &Path) -> HostResult<Option<Vec<u8>>> {
     };
     private_regular(&file).map_err(|error| storage("metadata", error))?;
     let mut bytes = Vec::new();
-    (&mut file).take((MAX_CACHE_BYTES + 1) as u64).read_to_end(&mut bytes)
+    (&mut file)
+        .take((MAX_CACHE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|error| storage("read", error))?;
     if bytes.len() > MAX_CACHE_BYTES {
         return Err(invalid("retained membership source exceeds its byte limit"));
@@ -178,8 +206,11 @@ fn read_file(path: &Path) -> HostResult<Option<Vec<u8>>> {
 }
 
 fn sync_parent(path: &Path) -> HostResult<()> {
-    let parent = path.parent().ok_or_else(|| invalid("retained source has no parent"))?;
-    File::open(parent).and_then(|file| file.sync_all())
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("retained source has no parent"))?;
+    File::open(parent)
+        .and_then(|file| file.sync_all())
         .map_err(|error| storage("directory_sync", error))
 }
 
@@ -190,26 +221,45 @@ fn digest(bytes: &[u8]) -> String {
 impl SourceCache {
     pub(super) fn open(path: &Path, endpoint: &url::Url) -> HostResult<Self> {
         validate_path(path)?;
-        let mut lock = options().create(true).truncate(false)
+        let mut lock = options()
+            .create(true)
+            .truncate(false)
             .open(companion(path, ".lock"))
             .map_err(|error| storage("lock_open", error))?;
         private_regular(&lock).map_err(|error| storage("lock_metadata", error))?;
-        lock.try_lock().map_err(|_| invalid("retained source is locked or locking is unsupported"))?;
+        lock.try_lock()
+            .map_err(|_| invalid("retained source is locked or locking is unsupported"))?;
         let mut bytes = Vec::new();
-        (&mut lock).take((MAX_JOURNAL_BYTES + 1) as u64).read_to_end(&mut bytes)
+        (&mut lock)
+            .take((MAX_JOURNAL_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .map_err(|error| storage("journal_read", error))?;
         if bytes.len() > MAX_JOURNAL_BYTES {
             return Err(invalid("retained source journal exceeds its byte limit"));
         }
-        let journal = if bytes.is_empty() { Journal::default() } else { Journal::decode(&bytes)? };
+        let journal = if bytes.is_empty() {
+            Journal::default()
+        } else {
+            Journal::decode(&bytes)?
+        };
         if journal.pending.is_some() {
-            return Err(invalid("retained source publication was interrupted; pending state must be recovered"));
+            return Err(invalid(
+                "retained source publication was interrupted; pending state must be recovered",
+            ));
         }
         let mut cache = Self {
-            path: path.to_owned(), lock,
-            binding: blake3::derive_key("fcp.mesh.retained-source.publisher.v1", endpoint.as_str().as_bytes())
-                .iter().map(|byte| format!("{byte:02x}")).collect(),
-            journal, current: None, poisoned: false,
+            path: path.to_owned(),
+            lock,
+            binding: blake3::derive_key(
+                "fcp.mesh.retained-source.publisher.v1",
+                endpoint.as_str().as_bytes(),
+            )
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+            journal,
+            current: None,
+            poisoned: false,
         };
         cache.current = cache.read_current()?;
         Ok(cache)
@@ -221,12 +271,18 @@ impl SourceCache {
             (Some(bytes), Some(expected)) if digest(&bytes) == expected => {
                 Record::decode(&bytes, &self.binding).map(Some)
             }
-            _ => Err(invalid("retained source is missing or changed outside its owner; refusing reset")),
+            _ => Err(invalid(
+                "retained source is missing or changed outside its owner; refusing reset",
+            )),
         }
     }
 
     fn check_clock(&self, now_ms: u64) -> HostResult<()> {
-        if self.current.as_ref().is_some_and(|record| now_ms < record.observed_at_ms) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|record| now_ms < record.observed_at_ms)
+        {
             return Err(invalid("clock precedes retained source observation"));
         }
         Ok(())
@@ -239,8 +295,9 @@ impl SourceCache {
         self.check_clock(now_ms)?;
         // Re-read under the same exclusive owner before relying on disk history.
         let current = self.read_current()?;
-        current.and_then(|record| record.document)
-            .ok_or_else(|| invalid("no retained source candidate is available; publisher recovery required"))
+        current.and_then(|record| record.document).ok_or_else(|| {
+            invalid("no retained source candidate is available; publisher recovery required")
+        })
     }
 
     fn write_journal(&mut self, mut journal: Journal) -> HostResult<()> {
@@ -251,7 +308,8 @@ impl SourceCache {
         if bytes.len() > MAX_JOURNAL_BYTES {
             return Err(invalid("retained source journal exceeds its byte limit"));
         }
-        self.lock.seek(SeekFrom::Start(0))
+        self.lock
+            .seek(SeekFrom::Start(0))
             .and_then(|_| self.lock.write_all(&bytes))
             .and_then(|()| self.lock.set_len(bytes.len() as u64))
             .and_then(|()| self.lock.sync_all())
@@ -269,7 +327,11 @@ impl SourceCache {
         }
         self.check_clock(now_ms)?;
         self.read_current()?;
-        if self.current.as_ref().is_some_and(|record| record.document == document) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|record| record.document == document)
+        {
             // Re-reading an identical document cannot renew its signed lifetime.
             return Ok(());
         }
@@ -278,8 +340,11 @@ impl SourceCache {
                 .map_err(|_| invalid("only complete membership envelopes may be retained"))?;
         }
         let mut record = Record {
-            schema_version: 1, source_digest: self.binding.clone(), observed_at_ms: now_ms,
-            document, checksum_hex: String::new(),
+            schema_version: 1,
+            source_digest: self.binding.clone(),
+            observed_at_ms: now_ms,
+            document,
+            checksum_hex: String::new(),
         };
         record.checksum_hex = record.checksum();
         let bytes = serde_json::to_vec(&record)
@@ -289,18 +354,28 @@ impl SourceCache {
         }
         self.poisoned = true;
         let stage = companion(&self.path, ".next");
-        let mut file = options().create(true).truncate(false).open(&stage)
+        let mut file = options()
+            .create(true)
+            .truncate(false)
+            .open(&stage)
             .map_err(|error| storage("stage_open", error))?;
         private_regular(&file).map_err(|error| storage("stage_metadata", error))?;
-        file.set_len(0).and_then(|()| file.write_all(&bytes)).and_then(|()| file.sync_all())
+        file.set_len(0)
+            .and_then(|()| file.write_all(&bytes))
+            .and_then(|()| file.sync_all())
             .map_err(|error| storage("stage_write", error))?;
         let target = digest(&bytes);
         self.write_journal(Journal {
-            ready: self.journal.ready.clone(), pending: Some(target.clone()), ..Journal::default()
+            ready: self.journal.ready.clone(),
+            pending: Some(target.clone()),
+            ..Journal::default()
         })?;
         std::fs::rename(&stage, &self.path).map_err(|error| storage("replace", error))?;
         sync_parent(&self.path)?;
-        self.write_journal(Journal { ready: Some(target), ..Journal::default() })?;
+        self.write_journal(Journal {
+            ready: Some(target),
+            ..Journal::default()
+        })?;
         self.current = Some(record);
         self.poisoned = false;
         Ok(())
@@ -309,13 +384,16 @@ impl SourceCache {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    fn endpoint() -> url::Url { url::Url::parse("https://source.example/members").unwrap() }
+    fn endpoint() -> url::Url {
+        url::Url::parse("https://source.example/members").unwrap()
+    }
     fn document() -> String {
         // Retention is deliberately not signature verification.
-        "{\"signer_public_key_hex\":\"00\",\"payload_json\":\"{}\",\"signature_hex\":\"00\"}".to_owned()
+        "{\"signer_public_key_hex\":\"00\",\"payload_json\":\"{}\",\"signature_hex\":\"00\"}"
+            .to_owned()
     }
 
     #[test]
@@ -331,7 +409,10 @@ mod tests {
         let cache = SourceCache::open(&path, &endpoint()).unwrap();
         assert_eq!(cache.candidate(101).unwrap(), expected);
         assert!(cache.candidate(99).is_err());
-        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -373,7 +454,10 @@ mod tests {
             } else {
                 std::fs::write(&path, b"corrupt-source-secret").unwrap();
             }
-            let error = SourceCache::open(&path, &endpoint()).err().unwrap().to_string();
+            let error = SourceCache::open(&path, &endpoint())
+                .err()
+                .unwrap()
+                .to_string();
             assert!(!error.contains("corrupt-source-secret"));
             assert!(!error.contains(path.to_str().unwrap()));
         }
@@ -389,8 +473,11 @@ mod tests {
             std::fs::write(&protected, b"do-not-change").unwrap();
             std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
             let path = dir.path().join("source");
-            if hard_link { std::fs::hard_link(&protected, &path).unwrap(); }
-            else { std::os::unix::fs::symlink(&protected, &path).unwrap(); }
+            if hard_link {
+                std::fs::hard_link(&protected, &path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&protected, &path).unwrap();
+            }
             assert!(SourceCache::open(&path, &endpoint()).is_err());
             assert_eq!(std::fs::read(&protected).unwrap(), b"do-not-change");
         }

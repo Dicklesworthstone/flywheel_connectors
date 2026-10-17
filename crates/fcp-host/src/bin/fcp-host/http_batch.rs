@@ -128,7 +128,9 @@ fn member_outcome(
         OperationResultStatus::Error => Err(result
             .error
             .unwrap_or_else(|| adapter_error("failed batch member omitted its error"))),
-        _ => Err(adapter_error("batch member returned an inconsistent terminal result")),
+        _ => Err(adapter_error(
+            "batch member returned an inconsistent terminal result",
+        )),
     }
 }
 

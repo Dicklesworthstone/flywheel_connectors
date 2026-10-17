@@ -7,8 +7,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use fcp_audit::AuditEntry;
-use fcp_audit::explain::{CausalExplanation, ReplayBundle};
 use fcp_audit::explain::host::explain_host_request;
+use fcp_audit::explain::{CausalExplanation, ReplayBundle};
 use fcp_host::{InvokeAuditSnapshotError, read_invoke_audit_snapshot};
 use serde::Serialize;
 
@@ -29,8 +29,14 @@ enum Format {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "fwc-audit-export", version, about = "Read-only export of a retained host invoke journal")]
-#[command(after_help = "This observes a local file, not a live host RPC or authenticated checkpoint.\nSnapshots fail on incomplete framing; --follow --format jsonl waits for a partial final append.\nThe journal is never repaired or modified. Do not redirect output onto the source journal.\nCaptured records may contain sensitive identities; follow-mode output is a stream of observed prefixes.")]
+#[command(
+    name = "fwc-audit-export",
+    version,
+    about = "Read-only export of a retained host invoke journal"
+)]
+#[command(
+    after_help = "This observes a local file, not a live host RPC or authenticated checkpoint.\nSnapshots fail on incomplete framing; --follow --format jsonl waits for a partial final append.\nThe journal is never repaired or modified. Do not redirect output onto the source journal.\nCaptured records may contain sensitive identities; follow-mode output is a stream of observed prefixes."
+)]
 struct Args {
     /// Existing regular FCPAUD1 journal file; never created by this command.
     #[arg(long)]
@@ -79,12 +85,22 @@ impl ExportError {
 
     const fn message(&self) -> &'static str {
         match self {
-            Self::Usage => "invalid selection or follow options; filters need a zone, explanations need a complete request, and --follow requires --format jsonl with positive limits",
-            Self::Snapshot(_) => "the full sampled journal could not be validated; no export was emitted",
-            Self::Follow(_) => "journal following failed; earlier output is only an observed prefix, not a complete export",
-            Self::FollowIncomplete => "idle deadline reached with an incomplete frame; earlier output is only an observed prefix",
+            Self::Usage => {
+                "invalid selection or follow options; filters need a zone, explanations need a complete request, and --follow requires --format jsonl with positive limits"
+            }
+            Self::Snapshot(_) => {
+                "the full sampled journal could not be validated; no export was emitted"
+            }
+            Self::Follow(_) => {
+                "journal following failed; earlier output is only an observed prefix, not a complete export"
+            }
+            Self::FollowIncomplete => {
+                "idle deadline reached with an incomplete frame; earlier output is only an observed prefix"
+            }
             Self::FollowNoMatch => "idle deadline reached before any records matched the selection",
-            Self::NoMatchingRecords => "no records in the sampled journal match the explicit selection",
+            Self::NoMatchingRecords => {
+                "no records in the sampled journal match the explicit selection"
+            }
             Self::Explanation => "the selected captured request cannot be explained consistently",
             Self::Output => "output could not be completed; discard any partial export",
         }
@@ -150,17 +166,29 @@ fn prepare(args: &Args) -> Result<PreparedExport, ExportError> {
         selected_records: 0,
         filtered: args.zone.is_some() || args.request_id.is_some() || args.from_seq.is_some(),
     };
-    let entries: Vec<_> = snapshot.into_entries().into_iter().filter(|entry| {
-        args.zone.as_deref().is_none_or(|zone| entry.zone_id == zone)
-            && args.request_id.as_deref().is_none_or(|id| entry.operation_id.as_deref() == Some(id))
-            && args.from_seq.is_none_or(|seq| entry.seq >= seq)
-    }).collect();
+    let entries: Vec<_> = snapshot
+        .into_entries()
+        .into_iter()
+        .filter(|entry| {
+            args.zone
+                .as_deref()
+                .is_none_or(|zone| entry.zone_id == zone)
+                && args
+                    .request_id
+                    .as_deref()
+                    .is_none_or(|id| entry.operation_id.as_deref() == Some(id))
+                && args.from_seq.is_none_or(|seq| entry.seq >= seq)
+        })
+        .collect();
     source.selected_records = entries.len();
     if source.filtered && entries.is_empty() {
         return Err(ExportError::NoMatchingRecords);
     }
     // Move the records, rather than cloning an entire retained journal.
-    let bundle = ReplayBundle { audit_entries: entries, ..ReplayBundle::default() };
+    let bundle = ReplayBundle {
+        audit_entries: entries,
+        ..ReplayBundle::default()
+    };
     let explanation = if args.format == Format::Explanation {
         let zone = args.zone.as_deref().ok_or(ExportError::Usage)?;
         let request = args.request_id.as_deref().ok_or(ExportError::Usage)?;
@@ -168,7 +196,11 @@ fn prepare(args: &Args) -> Result<PreparedExport, ExportError> {
     } else {
         None
     };
-    Ok(PreparedExport { source, entries: bundle.audit_entries, explanation })
+    Ok(PreparedExport {
+        source,
+        entries: bundle.audit_entries,
+        explanation,
+    })
 }
 
 #[derive(Serialize)]
@@ -200,7 +232,11 @@ fn json_line(output: &mut impl Write, value: &impl Serialize) -> Result<(), Expo
     output.write_all(b"\n").map_err(|_| ExportError::Output)
 }
 
-fn run(args: &Args, output: &mut impl Write, diagnostics: &mut impl Write) -> Result<(), ExportError> {
+fn run(
+    args: &Args,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+) -> Result<(), ExportError> {
     if args.stream.follow {
         return follow::run(args, output, diagnostics);
     }
@@ -208,12 +244,15 @@ fn run(args: &Args, output: &mut impl Write, diagnostics: &mut impl Write) -> Re
     // record in a filtered-out zone cannot be hidden behind a successful prefix.
     let prepared = prepare(args)?;
     match args.format {
-        Format::Bundle => json_line(output, &BundleOutput {
-            schema_version: SCHEMA,
-            source: &prepared.source,
-            selection: selection(args),
-            audit_entries: &prepared.entries,
-        })?,
+        Format::Bundle => json_line(
+            output,
+            &BundleOutput {
+                schema_version: SCHEMA,
+                source: &prepared.source,
+                selection: selection(args),
+                audit_entries: &prepared.entries,
+            },
+        )?,
         Format::Jsonl => {
             json_line(diagnostics, &prepared.source)?;
             diagnostics.flush().map_err(|_| ExportError::Output)?;
@@ -222,13 +261,19 @@ fn run(args: &Args, output: &mut impl Write, diagnostics: &mut impl Write) -> Re
             }
         }
         Format::Explanation => {
-            let explanation = prepared.explanation.as_ref().ok_or(ExportError::Explanation)?;
-            json_line(output, &ExplanationOutput {
-                schema_version: SCHEMA,
-                source: &prepared.source,
-                selection: selection(args),
-                explanation,
-            })?;
+            let explanation = prepared
+                .explanation
+                .as_ref()
+                .ok_or(ExportError::Explanation)?;
+            json_line(
+                output,
+                &ExplanationOutput {
+                    schema_version: SCHEMA,
+                    source: &prepared.source,
+                    selection: selection(args),
+                    explanation,
+                },
+            )?;
         }
     }
     output.flush().map_err(|_| ExportError::Output)
@@ -261,9 +306,12 @@ mod tests {
 
     fn context(zone: &str, request: &str) -> InvokeAuditContext {
         InvokeAuditContext {
-            zone_id: zone.to_owned(), actor: "agent:export-test".to_owned(),
-            connector_id: "github".to_owned(), operation: "issues.create".to_owned(),
-            operation_id: request.to_owned(), correlation_id: Some("shared-client-correlation".to_owned()),
+            zone_id: zone.to_owned(),
+            actor: "agent:export-test".to_owned(),
+            connector_id: "github".to_owned(),
+            operation: "issues.create".to_owned(),
+            operation_id: request.to_owned(),
+            correlation_id: Some("shared-client-correlation".to_owned()),
             occurred_at: 1_700_000_000,
         }
     }
@@ -272,23 +320,52 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("retained.journal");
         let writer = InvokeAuditChain::open_with_journal(&journal).unwrap();
-        writer.append(&context("z:work", "a"), InvokePhase::PreflightAllow).unwrap();
-        writer.append(&context("z:work", "b"), InvokePhase::PreflightDeny {
-            reason: "untrusted-provider-secret".to_owned(),
-        }).unwrap();
-        writer.append(&context("z:private", "a"), InvokePhase::PreflightAllow).unwrap();
-        writer.append(&context("z:work", "a"), InvokePhase::DispatchResult {
-            receipt_id: None, success: true, duration_ms: 12,
-        }).unwrap();
+        writer
+            .append(&context("z:work", "a"), InvokePhase::PreflightAllow)
+            .unwrap();
+        writer
+            .append(
+                &context("z:work", "b"),
+                InvokePhase::PreflightDeny {
+                    reason: "untrusted-provider-secret".to_owned(),
+                },
+            )
+            .unwrap();
+        writer
+            .append(&context("z:private", "a"), InvokePhase::PreflightAllow)
+            .unwrap();
+        writer
+            .append(
+                &context("z:work", "a"),
+                InvokePhase::DispatchResult {
+                    receipt_id: None,
+                    success: true,
+                    duration_ms: 12,
+                },
+            )
+            .unwrap();
         drop(writer);
-        (directory, Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle, stream: follow::FollowOptions::default() })
+        (
+            directory,
+            Args {
+                journal,
+                zone: None,
+                request_id: None,
+                from_seq: None,
+                format: Format::Bundle,
+                stream: follow::FollowOptions::default(),
+            },
+        )
     }
 
     fn output(args: &Args) -> (String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         run(args, &mut out, &mut err).unwrap();
-        (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     #[test]
@@ -318,7 +395,11 @@ mod tests {
         let (text, _) = output(&args);
         let bundle = parse_replay_bundle(&text).unwrap();
         assert_eq!(bundle.audit_entries.len(), 2);
-        assert!(bundle.audit_entries.iter().all(|entry| entry.zone_id == "z:work" && entry.operation_id.as_deref() == Some("a")));
+        assert!(
+            bundle.audit_entries.iter().all(
+                |entry| entry.zone_id == "z:work" && entry.operation_id.as_deref() == Some("a")
+            )
+        );
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["source"]["filtered"], true);
         assert_eq!(value["source"]["snapshot_records"], 4);
@@ -351,9 +432,13 @@ mod tests {
         args.format = Format::Explanation;
         let (text, _) = output(&args);
         let value: Value = serde_json::from_str(&text).unwrap();
-        let explanation: CausalExplanation = serde_json::from_value(value["explanation"].clone()).unwrap();
+        let explanation: CausalExplanation =
+            serde_json::from_value(value["explanation"].clone()).unwrap();
         assert_eq!(explanation.operation_id, "issues.create");
-        assert_eq!(explanation.host_request.unwrap().outcome, HostRequestOutcome::Denied);
+        assert_eq!(
+            explanation.host_request.unwrap().outcome,
+            HostRequestOutcome::Denied
+        );
         assert!(!text.contains("untrusted-provider-secret"));
     }
 
@@ -361,15 +446,23 @@ mod tests {
     fn contradictory_real_host_phases_refuse_explanation_before_output() {
         let (_directory, mut args) = fixture();
         let writer = InvokeAuditChain::open_with_journal(&args.journal).unwrap();
-        writer.append(&context("z:work", "a"), InvokePhase::PreflightDeny {
-            reason: "preflight_denied".to_owned(),
-        }).unwrap();
+        writer
+            .append(
+                &context("z:work", "a"),
+                InvokePhase::PreflightDeny {
+                    reason: "preflight_denied".to_owned(),
+                },
+            )
+            .unwrap();
         drop(writer);
         args.zone = Some("z:work".to_owned());
         args.request_id = Some("a".to_owned());
         args.format = Format::Explanation;
         let mut out = Vec::new();
-        assert!(matches!(run(&args, &mut out, &mut Vec::new()), Err(ExportError::Explanation)));
+        assert!(matches!(
+            run(&args, &mut out, &mut Vec::new()),
+            Err(ExportError::Explanation)
+        ));
         assert!(out.is_empty());
     }
 
@@ -378,7 +471,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("empty.journal");
         drop(InvokeAuditChain::open_with_journal(&journal).unwrap());
-        let args = Args { journal, zone: None, request_id: None, from_seq: None, format: Format::Bundle, stream: follow::FollowOptions::default() };
+        let args = Args {
+            journal,
+            zone: None,
+            request_id: None,
+            from_seq: None,
+            format: Format::Bundle,
+            stream: follow::FollowOptions::default(),
+        };
         let (text, _) = output(&args);
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["source"]["snapshot_records"], 0);
@@ -392,7 +492,14 @@ mod tests {
         args.from_seq = Some(1);
         let (text, _) = output(&args);
         let bundle = parse_replay_bundle(&text).unwrap();
-        assert_eq!(bundle.audit_entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            bundle
+                .audit_entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["source"]["filtered"], true);
         assert_eq!(value["selection"]["from_seq"], 1);
@@ -403,7 +510,10 @@ mod tests {
         let (_directory, mut args) = fixture();
         args.zone = Some("z:work".to_owned());
         args.request_id = Some("a".to_owned());
-        let mut file = std::fs::OpenOptions::new().append(true).open(&args.journal).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&args.journal)
+            .unwrap();
         file.write_all(&100u32.to_le_bytes()).unwrap();
         file.write_all(b"sensitive-incomplete-payload").unwrap();
         drop(file);
@@ -425,7 +535,10 @@ mod tests {
         args.zone = Some("z:work".to_owned());
         args.request_id = Some("missing".to_owned());
         let mut out = Vec::new();
-        assert!(matches!(run(&args, &mut out, &mut Vec::new()), Err(ExportError::NoMatchingRecords)));
+        assert!(matches!(
+            run(&args, &mut out, &mut Vec::new()),
+            Err(ExportError::NoMatchingRecords)
+        ));
         assert!(out.is_empty());
     }
 
@@ -448,25 +561,49 @@ mod tests {
     fn output_errors_are_failures_not_successful_exports() {
         struct Broken;
         impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::Error::from(io::ErrorKind::BrokenPipe)) }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let (_directory, mut args) = fixture();
-        assert!(matches!(run(&args, &mut Broken, &mut Vec::new()), Err(ExportError::Output)));
+        assert!(matches!(
+            run(&args, &mut Broken, &mut Vec::new()),
+            Err(ExportError::Output)
+        ));
         args.format = Format::Jsonl;
         let mut out = Vec::new();
-        assert!(matches!(run(&args, &mut out, &mut Broken), Err(ExportError::Output)));
+        assert!(matches!(
+            run(&args, &mut out, &mut Broken),
+            Err(ExportError::Output)
+        ));
         assert!(out.is_empty());
     }
 
     #[test]
     fn cli_rejects_ambiguous_selection_and_accepts_documented_invocation() {
-        assert!(Args::try_parse_from(["fwc-audit-export", "--journal", "file", "--request-id", "a"]).is_err());
-        assert!(Args::try_parse_from(["fwc-audit-export", "--journal", "file", "--from-seq", "1"]).is_err());
+        assert!(
+            Args::try_parse_from(["fwc-audit-export", "--journal", "file", "--request-id", "a"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["fwc-audit-export", "--journal", "file", "--from-seq", "1"])
+                .is_err()
+        );
         let args = Args::try_parse_from([
-            "fwc-audit-export", "--journal", "file", "--zone", "z:work",
-            "--request-id", "a", "--format", "explanation",
-        ]).unwrap();
+            "fwc-audit-export",
+            "--journal",
+            "file",
+            "--zone",
+            "z:work",
+            "--request-id",
+            "a",
+            "--format",
+            "explanation",
+        ])
+        .unwrap();
         assert!(validate_selection(&args).is_ok());
     }
 }

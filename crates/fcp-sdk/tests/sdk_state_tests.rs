@@ -497,7 +497,9 @@ fn cursor_store_forwards_explicit_snapshot_signer_after_canonical_commit() {
             writer_public_key: signing_key.verifying_key().to_bytes(),
             signature: Signature::zero(),
         };
-        later_state.sign_with(&signing_key).expect("later state should sign");
+        later_state
+            .sign_with(&signing_key)
+            .expect("later state should sign");
         let later_head = cursor_store
             .commit_cursor(
                 later_cursor.clone(),
@@ -795,7 +797,9 @@ fn cursor_snapshot_recovery_refuses_progress_erasure_without_changing_loaded_fie
             .recover_cursor_from_snapshot(root, fixture.snapshot_id, 3)
             .unwrap_err();
         assert!(
-            error.to_string().contains(&format!("clear the loaded cursor {field}")),
+            error
+                .to_string()
+                .contains(&format!("clear the loaded cursor {field}")),
             "unexpected recovery failure: {error}",
         );
         assert_eq!(reader.head(), Some(fixture.heads[3]));
@@ -899,7 +903,11 @@ fn cursor_snapshot_recovery_rejects_a_signed_fork_of_loaded_history() {
     let error = reader
         .recover_cursor_from_snapshot(fork_root, fixture.snapshot_id, 2)
         .unwrap_err();
-    assert!(error.to_string().contains("conflicts with the loaded cursor history"));
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with the loaded cursor history")
+    );
     assert_eq!(reader.head(), Some(fixture.heads[2]));
     assert_eq!(
         reader
@@ -1002,7 +1010,11 @@ fn cursor_snapshot_recovery_requires_explicit_verified_writer_trust() {
     let error = raw_backend
         .replay_from_snapshot(fixture.roots[3], fixture.snapshot_id, 2)
         .unwrap_err();
-    assert!(error.to_string().contains("verified canonical writer authorization"));
+    assert!(
+        error
+            .to_string()
+            .contains("verified canonical writer authorization")
+    );
 }
 
 #[cfg(feature = "cursor-store-object-store")]

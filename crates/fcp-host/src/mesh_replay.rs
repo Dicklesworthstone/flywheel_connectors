@@ -82,9 +82,11 @@ impl VerifiedMeshReplayNonce {
         scope: [u8; 32],
     ) -> Result<Self, MeshForwardError> {
         let mut nonce = [0_u8; 16];
-        hex::decode_to_slice(&envelope.nonce, &mut nonce).map_err(|_| MeshForwardError::Malformed {
-            field: "nonce",
-            detail: "expected 16 bytes encoded as hex".to_owned(),
+        hex::decode_to_slice(&envelope.nonce, &mut nonce).map_err(|_| {
+            MeshForwardError::Malformed {
+                field: "nonce",
+                detail: "expected 16 bytes encoded as hex".to_owned(),
+            }
         })?;
         Ok(Self {
             scope,
@@ -171,9 +173,14 @@ impl DurableMeshReplayGuard {
             .map_err(|error| startup_io("lock_open", &error))?;
         check_private_regular(&lock).map_err(|error| startup_io("lock_metadata", &error))?;
         lock.try_lock().map_err(|_| {
-            HostError::Internal("mesh replay journal is locked or locking is unsupported".to_owned())
+            HostError::Internal(
+                "mesh replay journal is locked or locking is unsupported".to_owned(),
+            )
         })?;
-        let scope = hash_parts(b"FCP-MESH-REPLAY-NODE-V1", &[local_node.as_str().as_bytes()]);
+        let scope = hash_parts(
+            b"FCP-MESH-REPLAY-NODE-V1",
+            &[local_node.as_str().as_bytes()],
+        );
         let mut file = match private_options().append(true).open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -229,7 +236,10 @@ impl DurableMeshReplayGuard {
         let mut entries = BTreeMap::<ReplayKey, Entry>::new();
         for bytes in bytes[HEADER_LEN..].chunks_exact(RECORD_LEN) {
             if bytes[RECORD_BODY_LEN..]
-                != hash_parts(b"FCP-MESH-REPLAY-RECORD-V1", &[&scope, &bytes[..RECORD_BODY_LEN]])
+                != hash_parts(
+                    b"FCP-MESH-REPLAY-RECORD-V1",
+                    &[&scope, &bytes[..RECORD_BODY_LEN]],
+                )
             {
                 return Err(malformed());
             }
@@ -241,7 +251,9 @@ impl DurableMeshReplayGuard {
             };
             if entry.expires_at_ms < entry.observed_at_ms
                 || entry.expires_at_ms
-                    > entry.observed_at_ms.saturating_add(window_ms.saturating_mul(2))
+                    > entry
+                        .observed_at_ms
+                        .saturating_add(window_ms.saturating_mul(2))
                 || entries
                     .get(&key)
                     .is_some_and(|previous| previous.expires_at_ms >= entry.observed_at_ms)
@@ -421,7 +433,10 @@ fn encode_record(scope: &[u8; 32], key: &ReplayKey, entry: Entry) -> [u8; RECORD
     bytes[..32].copy_from_slice(key);
     bytes[32..40].copy_from_slice(&entry.expires_at_ms.to_le_bytes());
     bytes[40..48].copy_from_slice(&entry.observed_at_ms.to_le_bytes());
-    let checksum = hash_parts(b"FCP-MESH-REPLAY-RECORD-V1", &[scope, &bytes[..RECORD_BODY_LEN]]);
+    let checksum = hash_parts(
+        b"FCP-MESH-REPLAY-RECORD-V1",
+        &[scope, &bytes[..RECORD_BODY_LEN]],
+    );
     bytes[RECORD_BODY_LEN..].copy_from_slice(&checksum);
     bytes
 }
@@ -523,7 +538,11 @@ mod tests {
             "origin",
             request.nonce.as_str(),
         ] {
-            assert!(!bytes.windows(secret.len()).any(|window| window == secret.as_bytes()));
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes())
+            );
         }
         let mut reopened = open(&path, 2, 1002);
         assert!(matches!(
@@ -537,7 +556,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal");
         let request = envelope(1, 1100);
-        open(&path, 1, 1000).record_authenticated(&request, 1000).unwrap();
+        open(&path, 1, 1000)
+            .record_authenticated(&request, 1000)
+            .unwrap();
         let mut guard = open(&path, 1, 1150);
         assert!(matches!(
             guard.record_authenticated(&request, 1200),
@@ -547,7 +568,9 @@ mod tests {
             guard.record_authenticated(&request, 1201),
             Err(MeshForwardError::Stale { .. })
         ));
-        guard.record_authenticated(&envelope(2, 1201), 1201).unwrap();
+        guard
+            .record_authenticated(&envelope(2, 1201), 1201)
+            .unwrap();
     }
 
     #[test]
@@ -596,7 +619,9 @@ mod tests {
         guard.record_authenticated(&future, 1000).unwrap();
         for index in 1_u8..20 {
             let now = 1000 + u64::from(index) * 10;
-            guard.record_authenticated(&envelope(index, now - 100), now).unwrap();
+            guard
+                .record_authenticated(&envelope(index, now - 100), now)
+                .unwrap();
             assert!(
                 std::fs::metadata(&path).unwrap().len()
                     <= u64::try_from(HEADER_LEN + 4 * RECORD_LEN).unwrap()
@@ -617,7 +642,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal");
         let mut guard = open(&path, 1, 1000);
-        guard.record_authenticated(&envelope(1, 1000), 1000).unwrap();
+        guard
+            .record_authenticated(&envelope(1, 1000), 1000)
+            .unwrap();
         guard.expire(2000);
         guard.high_water_ms = 2000;
         guard.compact().unwrap();
@@ -632,9 +659,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal");
         let mut guard = open(&path, 2, 1000);
-        guard.record_authenticated(&envelope(1, 1000), 1000).unwrap();
+        guard
+            .record_authenticated(&envelope(1, 1000), 1000)
+            .unwrap();
         assert!(guard.record_authenticated(&envelope(2, 999), 999).is_err());
-        guard.record_authenticated(&envelope(2, 1001), 1001).unwrap();
+        guard
+            .record_authenticated(&envelope(2, 1001), 1001)
+            .unwrap();
     }
 
     #[test]
@@ -643,7 +674,8 @@ mod tests {
         let path = dir.path().join("journal");
         drop(open(&path, 2, 1000));
         assert!(
-            DurableMeshReplayGuard::open(&path, &TailscaleNodeId::new("other"), 100, 2, 1000).is_err()
+            DurableMeshReplayGuard::open(&path, &TailscaleNodeId::new("other"), 100, 2, 1000)
+                .is_err()
         );
         assert!(DurableMeshReplayGuard::open(&path, &node(), 101, 2, 1000).is_err());
         let mut bytes = std::fs::read(&path).unwrap();
@@ -674,7 +706,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal");
         let mut guard = open(&path, 2, 1000);
-        guard.record_authenticated(&envelope(1, 1000), 1000).unwrap();
+        guard
+            .record_authenticated(&envelope(1, 1000), 1000)
+            .unwrap();
         guard.compact().unwrap();
         drop(guard);
         let valid = std::fs::read(&path).unwrap();
@@ -703,12 +737,23 @@ mod tests {
         let path = dir.path().join("journal");
         let mut guard = open(&path, 2, 1000);
         guard.file = File::open(&path).unwrap(); // deterministic write failure
-        assert!(guard.record_authenticated(&envelope(1, 1000), 1000).is_err());
+        assert!(
+            guard
+                .record_authenticated(&envelope(1, 1000), 1000)
+                .is_err()
+        );
         assert!(guard.io_failed);
         assert!(guard.entries.is_empty());
         guard.file = private_options().append(true).open(&path).unwrap();
-        assert!(guard.record_authenticated(&envelope(2, 1000), 1000).is_err());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), u64::try_from(HEADER_LEN).unwrap());
+        assert!(
+            guard
+                .record_authenticated(&envelope(2, 1000), 1000)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN).unwrap()
+        );
     }
 
     #[test]
@@ -742,7 +787,10 @@ mod tests {
             guard.accept(&forged, &directory, 1001),
             Err(MeshForwardError::SignatureInvalid { .. })
         ));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), u64::try_from(HEADER_LEN).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN).unwrap()
+        );
         guard.accept(&valid, &directory, 1001).unwrap();
         drop(guard);
         assert!(matches!(
@@ -760,7 +808,10 @@ mod tests {
         request.nonce = "bad".to_owned();
         assert!(guard.record_authenticated(&request, 1000).is_err());
         assert!(guard.record_authenticated(&envelope(2, 899), 1000).is_err());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), u64::try_from(HEADER_LEN).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            u64::try_from(HEADER_LEN).unwrap()
+        );
     }
 
     #[test]

@@ -17,9 +17,9 @@ use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
-    BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation,
-    BatchOperationError, BatchScheduleReport, BatchSchedulerMode, BatchStatus,
-    ExecutionPlan, HostResult, OperationResult, OperationResultStatus,
+    BatchExecutor, BatchInvokeRequest, BatchInvokeResponse, BatchOperation, BatchOperationError,
+    BatchScheduleReport, BatchSchedulerMode, BatchStatus, ExecutionPlan, HostResult,
+    OperationResult, OperationResultStatus,
 };
 
 // A timer need not represent the entire caller-supplied u64 millisecond budget.
@@ -187,7 +187,8 @@ fn delivery_remaining(
     context: Option<&ExecutionContext>,
 ) -> Duration {
     let remaining = timeout.saturating_sub(started_at.elapsed());
-    context.and_then(ExecutionContext::remaining_budget)
+    context
+        .and_then(ExecutionContext::remaining_budget)
         .map_or(remaining, |inherited| remaining.min(inherited))
 }
 
@@ -252,9 +253,14 @@ impl BatchExecutor {
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
     {
-        self.execute_async_inner(request, None, handler, None::<ImmediateSink<SilentResultSink>>)
-            .await
-            .map(|result| result.response)
+        self.execute_async_inner(
+            request,
+            None,
+            handler,
+            None::<ImmediateSink<SilentResultSink>>,
+        )
+        .await
+        .map(|result| result.response)
     }
 
     /// Execute a batch under an existing FCP cancellation/deadline context.
@@ -291,9 +297,14 @@ impl BatchExecutor {
         F: FnMut(&'a BatchOperation) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, BatchOperationError>>,
     {
-        self.execute_async_inner(request, Some(context), handler, None::<ImmediateSink<SilentResultSink>>)
-            .await
-            .map(|result| result.response)
+        self.execute_async_inner(
+            request,
+            Some(context),
+            handler,
+            None::<ImmediateSink<SilentResultSink>>,
+        )
+        .await
+        .map(|result| result.response)
     }
 
     /// Deliver results as operations settle, without waiting for unrelated work.
@@ -528,7 +539,12 @@ impl DependencyQueue {
             ranks: vec![0; count],
             ready: BTreeSet::new(),
         };
-        for (rank, id) in plan.tiers.iter().flat_map(|tier| &tier.operation_ids).enumerate() {
+        for (rank, id) in plan
+            .tiers
+            .iter()
+            .flat_map(|tier| &tier.operation_ids)
+            .enumerate()
+        {
             queue.ranks[indices[id.as_str()]] = rank;
         }
         for (index, operation) in request.operations.iter().enumerate() {
@@ -587,7 +603,8 @@ async fn cooperate(steps: &mut u8) {
             cx.waker().wake_by_ref();
             Poll::Pending
         }
-    }).await;
+    })
+    .await;
 }
 
 struct BatchRun<'a> {
@@ -606,8 +623,12 @@ impl<'a> BatchRun<'a> {
             request,
             started_at,
             timeout: Duration::from_millis(request.options.timeout_ms),
-            indices: request.operations.iter().enumerate()
-                .map(|(index, operation)| (operation.id.as_str(), index)).collect(),
+            indices: request
+                .operations
+                .iter()
+                .enumerate()
+                .map(|(index, operation)| (operation.id.as_str(), index))
+                .collect(),
             results: vec![None; request.operations.len()],
             admitted_at: vec![None; request.operations.len()],
             halt: None,
@@ -616,7 +637,8 @@ impl<'a> BatchRun<'a> {
 
     fn remaining(&self, context: Option<&ExecutionContext>) -> Duration {
         let batch_remaining = self.timeout.saturating_sub(self.started_at.elapsed());
-        context.and_then(ExecutionContext::remaining_budget)
+        context
+            .and_then(ExecutionContext::remaining_budget)
             .map_or(batch_remaining, |remaining| remaining.min(batch_remaining))
     }
 
@@ -632,12 +654,16 @@ impl<'a> BatchRun<'a> {
     }
 
     const fn interrupted(&self) -> bool {
-        matches!(self.halt, Some(Halt::Timeout | Halt::Cancelled | Halt::RuntimeFailure))
+        matches!(
+            self.halt,
+            Some(Halt::Timeout | Halt::Cancelled | Halt::RuntimeFailure)
+        )
     }
 
     fn dependencies_succeeded(&self, operation: &BatchOperation) -> bool {
         operation.depends_on.iter().all(|id| {
-            self.results[self.indices[id.as_str()]].as_ref()
+            self.results[self.indices[id.as_str()]]
+                .as_ref()
                 .is_some_and(|result| result.status == OperationResultStatus::Success)
         })
     }
@@ -678,14 +704,15 @@ impl<'a> BatchRun<'a> {
         index: usize,
         delivery: &mut ResultDelivery<S>,
         context: Option<&ExecutionContext>,
-    )
-    where
+    ) where
         S: ResultSink,
     {
         let Some(result) = &self.results[index] else {
             return;
         };
-        let delivered = delivery.deliver(result, self.started_at, self.timeout, context).await;
+        let delivered = delivery
+            .deliver(result, self.started_at, self.timeout, context)
+            .await;
         if S::WAIT_FOR_CAPACITY {
             self.check_limits(context);
         }
@@ -706,10 +733,22 @@ impl<'a> BatchRun<'a> {
     {
         let (skip_code, skip_message) = match self.halt {
             Some(Halt::Timeout) => ("BATCH_TIMEOUT", "batch timeout exceeded before admission"),
-            Some(Halt::Cancelled) => ("BATCH_CANCELLED", "batch context cancelled before admission"),
-            Some(Halt::RuntimeFailure) => ("BATCH_RUNTIME_ERROR", "batch runtime failed before admission"),
-            Some(Halt::HandlerPanic) => ("BATCH_PANICKED", "batch handler panicked before this operation was admitted"),
-            Some(Halt::DeliveryFailure) => ("BATCH_RESULT_DELIVERY_FAILED", "batch result sink failed before this operation was admitted"),
+            Some(Halt::Cancelled) => (
+                "BATCH_CANCELLED",
+                "batch context cancelled before admission",
+            ),
+            Some(Halt::RuntimeFailure) => (
+                "BATCH_RUNTIME_ERROR",
+                "batch runtime failed before admission",
+            ),
+            Some(Halt::HandlerPanic) => (
+                "BATCH_PANICKED",
+                "batch handler panicked before this operation was admitted",
+            ),
+            Some(Halt::DeliveryFailure) => (
+                "BATCH_RESULT_DELIVERY_FAILED",
+                "batch result sink failed before this operation was admitted",
+            ),
             _ => ("BATCH_ABORTED", "batch stopped before admission"),
         };
         let mut results = Vec::with_capacity(self.request.operations.len());
@@ -735,7 +774,9 @@ impl<'a> BatchRun<'a> {
             } else {
                 skipped(operation, skip_code, skip_message)
             };
-            let delivered = delivery.deliver(&result, self.started_at, self.timeout, context).await;
+            let delivered = delivery
+                .deliver(&result, self.started_at, self.timeout, context)
+                .await;
             if S::WAIT_FOR_CAPACITY {
                 self.check_limits(context);
             }
@@ -744,8 +785,14 @@ impl<'a> BatchRun<'a> {
             }
             results.push(result);
         }
-        let completed = results.iter().filter(|r| r.status == OperationResultStatus::Success).count();
-        let failed = results.iter().filter(|r| r.status == OperationResultStatus::Error).count();
+        let completed = results
+            .iter()
+            .filter(|r| r.status == OperationResultStatus::Success)
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| r.status == OperationResultStatus::Error)
+            .count();
         let skipped = results.len() - completed - failed;
         let status = if self.halt.is_some() {
             BatchStatus::Aborted
@@ -757,7 +804,11 @@ impl<'a> BatchRun<'a> {
             BatchStatus::PartialSuccess
         };
         BatchInvokeResponse {
-            status, completed, failed, skipped, results,
+            status,
+            completed,
+            failed,
+            skipped,
+            results,
             total_duration_ms: elapsed_millis(self.started_at),
             schedule_report,
         }
@@ -769,7 +820,11 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 }
 
 fn operation_error(code: &str, message: &str) -> BatchOperationError {
-    BatchOperationError { code: code.to_owned(), message: message.to_owned(), retry_after_ms: None }
+    BatchOperationError {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        retry_after_ms: None,
+    }
 }
 
 fn skipped(operation: &BatchOperation, code: &str, message: &str) -> OperationResult {
@@ -817,9 +872,11 @@ mod send_tests {
     async fn callback_free_batch_is_send() {
         let executor = BatchExecutor::new();
         let request = request();
-        let response = require_send(executor.execute_async(&request, |operation| {
-            ready(Ok(operation.input.clone()))
-        })).await.unwrap();
+        let response = require_send(
+            executor.execute_async(&request, |operation| ready(Ok(operation.input.clone()))),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.completed, 1);
     }
 
@@ -829,8 +886,12 @@ mod send_tests {
         let request = request();
         let context = ExecutionContext::background();
         let response = require_send(executor.execute_async_with_context(
-            &request, &context, |operation| ready(Ok(operation.input.clone())),
-        )).await.unwrap();
+            &request,
+            &context,
+            |operation| ready(Ok(operation.input.clone())),
+        ))
+        .await
+        .unwrap();
         assert_eq!(response.completed, 1);
     }
 
@@ -840,12 +901,16 @@ mod send_tests {
         let request = request();
         let observed = AtomicUsize::new(0);
         let response = require_send(executor.execute_async_streaming(
-            &request, None, |operation| ready(Ok(operation.input.clone())),
+            &request,
+            None,
+            |operation| ready(Ok(operation.input.clone())),
             |_| {
                 observed.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             },
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         assert_eq!(response.response.completed, 1);
         assert_eq!(response.acknowledged_results, 1);
         assert_eq!(observed.load(Ordering::Relaxed), 1);
@@ -856,10 +921,18 @@ mod send_tests {
         let executor = BatchExecutor::new();
         let request = request();
         let observed = Cell::new(0);
-        let response = executor.execute_async_streaming(
-            &request, None, |operation| ready(Ok(operation.input.clone())),
-            |_| { observed.set(observed.get() + 1); Ok(()) },
-        ).await.unwrap();
+        let response = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |operation| ready(Ok(operation.input.clone())),
+                |_| {
+                    observed.set(observed.get() + 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(response.delivery_status, BatchDeliveryStatus::Complete);
         assert_eq!(observed.get(), 1);
     }
@@ -893,7 +966,8 @@ mod waiting_delivery_tests {
                     *self.waker.borrow_mut() = Some(cx.waker().clone());
                     Poll::Pending
                 }
-            }).await;
+            })
+            .await;
         }
 
         fn release(&self) {
@@ -914,14 +988,17 @@ mod waiting_delivery_tests {
 
     fn request(parallelism: u32) -> BatchInvokeRequest {
         BatchInvokeRequest {
-            operations: ["a", "b", "c"].into_iter().map(|id| BatchOperation {
-                id: id.to_owned(),
-                tool: "test.echo".to_owned(),
-                input: json!({"id": id}),
-                depends_on: vec![],
-                zone: None,
-                scheduler: BatchScheduleHint::default(),
-            }).collect(),
+            operations: ["a", "b", "c"]
+                .into_iter()
+                .map(|id| BatchOperation {
+                    id: id.to_owned(),
+                    tool: "test.echo".to_owned(),
+                    input: json!({"id": id}),
+                    depends_on: vec![],
+                    zone: None,
+                    scheduler: BatchScheduleHint::default(),
+                })
+                .collect(),
             options: BatchOptions {
                 max_parallelism: parallelism,
                 stop_on_first_error: false,
@@ -942,12 +1019,16 @@ mod waiting_delivery_tests {
         // must determine whether the batch can move between runtime workers.
         let calls = Cell::new(0);
         let response = require_send(executor.execute_async_streaming_wait(
-            &request, None, |op| ready(Ok(op.input.clone())),
+            &request,
+            None,
+            |op| ready(Ok(op.input.clone())),
             move |_| {
                 calls.set(calls.get() + 1);
                 ready(Ok(()))
             },
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         assert_eq!(response.delivery_status, BatchDeliveryStatus::Complete);
         assert_eq!(response.acknowledged_results, 3);
     }
@@ -960,7 +1041,8 @@ mod waiting_delivery_tests {
         let admitted = RefCell::new(Vec::new());
         let delivered = RefCell::new(Vec::new());
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, None,
+            &request,
+            None,
             |op| {
                 admitted.borrow_mut().push(op.id.clone());
                 ready(Ok(op.input.clone()))
@@ -968,7 +1050,10 @@ mod waiting_delivery_tests {
             |result| {
                 delivered.borrow_mut().push(result.id.clone());
                 let gate = Rc::clone(&gate);
-                async move { gate.wait().await; Ok(()) }
+                async move {
+                    gate.wait().await;
+                    Ok(())
+                }
             },
         ));
         assert!(poll!(batch.as_mut()).is_pending());
@@ -992,7 +1077,8 @@ mod waiting_delivery_tests {
         let (sender, mut receiver) = fcp_async_core::channel::bounded("batch-results", 1);
         let admitted = RefCell::new(Vec::new());
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, None,
+            &request,
+            None,
             |op| {
                 admitted.borrow_mut().push(op.id.clone());
                 ready(Ok(op.input.clone()))
@@ -1000,9 +1086,10 @@ mod waiting_delivery_tests {
             |result| {
                 let sender = sender.clone();
                 async move {
-                    sender.send(result).await.map_err(|_| {
-                        operation_error("CLOSED", "result receiver closed")
-                    })
+                    sender
+                        .send(result)
+                        .await
+                        .map_err(|_| operation_error("CLOSED", "result receiver closed"))
                 }
             },
         ));
@@ -1019,8 +1106,15 @@ mod waiting_delivery_tests {
         assert_eq!(result.delivery_status, BatchDeliveryStatus::Complete);
         assert_eq!(result.acknowledged_results, 3);
         assert_eq!(result.response.status, BatchStatus::Success);
-        assert_eq!(result.response.results.iter().map(|item| item.id.as_str())
-            .collect::<Vec<_>>(), ["c", "b", "a"]);
+        assert_eq!(
+            result
+                .response
+                .results
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "b", "a"]
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -1029,13 +1123,16 @@ mod waiting_delivery_tests {
         let request = request(1);
         let (sender, receiver) = fcp_async_core::channel::bounded("batch-disconnect", 1);
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, None, |op| ready(Ok(op.input.clone())),
+            &request,
+            None,
+            |op| ready(Ok(op.input.clone())),
             |result| {
                 let sender = sender.clone();
                 async move {
-                    sender.send(result).await.map_err(|_| {
-                        operation_error("CLOSED", "private receiver error")
-                    })
+                    sender
+                        .send(result)
+                        .await
+                        .map_err(|_| operation_error("CLOSED", "private receiver error"))
                 }
             },
         ));
@@ -1048,7 +1145,11 @@ mod waiting_delivery_tests {
         assert_eq!(result.response.failed, 0);
         assert_eq!(result.response.skipped, 1);
         assert_eq!(result.response.results[1].output, Some(json!({"id": "b"})));
-        assert!(!serde_json::to_string(&result).unwrap().contains("private receiver"));
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private receiver")
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -1059,9 +1160,12 @@ mod waiting_delivery_tests {
         let calls = Cell::new(0);
         let drops = Cell::new(0);
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, Some(&context),
+            &request,
+            Some(&context),
             |op| async move {
-                if op.id != "a" { pending::<()>().await; }
+                if op.id != "a" {
+                    pending::<()>().await;
+                }
                 Ok(op.input.clone())
             },
             |_| {
@@ -1081,12 +1185,22 @@ mod waiting_delivery_tests {
         assert_eq!(result.acknowledged_results, 0);
         assert_eq!(calls.get(), 1);
         assert_eq!(drops.get(), 1);
-        assert_eq!((result.response.completed, result.response.failed, result.response.skipped), (1, 1, 1));
+        assert_eq!(
+            (
+                result.response.completed,
+                result.response.failed,
+                result.response.skipped
+            ),
+            (1, 1, 1)
+        );
         assert_eq!(result.response.results[0].output, Some(json!({"id": "a"})));
         let uncertain = result.response.results[1].error.as_ref().unwrap();
         assert_eq!(uncertain.code, "BATCH_OUTCOME_UNKNOWN");
         assert_eq!(uncertain.retry_after_ms, None);
-        assert_eq!(result.response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(
+            result.response.results[2].error.as_ref().unwrap().code,
+            "BATCH_CANCELLED"
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -1103,16 +1217,27 @@ mod waiting_delivery_tests {
             let result = fcp_async_core::time::timeout(
                 Duration::from_secs(5),
                 executor.execute_async_streaming_wait(
-                    &request, Some(&context), |op| ready(Ok(op.input.clone())),
+                    &request,
+                    Some(&context),
+                    |op| ready(Ok(op.input.clone())),
                     |_| pending::<Result<(), BatchOperationError>>(),
                 ),
-            ).await.expect("delivery must not renew its budget").unwrap();
+            )
+            .await
+            .expect("delivery must not renew its budget")
+            .unwrap();
             assert_eq!(result.delivery_status, BatchDeliveryStatus::Interrupted);
             assert_eq!(result.response.status, BatchStatus::Aborted);
             assert_eq!(result.response.completed, 1);
             assert_eq!(result.response.skipped, 2);
-            assert_eq!(result.response.failed, 0, "delivery timeout is not provider failure");
-            assert_eq!(result.response.results[1].error.as_ref().unwrap().code, "BATCH_TIMEOUT");
+            assert_eq!(
+                result.response.failed, 0,
+                "delivery timeout is not provider failure"
+            );
+            assert_eq!(
+                result.response.results[1].error.as_ref().unwrap().code,
+                "BATCH_TIMEOUT"
+            );
         }
     }
 
@@ -1129,7 +1254,11 @@ mod waiting_delivery_tests {
             status: BatchDeliveryStatus::Complete,
         };
         let result = skipped(&request.operations[0], "TEST", "not dispatched");
-        assert!(!delivery.deliver(&result, Instant::now(), Duration::ZERO, None).await);
+        assert!(
+            !delivery
+                .deliver(&result, Instant::now(), Duration::ZERO, None)
+                .await
+        );
         assert_eq!(calls.get(), 0);
         assert_eq!(delivery.status, BatchDeliveryStatus::Interrupted);
     }
@@ -1141,7 +1270,9 @@ mod waiting_delivery_tests {
         let gate = Gate::default();
         let calls = Cell::new(0);
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, None, |op| ready(Ok(op.input.clone())),
+            &request,
+            None,
+            |op| ready(Ok(op.input.clone())),
             |_| {
                 calls.set(calls.get() + 1);
                 let gate = &gate;
@@ -1157,9 +1288,23 @@ mod waiting_delivery_tests {
         assert_eq!(result.delivery_status, BatchDeliveryStatus::Rejected);
         assert_eq!(calls.get(), 1);
         assert_eq!(result.acknowledged_results, 0);
-        assert_eq!((result.response.completed, result.response.failed, result.response.skipped), (2, 0, 1));
-        assert_eq!(result.response.results[2].error.as_ref().unwrap().code, "BATCH_RESULT_DELIVERY_FAILED");
-        assert!(!serde_json::to_string(&result).unwrap().contains("private sink"));
+        assert_eq!(
+            (
+                result.response.completed,
+                result.response.failed,
+                result.response.skipped
+            ),
+            (2, 0, 1)
+        );
+        assert_eq!(
+            result.response.results[2].error.as_ref().unwrap().code,
+            "BATCH_RESULT_DELIVERY_FAILED"
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private sink")
+        );
     }
 
     #[cfg(panic = "unwind")]
@@ -1169,28 +1314,37 @@ mod waiting_delivery_tests {
             let executor = BatchExecutor::new();
             let request = request(2);
             let calls = Cell::new(0);
-            let result = executor.execute_async_streaming_wait(
-                &request, None, |op| ready(Ok(op.input.clone())),
-                |_| {
-                    calls.set(calls.get() + 1);
-                    assert!(!factory_panics, "private delivery factory panic");
-                    async {
-                        // Yield once to exercise panic containment after an
-                        // earlier Pending result, not only on first poll.
-                        let mut steps = 63;
-                        cooperate(&mut steps).await;
-                        panic!("private delivery poll panic");
-                        #[allow(unreachable_code)]
-                        Ok::<(), BatchOperationError>(())
-                    }
-                },
-            ).await.unwrap();
+            let result = executor
+                .execute_async_streaming_wait(
+                    &request,
+                    None,
+                    |op| ready(Ok(op.input.clone())),
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        assert!(!factory_panics, "private delivery factory panic");
+                        async {
+                            // Yield once to exercise panic containment after an
+                            // earlier Pending result, not only on first poll.
+                            let mut steps = 63;
+                            cooperate(&mut steps).await;
+                            panic!("private delivery poll panic");
+                            #[allow(unreachable_code)]
+                            Ok::<(), BatchOperationError>(())
+                        }
+                    },
+                )
+                .await
+                .unwrap();
             assert_eq!(result.delivery_status, BatchDeliveryStatus::Panicked);
             assert_eq!(result.acknowledged_results, 0);
             assert_eq!(calls.get(), 1);
             assert_eq!(result.response.completed, 2);
             assert_eq!(result.response.skipped, 1);
-            assert!(!serde_json::to_string(&result).unwrap().contains("private delivery"));
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("private delivery")
+            );
         }
     }
 
@@ -1200,21 +1354,43 @@ mod waiting_delivery_tests {
         let mut request = request(1);
         request.operations[0].depends_on.push("missing".to_owned());
         let calls = Cell::new(0);
-        assert!(executor.execute_async_streaming_wait(
-            &request, None,
-            |_| { calls.set(calls.get() + 1); ready(Ok(json!(null))) },
-            |_| { calls.set(calls.get() + 1); ready(Ok(())) },
-        ).await.is_err());
+        assert!(
+            executor
+                .execute_async_streaming_wait(
+                    &request,
+                    None,
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        ready(Ok(json!(null)))
+                    },
+                    |_| {
+                        calls.set(calls.get() + 1);
+                        ready(Ok(()))
+                    },
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(calls.get(), 0);
 
         request.operations[0].depends_on.clear();
         let context = ExecutionContext::background();
         context.cancel();
-        let result = executor.execute_async_streaming_wait(
-            &request, Some(&context),
-            |_| { calls.set(calls.get() + 1); ready(Ok(json!(null))) },
-            |_| { calls.set(calls.get() + 1); ready(Ok(())) },
-        ).await.unwrap();
+        let result = executor
+            .execute_async_streaming_wait(
+                &request,
+                Some(&context),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Ok(json!(null)))
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(result.response.skipped, 3);
         assert_eq!(result.delivery_status, BatchDeliveryStatus::Interrupted);
         assert_eq!(result.acknowledged_results, 0);
@@ -1229,17 +1405,21 @@ mod waiting_delivery_tests {
         request.operations[2].depends_on.push("b".to_owned());
         let calls = Cell::new(0);
         let delivered = RefCell::new(Vec::new());
-        let result = executor.execute_async_streaming_wait(
-            &request, None,
-            |_| {
-                calls.set(calls.get() + 1);
-                ready(Err(operation_error("REFUSED", "provider refused")))
-            },
-            |result| {
-                delivered.borrow_mut().push((result.id, result.status));
-                ready(Ok(()))
-            },
-        ).await.unwrap();
+        let result = executor
+            .execute_async_streaming_wait(
+                &request,
+                None,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Err(operation_error("REFUSED", "provider refused")))
+                },
+                |result| {
+                    delivered.borrow_mut().push((result.id, result.status));
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(result.acknowledged_results, 3);
         assert_eq!(result.delivery_status, BatchDeliveryStatus::Complete);
@@ -1254,7 +1434,9 @@ mod waiting_delivery_tests {
         let request = request(1);
         let drops = Cell::new(0);
         let mut batch = Box::pin(executor.execute_async_streaming_wait(
-            &request, None, |op| ready(Ok(op.input.clone())),
+            &request,
+            None,
+            |op| ready(Ok(op.input.clone())),
             |_| {
                 let guard = DropCount(&drops);
                 async move {
@@ -1274,14 +1456,22 @@ mod waiting_delivery_tests {
     async fn sink_owns_a_copy_and_cannot_rewrite_execution_evidence() {
         let executor = BatchExecutor::new();
         let request = request(1);
-        let result = executor.execute_async_streaming_wait(
-            &request, None, |op| ready(Ok(op.input.clone())),
-            |mut delivered| async move {
-                delivered.output = Some(json!({"tampered": true}));
-                delivered.status = OperationResultStatus::Error;
-                Ok(())
-            },
-        ).await.unwrap();
+        let result = executor
+            .execute_async_streaming_wait(
+                &request,
+                None,
+                |op| ready(Ok(op.input.clone())),
+                |delivered| async move {
+                    let mut delivered = delivered;
+                    delivered.output = Some(json!({"tampered": true}));
+                    delivered.status = OperationResultStatus::Error;
+                    assert_eq!(delivered.output, Some(json!({"tampered": true})));
+                    assert_eq!(delivered.status, OperationResultStatus::Error);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(result.response.completed, 3);
         assert_eq!(result.response.results[0].output, Some(json!({"id": "a"})));
         assert_eq!(result.acknowledged_results, 3);
@@ -1332,49 +1522,84 @@ mod panic_tests {
     #[fcp_async_core::runtime::test]
     async fn factory_panic_stops_admission_and_drains_previously_created_futures() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
+        let request = request(vec![
+            operation("a", &[]),
+            operation("b", &[]),
+            operation("c", &[]),
+        ]);
         let calls = RefCell::new(Vec::new());
-        let response = executor.execute_async(&request, |operation| {
-            calls.borrow_mut().push(operation.id.clone());
-            assert_ne!(operation.id, "b", "private factory panic payload");
-            ready(Ok(operation.input.clone()))
-        }).await.unwrap();
+        let response = executor
+            .execute_async(&request, |operation| {
+                calls.borrow_mut().push(operation.id.clone());
+                assert_ne!(operation.id, "b", "private factory panic payload");
+                ready(Ok(operation.input.clone()))
+            })
+            .await
+            .unwrap();
 
         assert_eq!(*calls.borrow(), ["a", "b"]);
         assert_eq!(response.status, BatchStatus::Aborted);
-        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (1, 1, 1)
+        );
         assert_eq!(response.results[0].output, Some(json!({ "id": "a" })));
         assert_unknown(&response.results[1]);
-        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_PANICKED");
-        assert!(!serde_json::to_string(&response).unwrap().contains("private factory"));
+        assert_eq!(
+            response.results[2].error.as_ref().unwrap().code,
+            "BATCH_PANICKED"
+        );
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("private factory")
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn poll_panic_preserves_other_results_without_releasing_dependents() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &["a"])]);
+        let request = request(vec![
+            operation("a", &[]),
+            operation("b", &[]),
+            operation("c", &["a"]),
+        ]);
         let calls = RefCell::new(Vec::new());
-        let response = executor.execute_async(&request, |operation| {
-            calls.borrow_mut().push(operation.id.clone());
-            async move {
-                assert_ne!(operation.id, "a", "private poll panic payload");
-                Ok(operation.input.clone())
-            }
-        }).await.unwrap();
+        let response = executor
+            .execute_async(&request, |operation| {
+                calls.borrow_mut().push(operation.id.clone());
+                async move {
+                    assert_ne!(operation.id, "a", "private poll panic payload");
+                    Ok(operation.input.clone())
+                }
+            })
+            .await
+            .unwrap();
 
         assert_eq!(*calls.borrow(), ["a", "b"]);
         assert_eq!(response.status, BatchStatus::Aborted);
-        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (1, 1, 1)
+        );
         assert_unknown(&response.results[0]);
         assert_eq!(response.results[1].output, Some(json!({ "id": "b" })));
         assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
-        assert!(!serde_json::to_string(&response).unwrap().contains("private poll"));
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("private poll")
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn panic_after_pending_keeps_already_observed_success() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &["a"])]);
+        let request = request(vec![
+            operation("a", &[]),
+            operation("b", &[]),
+            operation("c", &["a"]),
+        ]);
         let release = Cell::new(false);
         let mut batch = Box::pin(executor.execute_async(&request, |operation| {
             let release = &release;
@@ -1387,7 +1612,8 @@ mod panic_tests {
                             cx.waker().wake_by_ref();
                             Poll::Pending
                         }
-                    }).await;
+                    })
+                    .await;
                     std::panic::panic_any(17_u8);
                 }
                 Ok(operation.input.clone())
@@ -1399,45 +1625,70 @@ mod panic_tests {
         assert_unknown(&response.results[0]);
         assert_eq!(response.results[1].status, OperationResultStatus::Success);
         assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
-        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (1, 1, 1)
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn cancellation_during_panic_drain_preserves_unknown_outcomes() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
+        let request = request(vec![
+            operation("a", &[]),
+            operation("b", &[]),
+            operation("c", &[]),
+        ]);
         let context = ExecutionContext::background();
-        let mut batch = Box::pin(executor.execute_async_with_context(&request, &context, |operation| {
-            async move {
+        let mut batch = Box::pin(executor.execute_async_with_context(
+            &request,
+            &context,
+            |operation| async move {
                 assert_ne!(operation.id, "a", "handler failed");
                 pending::<()>().await;
                 Ok(json!(null))
-            }
-        }));
+            },
+        ));
         assert!(poll!(batch.as_mut()).is_pending());
         context.cancel();
         let response = batch.await.unwrap();
         assert_unknown(&response.results[0]);
         assert_unknown(&response.results[1]);
         assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
-        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(
+            response.results[2].error.as_ref().unwrap().code,
+            "BATCH_CANCELLED"
+        );
         assert_eq!(response.status, BatchStatus::Aborted);
-        assert_eq!((response.completed, response.failed, response.skipped), (0, 2, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (0, 2, 1)
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn multiple_admitted_panics_are_each_accounted_for() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])]);
-        let response = executor.execute_async(&request, |operation| async move {
-            assert_ne!(operation.id, "a", "first admitted panic");
-            assert_ne!(operation.id, "b", "second admitted panic");
-            Ok(operation.input.clone())
-        }).await.unwrap();
+        let request = request(vec![
+            operation("a", &[]),
+            operation("b", &[]),
+            operation("c", &[]),
+        ]);
+        let response = executor
+            .execute_async(&request, |operation| async move {
+                assert_ne!(operation.id, "a", "first admitted panic");
+                assert_ne!(operation.id, "b", "second admitted panic");
+                Ok(operation.input.clone())
+            })
+            .await
+            .unwrap();
         assert_unknown(&response.results[0]);
         assert_unknown(&response.results[1]);
         assert_eq!(response.results[2].status, OperationResultStatus::Skipped);
-        assert_eq!((response.completed, response.failed, response.skipped), (0, 2, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (0, 2, 1)
+        );
     }
 }
 
@@ -1490,7 +1741,8 @@ mod streaming_tests {
                     *self.waker.borrow_mut() = Some(cx.waker().clone());
                     Poll::Pending
                 }
-            }).await;
+            })
+            .await;
         }
 
         fn release(&self) {
@@ -1507,16 +1759,23 @@ mod streaming_tests {
         let request = request(vec![operation("a", &[]), operation("b", &[])], 2);
         let gate = Gate::default();
         let delivered = RefCell::new(Vec::new());
-        let mut batch = Box::pin(executor.execute_async_streaming(&request, None, |operation| {
-            let gate = &gate;
-            async move {
-                if operation.id == "a" { gate.wait().await; }
-                Ok(operation.input.clone())
-            }
-        }, |result| {
-            delivered.borrow_mut().push(result.id.clone());
-            Ok(())
-        }));
+        let mut batch = Box::pin(executor.execute_async_streaming(
+            &request,
+            None,
+            |operation| {
+                let gate = &gate;
+                async move {
+                    if operation.id == "a" {
+                        gate.wait().await;
+                    }
+                    Ok(operation.input.clone())
+                }
+            },
+            |result| {
+                delivered.borrow_mut().push(result.id.clone());
+                Ok(())
+            },
+        ));
 
         assert!(poll!(batch.as_mut()).is_pending());
         assert_eq!(*delivered.borrow(), ["b"]);
@@ -1526,25 +1785,48 @@ mod streaming_tests {
         assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Complete);
         assert_eq!(streamed.acknowledged_results, 2);
         assert_eq!(streamed.response.status, BatchStatus::Success);
-        assert_eq!(streamed.response.results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            streamed
+                .response
+                .results
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn bounded_sink_refusal_stops_admission_but_retains_admitted_successes() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])], 2);
+        let request = request(
+            vec![
+                operation("a", &[]),
+                operation("b", &[]),
+                operation("c", &[]),
+            ],
+            2,
+        );
         let calls = RefCell::new(Vec::new());
         let attempts = Cell::new(0);
         let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
-        let streamed = executor.execute_async_streaming(&request, None, |operation| {
-            calls.borrow_mut().push(operation.id.clone());
-            ready(Ok(operation.input.clone()))
-        }, |result| {
-            attempts.set(attempts.get() + 1);
-            sender.try_send(result.clone()).map_err(|_| {
-                operation_error("SINK_FULL", "private delivery failure payload")
-            })
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |operation| {
+                    calls.borrow_mut().push(operation.id.clone());
+                    ready(Ok(operation.input.clone()))
+                },
+                |result| {
+                    attempts.set(attempts.get() + 1);
+                    sender.try_send(result.clone()).map_err(|_| {
+                        operation_error("SINK_FULL", "private delivery failure payload")
+                    })
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(*calls.borrow(), ["a", "b"]);
         assert_eq!(attempts.get(), 1);
@@ -1552,79 +1834,158 @@ mod streaming_tests {
         assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Rejected);
         let response = &streamed.response;
         assert_eq!(response.status, BatchStatus::Aborted);
-        assert_eq!((response.completed, response.failed, response.skipped), (2, 0, 1));
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (2, 0, 1)
+        );
         assert_eq!(response.results[0].output, Some(json!({ "id": "a" })));
         assert_eq!(response.results[1].output, Some(json!({ "id": "b" })));
-        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_RESULT_DELIVERY_FAILED");
-        assert!(!serde_json::to_string(&streamed).unwrap().contains("private delivery"));
+        assert_eq!(
+            response.results[2].error.as_ref().unwrap().code,
+            "BATCH_RESULT_DELIVERY_FAILED"
+        );
+        assert!(
+            !serde_json::to_string(&streamed)
+                .unwrap()
+                .contains("private delivery")
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn acknowledgements_count_only_successful_callbacks_and_are_not_replayed() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])], 1);
+        let request = request(
+            vec![
+                operation("a", &[]),
+                operation("b", &[]),
+                operation("c", &[]),
+            ],
+            1,
+        );
         let delivered = RefCell::new(Vec::new());
-        let streamed = executor.execute_async_streaming(&request, None, |operation| {
-            ready(Ok(operation.input.clone()))
-        }, |result| {
-            delivered.borrow_mut().push(result.id.clone());
-            if result.id == "b" {
-                Err(operation_error("CLOSED", "result receiver disconnected"))
-            } else {
-                Ok(())
-            }
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |operation| ready(Ok(operation.input.clone())),
+                |result| {
+                    delivered.borrow_mut().push(result.id.clone());
+                    if result.id == "b" {
+                        Err(operation_error("CLOSED", "result receiver disconnected"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(*delivered.borrow(), ["a", "b"]);
         assert_eq!(streamed.acknowledged_results, 1);
         assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Rejected);
-        assert_eq!((streamed.response.completed, streamed.response.failed, streamed.response.skipped), (2, 0, 1));
+        assert_eq!(
+            (
+                streamed.response.completed,
+                streamed.response.failed,
+                streamed.response.skipped
+            ),
+            (2, 0, 1)
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn sink_cancellation_delivers_final_unknown_and_unadmitted_accounting() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])], 2);
+        let request = request(
+            vec![
+                operation("a", &[]),
+                operation("b", &[]),
+                operation("c", &[]),
+            ],
+            2,
+        );
         let context = ExecutionContext::background();
         let gate = Gate::default();
         let delivered = RefCell::new(Vec::new());
-        let streamed = executor.execute_async_streaming(&request, Some(&context), |operation| {
-            let gate = &gate;
-            async move {
-                if operation.id == "a" { gate.wait().await; }
-                Ok(operation.input.clone())
-            }
-        }, |result| {
-            delivered.borrow_mut().push(result.id.clone());
-            if result.id == "b" { context.cancel(); }
-            Ok(())
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                Some(&context),
+                |operation| {
+                    let gate = &gate;
+                    async move {
+                        if operation.id == "a" {
+                            gate.wait().await;
+                        }
+                        Ok(operation.input.clone())
+                    }
+                },
+                |result| {
+                    delivered.borrow_mut().push(result.id.clone());
+                    if result.id == "b" {
+                        context.cancel();
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(*delivered.borrow(), ["b", "a", "c"]);
         assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Complete);
         assert_eq!(streamed.acknowledged_results, 3);
         let response = streamed.response;
         assert_eq!(response.status, BatchStatus::Aborted);
-        assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
-        assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
-        assert_eq!(response.results[0].error.as_ref().unwrap().retry_after_ms, None);
+        assert_eq!(
+            (response.completed, response.failed, response.skipped),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            response.results[0].error.as_ref().unwrap().code,
+            "BATCH_OUTCOME_UNKNOWN"
+        );
+        assert_eq!(
+            response.results[0].error.as_ref().unwrap().retry_after_ms,
+            None
+        );
         assert_eq!(response.results[1].status, OperationResultStatus::Success);
-        assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_CANCELLED");
+        assert_eq!(
+            response.results[2].error.as_ref().unwrap().code,
+            "BATCH_CANCELLED"
+        );
     }
 
     #[fcp_async_core::runtime::test]
     async fn dependency_failures_are_delivered_once_without_invoking_dependents() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &["a"]), operation("c", &["b"])], 1);
+        let request = request(
+            vec![
+                operation("a", &[]),
+                operation("b", &["a"]),
+                operation("c", &["b"]),
+            ],
+            1,
+        );
         let calls = Cell::new(0);
         let delivered = RefCell::new(Vec::new());
-        let streamed = executor.execute_async_streaming(&request, None, |_| {
-            calls.set(calls.get() + 1);
-            ready(Err(operation_error("PROVIDER_REFUSED", "provider refused operation")))
-        }, |result| {
-            delivered.borrow_mut().push(result.id.clone());
-            Ok(())
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    ready(Err(operation_error(
+                        "PROVIDER_REFUSED",
+                        "provider refused operation",
+                    )))
+                },
+                |result| {
+                    delivered.borrow_mut().push(result.id.clone());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(calls.get(), 1);
         assert_eq!(*delivered.borrow(), ["a", "b", "c"]);
@@ -1642,13 +2003,20 @@ mod streaming_tests {
         let request = request(vec![operation("a", &[]), operation("a", &[])], 2);
         let called = Cell::new(false);
         let delivered = Cell::new(false);
-        let result = executor.execute_async_streaming(&request, None, |_| {
-            called.set(true);
-            ready(Ok(json!(null)))
-        }, |_| {
-            delivered.set(true);
-            Ok(())
-        }).await;
+        let result = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |_| {
+                    called.set(true);
+                    ready(Ok(json!(null)))
+                },
+                |_| {
+                    delivered.set(true);
+                    Ok(())
+                },
+            )
+            .await;
 
         assert!(result.is_err());
         assert!(!called.get());
@@ -1662,13 +2030,21 @@ mod streaming_tests {
         request.options.timeout_ms = 0;
         let called = Cell::new(false);
         let delivered = RefCell::new(Vec::new());
-        let streamed = executor.execute_async_streaming(&request, None, |_| {
-            called.set(true);
-            ready(Ok(json!(null)))
-        }, |result| {
-            delivered.borrow_mut().push(result.id.clone());
-            Ok(())
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |_| {
+                    called.set(true);
+                    ready(Ok(json!(null)))
+                },
+                |result| {
+                    delivered.borrow_mut().push(result.id.clone());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
 
         assert!(!called.get());
         assert_eq!(*delivered.borrow(), ["a", "b"]);
@@ -1686,12 +2062,18 @@ mod streaming_tests {
         let mut request = request(vec![operation("a", &[]), operation("b", &[])], 2);
         request.options.timeout_ms = 0;
         let attempts = Cell::new(0);
-        let streamed = executor.execute_async_streaming(&request, None, |_| {
-            ready(Ok(json!(null)))
-        }, |_| {
-            attempts.set(attempts.get() + 1);
-            Err(operation_error("CLOSED", "receiver disconnected"))
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |_| ready(Ok(json!(null))),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    Err(operation_error("CLOSED", "receiver disconnected"))
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(attempts.get(), 1);
         assert_eq!(streamed.acknowledged_results, 0);
@@ -1706,19 +2088,43 @@ mod streaming_tests {
     #[fcp_async_core::runtime::test]
     async fn sink_panic_disables_delivery_but_does_not_reclassify_successes() {
         let executor = BatchExecutor::new();
-        let request = request(vec![operation("a", &[]), operation("b", &[]), operation("c", &[])], 2);
+        let request = request(
+            vec![
+                operation("a", &[]),
+                operation("b", &[]),
+                operation("c", &[]),
+            ],
+            2,
+        );
         let attempts = Cell::new(0);
-        let streamed = executor.execute_async_streaming(&request, None, |operation| {
-            ready(Ok(operation.input.clone()))
-        }, |_| {
-            attempts.set(attempts.get() + 1);
-            panic!("private sink panic payload");
-        }).await.unwrap();
+        let streamed = executor
+            .execute_async_streaming(
+                &request,
+                None,
+                |operation| ready(Ok(operation.input.clone())),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    panic!("private sink panic payload");
+                },
+            )
+            .await
+            .unwrap();
 
         assert_eq!(attempts.get(), 1);
         assert_eq!(streamed.acknowledged_results, 0);
         assert_eq!(streamed.delivery_status, BatchDeliveryStatus::Panicked);
-        assert_eq!((streamed.response.completed, streamed.response.failed, streamed.response.skipped), (2, 0, 1));
-        assert!(!serde_json::to_string(&streamed).unwrap().contains("private sink"));
+        assert_eq!(
+            (
+                streamed.response.completed,
+                streamed.response.failed,
+                streamed.response.skipped
+            ),
+            (2, 0, 1)
+        );
+        assert!(
+            !serde_json::to_string(&streamed)
+                .unwrap()
+                .contains("private sink")
+        );
     }
 }

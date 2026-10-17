@@ -136,24 +136,6 @@ pub fn check_monthly_cadence_with_existing(
     let month = month_key(today);
     let title = overdue_title(&month);
 
-    if today.day() != 1 {
-        debug!(
-            date = %today,
-            month,
-            file_present = false,
-            existing_bead_id = "",
-            action = "skip_not_month_boundary",
-            "monthly reality-check cadence decision"
-        );
-        info!(
-            date = %today,
-            months_checked = 0_u8,
-            beads_proposed_count = 0_u8,
-            "monthly reality-check cadence complete"
-        );
-        return Vec::new();
-    }
-
     let file_present = has_reality_check_for_month(reality_dir, &month);
     let duplicate_suppressed = existing_beads
         .iter()
@@ -351,7 +333,7 @@ const fn is_quarter_boundary_month(month: u32) -> bool {
 
 fn is_quarterly_cadence_day(today: NaiveDate) -> bool {
     is_quarter_boundary_month(today.month())
-        && today.day() == first_business_day_of_month(today.year(), today.month())
+        && today.day() >= first_business_day_of_month(today.year(), today.month())
 }
 
 fn first_business_day_of_month(year: i32, month: u32) -> u32 {

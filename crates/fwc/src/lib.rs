@@ -7,8 +7,10 @@
 pub mod access_cmd;
 pub mod agent_bootstrap;
 pub mod capability_replay;
+pub mod catalog;
 pub mod connector_state;
 pub mod doctor;
+pub mod intent;
 pub mod mesh_cmd;
 pub mod pipe;
 pub mod proof_readiness;
@@ -18,3 +20,4 @@ pub mod recovery;
 pub mod schema_nav;
 pub mod search;
 pub mod test_observability;
+pub mod truth;

@@ -175,9 +175,7 @@ impl ForwardControl {
         self.state
             .lock()
             .map(|state| state.usage.clone())
-            .map_err(|_| {
-                HostError::Internal("mesh forward admission state is poisoned".to_owned())
-            })
+            .map_err(|_| HostError::Internal("mesh forward admission state is poisoned".to_owned()))
     }
 
     /// `send` is not even constructed until all ceilings have been reserved.
@@ -249,7 +247,12 @@ impl ForwardControl {
             Some("router_in_flight_limit")
         } else if usage.peers.get(peer).copied().unwrap_or(0) >= self.limits.max_per_peer {
             Some("peer_in_flight_limit")
-        } else if request_bytes > self.limits.max_request_bytes.saturating_sub(usage.request_bytes) {
+        } else if request_bytes
+            > self
+                .limits
+                .max_request_bytes
+                .saturating_sub(usage.request_bytes)
+        {
             Some("request_byte_limit")
         } else if MAX_REPLY_BYTES
             > self
@@ -336,7 +339,9 @@ impl Drop for ForwardPermit<'_> {
         let usage = &mut state.usage;
         usage.in_flight = usage.in_flight.saturating_sub(1);
         usage.request_bytes = usage.request_bytes.saturating_sub(self.request_bytes);
-        usage.response_bytes_reserved = usage.response_bytes_reserved.saturating_sub(MAX_REPLY_BYTES);
+        usage.response_bytes_reserved = usage
+            .response_bytes_reserved
+            .saturating_sub(MAX_REPLY_BYTES);
         if let Some(count) = usage.peers.get_mut(self.peer) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -455,7 +460,14 @@ mod tests {
     #[test]
     fn invalid_limits_fail_closed() {
         for name in LIMIT_ENV_KEYS {
-            for value in ["", " ", "0", "-1", "no", "999999999999999999999999999999999999"] {
+            for value in [
+                "",
+                " ",
+                "0",
+                "-1",
+                "no",
+                "999999999999999999999999999999999999",
+            ] {
                 assert!(
                     MeshForwardLimits::from_lookup(|key| {
                         (key == name).then(|| value.to_owned())
@@ -513,7 +525,11 @@ mod tests {
                 .summary()
                 .contains("request_byte_limit")
         );
-        assert_eq!(control.snapshot().unwrap(), before, "refusal must not partially reserve");
+        assert_eq!(
+            control.snapshot().unwrap(),
+            before,
+            "refusal must not partially reserve"
+        );
         drop(a);
         let c = control.reserve("c", usize::MAX - 2).unwrap();
         drop((b, c));
@@ -553,7 +569,10 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(future.as_mut().poll(&mut cx).is_pending());
         assert_eq!(control.snapshot().unwrap().request_bytes, 10);
-        assert_eq!(control.snapshot().unwrap().response_bytes_reserved, MAX_REPLY_BYTES);
+        assert_eq!(
+            control.snapshot().unwrap().response_bytes_reserved,
+            MAX_REPLY_BYTES
+        );
         drop(future);
         assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
         assert!(control.reserve("a", 10).is_ok());
@@ -664,7 +683,10 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(!called.get());
-        assert!(refusal.safe_to_retry(), "only this later, unsent request can fail over");
+        assert!(
+            refusal.safe_to_retry(),
+            "only this later, unsent request can fail over"
+        );
         assert!(refusal.summary().contains("peer_circuit_open"));
         assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
     }
@@ -709,7 +731,10 @@ mod tests {
             .now_or_never()
             .unwrap()
             .unwrap();
-        assert_eq!(result, reply, "signed operation error must be returned unchanged");
+        assert_eq!(
+            result, reply,
+            "signed operation error must be returned unchanged"
+        );
         assert_eq!(control.snapshot().unwrap(), MeshForwardUsage::default());
         assert!(control.reserve_at("a", 1, recovered_at).is_ok());
     }
@@ -789,8 +814,7 @@ mod tests {
     fn reply_budget_alone_cannot_silently_select_host_first() {
         assert!(
             crate::mesh_routing::MeshRoutingSettings::from_lookup(|name| {
-                (name == MeshForwardLimits::RESPONSE_BYTES_ENV)
-                    .then(|| MAX_REPLY_BYTES.to_string())
+                (name == MeshForwardLimits::RESPONSE_BYTES_ENV).then(|| MAX_REPLY_BYTES.to_string())
             })
             .is_err()
         );
@@ -885,9 +909,18 @@ mod tests {
         // Exercise the arithmetic boundary without creating billions of jobs.
         control.state.lock().unwrap().usage.response_bytes_reserved = usize::MAX - MAX_REPLY_BYTES;
         let permit = control.reserve("a", 1).unwrap();
-        assert_eq!(control.snapshot().unwrap().response_bytes_reserved, usize::MAX);
+        assert_eq!(
+            control.snapshot().unwrap().response_bytes_reserved,
+            usize::MAX
+        );
         let before = control.snapshot().unwrap();
-        assert!(control.reserve("b", 1).unwrap_err().summary().contains("response_byte_limit"));
+        assert!(
+            control
+                .reserve("b", 1)
+                .unwrap_err()
+                .summary()
+                .contains("response_byte_limit")
+        );
         assert_eq!(control.snapshot().unwrap(), before);
         drop(permit);
         assert_eq!(

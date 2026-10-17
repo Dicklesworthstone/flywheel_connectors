@@ -57,7 +57,10 @@ impl LiveMembership {
     }
 
     pub(super) fn snapshot(&self) -> Result<Arc<MeshPeerDirectory>, MeshForwardError> {
-        let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
+        let current = self
+            .publication
+            .read()
+            .map_err(|_| unavailable("state_poisoned"))?;
         current.check()?;
         Ok(Arc::clone(&current.directory))
     }
@@ -66,17 +69,25 @@ impl LiveMembership {
         &self,
         node_id: &TailscaleNodeId,
     ) -> Result<PeerSnapshot, MeshForwardError> {
-        let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
+        let current = self
+            .publication
+            .read()
+            .map_err(|_| unavailable("state_poisoned"))?;
         current.check()?;
         // Capture keys and their continuity epoch under the same read lock.
-        current.continuity.snapshot(Arc::clone(&current.directory), node_id)
+        current
+            .continuity
+            .snapshot(Arc::clone(&current.directory), node_id)
     }
 
     pub(super) fn check_peer_snapshot(
         &self,
         snapshot: &PeerSnapshot,
     ) -> Result<(), MeshForwardError> {
-        let current = self.publication.read().map_err(|_| unavailable("state_poisoned"))?;
+        let current = self
+            .publication
+            .read()
+            .map_err(|_| unavailable("state_poisoned"))?;
         // Preserved peer authority never bypasses expiry or a storage/source fence.
         current.check()?;
         current.continuity.check(snapshot)
@@ -99,7 +110,7 @@ fn unavailable(reason: &str) -> MeshForwardError {
 /// The worker is dropped before the checkpoint's exclusive lock is released.
 /// No router, replay journal, request body, or signing secret enters the worker.
 pub(super) struct ReloadWorker {
-    stop: mpsc::Sender<()>,
+    stop: mpsc::SyncSender<()>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -113,7 +124,7 @@ impl Drop for WorkerExitFence {
 
 impl Drop for ReloadWorker {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.stop.try_send(());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -126,7 +137,7 @@ pub(super) fn spawn(
     membership: Arc<LiveMembership>,
     last_observed_ms: u64,
 ) -> HostResult<ReloadWorker> {
-    let (stop, stopped) = mpsc::channel();
+    let (stop, stopped) = mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name("fcp-mesh-membership".to_owned())
         .spawn(move || {
@@ -168,7 +179,10 @@ pub(super) fn spawn(
             }
         })
         .map_err(|error| storage_error("reload_worker_start", &error))?;
-    Ok(ReloadWorker { stop, thread: Some(thread) })
+    Ok(ReloadWorker {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 struct Refresher {
@@ -201,27 +215,31 @@ impl Refresher {
                 now_ms,
             )
             .map_err(|error| invalid(&error.to_string()))?;
-        let previous = membership.publication.read()
+        let previous = membership
+            .publication
+            .read()
             .map_err(|_| invalid("membership publication is poisoned"))?
-            .checkpoint.clone();
-        verified.check_successor(&previous)
+            .checkpoint
+            .clone();
+        verified
+            .check_successor(&previous)
             .map_err(|error| invalid(&error.to_string()))?;
         if verified.checkpoint().generation == previous.generation {
             // Same-generation reloads never renew the monotonic deadline. An
             // observed expiration cannot be undone by rewinding the wall clock.
-            let mut current = membership.publication.write()
+            let mut current = membership
+                .publication
+                .write()
                 .map_err(|_| invalid("membership publication is poisoned"))?;
-            current.validity.check_at(now_ms, Instant::now())
+            current
+                .validity
+                .check_at(now_ms, Instant::now())
                 .map_err(|error| invalid(&error.to_string()))?;
             current.failure = None;
             return Ok(());
         }
 
-        let validity = MembershipValidity::new(
-            verified.payload().expires_at_ms,
-            now_ms,
-            now,
-        )?;
+        let validity = MembershipValidity::new(verified.payload().expires_at_ms, now_ms, now)?;
         let mut checkpoint = verified.checkpoint().clone();
         let directory = Arc::new(verified.directory().clone());
         // Fence requests before any checkpoint mutation. If storage is
@@ -231,7 +249,9 @@ impl Refresher {
         let persisted = match read_checkpoint(&self.state_path) {
             Ok(checkpoint) => checkpoint,
             Err(CheckpointReadError::Missing) => {
-                return Err(invalid("initialized directory checkpoint is missing; refusing reset"));
+                return Err(invalid(
+                    "initialized directory checkpoint is missing; refusing reset",
+                ));
             }
             Err(CheckpointReadError::Invalid(error)) => return Err(error),
         };
@@ -242,24 +262,33 @@ impl Refresher {
         if committed_at < now_ms {
             return Err(invalid("clock moved backwards during membership commit"));
         }
-        validity.check_at(committed_at, Instant::now())
+        validity
+            .check_at(committed_at, Instant::now())
             .map_err(|error| invalid(&error.to_string()))?;
         checkpoint.last_observed_ms = committed_at;
         write_checkpoint(&self.state_path, &checkpoint)?;
-        validity.check_at(unix_now_ms(), Instant::now())
+        validity
+            .check_at(unix_now_ms(), Instant::now())
             .map_err(|error| invalid(&error.to_string()))?;
         let generation = checkpoint.generation;
         let peer_count = directory.len();
         {
-            let mut current = membership.publication.write()
+            let mut current = membership
+                .publication
+                .write()
                 .map_err(|_| invalid("membership publication is poisoned"))?;
             // Publish the successor epochs together with the durable directory.
             // No request sees a new key with an old epoch or an uncommitted peer.
             let published_at = unix_now_ms();
             let published_now = Instant::now();
-            validity.check_at(published_at, published_now)
+            validity
+                .check_at(published_at, published_now)
                 .map_err(|error| invalid(&error.to_string()))?;
-            let continuity = if current.validity.check_at(published_at, published_now).is_ok() {
+            let continuity = if current
+                .validity
+                .check_at(published_at, published_now)
+                .is_ok()
+            {
                 current.continuity.successor(&directory)
             } else {
                 // A renewal after an authority gap admits new calls, but must
@@ -329,13 +358,15 @@ mod tests {
                 ],
             };
             let signed = SignedMeshPeerDirectory::sign(&owner, &payload).unwrap();
-            let verified = signed.verify(
-                &[owner.verifying_key()],
-                &payload.mesh_id,
-                TailscaleNodeId::new("local"),
-                &local.verifying_key(),
-                now_ms,
-            ).unwrap();
+            let verified = signed
+                .verify(
+                    &[owner.verifying_key()],
+                    &payload.mesh_id,
+                    TailscaleNodeId::new("local"),
+                    &local.verifying_key(),
+                    now_ms,
+                )
+                .unwrap();
             let state_path = dir.path().join("membership");
             write_checkpoint(&state_path, verified.checkpoint()).unwrap();
             let source = ReloadSource {
@@ -387,7 +418,8 @@ mod tests {
                 },
                 crate::mesh_routing::MeshForwardLimits::default(),
                 &self.dir.path().join("replay"),
-            ).unwrap();
+            )
+            .unwrap();
             router.membership = Some(DirectoryGuard {
                 _worker: None,
                 state: Arc::clone(&self.membership),
@@ -396,7 +428,10 @@ mod tests {
             router
         }
 
-        fn envelope(&self, peer_key: &Ed25519SigningKey) -> fcp_mesh::invoke_route::MeshForwardEnvelope {
+        fn envelope(
+            &self,
+            peer_key: &Ed25519SigningKey,
+        ) -> fcp_mesh::invoke_route::MeshForwardEnvelope {
             fcp_mesh::invoke_route::MeshForwardEnvelope::sign(
                 peer_key,
                 TailscaleNodeId::new("peer"),
@@ -405,7 +440,8 @@ mod tests {
                 fcp_mesh::invoke_route::MeshForwardBody::Introspect {
                     connector_id: "fcp.test:utility:1.0.0".to_owned(),
                 },
-            ).unwrap()
+            )
+            .unwrap()
         }
 
         fn start_file_router(&self) -> crate::mesh_routing::MeshRouter {
@@ -415,20 +451,30 @@ mod tests {
 
             let key_path = self.dir.path().join("local.key");
             let key = Ed25519SigningKey::from_bytes(&[32; 32]).unwrap();
-            let mut file = private_options().create(true).truncate(true).open(&key_path).unwrap();
-            file.write_all(hex::encode(key.to_bytes()).as_bytes()).unwrap();
+            let mut file = private_options()
+                .create(true)
+                .truncate(true)
+                .open(&key_path)
+                .unwrap();
+            file.write_all(hex::encode(key.to_bytes()).as_bytes())
+                .unwrap();
             crate::mesh_routing::MeshRouter::from_lookup(|name| match name {
                 MESH_NODE_ID_ENV => Some("local".to_owned()),
                 MESH_SIGNING_KEY_FILE_ENV => Some(key_path.display().to_string()),
                 MESH_PEERS_FILE_ENV => Some(self.refresher.source.path.display().to_string()),
                 MESH_DIRECTORY_ID_ENV => Some(self.payload.mesh_id.clone()),
-                MESH_DIRECTORY_OWNER_KEYS_ENV => Some(serde_json::json!([
-                    hex::encode(self.owner.verifying_key().to_bytes())
-                ]).to_string()),
+                MESH_DIRECTORY_OWNER_KEYS_ENV => Some(
+                    serde_json::json!([hex::encode(self.owner.verifying_key().to_bytes())])
+                        .to_string(),
+                ),
                 MESH_DIRECTORY_STATE_ENV => Some(self.refresher.state_path.display().to_string()),
-                MESH_REPLAY_JOURNAL_ENV => Some(self.dir.path().join("replay").display().to_string()),
+                MESH_REPLAY_JOURNAL_ENV => {
+                    Some(self.dir.path().join("replay").display().to_string())
+                }
                 _ => None,
-            }).unwrap().unwrap()
+            })
+            .unwrap()
+            .unwrap()
         }
     }
 
@@ -644,7 +690,10 @@ mod tests {
     fn wait_until(mut ready: impl FnMut() -> bool) {
         let start = Instant::now();
         while !ready() {
-            assert!(start.elapsed() < Duration::from_secs(5), "membership worker did not converge");
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "membership worker did not converge"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -652,7 +701,14 @@ mod tests {
     #[test]
     fn higher_generation_renews_expired_membership_and_commits_its_checkpoint() {
         let mut fixture = Fixture::new();
-        fixture.membership.publication.read().unwrap().validity.expired.store(true, Ordering::Release);
+        fixture
+            .membership
+            .publication
+            .read()
+            .unwrap()
+            .validity
+            .expired
+            .store(true, Ordering::Release);
         assert!(fixture.membership.snapshot().is_err());
         fixture.payload.generation = 2;
         fixture.payload.expires_at_ms += 300_000;
@@ -661,17 +717,30 @@ mod tests {
         assert_eq!(fixture.membership.snapshot().unwrap().len(), 1);
         let committed = read_checkpoint(&fixture.refresher.state_path).ok().unwrap();
         assert_eq!(committed.generation, 2);
-        assert_eq!(committed, fixture.membership.publication.read().unwrap().checkpoint);
+        assert_eq!(
+            committed,
+            fixture.membership.publication.read().unwrap().checkpoint
+        );
     }
 
     #[test]
     fn identical_generation_cannot_reset_an_observed_expiration() {
         let mut fixture = Fixture::new();
         let before = std::fs::read(&fixture.refresher.state_path).unwrap();
-        fixture.membership.publication.read().unwrap().validity.expired.store(true, Ordering::Release);
+        fixture
+            .membership
+            .publication
+            .read()
+            .unwrap()
+            .validity
+            .expired
+            .store(true, Ordering::Release);
         assert!(fixture.refresh().is_err());
         assert!(fixture.membership.snapshot().is_err());
-        assert_eq!(std::fs::read(&fixture.refresher.state_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&fixture.refresher.state_path).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -692,19 +761,31 @@ mod tests {
             }
             fixture.write_source();
             if scenario == "signature" {
-                let mut signed = SignedMeshPeerDirectory::sign(&fixture.owner, &fixture.payload).unwrap();
+                let mut signed =
+                    SignedMeshPeerDirectory::sign(&fixture.owner, &fixture.payload).unwrap();
                 signed.payload_json.push(' ');
-                std::fs::write(&fixture.refresher.source.path, serde_json::to_vec(&signed).unwrap()).unwrap();
+                std::fs::write(
+                    &fixture.refresher.source.path,
+                    serde_json::to_vec(&signed).unwrap(),
+                )
+                .unwrap();
             }
             assert!(fixture.refresh().is_err(), "{scenario} must be refused");
-            assert_eq!(std::fs::read(&fixture.refresher.state_path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(&fixture.refresher.state_path).unwrap(),
+                before
+            );
         }
     }
 
     #[test]
     fn missing_checkpoint_during_reload_cannot_initialize_from_scratch() {
         let mut fixture = Fixture::new();
-        std::fs::rename(&fixture.refresher.state_path, fixture.dir.path().join("retained-state")).unwrap();
+        std::fs::rename(
+            &fixture.refresher.state_path,
+            fixture.dir.path().join("retained-state"),
+        )
+        .unwrap();
         fixture.payload.generation = 2;
         fixture.write_source();
         assert!(fixture.refresh().is_err());
@@ -721,7 +802,11 @@ mod tests {
         let protected = fixture.dir.path().join("protected");
         std::fs::write(&protected, b"do not modify").unwrap();
         std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::hard_link(&protected, companion(&fixture.refresher.state_path, ".next")).unwrap();
+        std::fs::hard_link(
+            &protected,
+            companion(&fixture.refresher.state_path, ".next"),
+        )
+        .unwrap();
         let before = std::fs::read(&fixture.refresher.state_path).unwrap();
         fixture.payload.generation = 2;
         fixture.write_source();
@@ -731,7 +816,10 @@ mod tests {
         fixture.payload.generation = 1;
         fixture.write_source();
         assert!(fixture.refresh().is_err());
-        assert_eq!(std::fs::read(&fixture.refresher.state_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&fixture.refresher.state_path).unwrap(),
+            before
+        );
         assert_eq!(std::fs::read(&protected).unwrap(), b"do not modify");
     }
 
@@ -745,7 +833,13 @@ mod tests {
         fixture.payload.peers.truncate(1);
         fixture.write_source();
         fixture.refresh().unwrap();
-        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
+        assert_eq!(
+            read_checkpoint(&fixture.refresher.state_path)
+                .ok()
+                .unwrap()
+                .generation,
+            2
+        );
         assert!(router.directory().is_empty());
         assert_eq!(before.len(), 1, "retained snapshots must remain immutable");
         assert!(matches!(
@@ -768,7 +862,11 @@ mod tests {
         fixture.write_source();
         fixture.refresh().unwrap();
         assert_eq!(
-            router.directory().peer(&TailscaleNodeId::new("peer")).unwrap().endpoint,
+            router
+                .directory()
+                .peer(&TailscaleNodeId::new("peer"))
+                .unwrap()
+                .endpoint,
             "http://127.0.0.1:29999",
         );
         assert!(matches!(
@@ -780,9 +878,15 @@ mod tests {
         fixture.payload.peers[1].public_key_hex = hex::encode(old_key.verifying_key().to_bytes());
         fixture.write_source();
         fixture.refresh().unwrap();
-        assert!(matches!(router.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
+        assert!(matches!(
+            router.accept_inbound(&accepted),
+            Err(MeshForwardError::Replayed { .. })
+        ));
         assert!(router.has_durable_replay());
-        assert_eq!(router.forward_usage().unwrap(), crate::mesh_routing::MeshForwardUsage::default());
+        assert_eq!(
+            router.forward_usage().unwrap(),
+            crate::mesh_routing::MeshForwardUsage::default()
+        );
     }
 
     #[test]
@@ -799,16 +903,30 @@ mod tests {
         // admission while the membership writer publishes a removal.
         let journal = router.durable_replay.as_ref().unwrap().lock().unwrap();
         let mut pending = Box::pin(router.accept_inbound_async(&envelope));
-        assert!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         fixture.payload.generation = 2;
         fixture.payload.peers.truncate(1);
         fixture.write_source();
         fixture.refresh().unwrap();
         drop(journal);
-        let result = fcp_async_core::runtime::block_on_sync(
-            fcp_async_core::time::timeout(Duration::from_secs(5), pending),
-        ).unwrap().unwrap();
-        assert!(matches!(result, Err(MeshForwardError::Malformed { field: "peer_directory", .. })));
+        let result = fcp_async_core::runtime::block_on_sync(fcp_async_core::time::timeout(
+            Duration::from_secs(5),
+            pending,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(MeshForwardError::Malformed {
+                field: "peer_directory",
+                ..
+            })
+        ));
         fixture.payload.generation = 3;
         fixture.payload.peers = original_peers;
         fixture.write_source();
@@ -850,30 +968,62 @@ mod tests {
         fixture.payload.peers[1].public_key_hex = hex::encode(new_key.verifying_key().to_bytes());
         fixture.payload.peers[1].endpoint = "http://127.0.0.1:29999".to_owned();
         fixture.write_source();
-        wait_until(|| router.directory().peer(&TailscaleNodeId::new("peer"))
-            .is_some_and(|peer| peer.verifying_key == new_key.verifying_key()));
-        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
-        assert!(matches!(router.accept_inbound(&fixture.envelope(&old_key)),
-            Err(MeshForwardError::SignatureInvalid { .. })));
+        wait_until(|| {
+            router
+                .directory()
+                .peer(&TailscaleNodeId::new("peer"))
+                .is_some_and(|peer| peer.verifying_key == new_key.verifying_key())
+        });
+        assert_eq!(
+            read_checkpoint(&fixture.refresher.state_path)
+                .ok()
+                .unwrap()
+                .generation,
+            2
+        );
+        assert!(matches!(
+            router.accept_inbound(&fixture.envelope(&old_key)),
+            Err(MeshForwardError::SignatureInvalid { .. })
+        ));
         router.accept_inbound(&fixture.envelope(&new_key)).unwrap();
         fixture.payload.generation = 3;
         fixture.payload.peers.truncate(1);
         fixture.write_source();
-        wait_until(|| read_checkpoint(&fixture.refresher.state_path).ok()
-            .is_some_and(|state| state.generation == 3) && router.directory().is_empty());
+        wait_until(|| {
+            read_checkpoint(&fixture.refresher.state_path)
+                .ok()
+                .is_some_and(|state| state.generation == 3)
+                && router.directory().is_empty()
+        });
         assert!(router.accept_inbound(&fixture.envelope(&new_key)).is_err());
         fixture.payload.generation = 4;
         fixture.payload.peers = original_peers;
         fixture.write_source();
-        wait_until(|| router.directory().peer(&TailscaleNodeId::new("peer"))
-            .is_some_and(|peer| peer.verifying_key == old_key.verifying_key()));
-        assert!(matches!(router.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
+        wait_until(|| {
+            router
+                .directory()
+                .peer(&TailscaleNodeId::new("peer"))
+                .is_some_and(|peer| peer.verifying_key == old_key.verifying_key())
+        });
+        assert!(matches!(
+            router.accept_inbound(&accepted),
+            Err(MeshForwardError::Replayed { .. })
+        ));
         drop(router);
         // Worker shutdown must release the checkpoint lock only after its last
         // possible write, and restart must preserve the same replay journal.
         let restarted = fixture.start_file_router();
-        assert!(matches!(restarted.accept_inbound(&accepted), Err(MeshForwardError::Replayed { .. })));
-        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 4);
+        assert!(matches!(
+            restarted.accept_inbound(&accepted),
+            Err(MeshForwardError::Replayed { .. })
+        ));
+        assert_eq!(
+            read_checkpoint(&fixture.refresher.state_path)
+                .ok()
+                .unwrap()
+                .generation,
+            4
+        );
     }
 
     #[test]
@@ -888,19 +1038,28 @@ mod tests {
         fixture.write_source();
         wait_until(|| router.directory().is_empty());
         assert!(router.accept_inbound(&pending).is_err());
-        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap(), accepted_checkpoint);
+        assert_eq!(
+            read_checkpoint(&fixture.refresher.state_path).ok().unwrap(),
+            accepted_checkpoint
+        );
         fixture.owner = Ed25519SigningKey::from_bytes(&[31; 32]).unwrap();
         fixture.write_source();
         wait_until(|| router.directory().len() == 1);
         router.accept_inbound(&pending).unwrap();
-        assert_eq!(read_checkpoint(&fixture.refresher.state_path).ok().unwrap().generation, 2);
+        assert_eq!(
+            read_checkpoint(&fixture.refresher.state_path)
+                .ok()
+                .unwrap()
+                .generation,
+            2
+        );
     }
 
     #[test]
     fn delivered_forward_crossing_a_membership_change_is_never_retry_safe() {
-        use std::io::{BufRead, BufReader};
-        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
         use crate::mesh_routing::{MeshForwardFailure, MeshForwardUsage};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
+        use std::io::{BufRead, BufReader};
 
         let mut fixture = Fixture::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -922,8 +1081,12 @@ mod tests {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let envelope = {
                 let mut reader = BufReader::new(&mut socket);
                 let mut line = String::new();
@@ -936,7 +1099,9 @@ mod tests {
                     reader.read_line(&mut line).unwrap();
                     header_bytes += line.len();
                     assert!(!line.is_empty() && header_bytes <= 8192);
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                     if let Some((name, value)) = line.split_once(':')
                         && name.eq_ignore_ascii_case("content-length")
                     {
@@ -958,10 +1123,19 @@ mod tests {
             fixture.refresh().unwrap();
             let key = Ed25519SigningKey::from_bytes(&[33; 32]).unwrap();
             let reply = MeshForwardReply::sign(
-                &key, TailscaleNodeId::new("peer"), &envelope, 200, "{}".to_owned(),
+                &key,
+                TailscaleNodeId::new("peer"),
+                &envelope,
+                200,
+                "{}".to_owned(),
             );
             let body = serde_json::to_vec(&reply).unwrap();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
             socket.write_all(&body).unwrap();
             fixture
         });
@@ -971,7 +1145,8 @@ mod tests {
                 request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                 asserted_principal: None,
             },
-        )).unwrap();
+        ))
+        .unwrap();
         let fixture = server.join().unwrap();
         let error = result.unwrap_err();
         assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
@@ -987,8 +1162,8 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::task::{Context, Waker};
 
-        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
         use crate::mesh_routing::{MeshForwardFailure, MeshForwardUsage};
+        use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardReply};
 
         use super::*;
 
@@ -1017,7 +1192,12 @@ mod tests {
                 let before = router.trusted_directory().unwrap();
                 let journal = router.durable_replay.as_ref().unwrap().lock().unwrap();
                 let mut pending = Box::pin(router.accept_inbound_async(&envelope));
-                assert!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(
+                    pending
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
                 fixture.payload.expires_at_ms += 60_000;
                 if join {
                     add_other_peer(&mut fixture);
@@ -1025,13 +1205,20 @@ mod tests {
                 publish(&mut fixture);
                 assert!(!Arc::ptr_eq(&before, &router.trusted_directory().unwrap()));
                 drop(journal);
-                fcp_async_core::runtime::block_on_sync(
-                    fcp_async_core::time::timeout(Duration::from_secs(5), pending),
-                ).unwrap().unwrap().unwrap();
-                assert!(matches!(
-                    router.accept_inbound(&envelope),
-                    Err(MeshForwardError::Replayed { .. }),
-                ), "successful continuity must not reset nonce history");
+                fcp_async_core::runtime::block_on_sync(fcp_async_core::time::timeout(
+                    Duration::from_secs(5),
+                    pending,
+                ))
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert!(
+                    matches!(
+                        router.accept_inbound(&envelope),
+                        Err(MeshForwardError::Replayed { .. }),
+                    ),
+                    "successful continuity must not reset nonce history"
+                );
             }
         }
 
@@ -1054,8 +1241,10 @@ mod tests {
                 // must notice an expiry gap even when no request latched it.
                 fixture.payload.expires_at_ms += 60_000;
                 publish(&mut fixture);
-                assert!(router.ensure_current_peer(&old).is_err(),
-                    "{expiration}: an authority gap breaks continuity");
+                assert!(
+                    router.ensure_current_peer(&old).is_err(),
+                    "{expiration}: an authority gap breaks continuity"
+                );
                 let fresh = router.trusted_peer(&node).unwrap();
                 router.ensure_current_peer(&fresh).unwrap();
             }
@@ -1078,7 +1267,9 @@ mod tests {
             }
             // The terminal storage-failure state must refuse preserved authority.
             fixture.refresher.storage_failed = true;
-            fixture.membership.refuse("checkpoint_failure_requires_restart");
+            fixture
+                .membership
+                .refuse("checkpoint_failure_requires_restart");
             fixture.payload.expires_at_ms += 60_000;
             assert!(fixture.refresh().is_err());
             assert!(router.ensure_current_peer(&snapshot).is_err());
@@ -1087,11 +1278,14 @@ mod tests {
         // Receive a complete signed invoke before publishing changes, then
         // return a reply signed by the original executor. Every I/O is bounded.
         // This tests the actual forwarding path, not just an epoch comparison.
-        fn forward_across_update(change: fn(&mut Fixture)) -> Result<MeshForwardReply, MeshForwardFailure> {
+        fn forward_across_update(
+            change: fn(&mut Fixture),
+        ) -> Result<MeshForwardReply, MeshForwardFailure> {
             let mut fixture = Fixture::new();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
-            fixture.payload.peers[1].endpoint = format!("http://{}", listener.local_addr().unwrap());
+            fixture.payload.peers[1].endpoint =
+                format!("http://{}", listener.local_addr().unwrap());
             publish(&mut fixture);
             let router = fixture.router();
             let server = std::thread::spawn(move || {
@@ -1100,14 +1294,21 @@ mod tests {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(start.elapsed() < Duration::from_secs(5), "forward did not connect");
+                            assert!(
+                                start.elapsed() < Duration::from_secs(5),
+                                "forward did not connect"
+                            );
                             std::thread::sleep(Duration::from_millis(1));
                         }
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
-                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let envelope = {
                     let mut reader = BufReader::new(&mut socket);
                     let mut line = String::new();
@@ -1147,7 +1348,12 @@ mod tests {
                     "{\"committed\":true}".to_owned(),
                 );
                 let body = serde_json::to_vec(&reply).unwrap();
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
                 socket.write_all(&body).unwrap();
                 fixture
             });
@@ -1157,7 +1363,8 @@ mod tests {
                     request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                     asserted_principal: None,
                 },
-            )).unwrap();
+            ))
+            .unwrap();
             let fixture = server.join().unwrap();
             assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
             drop(router);
@@ -1174,7 +1381,8 @@ mod tests {
                 add_other_peer(fixture);
                 publish(fixture);
                 let key = Ed25519SigningKey::from_bytes(&[36; 32]).unwrap();
-                fixture.payload.peers[2].public_key_hex = hex::encode(key.verifying_key().to_bytes());
+                fixture.payload.peers[2].public_key_hex =
+                    hex::encode(key.verifying_key().to_bytes());
                 fixture.payload.peers[2].endpoint = "http://127.0.0.1:19004".to_owned();
                 publish(fixture);
                 fixture.payload.peers.truncate(2);
@@ -1195,7 +1403,8 @@ mod tests {
             fn rotate_and_restore(fixture: &mut Fixture) {
                 let original = fixture.payload.peers[1].public_key_hex.clone();
                 let replacement = Ed25519SigningKey::from_bytes(&[37; 32]).unwrap();
-                fixture.payload.peers[1].public_key_hex = hex::encode(replacement.verifying_key().to_bytes());
+                fixture.payload.peers[1].public_key_hex =
+                    hex::encode(replacement.verifying_key().to_bytes());
                 publish(fixture);
                 fixture.payload.peers[1].public_key_hex = original;
             }
@@ -1206,11 +1415,16 @@ mod tests {
                 fixture.payload.peers[1].endpoint = original;
             }
             for change in [
-                remove as fn(&mut Fixture), rotate_and_restore, move_endpoint_and_restore,
+                remove as fn(&mut Fixture),
+                rotate_and_restore,
+                move_endpoint_and_restore,
             ] {
                 let error = forward_across_update(change).unwrap_err();
                 assert!(matches!(error, MeshForwardFailure::OutcomeUnknown { .. }));
-                assert!(!error.safe_to_retry(), "a delivered write must never fan out");
+                assert!(
+                    !error.safe_to_retry(),
+                    "a delivered write must never fan out"
+                );
             }
         }
     }
@@ -1222,7 +1436,16 @@ mod tests {
         fixture.refresher.last_observed_ms = u64::MAX;
         fixture.payload.generation = 2;
         fixture.write_source();
-        assert!(fixture.refresh().unwrap_err().to_string().contains("clock moved backwards"));
-        assert_eq!(std::fs::read(&fixture.refresher.state_path).unwrap(), before);
+        assert!(
+            fixture
+                .refresh()
+                .unwrap_err()
+                .to_string()
+                .contains("clock moved backwards")
+        );
+        assert_eq!(
+            std::fs::read(&fixture.refresher.state_path).unwrap(),
+            before
+        );
     }
 }

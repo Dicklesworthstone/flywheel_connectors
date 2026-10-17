@@ -82,7 +82,9 @@ fn same_project_and_owner_access_remain_valid() {
     let mut attempted = operation("allowed", "project.tool", &[]);
     attempted.zone = Some(project);
 
-    validator.validate(std::slice::from_ref(&attempted)).unwrap();
+    validator
+        .validate(std::slice::from_ref(&attempted))
+        .unwrap();
     BatchZoneValidator::new(ZoneId::owner(), registry)
         .validate(&[attempted])
         .unwrap();
@@ -106,10 +108,8 @@ fn invalid_batch_is_rejected_before_any_handler_is_called() {
     let mut registry = ZoneRegistry::new();
     registry.register("public.tool", ZoneId::public());
     registry.register("private.tool", ZoneId::private());
-    let executor = BatchExecutor::with_zone_validator(BatchZoneValidator::new(
-        ZoneId::public(),
-        registry,
-    ));
+    let executor =
+        BatchExecutor::with_zone_validator(BatchZoneValidator::new(ZoneId::public(), registry));
     let mut denied = operation("denied", "private.tool", &[]);
     denied.zone = Some(ZoneId::public());
     let batch = request(vec![operation("allowed", "public.tool", &[]), denied]);
@@ -205,7 +205,10 @@ fn a_late_final_handler_keeps_its_known_result_but_aborts_the_batch() {
     assert_eq!(response.completed, 1);
     assert_eq!(response.failed, 0);
     assert_eq!(response.skipped, 0);
-    assert_eq!(response.results[0].status, fcp_host::OperationResultStatus::Success);
+    assert_eq!(
+        response.results[0].status,
+        fcp_host::OperationResultStatus::Success
+    );
     assert_eq!(
         response.results[0].output.as_ref().unwrap()["side_effect_completed"],
         true
@@ -229,7 +232,10 @@ fn maximum_timeout_does_not_overflow_the_monotonic_clock() {
 #[test]
 fn first_error_still_stops_admission_without_relabeling_it_as_a_timeout() {
     let executor = BatchExecutor::new();
-    let mut batch = request(vec![operation("a", "tool", &[]), operation("b", "tool", &[])]);
+    let mut batch = request(vec![
+        operation("a", "tool", &[]),
+        operation("b", "tool", &[]),
+    ]);
     batch.options.stop_on_first_error = true;
     batch.options.timeout_ms = u64::MAX;
     let calls = std::cell::Cell::new(0);

@@ -12,14 +12,14 @@
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use fcp_host::mesh_routing::MeshRouter;
 #[cfg(test)]
 use fcp_host::ConnectorStateExportRequest;
+use fcp_host::mesh_routing::MeshRouter;
 use fcp_host::{
     ConnectorStatePullRequest, ConnectorStatePullResponse, ConnectorStateRecoveryRequest,
-    ConnectorStateRecoveryResponse,
-    ConnectorStateReplicationService, ConnectorStateTransferDirection, ConnectorStateTransferGrant,
-    ConnectorStateTransferScope, MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES,
+    ConnectorStateRecoveryResponse, ConnectorStateReplicationService,
+    ConnectorStateTransferDirection, ConnectorStateTransferGrant, ConnectorStateTransferScope,
+    MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES,
 };
 use fcp_store::{
     DurableObjectStore, DurableObjectStoreConfig, FcpStoreConnectorStateStore,
@@ -292,12 +292,12 @@ pub(super) async fn pull_handler(
 ) -> Result<Json<StatePullResponse>, (StatusCode, String)> {
     let operation = async {
         match request {
-            StatePullCommand::Single(request) => {
-                pull(&state, &connector_id, *request).await.map(StatePullResponse::Single)
-            }
-            StatePullCommand::Recovery(request) => {
-                recover(&state, &connector_id, request).await.map(StatePullResponse::Recovery)
-            }
+            StatePullCommand::Single(request) => pull(&state, &connector_id, *request)
+                .await
+                .map(StatePullResponse::Single),
+            StatePullCommand::Recovery(request) => recover(&state, &connector_id, request)
+                .await
+                .map(StatePullResponse::Recovery),
         }
     };
     fcp_async_core::time::timeout(TRANSFER_TIMEOUT, operation)
@@ -406,47 +406,76 @@ async fn recover(
     request.validate().map_err(map_host_error)?;
     let connector = parse_connector_id(connector_id)?;
     if connector != request.candidates[0].request.scope.connector_id {
-        return Err((StatusCode::BAD_REQUEST, "state-recovery path and scope differ".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "state-recovery path and scope differ".to_owned(),
+        ));
     }
     let service = state.connector_state_replication.as_ref().ok_or_else(|| {
-        (StatusCode::NOT_FOUND, "connector-state transfer is not configured".to_owned())
+        (
+            StatusCode::NOT_FOUND,
+            "connector-state transfer is not configured".to_owned(),
+        )
     })?;
     let router = state.mesh.as_ref().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, "mesh routing is unavailable".to_owned())
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mesh routing is unavailable".to_owned(),
+        )
     })?;
     // Reject the whole plan if any local grant is absent or mismatched. Do not
     // resolve a donor, start I/O, or partially execute a malformed plan first.
-    service.validate_recovery(&request).map_err(map_host_error)?;
-    let peers: Vec<_> = request.candidates.iter().map(|candidate| {
-        candidate.peer_node.parse::<TailscaleNodeId>().ok()
-            .and_then(|node| router.state_transfer_peer(&node).ok())
-    }).collect();
+    service
+        .validate_recovery(&request)
+        .map_err(map_host_error)?;
+    let peers: Vec<_> = request
+        .candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .peer_node
+                .parse::<TailscaleNodeId>()
+                .ok()
+                .and_then(|node| router.state_transfer_peer(&node).ok())
+        })
+        .collect();
     // Pin each incarnation ONCE for the whole operation. An unavailable peer
     // stays unavailable; removal/re-addition cannot resurrect an old candidate.
     // A valid different candidate may still satisfy its own independent grant.
     let pinned = &peers;
-    service.recover_from_peers(
-        &request,
-        |index, request_json| async move {
-            let peer = pinned[index].as_ref().ok_or_else(|| {
-                unavailable("state-recovery donor authority or confidential transport unavailable")
-            })?;
-            let reply = router.forward_connector_state_export(peer, request_json).await
-                .map_err(|_| unavailable("authenticated state-recovery page unavailable"))?;
-            if reply.status != StatusCode::OK.as_u16() {
-                return Err(unavailable("donor refused the exact-root state-recovery page"));
-            }
-            Ok(reply.body_json)
-        },
-        |index| {
-            let peer = pinned[index].as_ref().ok_or_else(|| {
-                unavailable("state-recovery donor authority or confidential transport unavailable")
-            })?;
-            router.check_state_transfer_peer(peer).map_err(|_| {
-                unavailable("state-recovery donor authority changed before publication")
-            })
-        },
-    ).await.map_err(map_host_error)
+    service
+        .recover_from_peers(
+            &request,
+            |index, request_json| async move {
+                let peer = pinned[index].as_ref().ok_or_else(|| {
+                    unavailable(
+                        "state-recovery donor authority or confidential transport unavailable",
+                    )
+                })?;
+                let reply = router
+                    .forward_connector_state_export(peer, request_json)
+                    .await
+                    .map_err(|_| unavailable("authenticated state-recovery page unavailable"))?;
+                if reply.status != StatusCode::OK.as_u16() {
+                    return Err(unavailable(
+                        "donor refused the exact-root state-recovery page",
+                    ));
+                }
+                Ok(reply.body_json)
+            },
+            |index| {
+                let peer = pinned[index].as_ref().ok_or_else(|| {
+                    unavailable(
+                        "state-recovery donor authority or confidential transport unavailable",
+                    )
+                })?;
+                router.check_state_transfer_peer(peer).map_err(|_| {
+                    unavailable("state-recovery donor authority changed before publication")
+                })
+            },
+        )
+        .await
+        .map_err(map_host_error)
 }
 
 /// The mesh handler has already verified the signature and consumed the nonce.

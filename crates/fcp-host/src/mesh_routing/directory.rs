@@ -154,13 +154,17 @@ pub(super) fn prepare(
     let roots: Vec<String> = serde_json::from_str(&roots_json)
         .map_err(|_| invalid("directory owner keys must be a JSON array of hex public keys"))?;
     if roots.is_empty() || roots.len() > MAX_OWNER_KEYS {
-        return Err(invalid("signed membership requires between 1 and 32 owner keys"));
+        return Err(invalid(
+            "signed membership requires between 1 and 32 owner keys",
+        ));
     }
     let trusted_owners = roots
         .iter()
         .map(|root| {
             if root.len() != 64 {
-                return Err(invalid("directory owner public key must contain 64 hex characters"));
+                return Err(invalid(
+                    "directory owner public key must contain 64 hex characters",
+                ));
             }
             let mut bytes = [0; 32];
             hex::decode_to_slice(root, &mut bytes)
@@ -231,7 +235,9 @@ impl PreparedDirectory {
             .read_to_end(&mut marker)
             .map_err(|error| storage_error("lock_read", &error))?;
         if !marker.is_empty() && marker != INITIALIZED {
-            return Err(invalid("directory checkpoint initialization marker is corrupt"));
+            return Err(invalid(
+                "directory checkpoint initialization marker is corrupt",
+            ));
         }
         match read_checkpoint(&state_path) {
             Ok(previous) => verified
@@ -239,7 +245,9 @@ impl PreparedDirectory {
                 .map_err(|error| invalid(&error.to_string()))?,
             Err(CheckpointReadError::Missing) if marker.is_empty() => {}
             Err(CheckpointReadError::Missing) => {
-                return Err(invalid("initialized directory checkpoint is missing; refusing reset"));
+                return Err(invalid(
+                    "initialized directory checkpoint is missing; refusing reset",
+                ));
             }
             Err(CheckpointReadError::Invalid(error)) => return Err(error),
         }
@@ -384,7 +392,9 @@ fn check_private_regular(file: &File) -> io::Result<()> {
         Ok(())
     }
     #[cfg(not(unix))]
-    Err(io::Error::other("signed directory persistence requires Unix file guarantees"))
+    Err(io::Error::other(
+        "signed directory persistence requires Unix file guarantees",
+    ))
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
@@ -425,8 +435,8 @@ pub(super) fn read_peer_file(path: &Path) -> HostResult<String> {
     if bytes.len() > MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES {
         return Err(invalid("peer directory source exceeds its byte limit"));
     }
-    let json = String::from_utf8(bytes)
-        .map_err(|_| invalid("peer directory source is not UTF-8"))?;
+    let json =
+        String::from_utf8(bytes).map_err(|_| invalid("peer directory source is not UTF-8"))?;
     remote::resolve_file_source(json)
 }
 
@@ -458,8 +468,16 @@ mod tests {
     fn monotonic_deadline_expires_membership_even_when_wall_time_stops() {
         let now = Instant::now();
         let validity = MembershipValidity::new(2000, 1000, now).unwrap();
-        assert!(validity.check_at(1000, now + Duration::from_millis(999)).is_ok());
-        assert!(validity.check_at(1000, now + Duration::from_millis(1000)).is_err());
+        assert!(
+            validity
+                .check_at(1000, now + Duration::from_millis(999))
+                .is_ok()
+        );
+        assert!(
+            validity
+                .check_at(1000, now + Duration::from_millis(1000))
+                .is_err()
+        );
         assert!(validity.check_at(1000, now).is_err());
     }
 
@@ -486,7 +504,8 @@ mod tests {
                 "node_id": "peer",
                 "endpoint": "http://127.0.0.1:1",
                 "public_key_hex": hex::encode(peer.verifying_key().to_bytes()),
-            }]).to_string(),
+            }])
+            .to_string(),
             forward_timeout: Duration::from_secs(1),
         };
         let mut router = MeshRouter::new(settings).unwrap();
@@ -521,21 +540,32 @@ mod tests {
             TailscaleNodeId::new("local"),
             unix_now_ms(),
             body.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(
             router.accept_inbound(&envelope),
-            Err(MeshForwardError::Malformed { field: "peer_directory", .. })
+            Err(MeshForwardError::Malformed {
+                field: "peer_directory",
+                ..
+            })
         ));
         fcp_async_core::runtime::block_on_sync(async {
             assert!(matches!(
                 router.accept_inbound_async(&envelope).await,
-                Err(MeshForwardError::Malformed { field: "peer_directory", .. })
+                Err(MeshForwardError::Malformed {
+                    field: "peer_directory",
+                    ..
+                })
             ));
-            let error = router.forward(&TailscaleNodeId::new("peer"), body).await.unwrap_err();
+            let error = router
+                .forward(&TailscaleNodeId::new("peer"), body)
+                .await
+                .unwrap_err();
             assert!(matches!(error, MeshForwardFailure::NotDelivered { .. }));
             assert!(error.summary().contains("membership expired"));
             assert!(router.peer_advertisements().await.is_empty());
-        }).unwrap();
+        })
+        .unwrap();
         assert!(router.has_owner_signed_membership());
         assert_eq!(
             router.forward_usage().unwrap(),

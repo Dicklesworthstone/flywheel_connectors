@@ -436,7 +436,10 @@ mod tests {
         assert!(!info.is_request);
         assert_eq!(info.status_code, None);
         let bytes = serde_json::to_vec(&info).unwrap();
-        assert_eq!(serde_json::from_slice::<HttpErrorInfo>(&bytes).unwrap(), info);
+        assert_eq!(
+            serde_json::from_slice::<HttpErrorInfo>(&bytes).unwrap(),
+            info
+        );
     }
 
     #[test]
@@ -449,7 +452,11 @@ mod tests {
         assert!(!info.is_connect);
         assert!(matches!(
             error.to_fcp_error("test"),
-            FcpError::External { status_code: None, retry_after: None, .. }
+            FcpError::External {
+                status_code: None,
+                retry_after: None,
+                ..
+            }
         ));
     }
 

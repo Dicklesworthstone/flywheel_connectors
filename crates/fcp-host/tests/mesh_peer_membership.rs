@@ -16,10 +16,12 @@ use fcp_host::mesh_routing::{
     MESH_NODE_ID_ENV, MESH_PEERS_ENV, MESH_PEERS_FILE_ENV, MESH_REPLAY_JOURNAL_ENV,
     MESH_SIGNING_KEY_FILE_ENV, MeshRouter, unix_now_ms,
 };
-use fcp_mesh::invoke_route::{MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshPeerConfig};
+use fcp_mesh::invoke_route::{
+    MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshPeerConfig,
+};
 use fcp_mesh::peer_manifest::{
-    MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES, MESH_PEER_DIRECTORY_SCHEMA,
-    MeshPeerDirectoryCheckpoint, MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
+    MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES, MESH_PEER_DIRECTORY_SCHEMA, MeshPeerDirectoryCheckpoint,
+    MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
 };
 
 struct Fixture {
@@ -71,22 +73,41 @@ impl Fixture {
         private_write(&key_path, hex::encode(local.to_bytes()).as_bytes());
         let env = BTreeMap::from([
             (MESH_NODE_ID_ENV.to_owned(), "node-local".to_owned()),
-            (MESH_SIGNING_KEY_FILE_ENV.to_owned(), key_path.display().to_string()),
-            (MESH_REPLAY_JOURNAL_ENV.to_owned(), dir.path().join("replay").display().to_string()),
+            (
+                MESH_SIGNING_KEY_FILE_ENV.to_owned(),
+                key_path.display().to_string(),
+            ),
+            (
+                MESH_REPLAY_JOURNAL_ENV.to_owned(),
+                dir.path().join("replay").display().to_string(),
+            ),
             (MESH_DIRECTORY_ID_ENV.to_owned(), payload.mesh_id.clone()),
-            (MESH_DIRECTORY_OWNER_KEYS_ENV.to_owned(), serde_json::json!([
-                hex::encode(owner.verifying_key().to_bytes())
-            ]).to_string()),
-            (MESH_DIRECTORY_STATE_ENV.to_owned(), dir.path().join("membership").display().to_string()),
+            (
+                MESH_DIRECTORY_OWNER_KEYS_ENV.to_owned(),
+                serde_json::json!([hex::encode(owner.verifying_key().to_bytes())]).to_string(),
+            ),
+            (
+                MESH_DIRECTORY_STATE_ENV.to_owned(),
+                dir.path().join("membership").display().to_string(),
+            ),
         ]);
-        let mut fixture = Self { dir, owner, peer, payload, env };
+        let mut fixture = Self {
+            dir,
+            owner,
+            peer,
+            payload,
+            env,
+        };
         fixture.sign();
         fixture
     }
 
     fn sign(&mut self) {
         let document = SignedMeshPeerDirectory::sign(&self.owner, &self.payload).unwrap();
-        self.env.insert(MESH_PEERS_ENV.to_owned(), serde_json::to_string(&document).unwrap());
+        self.env.insert(
+            MESH_PEERS_ENV.to_owned(),
+            serde_json::to_string(&document).unwrap(),
+        );
     }
 
     fn start(&self) -> fcp_host::HostResult<Option<MeshRouter>> {
@@ -98,7 +119,8 @@ impl Fixture {
     }
 
     fn checkpoint(&self) -> MeshPeerDirectoryCheckpoint {
-        let outer: serde_json::Value = serde_json::from_slice(&fs::read(self.state_path()).unwrap()).unwrap();
+        let outer: serde_json::Value =
+            serde_json::from_slice(&fs::read(self.state_path()).unwrap()).unwrap();
         serde_json::from_str(outer["checkpoint_json"].as_str().unwrap()).unwrap()
     }
 
@@ -108,8 +130,11 @@ impl Fixture {
             TailscaleNodeId::try_new("node-peer").unwrap(),
             TailscaleNodeId::try_new("node-local").unwrap(),
             unix_now_ms(),
-            MeshForwardBody::Introspect { connector_id: "fcp.test:utility:1.0.0".to_owned() },
-        ).unwrap()
+            MeshForwardBody::Introspect {
+                connector_id: "fcp.test:utility:1.0.0".to_owned(),
+            },
+        )
+        .unwrap()
     }
 
     fn assert_authentication_refused_without_state(&self) {
@@ -132,12 +157,22 @@ fn signed_startup_binds_membership_and_preserves_nonce_replay_across_restart() {
     router.accept_inbound(&request).unwrap();
     drop(router);
     let router = fixture.start().unwrap().unwrap();
-    assert!(matches!(router.accept_inbound(&request), Err(MeshForwardError::Replayed { .. })));
+    assert!(matches!(
+        router.accept_inbound(&request),
+        Err(MeshForwardError::Replayed { .. })
+    ));
     let checkpoint = fixture.checkpoint();
     assert_eq!(checkpoint.generation, 7);
     assert_eq!(checkpoint.mesh_id, "host-membership-test");
     assert_eq!(checkpoint.local_node, "node-local");
-    assert_eq!(fs::metadata(fixture.state_path()).unwrap().permissions().mode() & 0o077, 0);
+    assert_eq!(
+        fs::metadata(fixture.state_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
 }
 
 #[test]
@@ -150,12 +185,21 @@ fn higher_generation_removes_peer_and_restart_cannot_restore_old_membership() {
     fixture.sign();
     let router = fixture.start().unwrap().unwrap();
     assert_eq!(router.directory().len(), 0);
-    assert!(matches!(router.accept_inbound(&fixture.request()), Err(MeshForwardError::UnknownPeer(_))));
+    assert!(matches!(
+        router.accept_inbound(&fixture.request()),
+        Err(MeshForwardError::UnknownPeer(_))
+    ));
     drop(router);
     let accepted_bytes = fs::read(fixture.state_path()).unwrap();
     fixture.payload = original;
     fixture.sign();
-    assert!(fixture.start().unwrap_err().to_string().contains("precedes accepted generation"));
+    assert!(
+        fixture
+            .start()
+            .unwrap_err()
+            .to_string()
+            .contains("precedes accepted generation")
+    );
     assert_eq!(fs::read(fixture.state_path()).unwrap(), accepted_bytes);
 }
 
@@ -184,15 +228,22 @@ fn bad_signature_wrong_mesh_wrong_local_key_and_expired_document_fail_before_sto
         let mut fixture = Fixture::new();
         match scenario {
             "signature" => {
-                let mut signed: SignedMeshPeerDirectory = serde_json::from_str(&fixture.env[MESH_PEERS_ENV]).unwrap();
+                let mut signed: SignedMeshPeerDirectory =
+                    serde_json::from_str(&fixture.env[MESH_PEERS_ENV]).unwrap();
                 signed.payload_json.push(' ');
-                fixture.env.insert(MESH_PEERS_ENV.to_owned(), serde_json::to_string(&signed).unwrap());
+                fixture.env.insert(
+                    MESH_PEERS_ENV.to_owned(),
+                    serde_json::to_string(&signed).unwrap(),
+                );
             }
             "mesh" => {
-                fixture.env.insert(MESH_DIRECTORY_ID_ENV.to_owned(), "other-mesh".to_owned());
+                fixture
+                    .env
+                    .insert(MESH_DIRECTORY_ID_ENV.to_owned(), "other-mesh".to_owned());
             }
             "local_key" => {
-                fixture.payload.peers[0].public_key_hex = hex::encode(fixture.peer.verifying_key().to_bytes());
+                fixture.payload.peers[0].public_key_hex =
+                    hex::encode(fixture.peer.verifying_key().to_bytes());
                 fixture.sign();
             }
             _ => {
@@ -206,7 +257,11 @@ fn bad_signature_wrong_mesh_wrong_local_key_and_expired_document_fail_before_sto
 
 #[test]
 fn partial_empty_or_malformed_signed_configuration_never_downgrades() {
-    let options = [MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV];
+    let options = [
+        MESH_DIRECTORY_ID_ENV,
+        MESH_DIRECTORY_OWNER_KEYS_ENV,
+        MESH_DIRECTORY_STATE_ENV,
+    ];
     for missing in options {
         let mut fixture = Fixture::new();
         fixture.env.remove(missing);
@@ -217,11 +272,16 @@ fn partial_empty_or_malformed_signed_configuration_never_downgrades() {
     }
     for roots in ["[]", "{}", "[\"bad-key\"]", "null"] {
         let mut fixture = Fixture::new();
-        fixture.env.insert(MESH_DIRECTORY_OWNER_KEYS_ENV.to_owned(), roots.to_owned());
+        fixture
+            .env
+            .insert(MESH_DIRECTORY_OWNER_KEYS_ENV.to_owned(), roots.to_owned());
         fixture.assert_authentication_refused_without_state();
     }
     let mut fixture = Fixture::new();
-    fixture.env.insert(MESH_PEERS_ENV.to_owned(), serde_json::to_string(&fixture.payload.peers).unwrap());
+    fixture.env.insert(
+        MESH_PEERS_ENV.to_owned(),
+        serde_json::to_string(&fixture.payload.peers).unwrap(),
+    );
     fixture.assert_authentication_refused_without_state();
 }
 
@@ -230,10 +290,24 @@ fn checkpoint_lock_prevents_parallel_activation_even_with_distinct_replay_storag
     let mut fixture = Fixture::new();
     let active = fixture.start().unwrap().unwrap();
     let bytes = fs::read(fixture.state_path()).unwrap();
-    fixture.env.insert(MESH_REPLAY_JOURNAL_ENV.to_owned(), fixture.dir.path().join("other-replay").display().to_string());
+    fixture.env.insert(
+        MESH_REPLAY_JOURNAL_ENV.to_owned(),
+        fixture
+            .dir
+            .path()
+            .join("other-replay")
+            .display()
+            .to_string(),
+    );
     fixture.payload.generation += 1;
     fixture.sign();
-    assert!(fixture.start().unwrap_err().to_string().contains("checkpoint is locked"));
+    assert!(
+        fixture
+            .start()
+            .unwrap_err()
+            .to_string()
+            .contains("checkpoint is locked")
+    );
     assert_eq!(fs::read(fixture.state_path()).unwrap(), bytes);
     drop(active);
     drop(fixture.start().unwrap().unwrap());
@@ -244,8 +318,18 @@ fn checkpoint_lock_prevents_parallel_activation_even_with_distinct_replay_storag
 fn missing_initialized_checkpoint_is_not_silently_recreated() {
     let fixture = Fixture::new();
     drop(fixture.start().unwrap().unwrap());
-    fs::rename(fixture.state_path(), fixture.dir.path().join("retained-checkpoint")).unwrap();
-    assert!(fixture.start().unwrap_err().to_string().contains("initialized directory checkpoint is missing"));
+    fs::rename(
+        fixture.state_path(),
+        fixture.dir.path().join("retained-checkpoint"),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .start()
+            .unwrap_err()
+            .to_string()
+            .contains("initialized directory checkpoint is missing")
+    );
     assert!(!fixture.state_path().exists());
 }
 
@@ -264,7 +348,8 @@ fn corrupt_or_empty_checkpoint_is_preserved_on_failure() {
 fn checkpoint_checksum_detects_valid_json_corruption() {
     let fixture = Fixture::new();
     drop(fixture.start().unwrap().unwrap());
-    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.state_path()).unwrap()).unwrap();
     stored["checksum_hex"] = serde_json::json!("00".repeat(32));
     let corrupted = serde_json::to_vec(&stored).unwrap();
     private_write(&fixture.state_path(), &corrupted);
@@ -281,7 +366,11 @@ fn readable_or_linked_state_is_rejected_without_overwriting_targets() {
     assert!(fixture.start().is_err());
     assert_eq!(fs::read(fixture.state_path()).unwrap(), bytes);
     fs::set_permissions(fixture.state_path(), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::hard_link(fixture.state_path(), fixture.dir.path().join("retained-hard-link")).unwrap();
+    fs::hard_link(
+        fixture.state_path(),
+        fixture.dir.path().join("retained-hard-link"),
+    )
+    .unwrap();
     assert!(fixture.start().is_err());
     assert_eq!(fs::read(fixture.state_path()).unwrap(), bytes);
 }
@@ -305,7 +394,10 @@ fn symlink_checkpoint_and_hardlinked_staging_do_not_modify_other_files() {
 #[test]
 fn reserved_staging_file_can_be_recovered_after_interrupted_write() {
     let fixture = Fixture::new();
-    private_write(&fixture.dir.path().join("membership.next"), b"interrupted staging record");
+    private_write(
+        &fixture.dir.path().join("membership.next"),
+        b"interrupted staging record",
+    );
     drop(fixture.start().unwrap().unwrap());
     assert_eq!(fixture.checkpoint().generation, 7);
     assert!(!fixture.dir.path().join("membership.next").exists());
@@ -315,8 +407,13 @@ fn reserved_staging_file_can_be_recovered_after_interrupted_write() {
 fn signed_file_source_works_and_oversized_input_fails_before_state() {
     let mut fixture = Fixture::new();
     let path = fixture.dir.path().join("signed-peers.json");
-    private_write(&path, fixture.env.remove(MESH_PEERS_ENV).unwrap().as_bytes());
-    fixture.env.insert(MESH_PEERS_FILE_ENV.to_owned(), path.display().to_string());
+    private_write(
+        &path,
+        fixture.env.remove(MESH_PEERS_ENV).unwrap().as_bytes(),
+    );
+    fixture
+        .env
+        .insert(MESH_PEERS_FILE_ENV.to_owned(), path.display().to_string());
     drop(fixture.start().unwrap().unwrap());
     assert_eq!(fixture.checkpoint().generation, 7);
 
@@ -324,17 +421,26 @@ fn signed_file_source_works_and_oversized_input_fails_before_state() {
     let path = oversized.dir.path().join("oversized.json");
     private_write(&path, &vec![b' '; MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES + 1]);
     oversized.env.remove(MESH_PEERS_ENV);
-    oversized.env.insert(MESH_PEERS_FILE_ENV.to_owned(), path.display().to_string());
+    oversized
+        .env
+        .insert(MESH_PEERS_FILE_ENV.to_owned(), path.display().to_string());
     oversized.assert_authentication_refused_without_state();
 }
 
 #[test]
 fn explicit_static_directory_remains_distinct_from_owner_signed_mode() {
     let mut fixture = Fixture::new();
-    for key in [MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV] {
+    for key in [
+        MESH_DIRECTORY_ID_ENV,
+        MESH_DIRECTORY_OWNER_KEYS_ENV,
+        MESH_DIRECTORY_STATE_ENV,
+    ] {
         fixture.env.remove(key);
     }
-    fixture.env.insert(MESH_PEERS_ENV.to_owned(), serde_json::to_string(&fixture.payload.peers).unwrap());
+    fixture.env.insert(
+        MESH_PEERS_ENV.to_owned(),
+        serde_json::to_string(&fixture.payload.peers).unwrap(),
+    );
     let router = fixture.start().unwrap().unwrap();
     assert!(!router.has_owner_signed_membership());
     assert!(router.has_durable_replay());

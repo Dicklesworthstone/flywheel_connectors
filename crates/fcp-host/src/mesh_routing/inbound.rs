@@ -126,7 +126,8 @@ impl InboundReplayWorker {
                             // work accumulated during a mutex wait can share
                             // the sync. Never delay a lone request to fill up.
                             extend_ready_group(&mut group, &receiver);
-                            let identities = group.iter()
+                            let identities = group
+                                .iter()
                                 .map(|request| &request.identity)
                                 .collect::<Vec<_>>();
                             // One clock sample under the lock preserves order
@@ -145,7 +146,9 @@ impl InboundReplayWorker {
                 }
             })
             .map_err(|error| {
-                HostError::Internal(format!("cannot start mesh replay admission worker: {error}"))
+                HostError::Internal(format!(
+                    "cannot start mesh replay admission worker: {error}"
+                ))
             })?;
         Ok(Self {
             sender: Some(sender),
@@ -277,7 +280,9 @@ mod tests {
     }
 
     fn result(receiver: oneshot::Receiver<AdmissionResult>) -> AdmissionResult {
-        fcp_async_core::runtime::block_on_sync(receiver).unwrap().unwrap()
+        fcp_async_core::runtime::block_on_sync(receiver)
+            .unwrap()
+            .unwrap()
     }
 
     fn unavailable(error: &MeshForwardError, reason: &str) -> bool {
@@ -312,7 +317,10 @@ mod tests {
         let pending = worker.submit(identity(READY)).unwrap();
         now.store(READY + WINDOW + 1, Ordering::SeqCst);
         drop(held);
-        assert!(matches!(result(pending), Err(MeshForwardError::Stale { .. })));
+        assert!(matches!(
+            result(pending),
+            Err(MeshForwardError::Stale { .. })
+        ));
         result(worker.submit(identity(READY + WINDOW + 1)).unwrap()).unwrap();
     }
 
@@ -320,7 +328,8 @@ mod tests {
     fn full_queue_refuses_without_waiting_for_disk_or_mutex() {
         let dir = tempfile::tempdir().unwrap();
         let state = state(&dir.path().join("replay"));
-        let worker = InboundReplayWorker::spawn_with_clock(Arc::clone(&state), 1, || READY).unwrap();
+        let worker =
+            InboundReplayWorker::spawn_with_clock(Arc::clone(&state), 1, || READY).unwrap();
         let held = state.lock().unwrap();
         let mut receivers = Vec::new();
         let mut refused = Vec::new();
@@ -389,8 +398,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = state(&dir.path().join("replay"));
         let worker = InboundReplayWorker::spawn_with_clock(state, 2, || READY).unwrap();
-        let error = result(worker.submit(identity_for("another-executor", READY)).unwrap())
-            .unwrap_err();
+        let error = result(
+            worker
+                .submit(identity_for("another-executor", READY))
+                .unwrap(),
+        )
+        .unwrap_err();
         assert!(unavailable(&error, "node_scope_mismatch"));
         result(worker.submit(identity(READY)).unwrap()).unwrap();
     }
@@ -401,10 +414,9 @@ mod tests {
         let state = state(&dir.path().join("replay"));
         let now = Arc::new(AtomicU64::new(READY + 1));
         let clock = Arc::clone(&now);
-        let worker = InboundReplayWorker::spawn_with_clock(state, 2, move || {
-            clock.load(Ordering::SeqCst)
-        })
-        .unwrap();
+        let worker =
+            InboundReplayWorker::spawn_with_clock(state, 2, move || clock.load(Ordering::SeqCst))
+                .unwrap();
         result(worker.submit(identity(READY)).unwrap()).unwrap();
         now.store(READY, Ordering::SeqCst);
         let error = result(worker.submit(identity(READY)).unwrap()).unwrap_err();
@@ -446,7 +458,10 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert!(unavailable(&error, "replay_admission_deadline"));
-        assert!(sender.send(Ok(())).is_err(), "late success cannot revive the caller");
+        assert!(
+            sender.send(Ok(())).is_err(),
+            "late success cannot revive the caller"
+        );
     }
 
     #[test]
@@ -480,7 +495,8 @@ mod tests {
     fn timed_out_job_can_commit_without_dispatch_or_replay() {
         let dir = tempfile::tempdir().unwrap();
         let state = state(&dir.path().join("replay"));
-        let worker = InboundReplayWorker::spawn_with_clock(Arc::clone(&state), 2, || READY).unwrap();
+        let worker =
+            InboundReplayWorker::spawn_with_clock(Arc::clone(&state), 2, || READY).unwrap();
         let held = state.lock().unwrap();
         let nonce = identity(READY);
         let receiver = worker.submit(nonce.clone()).unwrap();
@@ -506,12 +522,9 @@ mod tests {
     fn one_origin_cannot_monopolize_the_journal_queue() {
         let dir = tempfile::tempdir().unwrap();
         let state = state(&dir.path().join("replay"));
-        let worker = InboundReplayWorker::spawn_with_clock(
-            Arc::clone(&state),
-            QUEUE_CAPACITY,
-            || READY,
-        )
-        .unwrap();
+        let worker =
+            InboundReplayWorker::spawn_with_clock(Arc::clone(&state), QUEUE_CAPACITY, || READY)
+                .unwrap();
         let held = state.lock().unwrap();
         let cancelled_nonce = identity(READY);
         let cancelled = worker.submit(cancelled_nonce.clone()).unwrap();
@@ -520,11 +533,19 @@ mod tests {
             pending.push(worker.submit(identity(READY)).unwrap());
         }
         let refused_nonce = identity(READY);
-        let refusal = worker.submit(refused_nonce.clone()).err().expect("peer limit");
+        let refusal = worker
+            .submit(refused_nonce.clone())
+            .err()
+            .expect("peer limit");
         assert!(unavailable(&refusal, "replay_admission_peer_limit"));
-        let other = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        let other = worker
+            .submit(identity_from("other", "executor", READY))
+            .unwrap();
         drop(cancelled);
-        let refusal = worker.submit(identity(READY)).err().expect("job still pending");
+        let refusal = worker
+            .submit(identity(READY))
+            .err()
+            .expect("job still pending");
         assert!(unavailable(&refusal, "replay_admission_peer_limit"));
         assert_eq!(
             worker.peers.pending.lock().unwrap().get("origin").copied(),
@@ -560,7 +581,11 @@ mod tests {
         );
         drop(receiver.try_recv().unwrap());
         assert!(worker.peers.pending.lock().unwrap().is_empty());
-        assert!(fcp_async_core::runtime::block_on_sync(accepted).unwrap().is_err());
+        assert!(
+            fcp_async_core::runtime::block_on_sync(accepted)
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
@@ -572,12 +597,18 @@ mod tests {
             peers: Arc::new(PeerAdmissions::default()),
         };
         let first = worker.submit(identity(READY)).unwrap();
-        let second = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        let second = worker
+            .submit(identity_from("other", "executor", READY))
+            .unwrap();
         drop(receiver);
         drop(worker.sender.take());
         assert!(worker.peers.pending.lock().unwrap().is_empty());
         for response in [first, second] {
-            assert!(fcp_async_core::runtime::block_on_sync(response).unwrap().is_err());
+            assert!(
+                fcp_async_core::runtime::block_on_sync(response)
+                    .unwrap()
+                    .is_err()
+            );
         }
     }
 
@@ -620,7 +651,11 @@ mod tests {
             available: AtomicBool::new(false),
         });
         let waker = Waker::from(Arc::clone(&observer));
-        assert!(Pin::new(&mut first).poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            Pin::new(&mut first)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         drop(receiver.try_recv().unwrap());
         assert!(observer.available.load(Ordering::SeqCst));
         drop(receiver);
@@ -632,12 +667,9 @@ mod tests {
     fn peer_slots_are_released_before_success_and_error_notifications() {
         let dir = tempfile::tempdir().unwrap();
         let state = state(&dir.path().join("replay"));
-        let worker = InboundReplayWorker::spawn_with_clock(
-            state,
-            QUEUE_CAPACITY,
-            || READY + WINDOW + 1,
-        )
-        .unwrap();
+        let worker =
+            InboundReplayWorker::spawn_with_clock(state, QUEUE_CAPACITY, || READY + WINDOW + 1)
+                .unwrap();
         assert!(matches!(
             result(worker.submit(identity(READY)).unwrap()),
             Err(MeshForwardError::Stale { .. }),
@@ -675,7 +707,9 @@ mod tests {
         }));
         assert!(outcome.is_err());
         drop(permit);
-        let failure = PeerAdmissions::reserve(&peers, "other").err().expect("poison persists");
+        let failure = PeerAdmissions::reserve(&peers, "other")
+            .err()
+            .expect("poison persists");
         assert!(unavailable(&failure, "replay_peer_admission_poisoned"));
         assert!(peers.pending.lock().unwrap_err().into_inner().is_empty());
     }
@@ -732,21 +766,36 @@ mod tests {
         };
         let mut responses = Vec::new();
         for index in 0..QUEUE_CAPACITY {
-            responses.push(worker.submit(identity_from(
-                &format!("origin-{index}"), "executor", READY,
-            )).unwrap());
+            responses.push(
+                worker
+                    .submit(identity_from(&format!("origin-{index}"), "executor", READY))
+                    .unwrap(),
+            );
         }
         let first = receiver.try_recv().unwrap();
-        responses.push(worker.submit(identity_from("last", "executor", READY)).unwrap());
+        responses.push(
+            worker
+                .submit(identity_from("last", "executor", READY))
+                .unwrap(),
+        );
         let mut group = vec![first];
         extend_ready_group(&mut group, &receiver);
         assert_eq!(group.len(), MAX_REPLAY_GROUP_SIZE);
-        assert_eq!(worker.peers.pending.lock().unwrap().values().sum::<usize>(), MAX_PENDING_TOTAL);
-        let failure = worker.submit(identity_from("overflow", "executor", READY))
-            .err().expect("group still occupies capacity");
+        assert_eq!(
+            worker.peers.pending.lock().unwrap().values().sum::<usize>(),
+            MAX_PENDING_TOTAL
+        );
+        let failure = worker
+            .submit(identity_from("overflow", "executor", READY))
+            .err()
+            .expect("group still occupies capacity");
         assert!(unavailable(&failure, "replay_admission_total_limit"));
         drop(group.pop().unwrap());
-        responses.push(worker.submit(identity_from("overflow", "executor", READY)).unwrap());
+        responses.push(
+            worker
+                .submit(identity_from("overflow", "executor", READY))
+                .unwrap(),
+        );
         drop(group);
         drop(receiver);
         drop(responses);
@@ -761,22 +810,29 @@ mod tests {
         let state = state(&dir.path().join("replay"));
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
-        let worker = InboundReplayWorker::spawn_with_clock(
-            Arc::clone(&state), QUEUE_CAPACITY, move || {
+        let worker =
+            InboundReplayWorker::spawn_with_clock(Arc::clone(&state), QUEUE_CAPACITY, move || {
                 observed.fetch_add(1, Ordering::SeqCst);
                 READY
-            },
-        ).unwrap();
+            })
+            .unwrap();
         let held = state.lock().unwrap();
         let first = identity(READY);
         let accepted = worker.submit(first.clone()).unwrap();
-        let other = worker.submit(identity_from("other", "executor", READY)).unwrap();
+        let other = worker
+            .submit(identity_from("other", "executor", READY))
+            .unwrap();
         let duplicate = worker.submit(first).unwrap();
-        let stale = worker.submit(identity_from("stale", "executor", READY - WINDOW - 1)).unwrap();
+        let stale = worker
+            .submit(identity_from("stale", "executor", READY - WINDOW - 1))
+            .unwrap();
         drop(held);
         result(accepted).unwrap();
         result(other).unwrap();
-        assert!(matches!(result(duplicate), Err(MeshForwardError::Replayed { .. })));
+        assert!(matches!(
+            result(duplicate),
+            Err(MeshForwardError::Replayed { .. })
+        ));
         assert!(matches!(result(stale), Err(MeshForwardError::Stale { .. })));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(worker.peers.pending.lock().unwrap().is_empty());

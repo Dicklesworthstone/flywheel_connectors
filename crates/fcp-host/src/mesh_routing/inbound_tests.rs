@@ -61,7 +61,8 @@ impl Fixture {
             TailscaleNodeId::new("executor"),
             unix_now_ms(),
             MeshForwardBody::Invoke {
-                request_json: "{\"operation\":\"test.echo\",\"capability\":\"not-a-real-secret\"}".to_owned(),
+                request_json: "{\"operation\":\"test.echo\",\"capability\":\"not-a-real-secret\"}"
+                    .to_owned(),
                 asserted_principal: Some("agent:test".to_owned()),
             },
         )
@@ -174,7 +175,9 @@ fn first_async_poll_does_not_wait_for_the_journal_mutex() {
     let held = router.durable_replay.as_ref().unwrap().lock().unwrap();
     let thread = std::thread::spawn(move || {
         let mut future = Box::pin(other.accept_inbound_async(&envelope));
-        let first = future.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let first = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
         let _ = sender.send(first.is_pending());
         match first {
             Poll::Ready(result) => result,
@@ -186,6 +189,9 @@ fn first_async_poll_does_not_wait_for_the_journal_mutex() {
     let first_poll = receiver.recv_timeout(Duration::from_secs(5));
     drop(held);
     let result = thread.join().unwrap();
-    assert!(first_poll.unwrap(), "journal I/O must not block async polling");
+    assert!(
+        first_poll.unwrap(),
+        "journal I/O must not block async polling"
+    );
     result.unwrap();
 }

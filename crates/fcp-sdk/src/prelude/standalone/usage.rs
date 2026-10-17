@@ -78,9 +78,9 @@ impl Scope {
         // Never inspect an unverified token or accept a caller's separate
         // constraint object as authority for its budget.
         let claims = token.claims();
-        let raw = claims.get(fcp2_claims::CONSTRAINTS).ok_or_else(|| {
-            denied("Verified capability has no constraints")
-        })?;
+        let raw = claims
+            .get(fcp2_claims::CONSTRAINTS)
+            .ok_or_else(|| denied("Verified capability has no constraints"))?;
         let mut encoded = Vec::new();
         ciborium::into_writer(raw, &mut encoded)
             .map_err(|_| denied("Cannot decode verified capability constraints"))?;
@@ -93,23 +93,32 @@ impl Scope {
             hasher.finalize().into()
         });
         if (constraints.max_calls.is_some() || constraints.max_bytes.is_some()) && key.is_none() {
-            return Err(denied("A usage-limited capability requires a non-empty signed token ID"));
+            return Err(denied(
+                "A usage-limited capability requires a non-empty signed token ID",
+            ));
         }
         // Bind an account to the canonical SIGNED claims, not a mutable COSE
         // envelope, signature encoding, request ID, operation, or input. A
         // caller cannot reset accounting by changing unprotected headers or
         // alternating between operations granted by the same token.
-        let canonical = claims.to_cbor()
+        let canonical = claims
+            .to_cbor()
             .map_err(|_| denied("Cannot identify verified capability grant"))?;
         let grant = Sha256::digest(&canonical).into();
-        Ok(Self { key, grant, constraints })
+        Ok(Self {
+            key,
+            grant,
+            constraints,
+        })
     }
 
     fn check_key(&self, supplied: Option<&str>) -> FcpResult<()> {
         if let Some(required) = self.constraints.idempotency_key.as_deref()
             && supplied != Some(required)
         {
-            return Err(denied("Invocation does not match the signed idempotency key scope"));
+            return Err(denied(
+                "Invocation does not match the signed idempotency key scope",
+            ));
         }
         Ok(())
     }
@@ -130,25 +139,32 @@ impl UsageLedger {
             return Err(denied("Signed token ID was reused for a different grant"));
         }
         if let Some(limit) = scope.constraints.max_calls {
-            let next = account.map_or(0, |account| account.spent).checked_add(1)
+            let next = account
+                .map_or(0, |account| account.spent)
+                .checked_add(1)
                 .ok_or_else(|| denied("Signed capability call budget exhausted"))?;
             if DefaultConstraintEnforcer::new()
-                .enforce_scope_ceiling(Some(limit), None, next, 0).is_deny()
+                .enforce_scope_ceiling(Some(limit), None, next, 0)
+                .is_deny()
             {
                 return Err(denied("Signed capability call budget exhausted"));
             }
         }
         if let Some(limit) = scope.constraints.max_bytes {
-            let next = account.map_or(0, |account| account.bytes).checked_add(1)
+            let next = account
+                .map_or(0, |account| account.bytes)
+                .checked_add(1)
                 .ok_or_else(|| denied("Signed capability byte budget exhausted"))?;
             if DefaultConstraintEnforcer::new()
-                .enforce_scope_ceiling(None, Some(limit), 0, next).is_deny()
+                .enforce_scope_ceiling(None, Some(limit), 0, next)
+                .is_deny()
             {
                 return Err(denied("Signed capability byte budget exhausted"));
             }
         }
         if (scope.constraints.max_calls.is_some() || scope.constraints.max_bytes.is_some())
-            && account.is_none() && entries.len() >= self.capacity
+            && account.is_none()
+            && entries.len() >= self.capacity
         {
             return Err(FcpError::ResourceExhausted {
                 resource: "standalone capability usage ledger capacity".into(),
@@ -175,18 +191,29 @@ impl UsageLedger {
         // The legacy admission API has no response boundary to meter. Never
         // silently ignore a finite byte grant; require bounded admission.
         if scope.constraints.max_bytes.is_some() {
-            return Err(denied("Byte-limited capabilities require bounded admission"));
+            return Err(denied(
+                "Byte-limited capabilities require bounded admission",
+            ));
         }
         let mut entries = self.lock()?;
         self.check_scope(&entries, &scope)?;
         if scope.constraints.max_calls.is_some() {
-            let key = scope.key.ok_or_else(|| denied("Call-limited capability has no token ID"))?;
-            let account = entries.entry(key).or_insert(Account { grant: scope.grant, spent: 0, bytes: 0 });
+            let key = scope
+                .key
+                .ok_or_else(|| denied("Call-limited capability has no token ID"))?;
+            let account = entries.entry(key).or_insert(Account {
+                grant: scope.grant,
+                spent: 0,
+                bytes: 0,
+            });
             // check_scope proved this increment fits and is within the signed
             // ceiling. Retain it on every subsequent outcome, including Drop.
             account.spent += 1;
         }
-        Ok(StandaloneInvocation { token, completion: None })
+        Ok(StandaloneInvocation {
+            token,
+            completion: None,
+        })
     }
 }
 
@@ -207,7 +234,11 @@ mod tests {
 
     use super::*;
 
-    fn token(limit: Option<u32>, id: &[u8], key_scope: Option<&str>) -> CapabilityToken<BoundVerified> {
+    fn token(
+        limit: Option<u32>,
+        id: &[u8],
+        key_scope: Option<&str>,
+    ) -> CapabilityToken<BoundVerified> {
         let key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
         let instance = InstanceId::try_from("inst_usage_fixture".to_owned()).unwrap();
         let constraints = CapabilityConstraints {
@@ -228,12 +259,18 @@ mod tests {
             .target_instance(instance.as_str())
             .token_id(id)
             .validity(now, now + Duration::hours(1))
-            .try_constraints_cbor(&cbor).unwrap()
-            .sign(&key).unwrap();
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(&key)
+            .unwrap();
         CapabilityVerifier::new(key.verifying_key().to_bytes(), ZoneId::work(), instance)
-            .verify_bound(CapabilityToken::from_raw(raw),
+            .verify_bound(
+                CapabilityToken::from_raw(raw),
                 &CapabilityId::from_static("fixture.read"),
-                &OperationId::from_static("fixture.get"), &[]).unwrap()
+                &OperationId::from_static("fixture.get"),
+                &[],
+            )
+            .unwrap()
     }
 
     #[test]
@@ -251,7 +288,9 @@ mod tests {
     fn previews_do_not_consume_or_allocate() {
         let ledger = UsageLedger::default();
         let token = token(Some(1), b"grant", None);
-        for _ in 0..20 { ledger.check(&token).unwrap(); }
+        for _ in 0..20 {
+            ledger.check(&token).unwrap();
+        }
         assert!(ledger.lock().unwrap().is_empty());
         ledger.admit(token, None).unwrap();
         assert_eq!(ledger.lock().unwrap().len(), 1);
@@ -268,9 +307,14 @@ mod tests {
 
     #[test]
     fn unlimited_tokens_do_not_fill_the_ledger() {
-        let ledger = UsageLedger { capacity: 0, ..UsageLedger::default() };
+        let ledger = UsageLedger {
+            capacity: 0,
+            ..UsageLedger::default()
+        };
         let token = token(None, b"grant", None);
-        for _ in 0..20 { ledger.admit(token.clone(), None).unwrap(); }
+        for _ in 0..20 {
+            ledger.admit(token.clone(), None).unwrap();
+        }
         assert!(ledger.lock().unwrap().is_empty());
     }
 
@@ -285,7 +329,11 @@ mod tests {
     fn changed_signed_grant_cannot_refill_the_same_token_id() {
         let ledger = UsageLedger::default();
         ledger.admit(token(Some(1), b"shared", None), None).unwrap();
-        assert!(ledger.admit(token(Some(10), b"shared", None), None).is_err());
+        assert!(
+            ledger
+                .admit(token(Some(10), b"shared", None), None)
+                .is_err()
+        );
         assert!(ledger.admit(token(None, b"shared", None), None).is_err());
     }
 
@@ -299,11 +347,16 @@ mod tests {
 
     #[test]
     fn capacity_pressure_never_evicts_or_resets_spent_grants() {
-        let ledger = UsageLedger { capacity: 1, ..UsageLedger::default() };
+        let ledger = UsageLedger {
+            capacity: 1,
+            ..UsageLedger::default()
+        };
         let first = token(Some(2), b"first", None);
         ledger.admit(first.clone(), None).unwrap();
-        assert!(matches!(ledger.admit(token(Some(1), b"second", None), None),
-            Err(FcpError::ResourceExhausted { .. })));
+        assert!(matches!(
+            ledger.admit(token(Some(1), b"second", None), None),
+            Err(FcpError::ResourceExhausted { .. })
+        ));
         ledger.admit(first.clone(), None).unwrap();
         assert!(ledger.admit(first, None).is_err());
         assert_eq!(ledger.lock().unwrap().len(), 1);
@@ -325,13 +378,17 @@ mod tests {
         let ledger = Arc::new(UsageLedger::default());
         let token = token(Some(7), b"concurrent", None);
         let admitted = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..32).map(|_| {
-                let ledger = Arc::clone(&ledger);
-                let token = token.clone();
-                scope.spawn(move || ledger.admit(token, None).is_ok())
-            }).collect();
-            handles.into_iter()
-                .map(|handle| usize::from(handle.join().unwrap())).sum::<usize>()
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    let ledger = Arc::clone(&ledger);
+                    let token = token.clone();
+                    scope.spawn(move || ledger.admit(token, None).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>()
         });
         assert_eq!(admitted, 7);
         assert!(ledger.check(&token).is_err());
@@ -342,7 +399,14 @@ mod tests {
         let ledger = UsageLedger::default();
         let token = token(Some(u32::MAX), b"last", None);
         let scope = Scope::from_verified(&token).unwrap();
-        ledger.lock().unwrap().insert(scope.key.unwrap(), Account { grant: scope.grant, spent: u32::MAX - 1, bytes: 0 });
+        ledger.lock().unwrap().insert(
+            scope.key.unwrap(),
+            Account {
+                grant: scope.grant,
+                spent: u32::MAX - 1,
+                bytes: 0,
+            },
+        );
         ledger.admit(token.clone(), None).unwrap();
         assert!(ledger.admit(token, None).is_err());
     }
@@ -352,23 +416,35 @@ mod tests {
         let ledger = UsageLedger::default();
         std::thread::scope(|scope| {
             let ledger = &ledger;
-            let _ = scope.spawn(move || {
-                let _guard = ledger.entries.lock().unwrap();
-                panic!("test poison");
-            }).join();
+            let _ = scope
+                .spawn(move || {
+                    let _guard = ledger.entries.lock().unwrap();
+                    panic!("test poison");
+                })
+                .join();
         });
-        assert!(matches!(ledger.admit(token(Some(1), b"grant", None), None),
-            Err(FcpError::Internal { .. })));
+        assert!(matches!(
+            ledger.admit(token(Some(1), b"grant", None), None),
+            Err(FcpError::Internal { .. })
+        ));
     }
 
     #[test]
     fn permit_debug_never_prints_authenticated_claims_or_scoped_keys() {
         let ledger = UsageLedger::default();
-        let permit = ledger.admit(token(Some(1), b"secret-cti", Some("secret-key")), Some("secret-key")).unwrap();
+        let permit = ledger
+            .admit(
+                token(Some(1), b"secret-cti", Some("secret-key")),
+                Some("secret-key"),
+            )
+            .unwrap();
         let text = format!("{permit:?}");
         assert!(text.contains("redacted"));
         assert!(!text.contains("secret"));
-        assert_eq!(permit.token().claims().get_jti(), Some(b"secret-cti".as_slice()));
+        assert_eq!(
+            permit.token().claims().get_jti(),
+            Some(b"secret-cti".as_slice())
+        );
     }
 
     #[test]
@@ -377,14 +453,18 @@ mod tests {
         let original = token(Some(2), b"shared-operation-budget", None);
         let key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
         let verifier = CapabilityVerifier::new(
-            key.verifying_key().to_bytes(), ZoneId::work(),
+            key.verifying_key().to_bytes(),
+            ZoneId::work(),
             InstanceId::try_from("inst_usage_fixture".to_owned()).unwrap(),
         );
-        let other = verifier.verify_bound(
-            CapabilityToken::from_raw(original.raw().clone()),
-            &CapabilityId::from_static("fixture.read"),
-            &OperationId::from_static("fixture.list"), &[],
-        ).unwrap();
+        let other = verifier
+            .verify_bound(
+                CapabilityToken::from_raw(original.raw().clone()),
+                &CapabilityId::from_static("fixture.read"),
+                &OperationId::from_static("fixture.list"),
+                &[],
+            )
+            .unwrap();
         ledger.admit(original.clone(), None).unwrap();
         ledger.admit(other.clone(), None).unwrap();
         assert!(ledger.admit(original, None).is_err());
@@ -419,14 +499,17 @@ mod tests {
         let raw = fcp_crypto::cose::CoseToken::from_cbor(&changed).unwrap();
         let key = Ed25519SigningKey::from_bytes(&[41; 32]).unwrap();
         let verifier = CapabilityVerifier::new(
-            key.verifying_key().to_bytes(), ZoneId::work(),
+            key.verifying_key().to_bytes(),
+            ZoneId::work(),
             InstanceId::try_from("inst_usage_fixture".to_owned()).unwrap(),
         );
         // A verifier may reject extra unprotected headers outright. If it
         // accepts them, the unchanged signed claims still name a spent grant.
         if let Ok(verified) = verifier.verify_bound(
-            CapabilityToken::from_raw(raw), &CapabilityId::from_static("fixture.read"),
-            &OperationId::from_static("fixture.get"), &[],
+            CapabilityToken::from_raw(raw),
+            &CapabilityId::from_static("fixture.read"),
+            &OperationId::from_static("fixture.get"),
+            &[],
         ) {
             assert!(ledger.admit(verified, None).is_err());
         }

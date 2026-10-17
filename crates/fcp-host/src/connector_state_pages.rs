@@ -50,7 +50,10 @@ impl PageRequest {
             || self.offset >= self.export.limits.max_wire_bytes
             || self.offset % PAGE_BYTES != 0
             || (self.offset == 0) != self.wire_digest.is_none()
-            || self.wire_digest.as_deref().is_some_and(|digest| !valid_digest(digest))
+            || self
+                .wire_digest
+                .as_deref()
+                .is_some_and(|digest| !valid_digest(digest))
         {
             return Err(invalid("invalid connector-state page request"));
         }
@@ -62,7 +65,9 @@ impl PageRequest {
         let wire = serde_json::to_string(self)
             .map_err(|_| invalid("connector-state page request cannot be encoded"))?;
         if wire.len() > MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES {
-            return Err(invalid("connector-state page request exceeds its wire limit"));
+            return Err(invalid(
+                "connector-state page request exceeds its wire limit",
+            ));
         }
         Ok(wire)
     }
@@ -87,7 +92,9 @@ enum ExportWireRequest {
 
 fn valid_digest(digest: &str) -> bool {
     digest.len() == 64
-        && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn invalid(message: &str) -> HostError {
@@ -100,8 +107,8 @@ fn stable_export_wire(wire: String, limit: usize) -> HostResult<String> {
     }
     // Map iteration order is not a stable transfer identity. Sort nested JSON
     // objects even when a downstream dependency enables preserve_order.
-    let mut value: serde_json::Value = serde_json::from_str(&wire)
-        .map_err(|_| invalid("connector-state export is malformed"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&wire).map_err(|_| invalid("connector-state export is malformed"))?;
     drop(wire);
     value.sort_all_objects();
     let wire = serde_json::to_string(&value)
@@ -114,7 +121,11 @@ fn stable_export_wire(wire: String, limit: usize) -> HostResult<String> {
 
 #[cfg(test)]
 fn encode_page(request: &PageRequest, wire: &str) -> HostResult<String> {
-    encode_page_with_digest(request, wire, blake3::hash(wire.as_bytes()).to_hex().as_str())
+    encode_page_with_digest(
+        request,
+        wire,
+        blake3::hash(wire.as_bytes()).to_hex().as_str(),
+    )
 }
 
 fn encode_page_with_digest(request: &PageRequest, wire: &str, digest: &str) -> HostResult<String> {
@@ -124,9 +135,15 @@ fn encode_page_with_digest(request: &PageRequest, wire: &str, digest: &str) -> H
         || total_bytes > request.export.limits.max_wire_bytes
         || request.offset >= total_bytes
     {
-        return Err(invalid("connector-state export does not fit the requested page bounds"));
+        return Err(invalid(
+            "connector-state export does not fit the requested page bounds",
+        ));
     }
-    if request.wire_digest.as_deref().is_some_and(|expected| expected != digest) {
+    if request
+        .wire_digest
+        .as_deref()
+        .is_some_and(|expected| expected != digest)
+    {
         return Err(invalid("connector-state export changed between pages"));
     }
     let end = request.offset.saturating_add(PAGE_BYTES).min(total_bytes);
@@ -160,8 +177,8 @@ impl Assembly {
         if wire.len() > MAX_PAGE_WIRE_BYTES {
             return Err(invalid("connector-state page exceeds its envelope limit"));
         }
-        let page: PageResponse = serde_json::from_str(wire)
-            .map_err(|_| invalid("connector-state page is malformed"))?;
+        let page: PageResponse =
+            serde_json::from_str(wire).map_err(|_| invalid("connector-state page is malformed"))?;
         if page.schema_version != PAGE_SCHEMA
             || page.request != *request
             || request.offset != self.bytes.len()
@@ -171,14 +188,23 @@ impl Assembly {
             || page.total_bytes > MAX_CONNECTOR_STATE_TRANSFER_WIRE_BYTES
             || request.offset >= page.total_bytes
             || !valid_digest(&page.wire_digest)
-            || self.total_bytes.is_some_and(|total| total != page.total_bytes)
-            || self.digest.as_ref().is_some_and(|digest| digest != &page.wire_digest)
+            || self
+                .total_bytes
+                .is_some_and(|total| total != page.total_bytes)
+            || self
+                .digest
+                .as_ref()
+                .is_some_and(|digest| digest != &page.wire_digest)
         {
-            return Err(invalid("connector-state page does not match the admitted transfer"));
+            return Err(invalid(
+                "connector-state page does not match the admitted transfer",
+            ));
         }
         let expected_bytes = PAGE_BYTES.min(page.total_bytes - request.offset);
         if page.data_hex.len() != expected_bytes * 2 {
-            return Err(invalid("connector-state page has an invalid payload length"));
+            return Err(invalid(
+                "connector-state page has an invalid payload length",
+            ));
         }
         let decoded = hex::decode(&page.data_hex)
             .map_err(|_| invalid("connector-state page payload is malformed"))?;
@@ -192,10 +218,11 @@ impl Assembly {
         if self.total_bytes != Some(self.bytes.len())
             || self.digest.as_deref() != Some(blake3::hash(&self.bytes).to_hex().as_str())
         {
-            return Err(invalid("connector-state transfer is incomplete or its digest differs"));
+            return Err(invalid(
+                "connector-state transfer is incomplete or its digest differs",
+            ));
         }
-        String::from_utf8(self.bytes)
-            .map_err(|_| invalid("connector-state transfer is not UTF-8"))
+        String::from_utf8(self.bytes).map_err(|_| invalid("connector-state transfer is not UTF-8"))
     }
 }
 
@@ -226,13 +253,16 @@ impl ConnectorStateReplicationService {
         F: Fn() -> HostResult<()> + Send + Sync,
     {
         if request_json.len() > MAX_CONNECTOR_STATE_EXPORT_REQUEST_BYTES {
-            return Err(invalid("connector-state export request exceeds its wire limit"));
+            return Err(invalid(
+                "connector-state export request exceeds its wire limit",
+            ));
         }
         let request: ExportWireRequest = serde_json::from_str(request_json)
             .map_err(|_| invalid("connector-state export request is malformed"))?;
         match request {
             ExportWireRequest::Complete(request) => {
-                self.export_for_peer(authenticated_peer, &request, authorize_transport).await
+                self.export_for_peer(authenticated_peer, &request, authorize_transport)
+                    .await
             }
             ExportWireRequest::Page(page) => {
                 page.validate()?;
@@ -242,9 +272,14 @@ impl ConnectorStateReplicationService {
                 let snapshot = match self.runtime.begin_export(&permit, &page.export)? {
                     ExportLookup::Ready(snapshot) => snapshot,
                     ExportLookup::Build(build) => {
-                        let wire = self.export_admitted(
-                            authenticated_peer, &page.export, &authorize_transport, &permit,
-                        ).await?;
+                        let wire = self
+                            .export_admitted(
+                                authenticated_peer,
+                                &page.export,
+                                &authorize_transport,
+                                &permit,
+                            )
+                            .await?;
                         let wire = stable_export_wire(wire, page.export.limits.max_wire_bytes)?;
                         self.validate_export(authenticated_peer, &page.export)?;
                         authorize_transport()?;
@@ -294,11 +329,14 @@ impl ConnectorStateReplicationService {
         authorize_transport()?;
         // Keep the same reservation through every page and the final import.
         // Releasing/reacquiring here would admit unbounded partial assemblies.
-        let permit = self.runtime.admit(&request.peer_node, request.request.limits)?;
+        let permit = self
+            .runtime
+            .admit(&request.peer_node, request.request.limits)?;
         let wire = self
             .download_paged_admitted(request, fetch_page, &authorize_transport, &permit)
             .await?;
-        self.import_admitted(request, &wire, authorize_transport, &permit).await
+        self.import_admitted(request, &wire, authorize_transport, &permit)
+            .await
     }
 
     // Download only: this helper cannot write to a replica. Its caller must
@@ -341,9 +379,9 @@ impl ConnectorStateReplicationService {
 
 #[cfg(test)]
 mod tests {
-    use fcp_kernel::{ConnectorId, ObjectId, ZoneId};
-    use crate::{ConnectorStateTransferLimits, ConnectorStateTransferScope};
     use super::*;
+    use crate::{ConnectorStateTransferLimits, ConnectorStateTransferScope};
+    use fcp_kernel::{ConnectorId, ObjectId, ZoneId};
 
     fn request() -> PageRequest {
         PageRequest::first(&ConnectorStateExportRequest {
@@ -369,7 +407,11 @@ mod tests {
 
     #[test]
     fn pages_round_trip_utf8_across_byte_boundaries() {
-        let wire = format!("{}{}", "x".repeat(PAGE_BYTES - 1), "\u{1f642}".repeat(PAGE_BYTES));
+        let wire = format!(
+            "{}{}",
+            "x".repeat(PAGE_BYTES - 1),
+            "\u{1f642}".repeat(PAGE_BYTES)
+        );
         let mut request = request();
         let mut assembly = Assembly::default();
         let mut pages = 0;
@@ -377,7 +419,9 @@ mod tests {
             let page = encode_page(&request, &wire).unwrap();
             assert!(page.len() <= MAX_PAGE_WIRE_BYTES);
             pages += 1;
-            if assembly.accept(&request, &page).unwrap() { break; }
+            if assembly.accept(&request, &page).unwrap() {
+                break;
+            }
             next_request(&mut request, &assembly);
         }
         assert!(pages > 2);
@@ -389,9 +433,17 @@ mod tests {
         let wire = "x".repeat(PAGE_BYTES * 2);
         let mut request = request();
         let mut assembly = Assembly::default();
-        assert!(!assembly.accept(&request, &encode_page(&request, &wire).unwrap()).unwrap());
+        assert!(
+            !assembly
+                .accept(&request, &encode_page(&request, &wire).unwrap())
+                .unwrap()
+        );
         next_request(&mut request, &assembly);
-        assert!(assembly.accept(&request, &encode_page(&request, &wire).unwrap()).unwrap());
+        assert!(
+            assembly
+                .accept(&request, &encode_page(&request, &wire).unwrap())
+                .unwrap()
+        );
         assert_eq!(assembly.finish().unwrap(), wire);
     }
 
@@ -406,7 +458,11 @@ mod tests {
         assert!(assembly.accept(&first, &encoded).is_err());
         let mut next = first.clone();
         next_request(&mut next, &assembly);
-        assert!(Assembly::default().accept(&next, &encode_page(&next, &wire).unwrap()).is_err());
+        assert!(
+            Assembly::default()
+                .accept(&next, &encode_page(&next, &wire).unwrap())
+                .is_err()
+        );
         assert_eq!(assembly.bytes, saved);
     }
 
@@ -415,7 +471,9 @@ mod tests {
         let wire = "x".repeat(PAGE_BYTES + 1);
         let mut request = request();
         let mut assembly = Assembly::default();
-        assembly.accept(&request, &encode_page(&request, &wire).unwrap()).unwrap();
+        assembly
+            .accept(&request, &encode_page(&request, &wire).unwrap())
+            .unwrap();
         next_request(&mut request, &assembly);
         assert!(encode_page(&request, &"y".repeat(wire.len())).is_err());
     }
@@ -423,23 +481,30 @@ mod tests {
     #[test]
     fn page_metadata_payload_and_length_are_bound_to_the_request() {
         let request = request();
-        let original: serde_json::Value = serde_json::from_str(
-            &encode_page(&request, "secret-state").unwrap(),
-        ).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(&encode_page(&request, "secret-state").unwrap()).unwrap();
         for (pointer, value) in [
             ("/schema_version", serde_json::json!("other")),
             ("/request/export/grant_id", serde_json::json!("other")),
             ("/request/offset", serde_json::json!(PAGE_BYTES)),
             ("/total_bytes", serde_json::json!(0)),
-            ("/total_bytes", serde_json::json!(request.export.limits.max_wire_bytes + 1)),
+            (
+                "/total_bytes",
+                serde_json::json!(request.export.limits.max_wire_bytes + 1),
+            ),
             ("/wire_digest", serde_json::json!("not-a-digest")),
             ("/data_hex", serde_json::json!("00")),
-            ("/data_hex", serde_json::json!("z".repeat("secret-state".len() * 2))),
+            (
+                "/data_hex",
+                serde_json::json!("z".repeat("secret-state".len() * 2)),
+            ),
         ] {
             let mut value_copy = original.clone();
             *value_copy.pointer_mut(pointer).unwrap() = value;
             let mut assembly = Assembly::default();
-            let error = assembly.accept(&request, &value_copy.to_string()).unwrap_err();
+            let error = assembly
+                .accept(&request, &value_copy.to_string())
+                .unwrap_err();
             assert!(assembly.bytes.is_empty());
             assert!(!error.to_string().contains("secret-state"));
         }
@@ -448,12 +513,15 @@ mod tests {
     #[test]
     fn valid_hex_with_forged_content_fails_the_final_digest() {
         let request = request();
-        let mut page: PageResponse = serde_json::from_str(
-            &encode_page(&request, "abc").unwrap(),
-        ).unwrap();
+        let mut page: PageResponse =
+            serde_json::from_str(&encode_page(&request, "abc").unwrap()).unwrap();
         page.data_hex = hex::encode("xyz");
         let mut assembly = Assembly::default();
-        assert!(assembly.accept(&request, &serde_json::to_string(&page).unwrap()).unwrap());
+        assert!(
+            assembly
+                .accept(&request, &serde_json::to_string(&page).unwrap())
+                .unwrap()
+        );
         assert!(assembly.finish().is_err());
     }
 
@@ -462,7 +530,11 @@ mod tests {
         let request = request();
         let mut assembly = Assembly::default();
         let wire = "x".repeat(PAGE_BYTES + 1);
-        assert!(!assembly.accept(&request, &encode_page(&request, &wire).unwrap()).unwrap());
+        assert!(
+            !assembly
+                .accept(&request, &encode_page(&request, &wire).unwrap())
+                .unwrap()
+        );
         assert!(assembly.finish().is_err());
         assert!(Assembly::default().finish().is_err());
     }
@@ -499,7 +571,8 @@ mod tests {
             &pull,
             |_| async { panic!("unauthorized transfer reached the network") },
             || Ok(()),
-        )).unwrap();
+        ))
+        .unwrap();
         assert!(result.is_err());
     }
 }

@@ -102,6 +102,24 @@ impl PartialEq for KeyId {
 
 impl Eq for KeyId {}
 
+impl std::hash::Hash for KeyId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialOrd for KeyId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
 impl std::fmt::Debug for KeyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "KeyId({})", self.to_hex())
@@ -437,5 +455,28 @@ mod tests {
                 actual: 16
             }
         ));
+    }
+
+    #[test]
+    fn kid_hash_and_ord_collections() {
+        use std::collections::{BTreeMap, HashMap};
+
+        let kid_a = KeyId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+        let kid_b = KeyId::from_bytes([1, 2, 3, 4, 5, 6, 7, 9]);
+        let kid_missing = KeyId::from_bytes([9, 9, 9, 9, 9, 9, 9, 9]);
+
+        let mut hash_map = HashMap::new();
+        hash_map.insert(kid_a.clone(), "alpha");
+        hash_map.insert(kid_b.clone(), "beta");
+        assert_eq!(hash_map.get(&kid_a), Some(&"alpha"));
+        assert_eq!(hash_map.get(&kid_b), Some(&"beta"));
+        assert_eq!(hash_map.get(&kid_missing), None);
+
+        let mut btree_map = BTreeMap::new();
+        btree_map.insert(kid_b.clone(), 2);
+        btree_map.insert(kid_a.clone(), 1);
+        let keys: Vec<KeyId> = btree_map.keys().cloned().collect();
+        assert_eq!(keys, vec![kid_a, kid_b]);
+        assert_eq!(btree_map.get(&kid_missing), None);
     }
 }

@@ -693,7 +693,11 @@ impl TestConnector {
             });
         }
 
-        if let Some(delay_ms) = req.input.get("delay_ms").and_then(serde_json::Value::as_u64) {
+        if let Some(delay_ms) = req
+            .input
+            .get("delay_ms")
+            .and_then(serde_json::Value::as_u64)
+        {
             thread::sleep(Duration::from_millis(delay_ms));
         }
 

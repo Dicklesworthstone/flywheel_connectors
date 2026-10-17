@@ -16,8 +16,8 @@ use fcp_core::TailscaleNodeId;
 use fcp_crypto::ed25519::{Ed25519SigningKey, Ed25519VerifyingKey};
 use fcp_host::mesh_routing::unix_now_ms;
 use fcp_mesh::peer_manifest::{
-    MAX_MESH_PEER_DIRECTORY_BYTES, MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES,
-    MeshPeerDirectoryPayload, SignedMeshPeerDirectory,
+    MAX_MESH_PEER_DIRECTORY_BYTES, MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES, MeshPeerDirectoryPayload,
+    SignedMeshPeerDirectory,
 };
 use zeroize::Zeroizing;
 
@@ -66,12 +66,19 @@ fn arguments(args: Vec<OsString>) -> Result<(String, BTreeMap<String, OsString>)
     let required: &[&str] = match command.as_str() {
         "sign" => &["--owner-key-file", "--payload"],
         "sync" | "watch" => &[
-            "--url", "--owner-public-key-file", "--mesh-id", "--node-id",
-            "--node-public-key-file", "--directory",
+            "--url",
+            "--owner-public-key-file",
+            "--mesh-id",
+            "--node-id",
+            "--node-public-key-file",
+            "--directory",
         ],
         "verify" => &[
-            "--owner-public-key-file", "--mesh-id", "--node-id",
-            "--node-public-key-file", "--directory",
+            "--owner-public-key-file",
+            "--mesh-id",
+            "--node-id",
+            "--node-public-key-file",
+            "--directory",
         ],
         _ => return Err(USAGE.to_owned()),
     };
@@ -82,11 +89,15 @@ fn arguments(args: Vec<OsString>) -> Result<(String, BTreeMap<String, OsString>)
     };
     let mut options = BTreeMap::new();
     while let Some(name) = args.next() {
-        let name = name.into_string().map_err(|_| "option name is not UTF-8".to_owned())?;
+        let name = name
+            .into_string()
+            .map_err(|_| "option name is not UTF-8".to_owned())?;
         if !required.contains(&name.as_str()) && !optional.contains(&name.as_str()) {
             return Err("unknown option for this command".to_owned());
         }
-        let value = args.next().filter(|value| !value.is_empty())
+        let value = args
+            .next()
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("missing value for {name}"))?;
         if options.insert(name, value).is_some() {
             return Err("duplicate option".to_owned());
@@ -106,8 +117,12 @@ fn read_bounded(path: &Path, limit: usize, secret: bool) -> Result<Zeroizing<Vec
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path).map_err(|error| format!("input open failed ({:?})", error.kind()))?;
-    let metadata = file.metadata().map_err(|_| "input metadata is unavailable".to_owned())?;
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("input open failed ({:?})", error.kind()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "input metadata is unavailable".to_owned())?;
     if !metadata.is_file() {
         return Err("input must be a regular file".to_owned());
     }
@@ -135,8 +150,8 @@ fn read_bounded(path: &Path, limit: usize, secret: bool) -> Result<Zeroizing<Vec
 
 fn read_key(path: &Path, secret: bool) -> Result<Zeroizing<[u8; 32]>> {
     let bytes = read_bounded(path, 128, secret)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| "key must contain 64 hex characters".to_owned())?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| "key must contain 64 hex characters".to_owned())?;
     let mut key = Zeroizing::new([0; 32]);
     hex::decode_to_slice(text.trim(), &mut *key)
         .map_err(|_| "key must contain 64 hex characters".to_owned())?;
@@ -145,7 +160,9 @@ fn read_key(path: &Path, secret: bool) -> Result<Zeroizing<[u8; 32]>> {
 
 fn run(args: Vec<OsString>, output: &mut impl Write) -> Result<()> {
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
-        return output.write_all(USAGE.as_bytes()).map_err(|_| "output failed".to_owned());
+        return output
+            .write_all(USAGE.as_bytes())
+            .map_err(|_| "output failed".to_owned());
     }
     let (command, options) = arguments(args)?;
     if command == "sync" {
@@ -156,13 +173,17 @@ fn run(args: Vec<OsString>, output: &mut impl Write) -> Result<()> {
     }
     if command == "sign" {
         let key = read_key(Path::new(&options["--owner-key-file"]), true)?;
-        let owner = Ed25519SigningKey::from_bytes(&key)
-            .map_err(|_| "owner key is invalid".to_owned())?;
-        let bytes = read_bounded(Path::new(&options["--payload"]), MAX_MESH_PEER_DIRECTORY_BYTES, false)?;
+        let owner =
+            Ed25519SigningKey::from_bytes(&key).map_err(|_| "owner key is invalid".to_owned())?;
+        let bytes = read_bounded(
+            Path::new(&options["--payload"]),
+            MAX_MESH_PEER_DIRECTORY_BYTES,
+            false,
+        )?;
         let payload: MeshPeerDirectoryPayload = serde_json::from_slice(&bytes)
             .map_err(|_| "membership payload JSON is invalid".to_owned())?;
-        let signed = SignedMeshPeerDirectory::sign(&owner, &payload)
-            .map_err(|error| error.to_string())?;
+        let signed =
+            SignedMeshPeerDirectory::sign(&owner, &payload).map_err(|error| error.to_string())?;
         serde_json::to_writer_pretty(&mut *output, &signed)
             .map_err(|_| "signed directory output failed".to_owned())?;
     } else {
@@ -172,34 +193,41 @@ fn run(args: Vec<OsString>, output: &mut impl Write) -> Result<()> {
         let local_bytes = read_key(Path::new(&options["--node-public-key-file"]), false)?;
         let local = Ed25519VerifyingKey::from_bytes(&local_bytes)
             .map_err(|_| "node public key is invalid".to_owned())?;
-        let mesh_id = options["--mesh-id"].to_str()
+        let mesh_id = options["--mesh-id"]
+            .to_str()
             .ok_or_else(|| "mesh id is not UTF-8".to_owned())?;
-        let node_id = options["--node-id"].to_str()
+        let node_id = options["--node-id"]
+            .to_str()
             .ok_or_else(|| "node id is not UTF-8".to_owned())?;
-        let node = TailscaleNodeId::try_new(node_id)
-            .map_err(|_| "node id is invalid".to_owned())?;
+        let node =
+            TailscaleNodeId::try_new(node_id).map_err(|_| "node id is invalid".to_owned())?;
         let bytes = read_bounded(
             Path::new(&options["--directory"]),
             MAX_SIGNED_MESH_PEER_DIRECTORY_BYTES,
             false,
         )?;
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| "signed directory is not UTF-8".to_owned())?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| "signed directory is not UTF-8".to_owned())?;
         let signed = SignedMeshPeerDirectory::from_json(text).map_err(|error| error.to_string())?;
-        let verified = signed.verify(&[owner], mesh_id, node, &local, unix_now_ms())
+        let verified = signed
+            .verify(&[owner], mesh_id, node, &local, unix_now_ms())
             .map_err(|error| error.to_string())?;
         let payload = verified.payload();
-        serde_json::to_writer_pretty(&mut *output, &serde_json::json!({
-            "verification": "signature_scope_local_key_and_validity",
-            "mesh_id": payload.mesh_id,
-            "node_id": node_id,
-            "generation": payload.generation,
-            "member_count": payload.peers.len(),
-            "issued_at_ms": payload.issued_at_ms,
-            "expires_at_ms": payload.expires_at_ms,
-            "payload_hash_hex": verified.checkpoint().payload_hash_hex,
-            "rollback_checked": false,
-        })).map_err(|_| "verification output failed".to_owned())?;
+        serde_json::to_writer_pretty(
+            &mut *output,
+            &serde_json::json!({
+                "verification": "signature_scope_local_key_and_validity",
+                "mesh_id": payload.mesh_id,
+                "node_id": node_id,
+                "generation": payload.generation,
+                "member_count": payload.peers.len(),
+                "issued_at_ms": payload.issued_at_ms,
+                "expires_at_ms": payload.expires_at_ms,
+                "payload_hash_hex": verified.checkpoint().payload_hash_hex,
+                "rollback_checked": false,
+            }),
+        )
+        .map_err(|_| "verification output failed".to_owned())?;
     }
     writeln!(output).map_err(|_| "output failed".to_owned())
 }
@@ -215,8 +243,13 @@ mod tests {
     #[test]
     fn parses_sign_paths_without_accepting_secret_material_options() {
         let (command, options) = arguments(args(&[
-            "sign", "--owner-key-file", "owner.key", "--payload", "membership.json",
-        ])).unwrap();
+            "sign",
+            "--owner-key-file",
+            "owner.key",
+            "--payload",
+            "membership.json",
+        ]))
+        .unwrap();
         assert_eq!(command, "sign");
         assert_eq!(options["--payload"], "membership.json");
         assert!(arguments(args(&["sign", "--owner-key", "do-not-echo-secret"])).is_err());
@@ -225,14 +258,27 @@ mod tests {
     #[test]
     fn watch_options_are_optional_and_never_accepted_by_one_shot_commands() {
         let base = args(&[
-            "watch", "--url", "https://example.com/members", "--owner-public-key-file", "owner.pub",
-            "--mesh-id", "mesh", "--node-id", "local", "--node-public-key-file", "node.pub",
-            "--directory", "members.json",
+            "watch",
+            "--url",
+            "https://example.com/members",
+            "--owner-public-key-file",
+            "owner.pub",
+            "--mesh-id",
+            "mesh",
+            "--node-id",
+            "local",
+            "--node-public-key-file",
+            "node.pub",
+            "--directory",
+            "members.json",
         ]);
         assert_eq!(arguments(base.clone()).unwrap().0, "watch");
         let mut configured = base.clone();
         configured.extend(args(&["--interval-secs", "10", "--max-backoff-secs", "60"]));
-        assert_eq!(arguments(configured.clone()).unwrap().1["--interval-secs"], "10");
+        assert_eq!(
+            arguments(configured.clone()).unwrap().1["--interval-secs"],
+            "10"
+        );
         configured[0] = OsString::from("sync");
         assert!(arguments(configured).is_err());
         let mut duplicate = base.clone();
@@ -240,7 +286,11 @@ mod tests {
         assert!(arguments(duplicate).is_err());
         let mut secret = base;
         secret.extend(args(&["--owner-key", "do-not-echo-secret"]));
-        assert!(!arguments(secret).unwrap_err().contains("do-not-echo-secret"));
+        assert!(
+            !arguments(secret)
+                .unwrap_err()
+                .contains("do-not-echo-secret")
+        );
     }
 
     #[test]
@@ -299,17 +349,29 @@ mod tests {
         });
         std::fs::write(&payload_path, serde_json::to_vec(&payload).unwrap()).unwrap();
         let mut output = Vec::new();
-        run(vec![
-            OsString::from("sign"), OsString::from("--owner-key-file"), key_path.into_os_string(),
-            OsString::from("--payload"), payload_path.into_os_string(),
-        ], &mut output).unwrap();
+        run(
+            vec![
+                OsString::from("sign"),
+                OsString::from("--owner-key-file"),
+                key_path.into_os_string(),
+                OsString::from("--payload"),
+                payload_path.into_os_string(),
+            ],
+            &mut output,
+        )
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(!text.contains(&secret));
         let signed = SignedMeshPeerDirectory::from_json(&text).unwrap();
-        signed.verify(
-            &[owner.verifying_key()], "operator-test", TailscaleNodeId::new("local"),
-            &local.verifying_key(), now,
-        ).unwrap();
+        signed
+            .verify(
+                &[owner.verifying_key()],
+                "operator-test",
+                TailscaleNodeId::new("local"),
+                &local.verifying_key(),
+                now,
+            )
+            .unwrap();
 
         let owner_public = dir.path().join("owner.pub");
         let node_public = dir.path().join("node.pub");
@@ -318,14 +380,23 @@ mod tests {
         std::fs::write(&node_public, hex::encode(local.verifying_key().to_bytes())).unwrap();
         std::fs::write(&directory, text).unwrap();
         let mut output = Vec::new();
-        run(vec![
-            OsString::from("verify"),
-            OsString::from("--owner-public-key-file"), owner_public.into_os_string(),
-            OsString::from("--mesh-id"), OsString::from("operator-test"),
-            OsString::from("--node-id"), OsString::from("local"),
-            OsString::from("--node-public-key-file"), node_public.into_os_string(),
-            OsString::from("--directory"), directory.into_os_string(),
-        ], &mut output).unwrap();
+        run(
+            vec![
+                OsString::from("verify"),
+                OsString::from("--owner-public-key-file"),
+                owner_public.into_os_string(),
+                OsString::from("--mesh-id"),
+                OsString::from("operator-test"),
+                OsString::from("--node-id"),
+                OsString::from("local"),
+                OsString::from("--node-public-key-file"),
+                node_public.into_os_string(),
+                OsString::from("--directory"),
+                directory.into_os_string(),
+            ],
+            &mut output,
+        )
+        .unwrap();
         let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(summary["generation"], 1);
         assert_eq!(summary["member_count"], 1);

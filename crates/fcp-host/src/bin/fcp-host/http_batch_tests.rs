@@ -96,7 +96,10 @@ impl Gate {
 
 #[fcp_async_core::runtime::test]
 async fn http_adapter_refills_capacity_without_waiting_for_a_chunk_barrier() {
-    let request = batch(vec![member("c", &[]), member("b", &[]), member("a", &[])], 2);
+    let request = batch(
+        vec![member("c", &[]), member("b", &[]), member("a", &[])],
+        2,
+    );
     let slow = Gate::default();
     let calls = RefCell::new(Vec::new());
     let mut run = Box::pin(execute_with(&request, Instant::now(), |operation, _| {
@@ -114,12 +117,22 @@ async fn http_adapter_refills_capacity_without_waiting_for_a_chunk_barrier() {
     slow.release();
     let response = run.await.unwrap();
     assert_eq!(response.completed, 3);
-    assert_eq!(response.results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["c", "b", "a"]);
+    assert_eq!(
+        response
+            .results
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c", "b", "a"]
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn http_adapter_releases_a_dependent_before_an_unrelated_parent_finishes() {
-    let request = batch(vec![member("a", &[]), member("b", &[]), member("c", &["a"])], 2);
+    let request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &["a"])],
+        2,
+    );
     let slow = Gate::default();
     let calls = RefCell::new(Vec::new());
     let mut run = Box::pin(execute_with(&request, Instant::now(), |operation, _| {
@@ -140,7 +153,10 @@ async fn http_adapter_releases_a_dependent_before_an_unrelated_parent_finishes()
 
 #[fcp_async_core::runtime::test]
 async fn http_adapter_stops_factories_on_first_error_but_drains_an_admitted_member() {
-    let mut request = batch(vec![member("a", &[]), member("b", &[]), member("c", &[])], 2);
+    let mut request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &[])],
+        2,
+    );
     request.options.stop_on_first_error = true;
     let slow = Gate::default();
     let calls = RefCell::new(Vec::new());
@@ -161,20 +177,34 @@ async fn http_adapter_stops_factories_on_first_error_but_drains_an_admitted_memb
     slow.release();
     let response = run.await.unwrap();
     assert_eq!(response.status, BatchStatus::Aborted);
-    assert_eq!((response.completed, response.failed, response.skipped), (1, 1, 1));
-    assert_eq!(response.results[0].error.as_ref().unwrap().retry_after_ms, Some(5000));
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        response.results[0].error.as_ref().unwrap().retry_after_ms,
+        Some(5000)
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn http_adapter_propagates_transitive_failure_without_invoking_dependents() {
-    let request = batch(vec![member("a", &[]), member("b", &["a"]), member("c", &["b"])], 2);
+    let request = batch(
+        vec![member("a", &[]), member("b", &["a"]), member("c", &["b"])],
+        2,
+    );
     let calls = Cell::new(0);
     let response = execute_with(&request, Instant::now(), |operation, _| {
         calls.set(calls.get() + 1);
         ready(failure(operation))
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(calls.get(), 1);
-    assert_eq!((response.completed, response.failed, response.skipped), (0, 1, 2));
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (0, 1, 2)
+    );
     for result in &response.results[1..] {
         assert_eq!(result.error.as_ref().unwrap().code, "DEP_FAILED");
     }
@@ -184,17 +214,34 @@ async fn http_adapter_propagates_transitive_failure_without_invoking_dependents(
 async fn expired_http_batch_is_aborted_not_successful_and_never_dispatches() {
     let mut request = batch(vec![member("a", &[]), member("b", &[])], 2);
     request.options.timeout_ms = 0;
-    let response = execute_with(&request, Instant::now(), |_, _| -> std::future::Ready<OperationResult> {
-        panic!("expired batch cannot dispatch");
-    }).await.unwrap();
+    let response = execute_with(
+        &request,
+        Instant::now(),
+        |_, _| -> std::future::Ready<OperationResult> {
+            panic!("expired batch cannot dispatch");
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status, BatchStatus::Aborted);
-    assert_eq!((response.completed, response.failed, response.skipped), (0, 0, 2));
-    assert!(response.results.iter().all(|result| result.error.as_ref().unwrap().code == "BATCH_TIMEOUT"));
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (0, 0, 2)
+    );
+    assert!(
+        response
+            .results
+            .iter()
+            .all(|result| result.error.as_ref().unwrap().code == "BATCH_TIMEOUT")
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn http_deadline_keeps_admitted_work_unknown_and_unadmitted_work_skipped() {
-    let mut request = batch(vec![member("a", &[]), member("b", &[]), member("c", &[])], 2);
+    let mut request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &[])],
+        2,
+    );
     request.options.timeout_ms = 200;
     let calls = Cell::new(0);
     let mut run = Box::pin(execute_with(&request, Instant::now(), |operation, _| {
@@ -208,13 +255,19 @@ async fn http_deadline_keeps_admitted_work_unknown_and_unadmitted_work_skipped()
     assert_eq!(calls.get(), 2);
     let response = run.await.unwrap();
     assert_eq!(response.status, BatchStatus::Aborted);
-    assert_eq!((response.completed, response.failed, response.skipped), (0, 2, 1));
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (0, 2, 1)
+    );
     for result in &response.results[..2] {
         let error = result.error.as_ref().unwrap();
         assert_eq!(error.code, "BATCH_OUTCOME_UNKNOWN");
         assert_eq!(error.retry_after_ms, None);
     }
-    assert_eq!(response.results[2].error.as_ref().unwrap().code, "BATCH_TIMEOUT");
+    assert_eq!(
+        response.results[2].error.as_ref().unwrap().code,
+        "BATCH_TIMEOUT"
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -225,7 +278,9 @@ async fn every_http_member_receives_the_same_original_absolute_budget() {
     let response = execute_with(&request, started_at, |operation, deadline| {
         assert_eq!(deadline, expected);
         ready(success(operation))
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(response.completed, 2);
 }
 
@@ -233,8 +288,11 @@ async fn every_http_member_receives_the_same_original_absolute_budget() {
 async fn huge_http_batch_budget_does_not_wrap_to_an_expired_deadline() {
     let mut request = batch(vec![member("a", &[])], 1);
     request.options.timeout_ms = u64::MAX;
-    let response = execute_with(&request, Instant::now(), |operation, _| ready(success(operation)))
-        .await.unwrap();
+    let response = execute_with(&request, Instant::now(), |operation, _| {
+        ready(success(operation))
+    })
+    .await
+    .unwrap();
     assert_eq!(response.completed, 1);
 }
 
@@ -245,7 +303,8 @@ async fn invalid_graph_never_dispatches_any_http_member() {
     let result = execute_with(&request, Instant::now(), |operation, _| {
         calls.set(calls.get() + 1);
         ready(success(operation))
-    }).await;
+    })
+    .await;
     assert!(result.is_err());
     assert_eq!(calls.get(), 0);
 }
@@ -263,7 +322,8 @@ async fn duplicate_durable_ids_and_invalid_late_members_fail_before_dispatch() {
         let result = execute_with(&request, Instant::now(), |operation, _| {
             calls.set(calls.get() + 1);
             ready(success(operation))
-        }).await;
+        })
+        .await;
         assert!(result.is_err());
         assert_eq!(calls.get(), 0);
     }
@@ -276,8 +336,13 @@ async fn scheduler_does_not_rewrite_member_authority_effect_binding_or_fencing()
     execute_with(&request, Instant::now(), |operation, _| {
         assert_eq!(serde_json::to_value(&operation.request).unwrap(), expected);
         ready(success(operation))
-    }).await.unwrap();
-    assert_eq!(serde_json::to_value(&request.operations[0].request).unwrap(), expected);
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&request.operations[0].request).unwrap(),
+        expected
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -288,16 +353,26 @@ async fn mismatched_member_result_cannot_release_a_dependent() {
         let mut result = success(operation);
         result.id = "wrong".to_owned();
         ready(result)
-    }).await.unwrap();
-    assert_eq!(response.results[0].error.as_ref().unwrap().code, "BATCH_OUTCOME_UNKNOWN");
-    assert_eq!(response.results[1].error.as_ref().unwrap().code, "DEP_FAILED");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        response.results[0].error.as_ref().unwrap().code,
+        "BATCH_OUTCOME_UNKNOWN"
+    );
+    assert_eq!(
+        response.results[1].error.as_ref().unwrap().code,
+        "DEP_FAILED"
+    );
 }
 
 #[test]
 fn http_execution_future_preserves_send_when_its_callback_is_send() {
     fn assert_send<T: Send>(_: T) {}
     let request = batch(vec![member("a", &[])], 1);
-    assert_send(execute_with(&request, Instant::now(), |operation, _| ready(success(operation))));
+    assert_send(execute_with(&request, Instant::now(), |operation, _| {
+        ready(success(operation))
+    }));
 }
 
 #[fcp_async_core::runtime::test]
@@ -308,7 +383,10 @@ async fn dropping_http_scheduler_drops_owned_handler_futures_without_new_admissi
             self.0.set(self.0.get() - 1);
         }
     }
-    let request = batch(vec![member("a", &[]), member("b", &[]), member("c", &[])], 2);
+    let request = batch(
+        vec![member("a", &[]), member("b", &[]), member("c", &[])],
+        2,
+    );
     let active = Rc::new(Cell::new(0));
     let calls = Cell::new(0);
     let mut run = Box::pin(execute_with(&request, Instant::now(), |operation, _| {
@@ -332,7 +410,10 @@ async fn dropping_http_scheduler_drops_owned_handler_futures_without_new_admissi
 fn routed_members_cannot_extend_the_batch_deadline() {
     let started_at = Instant::now();
     let parent = started_at + Duration::from_millis(100);
-    assert_eq!(route_deadline(started_at, Some(30_000), Some(parent)), parent);
+    assert_eq!(
+        route_deadline(started_at, Some(30_000), Some(parent)),
+        parent
+    );
     assert_eq!(route_deadline(started_at, None, Some(parent)), parent);
 }
 
@@ -357,7 +438,10 @@ fn routing_waits_cannot_renew_an_expired_parent_budget() {
 fn a_non_batch_invoke_retains_the_existing_native_lifetime_limit() {
     let started_at = Instant::now();
     for timeout in [None, Some(0), Some(100), Some(u64::MAX)] {
-        assert_eq!(route_deadline(started_at, timeout, None), invocation_deadline(started_at, timeout));
+        assert_eq!(
+            route_deadline(started_at, timeout, None),
+            invocation_deadline(started_at, timeout)
+        );
     }
 }
 

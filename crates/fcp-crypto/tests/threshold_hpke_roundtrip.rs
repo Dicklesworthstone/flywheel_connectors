@@ -200,7 +200,7 @@ fn test_decap_share_order_does_not_matter() {
 
 #[test]
 fn deterministic_encap_is_reproducible_with_seeded_rng() {
-    let (key_packages, public_package) = execute_dkg_2_of_3();
+    let (_key_packages, public_package) = execute_dkg_2_of_3();
     let public_key =
         ThresholdHpkePublicKey::from_frost_pkpkg(&public_package).expect("group key derivation");
 

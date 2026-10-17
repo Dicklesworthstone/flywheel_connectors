@@ -61,8 +61,8 @@ use fcp_core::{HolderProof, InvokeRequest, TailscaleNodeId};
 use fcp_crypto::ed25519::{Ed25519Signature, Ed25519SigningKey};
 use fcp_mesh::invoke_route::{
     AdvertisedConnector, DEFAULT_MESH_FORWARD_MAX_SKEW_MS, DEFAULT_MESH_FORWARD_REPLAY_CAPACITY,
-    MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshForwardReplayGuard, MeshForwardReply,
-    MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
+    MeshForwardBody, MeshForwardEnvelope, MeshForwardError, MeshForwardReplayGuard,
+    MeshForwardReply, MeshPeer, MeshPeerAdvertisement, MeshPeerDirectory,
 };
 use zeroize::Zeroizing;
 
@@ -405,6 +405,11 @@ pub struct MeshRouter {
     membership: Option<DirectoryGuard>,
 }
 
+const _: fn() = || {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MeshRouter>();
+};
+
 impl std::fmt::Debug for MeshRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MeshRouter")
@@ -689,7 +694,11 @@ impl MeshRouter {
     ) -> Result<(), MeshForwardError> {
         // Recheck after journal I/O without undoing a consumed nonce. An
         // unrelated directory update is not a revocation of this origin.
-        envelope.verify(snapshot.directory(), unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
+        envelope.verify(
+            snapshot.directory(),
+            unix_now_ms(),
+            DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+        )?;
         self.ensure_current_peer(snapshot)
     }
 
@@ -735,11 +744,16 @@ impl MeshRouter {
         node_id: &TailscaleNodeId,
     ) -> Result<MeshStateTransferPeer, MeshForwardError> {
         let snapshot = self.trusted_peer(node_id)?;
-        let peer = snapshot.directory().peer(node_id)
+        let peer = snapshot
+            .directory()
+            .peer(node_id)
             .ok_or_else(|| MeshForwardError::UnknownPeer(node_id.as_str().to_owned()))?;
         require_confidential_state_endpoint(&peer.endpoint)?;
         self.ensure_current_peer(&snapshot)?;
-        Ok(MeshStateTransferPeer { node_id: node_id.clone(), snapshot })
+        Ok(MeshStateTransferPeer {
+            node_id: node_id.clone(),
+            snapshot,
+        })
     }
 
     /// Bind an already admitted export envelope to the peer continuity guard.
@@ -787,7 +801,8 @@ impl MeshRouter {
             &peer.node_id,
             MeshForwardBody::ConnectorStateExport { request_json },
             &peer.snapshot,
-        ).await
+        )
+        .await
     }
 
     /// Sign this node's advertisement, withdrawing inventory after membership expires.
@@ -837,7 +852,11 @@ impl MeshRouter {
             .map_err(|_| replay_unavailable("state_poisoned"))?;
         let now_ms = unix_now_ms();
         let snapshot = self.trusted_peer(&envelope.origin_node)?;
-        envelope.verify(snapshot.directory(), now_ms, DEFAULT_MESH_FORWARD_MAX_SKEW_MS)?;
+        envelope.verify(
+            snapshot.directory(),
+            now_ms,
+            DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+        )?;
         replay.check_and_record(envelope, now_ms)?;
         self.finish_inbound_admission(envelope, &snapshot)
     }
@@ -913,11 +932,12 @@ impl MeshRouter {
         body: MeshForwardBody,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = target.as_str().to_owned();
-        let snapshot = self.trusted_peer(target)
-            .map_err(|error| MeshForwardFailure::NotDelivered {
-                peer: peer_label.clone(),
-                detail: error.to_string(),
-            })?;
+        let snapshot =
+            self.trusted_peer(target)
+                .map_err(|error| MeshForwardFailure::NotDelivered {
+                    peer: peer_label.clone(),
+                    detail: error.to_string(),
+                })?;
         self.forward_to_snapshot(target, body, &snapshot).await
     }
 
@@ -928,10 +948,11 @@ impl MeshRouter {
         snapshot: &PeerSnapshot,
     ) -> Result<MeshForwardReply, MeshForwardFailure> {
         let peer_label = target.as_str().to_owned();
-        self.ensure_current_peer(snapshot).map_err(|error| MeshForwardFailure::NotDelivered {
-            peer: peer_label.clone(),
-            detail: error.to_string(),
-        })?;
+        self.ensure_current_peer(snapshot)
+            .map_err(|error| MeshForwardFailure::NotDelivered {
+                peer: peer_label.clone(),
+                detail: error.to_string(),
+            })?;
         let Some(peer) = snapshot.directory().peer(target) else {
             return Err(MeshForwardFailure::NotDelivered {
                 peer: peer_label,
@@ -1163,7 +1184,10 @@ mod tests {
             "http://node-b.example:8765",
             "file:///tmp/state",
         ] {
-            assert!(require_confidential_state_endpoint(endpoint).is_err(), "{endpoint}");
+            assert!(
+                require_confidential_state_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
         }
     }
 
@@ -1184,16 +1208,25 @@ mod tests {
             TailscaleNodeId::new("node-b"),
             TailscaleNodeId::new("node-a"),
             unix_now_ms(),
-            MeshForwardBody::ConnectorStateExport { request_json: "{}".to_owned() },
-        ).unwrap();
+            MeshForwardBody::ConnectorStateExport {
+                request_json: "{}".to_owned(),
+            },
+        )
+        .unwrap();
         router.accept_inbound(&envelope).unwrap();
         let authorized = router.state_transfer_origin(&envelope).unwrap();
         router.check_state_transfer_peer(&authorized).unwrap();
         assert!(other_router.check_state_transfer_peer(&authorized).is_err());
         let mut altered = envelope.clone();
-        altered.body = MeshForwardBody::ConnectorStateExport { request_json: "{\"root\":\"changed\"}".to_owned() };
+        altered.body = MeshForwardBody::ConnectorStateExport {
+            request_json: "{\"root\":\"changed\"}".to_owned(),
+        };
         assert!(router.state_transfer_origin(&altered).is_err());
-        assert!(router.state_transfer_peer(&TailscaleNodeId::new("unknown")).is_err());
+        assert!(
+            router
+                .state_transfer_peer(&TailscaleNodeId::new("unknown"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1207,14 +1240,21 @@ mod tests {
                 "node_id": "node-b",
                 "endpoint": "http://100.64.0.2:8765",
                 "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
-            }]).to_string(),
+            }])
+            .to_string(),
             forward_timeout: Duration::from_secs(5),
-        }).unwrap();
+        })
+        .unwrap();
         let result = fcp_async_core::runtime::block_on_sync(router.forward(
             &TailscaleNodeId::new("node-b"),
-            MeshForwardBody::ConnectorStateExport { request_json: "{}".to_owned() },
-        )).unwrap();
-        assert!(matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS")));
+            MeshForwardBody::ConnectorStateExport {
+                request_json: "{}".to_owned(),
+            },
+        ))
+        .unwrap();
+        assert!(
+            matches!(result, Err(MeshForwardFailure::NotDelivered { detail, .. }) if detail.contains("HTTPS"))
+        );
         assert_eq!(router.forward_usage().unwrap().in_flight, 0);
     }
 
@@ -1497,8 +1537,12 @@ mod tests {
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let envelope = {
                 let mut reader = BufReader::new(&mut socket);
                 let mut line = String::new();
@@ -1544,7 +1588,9 @@ mod tests {
             },
         ))
         .expect("runtime");
-        server.join().expect("peer must receive the complete invoke");
+        server
+            .join()
+            .expect("peer must receive the complete invoke");
         result
     }
 
@@ -1566,15 +1612,22 @@ mod tests {
                 failure,
                 MeshForwardFailure::Rejected { status: actual, .. } if actual == status
             ));
-            assert!(!failure.safe_to_retry(), "HTTP {status} cannot justify fanout");
-            assert!(!failure.summary().contains("secret-from-unsigned-error-body"));
+            assert!(
+                !failure.safe_to_retry(),
+                "HTTP {status} cannot justify fanout"
+            );
+            assert!(
+                !failure
+                    .summary()
+                    .contains("secret-from-unsigned-error-body")
+            );
         }
     }
 
     #[test]
     fn forward_malformed_success_reply_is_not_retryable() {
-        let failure = forward_after_receipt(|_, _| Some((200, "not a signed reply".to_owned())))
-            .unwrap_err();
+        let failure =
+            forward_after_receipt(|_, _| Some((200, "not a signed reply".to_owned()))).unwrap_err();
         assert!(matches!(failure, MeshForwardFailure::InvalidReply { .. }));
         assert!(!failure.safe_to_retry());
     }
@@ -1594,7 +1647,11 @@ mod tests {
         .unwrap();
         assert_eq!(reply.status, 500);
         assert_eq!(reply.served_by.as_str(), "node-b");
-        assert!(reply.body_json.contains("operation failed after acceptance"));
+        assert!(
+            reply
+                .body_json
+                .contains("operation failed after acceptance")
+        );
     }
 
     #[test]
@@ -1618,9 +1675,11 @@ mod tests {
     fn router_loads_admission_limits_without_ambient_environment() {
         assert!(MeshRouter::from_lookup(|_| None).unwrap().is_none());
         for variable in LIMIT_ENV_KEYS {
-            assert!(MeshRouter::from_lookup(|name| {
-                (name == variable).then(|| "8".to_owned())
-            }).is_err(), "a limit alone must not silently disable mesh routing");
+            assert!(
+                MeshRouter::from_lookup(|name| { (name == variable).then(|| "8".to_owned()) })
+                    .is_err(),
+                "a limit alone must not silently disable mesh routing"
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         let key_file = write_key_file(&dir, &Ed25519SigningKey::generate());
@@ -1633,10 +1692,18 @@ mod tests {
             MESH_FORWARD_MAX_PER_PEER_ENV => Some("2".to_owned()),
             MESH_FORWARD_MAX_REQUEST_BYTES_ENV => Some("4096".to_owned()),
             _ => None,
-        }).unwrap().unwrap();
-        assert_eq!(router.forward_limits(), MeshForwardLimits {
-            max_in_flight: 8, max_per_peer: 2, max_request_bytes: 4096,
-        });
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            router.forward_limits(),
+            MeshForwardLimits {
+                max_in_flight: 8,
+                max_per_peer: 2,
+                max_request_bytes: 4096,
+                ..MeshForwardLimits::default()
+            }
+        );
         assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
     }
 
@@ -1655,15 +1722,40 @@ mod tests {
                 }]).to_string(),
                 forward_timeout: Duration::from_secs(1),
             },
-            MeshForwardLimits { max_in_flight: 1, max_per_peer: 1, max_request_bytes: 1 },
+            MeshForwardLimits {
+                max_in_flight: 1,
+                max_per_peer: 1,
+                max_request_bytes: 1,
+                ..MeshForwardLimits::default()
+            },
         ).unwrap();
         let failure = fcp_async_core::runtime::block_on_sync(router.forward(
             &TailscaleNodeId::new("node-b"),
-            MeshForwardBody::Introspect { connector_id: "fcp.test:utility:1.0.0".to_owned() },
-        )).unwrap().unwrap_err();
+            MeshForwardBody::Introspect {
+                connector_id: "fcp.test:utility:1.0.0".to_owned(),
+            },
+        ))
+        .unwrap()
+        .unwrap_err();
         assert!(failure.safe_to_retry());
         assert!(failure.summary().contains("request_byte_limit"));
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+    }
+
+    #[test]
+    fn mesh_router_peer_advertisements_future_is_send() {
+        fn assert_send<F: std::future::Future + Send>(_f: F) {}
+        let router = MeshRouter::new(MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("node-a"),
+            signing_key: Ed25519SigningKey::generate(),
+            peers_json: "[]".to_owned(),
+            forward_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert_send(router.peer_advertisements());
     }
 }

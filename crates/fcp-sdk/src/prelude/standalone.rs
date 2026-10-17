@@ -11,9 +11,8 @@ use fcp_manifest::ConnectorManifest;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CapabilityGrant, CapabilityId, CapabilityToken, ConnectorId, EventCaps, FcpError,
-    FcpResult, HandshakeRequest, HandshakeResponse, InstanceId, InvokeRequest, OperationId,
-    SessionId, ZoneId,
+    CapabilityGrant, CapabilityId, CapabilityToken, ConnectorId, EventCaps, FcpError, FcpResult,
+    HandshakeRequest, HandshakeResponse, InstanceId, InvokeRequest, OperationId, SessionId, ZoneId,
 };
 
 mod usage;
@@ -55,19 +54,26 @@ impl StandaloneSession {
     /// # Errors
     /// Returns an internal error if the embedded manifest is invalid.
     pub fn new(manifest_toml: &str) -> FcpResult<Self> {
-        let manifest = ConnectorManifest::parse_str(manifest_toml).map_err(|error| {
-            FcpError::Internal {
+        let manifest =
+            ConnectorManifest::parse_str(manifest_toml).map_err(|error| FcpError::Internal {
                 message: format!("Invalid embedded connector manifest: {error}"),
-            }
-        })?;
+            })?;
         Ok(Self {
             connector_id: manifest.connector.id,
             instance_id: InstanceId::new(),
             manifest_hash: manifest_hash(manifest_toml),
-            operations: manifest.provides.operations.into_iter()
-                .map(|(id, operation)| (id, operation.capability)).collect(),
-            forbidden_zones: manifest.zones.forbidden.into_iter()
-                .map(|zone| zone.as_str().to_owned()).collect(),
+            operations: manifest
+                .provides
+                .operations
+                .into_iter()
+                .map(|(id, operation)| (id, operation.capability))
+                .collect(),
+            forbidden_zones: manifest
+                .zones
+                .forbidden
+                .into_iter()
+                .map(|zone| zone.as_str().to_owned())
+                .collect(),
             authority: None,
         })
     }
@@ -116,14 +122,20 @@ impl StandaloneSession {
                 reason: "Connector manifest forbids the requested session zone".into(),
             });
         }
-        let negotiated: BTreeMap<String, CapabilityId> = request.capabilities_requested.into_iter()
+        let negotiated: BTreeMap<String, CapabilityId> = request
+            .capabilities_requested
+            .into_iter()
             .filter(|capability| self.operations.values().any(|known| known == capability))
-            .map(|capability| (capability.as_str().to_owned(), capability)).collect();
+            .map(|capability| (capability.as_str().to_owned(), capability))
+            .collect();
         let capabilities = negotiated.keys().cloned().collect();
-        let capabilities_granted = negotiated.into_values().map(|capability| CapabilityGrant {
-            capability,
-            operation: None,
-        }).collect();
+        let capabilities_granted = negotiated
+            .into_values()
+            .map(|capability| CapabilityGrant {
+                capability,
+                operation: None,
+            })
+            .collect();
         let response = HandshakeResponse {
             status: "accepted".into(),
             capabilities_granted,
@@ -167,12 +179,13 @@ impl StandaloneSession {
         resource_uris: &[String],
     ) -> FcpResult<CapabilityToken<BoundVerified>> {
         let authority = self.authority.as_ref().ok_or(FcpError::NotHandshaken)?;
-        let capability = self.operations.get(operation.as_str()).ok_or_else(|| {
-            FcpError::InvalidRequest {
-                code: 1002,
-                message: "Operation is not declared by this connector".into(),
-            }
-        })?;
+        let capability =
+            self.operations
+                .get(operation.as_str())
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1002,
+                    message: "Operation is not declared by this connector".into(),
+                })?;
         let denied = |reason: &str| FcpError::CapabilityDenied {
             capability: capability.as_str().to_owned(),
             reason: reason.to_owned(),
@@ -184,9 +197,13 @@ impl StandaloneSession {
             return Err(denied("Invocation zone differs from the negotiated zone"));
         }
         if !authority.capabilities.contains(capability.as_str()) {
-            return Err(denied("Required capability was not negotiated in this session"));
+            return Err(denied(
+                "Required capability was not negotiated in this session",
+            ));
         }
-        let token = authority.verifier.verify_bound(token, capability, operation, resource_uris)?;
+        let token = authority
+            .verifier
+            .verify_bound(token, capability, operation, resource_uris)?;
         authority.usage.check(&token)?;
         Ok(token)
     }
@@ -219,21 +236,32 @@ impl StandaloneSession {
                 message: "Admission requires an invoke request with a non-empty ID".into(),
             });
         }
-        request.validate_idempotency_key().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid invocation idempotency key".into(),
-        })?;
+        request
+            .validate_idempotency_key()
+            .map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid invocation idempotency key".into(),
+            })?;
         let token = self.authorize(
-            &request.connector_id, &request.zone_id, &request.operation,
-            request.capability_token.clone(), resource_uris,
+            &request.connector_id,
+            &request.zone_id,
+            &request.operation,
+            request.capability_token.clone(),
+            resource_uris,
         )?;
-        self.authority.as_ref().ok_or(FcpError::NotHandshaken)?
-            .usage.admit(token, request.idempotency_key.as_deref())
+        self.authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .usage
+            .admit(token, request.idempotency_key.as_deref())
     }
 }
 
 fn manifest_hash(manifest_toml: &str) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(manifest_toml.as_bytes())))
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(manifest_toml.as_bytes()))
+    )
 }
 
 #[cfg(test)]
@@ -299,16 +327,26 @@ mod tests {
             .operations(&[operation])
             .issuer("node:test")
             .target_instance(session.instance_id().as_str())
-            .validity(now - Duration::hours(1), now + Duration::seconds(seconds_from_now))
-            .try_constraints_cbor(&cbor).unwrap()
-            .sign(key).unwrap();
+            .validity(
+                now - Duration::hours(1),
+                now + Duration::seconds(seconds_from_now),
+            )
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(key)
+            .unwrap();
         CapabilityToken::from_raw(raw)
     }
 
-    fn authorize(session: &StandaloneSession, token: CapabilityToken) -> FcpResult<CapabilityToken<BoundVerified>> {
+    fn authorize(
+        session: &StandaloneSession,
+        token: CapabilityToken,
+    ) -> FcpResult<CapabilityToken<BoundVerified>> {
         session.authorize(
             &ConnectorId::from_static("fcp.fixture"),
-            &ZoneId::work(), &OperationId::from_static(GET), token,
+            &ZoneId::work(),
+            &OperationId::from_static(GET),
+            token,
             &["urn:fixture:allowed".into()],
         )
     }
@@ -323,32 +361,46 @@ mod tests {
     #[test]
     fn valid_signature_produces_instance_bound_witness() {
         let (session, key) = established();
-        let verified: CapabilityToken<BoundVerified> = authorize(
-            &session, token(&session, &key, READ, GET, "z:work", 3600),
-        ).unwrap();
+        let verified: CapabilityToken<BoundVerified> =
+            authorize(&session, token(&session, &key, READ, GET, "z:work", 3600)).unwrap();
         drop(verified);
     }
 
     #[test]
     fn missing_handshake_fails_closed() {
-        assert!(matches!(authorize(&session(), CapabilityToken::test_token()), Err(FcpError::NotHandshaken)));
+        assert!(matches!(
+            authorize(&session(), CapabilityToken::test_token()),
+            Err(FcpError::NotHandshaken)
+        ));
     }
 
     #[test]
     fn undeclared_operation_is_rejected() {
         let (session, key) = established();
-        assert!(session.authorize(
-            &ConnectorId::from_static("fcp.fixture"), &ZoneId::work(),
-            &OperationId::from_static("fixture.unknown"),
-            token(&session, &key, READ, GET, "z:work", 3600), &[],
-        ).is_err());
+        assert!(
+            session
+                .authorize(
+                    &ConnectorId::from_static("fcp.fixture"),
+                    &ZoneId::work(),
+                    &OperationId::from_static("fixture.unknown"),
+                    token(&session, &key, READ, GET, "z:work", 3600),
+                    &[],
+                )
+                .is_err()
+        );
     }
 
     #[test]
     fn foreign_signer_is_rejected() {
         let (session, _) = established();
         let foreign = Ed25519SigningKey::generate();
-        assert!(authorize(&session, token(&session, &foreign, READ, GET, "z:work", 3600)).is_err());
+        assert!(
+            authorize(
+                &session,
+                token(&session, &foreign, READ, GET, "z:work", 3600)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -360,7 +412,13 @@ mod tests {
     #[test]
     fn token_zone_must_match_authority() {
         let (session, key) = established();
-        assert!(authorize(&session, token(&session, &key, READ, GET, "z:private", 3600)).is_err());
+        assert!(
+            authorize(
+                &session,
+                token(&session, &key, READ, GET, "z:private", 3600)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -381,7 +439,8 @@ mod tests {
         let key = Ed25519SigningKey::generate();
         let mut request = handshake(&key);
         request.capabilities_requested.extend([
-            CapabilityId::from_static(READ), CapabilityId::from_static("unrelated.admin"),
+            CapabilityId::from_static(READ),
+            CapabilityId::from_static("unrelated.admin"),
         ]);
         let response = session.handshake(request).unwrap();
         assert_eq!(response.capabilities_granted.len(), 1);
@@ -395,7 +454,13 @@ mod tests {
         let (mut session, key) = established();
         let mut request = handshake(&key);
         request.capabilities_requested.clear();
-        assert!(session.handshake(request).unwrap().capabilities_granted.is_empty());
+        assert!(
+            session
+                .handshake(request)
+                .unwrap()
+                .capabilities_granted
+                .is_empty()
+        );
         assert!(authorize(&session, token(&session, &key, READ, GET, "z:work", 3600)).is_err());
     }
 
@@ -406,18 +471,34 @@ mod tests {
             (ConnectorId::from_static("fcp.other"), ZoneId::work()),
             (ConnectorId::from_static("fcp.fixture"), ZoneId::private()),
         ] {
-            assert!(session.authorize(&target, &zone, &OperationId::from_static(GET),
-                token(&session, &key, READ, GET, "z:work", 3600), &[]).is_err());
+            assert!(
+                session
+                    .authorize(
+                        &target,
+                        &zone,
+                        &OperationId::from_static(GET),
+                        token(&session, &key, READ, GET, "z:work", 3600),
+                        &[]
+                    )
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn actual_resource_uri_is_checked() {
         let (session, key) = established();
-        assert!(session.authorize(
-            &ConnectorId::from_static("fcp.fixture"), &ZoneId::work(), &OperationId::from_static(GET),
-            token(&session, &key, READ, GET, "z:work", 3600), &["urn:fixture:denied".into()],
-        ).is_err());
+        assert!(
+            session
+                .authorize(
+                    &ConnectorId::from_static("fcp.fixture"),
+                    &ZoneId::work(),
+                    &OperationId::from_static(GET),
+                    token(&session, &key, READ, GET, "z:work", 3600),
+                    &["urn:fixture:denied".into()],
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -439,7 +520,10 @@ mod tests {
         let old_token = token(&session, &key, READ, GET, "z:work", 3600);
         session.invalidate();
         assert!(!session.is_established());
-        assert!(matches!(authorize(&session, old_token), Err(FcpError::NotHandshaken)));
+        assert!(matches!(
+            authorize(&session, old_token),
+            Err(FcpError::NotHandshaken)
+        ));
     }
 
     #[test]
@@ -468,8 +552,10 @@ mod tests {
                 request.capabilities_requested.clear();
             }
             let error = session.handshake(request).unwrap_err();
-            assert!(matches!(error, FcpError::CapabilityDenied { capability, .. }
-                if capability == "standalone.handshake"));
+            assert!(
+                matches!(error, FcpError::CapabilityDenied { capability, .. }
+                if capability == "standalone.handshake")
+            );
             assert!(!session.is_established());
             assert!(session.authority.is_none());
         }
@@ -486,7 +572,10 @@ mod tests {
         request.requested_instance_id = Some(old_instance.clone());
         assert!(session.handshake(request).is_err());
         assert_ne!(session.instance_id(), &old_instance);
-        assert!(matches!(authorize(&session, old_token.clone()), Err(FcpError::NotHandshaken)));
+        assert!(matches!(
+            authorize(&session, old_token.clone()),
+            Err(FcpError::NotHandshaken)
+        ));
         session.handshake(handshake(&key)).unwrap();
         assert!(authorize(&session, old_token).is_err());
         assert!(authorize(&session, token(&session, &key, READ, GET, "z:work", 3600)).is_ok());
@@ -537,7 +626,10 @@ mod tests {
 
     #[test]
     fn manifest_hash_is_sha256_of_exact_utf8_bytes() {
-        assert_eq!(manifest_hash("abc"), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            manifest_hash("abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert_ne!(manifest_hash("abc"), manifest_hash("abc\n"));
     }
 
@@ -552,18 +644,33 @@ mod tests {
         ciborium::into_writer(&constraints, &mut cbor).unwrap();
         let now = Utc::now();
         let raw = CapabilityTokenBuilder::new()
-            .capability_id(READ).zone_id("z:work").principal("user:test")
-            .operations(&[GET]).issuer("node:test")
-            .target_instance(session.instance_id().as_str()).token_id(b"admission-test")
+            .capability_id(READ)
+            .zone_id("z:work")
+            .principal("user:test")
+            .operations(&[GET])
+            .issuer("node:test")
+            .target_instance(session.instance_id().as_str())
+            .token_id(b"admission-test")
             .validity(now, now + Duration::hours(1))
-            .try_constraints_cbor(&cbor).unwrap().sign(key).unwrap();
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(key)
+            .unwrap();
         InvokeRequest {
-            r#type: "invoke".into(), id: crate::RequestId::new("first"),
+            r#type: "invoke".into(),
+            id: crate::RequestId::new("first"),
             connector_id: ConnectorId::from_static("fcp.fixture"),
-            operation: OperationId::from_static(GET), zone_id: ZoneId::work(),
-            input: serde_json::json!({}), capability_token: CapabilityToken::from_raw(raw),
-            holder_proof: None, context: None, idempotency_key: Some("scoped-key".into()),
-            lease_seq: None, deadline_ms: None, correlation_id: None, provenance: None,
+            operation: OperationId::from_static(GET),
+            zone_id: ZoneId::work(),
+            input: serde_json::json!({}),
+            capability_token: CapabilityToken::from_raw(raw),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("scoped-key".into()),
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
             approval_tokens: Vec::new(),
         }
     }
@@ -572,10 +679,20 @@ mod tests {
     fn session_admission_spends_once_despite_changed_request_ids() {
         let (session, key) = established();
         let mut request = limited_request(&session, &key);
-        for _ in 0..4 { authorize(&session, request.capability_token.clone()).unwrap(); }
-        drop(session.admit(&request, &["urn:fixture:allowed".into()]).unwrap());
+        for _ in 0..4 {
+            authorize(&session, request.capability_token.clone()).unwrap();
+        }
+        drop(
+            session
+                .admit(&request, &["urn:fixture:allowed".into()])
+                .unwrap(),
+        );
         request.id = crate::RequestId::new("second");
-        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        assert!(
+            session
+                .admit(&request, &["urn:fixture:allowed".into()])
+                .is_err()
+        );
         assert!(authorize(&session, request.capability_token).is_err());
     }
 
@@ -583,9 +700,20 @@ mod tests {
     fn invalid_signature_cannot_allocate_or_spend_an_account() {
         let (session, key) = established();
         let foreign = Ed25519SigningKey::generate();
-        assert!(session.admit(&limited_request(&session, &foreign),
-            &["urn:fixture:allowed".into()]).is_err());
-        session.admit(&limited_request(&session, &key), &["urn:fixture:allowed".into()]).unwrap();
+        assert!(
+            session
+                .admit(
+                    &limited_request(&session, &foreign),
+                    &["urn:fixture:allowed".into()]
+                )
+                .is_err()
+        );
+        session
+            .admit(
+                &limited_request(&session, &key),
+                &["urn:fixture:allowed".into()],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -593,24 +721,53 @@ mod tests {
         let (session, key) = established();
         let mut request = limited_request(&session, &key);
         request.r#type = "simulate".into();
-        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        assert!(
+            session
+                .admit(&request, &["urn:fixture:allowed".into()])
+                .is_err()
+        );
         request.r#type = "invoke".into();
-        assert!(session.admit(&request, &["urn:fixture:denied".into()]).is_err());
+        assert!(
+            session
+                .admit(&request, &["urn:fixture:denied".into()])
+                .is_err()
+        );
         request.idempotency_key = Some("wrong".into());
-        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        assert!(
+            session
+                .admit(&request, &["urn:fixture:allowed".into()])
+                .is_err()
+        );
         request.idempotency_key = Some("x".repeat(129));
-        assert!(session.admit(&request, &["urn:fixture:allowed".into()]).is_err());
+        assert!(
+            session
+                .admit(&request, &["urn:fixture:allowed".into()])
+                .is_err()
+        );
         request.idempotency_key = Some("scoped-key".into());
-        session.admit(&request, &["urn:fixture:allowed".into()]).unwrap();
+        session
+            .admit(&request, &["urn:fixture:allowed".into()])
+            .unwrap();
     }
 
     #[test]
     fn resetting_accounting_also_revokes_the_old_instance_grant() {
         let (mut session, key) = established();
         let old = limited_request(&session, &key);
-        session.admit(&old, &["urn:fixture:allowed".into()]).unwrap();
+        session
+            .admit(&old, &["urn:fixture:allowed".into()])
+            .unwrap();
         session.handshake(handshake(&key)).unwrap();
-        assert!(session.admit(&old, &["urn:fixture:allowed".into()]).is_err());
-        session.admit(&limited_request(&session, &key), &["urn:fixture:allowed".into()]).unwrap();
+        assert!(
+            session
+                .admit(&old, &["urn:fixture:allowed".into()])
+                .is_err()
+        );
+        session
+            .admit(
+                &limited_request(&session, &key),
+                &["urn:fixture:allowed".into()],
+            )
+            .unwrap();
     }
 }

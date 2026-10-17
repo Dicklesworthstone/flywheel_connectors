@@ -1027,6 +1027,7 @@ fn object_and_symbol_stores_coherent() {
             let stored_obj = StoredObject {
                 object_id,
                 header: fcp_core::ObjectHeader {
+                    encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                     schema: fcp_cbor::SchemaId::new(
                         "fcp.test",
                         "IntegrationTest",
@@ -1612,6 +1613,7 @@ fn lifecycle_snapshot_reflects_reachability_and_symbol_state() {
             let mut root = StoredObject {
                 object_id: root_id,
                 header: fcp_core::ObjectHeader {
+                    encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                     schema: fcp_cbor::SchemaId::new(
                         "fcp.test",
                         "LifecycleRoot",
@@ -1636,6 +1638,7 @@ fn lifecycle_snapshot_reflects_reachability_and_symbol_state() {
             let mut payload_object = StoredObject {
                 object_id,
                 header: fcp_core::ObjectHeader {
+                    encryption_kind: fcp_core::ObjectEncryptionKind::default(),
                     schema: fcp_cbor::SchemaId::new(
                         "fcp.test",
                         "LifecyclePayload",
