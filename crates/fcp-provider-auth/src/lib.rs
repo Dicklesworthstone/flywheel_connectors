@@ -24,8 +24,9 @@ use std::time::Duration as StdDuration;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
+use fcp_async_core::channel::watch;
 use hmac::{Hmac, Mac};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -106,6 +107,10 @@ pub enum AuthError {
         /// Canonical provider id.
         provider: String,
     },
+
+    /// A refresh was cancelled before its result could be committed.
+    #[error("auth profile refresh was cancelled")]
+    RefreshCancelled,
 
     /// Method surface is declared but intentionally deferred to a later slice.
     #[error("auth method {method} does not support {operation} in this slice")]
@@ -3541,11 +3546,37 @@ pub enum AuthMethodKind {
 }
 
 impl AuthMethodKind {
+    // Capture token values as well as configuration. A JWT clone normally
+    // shares its mutable cache, which is unsuitable as a refresh witness.
+    fn detached_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        if let Self::Jwt(method) = &mut snapshot {
+            method.cached_token = Arc::new(RwLock::new(method.cached_token()));
+        }
+        snapshot
+    }
+
+    fn same_auth_state(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ApiKey(left), Self::ApiKey(right)) => left == right,
+            (Self::OAuthDeviceCode(left), Self::OAuthDeviceCode(right)) => left == right,
+            (Self::OAuthAuthCode(left), Self::OAuthAuthCode(right)) => left == right,
+            (Self::SetupToken(left), Self::SetupToken(right)) => left == right,
+            (Self::SigV4(left), Self::SigV4(right)) => left == right,
+            (Self::Jwt(left), Self::Jwt(right)) => {
+                left.id == right.id
+                    && left.ttl == right.ttl
+                    && Arc::ptr_eq(&left.generator, &right.generator)
+                    && left.cached_token() == right.cached_token()
+            }
+            _ => false,
+        }
+    }
+
     /// The refresh token this method currently holds, if any.
     ///
-    /// Used as the compare-and-swap witness for store-backed refreshes: it is
-    /// the one piece of state a provider rotates, so a mismatch is proof that
-    /// another refresh already landed and this response is stale.
+    /// Store-backed refreshes compare this together with the original auth
+    /// configuration and profile incarnation before committing new tokens.
     #[must_use]
     pub fn refresh_token_material(&self) -> Option<&str> {
         match self {
@@ -3642,6 +3673,15 @@ pub struct AuthProfile {
     pub created_at: DateTime<Utc>,
     /// Last use timestamp.
     pub last_used_at: Option<DateTime<Utc>>,
+    // Credential/configuration writes and successful refreshes rotate this
+    // identity even when the provider keeps the same refresh-token string.
+    revision: Arc<()>,
+    // Clones and independently constructed actors share a profile flight.
+    // A newly inserted profile always receives a new gate/incarnation.
+    refresh_gate: Arc<ProfileRefreshGate>,
+    // Store reads capture the full original auth state. This distinguishes
+    // metadata edits from explicit credential changes without secret hashes.
+    auth_snapshot: Option<AuthMethodKind>,
 }
 
 impl AuthProfile {
@@ -3670,7 +3710,25 @@ impl AuthProfile {
             priority,
             created_at: Utc::now(),
             last_used_at: None,
+            revision: Arc::new(()),
+            refresh_gate: Arc::new(ProfileRefreshGate::default()),
+            auth_snapshot: None,
         })
+    }
+
+    fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.auth_snapshot = Some(self.method.detached_snapshot());
+        snapshot
+    }
+
+    fn auth_is_unchanged(&self, stored: &Self) -> bool {
+        Arc::ptr_eq(&self.refresh_gate, &stored.refresh_gate)
+            && Arc::ptr_eq(&self.revision, &stored.revision)
+            && self
+                .auth_snapshot
+                .as_ref()
+                .is_some_and(|original| original.same_auth_state(&stored.method))
     }
 }
 
@@ -3766,7 +3824,7 @@ impl TokenRefreshAction {
 pub enum TokenRefreshOutcome {
     /// Profile refresh succeeded and was persisted through the profile store.
     Refreshed(TokenRefreshDecision),
-    /// Profile did not require a refresh attempt.
+    /// Profile was fresh or a concurrent auth change superseded the refresh.
     Skipped(TokenRefreshDecision),
     /// Profile needed refresh but the refresh or persistence failed.
     Failed {
@@ -3829,6 +3887,83 @@ impl TokenRefreshReport {
     }
 }
 
+#[derive(Debug, Default)]
+struct ProfileRefreshGate {
+    active: Mutex<Option<watch::Sender<Option<TokenRefreshOutcome>>>>,
+}
+
+struct ProfileRefreshLease {
+    gate: Arc<ProfileRefreshGate>,
+    decision: TokenRefreshDecision,
+    _keepalive: watch::Receiver<Option<TokenRefreshOutcome>>,
+    completed: bool,
+}
+
+impl ProfileRefreshLease {
+    fn claim(
+        profile: &AuthProfile,
+        decision: TokenRefreshDecision,
+    ) -> Result<Self, watch::Receiver<Option<TokenRefreshOutcome>>> {
+        let mut active = profile.refresh_gate.active.lock();
+        if let Some(sender) = active.as_ref() {
+            return Err(sender.subscribe());
+        }
+
+        let (sender, receiver) = watch::channel(None);
+        *active = Some(sender);
+        drop(active);
+        Ok(Self {
+            gate: Arc::clone(&profile.refresh_gate),
+            decision,
+            _keepalive: receiver,
+            completed: false,
+        })
+    }
+
+    fn finish(mut self, outcome: TokenRefreshOutcome) -> TokenRefreshOutcome {
+        self.publish(outcome.clone());
+        self.completed = true;
+        outcome
+    }
+
+    fn publish(&self, outcome: TokenRefreshOutcome) {
+        // Never invoke subscriber wakers while holding the gate lock.
+        let sender = self.gate.active.lock().take();
+        if let Some(sender) = sender {
+            let _ = sender.send(Some(outcome));
+        }
+    }
+}
+
+impl Drop for ProfileRefreshLease {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.publish(TokenRefreshOutcome::Failed {
+                decision: self.decision.clone(),
+                error: AuthError::RefreshCancelled,
+            });
+        }
+    }
+}
+
+async fn wait_for_profile_refresh(
+    cx: &fcp_async_core::Cx,
+    mut receiver: watch::Receiver<Option<TokenRefreshOutcome>>,
+    decision: TokenRefreshDecision,
+) -> TokenRefreshOutcome {
+    loop {
+        if let Some(outcome) = receiver.borrow_and_update().clone() {
+            return outcome;
+        }
+        if cx.checkpoint().is_err() || receiver.changed().await.is_err() {
+            return TokenRefreshOutcome::Failed {
+                decision,
+                error: AuthError::RefreshCancelled,
+            };
+        }
+    }
+}
+
 /// Storage boundary for provider auth profiles.
 #[async_trait]
 pub trait AuthProfileStore: Send + Sync {
@@ -3848,25 +3983,26 @@ pub trait AuthProfileStore: Send + Sync {
 
     /// Save or replace a provider profile.
     ///
+    /// Metadata-only edits to a store snapshot preserve the latest stored
+    /// credentials, including a refresh that completed after the snapshot.
+    ///
     /// # Errors
     ///
     /// Returns an [`AuthError`] when profile identity fields are invalid.
     async fn save_profile(&self, profile: AuthProfile) -> AuthResult<()>;
 
-    /// Save a profile only if the stored refresh token still matches
-    /// `expected_refresh_token`.
+    /// Commit refreshed auth only if the profile incarnation and original
+    /// auth state still match, including `expected_refresh_token`.
     ///
-    /// Returns `Ok(false)` — leaving the store untouched — when it does not,
-    /// which means another refresh already rotated the credential and this
-    /// response is stale.
+    /// The candidate must originate from [`Self::get_profile`] or
+    /// [`Self::list_profiles`], retaining its original auth snapshot.
+    /// Metadata changes are preserved while only refreshed auth is committed.
+    /// Credential/configuration changes, another completed refresh, or a
+    /// deleted and recreated profile supersede the candidate.
     ///
-    /// Store-backed refresh is otherwise a read-modify-write with no lock held
-    /// across the provider round trip: two concurrent refreshes both snapshot
-    /// the same profile, both present the same refresh token, and the later
-    /// save wins. With refresh-token rotation (Google, Okta, Auth0) the
-    /// winner's exchange has already invalidated the loser's token, so the
-    /// value that lands in the store is dead and every later refresh fails
-    /// `invalid_grant` until an operator re-runs the login flow.
+    /// Returns `Ok(false)` without modifying the store when the candidate is
+    /// stale. Comparing only the refresh-token string would miss configuration
+    /// edits, non-rotating providers, and delete/recreate with the same token.
     ///
     /// # Errors
     ///
@@ -3901,7 +4037,7 @@ pub struct TokenRefreshActor<S: AuthProfileStore + ?Sized> {
 
 impl<S> TokenRefreshActor<S>
 where
-    S: AuthProfileStore,
+    S: AuthProfileStore + ?Sized,
 {
     /// Construct a token refresh actor over an auth profile store.
     #[must_use]
@@ -3939,7 +4075,7 @@ where
         let profiles = self.store.list_profiles(provider).await?;
         let mut report = TokenRefreshReport::default();
         for profile in profiles {
-            report.push(self.refresh_profile_snapshot(cx, profile).await);
+            report.push(self.refresh_profile_snapshot(cx, profile, None).await);
         }
         Ok(report)
     }
@@ -3956,45 +4092,99 @@ where
         profile_id: &str,
     ) -> AuthResult<TokenRefreshOutcome> {
         let profile = self.store.get_profile(provider, profile_id).await?;
-        Ok(self.refresh_profile_snapshot(cx, profile).await)
+        Ok(self.refresh_profile_snapshot(cx, profile, None).await)
+    }
+
+    /// Refresh one due profile through an injectable OAuth transport.
+    ///
+    /// Concurrent actors sharing a store snapshot join the same profile
+    /// flight. Only its leader spends the refresh token and commits auth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AuthError`] when the provider/profile id is invalid or the profile is missing.
+    pub async fn refresh_profile_with_transport(
+        &self,
+        cx: &fcp_async_core::Cx,
+        provider: &str,
+        profile_id: &str,
+        transport: &dyn OAuthRefreshTokenTransport,
+    ) -> AuthResult<TokenRefreshOutcome> {
+        let profile = self.store.get_profile(provider, profile_id).await?;
+        Ok(self
+            .refresh_profile_snapshot(cx, profile, Some(transport))
+            .await)
     }
 
     async fn refresh_profile_snapshot(
         &self,
         cx: &fcp_async_core::Cx,
         mut profile: AuthProfile,
+        transport: Option<&dyn OAuthRefreshTokenTransport>,
     ) -> TokenRefreshOutcome {
+        // Capture the actual method returned by any store implementation;
+        // callers do not need access to the private comparison witness.
+        profile.auth_snapshot = Some(profile.method.detached_snapshot());
         let decision = TokenRefreshDecision::for_profile(&profile, self.policy);
         if !decision.should_refresh() {
             return TokenRefreshOutcome::Skipped(decision);
         }
 
-        // Capture the refresh token we are about to spend, BEFORE the provider
-        // round trip rotates it. It is the compare-and-swap witness: if the
-        // stored value has moved on by the time we write back, another refresh
-        // already landed and ours is stale.
+        let lease = match ProfileRefreshLease::claim(&profile, decision.clone()) {
+            Ok(lease) => lease,
+            Err(receiver) => return wait_for_profile_refresh(cx, receiver, decision).await,
+        };
+
+        // A previous flight may have completed after this snapshot was read
+        // but before its gate was claimed. Never spend that stale grant.
+        match self.store.get_profile(&profile.provider, &profile.id).await {
+            Ok(current) if profile.auth_is_unchanged(&current) => {}
+            Ok(current) => {
+                return lease.finish(TokenRefreshOutcome::Skipped(
+                    TokenRefreshDecision::for_profile(&current, self.policy),
+                ));
+            }
+            Err(error) => {
+                return lease.finish(TokenRefreshOutcome::Failed { decision, error });
+            }
+        }
+        if cx.checkpoint().is_err() {
+            return lease.finish(TokenRefreshOutcome::Failed {
+                decision,
+                error: AuthError::RefreshCancelled,
+            });
+        }
+
         let expected_refresh_token = profile
             .method
             .refresh_token_material()
             .map(ToString::to_string);
-
-        if let Err(error) = profile.method.refresh(cx).await {
-            return TokenRefreshOutcome::Failed { decision, error };
+        // Candidate refresh must not mutate the store's shared JWT cache
+        // before the atomic comparison has accepted this result.
+        profile.method = profile.method.detached_snapshot();
+        let result = match (&mut profile.method, transport) {
+            (AuthMethodKind::OAuthDeviceCode(method), Some(transport)) => {
+                method.refresh_with_transport(cx, transport).await
+            }
+            (AuthMethodKind::OAuthAuthCode(method), Some(transport)) => {
+                method.refresh_with_transport(cx, transport).await
+            }
+            (method, _) => method.refresh(cx).await,
+        };
+        if let Err(error) = result {
+            return lease.finish(TokenRefreshOutcome::Failed { decision, error });
         }
 
-        match self
+        let outcome = match self
             .store
             .save_profile_if_unchanged(profile, expected_refresh_token.as_deref())
             .await
         {
-            // Losing the race is not a failure: the winner's result is already
-            // stored and is strictly fresher than ours. Discarding our response
-            // is the whole point — writing it would install a refresh token the
-            // provider already invalidated.
             Ok(true) => TokenRefreshOutcome::Refreshed(decision),
             Ok(false) => TokenRefreshOutcome::Skipped(decision),
             Err(error) => TokenRefreshOutcome::Failed { decision, error },
-        }
+        };
+        lease.finish(outcome)
     }
 }
 
@@ -4050,7 +4240,7 @@ impl AuthProfileStore for InMemoryAuthProfileStore {
             .read()
             .values()
             .filter(|profile| profile.provider == provider)
-            .cloned()
+            .map(AuthProfile::snapshot)
             .collect::<Vec<_>>();
         profiles.sort_by(|left, right| profile_sort_key(left).cmp(&profile_sort_key(right)));
         Ok(profiles)
@@ -4062,7 +4252,7 @@ impl AuthProfileStore for InMemoryAuthProfileStore {
         self.profiles
             .read()
             .get(&(provider.clone(), profile_id.to_string()))
-            .cloned()
+            .map(AuthProfile::snapshot)
             .ok_or_else(|| AuthError::ProfileNotFound {
                 provider,
                 profile_id: profile_id.to_string(),
@@ -4073,9 +4263,31 @@ impl AuthProfileStore for InMemoryAuthProfileStore {
         validate_non_empty(&profile.id, "profile_id")?;
         validate_non_empty(&profile.label, "label")?;
         profile.provider = canonical_provider(&profile.provider)?;
-        self.profiles
-            .write()
-            .insert((profile.provider.clone(), profile.id.clone()), profile);
+        let key = (profile.provider.clone(), profile.id.clone());
+        let mut profiles = self.profiles.write();
+        if let Some(stored) = profiles.get(&key) {
+            let metadata_only = Arc::ptr_eq(&profile.refresh_gate, &stored.refresh_gate)
+                && profile
+                    .auth_snapshot
+                    .as_ref()
+                    .is_some_and(|original| original.same_auth_state(&profile.method));
+            if metadata_only {
+                // A label/priority/usage update may race a rotating refresh.
+                // Keep the newest auth even if this editor read older tokens.
+                profile.method = stored.method.clone();
+                profile.revision = Arc::clone(&stored.revision);
+            } else {
+                profile.revision = Arc::new(());
+            }
+            profile.refresh_gate = Arc::clone(&stored.refresh_gate);
+        } else {
+            // Public ids can be edited on a clone. Never share another key's
+            // flight, nor reuse the incarnation of a deleted profile.
+            profile.refresh_gate = Arc::new(ProfileRefreshGate::default());
+            profile.revision = Arc::new(());
+        }
+        profile.auth_snapshot = None;
+        profiles.insert(key, profile);
         Ok(())
     }
 
@@ -4093,18 +4305,24 @@ impl AuthProfileStore for InMemoryAuthProfileStore {
         // the race this method exists to close.
         let mut profiles = self.profiles.write();
         let key = (profile.provider.clone(), profile.id.clone());
-        let outcome = match profiles.get(&key) {
-            None => Err(AuthError::ProfileNotFound {
+        let Some(stored) = profiles.get_mut(&key) else {
+            return Err(AuthError::ProfileNotFound {
                 provider: profile.provider.clone(),
                 profile_id: profile.id.clone(),
-            }),
-            Some(stored) => Ok(stored.method.refresh_token_material() == expected_refresh_token),
+            });
         };
-        if matches!(outcome, Ok(true)) {
-            profiles.insert(key, profile);
+        if !profile.auth_is_unchanged(stored)
+            || stored.method.refresh_token_material() != expected_refresh_token
+        {
+            return Ok(false);
         }
-        drop(profiles);
-        outcome
+
+        // The original auth still matches, but operator metadata may be newer
+        // than the refresh snapshot. Commit only auth and keep those edits.
+        stored.method = profile.method;
+        stored.revision = Arc::new(());
+        stored.auth_snapshot = None;
+        Ok(true)
     }
 
     async fn delete_profile(&self, provider: &str, profile_id: &str) -> AuthResult<()> {
@@ -4367,6 +4585,89 @@ mod tests {
                     reason: "scripted transport had no response".to_string(),
                 })
         }
+    }
+
+    #[derive(Debug)]
+    struct ControlledRefreshTransport {
+        release: watch::Receiver<bool>,
+        calls: AtomicUsize,
+        response: OAuthRefreshProviderResponse,
+    }
+
+    impl ControlledRefreshTransport {
+        fn new(response: OAuthRefreshProviderResponse) -> (Self, watch::Sender<bool>) {
+            let (sender, receiver) = watch::channel(false);
+            (
+                Self {
+                    release: receiver,
+                    calls: AtomicUsize::new(0),
+                    response,
+                },
+                sender,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl OAuthRefreshTokenTransport for ControlledRefreshTransport {
+        async fn refresh(
+            &self,
+            config: &OAuthRefreshTokenConfig,
+            grant: &OAuthRefreshTokenGrant,
+        ) -> AuthResult<OAuthRefreshProviderResponse> {
+            assert_eq!(config.client_id, "fixture-client");
+            assert_eq!(grant.refresh_token.expose_secret(), "fixture-refresh-token");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.clone();
+            loop {
+                let released = *release.borrow_and_update();
+                if released {
+                    break;
+                }
+                release
+                    .changed()
+                    .await
+                    .map_err(|_| AuthError::RefreshCancelled)?;
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    fn due_oauth_profile(id: &str, auth_code: bool) -> AuthProfile {
+        let tokens = OAuthTokens::bearer(
+            "fixture-access-token",
+            Some(StdDuration::from_secs(60)),
+            Some("fixture-refresh-token"),
+            Some("chat messages"),
+        )
+        .unwrap();
+        let method = if auth_code {
+            let mut auth = OAuthAuthCodeAuth::from_config(auth_code_config());
+            auth.apply_tokens(tokens);
+            AuthMethodKind::OAuthAuthCode(auth)
+        } else {
+            let mut auth = OAuthDeviceCodeAuth::from_config(oauth_config());
+            auth.apply_tokens(tokens);
+            AuthMethodKind::OAuthDeviceCode(auth)
+        };
+        AuthProfile::new(id, "example", method, "original label", 0).unwrap()
+    }
+
+    fn rotated_oauth_response() -> OAuthRefreshProviderResponse {
+        OAuthRefreshProviderResponse::Authorized(
+            OAuthTokens::bearer(
+                "rotated-access-token",
+                Some(StdDuration::from_secs(3_600)),
+                Some("rotated-refresh-token"),
+                Some("chat messages"),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn poll_refresh_pending<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
     }
 
     #[test]
@@ -5223,6 +5524,402 @@ mod tests {
     /// refresh-token rotation the loser's token was already invalidated by the
     /// winner's exchange — so the value that lands is dead.
     #[test]
+    fn token_refresh_actor_coalesces_oauth_across_independent_actors() {
+        for auth_code in [false, true] {
+            run(async {
+                let store = Arc::new(InMemoryAuthProfileStore::new());
+                store
+                    .save_profile(due_oauth_profile("work", auth_code))
+                    .await
+                    .unwrap();
+                let policy = TokenRefreshPolicy::default();
+                let first_actor = TokenRefreshActor::new(Arc::clone(&store), policy);
+                let second_actor = TokenRefreshActor::new(Arc::clone(&store), policy);
+                let (transport, release) =
+                    ControlledRefreshTransport::new(rotated_oauth_response());
+                let cx = cx();
+                let mut first = Box::pin(
+                    first_actor.refresh_profile_with_transport(&cx, "example", "work", &transport),
+                );
+                poll_refresh_pending(first.as_mut());
+                let mut second = Box::pin(
+                    second_actor.refresh_profile_with_transport(&cx, "example", "work", &transport),
+                );
+                poll_refresh_pending(second.as_mut());
+                assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+                release.send(true).unwrap();
+                let outcome = first.await.unwrap();
+                assert!(matches!(outcome, TokenRefreshOutcome::Refreshed(_)));
+                assert_eq!(second.await.unwrap(), outcome);
+                assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+                let stored = store.get_profile("example", "work").await.unwrap();
+                assert_eq!(
+                    stored.method.refresh_token_material(),
+                    Some("rotated-refresh-token")
+                );
+                let mut request = AuthRequest::new();
+                stored
+                    .method
+                    .build_request_auth(&cx, &mut request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    request.value_for("Authorization"),
+                    Some("Bearer rotated-access-token")
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn token_refresh_actor_keeps_renamed_clones_and_profiles_independent() {
+        run(async {
+            let store = Arc::new(InMemoryAuthProfileStore::new());
+            store
+                .save_profile(due_oauth_profile("first", false))
+                .await
+                .unwrap();
+            let mut second_profile = store.get_profile("example", "first").await.unwrap();
+            second_profile.id = "second".to_string();
+            store.save_profile(second_profile).await.unwrap();
+            let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+            let (transport, release) = ControlledRefreshTransport::new(rotated_oauth_response());
+            let cx = cx();
+            let mut first =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "first", &transport));
+            poll_refresh_pending(first.as_mut());
+            let mut second = Box::pin(
+                actor.refresh_profile_with_transport(&cx, "example", "second", &transport),
+            );
+            poll_refresh_pending(second.as_mut());
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+
+            release.send(true).unwrap();
+            let first_outcome = first.await.unwrap();
+            let second_outcome = second.await.unwrap();
+            assert!(matches!(first_outcome, TokenRefreshOutcome::Refreshed(_)));
+            assert!(matches!(second_outcome, TokenRefreshOutcome::Refreshed(_)));
+            assert_eq!(first_outcome.decision().profile_id, "first");
+            assert_eq!(second_outcome.decision().profile_id, "second");
+            for id in ["first", "second"] {
+                let stored = store.get_profile("example", id).await.unwrap();
+                assert_eq!(
+                    stored.method.refresh_token_material(),
+                    Some("rotated-refresh-token")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn token_refresh_actor_preserves_metadata_on_both_sides_of_rotation() {
+        for auth_code in [false, true] {
+            for edit_before_response in [false, true] {
+                run(async {
+                    let store = Arc::new(InMemoryAuthProfileStore::new());
+                    store
+                        .save_profile(due_oauth_profile("work", auth_code))
+                        .await
+                        .unwrap();
+                    let actor =
+                        TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+                    let (transport, release) =
+                        ControlledRefreshTransport::new(rotated_oauth_response());
+                    let cx = cx();
+                    let mut refresh = Box::pin(
+                        actor.refresh_profile_with_transport(&cx, "example", "work", &transport),
+                    );
+                    poll_refresh_pending(refresh.as_mut());
+                    let mut editor = store.get_profile("example", "work").await.unwrap();
+                    editor.label = "operator label".to_string();
+                    editor.priority = 42;
+                    editor.last_used_at = Some(Utc::now());
+                    let expected_last_used = editor.last_used_at;
+                    if edit_before_response {
+                        store.save_profile(editor.clone()).await.unwrap();
+                    }
+
+                    release.send(true).unwrap();
+                    assert!(matches!(
+                        refresh.await.unwrap(),
+                        TokenRefreshOutcome::Refreshed(_)
+                    ));
+                    if !edit_before_response {
+                        // The editor still holds the old refresh token, but
+                        // changed only metadata relative to its read snapshot.
+                        store.save_profile(editor).await.unwrap();
+                    }
+                    let stored = store.get_profile("example", "work").await.unwrap();
+                    assert_eq!(stored.label, "operator label");
+                    assert_eq!(stored.priority, 42);
+                    assert_eq!(stored.last_used_at, expected_last_used);
+                    assert_eq!(
+                        stored.method.refresh_token_material(),
+                        Some("rotated-refresh-token")
+                    );
+                    let mut request = AuthRequest::new();
+                    stored
+                        .method
+                        .build_request_auth(&cx, &mut request)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        request.value_for("Authorization"),
+                        Some("Bearer rotated-access-token")
+                    );
+                    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn token_refresh_actor_never_resurrects_logout_or_overwrites_auth_edits() {
+        for change in [
+            "logout",
+            "recreate",
+            "configuration",
+            "client_secret",
+            "scope",
+            "credentials",
+            "method",
+        ] {
+            run(async {
+                let store = Arc::new(InMemoryAuthProfileStore::new());
+                store
+                    .save_profile(due_oauth_profile("work", true))
+                    .await
+                    .unwrap();
+                let actor =
+                    TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+                let (transport, release) =
+                    ControlledRefreshTransport::new(rotated_oauth_response());
+                let cx = cx();
+                let mut refresh = Box::pin(
+                    actor.refresh_profile_with_transport(&cx, "example", "work", &transport),
+                );
+                poll_refresh_pending(refresh.as_mut());
+
+                let mut edited = store.get_profile("example", "work").await.unwrap();
+                if change == "logout" || change == "recreate" {
+                    store.delete_profile("example", "work").await.unwrap();
+                }
+                if change != "logout" {
+                    edited.label = "operator edit".to_string();
+                    edited.priority = 37;
+                    if change == "method" {
+                        edited.method =
+                            AuthMethodKind::ApiKey(ApiKeyAuth::bearer("operator-api-key").unwrap());
+                    } else if let AuthMethodKind::OAuthAuthCode(method) = &mut edited.method {
+                        match change {
+                            "configuration" => {
+                                method.token_url =
+                                    "https://new-auth.example.test/token".to_string();
+                            }
+                            "client_secret" => {
+                                method.client_secret =
+                                    Some(RedactedSecret::new("operator-client-secret").unwrap());
+                            }
+                            "scope" => {
+                                method.granted_scope = Some("chat".to_string());
+                            }
+                            "credentials" => {
+                                method.access_token =
+                                    Some(RedactedSecret::new("operator-access-token").unwrap());
+                            }
+                            _ => {}
+                        }
+                    }
+                    store.save_profile(edited.clone()).await.unwrap();
+                }
+
+                release.send(true).unwrap();
+                let outcome = refresh.await.unwrap();
+                if change == "logout" {
+                    assert!(matches!(
+                        outcome,
+                        TokenRefreshOutcome::Failed {
+                            error: AuthError::ProfileNotFound { .. },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        store.get_profile("example", "work").await,
+                        Err(AuthError::ProfileNotFound { .. })
+                    ));
+                } else {
+                    assert!(matches!(outcome, TokenRefreshOutcome::Skipped(_)));
+                    let stored = store.get_profile("example", "work").await.unwrap();
+                    assert!(
+                        stored.method.same_auth_state(&edited.method),
+                        "change: {change}"
+                    );
+                    assert_eq!(stored.label, "operator edit");
+                    assert_eq!(stored.priority, 37);
+                }
+                assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn token_refresh_actor_shares_provider_failure_without_reusing_the_grant() {
+        run(async {
+            let store = Arc::new(InMemoryAuthProfileStore::new());
+            store
+                .save_profile(due_oauth_profile("work", false))
+                .await
+                .unwrap();
+            let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+            let (transport, release) =
+                ControlledRefreshTransport::new(OAuthRefreshProviderResponse::Rejected {
+                    code: "invalid_grant".to_string(),
+                    reason: "refresh token rejected".to_string(),
+                });
+            let cx = cx();
+            let mut leader =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(leader.as_mut());
+            let mut waiter =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(waiter.as_mut());
+            release.send(true).unwrap();
+            let outcome = leader.await.unwrap();
+            assert!(matches!(
+                outcome,
+                TokenRefreshOutcome::Failed {
+                    error: AuthError::ProviderRejected { .. },
+                    ..
+                }
+            ));
+            assert_eq!(waiter.await.unwrap(), outcome);
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+            let stored = store.get_profile("example", "work").await.unwrap();
+            assert_eq!(
+                stored.method.refresh_token_material(),
+                Some("fixture-refresh-token")
+            );
+        });
+    }
+
+    #[test]
+    fn token_refresh_actor_cancelled_leader_wakes_waiters_and_releases_flight() {
+        run(async {
+            let store = Arc::new(InMemoryAuthProfileStore::new());
+            store
+                .save_profile(due_oauth_profile("work", false))
+                .await
+                .unwrap();
+            let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+            let (transport, release) = ControlledRefreshTransport::new(rotated_oauth_response());
+            let cx = cx();
+            let mut leader =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(leader.as_mut());
+            let mut waiter =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(waiter.as_mut());
+            drop(leader);
+            assert!(matches!(
+                waiter.await.unwrap(),
+                TokenRefreshOutcome::Failed {
+                    error: AuthError::RefreshCancelled,
+                    ..
+                }
+            ));
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+            release.send(true).unwrap();
+            assert!(matches!(
+                actor
+                    .refresh_profile_with_transport(&cx, "example", "work", &transport)
+                    .await
+                    .unwrap(),
+                TokenRefreshOutcome::Refreshed(_)
+            ));
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn token_refresh_actor_dropped_waiter_does_not_release_the_leader() {
+        run(async {
+            let store = Arc::new(InMemoryAuthProfileStore::new());
+            store
+                .save_profile(due_oauth_profile("work", false))
+                .await
+                .unwrap();
+            let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+            let (transport, release) = ControlledRefreshTransport::new(rotated_oauth_response());
+            let cx = cx();
+            let mut leader =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(leader.as_mut());
+            let mut waiter =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(waiter.as_mut());
+            drop(waiter);
+            let mut later_waiter =
+                Box::pin(actor.refresh_profile_with_transport(&cx, "example", "work", &transport));
+            poll_refresh_pending(later_waiter.as_mut());
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+            release.send(true).unwrap();
+            assert_eq!(leader.await.unwrap(), later_waiter.await.unwrap());
+        });
+    }
+
+    #[test]
+    fn token_refresh_actor_rejects_snapshot_changed_before_flight_claim() {
+        run(async {
+            let store = Arc::new(InMemoryAuthProfileStore::new());
+            store
+                .save_profile(due_oauth_profile("work", false))
+                .await
+                .unwrap();
+            let stale = store.get_profile("example", "work").await.unwrap();
+            let mut edited = stale.clone();
+            let AuthMethodKind::OAuthDeviceCode(method) = &mut edited.method else {
+                panic!("expected device-code auth");
+            };
+            method.token_url = "https://new-auth.example.test/token".to_string();
+            store.save_profile(edited).await.unwrap();
+            let actor = TokenRefreshActor::new(Arc::clone(&store), TokenRefreshPolicy::default());
+            let (transport, _release) = ControlledRefreshTransport::new(rotated_oauth_response());
+            assert!(matches!(
+                actor
+                    .refresh_profile_snapshot(&cx(), stale, Some(&transport))
+                    .await,
+                TokenRefreshOutcome::Skipped(_)
+            ));
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn store_refresh_revision_rejects_even_identical_non_rotating_writes() {
+        run(async {
+            let store = InMemoryAuthProfileStore::new();
+            store
+                .save_profile(due_oauth_profile("work", false))
+                .await
+                .unwrap();
+            let snapshot = store.get_profile("example", "work").await.unwrap();
+            assert!(
+                store
+                    .save_profile_if_unchanged(snapshot.clone(), Some("fixture-refresh-token"))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !store
+                    .save_profile_if_unchanged(snapshot, Some("fixture-refresh-token"))
+                    .await
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
     fn store_refresh_rejects_a_stale_write_after_a_concurrent_rotation() {
         let store = InMemoryAuthProfileStore::new();
 
@@ -5245,6 +5942,7 @@ mod tests {
         )
         .unwrap();
         run(async { store.save_profile(profile.clone()).await }).unwrap();
+        let snapshot = run(async { store.get_profile("example", "p1").await }).unwrap();
 
         // A concurrent refresh lands first, rotating the stored token to v2.
         let mut winner = auth.clone();
@@ -5257,14 +5955,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let winner_profile = AuthProfile::new(
-            "p1",
-            "example",
-            AuthMethodKind::OAuthDeviceCode(winner),
-            "label",
-            0,
-        )
-        .unwrap();
+        let mut winner_profile = snapshot.clone();
+        winner_profile.method = AuthMethodKind::OAuthDeviceCode(winner);
         assert!(
             run(async {
                 store
@@ -5286,14 +5978,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let loser_profile = AuthProfile::new(
-            "p1",
-            "example",
-            AuthMethodKind::OAuthDeviceCode(loser),
-            "label",
-            0,
-        )
-        .unwrap();
+        let mut loser_profile = snapshot;
+        loser_profile.method = AuthMethodKind::OAuthDeviceCode(loser);
         assert!(
             !run(async {
                 store

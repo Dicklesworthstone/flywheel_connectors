@@ -140,8 +140,8 @@ use fcp_provider_auth::{
     OAuthDeviceCodeAuth, OAuthDeviceCodeChallenge, OAuthDeviceCodeConfig, OAuthDeviceCodeFlow,
     OAuthDeviceCodePoll, OAuthDeviceCodeProviderResponse, OAuthDeviceCodeTransport,
     OAuthRefreshProviderResponse, OAuthRefreshTokenConfig, OAuthRefreshTokenGrant,
-    OAuthRefreshTokenTransport, OAuthTokens, TokenRefreshDecision, TokenRefreshOutcome,
-    TokenRefreshPolicy,
+    OAuthRefreshTokenTransport, OAuthTokens, TokenRefreshActor, TokenRefreshDecision,
+    TokenRefreshOutcome, TokenRefreshPolicy,
 };
 use fcp_ratelimit::{BackpressureThresholds, RateLimiter, TokenBucket};
 use fcp_sandbox::{
@@ -9601,6 +9601,7 @@ fn map_auth_profile_error(error: AuthError) -> (StatusCode, String) {
         AuthError::UnsupportedMethod { .. }
         | AuthError::Expired { .. }
         | AuthError::ProviderRejected { .. } => StatusCode::CONFLICT,
+        AuthError::RefreshCancelled => StatusCode::REQUEST_TIMEOUT,
         AuthError::InvalidConfig { .. }
         | AuthError::InvalidHeader { .. }
         | AuthError::InvalidProviderResponse { .. }
@@ -9762,7 +9763,7 @@ fn auth_refresh_outcome_view(outcome: TokenRefreshOutcome) -> AuthProfileRefresh
 
 async fn auth_refresh_profile_snapshot_with_transport(
     store: &Arc<InMemoryAuthProfileStore>,
-    mut profile: AuthProfile,
+    profile: AuthProfile,
 ) -> TokenRefreshOutcome {
     let policy = TokenRefreshPolicy::default();
     let decision = TokenRefreshDecision::for_profile(&profile, policy);
@@ -9775,21 +9776,12 @@ async fn auth_refresh_profile_snapshot_with_transport(
         Err(error) => return TokenRefreshOutcome::Failed { decision, error },
     };
     let cx = fcp_async_core::compatibility_cx();
-    let refresh_result = match &mut profile.method {
-        AuthMethodKind::OAuthDeviceCode(method) => {
-            method.refresh_with_transport(&cx, &transport).await
-        }
-        AuthMethodKind::OAuthAuthCode(method) => {
-            method.refresh_with_transport(&cx, &transport).await
-        }
-        _ => profile.method.refresh(&cx).await,
-    };
-    if let Err(error) = refresh_result {
-        return TokenRefreshOutcome::Failed { decision, error };
-    }
-
-    match store.save_profile(profile).await {
-        Ok(()) => TokenRefreshOutcome::Refreshed(decision),
+    let actor = TokenRefreshActor::new(Arc::clone(store), policy);
+    match actor
+        .refresh_profile_with_transport(&cx, &profile.provider, &profile.id, &transport)
+        .await
+    {
+        Ok(outcome) => outcome,
         Err(error) => TokenRefreshOutcome::Failed { decision, error },
     }
 }
@@ -33597,6 +33589,13 @@ done"#;
 
     impl HostOAuthLoopbackServer {
         fn start(expected: Vec<HostOAuthLoopbackExpectedRequest>) -> Self {
+            Self::start_before_response(expected, || {})
+        }
+
+        fn start_before_response(
+            expected: Vec<HostOAuthLoopbackExpectedRequest>,
+            mut before_response: impl FnMut() + Send + 'static,
+        ) -> Self {
             let listener =
                 StdTcpListener::bind("127.0.0.1:0").expect("bind host OAuth loopback server");
             listener
@@ -33665,6 +33664,7 @@ done"#;
                         .lock()
                         .expect("OAuth loopback observed lock")
                         .push((format!("{method} {path}"), body));
+                    before_response();
                     write_host_telegram_loopback_response(&mut stream, &expected.response);
                     served += 1;
                 }
@@ -35336,6 +35336,142 @@ done"#;
         )
         .await?;
         assert_eq!(missing.status(), axum::http::StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn auth_profile_refresh_route_preserves_logout_recreation_and_edits()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let app = credential_pool_admin_test_app(cancel_route_test_state());
+        let auth = [
+            ("Authorization", "Bearer topsecret"),
+            (ADMIN_ZONE_HEADER, "z:owner"),
+        ];
+        for change in ["logout", "recreate", "configuration", "metadata"] {
+            let provider = format!("test-refresh-race-{change}");
+            let store = auth_profile_store();
+            let hook_store = Arc::clone(&store);
+            let hook_provider = provider.clone();
+            let oauth = HostOAuthLoopbackServer::start_before_response(
+                vec![HostOAuthLoopbackExpectedRequest {
+                    method: "POST",
+                    path: "/token",
+                    body_contains: vec![
+                        "grant_type=refresh_token",
+                        "refresh_token=race-old-refresh",
+                    ],
+                    response: json!({
+                        "access_token": "race-returned-access",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "refresh_token": "race-returned-refresh",
+                        "scope": "repo"
+                    }),
+                }],
+                move || {
+                    fcp_async_core::runtime::block_on_sync(async {
+                        let mut current = hook_store.get_profile(&hook_provider, "primary").await?;
+                        if change == "logout" || change == "recreate" {
+                            hook_store.delete_profile(&hook_provider, "primary").await?;
+                        }
+                        if change != "logout" {
+                            current.label = "new operator state".to_string();
+                            current.priority = 37;
+                            if change == "configuration" {
+                                let AuthMethodKind::OAuthDeviceCode(method) = &mut current.method
+                                else {
+                                    panic!("expected device-code profile");
+                                };
+                                method.token_url =
+                                    "https://new-auth.example.test/token".to_string();
+                            }
+                            hook_store.save_profile(current).await?;
+                        }
+                        Ok::<(), AuthError>(())
+                    })
+                    .expect("run concurrent profile edit")
+                    .expect("save concurrent profile edit");
+                },
+            );
+            let mut method = OAuthDeviceCodeAuth::new(
+                "race-client",
+                format!("{}/device", oauth.base_url),
+                format!("{}/token", oauth.base_url),
+                "repo",
+            )?;
+            method.apply_tokens(OAuthTokens::bearer(
+                "race-old-access",
+                Some(Duration::from_secs(60)),
+                Some("race-old-refresh"),
+                Some("repo"),
+            )?);
+            store
+                .save_profile(AuthProfile::new(
+                    "primary",
+                    &provider,
+                    AuthMethodKind::OAuthDeviceCode(method),
+                    "original profile",
+                    0,
+                )?)
+                .await?;
+
+            let path = if change == "metadata" {
+                format!("/rpc/admin/auth/profiles/{provider}/refresh")
+            } else {
+                format!("/rpc/admin/auth/profiles/{provider}/primary/refresh")
+            };
+            let response = send_json_request(
+                app.clone(),
+                axum::http::Method::POST,
+                &path,
+                json!({}),
+                &auth,
+            )
+            .await?;
+            let body =
+                response_body_json_ok(response, "OAuth refresh racing profile edits").await?;
+            let (observed, errors) = oauth.join();
+            assert!(errors.is_empty(), "loopback errors: {errors:?}");
+            assert_eq!(observed.len(), 1);
+            assert!(!body.to_string().contains("race-returned"));
+            if change == "logout" {
+                assert_eq!(body["outcomes"][0]["outcome"], "failed");
+                assert!(matches!(
+                    store.get_profile(&provider, "primary").await,
+                    Err(AuthError::ProfileNotFound { .. })
+                ));
+            } else {
+                let expected_outcome = if change == "metadata" {
+                    "refreshed"
+                } else {
+                    "skipped"
+                };
+                assert_eq!(body["outcomes"][0]["outcome"], expected_outcome);
+                let current = store.get_profile(&provider, "primary").await?;
+                assert_eq!(current.label, "new operator state");
+                assert_eq!(current.priority, 37);
+                let expected_refresh = if change == "metadata" {
+                    "race-returned-refresh"
+                } else {
+                    "race-old-refresh"
+                };
+                assert_eq!(
+                    current.method.refresh_token_material(),
+                    Some(expected_refresh)
+                );
+                let mut request = fcp_provider_auth::AuthRequest::new();
+                current
+                    .method
+                    .build_request_auth(&fcp_async_core::compatibility_cx(), &mut request)
+                    .await?;
+                let expected_header = if change == "metadata" {
+                    "Bearer race-returned-access"
+                } else {
+                    "Bearer race-old-access"
+                };
+                assert_eq!(request.value_for("Authorization"), Some(expected_header));
+            }
+        }
         Ok(())
     }
 
