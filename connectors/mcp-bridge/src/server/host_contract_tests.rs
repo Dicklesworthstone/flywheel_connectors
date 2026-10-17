@@ -6,7 +6,11 @@ use fcp_core::{HandshakeResponse, Introspection, SelfCheckReport};
 use super::*;
 
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
-    Builder::new_multi_thread().enable_all().build().unwrap().block_on(future)
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 fn handshake() -> Value {
@@ -19,7 +23,10 @@ fn handshake() -> Value {
 
 async fn configure(server: &mut McpBridgeServer) {
     // Construction is local. No test needs a running upstream MCP server.
-    server.dispatch("configure", json!({"mcp_url": "http://127.0.0.1:1"})).await.unwrap();
+    server
+        .dispatch("configure", json!({"mcp_url": "http://127.0.0.1:1"}))
+        .await
+        .unwrap();
 }
 
 async fn health(server: &mut McpBridgeServer) -> (HealthSnapshot, Value) {
@@ -39,7 +46,10 @@ fn initial_health_is_canonical_starting_not_a_legacy_status_string() {
         assert_eq!(value["handshaken"], false);
         assert_eq!(value["requests"], 0);
         assert!(!snapshot.is_ready());
-        assert_eq!(snapshot.details.as_ref().unwrap()["instance_id"], value["instance_id"]);
+        assert_eq!(
+            snapshot.details.as_ref().unwrap()["instance_id"],
+            value["instance_id"]
+        );
     });
 }
 
@@ -69,7 +79,10 @@ fn accepted_handshake_and_health_report_the_same_actual_instance() {
         let (snapshot, value) = health(&mut server).await;
         assert!(snapshot.is_ready());
         assert_eq!(value["instance_id"], reply["instance_id"]);
-        assert_eq!(snapshot.details.unwrap()["instance_id"], reply["instance_id"]);
+        assert_eq!(
+            snapshot.details.unwrap()["instance_id"],
+            reply["instance_id"]
+        );
         assert_eq!(value["requests"], 0);
     });
 }
@@ -140,13 +153,13 @@ fn uptime_is_process_lifetime_not_time_since_last_configure_or_handshake() {
 fn host_control_plane_types_round_trip_without_invoking_the_provider() {
     run(async {
         let mut server = McpBridgeServer::new().unwrap();
-        let catalog: Introspection = serde_json::from_value(
-            server.dispatch("introspect", json!({})).await.unwrap(),
-        ).unwrap();
+        let catalog: Introspection =
+            serde_json::from_value(server.dispatch("introspect", json!({})).await.unwrap())
+                .unwrap();
         assert_eq!(catalog.operations.len(), 10);
-        let report: SelfCheckReport = serde_json::from_value(
-            server.dispatch("self_check", json!({})).await.unwrap(),
-        ).unwrap();
+        let report: SelfCheckReport =
+            serde_json::from_value(server.dispatch("self_check", json!({})).await.unwrap())
+                .unwrap();
         assert!(matches!(report.status, fcp_core::SelfCheckStatus::Degraded));
         let (_, value) = health(&mut server).await;
         assert_eq!(value["requests"], 0);
@@ -162,8 +175,10 @@ fn embedded_manifest_forbidden_zones_cannot_establish_provider_authority() {
         for zone in ["z:public", "z:community"] {
             let mut request = handshake();
             request["zone"] = json!(zone);
-            assert!(matches!(server.dispatch("handshake", request).await,
-                Err(FcpError::CapabilityDenied { .. })));
+            assert!(matches!(
+                server.dispatch("handshake", request).await,
+                Err(FcpError::CapabilityDenied { .. })
+            ));
             let (snapshot, value) = health(&mut server).await;
             assert!(matches!(snapshot.status, HealthState::Degraded { .. }));
             assert_eq!(value["configured"], true);
@@ -204,8 +219,10 @@ fn empty_grants_cannot_bypass_embedded_manifest_zone_veto() {
         let mut request = handshake();
         request["zone"] = json!("z:community");
         request["capabilities_requested"] = json!([]);
-        assert!(matches!(server.dispatch("handshake", request).await,
-            Err(FcpError::CapabilityDenied { .. })));
+        assert!(matches!(
+            server.dispatch("handshake", request).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
         let (snapshot, value) = health(&mut server).await;
         assert!(!snapshot.is_ready());
         assert_eq!(value["handshaken"], false);
@@ -221,7 +238,10 @@ fn completion_resource_scope_uses_the_literal_reference_not_decoys_or_expansion(
         "argument": {"name": "path", "value": "private"},
         "uri": "urn:decoy", "resource_uris": ["urn:other"],
     });
-    assert_eq!(resource_uris(&operation, &input).unwrap(), vec!["file:///{path}?q={value}".to_owned()]);
+    assert_eq!(
+        resource_uris(&operation, &input).unwrap(),
+        vec!["file:///{path}?q={value}".to_owned()]
+    );
 }
 
 #[test]
@@ -235,10 +255,13 @@ fn completion_prompt_references_do_not_authorize_an_extra_resource() {
 #[test]
 fn completion_missing_or_malformed_resource_references_fail_before_admission() {
     let operation = OperationId::from_static("mcp.completion.complete");
-    for reference in [Value::Null, json!({"type": "ref/tool"}),
-        json!({"type": "ref/resource"}), json!({"type": "ref/resource", "uri": ""}),
-        json!({"type": "ref/resource", "uri": 42})]
-    {
+    for reference in [
+        Value::Null,
+        json!({"type": "ref/tool"}),
+        json!({"type": "ref/resource"}),
+        json!({"type": "ref/resource", "uri": ""}),
+        json!({"type": "ref/resource", "uri": 42}),
+    ] {
         assert!(resource_uris(&operation, &json!({"ref": reference, "uri": "urn:decoy"})).is_err());
     }
 }

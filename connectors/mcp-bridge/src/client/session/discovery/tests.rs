@@ -20,16 +20,23 @@ async fn mount_initialization(server: &MockServer, session: Option<&'static str>
     if let Some(id) = session {
         response = response.insert_header("Mcp-Session-Id", id);
     }
-    Mock::given(method("POST")).and(path("/mcp"))
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "initialize"})))
-        .respond_with(response).mount(server).await;
+        .respond_with(response)
+        .mount(server)
+        .await;
     mount_notification(server).await;
 }
 
 async fn mount_notification(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(body_partial_json(json!({"method": "notifications/initialized"})))
-        .respond_with(ResponseTemplate::new(202)).mount(server).await;
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(server)
+        .await;
 }
 
 fn client(server: &MockServer) -> McpClient {
@@ -47,9 +54,14 @@ fn reply(body: &Value, result: Value) -> ResponseTemplate {
 }
 
 async fn list_requests(server: &MockServer, rpc_method: &str) -> Vec<Value> {
-    server.received_requests().await.unwrap().iter()
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
         .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
-        .filter(|body| body["method"] == rpc_method).collect()
+        .filter(|body| body["method"] == rpc_method)
+        .collect()
 }
 
 #[test]
@@ -62,12 +74,32 @@ fn preserves_order_extensions_and_initial_envelope_for_all_catalogs() {
         let mut catalog = Catalog::new(method).unwrap();
         let first = json!({identity: "first", "extension": {"keep": [1, null]}});
         let last = json!({identity: "last", "title": "Last entry"});
-        assert_eq!(catalog.append(json!({
-            field: [first.clone()], "nextCursor": "a", "_meta": {"page": 1}
-        })).unwrap().as_deref(), Some("a"));
-        assert_eq!(catalog.append(json!({field: [], "nextCursor": "b"})).unwrap().as_deref(), Some("b"));
-        assert!(catalog.append(json!({field: [last.clone()], "_meta": {"page": 3}})).unwrap().is_none());
-        assert_eq!(catalog.finish(), json!({field: [first, last], "_meta": {"page": 1}}));
+        assert_eq!(
+            catalog
+                .append(json!({
+                    field: [first.clone()], "nextCursor": "a", "_meta": {"page": 1}
+                }))
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            catalog
+                .append(json!({field: [], "nextCursor": "b"}))
+                .unwrap()
+                .as_deref(),
+            Some("b")
+        );
+        assert!(
+            catalog
+                .append(json!({field: [last.clone()], "_meta": {"page": 3}}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog.finish(),
+            json!({field: [first, last], "_meta": {"page": 1}})
+        );
     }
 }
 
@@ -75,7 +107,12 @@ fn preserves_order_extensions_and_initial_envelope_for_all_catalogs() {
 fn cursors_are_opaque_including_empty_and_unicode() {
     let mut catalog = Catalog::new("tools/list").unwrap();
     for cursor in ["", "  ", "雪/../?token=a&b=%20"] {
-        assert_eq!(catalog.append(json!({"tools": [], "nextCursor": cursor})).unwrap(), Some(cursor.to_owned()));
+        assert_eq!(
+            catalog
+                .append(json!({"tools": [], "nextCursor": cursor}))
+                .unwrap(),
+            Some(cursor.to_owned())
+        );
     }
     assert!(catalog.append(json!({"tools": []})).unwrap().is_none());
 }
@@ -84,9 +121,13 @@ fn cursors_are_opaque_including_empty_and_unicode() {
 fn rejects_cycles_through_empty_pages() {
     let mut catalog = Catalog::new("tools/list").unwrap();
     for cursor in ["a", "b"] {
-        catalog.append(json!({"tools": [], "nextCursor": cursor})).unwrap();
+        catalog
+            .append(json!({"tools": [], "nextCursor": cursor}))
+            .unwrap();
     }
-    let error = catalog.append(json!({"tools": [], "nextCursor": "a"})).unwrap_err();
+    let error = catalog
+        .append(json!({"tools": [], "nextCursor": "a"}))
+        .unwrap_err();
     assert!(error.to_string().contains("cursor cycle"));
     assert!(!error.is_retryable());
 }
@@ -94,14 +135,22 @@ fn rejects_cycles_through_empty_pages() {
 #[test]
 fn rejects_malformed_catalogs_and_cursors_without_echoing_them() {
     for page in [
-        Value::Null, json!([]), json!({}), json!({"tools": {}}),
-        json!({"tools": [null]}), json!({"tools": [{}]}),
-        json!({"tools": [{"name": ""}]}), json!({"tools": [{"name": 3}]}),
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"tools": {}}),
+        json!({"tools": [null]}),
+        json!({"tools": [{}]}),
+        json!({"tools": [{"name": ""}]}),
+        json!({"tools": [{"name": 3}]}),
         json!({"tools": [], "nextCursor": null}),
         json!({"tools": [], "nextCursor": 0}),
         json!({"tools": [], "nextCursor": "secret".repeat(MAX_CURSOR_BYTES)}),
     ] {
-        let error = Catalog::new("tools/list").unwrap().append(page).unwrap_err();
+        let error = Catalog::new("tools/list")
+            .unwrap()
+            .append(page)
+            .unwrap_err();
         assert!(!error.is_retryable());
         assert!(!error.to_string().contains("secret"));
     }
@@ -111,15 +160,28 @@ fn rejects_malformed_catalogs_and_cursors_without_echoing_them() {
 fn cursor_limit_counts_utf8_bytes_and_accepts_exact_boundary() {
     let mut catalog = Catalog::new("tools/list").unwrap();
     let cursor = "x".repeat(MAX_CURSOR_BYTES);
-    assert_eq!(catalog.append(json!({"tools": [], "nextCursor": cursor})).unwrap(), Some(cursor));
-    assert!(catalog.append(json!({"tools": [], "nextCursor": "雪".repeat(MAX_CURSOR_BYTES / 3 + 1)})).is_err());
+    assert_eq!(
+        catalog
+            .append(json!({"tools": [], "nextCursor": cursor}))
+            .unwrap(),
+        Some(cursor)
+    );
+    assert!(
+        catalog
+            .append(json!({"tools": [], "nextCursor": "雪".repeat(MAX_CURSOR_BYTES / 3 + 1)}))
+            .is_err()
+    );
 }
 
 #[test]
 fn duplicate_entries_fail_instead_of_silently_selecting_a_definition() {
     let mut catalog = Catalog::new("tools/list").unwrap();
-    catalog.append(json!({"tools": [{"name": "Read"}, {"name": "read"}], "nextCursor": "more"})).unwrap();
-    let error = catalog.append(json!({"tools": [{"name": "read", "description": "different"}]})).unwrap_err();
+    catalog
+        .append(json!({"tools": [{"name": "Read"}, {"name": "read"}], "nextCursor": "more"}))
+        .unwrap();
+    let error = catalog
+        .append(json!({"tools": [{"name": "read", "description": "different"}]}))
+        .unwrap_err();
     assert!(error.to_string().contains("duplicate"));
     assert!(!error.is_retryable());
 }
@@ -127,9 +189,17 @@ fn duplicate_entries_fail_instead_of_silently_selecting_a_definition() {
 #[test]
 fn entry_limit_includes_all_pages_with_exact_boundary_allowed() {
     let mut catalog = Catalog::new("tools/list").unwrap();
-    let entries: Vec<_> = (0..MAX_DISCOVERY_ENTRIES).map(|i| json!({"name": format!("tool-{i}")})).collect();
-    catalog.append(json!({"tools": entries, "nextCursor": "extra"})).unwrap();
-    assert!(catalog.append(json!({"tools": [{"name": "too-many"}]})).is_err());
+    let entries: Vec<_> = (0..MAX_DISCOVERY_ENTRIES)
+        .map(|i| json!({"name": format!("tool-{i}")}))
+        .collect();
+    catalog
+        .append(json!({"tools": entries, "nextCursor": "extra"}))
+        .unwrap();
+    assert!(
+        catalog
+            .append(json!({"tools": [{"name": "too-many"}]}))
+            .is_err()
+    );
 }
 
 #[test]
@@ -163,7 +233,13 @@ fn response_budget_includes_metadata_and_prior_passes() {
 
 #[test]
 fn write_methods_cannot_enter_discovery_retry_policy() {
-    for method in ["tools/call", "resources/read", "initialize", "notifications/initialized", ""] {
+    for method in [
+        "tools/call",
+        "resources/read",
+        "initialize",
+        "notifications/initialized",
+        "",
+    ] {
         assert!(Catalog::new(method).is_err());
     }
 }
@@ -177,10 +253,14 @@ async fn high_level_lists_follow_cursors_and_keep_single_page_rpc_available() {
     ] {
         let server = MockServer::start().await;
         mount_initialization(&server, Some("catalog-session")).await;
-        Mock::given(method("POST")).and(path("/mcp"))
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
             .and(body_partial_json(json!({"method": rpc_method})))
             .respond_with(move |request: &Request| {
-                assert_eq!(request.headers.get("mcp-session-id").unwrap(), "catalog-session");
+                assert_eq!(
+                    request.headers.get("mcp-session-id").unwrap(),
+                    "catalog-session"
+                );
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 let result = if body["params"].get("cursor").is_none() {
                     json!({field: [{identity: "one"}], "nextCursor": " 雪/%?= "})
@@ -189,14 +269,20 @@ async fn high_level_lists_follow_cursors_and_keep_single_page_rpc_available() {
                     json!({field: [{identity: "two"}]})
                 };
                 reply(&body, result)
-            }).mount(&server).await;
+            })
+            .mount(&server)
+            .await;
         let client = client(&server);
         let result = match rpc_method {
             "tools/list" => client.tools_list().await,
             "resources/list" => client.resources_list().await,
             _ => client.prompts_list().await,
-        }.unwrap();
-        assert_eq!(result, json!({field: [{identity: "one"}, {identity: "two"}]}));
+        }
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({field: [{identity: "one"}, {identity: "two"}]})
+        );
         let requests = list_requests(&server, rpc_method).await;
         assert_eq!(requests.len(), 2);
         assert_ne!(requests[0]["id"], requests[1]["id"]);
@@ -210,18 +296,27 @@ async fn high_level_lists_follow_cursors_and_keep_single_page_rpc_available() {
 async fn stateless_pagination_follows_an_empty_cursor() {
     let server = MockServer::start().await;
     mount_initialization(&server, None).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method": "tools/list"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(|request: &Request| {
             assert!(!request.headers.contains_key("mcp-session-id"));
             let body: Value = serde_json::from_slice(&request.body).unwrap();
-            reply(&body, if body["params"].get("cursor").is_some() {
-                assert_eq!(body["params"]["cursor"], "");
-                json!({"tools": [{"name": "last"}]})
-            } else {
-                json!({"tools": [], "nextCursor": ""})
-            })
-        }).mount(&server).await;
-    assert_eq!(client(&server).tools_list().await.unwrap(), json!({"tools": [{"name": "last"}]}));
+            reply(
+                &body,
+                if body["params"].get("cursor").is_some() {
+                    assert_eq!(body["params"]["cursor"], "");
+                    json!({"tools": [{"name": "last"}]})
+                } else {
+                    json!({"tools": [], "nextCursor": ""})
+                },
+            )
+        })
+        .mount(&server)
+        .await;
+    assert_eq!(
+        client(&server).tools_list().await.unwrap(),
+        json!({"tools": [{"name": "last"}]})
+    );
     assert_eq!(list_requests(&server, "tools/list").await.len(), 2);
 }
 
@@ -230,14 +325,19 @@ async fn expired_session_restarts_without_reusing_cursor_or_partial_catalog() {
     let server = MockServer::start().await;
     let generations = Arc::new(AtomicUsize::new(0));
     let generated = Arc::clone(&generations);
-    Mock::given(method("POST")).and(body_partial_json(json!({"method": "initialize"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "initialize"})))
         .respond_with(move |request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let generation = generated.fetch_add(1, Ordering::Relaxed) + 1;
-            reply(&body, initialization()).insert_header("Mcp-Session-Id", format!("session-{generation}"))
-        }).mount(&server).await;
+            reply(&body, initialization())
+                .insert_header("Mcp-Session-Id", format!("session-{generation}"))
+        })
+        .mount(&server)
+        .await;
     mount_notification(&server).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method": "tools/list"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(|request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let cursor = body["params"].get("cursor");
@@ -246,18 +346,29 @@ async fn expired_session_restarts_without_reusing_cursor_or_partial_catalog() {
                     assert_eq!(cursor.unwrap(), "expired-cursor");
                     return ResponseTemplate::new(404);
                 }
-                return reply(&body, json!({"tools": [{"name": "discard-me"}], "nextCursor": "expired-cursor"}));
+                return reply(
+                    &body,
+                    json!({"tools": [{"name": "discard-me"}], "nextCursor": "expired-cursor"}),
+                );
             }
             assert_eq!(request.headers.get("mcp-session-id").unwrap(), "session-2");
             if let Some(cursor) = cursor {
                 assert_eq!(cursor, "fresh-cursor");
                 reply(&body, json!({"tools": [{"name": "fresh-two"}]}))
             } else {
-                reply(&body, json!({"tools": [{"name": "fresh-one"}], "nextCursor": "fresh-cursor"}))
+                reply(
+                    &body,
+                    json!({"tools": [{"name": "fresh-one"}], "nextCursor": "fresh-cursor"}),
+                )
             }
-        }).mount(&server).await;
+        })
+        .mount(&server)
+        .await;
     let client = client(&server);
-    assert_eq!(client.tools_list().await.unwrap(), json!({"tools": [{"name": "fresh-one"}, {"name": "fresh-two"}]}));
+    assert_eq!(
+        client.tools_list().await.unwrap(),
+        json!({"tools": [{"name": "fresh-one"}, {"name": "fresh-two"}]})
+    );
     assert_eq!(client.metrics().session_expired_retry_count, 1);
     assert_eq!(generations.load(Ordering::Relaxed), 2);
     assert_eq!(list_requests(&server, "tools/list").await.len(), 4);
@@ -268,11 +379,15 @@ async fn later_page_protocol_failure_returns_no_partial_success_or_retry() {
     for bad_id in [false, true] {
         let server = MockServer::start().await;
         mount_initialization(&server, None).await;
-        Mock::given(method("POST")).and(body_partial_json(json!({"method": "tools/list"})))
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
             .respond_with(move |request: &Request| {
                 let mut body: Value = serde_json::from_slice(&request.body).unwrap();
                 if body["params"].get("cursor").is_none() {
-                    return reply(&body, json!({"tools": [{"name": "not-partial-success"}], "nextCursor": "next"}));
+                    return reply(
+                        &body,
+                        json!({"tools": [{"name": "not-partial-success"}], "nextCursor": "next"}),
+                    );
                 }
                 if bad_id {
                     body["id"] = json!("mismatched");
@@ -280,7 +395,9 @@ async fn later_page_protocol_failure_returns_no_partial_success_or_retry() {
                 } else {
                     reply(&body, json!({"wrongArray": []}))
                 }
-            }).mount(&server).await;
+            })
+            .mount(&server)
+            .await;
         let error = client(&server).tools_list().await.unwrap_err();
         assert!(!error.is_retryable());
         assert_eq!(list_requests(&server, "tools/list").await.len(), 2);
@@ -291,7 +408,8 @@ async fn later_page_protocol_failure_returns_no_partial_success_or_retry() {
 async fn deadline_is_shared_across_pages_not_refreshed_per_request() {
     let server = MockServer::start().await;
     mount_initialization(&server, None).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method": "tools/list"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(|request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let result = match body["params"]["cursor"].as_str() {
@@ -300,11 +418,14 @@ async fn deadline_is_shared_across_pages_not_refreshed_per_request() {
                 _ => json!({"tools": [{"name": "three"}]}),
             };
             reply(&body, result).set_delay(Duration::from_millis(100))
-        }).mount(&server).await;
+        })
+        .mount(&server)
+        .await;
     let mut client = client(&server);
     client.initialize().await.unwrap();
-    client.runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default()
-        .with_request_timeout(Duration::from_millis(180)));
+    client.runtime = ConnectorRuntime::new(
+        ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_millis(180)),
+    );
     assert!(client.tools_list().await.is_err());
     assert!(list_requests(&server, "tools/list").await.len() <= 2);
 }
@@ -313,8 +434,14 @@ async fn deadline_is_shared_across_pages_not_refreshed_per_request() {
 async fn generation_check_rejects_reused_session_header() {
     let server = MockServer::start().await;
     let client = client(&server);
-    let old = Arc::new(McpSession::from_initialize(initialization(), Some(HeaderValue::from_static("same"))).unwrap());
-    let new = Arc::new(McpSession::from_initialize(initialization(), Some(HeaderValue::from_static("same"))).unwrap());
+    let old = Arc::new(
+        McpSession::from_initialize(initialization(), Some(HeaderValue::from_static("same")))
+            .unwrap(),
+    );
+    let new = Arc::new(
+        McpSession::from_initialize(initialization(), Some(HeaderValue::from_static("same")))
+            .unwrap(),
+    );
     *client.session.lock().await = Some(Arc::clone(&new));
     assert!(client.require_catalog_session(&old).await.is_err());
     client.require_catalog_session(&new).await.unwrap();

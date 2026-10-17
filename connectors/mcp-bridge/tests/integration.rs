@@ -23,11 +23,15 @@ struct MockServer(wiremock::MockServer);
 
 impl std::ops::Deref for MockServer {
     type Target = wiremock::MockServer;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl MockServer {
-    async fn start() -> Self { Self::start_with_session(None).await }
+    async fn start() -> Self {
+        Self::start_with_session(None).await
+    }
 
     async fn start_with_session(session_id: Option<&'static str>) -> Self {
         let server = wiremock::MockServer::start().await;
@@ -42,12 +46,22 @@ impl MockServer {
         if let Some(session_id) = session_id {
             response = response.insert_header("Mcp-Session-Id", session_id);
         }
-        Mock::given(method("POST")).and(path("/mcp"))
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
             .and(body_partial_json(json!({"method": "initialize"})))
-            .respond_with(response).with_priority(0).mount(&server).await;
-        Mock::given(method("POST")).and(path("/mcp"))
-            .and(body_partial_json(json!({"method": "notifications/initialized"})))
-            .respond_with(ResponseTemplate::new(202)).with_priority(0).mount(&server).await;
+            .respond_with(response)
+            .with_priority(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .with_priority(0)
+            .mount(&server)
+            .await;
         Self(server)
     }
 }
@@ -141,7 +155,10 @@ async fn lifecycle_self_check() {
             ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": body["id"], "result": {}
             }))
-        }).expect(1).mount(&server).await;
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     let c = setup_connector(&server.uri()).await;
     let check = c.handle_self_check().await.unwrap();
     assert_eq!(check["status"], "ok");
@@ -180,8 +197,12 @@ async fn lifecycle_introspect() {
     let server = MockServer::start().await;
     let c = setup_connector(&server.uri()).await;
     let intro = c.handle_introspect().await.unwrap();
-    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml")).unwrap();
-    assert_eq!(intro["operations"].as_array().unwrap().len(), manifest.provides.operations.len());
+    let manifest =
+        fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml")).unwrap();
+    assert_eq!(
+        intro["operations"].as_array().unwrap().len(),
+        manifest.provides.operations.len()
+    );
 }
 
 #[fcp_async_core::runtime::test]

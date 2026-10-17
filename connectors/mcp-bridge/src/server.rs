@@ -11,8 +11,10 @@
 
 use std::time::{Duration, Instant};
 
-use fcp_core::{FcpError, FcpResult, HandshakeRequest, HealthSnapshot, HealthState,
-    InvokeRequest, InvokeResponse, OperationId, RequestId, SimulateRequest, SimulateResponse};
+use fcp_core::{
+    FcpError, FcpResult, HandshakeRequest, HealthSnapshot, HealthState, InvokeRequest,
+    InvokeResponse, OperationId, RequestId, SimulateRequest, SimulateResponse,
+};
 use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -142,7 +144,11 @@ impl McpBridgeServer {
         result["handshaken"] = json!(handshaken);
         result["instance_id"] = json!(self.session.instance_id());
         for name in [
-            "requests", "errors", "injection_scans", "injection_findings", "sampling_requests",
+            "requests",
+            "errors",
+            "injection_scans",
+            "injection_findings",
+            "sampling_requests",
         ] {
             if let Some(value) = provider.get(name) {
                 result[name] = value.clone();
@@ -160,9 +166,12 @@ impl McpBridgeServer {
         let request: HandshakeRequest = decode(params, "Invalid FCP handshake request")?;
         let response = self.session.handshake(request)?;
         let mut result = encode(&response)?;
-        let provider_handshake = self.connector.handle_handshake(json!({
-            "session_id": result["session_id"].clone(),
-        })).await;
+        let provider_handshake = self
+            .connector
+            .handle_handshake(json!({
+                "session_id": result["session_id"].clone(),
+            }))
+            .await;
         if let Err(error) = provider_handshake {
             self.session.invalidate();
             return Err(error);
@@ -189,24 +198,36 @@ impl McpBridgeServer {
         self.check_ready()?;
         let request: InvokeRequest = decode(params, "Invalid FCP invoke request")?;
         validate_request(&request.r#type, "invoke", &request.id, &request.input)?;
-        request.validate_idempotency_key().map_err(|_| invalid("Invalid idempotency key"))?;
+        request
+            .validate_idempotency_key()
+            .map_err(|_| invalid("Invalid idempotency key"))?;
         let resource_uris = resource_uris(&request.operation, &request.input)?;
-        let budget = request.deadline_ms.map(Duration::from_millis)
-            .unwrap_or(MAX_INVOKE_TIMEOUT).min(MAX_INVOKE_TIMEOUT);
+        let budget = request
+            .deadline_ms
+            .map(Duration::from_millis)
+            .unwrap_or(MAX_INVOKE_TIMEOUT)
+            .min(MAX_INVOKE_TIMEOUT);
         if budget.saturating_sub(started.elapsed()).is_zero() {
             return Err(invalid("Invocation deadline elapsed before MCP dispatch"));
         }
         // Verification and the signed usage charge precede every provider
         // operation. Changes to request IDs or input cannot refill a grant.
         // Once admitted, errors, interruption and dropped futures do not refund.
-        let witness = self.session.admit_bounded(
-            &request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES,
-        )?;
+        let witness =
+            self.session
+                .admit_bounded(&request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES)?;
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(invalid("Invocation deadline elapsed before MCP dispatch"));
         }
-        self.invoke_verified(witness, request.id, request.operation, request.input, remaining).await
+        self.invoke_verified(
+            witness,
+            request.id,
+            request.operation,
+            request.input,
+            remaining,
+        )
+        .await
     }
 
     /// The only process-boundary path that can execute a provider operation.
@@ -218,10 +239,14 @@ impl McpBridgeServer {
         input: Value,
         budget: Duration,
     ) -> FcpResult<Value> {
-        let outcome = await_invocation(self.connector.handle_invoke(json!({
-            "operation_id": operation.as_str(),
-            "input": input,
-        })), budget).await;
+        let outcome = await_invocation(
+            self.connector.handle_invoke(json!({
+                "operation_id": operation.as_str(),
+                "input": input,
+            })),
+            budget,
+        )
+        .await;
         // Admitted provider failures are canonical error responses too. Letting
         // them escape via `?` would bypass the byte boundary for error payloads.
         let response = match outcome {
@@ -242,11 +267,16 @@ impl McpBridgeServer {
         validate_request(&request.r#type, "simulate", &request.id, &request.input)?;
         let resources = resource_uris(&request.operation, &request.input)?;
         let response = match self.session.authorize(
-            &request.connector_id, &request.zone_id, &request.operation,
-            request.capability_token, &resources,
+            &request.connector_id,
+            &request.zone_id,
+            &request.operation,
+            request.capability_token,
+            &resources,
         ) {
             Ok(_) => SimulateResponse::allowed(request.id),
-            Err(error) => SimulateResponse::denied(request.id, error.to_string(), error.error_code()),
+            Err(error) => {
+                SimulateResponse::denied(request.id, error.to_string(), error.error_code())
+            }
         };
         // Authorization simulation checks remaining call/byte quota without
         // charging or reserving it. It does not predict the complete invocation
@@ -257,7 +287,10 @@ impl McpBridgeServer {
 }
 
 fn invalid(message: &str) -> FcpError {
-    FcpError::InvalidRequest { code: 1003, message: message.to_owned() }
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: message.to_owned(),
+    }
 }
 
 fn decode<T: DeserializeOwned>(value: Value, message: &str) -> FcpResult<T> {
@@ -273,7 +306,9 @@ fn encode<T: Serialize>(value: &T) -> FcpResult<Value> {
 
 fn validate_request(kind: &str, expected: &str, id: &RequestId, input: &Value) -> FcpResult<()> {
     if kind != expected || id.0.is_empty() || !input.is_object() {
-        return Err(invalid("Invalid request type, request ID or operation input"));
+        return Err(invalid(
+            "Invalid request type, request ID or operation input",
+        ));
     }
     Ok(())
 }
@@ -282,17 +317,25 @@ fn resource_uris(operation: &OperationId, input: &Value) -> FcpResult<Vec<String
     let uri = match operation.as_str() {
         "mcp.resources.read" => input.get("uri"),
         "mcp.completion.complete" => {
-            let reference = input.get("ref").and_then(Value::as_object)
+            let reference = input
+                .get("ref")
+                .and_then(Value::as_object)
                 .ok_or_else(|| invalid("Completion requires a prompt or resource reference"))?;
             match reference.get("type").and_then(Value::as_str) {
                 Some("ref/resource") => reference.get("uri"),
                 Some("ref/prompt") => return Ok(Vec::new()),
-                _ => return Err(invalid("Completion requires a prompt or resource reference")),
+                _ => {
+                    return Err(invalid(
+                        "Completion requires a prompt or resource reference",
+                    ));
+                }
             }
         }
         _ => return Ok(Vec::new()),
     };
-    let uri = uri.and_then(Value::as_str).filter(|uri| !uri.is_empty())
+    let uri = uri
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.is_empty())
         .ok_or_else(|| invalid("Resource operation requires a non-empty uri"))?;
     // Authorize the exact resource/template identifier sent upstream, not an
     // expanded suggestion or a caller-supplied resource_uris/uri decoy. The
@@ -314,7 +357,9 @@ async fn await_invocation(
     future: impl std::future::Future<Output = FcpResult<Value>>,
     budget: Duration,
 ) -> FcpResult<Value> {
-    fcp_async_core::time::timeout(budget, future).await.map_err(|_| interrupted_invoke())?
+    fcp_async_core::time::timeout(budget, future)
+        .await
+        .map_err(|_| interrupted_invoke())?
 }
 
 #[cfg(test)]
@@ -345,7 +390,10 @@ mod tests {
 
     async fn configured() -> McpBridgeServer {
         let mut server = McpBridgeServer::new().unwrap();
-        server.dispatch("configure", json!({"mcp_url": "http://127.0.0.1:1"})).await.unwrap();
+        server
+            .dispatch("configure", json!({"mcp_url": "http://127.0.0.1:1"}))
+            .await
+            .unwrap();
         server.dispatch("handshake", handshake()).await.unwrap();
         server
     }
@@ -362,7 +410,10 @@ mod tests {
     fn handshake_without_configuration_is_denied() {
         run!(async {
             let mut server = McpBridgeServer::new().unwrap();
-            assert!(matches!(server.dispatch("handshake", handshake()).await, Err(FcpError::NotConfigured)));
+            assert!(matches!(
+                server.dispatch("handshake", handshake()).await,
+                Err(FcpError::NotConfigured)
+            ));
             assert!(!server.session.is_established());
         });
     }
@@ -374,9 +425,17 @@ mod tests {
             let response = server.dispatch("handshake", handshake()).await.unwrap();
             assert_eq!(response["status"], "accepted");
             assert_eq!(response["nonce"], json!(vec![9_u8; 32]));
-            assert_eq!(response["capabilities_granted"].as_array().unwrap().len(), 6);
+            assert_eq!(
+                response["capabilities_granted"].as_array().unwrap().len(),
+                6
+            );
             assert_eq!(response["instance_id"], json!(server.session.instance_id()));
-            assert!(response["manifest_hash"].as_str().unwrap().starts_with("sha256:"));
+            assert!(
+                response["manifest_hash"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("sha256:")
+            );
         });
     }
 
@@ -384,12 +443,21 @@ mod tests {
     fn legacy_keyless_handshake_cannot_authorize_operations() {
         run!(async {
             let mut server = configured().await;
-            assert!(server.dispatch("handshake", json!({"session_id": "claimed"})).await.is_err());
+            assert!(
+                server
+                    .dispatch("handshake", json!({"session_id": "claimed"}))
+                    .await
+                    .is_err()
+            );
             let health = server.dispatch("health", json!({})).await.unwrap();
             assert_eq!(health["handshaken"], false);
             assert_eq!(health["status"]["state"], "degraded");
-            assert!(matches!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await,
-                Err(FcpError::NotHandshaken)));
+            assert!(matches!(
+                server
+                    .dispatch("invoke", untrusted_invoke("mcp.tools.call"))
+                    .await,
+                Err(FcpError::NotHandshaken)
+            ));
         });
     }
 
@@ -402,8 +470,18 @@ mod tests {
             assert_eq!(operations.len(), 10);
             for operation in operations {
                 let id = operation["id"].as_str().unwrap();
-                assert!(server.dispatch("invoke", json!({"operation_id": id, "input": {}})).await.is_err());
-                assert!(server.dispatch("invoke", untrusted_invoke(id)).await.is_err());
+                assert!(
+                    server
+                        .dispatch("invoke", json!({"operation_id": id, "input": {}}))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    server
+                        .dispatch("invoke", untrusted_invoke(id))
+                        .await
+                        .is_err()
+                );
             }
             let health = server.dispatch("health", json!({})).await.unwrap();
             assert_eq!(health["requests"], 0);
@@ -419,7 +497,12 @@ mod tests {
             assert_eq!(health["configured"], false);
             assert_eq!(health["handshaken"], false);
             assert_eq!(health["status"]["state"], "starting");
-            assert!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await.is_err());
+            assert!(
+                server
+                    .dispatch("invoke", untrusted_invoke("mcp.tools.call"))
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -428,11 +511,18 @@ mod tests {
         run!(async {
             let mut server = configured().await;
             let original = server.session.instance_id().clone();
-            server.dispatch("configure", json!({"mcp_url": "http://127.0.0.1:2"})).await.unwrap();
+            server
+                .dispatch("configure", json!({"mcp_url": "http://127.0.0.1:2"}))
+                .await
+                .unwrap();
             assert_ne!(server.session.instance_id(), &original);
             assert!(!server.session.is_established());
-            assert!(matches!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await,
-                Err(FcpError::NotHandshaken)));
+            assert!(matches!(
+                server
+                    .dispatch("invoke", untrusted_invoke("mcp.tools.call"))
+                    .await,
+                Err(FcpError::NotHandshaken)
+            ));
         });
     }
 
@@ -445,8 +535,12 @@ mod tests {
             assert!(server.dispatch("handshake", request).await.is_err());
             let doctor = server.dispatch("doctor", json!({})).await.unwrap();
             assert_eq!(doctor["status"], "degraded");
-            let check = doctor["checks"].as_array().unwrap().iter()
-                .find(|check| check["name"] == "handshake").unwrap();
+            let check = doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "handshake")
+                .unwrap();
             assert_eq!(check["passed"], false);
         });
     }
@@ -455,11 +549,19 @@ mod tests {
     fn shutdown_clears_authority_and_reported_readiness() {
         run!(async {
             let mut server = configured().await;
-            assert_eq!(server.dispatch("shutdown", json!({})).await.unwrap(), json!({}));
+            assert_eq!(
+                server.dispatch("shutdown", json!({})).await.unwrap(),
+                json!({})
+            );
             let health = server.dispatch("health", json!({})).await.unwrap();
             assert_eq!(health["configured"], false);
             assert_eq!(health["handshaken"], false);
-            assert!(server.dispatch("invoke", untrusted_invoke("mcp.tools.call")).await.is_err());
+            assert!(
+                server
+                    .dispatch("invoke", untrusted_invoke("mcp.tools.call"))
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -495,9 +597,16 @@ mod tests {
     #[test]
     fn resource_authorization_uses_exact_input_uri_not_an_alternate_list() {
         let operation = OperationId::from_static("mcp.resources.read");
-        assert_eq!(resource_uris(&operation, &json!({
-            "uri": "urn:actual", "resource_uris": ["urn:decoy"],
-        })).unwrap(), vec!["urn:actual".to_owned()]);
+        assert_eq!(
+            resource_uris(
+                &operation,
+                &json!({
+                    "uri": "urn:actual", "resource_uris": ["urn:decoy"],
+                })
+            )
+            .unwrap(),
+            vec!["urn:actual".to_owned()]
+        );
         for input in [json!({}), json!({"uri": ""}), json!({"uri": 42})] {
             assert!(resource_uris(&operation, &input).is_err());
         }
@@ -506,7 +615,13 @@ mod tests {
     #[test]
     fn admitted_interruption_never_advertises_safe_replay() {
         let error = interrupted_invoke();
-        let FcpError::External { retryable, retry_after, message, .. } = error else {
+        let FcpError::External {
+            retryable,
+            retry_after,
+            message,
+            ..
+        } = error
+        else {
             panic!("expected external outcome-unknown error");
         };
         assert!(!retryable);
@@ -524,7 +639,10 @@ mod tests {
 
     #[test]
     fn in_flight_deadline_drops_pending_work_and_returns_unknown_outcome() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
 
         struct Release(Arc<AtomicBool>);
         impl Drop for Release {
@@ -539,9 +657,18 @@ mod tests {
                 let _release = release;
                 std::future::pending::<FcpResult<Value>>().await
             };
-            let error = await_invocation(pending, Duration::from_millis(1)).await.unwrap_err();
+            let error = await_invocation(pending, Duration::from_millis(1))
+                .await
+                .unwrap_err();
             assert!(dropped.load(Ordering::SeqCst));
-            assert!(matches!(error, FcpError::External { retryable: false, retry_after: None, .. }));
+            assert!(matches!(
+                error,
+                FcpError::External {
+                    retryable: false,
+                    retry_after: None,
+                    ..
+                }
+            ));
         });
     }
 
@@ -549,8 +676,21 @@ mod tests {
     fn admitted_success_and_provider_failure_are_not_rewritten_or_retried() {
         run!(async {
             let value = json!({"content": [], "extension": {"opaque": true}});
-            assert_eq!(await_invocation(std::future::ready(Ok(value.clone())), Duration::from_secs(1)).await.unwrap(), value);
-            let error = await_invocation(std::future::ready(Err(invalid("provider validation"))), Duration::from_secs(1)).await.unwrap_err();
+            assert_eq!(
+                await_invocation(
+                    std::future::ready(Ok(value.clone())),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+                value
+            );
+            let error = await_invocation(
+                std::future::ready(Err(invalid("provider validation"))),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(error, FcpError::InvalidRequest { code: 1003, .. }));
         });
     }

@@ -113,11 +113,17 @@ mod tests {
         for (index, expected_state) in [(0, "starting"), (2, "degraded"), (4, "ready")] {
             let snapshot: fcp_core::HealthSnapshot =
                 serde_json::from_value(responses[index]["result"].clone()).unwrap();
-            assert_eq!(responses[index]["result"]["status"]["state"], expected_state);
+            assert_eq!(
+                responses[index]["result"]["status"]["state"],
+                expected_state
+            );
             assert_eq!(snapshot.is_ready(), expected_state == "ready");
             assert_eq!(responses[index]["result"]["requests"], 0);
         }
-        assert_eq!(responses[4]["result"]["details"]["instance_id"], responses[3]["result"]["instance_id"]);
+        assert_eq!(
+            responses[4]["result"]["details"]["instance_id"],
+            responses[3]["result"]["instance_id"]
+        );
     }
 
     #[test]
@@ -129,7 +135,10 @@ mod tests {
         let mut output = Vec::new();
         run_fcp_loop_with_io(&mut reader, &mut output, JsonlConfig::default()).unwrap();
         assert_eq!(reader.position(), shutdown.len() as u64);
-        assert_eq!(replies(&output), vec![json!({"jsonrpc":"2.0","id":7,"result":{}})]);
+        assert_eq!(
+            replies(&output),
+            vec![json!({"jsonrpc":"2.0","id":7,"result":{}})]
+        );
     }
 
     #[test]
@@ -175,7 +184,11 @@ mod tests {
         assert_eq!(responses[2]["result"]["handshaken"], true);
         let operations = responses[3]["result"]["operations"].as_array().unwrap();
         assert_eq!(operations.len(), 10);
-        for id in ["mcp.prompts.get", "mcp.resources.templates.list", "mcp.completion.complete"] {
+        for id in [
+            "mcp.prompts.get",
+            "mcp.resources.templates.list",
+            "mcp.completion.complete",
+        ] {
             assert!(operations.iter().any(|operation| operation["id"] == id));
         }
     }
@@ -188,11 +201,16 @@ mod tests {
         );
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();
-        assert!(run_fcp_loop_with_io(
-            &mut reader,
-            &mut output,
-            JsonlConfig { max_request_bytes: 16 },
-        ).is_err());
+        assert!(
+            run_fcp_loop_with_io(
+                &mut reader,
+                &mut output,
+                JsonlConfig {
+                    max_request_bytes: 16
+                },
+            )
+            .is_err()
+        );
         assert_eq!(reader.position(), 18);
         let responses = replies(&output);
         assert_eq!(responses.len(), 1);
@@ -224,7 +242,12 @@ mod tests {
     #[test]
     fn empty_and_whitespace_frames_are_ignored() {
         let mut output = Vec::new();
-        run_fcp_loop_with_io(Cursor::new("\n \t\r\n"), &mut output, JsonlConfig::default()).unwrap();
+        run_fcp_loop_with_io(
+            Cursor::new("\n \t\r\n"),
+            &mut output,
+            JsonlConfig::default(),
+        )
+        .unwrap();
         assert!(output.is_empty());
     }
 
@@ -252,7 +275,10 @@ mod tests {
         let first = "{\"id\":1,\"method\":\"health\"}\n";
         let input = format!("{first}{{\"id\":2,\"method\":\"configure\",\"params\":{{}}}}\n");
         let mut reader = Cursor::new(input);
-        let mut output = FailedOutput { fail_write, bytes: Vec::new() };
+        let mut output = FailedOutput {
+            fail_write,
+            bytes: Vec::new(),
+        };
         assert!(run_fcp_loop_with_io(&mut reader, &mut output, JsonlConfig::default()).is_err());
         assert_eq!(reader.position(), first.len() as u64);
         if !fail_write {

@@ -4,6 +4,7 @@
 //! Uses polling (getUpdates) for receiving messages and the Bot API for sending.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

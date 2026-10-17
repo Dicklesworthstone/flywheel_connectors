@@ -3,8 +3,8 @@
 //! Session publication follows the initialized notification, not just the
 //! initialize response. A cancelled initializer leaves no half-ready state.
 
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fcp_sdk::ConnectorErrorMapping;
@@ -23,8 +23,10 @@ pub(super) const PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_SESSION_ID_BYTES: usize = 1024;
 
 fn is_cursor_continuation(method: &str, params: &Value) -> bool {
-    matches!(method, "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list")
-        && params.get("cursor").is_some()
+    matches!(
+        method,
+        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+    ) && params.get("cursor").is_some()
 }
 
 pub(super) struct McpSession {
@@ -40,8 +42,12 @@ impl McpSession {
             ));
         }
         if !result.get("capabilities").is_some_and(Value::is_object)
-            || !result.pointer("/serverInfo/name").is_some_and(Value::is_string)
-            || !result.pointer("/serverInfo/version").is_some_and(Value::is_string)
+            || !result
+                .pointer("/serverInfo/name")
+                .is_some_and(Value::is_string)
+            || !result
+                .pointer("/serverInfo/version")
+                .is_some_and(Value::is_string)
         {
             return Err(transport::invalid_response("invalid initialize result"));
         }
@@ -71,7 +77,10 @@ pub(super) fn validate_session_id(id: Option<HeaderValue>) -> McpBridgeResult<Op
     };
     if id.as_bytes().is_empty()
         || id.as_bytes().len() > MAX_SESSION_ID_BYTES
-        || !id.as_bytes().iter().all(|byte| (0x21..=0x7e).contains(byte))
+        || !id
+            .as_bytes()
+            .iter()
+            .all(|byte| (0x21..=0x7e).contains(byte))
     {
         return Err(transport::invalid_response("invalid MCP session header"));
     }
@@ -164,7 +173,10 @@ impl McpClient {
         let mut state = self.session.lock().await;
         // An old in-flight 404 cannot revoke a replacement published by another
         // request, even if the server reused the same opaque session string.
-        if state.as_ref().is_some_and(|current| Arc::ptr_eq(current, expired)) {
+        if state
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expired))
+        {
             *state = None;
         }
     }
@@ -177,7 +189,9 @@ impl McpClient {
         let original = bound.get_or_init(|| Arc::clone(session));
         let current = self.session.lock().await;
         if Arc::ptr_eq(original, session)
-            && current.as_ref().is_some_and(|current| Arc::ptr_eq(current, session))
+            && current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, session))
         {
             Ok(())
         } else {

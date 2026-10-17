@@ -4,6 +4,7 @@
 //! providing message sending, polling, and event streaming.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

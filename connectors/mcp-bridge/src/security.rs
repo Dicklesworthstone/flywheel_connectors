@@ -351,11 +351,18 @@ mod tests {
 
     #[test]
     fn every_manifest_operation_is_protected_against_normalized_tool_name_collisions() {
-        let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml")).unwrap();
+        let manifest =
+            fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml")).unwrap();
         for operation in manifest.provides.operations.keys() {
             assert!(tool_name_collides_with_builtin(operation), "{operation}");
-            assert!(tool_name_collides_with_builtin(operation.trim_start_matches("mcp.")), "{operation}");
-            assert!(tool_name_collides_with_builtin(&operation.replace('.', "_").to_ascii_uppercase()), "{operation}");
+            assert!(
+                tool_name_collides_with_builtin(operation.trim_start_matches("mcp.")),
+                "{operation}"
+            );
+            assert!(
+                tool_name_collides_with_builtin(&operation.replace('.', "_").to_ascii_uppercase()),
+                "{operation}"
+            );
         }
     }
 

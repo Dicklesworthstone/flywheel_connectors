@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use super::{McpClient, McpBridgeError, McpBridgeResult, transport};
+use super::{McpBridgeError, McpBridgeResult, McpClient, transport};
 
 const MAX_COMPLETION_VALUES: usize = 100;
 
@@ -29,25 +29,36 @@ impl McpClient {
     /// Rejects malformed parameters before I/O, unnegotiated completions,
     /// invalid response envelopes and ordinary managed MCP transport failures.
     pub async fn completion_complete(&self, params: Value) -> McpBridgeResult<Value> {
-        self.execute_session_rpc("completion/complete", params).await
+        self.execute_session_rpc("completion/complete", params)
+            .await
     }
 }
 
 pub(super) fn validate_request(params: &Value) -> McpBridgeResult<()> {
     let params = params.as_object().ok_or_else(invalid_params)?;
-    let reference = params.get("ref").and_then(Value::as_object)
+    let reference = params
+        .get("ref")
+        .and_then(Value::as_object)
         .ok_or_else(invalid_params)?;
     let target = match reference.get("type").and_then(Value::as_str) {
         Some("ref/prompt") => reference.get("name"),
         Some("ref/resource") => reference.get("uri"),
         _ => return Err(invalid_params()),
     };
-    if !target.and_then(Value::as_str).is_some_and(|name| !name.is_empty()) {
+    if !target
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty())
+    {
         return Err(invalid_params());
     }
-    let argument = params.get("argument").and_then(Value::as_object)
+    let argument = params
+        .get("argument")
+        .and_then(Value::as_object)
         .ok_or_else(invalid_params)?;
-    if !argument.get("name").and_then(Value::as_str).is_some_and(|name| !name.is_empty())
+    if !argument
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty())
         || !argument.get("value").is_some_and(Value::is_string)
     {
         return Err(invalid_params());
@@ -56,7 +67,10 @@ pub(super) fn validate_request(params: &Value) -> McpBridgeResult<()> {
         let context = context.as_object().ok_or_else(invalid_params)?;
         if let Some(arguments) = context.get("arguments") {
             let arguments = arguments.as_object().ok_or_else(invalid_params)?;
-            if arguments.iter().any(|(name, value)| name.is_empty() || !value.is_string()) {
+            if arguments
+                .iter()
+                .any(|(name, value)| name.is_empty() || !value.is_string())
+            {
                 return Err(invalid_params());
             }
         }
@@ -65,9 +79,13 @@ pub(super) fn validate_request(params: &Value) -> McpBridgeResult<()> {
 }
 
 pub(super) fn validate_response(result: Value) -> McpBridgeResult<Value> {
-    let completion = result.get("completion").and_then(Value::as_object)
+    let completion = result
+        .get("completion")
+        .and_then(Value::as_object)
         .ok_or_else(invalid_result)?;
-    let values = completion.get("values").and_then(Value::as_array)
+    let values = completion
+        .get("values")
+        .and_then(Value::as_array)
         .ok_or_else(invalid_result)?;
     if values.len() > MAX_COMPLETION_VALUES || values.iter().any(|value| !value.is_string()) {
         return Err(invalid_result());
@@ -75,7 +93,9 @@ pub(super) fn validate_response(result: Value) -> McpBridgeResult<Value> {
     if let Some(total) = completion.get("total") {
         // JSON Schema integers can be encoded as 2 or 2.0. Only compare here;
         // retain the exact JSON number instead of coercing or rounding it.
-        let valid = total.as_u64().is_some_and(|total| total >= values.len() as u64)
+        let valid = total
+            .as_u64()
+            .is_some_and(|total| total >= values.len() as u64)
             || total.as_f64().is_some_and(|total| {
                 total.is_finite() && total.fract() == 0.0 && total >= values.len() as f64
             });
@@ -83,7 +103,10 @@ pub(super) fn validate_response(result: Value) -> McpBridgeResult<Value> {
             return Err(invalid_result());
         }
     }
-    if completion.get("hasMore").is_some_and(|value| !value.is_boolean()) {
+    if completion
+        .get("hasMore")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return Err(invalid_result());
     }
     // Do not sort, deduplicate, trim, expand URI templates or fetch another

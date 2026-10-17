@@ -119,15 +119,22 @@ mod tests {
         let result = failure_result();
         let error = check_tool_outcome("tools/call", result.clone()).unwrap_err();
         let FcpError::External {
-            service, message, status_code, retryable, retry_after,
-        } = error.to_fcp_error() else {
+            service,
+            message,
+            status_code,
+            retryable,
+            retry_after,
+        } = error.to_fcp_error()
+        else {
             panic!("expected a failed external operation");
         };
         assert_eq!(service, "mcp-bridge");
         assert!(status_code.is_none());
         assert!(!retryable);
         assert!(retry_after.is_none());
-        let encoded = message.strip_prefix("MCP tool execution failed (isError=true): ").unwrap();
+        let encoded = message
+            .strip_prefix("MCP tool execution failed (isError=true): ")
+            .unwrap();
         assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), result);
     }
 
@@ -146,13 +153,22 @@ mod tests {
             json!({"content": [], "structuredContent": {"isError": true}, "extra": null}),
             json!({"isError": false, "content": [{"type": "resource_link", "uri": "urn:result"}]}),
         ] {
-            assert_eq!(check_tool_outcome("tools/call", result.clone()).unwrap(), result);
+            assert_eq!(
+                check_tool_outcome("tools/call", result.clone()).unwrap(),
+                result
+            );
         }
     }
 
     #[test]
     fn outcome_flags_are_not_coerced_and_invalid_data_is_not_echoed() {
-        for flag in [Value::Null, json!("secret-result-marker"), json!(0), json!([]), json!({})] {
+        for flag in [
+            Value::Null,
+            json!("secret-result-marker"),
+            json!(0),
+            json!([]),
+            json!({}),
+        ] {
             let error = check_tool_outcome("tools/call", json!({"isError": flag})).unwrap_err();
             assert!(!error.is_retryable());
             assert!(!error.to_string().contains("secret-result-marker"));
@@ -161,7 +177,13 @@ mod tests {
 
     #[test]
     fn non_object_tool_results_are_not_successful_operations() {
-        for result in [Value::Null, json!([]), json!(true), json!(42), json!("secret-result-marker")] {
+        for result in [
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!(42),
+            json!("secret-result-marker"),
+        ] {
             let error = check_tool_outcome("tools/call", result).unwrap_err();
             assert!(!error.is_retryable());
             assert!(!error.to_string().contains("secret-result-marker"));
@@ -170,7 +192,12 @@ mod tests {
 
     #[test]
     fn other_methods_keep_their_own_result_semantics() {
-        for method in ["resources/read", "tools/list", "prompts/get", "custom/method"] {
+        for method in [
+            "resources/read",
+            "tools/list",
+            "prompts/get",
+            "custom/method",
+        ] {
             let result = failure_result();
             assert_eq!(check_tool_outcome(method, result.clone()).unwrap(), result);
         }

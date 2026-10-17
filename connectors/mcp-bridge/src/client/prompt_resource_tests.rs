@@ -1,8 +1,8 @@
 //! Production-client and FCP dispatch regressions for prompt/template reads.
 use super::*;
-use std::sync::atomic::AtomicUsize;
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use serde_json::{Value, json};
+use std::sync::atomic::AtomicUsize;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -23,19 +23,30 @@ fn initialization(capabilities: Value) -> Value {
 }
 
 async fn mount_initialization(server: &MockServer, capabilities: Value) {
-    Mock::given(method("POST")).and(path("/mcp"))
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
         .and(body_partial_json(json!({"method":"initialize"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc":"2.0", "id":0, "result":initialization(capabilities)
-        })).insert_header("Mcp-Session-Id", "active"))
-        .mount(server).await;
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "jsonrpc":"2.0", "id":0, "result":initialization(capabilities)
+                }))
+                .insert_header("Mcp-Session-Id", "active"),
+        )
+        .mount(server)
+        .await;
     mount_initialized(server).await;
 }
 
 async fn mount_initialized(server: &MockServer) {
-    Mock::given(method("POST")).and(path("/mcp"))
-        .and(body_partial_json(json!({"method":"notifications/initialized"})))
-        .respond_with(ResponseTemplate::new(202)).mount(server).await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method":"notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(server)
+        .await;
 }
 
 fn rpc_response(request: &Request, result: Value) -> ResponseTemplate {
@@ -46,15 +57,22 @@ fn rpc_response(request: &Request, result: Value) -> ResponseTemplate {
 }
 
 async fn mount_result(server: &MockServer, rpc_method: &str, result: Value) {
-    Mock::given(method("POST")).and(path("/mcp"))
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
         .and(body_partial_json(json!({"method":rpc_method})))
         .respond_with(move |request: &Request| rpc_response(request, result.clone()))
-        .mount(server).await;
+        .mount(server)
+        .await;
 }
 
 async fn requests(server: &MockServer) -> Vec<Value> {
-    server.received_requests().await.unwrap().iter()
-        .map(|request| serde_json::from_slice(&request.body).unwrap()).collect()
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
 }
 
 fn rich_prompt() -> Value {
@@ -81,7 +99,10 @@ fn prompt_validation_accepts_all_negotiated_content_kinds_and_extensions() {
 #[test]
 fn prompt_validation_refuses_malformed_core_envelopes_without_echoing_content() {
     for value in [
-        Value::Null, json!([]), json!({}), json!({"messages":null}),
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"messages":null}),
         json!({"messages":[],"description":false}),
         json!({"messages":[null]}),
         json!({"messages":[{"role":"system","content":{"type":"text","text":"PRIVATE"}}]}),
@@ -107,12 +128,22 @@ async fn prompt_get_preserves_arguments_and_multimodal_results_without_followup_
     mount_result(&server, "prompts/get", expected.clone()).await;
     let client = client(&server);
     let arguments = json!({"empty":"", "code":" \n\tß\"{x} "});
-    let result = client.prompts_get("exact name", Some(&arguments)).await.unwrap();
+    let result = client
+        .prompts_get("exact name", Some(&arguments))
+        .await
+        .unwrap();
     assert_eq!(result, expected);
     let bodies = requests(&server).await;
-    assert_eq!(bodies.len(), 3, "must not fetch links, sample or execute tools");
+    assert_eq!(
+        bodies.len(),
+        3,
+        "must not fetch links, sample or execute tools"
+    );
     assert_eq!(bodies[2]["method"], "prompts/get");
-    assert_eq!(bodies[2]["params"], json!({"name":"exact name","arguments":arguments}));
+    assert_eq!(
+        bodies[2]["params"],
+        json!({"name":"exact name","arguments":arguments})
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -121,7 +152,10 @@ async fn omitted_prompt_arguments_are_absent_not_null_or_an_invented_empty_map()
     mount_initialization(&server, json!({"prompts":{}})).await;
     mount_result(&server, "prompts/get", json!({"messages":[]})).await;
     client(&server).prompts_get("plain", None).await.unwrap();
-    assert_eq!(requests(&server).await[2]["params"], json!({"name":"plain"}));
+    assert_eq!(
+        requests(&server).await[2]["params"],
+        json!({"name":"plain"})
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -129,10 +163,23 @@ async fn invalid_prompt_arguments_are_rejected_before_initialization_or_network_
     let server = MockServer::start().await;
     let client = client(&server);
     assert!(client.prompts_get("", None).await.is_err());
-    for arguments in [Value::Null, json!(false), json!("{}"), json!([]),
-        json!({"key":1}), json!({"key":null}), json!({"key":{"PRIVATE":true}})] {
-        let error = client.prompts_get("valid", Some(&arguments)).await.unwrap_err();
-        assert!(matches!(error, McpBridgeError::McpError {code:-32602,..}));
+    for arguments in [
+        Value::Null,
+        json!(false),
+        json!("{}"),
+        json!([]),
+        json!({"key":1}),
+        json!({"key":null}),
+        json!({"key":{"PRIVATE":true}}),
+    ] {
+        let error = client
+            .prompts_get("valid", Some(&arguments))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            McpBridgeError::McpError { code: -32602, .. }
+        ));
         assert!(!error.to_string().contains("PRIVATE"));
     }
     assert!(requests(&server).await.is_empty());
@@ -145,29 +192,49 @@ async fn prompt_and_template_reads_require_their_negotiated_server_capabilities(
     let client = client(&server);
     assert!(client.prompts_get("missing", None).await.is_err());
     assert!(client.resource_templates_list().await.is_err());
-    assert_eq!(requests(&server).await.len(), 2, "only initialization may be sent");
+    assert_eq!(
+        requests(&server).await.len(),
+        2,
+        "only initialization may be sent"
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn prompt_read_retries_a_transient_failure_but_never_reinitializes_unnecessarily() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"prompts/get"})))
-        .respond_with(ResponseTemplate::new(503)).with_priority(0).up_to_n_times(1)
-        .expect(1).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"prompts/get"})))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(0)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
     mount_result(&server, "prompts/get", json!({"messages":[]})).await;
     client(&server).prompts_get("read", None).await.unwrap();
     let bodies = requests(&server).await;
     assert_eq!(bodies.len(), 4);
-    assert_eq!(bodies[2], bodies[3], "read retries retain request correlation and arguments");
+    assert_eq!(
+        bodies[2], bodies[3],
+        "read retries retain request correlation and arguments"
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn malformed_prompt_success_is_terminal_not_retried_or_returned_as_success() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{}})).await;
-    mount_result(&server, "prompts/get", json!({"messages":[{"role":"system"}]})).await;
-    let error = client(&server).prompts_get("broken", None).await.unwrap_err();
+    mount_result(
+        &server,
+        "prompts/get",
+        json!({"messages":[{"role":"system"}]}),
+    )
+    .await;
+    let error = client(&server)
+        .prompts_get("broken", None)
+        .await
+        .unwrap_err();
     assert!(!error.is_retryable());
     assert_eq!(requests(&server).await.len(), 3);
 }
@@ -176,17 +243,24 @@ async fn malformed_prompt_success_is_terminal_not_retried_or_returned_as_success
 async fn prompt_read_deadline_is_not_refreshed_or_retried_after_expiration() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"prompts/get"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"prompts/get"})))
         .respond_with(|request: &Request| {
             rpc_response(request, json!({"messages":[]})).set_delay(Duration::from_secs(1))
-        }).expect(1).mount(&server).await;
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     let mut client = client(&server);
     client.initialize().await.unwrap();
     client.runtime = ConnectorRuntime::new(
         ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_millis(100)),
     );
-    let error = fcp_async_core::time::timeout(Duration::from_secs(2), client.prompts_get("slow", None))
-        .await.expect("outer watchdog").unwrap_err();
+    let error =
+        fcp_async_core::time::timeout(Duration::from_secs(2), client.prompts_get("slow", None))
+            .await
+            .expect("outer watchdog")
+            .unwrap_err();
     assert!(!error.is_retryable());
     assert_eq!(requests(&server).await.len(), 3);
 }
@@ -211,7 +285,10 @@ async fn resource_templates_collect_all_pages_without_expanding_uri_templates() 
             rpc_response(request, page)
         }).expect(2).mount(&server).await;
     let result = client(&server).resource_templates_list().await.unwrap();
-    assert_eq!(result, json!({"resourceTemplates":[first,second],"_meta":{"first":true}}));
+    assert_eq!(
+        result,
+        json!({"resourceTemplates":[first,second],"_meta":{"first":true}})
+    );
     assert_eq!(requests(&server).await.len(), 4);
 }
 
@@ -219,12 +296,21 @@ async fn resource_templates_collect_all_pages_without_expanding_uri_templates() 
 async fn resource_template_identity_is_the_uri_template_not_the_display_name() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"resources":{}})).await;
-    mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[
-        {"name":"one","uriTemplate":"data:///{id}"},
-        {"name":"two","uriTemplate":"data:///{id}"}
-    ]})).await;
+    mount_result(
+        &server,
+        "resources/templates/list",
+        json!({"resourceTemplates":[
+            {"name":"one","uriTemplate":"data:///{id}"},
+            {"name":"two","uriTemplate":"data:///{id}"}
+        ]}),
+    )
+    .await;
     let error = client(&server).resource_templates_list().await.unwrap_err();
-    assert!(error.to_string().contains("duplicate discovery entry identity"));
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate discovery entry identity")
+    );
     assert_eq!(requests(&server).await.len(), 3);
 }
 
@@ -232,7 +318,12 @@ async fn resource_template_identity_is_the_uri_template_not_the_display_name() {
 async fn resource_template_cursor_cycles_fail_without_returning_partial_catalogs() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"resources":{}})).await;
-    mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[],"nextCursor":"loop"})).await;
+    mount_result(
+        &server,
+        "resources/templates/list",
+        json!({"resourceTemplates":[],"nextCursor":"loop"}),
+    )
+    .await;
     let error = client(&server).resource_templates_list().await.unwrap_err();
     assert!(error.to_string().contains("cursor cycle"));
     assert_eq!(requests(&server).await.len(), 4);
@@ -240,12 +331,22 @@ async fn resource_template_cursor_cycles_fail_without_returning_partial_catalogs
 
 #[fcp_async_core::runtime::test]
 async fn invalid_resource_templates_fail_the_complete_read() {
-    for entry in [json!({"uriTemplate":"x:{id}"}), json!({"name":"","uriTemplate":"x:{id}"}),
-        json!({"name":42,"uriTemplate":"x:{id}"}), json!({"name":"x"}),
-        json!({"name":"x","uriTemplate":""}), json!({"name":"x","uriTemplate":false})] {
+    for entry in [
+        json!({"uriTemplate":"x:{id}"}),
+        json!({"name":"","uriTemplate":"x:{id}"}),
+        json!({"name":42,"uriTemplate":"x:{id}"}),
+        json!({"name":"x"}),
+        json!({"name":"x","uriTemplate":""}),
+        json!({"name":"x","uriTemplate":false}),
+    ] {
         let server = MockServer::start().await;
         mount_initialization(&server, json!({"resources":{}})).await;
-        mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[entry]})).await;
+        mount_result(
+            &server,
+            "resources/templates/list",
+            json!({"resourceTemplates":[entry]}),
+        )
+        .await;
         let error = client(&server).resource_templates_list().await.unwrap_err();
         assert!(!error.is_retryable());
         assert_eq!(requests(&server).await.len(), 3);
@@ -257,12 +358,16 @@ async fn template_session_expiry_discards_old_pages_and_restarts_without_a_curso
     let server = MockServer::start().await;
     let generations = Arc::new(AtomicUsize::new(0));
     let generation = Arc::clone(&generations);
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"initialize"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"initialize"})))
         .respond_with(move |request: &Request| {
             let number = generation.fetch_add(1, Ordering::SeqCst) + 1;
             rpc_response(request, initialization(json!({"resources":{}})))
                 .insert_header("Mcp-Session-Id", format!("generation-{number}"))
-        }).expect(2).mount(&server).await;
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
     mount_initialized(&server).await;
     Mock::given(method("POST")).and(body_partial_json(json!({"method":"resources/templates/list"})))
         .and(header("Mcp-Session-Id", "generation-1"))
@@ -271,16 +376,32 @@ async fn template_session_expiry_discards_old_pages_and_restarts_without_a_curso
             if body["params"].get("cursor").is_some() { ResponseTemplate::new(404) }
             else { rpc_response(request, json!({"resourceTemplates":[{"name":"old","uriTemplate":"old:{id}"}],"nextCursor":"old-cursor"})) }
         }).expect(2).mount(&server).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"resources/templates/list"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"method":"resources/templates/list"}),
+        ))
         .and(header("Mcp-Session-Id", "generation-2"))
         .respond_with(|request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(body["params"], json!({}), "stale cursor must not cross sessions");
-            rpc_response(request, json!({"resourceTemplates":[{"name":"new","uriTemplate":"new:{id}"}]}))
-        }).expect(1).mount(&server).await;
+            assert_eq!(
+                body["params"],
+                json!({}),
+                "stale cursor must not cross sessions"
+            );
+            rpc_response(
+                request,
+                json!({"resourceTemplates":[{"name":"new","uriTemplate":"new:{id}"}]}),
+            )
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     let client = client(&server);
     let result = client.resource_templates_list().await.unwrap();
-    assert_eq!(result, json!({"resourceTemplates":[{"name":"new","uriTemplate":"new:{id}"}]}));
+    assert_eq!(
+        result,
+        json!({"resourceTemplates":[{"name":"new","uriTemplate":"new:{id}"}]})
+    );
     assert_eq!(client.metrics().session_expired_retry_count, 1);
     assert_eq!(generations.load(Ordering::SeqCst), 2);
     assert_eq!(requests(&server).await.len(), 7);
@@ -290,10 +411,19 @@ async fn template_session_expiry_discards_old_pages_and_restarts_without_a_curso
 async fn explicit_template_cursor_is_not_replayed_into_a_reinitialized_session() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"resources":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"resources/templates/list"})))
-        .respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"method":"resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
     let client = client(&server);
-    let error = client.rpc_call("resources/templates/list", json!({"cursor":"old"})).await.unwrap_err();
+    let error = client
+        .rpc_call("resources/templates/list", json!({"cursor":"old"}))
+        .await
+        .unwrap_err();
     assert!(!error.is_retryable());
     assert_eq!(client.metrics().session_expired_retry_count, 0);
     assert_eq!(requests(&server).await.len(), 3);
@@ -303,9 +433,16 @@ async fn explicit_template_cursor_is_not_replayed_into_a_reinitialized_session()
 async fn new_read_retries_do_not_authorize_unsafe_tool_replay() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{},"resources":{},"tools":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"tools/call"})))
-        .respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
-    let error = client(&server).tools_call("create", &json!({})).await.unwrap_err();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"tools/call"})))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)
+        .tools_call("create", &json!({}))
+        .await
+        .unwrap_err();
     assert!(!error.is_retryable());
     assert_eq!(requests(&server).await.len(), 3);
 }
@@ -325,11 +462,20 @@ fn expanded_manifest_passes_strict_validation_and_uses_existing_read_capabilitie
     let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../../manifest.toml"))
         .expect("strict validation must include the recalculated interface hash");
     assert_eq!(manifest.provides.operations.len(), 10);
-    for (id, capability) in [("mcp.prompts.get","mcp.prompts.read"),
-        ("mcp.resources.templates.list","mcp.resources.read")] {
+    for (id, capability) in [
+        ("mcp.prompts.get", "mcp.prompts.read"),
+        ("mcp.resources.templates.list", "mcp.resources.read"),
+    ] {
         let operation = &manifest.provides.operations[id];
         assert_eq!(operation.capability.as_str(), capability);
-        assert_eq!(operation.network_constraints.as_ref().unwrap().max_redirects, 0);
+        assert_eq!(
+            operation
+                .network_constraints
+                .as_ref()
+                .unwrap()
+                .max_redirects,
+            0
+        );
         assert_eq!(operation.input_schema["type"], "object");
     }
 }
@@ -339,28 +485,54 @@ async fn fcp_dispatch_and_introspection_expose_both_new_operations() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{},"resources":{}})).await;
     mount_result(&server, "prompts/get", rich_prompt()).await;
-    mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[
-        {"name":"example","uriTemplate":"example:{id}","description":"Example records"}
-    ]})).await;
+    mount_result(
+        &server,
+        "resources/templates/list",
+        json!({"resourceTemplates":[
+            {"name":"example","uriTemplate":"example:{id}","description":"Example records"}
+        ]}),
+    )
+    .await;
     let mut connector = crate::connector::McpBridgeConnector::new();
-    connector.handle_configure(json!({"mcp_url":server.uri()})).await.unwrap();
-    connector.handle_handshake(json!({"session_id":"fcp-test"})).await.unwrap();
+    connector
+        .handle_configure(json!({"mcp_url":server.uri()}))
+        .await
+        .unwrap();
+    connector
+        .handle_handshake(json!({"session_id":"fcp-test"}))
+        .await
+        .unwrap();
     let introspection = connector.handle_introspect().await.unwrap();
     let operations = introspection["operations"].as_array().unwrap();
     assert_eq!(operations.len(), 10);
     for id in ["mcp.prompts.get", "mcp.resources.templates.list"] {
         assert!(operations.iter().any(|op| op["id"] == id));
-        assert_eq!(connector.handle_simulate(json!({"operation_id":id})).await.unwrap()["allowed"], true);
+        assert_eq!(
+            connector
+                .handle_simulate(json!({"operation_id":id}))
+                .await
+                .unwrap()["allowed"],
+            true
+        );
     }
     let prompt = connector.handle_invoke(json!({
         "operation_id":"mcp.prompts.get", "input":{"name":"review","arguments":{"code":"example"}}
     })).await.unwrap();
     assert_eq!(prompt, rich_prompt());
-    let templates = connector.handle_invoke(json!({
-        "operation_id":"mcp.resources.templates.list", "input":{}
-    })).await.unwrap();
-    assert_eq!(templates["resourceTemplates"][0]["uriTemplate"], "example:{id}");
-    assert_eq!(templates["resourceTemplates"][0]["injection_findings"], json!([]));
+    let templates = connector
+        .handle_invoke(json!({
+            "operation_id":"mcp.resources.templates.list", "input":{}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        templates["resourceTemplates"][0]["uriTemplate"],
+        "example:{id}"
+    );
+    assert_eq!(
+        templates["resourceTemplates"][0]["injection_findings"],
+        json!([])
+    );
     assert_eq!(requests(&server).await.len(), 4);
 }
 
@@ -368,13 +540,31 @@ async fn fcp_dispatch_and_introspection_expose_both_new_operations() {
 async fn fcp_prompt_validation_errors_are_terminal_and_counted_without_network_io() {
     let server = MockServer::start().await;
     let mut connector = crate::connector::McpBridgeConnector::new();
-    connector.handle_configure(json!({"mcp_url":server.uri()})).await.unwrap();
-    connector.handle_handshake(json!({"session_id":"fcp-test"})).await.unwrap();
-    let error = connector.handle_invoke(json!({
-        "operation_id":"mcp.prompts.get", "input":{"name":"review","arguments":{"code":42}}
-    })).await.unwrap_err();
-    assert!(matches!(error, fcp_prelude::FcpError::External {retryable:false,..}));
-    let metrics = connector.handle_invoke(json!({"operation_id":"mcp.server.metrics"})).await.unwrap();
+    connector
+        .handle_configure(json!({"mcp_url":server.uri()}))
+        .await
+        .unwrap();
+    connector
+        .handle_handshake(json!({"session_id":"fcp-test"}))
+        .await
+        .unwrap();
+    let error = connector
+        .handle_invoke(json!({
+            "operation_id":"mcp.prompts.get", "input":{"name":"review","arguments":{"code":42}}
+        }))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        fcp_prelude::FcpError::External {
+            retryable: false,
+            ..
+        }
+    ));
+    let metrics = connector
+        .handle_invoke(json!({"operation_id":"mcp.server.metrics"}))
+        .await
+        .unwrap();
     assert_eq!(metrics["errors"], 1);
     assert!(requests(&server).await.is_empty());
 }
@@ -394,10 +584,18 @@ async fn template_catalog_enforces_entry_and_utf8_cursor_byte_limits() {
         };
         mount_result(&server, "resources/templates/list", result).await;
         let error = client(&server).resource_templates_list().await.unwrap_err();
-        let expected = if excessive_entries { "entry limit" } else { "oversized discovery cursor" };
+        let expected = if excessive_entries {
+            "entry limit"
+        } else {
+            "oversized discovery cursor"
+        };
         assert!(error.to_string().contains(expected));
         assert!(!error.is_retryable());
-        assert_eq!(requests(&server).await.len(), 3, "must not request another page");
+        assert_eq!(
+            requests(&server).await.len(),
+            3,
+            "must not request another page"
+        );
     }
 }
 
@@ -405,12 +603,27 @@ async fn template_catalog_enforces_entry_and_utf8_cursor_byte_limits() {
 async fn explicit_template_page_retries_keep_the_same_session_and_opaque_cursor() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"resources":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"resources/templates/list"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"method":"resources/templates/list"}),
+        ))
         .and(header("Mcp-Session-Id", "active"))
-        .respond_with(ResponseTemplate::new(503)).with_priority(0).up_to_n_times(1)
-        .expect(1).mount(&server).await;
-    mount_result(&server, "resources/templates/list", json!({"resourceTemplates":[]})).await;
-    client(&server).rpc_call("resources/templates/list", json!({"cursor":"  opaque/ß  "})).await.unwrap();
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(0)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_result(
+        &server,
+        "resources/templates/list",
+        json!({"resourceTemplates":[]}),
+    )
+    .await;
+    client(&server)
+        .rpc_call("resources/templates/list", json!({"cursor":"  opaque/ß  "}))
+        .await
+        .unwrap();
     let bodies = requests(&server).await;
     assert_eq!(bodies.len(), 4);
     assert_eq!(bodies[2], bodies[3]);
@@ -423,11 +636,18 @@ async fn explicit_template_page_retries_keep_the_same_session_and_opaque_cursor(
 async fn prompt_get_rejects_a_mismatched_json_rpc_response_id_without_replay() {
     let server = MockServer::start().await;
     mount_initialization(&server, json!({"prompts":{}})).await;
-    Mock::given(method("POST")).and(body_partial_json(json!({"method":"prompts/get"})))
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"prompts/get"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jsonrpc":"2.0", "id":9999, "result":{"messages":[]}
-        }))).expect(1).mount(&server).await;
-    let error = client(&server).prompts_get("plain", None).await.unwrap_err();
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)
+        .prompts_get("plain", None)
+        .await
+        .unwrap_err();
     assert!(!error.is_retryable());
     assert_eq!(requests(&server).await.len(), 3);
 }

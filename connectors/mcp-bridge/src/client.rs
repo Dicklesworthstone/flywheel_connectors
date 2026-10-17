@@ -139,11 +139,7 @@ impl McpClient {
         }
     }
 
-    async fn handle_http_error(
-        &self,
-        status: StatusCode,
-        resp: Response,
-    ) -> McpBridgeError {
+    async fn handle_http_error(&self, status: StatusCode, resp: Response) -> McpBridgeError {
         let retry_after = resp
             .headers()
             .get("retry-after")
@@ -217,7 +213,8 @@ impl McpClient {
         transport::read_rpc_response(resp, request.id, |reply| {
             self.send_server_reply(url, session_id, reply)
         })
-        .await.map_err(RpcFailure::from)
+        .await
+        .map_err(RpcFailure::from)
     }
 
     /// Respond on the same endpoint without forwarding a server request to any
@@ -314,9 +311,10 @@ impl McpClient {
         }
         let mut params = json!({"name": name});
         if let Some(arguments) = arguments {
-            if !arguments.as_object().is_some_and(|arguments| {
-                arguments.values().all(serde_json::Value::is_string)
-            }) {
+            if !arguments
+                .as_object()
+                .is_some_and(|arguments| arguments.values().all(serde_json::Value::is_string))
+            {
                 return Err(McpBridgeError::McpError {
                     code: -32602,
                     message: "prompt arguments must be an object containing only strings".into(),
@@ -337,15 +335,27 @@ fn validate_prompt_result(result: &serde_json::Value) -> McpBridgeResult<()> {
     use serde_json::Value;
     let invalid = || transport::invalid_response("invalid prompts/get result");
     let object = result.as_object().ok_or_else(invalid)?;
-    if object.get("description").is_some_and(|value| !value.is_string()) {
+    if object
+        .get("description")
+        .is_some_and(|value| !value.is_string())
+    {
         return Err(invalid());
     }
-    let messages = object.get("messages").and_then(Value::as_array).ok_or_else(invalid)?;
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
     for message in messages {
-        if !matches!(message.get("role").and_then(Value::as_str), Some("user" | "assistant")) {
+        if !matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
             return Err(invalid());
         }
-        let content = message.get("content").and_then(Value::as_object).ok_or_else(invalid)?;
+        let content = message
+            .get("content")
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
         let string_field = |name: &str| content.get(name).is_some_and(Value::is_string);
         let valid = match content.get("type").and_then(Value::as_str) {
             Some("text") => string_field("text"),
@@ -535,7 +545,8 @@ mod tests {
 
     #[test]
     fn explicit_mcp_endpoint_is_not_appended_twice() {
-        let client = McpClient::new(McpAuth { api_key: None }, "https://example.com/api/mcp/").unwrap();
+        let client =
+            McpClient::new(McpAuth { api_key: None }, "https://example.com/api/mcp/").unwrap();
         assert_eq!(client.rpc_endpoint(), "https://example.com/api/mcp");
     }
 }

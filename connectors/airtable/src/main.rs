@@ -227,6 +227,10 @@ mod tests {
         let replies = responses(&output);
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0]["error"]["code"], "FCP-1004");
-        assert!(!String::from_utf8(output).unwrap().contains("must-not-be-used"));
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("must-not-be-used")
+        );
     }
 }

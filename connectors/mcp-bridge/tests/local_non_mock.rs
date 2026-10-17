@@ -58,15 +58,22 @@ struct LoopbackServer {
 impl LoopbackServer {
     fn start(exchanges: Vec<Exchange>) -> Self {
         let handshake = [
-            Exchange::json("200 OK", &json!({
-                "jsonrpc": "2.0", "id": 0,
-                "result": {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                    "serverInfo": {"name": "raw-loopback", "version": "1"}
-                }
-            })),
-            Exchange { response_status: "202 Accepted", response_body: String::new(), extra_headers: "" },
+            Exchange::json(
+                "200 OK",
+                &json!({
+                    "jsonrpc": "2.0", "id": 0,
+                    "result": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                        "serverInfo": {"name": "raw-loopback", "version": "1"}
+                    }
+                }),
+            ),
+            Exchange {
+                response_status: "202 Accepted",
+                response_body: String::new(),
+                extra_headers: "",
+            },
         ];
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind MCP loopback listener");
         listener
@@ -97,7 +104,8 @@ impl LoopbackServer {
     }
 
     fn join(mut self) -> Vec<CapturedRequest> {
-        let requests = self.handle
+        let requests = self
+            .handle
             .take()
             .expect("loopback thread present")
             .join()
@@ -108,9 +116,15 @@ impl LoopbackServer {
         assert_eq!(initialize["method"], "initialize");
         assert_eq!(initialize["jsonrpc"], "2.0");
         assert_eq!(initialize["id"], 0);
-        assert_eq!(initialize["params"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(
+            initialize["params"]["protocolVersion"],
+            MCP_PROTOCOL_VERSION
+        );
         assert_eq!(initialize["params"]["capabilities"], json!({}));
-        assert_eq!(header_value(&requests[0].headers, "authorization"), format!("Bearer {LOOPBACK_CREDENTIAL}"));
+        assert_eq!(
+            header_value(&requests[0].headers, "authorization"),
+            format!("Bearer {LOOPBACK_CREDENTIAL}")
+        );
         assert_http_boundary(&requests[1]);
         let initialized: Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(initialized["method"], "notifications/initialized");

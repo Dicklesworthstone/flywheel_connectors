@@ -25,7 +25,10 @@ pub(super) fn invalid_response(message: &str) -> McpBridgeError {
 }
 
 pub(super) async fn read_bounded(mut response: Response, limit: usize) -> McpBridgeResult<Vec<u8>> {
-    if response.content_length().is_some_and(|length| length > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
         return Err(invalid_response("HTTP body exceeds byte limit"));
     }
     let mut body = Vec::new();
@@ -118,9 +121,14 @@ fn classify_message(mut value: Value, expected_id: u64) -> McpBridgeResult<Messa
             .filter(|method| !method.is_empty())
             .ok_or_else(|| invalid_response("invalid server method"))?;
         if object.contains_key("result") || object.contains_key("error") {
-            return Err(invalid_response("message mixes request and response fields"));
+            return Err(invalid_response(
+                "message mixes request and response fields",
+            ));
         }
-        if object.get("params").is_some_and(|params| !params.is_object()) {
+        if object
+            .get("params")
+            .is_some_and(|params| !params.is_object())
+        {
             return Err(invalid_response("server params must be an object"));
         }
         let Some(id) = object.get("id") else {
@@ -258,7 +266,8 @@ mod tests {
 
     #[test]
     fn sse_multiline_unicode_comments_and_bom() {
-        let bytes = "\u{feff}: heartbeat\r\nevent: message\r\ndata: {\r\ndata: \"name\":\"café\"}\r\n\r\n";
+        let bytes =
+            "\u{feff}: heartbeat\r\nevent: message\r\ndata: {\r\ndata: \"name\":\"café\"}\r\n\r\n";
         assert_eq!(
             decode(bytes.as_bytes(), 128).unwrap(),
             vec!["{\n\"name\":\"café\"}".as_bytes().to_vec()]
@@ -292,7 +301,10 @@ mod tests {
     fn sse_enforces_line_and_multiline_event_limits() {
         assert!(decode(b"data: 12345\n\n", 10).is_err());
         assert!(decode(b"data: 12345\ndata: 67890\n\n", 11).is_err());
-        assert_eq!(decode(b"data: 1234\n\n", 10).unwrap(), vec![b"1234".to_vec()]);
+        assert_eq!(
+            decode(b"data: 1234\n\n", 10).unwrap(),
+            vec![b"1234".to_vec()]
+        );
     }
 
     #[test]
@@ -323,31 +335,58 @@ mod tests {
 
     #[test]
     fn rpc_error_is_not_a_successful_null_result() {
-        let result = classify_message(json!({
-            "jsonrpc": "2.0", "id": 7,
-            "error": {"code": -32601, "message": "not found"}
-        }), 7).unwrap();
-        assert!(matches!(result, Message::Error(McpBridgeError::McpError { code: -32601, .. })));
+        let result = classify_message(
+            json!({
+                "jsonrpc": "2.0", "id": 7,
+                "error": {"code": -32601, "message": "not found"}
+            }),
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Message::Error(McpBridgeError::McpError { code: -32601, .. })
+        ));
     }
 
     #[test]
     fn progress_is_a_notification_and_ping_is_answered() {
         assert!(matches!(
-            classify_message(json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}}), 7).unwrap(),
+            classify_message(
+                json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}}),
+                7
+            )
+            .unwrap(),
             Message::Notification
         ));
         let Message::Respond(reply) = classify_message(
-            json!({"jsonrpc":"2.0","id":"server-ping","method":"ping"}), 7,
-        ).unwrap() else { panic!("expected ping response") };
-        assert_eq!(reply, json!({"jsonrpc":"2.0","id":"server-ping","result":{}}));
+            json!({"jsonrpc":"2.0","id":"server-ping","method":"ping"}),
+            7,
+        )
+        .unwrap() else {
+            panic!("expected ping response")
+        };
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":"server-ping","result":{}})
+        );
     }
 
     #[test]
     fn unsolicited_capabilities_are_refused_not_executed() {
-        for method in ["sampling/createMessage", "roots/list", "elicitation/create", "tools/call"] {
+        for method in [
+            "sampling/createMessage",
+            "roots/list",
+            "elicitation/create",
+            "tools/call",
+        ] {
             let Message::Respond(reply) = classify_message(
-                json!({"jsonrpc":"2.0","id":0,"method":method,"params":{}}), 7,
-            ).unwrap() else { panic!("expected method refusal") };
+                json!({"jsonrpc":"2.0","id":0,"method":method,"params":{}}),
+                7,
+            )
+            .unwrap() else {
+                panic!("expected method refusal")
+            };
             assert_eq!(reply["error"]["code"], -32601);
             assert_eq!(reply["id"], 0);
         }
@@ -386,11 +425,22 @@ mod tests {
                 "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
             )).insert_header("Content-Type", "text/event-stream; charset=utf-8"))
             .expect(1).mount(&server).await;
-        let client = super::super::McpClient::new(super::super::McpAuth { api_key: None }, &server.uri()).unwrap();
+        let client =
+            super::super::McpClient::new(super::super::McpAuth { api_key: None }, &server.uri())
+                .unwrap();
         let request = crate::types::JsonRpcRequest {
-            jsonrpc: "2.0", id: 1, method: "tools/list".into(), params: json!({}),
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/list".into(),
+            params: json!({}),
         };
-        assert_eq!(client.rpc_call_once(&format!("{}/mcp", server.uri()), &request, None).await.unwrap(), json!({"tools":[]}));
+        assert_eq!(
+            client
+                .rpc_call_once(&format!("{}/mcp", server.uri()), &request, None)
+                .await
+                .unwrap(),
+            json!({"tools":[]})
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -405,7 +455,9 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut headers = Vec::new();
             while !headers.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
@@ -422,8 +474,15 @@ mod tests {
             // must finish on its JSON-RPC response, not on connection closure.
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok()
         });
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
-        let response = http.post(format!("http://{address}/mcp")).send().await.unwrap();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let response = http
+            .post(format!("http://{address}/mcp"))
+            .send()
+            .await
+            .unwrap();
         let result = read_rpc_response(response, 9, |_| async { Ok(()) }).await;
         let _ = done_tx.send(());
         assert!(worker.join().unwrap());

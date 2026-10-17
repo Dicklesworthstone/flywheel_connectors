@@ -331,7 +331,11 @@ mod tests {
         );
         assert!(matches!(
             error.to_fcp_error(),
-            FcpError::External { status_code: None, retry_after: None, .. }
+            FcpError::External {
+                status_code: None,
+                retry_after: None,
+                ..
+            }
         ));
     }
 
