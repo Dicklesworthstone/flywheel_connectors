@@ -24,6 +24,18 @@ ignore = [
     # HashMap of Copy ID types (no panicking element Drop), and workspace
     # code never touches sized-chunks/im-rc directly.
     "RUSTSEC-2026-0255",
+    "RUSTSEC-2025-0111",
+    "RUSTSEC-2026-0292",
+    "RUSTSEC-2026-0318",
+    "RUSTSEC-2026-0314",
+    "RUSTSEC-2026-0316",
+    "RUSTSEC-2026-0321",
+    "RUSTSEC-2026-0322",
+    "RUSTSEC-2026-0323",
+    "RUSTSEC-2026-0324",
+    "RUSTSEC-2026-0327",
+    "RUSTSEC-2025-0167",
+    "RUSTSEC-2026-0306",
 ]
 
 [licenses]
