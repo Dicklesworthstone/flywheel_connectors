@@ -42,6 +42,45 @@ impl std::fmt::Debug for OperationContractSet {
 }
 
 impl OperationContractSet {
+    /// Compile one dynamically discovered operation without external retrieval.
+    ///
+    /// Each schema is limited to 64 KiB of compact JSON, 4096 JSON nodes and
+    /// 32 levels. Patterns use the non-backtracking regex engine with bounded
+    /// compiled-pattern/cache sizes; unsupported advanced patterns fail closed.
+    /// These are representation limits, not a hard CPU or allocator quota.
+    /// Callers must retain their execution deadline and original schema/session
+    /// identity, and must still perform ordinary authorization independently.
+    ///
+    /// Unlike manifest construction this does not validate an interface hash:
+    /// it creates a contract, never a manifest, grant, or proof of server trust.
+    ///
+    /// # Errors
+    /// Rejects invalid, excessive or externally resolved schemas without
+    /// exposing schema contents, reference URLs or validation paths.
+    pub fn from_operation_schemas(
+        operation: &OperationId,
+        input_schema: &Value,
+        output_schema: &Value,
+    ) -> FcpResult<Self> {
+        let compile = |schema: &Value| {
+            check_dynamic_schema_bounds(schema)?;
+            jsonschema::options()
+                .with_retriever(LocalOnly)
+                .with_pattern_options(jsonschema::PatternOptions::regex()
+                    .size_limit(64 * 1024).dfa_size_limit(64 * 1024))
+                .build(schema)
+                .map(Arc::new)
+                .map_err(|_| invalid_dynamic_contract())
+        };
+        let contract = CompiledOperation {
+            input: compile(input_schema)?,
+            output: compile(output_schema)?,
+        };
+        Ok(Self {
+            operations: BTreeMap::from([(operation.as_str().to_owned(), contract)]),
+        })
+    }
+
     /// Compile the input and output contracts of every declared operation.
     ///
     /// Compilation is all-or-nothing and intended for process construction,
@@ -86,6 +125,20 @@ impl OperationContractSet {
         Ok(())
     }
 
+    /// Validate just the result data without cloning it into an FCP envelope.
+    /// The caller must separately check transport correlation and outcome shape.
+    ///
+    /// # Errors
+    /// Invalid or undeclared results are non-retryable unknown outcomes, just
+    /// as in [`Self::validate_response`]. No input or schema data is included.
+    pub fn validate_result(&self, operation: &OperationId, result: &Value) -> FcpResult<()> {
+        let contract = self.operations.get(operation.as_str()).ok_or_else(invalid_outcome)?;
+        if !contract.output.is_valid(result) {
+            return Err(invalid_outcome());
+        }
+        Ok(())
+    }
+
     /// Check a complete admitted reply without rewriting it.
     ///
     /// The response must correlate with the original request and have one
@@ -116,6 +169,50 @@ impl OperationContractSet {
             return Err(invalid_outcome());
         }
         Ok(())
+    }
+}
+
+fn check_dynamic_schema_bounds(schema: &Value) -> FcpResult<()> {
+    use std::io::{self, Write};
+
+    let mut stack = vec![(schema, 0_usize)];
+    let mut nodes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > 4096 || depth > 32 {
+            return Err(invalid_dynamic_contract());
+        }
+        let children = match value {
+            Value::Object(object) => object.len(),
+            Value::Array(array) => array.len(),
+            _ => 0,
+        };
+        if children > 4096_usize.saturating_sub(nodes + stack.len()) {
+            return Err(invalid_dynamic_contract());
+        }
+        match value {
+            Value::Object(object) => stack.extend(object.values().map(|v| (v, depth + 1))),
+            Value::Array(array) => stack.extend(array.iter().map(|v| (v, depth + 1))),
+            _ => {}
+        }
+    }
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len())
+                .filter(|size| *size <= 64 * 1024)
+                .ok_or_else(|| io::Error::other("dynamic schema byte limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    serde_json::to_writer(Counter(0), schema).map_err(|_| invalid_dynamic_contract())
+}
+
+fn invalid_dynamic_contract() -> FcpError {
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: "Dynamic operation schema is invalid, unsupported or exceeds local limits".into(),
     }
 }
 
@@ -322,5 +419,52 @@ mod tests {
         contracts(json!(true), json!(true)).validate_response(&operation(), &id(), &response).unwrap();
         assert_unknown(contracts(json!(true), json!(false))
             .validate_response(&operation(), &id(), &response).unwrap_err());
+    }
+
+    #[test]
+    fn dynamic_contracts_preserve_local_refs_and_validate_borrowed_results() {
+        let set = OperationContractSet::from_operation_schemas(&operation(),
+            &json!({"type":"object","required":["n"],"$defs":{"n":{"type":"integer","minimum":1}},
+                "properties":{"n":{"$ref":"#/$defs/n"}}}),
+            &json!({"type":"object","required":["accepted"],"properties":{"accepted":{"const":true}}})).unwrap();
+        set.validate_input(&operation(), &json!({"n":1})).unwrap();
+        assert!(set.validate_input(&operation(), &json!({"n":"1"})).is_err());
+        let output = json!({"accepted":true,"extension":{"keep":true}});
+        set.validate_result(&operation(), &output).unwrap();
+        assert_eq!(output["extension"]["keep"], true);
+        assert_unknown(set.validate_result(&operation(), &json!({"accepted":false})).unwrap_err());
+        assert_unknown(set.validate_result(&OperationId::from_static("other.operation"), &output).unwrap_err());
+    }
+
+    #[test]
+    fn dynamic_contracts_never_fetch_external_refs_or_echo_schema_data() {
+        for reference in ["https://uncontacted.invalid/private", "file:///private", "private.json"] {
+            let result = OperationContractSet::from_operation_schemas(&operation(),
+                &json!({"$ref":reference}), &json!(true));
+            assert!(!result.unwrap_err().to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn dynamic_schema_limits_reject_depth_width_and_utf8_bytes_before_compilation() {
+        let mut deep = json!(true);
+        for _ in 0..34 { deep = json!({"not":deep}); }
+        let wide = json!({"enum": vec![0; 4096]});
+        let large = json!({"description":"雪".repeat(22_000)});
+        for schema in [deep, wide, large] {
+            assert!(OperationContractSet::from_operation_schemas(&operation(), &schema, &json!(true)).is_err());
+        }
+        check_dynamic_schema_bounds(&json!("a".repeat(64 * 1024 - 2))).unwrap();
+        assert!(check_dynamic_schema_bounds(&json!("a".repeat(64 * 1024 - 1))).is_err());
+    }
+
+    #[test]
+    fn dynamic_patterns_reject_backreferences_instead_of_enabling_backtracking() {
+        assert!(OperationContractSet::from_operation_schemas(&operation(),
+            &json!({"type":"string","pattern":r"^(a+)\1$"}), &json!(true)).is_err());
+        let set = OperationContractSet::from_operation_schemas(&operation(),
+            &json!({"type":"string","pattern":"^[a-z]+$"}), &json!(true)).unwrap();
+        set.validate_input(&operation(), &json!("letters")).unwrap();
+        assert!(set.validate_input(&operation(), &json!("12")).is_err());
     }
 }
