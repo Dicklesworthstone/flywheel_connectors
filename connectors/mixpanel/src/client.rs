@@ -176,19 +176,19 @@ impl MixpanelClient {
 
     /// Issue a request with retry.
     ///
-    /// br-kxd3e: replay safety is derived from the verb. Only POST ingests, and
-    /// a replay after a 5xx DOUBLE-COUNTS the event in every downstream
-    /// dashboard and funnel. These providers offer a per-event dedup id
-    /// (`messageId` / `$insert_id`) that would make the retry genuinely safe,
-    /// but the events are caller-supplied here so the key may be absent —
-    /// recorded as a follow-up rather than assumed present.
+    /// br-kxd3e / br-d018i: GET requests and read-only query POSTs (`/insights`)
+    /// are replay-safe. Event-ingestion POSTs are replay-safe when every event
+    /// carries Mixpanel's `$insert_id` deduplication key (`properties.$insert_id`
+    /// or top-level `$insert_id`).
     async fn request_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
+        replay_safe_override: bool,
     ) -> MixpanelResult<serde_json::Value> {
-        let replay_safe = http_method != "POST";
+        let replay_safe =
+            replay_safe_override || http_method != "POST" || body_has_mixpanel_insert_ids(body);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -227,7 +227,7 @@ impl MixpanelClient {
     #[instrument(skip(self), fields(url))]
     async fn get(&self, path: &str) -> MixpanelResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("GET", &url, None).await
+        self.request_with_retry("GET", &url, None, true).await
     }
 
     #[instrument(skip(self, body), fields(url))]
@@ -237,7 +237,19 @@ impl MixpanelClient {
         body: &serde_json::Value,
     ) -> MixpanelResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        self.request_with_retry("POST", &url, Some(body)).await
+        self.request_with_retry("POST", &url, Some(body), false)
+            .await
+    }
+
+    #[instrument(skip(self, body), fields(url))]
+    async fn post_replay_safe(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> MixpanelResult<serde_json::Value> {
+        let url = format!("{}{path}", self.base_url);
+        self.request_with_retry("POST", &url, Some(body), true)
+            .await
     }
 
     // -- Events --
@@ -257,7 +269,8 @@ impl MixpanelClient {
         if let Some(event_name) = event {
             body["event"] = serde_json::json!(event_name);
         }
-        self.post("/insights", &body).await
+        // Read-only POST query against Mixpanel Insights API.
+        self.post_replay_safe("/insights", &body).await
     }
 
     // -- Funnels --
@@ -277,7 +290,70 @@ impl MixpanelClient {
             "project_id": self.project_id.parse::<u64>().unwrap_or(0),
             "bookmark_id": bookmark_id,
         });
-        self.post("/insights", &body).await
+        // Read-only POST query against Mixpanel Insights API.
+        self.post_replay_safe("/insights", &body).await
+    }
+}
+
+fn event_obj_has_mixpanel_insert_id(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if obj
+        .get("$insert_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    obj.get("properties")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|props| props.get("$insert_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn ensure_mixpanel_event_insert_id(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if event_obj_has_mixpanel_insert_id(obj) {
+        return;
+    }
+    let props = obj
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(props_obj) = props.as_object_mut() {
+        props_obj.insert(
+            "$insert_id".to_string(),
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+}
+
+/// Ensure every Mixpanel event object in `body` carries a stable `properties.$insert_id`.
+#[must_use]
+pub fn ensure_mixpanel_insert_ids(body: &serde_json::Value) -> serde_json::Value {
+    let mut cloned = body.clone();
+    match &mut cloned {
+        serde_json::Value::Object(obj) => ensure_mixpanel_event_insert_id(obj),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(obj) = item.as_object_mut() {
+                    ensure_mixpanel_event_insert_id(obj);
+                }
+            }
+        }
+        _ => {}
+    }
+    cloned
+}
+
+fn body_has_mixpanel_insert_ids(body: Option<&serde_json::Value>) -> bool {
+    match body {
+        Some(serde_json::Value::Object(obj)) => event_obj_has_mixpanel_insert_id(obj),
+        Some(serde_json::Value::Array(items)) => {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    item.as_object()
+                        .is_some_and(event_obj_has_mixpanel_insert_id)
+                })
+        }
+        _ => false,
     }
 }
 
@@ -594,5 +670,136 @@ mod tests {
     #[test]
     fn sanitize_path_segment_rejects_encoded_backslash() {
         assert!(sanitize_path_segment("foo%5Cbar", "project_id").is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn query_events_post_is_replay_safe_and_retries_after_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/insights"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/insights"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "series": {}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = MixpanelClient::new(
+            MixpanelAuth::ServiceAccount {
+                username: "u".into(),
+                secret: "s".into(),
+            },
+            "12345",
+            Some(&mock_server.uri()),
+        )
+        .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let resp = client
+            .query_events("2026-01-01", "2026-01-02", Some("Signup"))
+            .await
+            .expect("read-only /insights POST query should retry 503 and succeed");
+        assert!(resp["series"].is_object());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn post_with_ensure_mixpanel_insert_ids_retries_after_5xx_with_stable_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/import"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/import"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "OK",
+                "num_records_imported": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = MixpanelClient::new(
+            MixpanelAuth::ServiceAccount {
+                username: "u".into(),
+                secret: "s".into(),
+            },
+            "12345",
+            Some(&mock_server.uri()),
+        )
+        .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let payload = ensure_mixpanel_insert_ids(&serde_json::json!([
+            {
+                "event": "Purchase",
+                "properties": { "distinct_id": "user-1" }
+            }
+        ]));
+        let resp = client
+            .post("/import", &payload)
+            .await
+            .expect("event ingestion with $insert_id should retry 503 and succeed");
+        assert_eq!(resp["status"], "OK");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let id_0 = body_0[0]["properties"]["$insert_id"].as_str().unwrap();
+        let id_1 = body_1[0]["properties"]["$insert_id"].as_str().unwrap();
+        assert!(!id_0.is_empty());
+        assert_eq!(id_0, id_1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn post_without_insert_id_does_not_retry_after_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/import"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = MixpanelClient::new(
+            MixpanelAuth::ServiceAccount {
+                username: "u".into(),
+                secret: "s".into(),
+            },
+            "12345",
+            Some(&mock_server.uri()),
+        )
+        .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let err = client
+            .post("/import", &serde_json::json!([{"event": "Unkeyed"}]))
+            .await
+            .expect_err("unkeyed event ingestion POST must fail closed on 503");
+        assert!(matches!(err, MixpanelError::Api { status_code: 503, .. }));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 }
