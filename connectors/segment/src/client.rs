@@ -161,19 +161,18 @@ impl SegmentClient {
 
     /// Issue a request with retry.
     ///
-    /// br-kxd3e: replay safety is derived from the verb. Only POST ingests, and
-    /// a replay after a 5xx DOUBLE-COUNTS the event in every downstream
-    /// dashboard and funnel. These providers offer a per-event dedup id
-    /// (`messageId` / `$insert_id`) that would make the retry genuinely safe,
-    /// but the events are caller-supplied here so the key may be absent —
-    /// recorded as a follow-up rather than assumed present.
+    /// br-kxd3e / br-d018i: GET requests are always replay-safe. POST event
+    /// ingestion (`/track`, `/batch`, etc.) is replay-safe when every event in
+    /// the request body carries a non-empty `messageId` (Segment's documented
+    /// 24-hour deduplication key). `SegmentClient::track` injects a stable UUID
+    /// `messageId` before entering `RetryLoop` when the caller omits one.
     async fn request_with_retry(
         &self,
         http_method: &'static str,
         url: &str,
         body: Option<&serde_json::Value>,
     ) -> SegmentResult<serde_json::Value> {
-        let replay_safe = http_method != "POST";
+        let replay_safe = http_method != "POST" || body_has_segment_message_id(body);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -239,9 +238,62 @@ impl SegmentClient {
     // -- Track --
 
     /// Send a track event.
+    ///
+    /// Ensures a stable `messageId` is present on the payload before entering
+    /// the retry loop so that retries after transient 5xx responses are
+    /// deduplicated by Segment rather than double-counted.
     pub async fn track(&self, event_body: &serde_json::Value) -> SegmentResult<serde_json::Value> {
-        self.post("/track", event_body).await
+        let body = ensure_segment_message_id(event_body);
+        self.post("/track", &body).await
     }
+}
+
+fn has_non_empty_str_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn ensure_segment_message_id(body: &serde_json::Value) -> serde_json::Value {
+    let mut cloned = body.clone();
+    if let Some(obj) = cloned.as_object_mut() {
+        if let Some(batch) = obj.get_mut("batch").and_then(serde_json::Value::as_array_mut) {
+            for item in batch {
+                if let Some(item_obj) = item.as_object_mut()
+                    && !has_non_empty_str_field(item_obj, "messageId")
+                {
+                    item_obj.insert(
+                        "messageId".to_string(),
+                        serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+                    );
+                }
+            }
+        } else if !has_non_empty_str_field(obj, "messageId") {
+            obj.insert(
+                "messageId".to_string(),
+                serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+            );
+        }
+    }
+    cloned
+}
+
+fn body_has_segment_message_id(body: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = body.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if has_non_empty_str_field(obj, "messageId") {
+        return true;
+    }
+    obj.get("batch")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|batch| {
+            !batch.is_empty()
+                && batch.iter().all(|item| {
+                    item.as_object()
+                        .is_some_and(|item_obj| has_non_empty_str_field(item_obj, "messageId"))
+                })
+        })
 }
 
 fn decode_success_body(status: StatusCode, body: &str) -> SegmentResult<serde_json::Value> {
@@ -478,5 +530,124 @@ mod tests {
     #[test]
     fn sanitize_path_segment_rejects_encoded_backslash() {
         assert!(sanitize_path_segment("foo%5Cbar", "source_id").is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn track_injects_stable_message_id_and_retries_after_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "SUCCESS"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client =
+            SegmentClient::new(SegmentAuth::BearerToken("tok".into()), Some(&mock_server.uri()))
+                .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let resp = client
+            .track(&serde_json::json!({
+                "userId": "u-123",
+                "event": "Button Clicked"
+            }))
+            .await
+            .expect("track with auto-injected messageId should retry 503 and succeed");
+        assert_eq!(resp["status"], "SUCCESS");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let msg_id_0 = body_0["messageId"].as_str().expect("messageId on attempt 1");
+        let msg_id_1 = body_1["messageId"].as_str().expect("messageId on attempt 2");
+        assert!(!msg_id_0.is_empty());
+        assert_eq!(
+            msg_id_0, msg_id_1,
+            "Segment deduplicates by messageId; both attempts must carry the identical key"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn track_preserves_caller_message_id_across_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "SUCCESS"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client =
+            SegmentClient::new(SegmentAuth::BearerToken("tok".into()), Some(&mock_server.uri()))
+                .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        client
+            .track(&serde_json::json!({
+                "userId": "u-123",
+                "event": "Order Completed",
+                "messageId": "caller-msg-id-42"
+            }))
+            .await
+            .expect("track with caller messageId should retry 503 and succeed");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(body_0["messageId"], "caller-msg-id-42");
+        assert_eq!(body_1["messageId"], "caller-msg-id-42");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn post_without_message_id_does_not_retry_after_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/track"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let mut client =
+            SegmentClient::new(SegmentAuth::BearerToken("tok".into()), Some(&mock_server.uri()))
+                .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let err = client
+            .post("/track", &serde_json::json!({"event": "Unkeyed"}))
+            .await
+            .expect_err("raw post without messageId must fail closed on 503");
+        assert!(matches!(err, SegmentError::Api { status_code: 503, .. }));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 }
