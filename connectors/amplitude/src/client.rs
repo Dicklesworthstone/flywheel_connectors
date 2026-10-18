@@ -157,12 +157,10 @@ impl AmplitudeClient {
 
     /// Issue a request with retry.
     ///
-    /// br-kxd3e: replay safety is derived from the verb. Only POST ingests, and
-    /// a replay after a 5xx DOUBLE-COUNTS the event in every downstream
-    /// dashboard and funnel. These providers all offer a per-event dedup id
-    /// (`insert_id` / `messageId` / `$insert_id`) that would make the retry
-    /// genuinely safe, but the events are caller-supplied here so the key may
-    /// be absent — recorded as a follow-up rather than assumed present.
+    /// br-kxd3e / br-d018i: GET requests are always replay-safe. POST event
+    /// ingestion (`/2/httpapi`, `/batch`) is replay-safe when every event in
+    /// the request body carries a non-empty `insert_id` (Amplitude's documented
+    /// 7-day sliding-window deduplication key).
     async fn request_with_retry<T>(
         &self,
         http_method: &'static str,
@@ -172,7 +170,7 @@ impl AmplitudeClient {
     where
         T: DeserializeOwned + Default,
     {
-        let replay_safe = http_method != "POST";
+        let replay_safe = http_method != "POST" || body_has_amplitude_insert_ids(body);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
 
@@ -245,6 +243,60 @@ impl AmplitudeClient {
         self.get(&format!("/export?start={safe_start}&end={safe_end}"))
             .await
     }
+}
+
+fn event_obj_has_amplitude_insert_id(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("insert_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn ensure_amplitude_event_insert_id(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if !event_obj_has_amplitude_insert_id(obj) {
+        obj.insert(
+            "insert_id".to_string(),
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+}
+
+/// Ensure every Amplitude event in `body` carries a stable `insert_id`.
+#[must_use]
+pub fn ensure_amplitude_insert_ids(body: &serde_json::Value) -> serde_json::Value {
+    let mut cloned = body.clone();
+    if let Some(obj) = cloned.as_object_mut() {
+        if let Some(events) = obj
+            .get_mut("events")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for item in events {
+                if let Some(item_obj) = item.as_object_mut() {
+                    ensure_amplitude_event_insert_id(item_obj);
+                }
+            }
+        } else {
+            ensure_amplitude_event_insert_id(obj);
+        }
+    }
+    cloned
+}
+
+fn body_has_amplitude_insert_ids(body: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = body.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if event_obj_has_amplitude_insert_id(obj) {
+        return true;
+    }
+    obj.get("events")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|events| {
+            !events.is_empty()
+                && events.iter().all(|item| {
+                    item.as_object()
+                        .is_some_and(event_obj_has_amplitude_insert_id)
+                })
+        })
 }
 
 /// Validate that a user-supplied ID is safe to interpolate into a URL path segment.
@@ -667,5 +719,101 @@ mod tests {
     #[test]
     fn sanitize_path_segment_rejects_encoded_backslash() {
         assert!(sanitize_path_segment("foo%5Cbar", "chart_id").is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn post_with_amplitude_insert_ids_retries_after_5xx_with_stable_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/httpapi"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/httpapi"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 200,
+                "events_ingested": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = AmplitudeClient::new(
+            AmplitudeAuth {
+                api_key: "k".into(),
+                secret_key: "s".into(),
+            },
+            Some(&mock_server.uri()),
+        )
+        .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let payload = ensure_amplitude_insert_ids(&serde_json::json!({
+            "api_key": "k",
+            "events": [
+                {
+                    "user_id": "u-1",
+                    "event_type": "Checkout"
+                }
+            ]
+        }));
+        let url = format!("{}/httpapi", client.base_url);
+        let resp: serde_json::Value = client
+            .request_with_retry("POST", &url, Some(&payload))
+            .await
+            .expect("POST with insert_id on every event should retry 503 and succeed");
+        assert_eq!(resp["code"], 200);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let id_0 = body_0["events"][0]["insert_id"].as_str().unwrap();
+        let id_1 = body_1["events"][0]["insert_id"].as_str().unwrap();
+        assert!(!id_0.is_empty());
+        assert_eq!(id_0, id_1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn post_without_insert_id_does_not_retry_after_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/httpapi"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = AmplitudeClient::new(
+            AmplitudeAuth {
+                api_key: "k".into(),
+                secret_key: "s".into(),
+            },
+            Some(&mock_server.uri()),
+        )
+        .unwrap();
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 5;
+
+        let payload = serde_json::json!({
+            "api_key": "k",
+            "events": [{ "user_id": "u-1", "event_type": "Unkeyed" }]
+        });
+        let url = format!("{}/httpapi", client.base_url);
+        let err = client
+            .request_with_retry::<serde_json::Value>("POST", &url, Some(&payload))
+            .await
+            .expect_err("POST without insert_id must fail closed on 503");
+        assert!(matches!(err, AmplitudeError::Api { status_code: 503, .. }));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 }
