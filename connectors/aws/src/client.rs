@@ -15,7 +15,11 @@ use fcp_sdk::sigv4::{
 };
 
 use crate::error::{AwsError, AwsResult};
-use crate::types::*;
+use crate::types::{
+    AwsAuth, CallerIdentity, Ec2Instance, Ec2StateChange, HealthStatus, LambdaFunction,
+    LambdaInvokeResponse, S3Bucket, S3DeleteObjectResponse, S3GetObjectResponse, S3Object,
+    S3PutObjectResponse,
+};
 
 #[derive(Debug, Default, Deserialize)]
 struct S3ListBucketResultXml {
@@ -122,7 +126,7 @@ fn normalize_base_url_override(base_url: Option<String>) -> Option<String> {
     })
 }
 
-/// AWS API client with retry support and real SigV4 request signing.
+/// AWS API client with retry support and real `SigV4` request signing.
 pub struct AwsClient {
     client: Client,
     auth: AwsAuth,
@@ -137,15 +141,26 @@ pub struct AwsClient {
 impl std::fmt::Debug for AwsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AwsClient")
+            .field("client", &self.client)
             .field("region", &self.region)
             .field("auth", &self.auth)
+            .field("retry_config", &self.retry_config)
+            .field("s3_base_url", &self.s3_base_url)
+            .field("ec2_base_url", &self.ec2_base_url)
+            .field("lambda_base_url", &self.lambda_base_url)
+            .field("sts_base_url", &self.sts_base_url)
             .finish()
     }
 }
 
 impl AwsClient {
+    /// Construct a new AWS API client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be constructed.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub fn new(
         auth: AwsAuth,
         region: &str,
         retry_config: HttpRetryConfig,
@@ -172,10 +187,12 @@ impl AwsClient {
         })
     }
 
+    #[must_use]
     pub fn region(&self) -> &str {
         &self.region
     }
 
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.auth.access_key_id.is_empty()
     }
@@ -206,6 +223,11 @@ impl AwsClient {
 
     // ── S3 operations ──
 
+    /// List all S3 buckets in the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 API call fails.
     pub async fn s3_list_buckets(&self, runtime: &ConnectorRuntime) -> AwsResult<Vec<S3Bucket>> {
         let url = self.s3_url();
         let ctx = runtime.request_context();
@@ -225,6 +247,11 @@ impl AwsClient {
         .await
     }
 
+    /// List objects in an S3 bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the S3 API call fails.
     pub async fn s3_list_objects(
         &self,
         runtime: &ConnectorRuntime,
@@ -256,6 +283,11 @@ impl AwsClient {
         .await
     }
 
+    /// Fetch an object from S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the S3 API call fails.
     pub async fn s3_get_object(
         &self,
         runtime: &ConnectorRuntime,
@@ -299,9 +331,9 @@ impl AwsClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: AwsError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: duration_ms(
+                                retry_after.unwrap_or(Duration::from_secs(30)),
+                            ),
                         },
                         retry_after,
                     };
@@ -336,6 +368,11 @@ impl AwsClient {
         .await
     }
 
+    /// Upload an object to S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the S3 API call fails.
     pub async fn s3_put_object(
         &self,
         runtime: &ConnectorRuntime,
@@ -380,6 +417,11 @@ impl AwsClient {
         .await
     }
 
+    /// Delete an object from S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the S3 API call fails.
     pub async fn s3_delete_object(
         &self,
         runtime: &ConnectorRuntime,
@@ -416,6 +458,11 @@ impl AwsClient {
 
     // ── EC2 operations ──
 
+    /// Describe EC2 instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the EC2 API call fails.
     pub async fn ec2_describe_instances(
         &self,
         runtime: &ConnectorRuntime,
@@ -441,6 +488,11 @@ impl AwsClient {
         .await
     }
 
+    /// Start an EC2 instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the EC2 API call fails.
     pub async fn ec2_start_instance(
         &self,
         runtime: &ConnectorRuntime,
@@ -471,6 +523,11 @@ impl AwsClient {
         .await
     }
 
+    /// Stop an EC2 instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the EC2 API call fails.
     pub async fn ec2_stop_instance(
         &self,
         runtime: &ConnectorRuntime,
@@ -501,6 +558,11 @@ impl AwsClient {
         .await
     }
 
+    /// Terminate an EC2 instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the EC2 API call fails.
     pub async fn ec2_terminate_instance(
         &self,
         runtime: &ConnectorRuntime,
@@ -533,6 +595,11 @@ impl AwsClient {
 
     // ── Lambda operations ──
 
+    /// List Lambda functions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda API call fails.
     pub async fn lambda_list_functions(
         &self,
         runtime: &ConnectorRuntime,
@@ -556,6 +623,11 @@ impl AwsClient {
         .await
     }
 
+    /// Invoke a Lambda function.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input sanitization or the Lambda API call fails.
     pub async fn lambda_invoke(
         &self,
         runtime: &ConnectorRuntime,
@@ -602,6 +674,11 @@ impl AwsClient {
 
     // ── STS operations ──
 
+    /// Get caller identity via STS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the STS API call fails.
     pub async fn sts_get_caller_identity(
         &self,
         runtime: &ConnectorRuntime,
@@ -629,6 +706,11 @@ impl AwsClient {
 
     // ── Health check ──
 
+    /// Check AWS API health by querying STS caller identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the STS caller identity probe fails.
     pub async fn health_check(&self, runtime: &ConnectorRuntime) -> AwsResult<HealthStatus> {
         match self.sts_get_caller_identity(runtime).await {
             Ok(identity) => Ok(HealthStatus {
@@ -643,7 +725,11 @@ impl AwsClient {
 
 // ── Free functions for request handling ──
 
-/// Sign an HTTP request with AWS SigV4 and apply auth headers.
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Sign an HTTP request with AWS `SigV4` and apply auth headers.
 ///
 /// # Arguments
 ///
@@ -777,7 +863,7 @@ async fn handle_json_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: AwsError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: duration_ms(retry_after.unwrap_or(Duration::from_secs(30))),
             },
             retry_after,
         };
@@ -836,7 +922,7 @@ async fn handle_s3_list_objects_response(
     if status == 429 || status == 503 {
         return AttemptOutcome::Retryable {
             error: AwsError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: duration_ms(retry_after.unwrap_or(Duration::from_secs(30))),
             },
             retry_after,
         };
@@ -894,7 +980,7 @@ async fn handle_s3_put_object_response(
     if status == 429 || status == 503 {
         return AttemptOutcome::Retryable {
             error: AwsError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: duration_ms(retry_after.unwrap_or(Duration::from_secs(30))),
             },
             retry_after,
         };
@@ -949,7 +1035,7 @@ async fn handle_s3_delete_object_response(
     if status == 429 || status == 503 {
         return AttemptOutcome::Retryable {
             error: AwsError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: duration_ms(retry_after.unwrap_or(Duration::from_secs(30))),
             },
             retry_after,
         };
@@ -1021,24 +1107,20 @@ mod tests {
 
     #[test]
     fn client_debug_redacts_auth() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: TEST_ACCESS_KEY_ID.into(),
-                    secret_access_key: TEST_SIGNING_MATERIAL.into(),
-                    session_token: None,
-                },
-                "us-east-1",
-                HttpRetryConfig::default(),
-                30_000,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-        })
+        let rt = AwsClient::new(
+            AwsAuth {
+                access_key_id: TEST_ACCESS_KEY_ID.into(),
+                secret_access_key: TEST_SIGNING_MATERIAL.into(),
+                session_token: None,
+            },
+            "us-east-1",
+            HttpRetryConfig::default(),
+            30_000,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
 
         let debug = format!("{rt:?}");
@@ -1049,93 +1131,77 @@ mod tests {
 
     #[test]
     fn secretless_detection() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: String::new(),
-                    secret_access_key: String::new(),
-                    session_token: None,
-                },
-                "us-east-1",
-                HttpRetryConfig::default(),
-                30_000,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-        })
+        let rt = AwsClient::new(
+            AwsAuth {
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                session_token: None,
+            },
+            "us-east-1",
+            HttpRetryConfig::default(),
+            30_000,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
         assert!(rt.is_secretless());
 
-        let rt2 = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: "AKID".into(),
-                    secret_access_key: TEST_SIGNING_MATERIAL.into(),
-                    session_token: None,
-                },
-                "us-east-1",
-                HttpRetryConfig::default(),
-                30_000,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-        })
+        let rt2 = AwsClient::new(
+            AwsAuth {
+                access_key_id: "AKID".into(),
+                secret_access_key: TEST_SIGNING_MATERIAL.into(),
+                session_token: None,
+            },
+            "us-east-1",
+            HttpRetryConfig::default(),
+            30_000,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
         assert!(!rt2.is_secretless());
     }
 
     #[test]
     fn region_stored() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: "k".into(),
-                    secret_access_key: "s".into(),
-                    session_token: None,
-                },
-                "eu-west-1",
-                HttpRetryConfig::default(),
-                30_000,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-        })
+        let rt = AwsClient::new(
+            AwsAuth {
+                access_key_id: "k".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            },
+            "eu-west-1",
+            HttpRetryConfig::default(),
+            30_000,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(rt.region(), "eu-west-1");
     }
 
     #[test]
     fn custom_base_urls() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: "k".into(),
-                    secret_access_key: "s".into(),
-                    session_token: None,
-                },
-                "us-east-1",
-                HttpRetryConfig::default(),
-                30_000,
-                Some(" http://localhost:4566/ ".into()),
-                Some("http://localhost:4567///".into()),
-                Some("http://localhost:4568".into()),
-                Some(" http://localhost:4569 ".into()),
-            )
-            .await
-            .unwrap()
-        })
+        let rt = AwsClient::new(
+            AwsAuth {
+                access_key_id: "k".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            },
+            "us-east-1",
+            HttpRetryConfig::default(),
+            30_000,
+            Some(" http://localhost:4566/ ".into()),
+            Some("http://localhost:4567///".into()),
+            Some("http://localhost:4568".into()),
+            Some(" http://localhost:4569 ".into()),
+        )
         .unwrap();
         assert_eq!(rt.s3_url(), "http://localhost:4566");
         assert_eq!(rt.ec2_url(), "http://localhost:4567");
@@ -1179,24 +1245,20 @@ mod tests {
 
     #[test]
     fn default_urls_use_region() {
-        let rt = fcp_async_core::runtime::block_on_sync(async {
-            AwsClient::new(
-                AwsAuth {
-                    access_key_id: "k".into(),
-                    secret_access_key: "s".into(),
-                    session_token: None,
-                },
-                "ap-southeast-1",
-                HttpRetryConfig::default(),
-                30_000,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-        })
+        let rt = AwsClient::new(
+            AwsAuth {
+                access_key_id: "k".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            },
+            "ap-southeast-1",
+            HttpRetryConfig::default(),
+            30_000,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
         assert_eq!(rt.s3_url(), "https://s3.ap-southeast-1.amazonaws.com");
         assert_eq!(rt.ec2_url(), "https://ec2.ap-southeast-1.amazonaws.com");

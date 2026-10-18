@@ -89,6 +89,12 @@ impl std::fmt::Debug for AwsConfig {
         f.debug_struct("AwsConfig")
             .field("region", &self.region)
             .field("auth", &self.auth)
+            .field("retry", &self.retry)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("s3_base_url", &self.s3_base_url)
+            .field("ec2_base_url", &self.ec2_base_url)
+            .field("lambda_base_url", &self.lambda_base_url)
+            .field("sts_base_url", &self.sts_base_url)
             .finish()
     }
 }
@@ -165,7 +171,7 @@ impl AwsConfig {
         Ok(config)
     }
 
-    fn auth_mode(&self) -> &'static str {
+    const fn auth_mode(&self) -> &'static str {
         if self.auth.session_token.is_some() {
             "static_keys_with_session_token"
         } else {
@@ -258,7 +264,7 @@ impl EndpointOverrideReadiness {
         }
     }
 
-    fn fully_overridden(&self) -> bool {
+    const fn fully_overridden(&self) -> bool {
         self.missing_sigv4_overrides.is_empty()
     }
 }
@@ -408,7 +414,7 @@ impl AwsConnector {
     fn attach_self_check_details(
         &self,
         mut report: SelfCheckReport,
-        provisioning: Option<ProvisioningReadiness>,
+        provisioning: Option<&ProvisioningReadiness>,
     ) -> SelfCheckReport {
         report.details = Some(json!({
             "configured": self.config.is_some(),
@@ -424,6 +430,7 @@ impl AwsConnector {
         report
     }
 
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let provisioning = self.config.as_ref().map(AwsConfig::provisioning_readiness);
         let mut checks = Vec::new();
@@ -510,14 +517,13 @@ impl AwsConnector {
     }
 
     fn require_str<'a>(input: &'a serde_json::Value, key: &str) -> FcpResult<&'a str> {
-        let value =
-            input
-                .get(key)
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| FcpError::InvalidRequest {
-                    code: 1005,
-                    message: format!("Missing: {key}"),
-                })?;
+        let value = input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1005,
+                message: format!("Missing: {key}"),
+            })?;
         if value.trim().is_empty() {
             return Err(FcpError::InvalidRequest {
                 code: 1005,
@@ -844,7 +850,6 @@ impl FcpConnector for AwsConnector {
             cfg.lambda_base_url.clone(),
             cfg.sts_base_url.clone(),
         )
-        .await
         .map_err(|e| FcpError::Internal {
             message: format!("Client init: {e}"),
         })?;
@@ -935,7 +940,7 @@ impl FcpConnector for AwsConnector {
                     "client_missing",
                     "AWS HTTP client not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
         let Some(runtime) = &self.runtime else {
@@ -944,7 +949,7 @@ impl FcpConnector for AwsConnector {
                     "runtime_missing",
                     "ConnectorRuntime not initialized; re-run configure",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
         };
         if !provisioning.sts_self_check_supported {
@@ -962,9 +967,9 @@ impl FcpConnector for AwsConnector {
                     // against a deterministic verification target without touching production.
                     "self_check abstains against the default AWS STS endpoint to avoid hitting production with the operator's real credentials; set sts_base_url to a staging STS endpoint, LocalStack, or signing proxy for deterministic verification",
                 ),
-                Some(provisioning),
+                Some(&provisioning),
             ));
-        };
+        }
         let report = match client.health_check(runtime).await {
             Ok(h) if h.authenticated => SelfCheckReport::ok(),
             Ok(_) => SelfCheckReport::degraded(
@@ -976,7 +981,7 @@ impl FcpConnector for AwsConnector {
             }
             Err(error) => SelfCheckReport::failed("self_check_failed", error.to_string()),
         };
-        Ok(self.attach_self_check_details(report, Some(provisioning)))
+        Ok(self.attach_self_check_details(report, Some(&provisioning)))
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
@@ -1097,7 +1102,7 @@ impl AwsConnector {
             }
             OP_S3_LIST_OBJECTS => {
                 let bucket = Self::require_str(&req.input, "bucket")?;
-                let prefix = req.input.get("prefix").and_then(|v| v.as_str());
+                let prefix = req.input.get("prefix").and_then(serde_json::Value::as_str);
                 let objects = client
                     .s3_list_objects(runtime, bucket, prefix)
                     .await
@@ -1121,7 +1126,10 @@ impl AwsConnector {
                 let bucket = Self::require_str(&req.input, "bucket")?;
                 let key = Self::require_str(&req.input, "key")?;
                 let body = Self::require_str(&req.input, "body")?;
-                let content_type = req.input.get("content_type").and_then(|v| v.as_str());
+                let content_type = req
+                    .input
+                    .get("content_type")
+                    .and_then(serde_json::Value::as_str);
                 let r = client
                     .s3_put_object(runtime, bucket, key, body, content_type)
                     .await
@@ -1810,7 +1818,7 @@ mod tests {
                     "access_key_id": "k",
                     "secret_access_key": "signing-material",
                     "region": "us-west-2",
-                    "request_timeout_ms": 60000
+                    "request_timeout_ms": 60_000
                 }))
                 .await
             })
@@ -1959,13 +1967,13 @@ mod tests {
         );
     }
 
-    /// br-3hrw3-style message regression: the pre-fix self_check
-    /// abstention message claimed "SigV4 signing is not implemented",
-    /// but SigV4 IS implemented in this connector (fcp_sdk::sigv4 +
-    /// client.rs::sign_request) and the integration test
+    /// br-3hrw3-style message regression: the pre-fix `self_check`
+    /// abstention message claimed "`SigV4` signing is not implemented",
+    /// but `SigV4` IS implemented in this connector (`fcp_sdk::sigv4` +
+    /// `client.rs::sign_request`) and the integration test
     /// `assert_sigv4_headers` confirms the headers are emitted on
     /// every request. The real reason for abstention is operational:
-    /// the default STS endpoint is production AWS, and self_check
+    /// the default STS endpoint is production AWS, and `self_check`
     /// must not hit production with the operator's real credentials.
     /// Pin both halves of that contract here so neither half drifts
     /// back without a test failure.
