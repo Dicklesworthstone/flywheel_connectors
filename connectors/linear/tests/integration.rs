@@ -961,18 +961,12 @@ async fn unknown_operation_rejected() {
 }
 
 // ============================================================================
-// Replay safety on retry (br-kxd3e)
+// Replay safety on retry with client-supplied UUID id (br-kxd3e / br-d018i)
 // ============================================================================
 //
-// Linear speaks GraphQL: every query AND every mutation is the same
-// `POST /graphql` request. The HTTP verb therefore carries no information
-// about whether a replay is safe, which makes this the clearest case in the
-// sweep for gating on the OPERATION rather than on the transport.
-//
-// These two tests are a matched pair — identical mock, identical retry
-// budget, different GraphQL document — so what they pin is exactly that
-// distinction. A gate written at the helper level would make both behave the
-// same and one of these would fail.
+// `issueCreate` and `commentCreate` pass a stable client-generated UUID v4
+// `id` in their GraphQL input across retry attempts so transient 5xx retries
+// do not mint a second issue or comment with a new UUID.
 
 fn replay_test_client(mock_server: &MockServer) -> LinearClient {
     LinearClient::new("test-key")
@@ -982,29 +976,150 @@ fn replay_test_client(mock_server: &MockServer) -> LinearClient {
 }
 
 #[fcp_async_core::runtime::test]
-async fn create_issue_mutation_is_not_retried_after_a_5xx() {
+async fn create_issue_mutation_retries_after_5xx_with_stable_client_uuid() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issueCreate": {
+                    "success": true,
+                    "issue": {
+                        "id": "issue-1",
+                        "identifier": "ENG-1",
+                        "title": "Test issue"
+                    }
+                }
+            }
+        })))
         .mount(&mock_server)
         .await;
 
-    let result = replay_test_client(&mock_server)
+    let created = replay_test_client(&mock_server)
         .create_issue("Test issue", "team-1", None)
-        .await;
-    assert!(result.is_err());
+        .await
+        .expect("create_issue with client-supplied UUID id should retry 503 and succeed");
+    assert_eq!(created.identifier, "ENG-1");
 
     let requests = mock_server
         .received_requests()
         .await
         .expect("recorded requests");
+    assert_eq!(requests.len(), 2);
+    let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let id_0 = body_0["variables"]["id"]
+        .as_str()
+        .expect("client-supplied UUID id on attempt 1");
+    let id_1 = body_1["variables"]["id"]
+        .as_str()
+        .expect("client-supplied UUID id on attempt 2");
+    assert!(!id_0.is_empty());
     assert_eq!(
-        requests.len(),
-        1,
-        "a 503 means Linear received the issueCreate mutation — retrying files \
-         a SECOND issue"
+        id_0, id_1,
+        "both issueCreate attempts must carry the identical client-generated UUID id"
     );
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_issue_recovers_via_get_issue_on_duplicate_id_conflict() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": [
+                { "message": "Entity with id already exists" }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issue": {
+                    "id": "issue-recovered",
+                    "identifier": "ENG-99",
+                    "title": "Test issue"
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let recovered = replay_test_client(&mock_server)
+        .create_issue("Test issue", "team-1", None)
+        .await
+        .expect("duplicate UUID conflict after retry must recover via get_issue");
+    assert_eq!(recovered.identifier, "ENG-99");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(requests.len(), 3);
+    let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let body_2: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(body_0["variables"]["id"], body_1["variables"]["id"]);
+    assert_eq!(body_0["variables"]["id"], body_2["variables"]["id"]);
+}
+
+#[fcp_async_core::runtime::test]
+async fn add_comment_mutation_retries_after_5xx_with_stable_client_uuid() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "commentCreate": {
+                    "success": true,
+                    "comment": {
+                        "id": "comment-1",
+                        "body": "Hello world"
+                    }
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let comment = replay_test_client(&mock_server)
+        .add_comment("issue-1", "Hello world")
+        .await
+        .expect("add_comment with client-supplied UUID id should retry 503 and succeed");
+    assert_eq!(comment.body, "Hello world");
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(requests.len(), 2);
+    let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let id_0 = body_0["variables"]["id"].as_str().unwrap();
+    let id_1 = body_1["variables"]["id"].as_str().unwrap();
+    assert!(!id_0.is_empty());
+    assert_eq!(id_0, id_1);
 }
 
 #[fcp_async_core::runtime::test]

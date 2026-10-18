@@ -160,13 +160,21 @@ impl LinearClient {
     // ── API Methods ──────────────────────────────────────────────
 
     /// Create a new issue.
+    ///
+    /// Supplies a stable client-generated UUID v4 `id` in `IssueCreateInput`
+    /// before entering the retry loop (br-d018i). If a retry after a transient
+    /// 5xx or dropped response hits Linear's duplicate-ID conflict because an
+    /// earlier attempt already committed the issue, falls back to
+    /// [`Self::get_issue`] with that UUID.
     pub async fn create_issue(
         &self,
         title: &str,
         team_id: &str,
         description: Option<&str>,
     ) -> LinearResult<Issue> {
+        let issue_id = uuid::Uuid::new_v4().to_string();
         let mut variables = serde_json::json!({
+            "id": issue_id,
             "title": title,
             "teamId": team_id,
         });
@@ -178,8 +186,8 @@ impl LinearClient {
         }
 
         let query = r"
-            mutation IssueCreate($title: String!, $teamId: String!, $description: String) {
-                issueCreate(input: { title: $title, teamId: $teamId, description: $description }) {
+            mutation IssueCreate($id: String, $title: String!, $teamId: String!, $description: String) {
+                issueCreate(input: { id: $id, title: $title, teamId: $teamId, description: $description }) {
                     success
                     issue {
                         id identifier title description priority priorityLabel
@@ -193,15 +201,18 @@ impl LinearClient {
             }
         ";
 
-        // NOT replay-safe: `issueCreate` mutation — a replay files a
-        // second issue. Linear has no idempotency-key header.
-        let data = self.execute_graphql(query, Some(variables), false).await?;
-        let payload: IssueCreatePayload = serde_json::from_value(data["issueCreate"].clone())?;
-
-        payload.issue.ok_or(LinearError::Api {
-            message: "Issue creation returned no issue".into(),
-            status_code: None,
-        })
+        match self.execute_graphql(query, Some(variables), true).await {
+            Ok(data) => {
+                let payload: IssueCreatePayload =
+                    serde_json::from_value(data["issueCreate"].clone())?;
+                payload.issue.ok_or(LinearError::Api {
+                    message: "Issue creation returned no issue".into(),
+                    status_code: None,
+                })
+            }
+            Err(err) if is_duplicate_entity_conflict(&err) => self.get_issue(&issue_id).await,
+            Err(err) => Err(err),
+        }
     }
 
     /// Get an issue by ID.
@@ -379,14 +390,19 @@ impl LinearClient {
     }
 
     /// Add a comment to an issue.
+    ///
+    /// Supplies a stable client-generated UUID v4 `id` in `CommentCreateInput`
+    /// before entering the retry loop so retries cannot create a second comment
+    /// with a distinct UUID (br-d018i).
     pub async fn add_comment(
         &self,
         issue_id: &str,
         body: &str,
     ) -> LinearResult<crate::types::IssueComment> {
+        let comment_id = uuid::Uuid::new_v4().to_string();
         let query = r"
-            mutation CommentCreate($issueId: String!, $body: String!) {
-                commentCreate(input: { issueId: $issueId, body: $body }) {
+            mutation CommentCreate($id: String, $issueId: String!, $body: String!) {
+                commentCreate(input: { id: $id, issueId: $issueId, body: $body }) {
                     success
                     comment {
                         id body
@@ -398,13 +414,12 @@ impl LinearClient {
         ";
 
         let variables = serde_json::json!({
+            "id": comment_id,
             "issueId": issue_id,
             "body": body,
         });
 
-        // NOT replay-safe: `commentCreate` mutation — a replay posts a
-        // second comment on the issue.
-        let data = self.execute_graphql(query, Some(variables), false).await?;
+        let data = self.execute_graphql(query, Some(variables), true).await?;
         let payload: CommentCreatePayload = serde_json::from_value(data["commentCreate"].clone())?;
 
         payload.comment.ok_or(LinearError::Api {
@@ -445,18 +460,10 @@ impl LinearClient {
     /// Execute a GraphQL document against Linear's single endpoint.
     ///
     /// `replay_safe` states whether repeating this document can duplicate a
-    /// side effect (br-kxd3e). It has to be supplied per call because Linear
-    /// speaks GraphQL: queries and mutations travel over the SAME `POST
-    /// /graphql` request, so the HTTP verb carries no information about
-    /// whether a replay is safe. Deciding it here rather than in the helper is
-    /// the whole point — a mutation added later cannot inherit a query's
-    /// retry behaviour by accident.
-    ///
-    /// Linear has no idempotency-key header. `issueCreate` and `commentCreate`
-    /// do accept a client-supplied UUID `id`, which would make those retries
-    /// genuinely safe rather than merely refused — recorded as a follow-up on
-    /// the bead rather than done blind, because it needs Linear's real
-    /// duplicate-id error shape to handle correctly.
+    /// side effect (br-kxd3e / br-d018i). It is supplied per call because
+    /// Linear speaks GraphQL over `POST /graphql`. `issueCreate` and
+    /// `commentCreate` pass a client-generated UUID `id` in their GraphQL
+    /// input before entering `RetryLoop`, making their retries idempotent.
     async fn execute_graphql(
         &self,
         query: &str,
@@ -588,6 +595,22 @@ impl LinearClient {
             }
         })
         .await
+    }
+}
+
+fn is_duplicate_entity_conflict(err: &LinearError) -> bool {
+    match err {
+        LinearError::Api {
+            message,
+            status_code,
+        } => {
+            if *status_code == Some(409) {
+                return true;
+            }
+            let lower = message.to_ascii_lowercase();
+            lower.contains("already exists") || lower.contains("duplicate")
+        }
+        _ => false,
     }
 }
 
