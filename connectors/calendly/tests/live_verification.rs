@@ -248,8 +248,7 @@ async fn configured_connector(
 
 fn capability_for_operation(operation: &'static str) -> &'static str {
     match operation {
-        OP_EVENTS_LIST => CAP_EVENTS_READ,
-        OP_EVENT_TYPES_LIST => CAP_EVENTS_READ,
+        OP_EVENTS_LIST | OP_EVENT_TYPES_LIST => CAP_EVENTS_READ,
         OP_USER_GET => CAP_USER_READ,
         _ => panic!("unsupported operation {operation}"),
     }

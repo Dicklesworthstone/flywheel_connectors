@@ -220,20 +220,19 @@ impl CalendlyClient {
     ) -> CalendlyResult<()> {
         let uuid = sanitize_path_segment(event_uuid)?;
         let url = format!("{}/scheduled_events/{}/cancellation", self.base_url, uuid);
-        let body = match reason {
-            Some(r) => serde_json::json!({ "reason": r }),
-            None => serde_json::json!({}),
-        };
+        let body = reason.map_or_else(
+            || serde_json::json!({}),
+            |r| serde_json::json!({ "reason": r }),
+        );
 
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
-        let body_clone = body.clone();
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = url.clone();
             let client = self.client.clone();
             let token = self.access_token.clone();
-            let body = body_clone.clone();
+            let body = body.clone();
             async move {
                 debug!(attempt, "Cancelling Calendly event");
                 let request = if token.is_empty() {
@@ -305,11 +304,13 @@ impl CalendlyClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.access_token.is_empty()
     }
@@ -419,8 +420,7 @@ async fn send_request(request: RequestBuilder, label: &str) -> CalendlyResult<St
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .map(|s| s * 1000)
-            .unwrap_or(30_000);
+            .map_or(30_000, |s| s * 1000);
         return Err(CalendlyError::RateLimited { retry_after_ms });
     }
 

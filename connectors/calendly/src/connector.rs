@@ -204,7 +204,7 @@ struct RemediationHint {
     action: &'static str,
 }
 
-fn auth_mode_label(config: &CalendlyConfig) -> &'static str {
+const fn auth_mode_label(config: &CalendlyConfig) -> &'static str {
     if config.access_token.is_empty() {
         "proxy_injected"
     } else {
@@ -337,7 +337,7 @@ impl CalendlyConnector {
 
     /// Stable connector instance identity used for bound capability-token verification.
     #[must_use]
-    pub fn instance_id(&self) -> &InstanceId {
+    pub const fn instance_id(&self) -> &InstanceId {
         &self.base.instance_id
     }
 
@@ -385,6 +385,8 @@ impl CalendlyConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
         let provisioning = self.provisioning_readiness();
@@ -477,7 +479,10 @@ impl CalendlyConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self
+                .client
+                .as_ref()
+                .is_some_and(CalendlyClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -517,6 +522,8 @@ impl Default for CalendlyConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -1026,6 +1033,7 @@ impl FcpConnector for CalendlyConnector {
 }
 
 impl CalendlyConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
@@ -1064,167 +1072,195 @@ impl CalendlyConnector {
         let output = match operation {
             OP_EVENTS_LIST => {
                 // Resolve user_uri: use input or fetch current user
-                let user_uri = if let Some(uri) = req.input.get("user_uri").and_then(|v| v.as_str())
+                let user_uri = if let Some(uri) = req
+                    .input
+                    .get("user_uri")
+                    .and_then(serde_json::Value::as_str)
                 {
                     uri.to_string()
                 } else {
                     let user = client
                         .get_current_user(runtime)
                         .await
-                        .map_err(|e| e.to_fcp_error())?;
+                        .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                     user.resource.uri
                 };
                 let count = req
                     .input
                     .get("count")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let page_token = req.input.get("page_token").and_then(|v| v.as_str());
-                let status = req.input.get("status").and_then(|v| v.as_str());
-                let min_start = req.input.get("min_start_time").and_then(|v| v.as_str());
-                let max_start = req.input.get("max_start_time").and_then(|v| v.as_str());
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let page_token = req.input.get("page_token").and_then(serde_json::Value::as_str);
+                let status = req.input.get("status").and_then(serde_json::Value::as_str);
+                let min_start = req
+                    .input
+                    .get("min_start_time")
+                    .and_then(serde_json::Value::as_str);
+                let max_start = req
+                    .input
+                    .get("max_start_time")
+                    .and_then(serde_json::Value::as_str);
 
                 let resp = client
                     .list_events(
                         runtime, &user_uri, count, page_token, status, min_start, max_start,
                     )
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize events: {e}"),
                 })?
             }
             OP_EVENTS_GET => {
-                let event_uuid = req.input.get("event_uuid").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let event_uuid = req
+                    .input
+                    .get("event_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_event(runtime, event_uuid)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize event: {e}"),
                 })?
             }
             OP_EVENT_TYPES_LIST => {
-                let user_uri = if let Some(uri) = req.input.get("user_uri").and_then(|v| v.as_str())
+                let user_uri = if let Some(uri) = req
+                    .input
+                    .get("user_uri")
+                    .and_then(serde_json::Value::as_str)
                 {
                     uri.to_string()
                 } else {
                     let user = client
                         .get_current_user(runtime)
                         .await
-                        .map_err(|e| e.to_fcp_error())?;
+                        .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                     user.resource.uri
                 };
                 let count = req
                     .input
                     .get("count")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let page_token = req.input.get("page_token").and_then(|v| v.as_str());
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let page_token = req.input.get("page_token").and_then(serde_json::Value::as_str);
                 let resp = client
                     .list_event_types(runtime, &user_uri, count, page_token)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize event types: {e}"),
                 })?
             }
             OP_INVITEES_LIST => {
-                let event_uuid = req.input.get("event_uuid").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let event_uuid = req
+                    .input
+                    .get("event_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
-                    },
-                )?;
+                    })?;
                 let count = req
                     .input
                     .get("count")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let page_token = req.input.get("page_token").and_then(|v| v.as_str());
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                let page_token = req.input.get("page_token").and_then(serde_json::Value::as_str);
                 let resp = client
                     .list_invitees(runtime, event_uuid, count, page_token)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize invitees: {e}"),
                 })?
             }
             OP_SCHEDULING_LINKS_CREATE => {
-                let owner_uri = req.input.get("owner_uri").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let owner_uri = req
+                    .input
+                    .get("owner_uri")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'owner_uri' field".into(),
-                    },
-                )?;
-                let owner_type = req.input.get("owner_type").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let owner_type = req
+                    .input
+                    .get("owner_type")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'owner_type' field".into(),
-                    },
-                )?;
+                    })?;
                 let max_event_count = req
                     .input
                     .get("max_event_count")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let resp = client
                     .create_scheduling_link(runtime, owner_uri, owner_type, max_event_count)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize scheduling link: {e}"),
                 })?
             }
             OP_EVENTS_CANCEL => {
-                let event_uuid = req.input.get("event_uuid").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let event_uuid = req
+                    .input
+                    .get("event_uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
-                    },
-                )?;
-                let reason = req.input.get("reason").and_then(|v| v.as_str());
+                    })?;
+                let reason = req.input.get("reason").and_then(serde_json::Value::as_str);
                 client
                     .cancel_event(runtime, event_uuid, reason)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 json!({ "status": "cancelled" })
             }
             OP_USER_GET => {
                 let resp = client
                     .get_current_user(runtime)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize user: {e}"),
                 })?
             }
             OP_AVAILABILITY_LIST => {
-                let user_uri = if let Some(uri) = req.input.get("user_uri").and_then(|v| v.as_str())
+                let user_uri = if let Some(uri) = req
+                    .input
+                    .get("user_uri")
+                    .and_then(serde_json::Value::as_str)
                 {
                     uri.to_string()
                 } else {
                     let user = client
                         .get_current_user(runtime)
                         .await
-                        .map_err(|e| e.to_fcp_error())?;
+                        .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                     user.resource.uri
                 };
                 let resp = client
                     .list_availability(runtime, &user_uri)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize availability: {e}"),
                 })?
             }
             OP_HEALTH => {
-                client.health_check().await.map_err(|e| e.to_fcp_error())?;
+                client
+                    .health_check()
+                    .await
+                    .map_err(|e| CalendlyError::to_fcp_error(&e))?;
                 json!({ "status": "ok" })
             }
             _ => {

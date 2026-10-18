@@ -229,7 +229,7 @@ pub struct AvailabilitySchedule {
     pub rules: Vec<AvailabilityRule>,
 }
 
-fn default_false() -> bool {
+const fn default_false() -> bool {
     false
 }
 
