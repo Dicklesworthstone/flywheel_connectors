@@ -1088,3 +1088,111 @@ async fn invoke_sync_events_missing_calendar_id() {
         e => panic!("Expected InvalidRequest, got: {e:?}"),
     }
 }
+
+// ── Replay safety & client-supplied event ID idempotency (br-d018i) ─────
+
+#[fcp_async_core::runtime::test]
+async fn create_event_retries_after_5xx_with_stable_event_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/calendars/primary/events"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/calendars/primary/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(event_json("evtNEW", "New Meeting")))
+        .mount(&server)
+        .await;
+
+    let client = GoogleCalendarClient::new("test_tok")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 5);
+    let event: fcp_google_calendar::types::Event =
+        serde_json::from_value(event_json("", "New Meeting")).unwrap();
+    let created = client
+        .create_event("primary", &event)
+        .await
+        .expect("create_event with client-supplied id must retry 503 and succeed");
+    assert_eq!(created.id.as_deref(), Some("evtNEW"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let body_0: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let body_1: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let id_0 = body_0["id"].as_str().expect("client event id on attempt 1");
+    let id_1 = body_1["id"].as_str().expect("client event id on attempt 2");
+    assert!(id_0.len() >= 5);
+    assert_eq!(
+        id_0, id_1,
+        "both attempts must carry the identical base32hex event id"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn create_event_recovers_via_get_event_on_409_duplicate_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/calendars/primary/events"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/calendars/primary/events"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": {
+                "code": 409,
+                "message": "The requested identifier already exists."
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/calendars/primary/events/customid12345"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(event_json("customid12345", "Idempotent Meeting")),
+        )
+        .mount(&server)
+        .await;
+
+    let client = GoogleCalendarClient::new("test_tok")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 5);
+    let event: fcp_google_calendar::types::Event =
+        serde_json::from_value(event_json("customid12345", "Idempotent Meeting")).unwrap();
+    let recovered = client
+        .create_event("primary", &event)
+        .await
+        .expect("409 Conflict on duplicate client event id must recover via get_event");
+    assert_eq!(recovered.id.as_deref(), Some("customid12345"));
+    assert_eq!(recovered.summary.as_deref(), Some("Idempotent Meeting"));
+}
+
+#[fcp_async_core::runtime::test]
+async fn quick_add_remains_fail_closed_after_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/calendars/primary/events/quickAdd"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let client = GoogleCalendarClient::new("test_tok")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 5);
+    let result = client.quick_add("primary", "Lunch at noon").await;
+    assert!(result.is_err());
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "quickAdd has no client-supplied event id and must not retry after 503"
+    );
+}

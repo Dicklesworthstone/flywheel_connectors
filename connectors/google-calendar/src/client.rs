@@ -240,13 +240,38 @@ impl GoogleCalendarClient {
     }
 
     /// Create a new event in a calendar.
+    ///
+    /// Ensures a stable client-supplied Google Calendar event `id` (base32hex
+    /// `[0-9a-v]{5,1024}`) is present on the event body before entering the
+    /// retry loop (br-d018i). If a retry after a transient 5xx or dropped
+    /// response receives `409 Conflict` ("The requested identifier already
+    /// exists") because an earlier attempt committed the event, recovers via
+    /// [`Self::get_event`].
     #[instrument(skip(self, event))]
     pub async fn create_event(&self, calendar_id: &str, event: &Event) -> GCalResult<Event> {
         let encoded_cal =
             percent_encoding::utf8_percent_encode(calendar_id, percent_encoding::NON_ALPHANUMERIC);
         let url = format!("{}/calendars/{encoded_cal}/events", self.base_url);
-        let body = serde_json::to_value(event).map_err(GoogleCalendarError::Json)?;
-        self.post_json(&url, &body).await
+        let event_id = event
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map_or_else(
+                || uuid::Uuid::new_v4().simple().to_string(),
+                str::to_string,
+            );
+        let mut body = serde_json::to_value(event).map_err(GoogleCalendarError::Json)?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("id".to_string(), serde_json::Value::String(event_id.clone()));
+        }
+        match self.post_json_replay_safe(&url, &body).await {
+            Ok(created) => Ok(created),
+            Err(GoogleCalendarError::Api { code: 409, .. }) => {
+                self.get_event(calendar_id, &event_id).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Update an existing event.
