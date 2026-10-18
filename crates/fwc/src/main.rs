@@ -5266,6 +5266,112 @@ struct HostConnectorCatalog {
     connectors: Vec<HostConnectorRecord>,
 }
 
+/// Origin attested by the selected host for one read response. This proves
+/// neither replica coverage nor quorum freshness; the host owns peer signature
+/// and response-binding verification before emitting route metadata. Discovery
+/// contributions arrive in headers; point reads retain the typed body route.
+#[derive(Clone, Debug, Serialize)]
+struct HostReadProvenance {
+    path: String,
+    truth_source: KnowledgeState,
+    attested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<fcp_kernel::InvokeRouteProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_connectors: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mesh_connectors: Option<usize>,
+}
+
+impl HostReadProvenance {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Result<Self> {
+        let source_header = headers.get_all("x-fcp-truth-source");
+        let mut values = source_header.iter();
+        let value = values.next();
+        anyhow::ensure!(
+            values.next().is_none(),
+            "host returned duplicate read truth headers"
+        );
+        let truth_source = match value
+            .map(reqwest::header::HeaderValue::to_str)
+            .transpose()?
+        {
+            None | Some("host-backed") => KnowledgeState::HostBacked,
+            Some("mesh-backed") => KnowledgeState::MeshBacked,
+            Some(_) => bail!("host returned an unsupported read truth source"),
+        };
+        let count = |name: &'static str| -> Result<Option<usize>> {
+            let header = headers.get_all(name);
+            let mut values = header.iter();
+            let value = values.next();
+            anyhow::ensure!(
+                values.next().is_none(),
+                "host returned duplicate read contribution headers"
+            );
+            value
+                .map(|value| {
+                    value
+                        .to_str()?
+                        .parse::<usize>()
+                        .context("host returned an invalid read contribution count")
+                })
+                .transpose()
+        };
+        let local_connectors = count("x-fcp-truth-local-connectors")?;
+        let mesh_connectors = count("x-fcp-truth-mesh-connectors")?;
+        anyhow::ensure!(
+            local_connectors.is_some() == mesh_connectors.is_some(),
+            "host returned incomplete read contribution counts"
+        );
+        if let (Some(local), Some(mesh)) = (local_connectors, mesh_connectors) {
+            let expected = if local == 0 && mesh > 0 {
+                KnowledgeState::MeshBacked
+            } else {
+                KnowledgeState::HostBacked
+            };
+            anyhow::ensure!(
+                truth_source == expected && value.is_some(),
+                "host read truth source contradicts its contribution counts"
+            );
+        }
+        Ok(Self {
+            path: String::new(),
+            truth_source,
+            attested: value.is_some(),
+            route: None,
+            local_connectors,
+            mesh_connectors,
+        })
+    }
+
+    fn validate_discovery(&self, connector_count: usize) -> Result<()> {
+        if let (Some(local), Some(mesh)) = (self.local_connectors, self.mesh_connectors) {
+            anyhow::ensure!(
+                local.checked_add(mesh) == Some(connector_count),
+                "host read contribution counts do not match discovery inventory"
+            );
+        } else {
+            anyhow::ensure!(
+                self.truth_source != KnowledgeState::MeshBacked,
+                "mesh discovery response omitted its contribution counts"
+            );
+        }
+        Ok(())
+    }
+
+    fn with_route(mut self, route: Option<fcp_kernel::InvokeRouteProvenance>) -> Result<Self> {
+        let actual = read_response_knowledge_state(&[route.as_ref()])?;
+        anyhow::ensure!(
+            !self.attested || self.truth_source == actual,
+            "host read response headers contradict its executor evidence"
+        );
+        self.truth_source = actual;
+        self.attested |= route.is_some();
+        self.route = route;
+        Ok(self)
+    }
+}
+
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
         Self::with_redirects(endpoint, true)
@@ -5334,6 +5440,29 @@ impl HostAdminClient {
         Ok((HostConnectorCatalog::from_response(&response), response))
     }
 
+    fn catalog_with_provenance(
+        &self,
+        filter: Option<&HostDiscoveryFilter>,
+    ) -> Result<(
+        HostConnectorCatalog,
+        HostDiscoveryResponse,
+        HostReadProvenance,
+    )> {
+        let (response, provenance): (HostDiscoveryResponse, _) = self.read_json_with_provenance(
+            self.client
+                .post(format!("{}/rpc/discover", self.base_url))
+                .json(&json!({ "filter": filter })),
+            "POST",
+            "/rpc/discover",
+        )?;
+        provenance.validate_discovery(response.connectors.len())?;
+        Ok((
+            HostConnectorCatalog::from_response(&response),
+            response,
+            provenance,
+        ))
+    }
+
     fn cutover_gates_snapshot(&self) -> Result<Value> {
         self.get_json("/rpc/mesh/cutover-gates")
     }
@@ -5350,25 +5479,54 @@ impl HostAdminClient {
         self.get_json(&format!("/rpc/introspect/{connector_id}"))
     }
 
-    fn routed_connector(
+    fn connector_with_provenance(
         &self,
         connector_id: &str,
-    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostConnectorInventoryResponse>> {
-        self.get_json(&format!("/rpc/connectors/{connector_id}"))
+    ) -> Result<(HostConnectorInventoryResponse, HostReadProvenance)> {
+        let (response, provenance): (
+            fcp_host::RoutedReadResponse<HostConnectorInventoryResponse>,
+            _,
+        ) = self.get_json_with_provenance(&format!("/rpc/connectors/{connector_id}"))?;
+        anyhow::ensure!(
+            response.response.connector.id.as_str() == connector_id,
+            "host returned inventory for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
     }
 
-    fn routed_introspection(
+    fn introspect_with_provenance(
         &self,
         connector_id: &str,
-    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostIntrospectionResponse>> {
-        self.get_json(&format!("/rpc/introspect/{connector_id}"))
+    ) -> Result<(HostIntrospectionResponse, HostReadProvenance)> {
+        let (response, provenance): (fcp_host::RoutedReadResponse<HostIntrospectionResponse>, _) =
+            self.get_json_with_provenance(&format!("/rpc/introspect/{connector_id}"))?;
+        anyhow::ensure!(
+            response.response.connector.id.as_str() == connector_id,
+            "host returned introspection for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
     }
 
-    fn routed_connector_status(
+    fn connector_status_with_provenance(
         &self,
         connector_id: &str,
-    ) -> Result<fcp_host::discovery::RoutedReadResponse<HostConnectorAdminStatus>> {
-        self.get_json(&format!("/rpc/connectors/{connector_id}/status"))
+    ) -> Result<(HostConnectorAdminStatus, HostReadProvenance)> {
+        let (response, provenance): (fcp_host::RoutedReadResponse<HostConnectorAdminStatus>, _) =
+            self.get_json_with_provenance(&format!("/rpc/connectors/{connector_id}/status"))?;
+        anyhow::ensure!(
+            response.response.connector_id.as_str() == connector_id,
+            "host returned runtime status for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
     }
 
     fn doctor(&self, request: &HostDoctorRequest) -> Result<HostDoctorReport> {
@@ -5691,6 +5849,17 @@ impl HostAdminClient {
         )
     }
 
+    fn get_json_with_provenance<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, HostReadProvenance)> {
+        self.read_json_with_provenance(
+            self.client.get(format!("{}{}", self.base_url, path)),
+            "GET",
+            path,
+        )
+    }
+
     fn post_read_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         self.read_json(
             self.client
@@ -5707,11 +5876,25 @@ impl HostAdminClient {
         method: &'static str,
         path: &str,
     ) -> Result<T> {
+        self.read_json_with_provenance(request, method, path)
+            .map(|(value, _)| value)
+    }
+
+    fn read_json_with_provenance<T: DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        method: &'static str,
+        path: &str,
+    ) -> Result<(T, HostReadProvenance)> {
         request
             .timeout(self.read_timeout)
             .send()
             .with_context(|| format!("{method} {path} from host admin API failed"))
-            .and_then(|response| Self::decode_response(response, method, path))
+            .and_then(|response| {
+                let mut provenance = HostReadProvenance::from_headers(response.headers())?;
+                provenance.path = path.to_owned();
+                Self::decode_response(response, method, path).map(|value| (value, provenance))
+            })
             .map_err(|error| {
                 if error.chain().any(|cause| {
                     cause
@@ -6487,12 +6670,18 @@ fn host_discovered_connector(
 fn load_live_discovered_connectors(
     client: &HostAdminClient,
     catalog: &HostConnectorCatalog,
-) -> Result<(Vec<DiscoveredConnector>, Vec<Value>)> {
+) -> Result<(
+    Vec<DiscoveredConnector>,
+    Vec<Value>,
+    Vec<HostReadProvenance>,
+)> {
     let mut connectors = Vec::with_capacity(catalog.connectors.len());
     let mut metadata_gaps = Vec::new();
+    let mut provenance = Vec::with_capacity(catalog.connectors.len());
 
     for connector in &catalog.connectors {
-        let introspection = client.introspect(connector.summary.id.as_str())?;
+        let (introspection, read_provenance) =
+            client.introspect_with_provenance(connector.summary.id.as_str())?;
         metadata_gaps.extend(host_metadata_gaps(&introspection).into_iter().map(|gap| {
             json!({
                 "connector": {
@@ -6504,9 +6693,10 @@ fn load_live_discovered_connectors(
             })
         }));
         connectors.push(host_discovered_connector(connector, &introspection));
+        provenance.push(read_provenance);
     }
 
-    Ok((connectors, metadata_gaps))
+    Ok((connectors, metadata_gaps, provenance))
 }
 
 fn host_connector_schema_glossary(
@@ -7739,18 +7929,12 @@ fn attach_tool_inventory_provenance(
 }
 
 fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("list", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
     let filter = HostDiscoveryFilter {
         category: args.category.clone(),
         ..HostDiscoveryFilter::default()
     };
-    let (catalog, response) = client.catalog(Some(&filter))?;
+    let (catalog, response, provenance) = client.catalog_with_provenance(Some(&filter))?;
     let filter_gaps = host_filter_gaps(args.zone.as_deref());
     let connectors = catalog
         .connectors
@@ -7782,39 +7966,42 @@ fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
         "list",
         catalog::DiscoveryDataSource::LiveHostInventory,
     );
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "list",
+        args.require_source,
+        "connector-inventory",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![provenance],
+    )
 }
 
 fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
         Err(error) => {
-            let mut outcome = connector_resolution_dispatch("show", &args.connector, &error);
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-            return Ok(outcome);
+            let outcome = connector_resolution_dispatch("show", &args.connector, &error);
+            return resolve_live_read_outcome(
+                "show",
+                args.require_source,
+                "connector-selection",
+                outcome,
+                vec![catalog_provenance],
+            );
         }
     };
-    let inventory = client.routed_connector(connector.summary.id.as_str())?;
-    let introspection = client.routed_introspection(connector.summary.id.as_str())?;
-    let routes = [
-        inventory.read_route.as_ref(),
-        introspection.read_route.as_ref(),
-    ];
-    let knowledge_state = read_response_knowledge_state(&routes)?;
-    if let Some(outcome) =
-        enforce_required_truth_source("show", args.require_source, knowledge_state)
-    {
-        return Ok(outcome);
-    }
-    let inventory = &inventory.response;
-    let introspection = &introspection.response;
+    let (inventory, inventory_provenance) =
+        client.connector_with_provenance(connector.summary.id.as_str())?;
+    let (introspection, introspection_provenance) =
+        client.introspect_with_provenance(connector.summary.id.as_str())?;
+    let evidence = vec![inventory_provenance, introspection_provenance];
+    let inventory = &inventory;
+    let introspection = &introspection;
     let preview = introspection
         .tools
         .iter()
@@ -7848,12 +8035,16 @@ fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
         &example_operation,
     ))?;
     envelope.inject_into(&mut payload);
-    attach_read_route_evidence(&mut payload, &routes);
-    inject_truth_source_metadata(&mut payload, knowledge_state);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "show",
+        args.require_source,
+        "connector-details",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
@@ -7916,44 +8107,46 @@ fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
 #[allow(clippy::too_many_lines)]
 fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome> {
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
         Err(error) => {
-            let mut outcome = connector_resolution_dispatch("schema", &args.connector, &error);
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-            return Ok(outcome);
+            let outcome = connector_resolution_dispatch("schema", &args.connector, &error);
+            return resolve_live_read_outcome(
+                "schema",
+                args.require_source,
+                "connector-selection",
+                outcome,
+                vec![catalog_provenance],
+            );
         }
     };
-    let inventory = client.routed_connector(connector.summary.id.as_str())?;
-    let introspection = client.routed_introspection(connector.summary.id.as_str())?;
-    let routes = [
-        inventory.read_route.as_ref(),
-        introspection.read_route.as_ref(),
-    ];
-    let knowledge_state = read_response_knowledge_state(&routes)?;
-    if let Some(outcome) =
-        enforce_required_truth_source("schema", args.require_source, knowledge_state)
-    {
-        return Ok(outcome);
-    }
-    let inventory = &inventory.response;
-    let introspection = &introspection.response;
+    let (inventory, inventory_provenance) =
+        client.connector_with_provenance(connector.summary.id.as_str())?;
+    let (introspection, introspection_provenance) =
+        client.introspect_with_provenance(connector.summary.id.as_str())?;
+    let evidence = vec![inventory_provenance, introspection_provenance];
+    let inventory = &inventory;
+    let introspection = &introspection;
     let metadata_gaps = host_metadata_gaps(introspection);
 
     if let Some(operation_selector) = args.operation.as_deref() {
         let operation = match resolve_host_tool(&introspection.tools, operation_selector) {
             Ok(operation) => operation,
             Err(error) => {
-                let mut outcome = host_operation_resolution_dispatch(
+                let outcome = host_operation_resolution_dispatch(
                     "schema",
                     &connector.slug,
                     operation_selector,
                     &error,
                 );
-                attach_read_route_evidence(&mut outcome.payload, &routes);
-                inject_truth_source_metadata(&mut outcome.payload, knowledge_state);
-                return Ok(outcome);
+                return resolve_live_read_outcome(
+                    "schema",
+                    args.require_source,
+                    "operation-selection",
+                    outcome,
+                    evidence,
+                );
             }
         };
 
@@ -7975,12 +8168,10 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
                 catalog::DiscoveryDataSource::LiveHostIntrospection,
             );
             envelope.inject_into(&mut payload);
-            attach_read_route_evidence(&mut payload, &routes);
-            inject_truth_source_metadata(&mut payload, knowledge_state);
-            return Ok(DispatchOutcome {
+            return resolve_live_read_outcome("schema", args.require_source, "operation-schema", DispatchOutcome {
                 payload,
                 exit_code: CliExitCode::Success,
-            });
+            }, evidence);
         }
 
         let example_strs = if args.examples {
@@ -8042,12 +8233,16 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             catalog::DiscoveryDataSource::LiveHostIntrospection,
         );
         envelope.inject_into(&mut payload);
-        attach_read_route_evidence(&mut payload, &routes);
-        inject_truth_source_metadata(&mut payload, knowledge_state);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        return resolve_live_read_outcome(
+            "schema",
+            args.require_source,
+            "operation-schema",
+            DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::Success,
+            },
+            evidence,
+        );
     }
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "schema");
@@ -8074,12 +8269,16 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
         catalog::DiscoveryDataSource::LiveHostIntrospection,
     );
     envelope.inject_into(&mut payload);
-    attach_read_route_evidence(&mut payload, &routes);
-    inject_truth_source_metadata(&mut payload, knowledge_state);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "schema",
+        args.require_source,
+        "connector-schema",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8223,10 +8422,12 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return list_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -8237,26 +8438,8 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
     // The truthfulness contract forbids silent downgrade: offline artifacts
     // are only a source when the operator asked for `--offline`, and a
     // configured-but-failed host propagates its transport error unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match list_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) if outcome.exit_code == CliExitCode::Success => {
-                    QueryResult::Complete(outcome.payload)
-                }
-                Ok(outcome) => QueryResult::Error(format!(
-                    "host list returned exit code {:?}",
-                    outcome.exit_code
-                )),
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match list_offline_payload(args) {
             Ok(payload) => QueryResult::Complete(payload),
             Err(error) => {
@@ -8265,9 +8448,6 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // list cache; Degraded/FallbackDerived are resolver-assigned outcomes,
-        // never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
@@ -8284,9 +8464,6 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -12966,15 +13143,12 @@ fn session_next_actions(session: &session::Session) -> Vec<String> {
 }
 
 fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("search", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
-    let (connectors, metadata_gaps) = load_live_discovered_connectors(&client, &catalog)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
+    let (connectors, metadata_gaps, introspection_provenance) =
+        load_live_discovered_connectors(&client, &catalog)?;
+    let mut evidence = vec![catalog_provenance];
+    evidence.extend(introspection_provenance);
     let filter_gaps = host_filter_gaps(args.zone.as_deref());
     let filters = search::SearchFilters {
         connector: args.connector.clone(),
@@ -13042,11 +13216,16 @@ fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome
         catalog::DiscoveryDataSource::LiveHostIntrospection,
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "search",
+        args.require_source,
+        "operation-search",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutcome> {
@@ -13057,10 +13236,12 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return search_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13075,26 +13256,8 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
     // the dispatchers as non-success outcomes: the queried source did answer,
     // so they resolve as `Complete` and their exit code is reattached to the
     // final dispatch unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
-    let mut outcome_exit_code: Option<CliExitCode> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match search_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => {
-                    if outcome.exit_code != CliExitCode::Success {
-                        outcome_exit_code = Some(outcome.exit_code);
-                    }
-                    QueryResult::Complete(outcome.payload)
-                }
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match search_offline_payload(args) {
             Ok(payload) => QueryResult::Complete(payload),
             Err(error) => {
@@ -13103,9 +13266,6 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // search cache; Degraded/FallbackDerived are resolver-assigned
-        // outcomes, never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13120,13 +13280,10 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
             }
             Ok(DispatchOutcome {
                 payload: resolved.value,
-                exit_code: outcome_exit_code.unwrap_or(CliExitCode::Success),
+                exit_code: CliExitCode::Success,
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -13281,10 +13438,12 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return show_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13298,26 +13457,9 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
     // Connector-resolution refusals surface from the builders as non-success
     // outcomes: the queried source did answer, so they resolve as `Complete`
     // and their exit code is reattached to the final dispatch unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let mut outcome_exit_code: Option<CliExitCode> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match show_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => {
-                    if outcome.exit_code != CliExitCode::Success {
-                        outcome_exit_code = Some(outcome.exit_code);
-                    }
-                    QueryResult::Complete(outcome.payload)
-                }
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match show_offline_payload(args) {
             Ok(outcome) => {
                 if outcome.exit_code != CliExitCode::Success {
@@ -13331,8 +13473,6 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh reads use the host transport and carry per-response executor
-        // evidence. There is no independent node-local show cache.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13341,7 +13481,7 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
             if let Some(outcome) = enforce_required_truth_source(
                 "show",
                 args.require_source,
-                resolved_read_knowledge_state(&resolved.value, resolved.knowledge_state),
+                resolved.knowledge_state,
             ) {
                 return Ok(outcome);
             }
@@ -13351,9 +13491,6 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -13570,10 +13707,12 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return schema_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13587,20 +13726,8 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
     // Selector-resolution refusals (connector/operation not found) are
     // complete source answers whose non-success exit codes must survive, so
     // the ladder carries whole `DispatchOutcome`s rather than bare payloads.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match schema_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => QueryResult::Complete(outcome),
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match schema_offline_payload(args) {
             Ok(outcome) => QueryResult::Complete(outcome),
             Err(error) => {
@@ -13609,8 +13736,6 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh reads use the host transport and carry per-response executor
-        // evidence. There is no independent node-local schema cache.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13619,16 +13744,13 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
             if let Some(outcome) = enforce_required_truth_source(
                 "schema",
                 args.require_source,
-                resolved_read_knowledge_state(&resolved.value.payload, resolved.knowledge_state),
+                resolved.knowledge_state,
             ) {
                 return Ok(outcome);
             }
             Ok(resolved.value)
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -15680,8 +15802,8 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
         return Ok(outcome);
     };
 
-    // Fleet discovery mixes local and advertised records. Only a selected
-    // connector's verified response can establish a mesh source.
+    // Fleet status includes the entry host's own health, so it cannot satisfy
+    // a mesh-only requirement. Selected connector status has its own origin.
     if args.connector.is_none() {
         if let Some(outcome) =
             enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
@@ -15691,42 +15813,47 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
     }
 
     let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, discovery) = client.catalog(None)?;
-    let health = client.health()?;
+    let (catalog, discovery, catalog_provenance) = client.catalog_with_provenance(None)?;
+    let (health, health_provenance): (HostHealthResponse, _) =
+        client.get_json_with_provenance("/rpc/health")?;
 
     if let Some(selector) = args.connector.as_deref() {
         let connector = match catalog.resolve_connector(selector) {
             Ok(connector) => connector,
             Err(error) => {
-                let mut outcome = connector_resolution_dispatch("status", selector, &error);
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-                return Ok(outcome);
+                let outcome = connector_resolution_dispatch("status", selector, &error);
+                return resolve_live_read_outcome(
+                    "status",
+                    args.require_source,
+                    "connector-selection",
+                    outcome,
+                    vec![catalog_provenance],
+                );
             }
         };
-        let admin = client.routed_connector_status(connector.summary.id.as_str())?;
-        let routes = [admin.read_route.as_ref()];
-        let knowledge_state = read_response_knowledge_state(&routes)?;
-        if let Some(outcome) =
-            enforce_required_truth_source("status", args.require_source, knowledge_state)
-        {
-            return Ok(outcome);
-        }
+        let (admin, status_provenance) =
+            client.connector_status_with_provenance(connector.summary.id.as_str())?;
 
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "status");
         let mut payload = serde_json::to_value(build_connector_status_operator_contract(
             &host.endpoint,
             connector,
-            admin.response,
+            admin,
             &health,
             discovery.registry_version,
         ))?;
         envelope.inject_into(&mut payload);
-        attach_read_route_evidence(&mut payload, &routes);
-        inject_truth_source_metadata(&mut payload, knowledge_state);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        payload["host_health"]["_truth_source"] = json!("host");
+        return resolve_live_read_outcome(
+            "status",
+            args.require_source,
+            "connector-runtime-status",
+            DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::Success,
+            },
+            vec![status_provenance],
+        );
     }
 
     let connector_rows = catalog
@@ -15781,11 +15908,17 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
         })],
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    payload["host_health"]["_truth_source"] = json!("host");
+    resolve_live_read_outcome(
+        "status",
+        args.require_source,
+        "fleet-status",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![catalog_provenance, health_provenance],
+    )
 }
 
 /// Build a health dashboard from the host catalog's connector entries.
@@ -22191,7 +22324,7 @@ fn export_tools_options(args: &ExportToolsArgs) -> export_tools::ExportOptions {
 fn suggest_dispatch_host(args: &SuggestArgs, host: &str) -> Result<DispatchOutcome> {
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
-    let (all_connectors, metadata_gaps) = load_live_discovered_connectors(&client, &catalog)?;
+    let (all_connectors, metadata_gaps, _) = load_live_discovered_connectors(&client, &catalog)?;
 
     if let Some(after_op) = &args.after {
         let mut related_ids: Vec<String> = Vec::new();
@@ -24591,16 +24724,93 @@ fn attach_read_route_evidence(
     }
 }
 
-/// The resolver chooses how to reach the host; the authenticated response can
-/// establish that a remote executor actually answered this particular read.
-fn resolved_read_knowledge_state(payload: &Value, transport: KnowledgeState) -> KnowledgeState {
-    if transport == KnowledgeState::HostBacked
-        && payload.get("_truth_source").and_then(Value::as_str) == Some("mesh")
+/// Classify already-received live evidence without inventing a second network
+/// query or treating an entry host's address as the answer's execution origin.
+/// Mixed answers retain the weaker host source; individual response evidence
+/// still exposes any authenticated mesh contributions.
+fn resolve_live_read_outcome(
+    command: &str,
+    requirement: Option<RequiredTruthSource>,
+    scope: &str,
+    mut outcome: DispatchOutcome,
+    evidence: Vec<HostReadProvenance>,
+) -> Result<DispatchOutcome> {
+    let actual = if !evidence.is_empty()
+        && evidence
+            .iter()
+            .all(|read| read.truth_source == KnowledgeState::MeshBacked)
     {
         KnowledgeState::MeshBacked
     } else {
-        transport
+        KnowledgeState::HostBacked
+    };
+    // The host has already selected and authenticated the answering source.
+    // Pin resolution to that observation: FWC_MESH_BACKED controls speculative
+    // source attempts, not permission to relabel a response that came via mesh.
+    let mut policy = if actual == KnowledgeState::MeshBacked {
+        truth::TruthPrecedencePolicy::v2_default()
+    } else {
+        truth::TruthPrecedencePolicy::v1_default()
+    };
+    policy.precedence = vec![actual];
+    policy.minimum_acceptable = actual;
+    policy.allow_fallback = false;
+    let strategy = policy.to_resolution_strategy();
+    let resolver = LiveTruthResolver::with_precedence_policy(
+        ResolverConfig::default().with_mesh_backed(actual == KnowledgeState::MeshBacked),
+        policy,
+    );
+    let mut payload = Some(outcome.payload);
+    let mut resolved = resolver.resolve_with_partials(strategy, |source| {
+        if source == actual {
+            payload
+                .take()
+                .map_or(QueryResult::NotConfigured, QueryResult::Complete)
+        } else {
+            QueryResult::NotConfigured
+        }
+    })?;
+    resolved.trace.reason = format!(
+        "The selected host returned {scope} with {} origin; mixed or unattested reads retain host-backed classification.",
+        actual.label(),
+    );
+    if let Some(refused) = enforce_required_truth_source(command, requirement, actual) {
+        outcome = refused;
+    } else {
+        outcome.payload = resolved.value;
     }
+    inject_truth_source_metadata(&mut outcome.payload, actual);
+    attach_read_route_evidence(
+        &mut outcome.payload,
+        &evidence
+            .iter()
+            .map(|read| read.route.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    if actual == KnowledgeState::MeshBacked
+        && let Some(provenance) = outcome
+            .payload
+            .get_mut("provenance")
+            .and_then(Value::as_object_mut)
+    {
+        provenance.insert("caveat".to_owned(), json!(
+            "The host-admin API is the transport and attestation authority; this answer originated from authenticated mesh peers. Replication, quorum freshness and mesh-wide completeness require separate evidence."
+        ));
+        if provenance.contains_key("mesh_backed") {
+            provenance.insert("mesh_backed".to_owned(), json!(true));
+        }
+        if provenance.contains_key("transport") {
+            provenance.insert("transport".to_owned(), json!("host-verified-mesh-peer"));
+        }
+    }
+    outcome.payload["read_provenance"] = json!({
+        "authority": "selected-host",
+        "scope": scope,
+        "replication_proven": false,
+        "responses": evidence,
+    });
+    outcome.payload["decision_trace"] = serde_json::to_value(resolved.trace)?;
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -34115,6 +34325,14 @@ max_state_replication_staleness_secs = 120
         routes: StdBTreeMap<String, Value>,
         expected_requests: usize,
     ) -> (String, thread::JoinHandle<()>) {
+        spawn_mock_host_with_response_headers(routes, expected_requests, StdBTreeMap::new())
+    }
+
+    fn spawn_mock_host_with_response_headers(
+        routes: StdBTreeMap<String, Value>,
+        expected_requests: usize,
+        response_headers: StdBTreeMap<String, Vec<(String, String)>>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock host should bind");
         listener
             .set_nonblocking(true)
@@ -34199,11 +34417,16 @@ max_state_replication_staleness_secs = 120
                     )
                 });
                 let body = bind_mock_invoke_response(&key, body, &request_body);
+                let headers = response_headers.get(&key).map_or_else(String::new, |headers| {
+                    headers.iter().map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>()
+                });
 
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{}\r\n{}",
                     body.len(),
+                    headers,
                     body
                 )
                 .expect("mock host should write response");
@@ -37292,6 +37515,300 @@ deny_ptrace = true
         response
     }
 
+    fn discovery_truth_headers(source: &str, local: usize, mesh: usize) -> Vec<(String, String)> {
+        vec![
+            ("x-fcp-truth-source".to_owned(), source.to_owned()),
+            ("x-fcp-truth-local-connectors".to_owned(), local.to_string()),
+            ("x-fcp-truth-mesh-connectors".to_owned(), mesh.to_string()),
+        ]
+    }
+
+    #[test]
+    fn live_read_provenance_validates_discovery_headers_and_body_counts() {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let unattested = super::HostReadProvenance::from_headers(&HeaderMap::new()).unwrap();
+        assert_eq!(unattested.truth_source, KnowledgeState::HostBacked);
+        assert!(!unattested.attested);
+
+        for (source, local, mesh, expected) in [
+            ("mesh-backed", 0, 1, KnowledgeState::MeshBacked),
+            ("host-backed", 1, 1, KnowledgeState::HostBacked),
+            ("host-backed", 0, 0, KnowledgeState::HostBacked),
+        ] {
+            let headers: HeaderMap = discovery_truth_headers(source, local, mesh)
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        HeaderValue::from_str(&value).unwrap(),
+                    )
+                })
+                .collect();
+            let provenance = super::HostReadProvenance::from_headers(&headers).unwrap();
+            assert_eq!(provenance.truth_source, expected);
+            assert!(provenance.attested);
+            assert!(provenance.validate_discovery(local + mesh).is_ok());
+            assert!(provenance.validate_discovery(local + mesh + 1).is_err());
+        }
+        for headers in [
+            vec![("x-fcp-truth-source", "offline")],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-source", "host-backed"),
+            ],
+            vec![("x-fcp-truth-local-connectors", "1")],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-local-connectors", "1"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+            vec![
+                ("x-fcp-truth-source", "host-backed"),
+                ("x-fcp-truth-local-connectors", "0"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-local-connectors", "-1"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+        ] {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                map.append(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            assert!(
+                super::HostReadProvenance::from_headers(&map).is_err(),
+                "{map:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_read_provenance_requires_consistent_point_executor_evidence() {
+        let mesh_route = fcp_kernel::InvokeRouteProvenance::mesh_backed(
+            "entry-host".to_owned(),
+            "executor-peer".to_owned(),
+            1,
+            "advertised_peer_forward",
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        let route_only = super::HostReadProvenance::from_headers(&headers)
+            .unwrap()
+            .with_route(Some(mesh_route.clone()))
+            .unwrap();
+        assert_eq!(route_only.truth_source, KnowledgeState::MeshBacked);
+        assert!(route_only.attested);
+        headers.insert(
+            "x-fcp-truth-source",
+            reqwest::header::HeaderValue::from_static("host-backed"),
+        );
+        assert!(
+            super::HostReadProvenance::from_headers(&headers)
+                .unwrap()
+                .with_route(Some(mesh_route))
+                .is_err()
+        );
+        headers.insert(
+            "x-fcp-truth-source",
+            reqwest::header::HeaderValue::from_static("mesh-backed"),
+        );
+        assert!(
+            super::HostReadProvenance::from_headers(&headers)
+                .unwrap()
+                .with_route(None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_read_provenance_rejects_mismatched_connector_identity() {
+        let mut inventory = mock_mesh_read_response(mock_inventory_response_json());
+        inventory["connector"]["id"] = json!("fcp.other:enterprise:v1");
+        let mut introspection = mock_mesh_read_response(mock_introspection_response_json());
+        introspection["connector"]["id"] = json!("fcp.other:enterprise:v1");
+        let mut status = mock_mesh_read_response(mock_connector_admin_status_json());
+        status["connector_id"] = json!("fcp.other:enterprise:v1");
+        for (path, value, method) in [
+            (
+                "/rpc/connectors/fcp.github:enterprise:v1",
+                inventory,
+                "inventory",
+            ),
+            (
+                "/rpc/introspect/fcp.github:enterprise:v1",
+                introspection,
+                "introspection",
+            ),
+            (
+                "/rpc/connectors/fcp.github:enterprise:v1/status",
+                status,
+                "status",
+            ),
+        ] {
+            let (host, server) =
+                spawn_mock_host(StdBTreeMap::from([(format!("GET {path}"), value)]), 1);
+            let client = super::HostAdminClient::new(&host).unwrap();
+            let result = match method {
+                "inventory" => client
+                    .connector_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                "introspection" => client
+                    .introspect_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                "status" => client
+                    .connector_status_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different connector")
+            );
+            server
+                .join()
+                .expect("each mismatched response was rejected");
+        }
+    }
+
+    #[test]
+    fn live_read_provenance_remote_discovery_and_search_satisfy_mesh_requirement() {
+        let (host, server) = spawn_mock_host_with_response_headers(
+            mock_github_host_routes(StdBTreeMap::from([(
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_mesh_read_response(mock_introspection_response_json()),
+            )])),
+            3,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("mesh-backed", 0, 1),
+            )]),
+        );
+        for suffix in [&["list"][..], &["search", "github issue"][..]] {
+            let mut args = vec!["fwc", "--json", "--host", host.as_str()];
+            args.extend_from_slice(suffix);
+            args.extend_from_slice(&["--require-source", "mesh"]);
+            let (exit, payload) = execute_json(&args);
+            assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["_truth_source"], "mesh");
+            assert_eq!(payload["decision_trace"]["selected_source"], "mesh-backed");
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["mesh_connectors"],
+                1
+            );
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["local_connectors"],
+                0
+            );
+            let schema: Value = serde_json::from_str(if suffix[0] == "list" {
+                include_str!("../schemas/list.schema.json")
+            } else {
+                include_str!("../schemas/search.schema.json")
+            })
+            .unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap_or_else(|error| panic!("mesh discovery violates schema: {error}"));
+        }
+        server
+            .join()
+            .expect("one request for list and two for search");
+    }
+
+    #[test]
+    fn live_read_provenance_mixed_inventory_retains_host_source_and_contributions() {
+        let mut local = mock_connector_summary_json();
+        local["id"] = json!("fcp.local:enterprise:v1");
+        local["name"] = json!("Local");
+        let discovery =
+            mock_discovery_response_with_connectors(vec![local, mock_connector_summary_json()]);
+        let (host, server) = spawn_mock_host_with_response_headers(
+            StdBTreeMap::from([("POST /rpc/discover".to_owned(), discovery)]),
+            2,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("host-backed", 1, 1),
+            )]),
+        );
+        for required in ["mesh-or-host", "mesh"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "list",
+                "--require-source",
+                required,
+            ]);
+            assert_eq!(payload["_truth_source"], "host");
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["mesh_connectors"],
+                1
+            );
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["local_connectors"],
+                1
+            );
+            assert_eq!(
+                exit,
+                if required == "mesh" {
+                    CliExitCode::Transport
+                } else {
+                    CliExitCode::Success
+                }
+                .into()
+            );
+            let schema: Value =
+                serde_json::from_str(include_str!("../schemas/list.schema.json")).unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap();
+        }
+        server.join().expect("mixed inventory query count");
+    }
+
+    #[test]
+    fn live_read_provenance_mesh_inventory_does_not_upgrade_host_introspection() {
+        let (host, server) = spawn_mock_host_with_response_headers(
+            mock_github_host_routes(StdBTreeMap::new()),
+            2,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("mesh-backed", 0, 1),
+            )]),
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "search",
+            "github issue",
+            "--require-source",
+            "mesh",
+        ]);
+        assert_eq!(exit, CliExitCode::Transport.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(
+            payload["read_provenance"]["responses"][0]["truth_source"],
+            "mesh-backed"
+        );
+        assert_eq!(
+            payload["read_provenance"]["responses"][1]["truth_source"],
+            "host-backed"
+        );
+        server
+            .join()
+            .expect("discovery never taints a later local response");
+    }
+
     #[test]
     fn execute_mesh_reads_preserve_executor_and_satisfy_required_source() {
         let (host, server) = spawn_mock_host(
@@ -37331,6 +37848,9 @@ deny_ptrace = true
                 assert_eq!(route["hop_count"], 1);
                 assert_eq!(route["failed_attempts"].as_array().unwrap().len(), 1);
             }
+            assert_eq!(payload["decision_trace"]["selected_source"], "mesh-backed");
+            assert_eq!(payload["decision_trace"]["attempts"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["read_provenance"]["replication_proven"], false);
             let schema: Value = serde_json::from_str(if suffix[0] == "show" {
                 include_str!("../schemas/show.schema.json")
             } else {
@@ -37388,6 +37908,19 @@ deny_ptrace = true
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(refusal["error"]["type"], "truth-source-unavailable");
         assert_eq!(refusal["error"]["actual"], "host");
+        assert_eq!(
+            refusal["read_provenance"]["responses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/show.schema.json")).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&refusal)
+            .unwrap();
         server.join().expect("mock host thread should complete");
     }
 
@@ -37410,7 +37943,7 @@ deny_ptrace = true
                     mock_mesh_read_response(mock_introspection_response_json()),
                 ),
             ]),
-            3,
+            2,
         );
         let args = super::ShowArgs {
             connector: "github".to_owned(),
@@ -37424,7 +37957,9 @@ deny_ptrace = true
                 .to_string()
                 .contains("incomplete mesh executor evidence")
         );
-        server.join().expect("mock host thread should complete");
+        server
+            .join()
+            .expect("malformed inventory must stop before introspection");
     }
 
     #[test]
@@ -43701,18 +44236,20 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_search_host_require_mesh_fails_truth_source_unavailable_without_network() {
+    fn execute_search_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(mock_github_host_routes(StdBTreeMap::new()), 2);
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
-            "http://127.0.0.1:9",
+            &host,
             "search",
             "github issue",
             "--require-source",
             "mesh",
         ]);
 
+        server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "search");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -50198,6 +50735,12 @@ depends_on = ["missing"]
             .expect("status carries executor evidence");
         assert_eq!(route["route"]["served_by"], "executor-peer");
         assert_eq!(payload["admin"]["connector_id"], cid);
+        assert_eq!(payload["provenance"]["mesh_backed"], true);
+        assert_eq!(
+            payload["provenance"]["transport"],
+            "host-verified-mesh-peer"
+        );
+        assert_eq!(payload["host_health"]["_truth_source"], "host");
         let schema: Value =
             serde_json::from_str(include_str!("../schemas/status.schema.json")).unwrap();
         jsonschema::validator_for(&schema)

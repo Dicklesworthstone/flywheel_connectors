@@ -557,6 +557,39 @@ fn show_success_payload(truth_source: &str) -> Value {
     })
 }
 
+fn with_live_read_metadata(
+    mut payload: Value,
+    truth_source: &str,
+    scope: &str,
+    path: &str,
+) -> Value {
+    let source = if truth_source == "mesh" {
+        "mesh-backed"
+    } else {
+        "host-backed"
+    };
+    payload["read_provenance"] = json!({
+        "authority": "selected-host",
+        "scope": scope,
+        "replication_proven": false,
+        "responses": [{ "path": path, "truth_source": source, "attested": true }]
+    });
+    payload["decision_trace"] = json!({
+        "attempts": [{
+            "source": source,
+            "outcome": "success",
+            "elapsed": { "secs": 0, "nanos": 123 },
+            "detail": null
+        }],
+        "selected_source": source,
+        "strategy": if truth_source == "mesh" { "best-available" } else { "prefer-host" },
+        "reason": "Classified the source attested by the selected host.",
+        "used_fallback": false,
+        "correlation_id": "01234567-89ab-cdef-0123-456789abcdef"
+    });
+    payload
+}
+
 fn status_provenance(scope: &str) -> Value {
     json!({
         "command": "status",
@@ -573,7 +606,7 @@ fn status_provenance(scope: &str) -> Value {
 }
 
 fn status_success_payload(truth_source: &str) -> Value {
-    json!({
+    let payload = json!({
         "status": "ok",
         "command": "status",
         "scope": "fleet",
@@ -584,7 +617,8 @@ fn status_success_payload(truth_source: &str) -> Value {
             "connectors": {},
             "uptime_seconds": 3600,
             "active_connections": 2,
-            "timestamp": "2026-03-12T00:00:00Z"
+            "timestamp": "2026-03-12T00:00:00Z",
+            "_truth_source": "host"
         },
         "registry_version": 7,
         "connectors": [
@@ -616,11 +650,12 @@ fn status_success_payload(truth_source: &str) -> Value {
         "schema_version": "fcp.fwc.truth-source.v1",
         "_truth_source": truth_source,
         "availability": command_availability("status", CommandAvailability::LiveRuntime)
-    })
+    });
+    with_live_read_metadata(payload, truth_source, "fleet-status", "/rpc/discover")
 }
 
 fn status_connector_success_payload(truth_source: &str) -> Value {
-    json!({
+    let payload = json!({
         "status": "ok",
         "command": "status",
         "scope": "connector",
@@ -660,7 +695,8 @@ fn status_connector_success_payload(truth_source: &str) -> Value {
         },
         "host_health": {
             "status": "healthy",
-            "timestamp": "2026-03-12T00:00:00Z"
+            "timestamp": "2026-03-12T00:00:00Z",
+            "_truth_source": "host"
         },
         "registry_version": 7,
         "next_actions": [
@@ -682,7 +718,13 @@ fn status_connector_success_payload(truth_source: &str) -> Value {
         "schema_version": "fcp.fwc.truth-source.v1",
         "_truth_source": truth_source,
         "availability": command_availability("status", CommandAvailability::LiveRuntime)
-    })
+    });
+    with_live_read_metadata(
+        payload,
+        truth_source,
+        "connector-runtime-status",
+        "/rpc/connector/fcp.github:enterprise:v1/status",
+    )
 }
 
 fn doctor_provenance() -> Value {
@@ -1303,7 +1345,7 @@ fn show_connector_resolution_error_payload() -> Value {
 }
 
 fn status_connector_resolution_error_payload() -> Value {
-    json!({
+    let payload = json!({
         "status": "error",
         "command": "status",
         "schema_version": "fcp.fwc.truth-source.v1",
@@ -1320,7 +1362,8 @@ fn status_connector_resolution_error_payload() -> Value {
                 "Use `fwc ops <connector>` before `schema` or `examples` when the operation name is uncertain."
             ]
         }
-    })
+    });
+    with_live_read_metadata(payload, "host", "connector-selection", "/rpc/discover")
 }
 
 fn resolver_internal_error_payload(case: CommandSchemaCase) -> Value {
@@ -1396,6 +1439,74 @@ fn fwc_command_truth_source_schemas_compile_and_validate_envelopes() {
         }
 
         assert_valid(&validator, &error_payload(*case), case.file);
+    }
+}
+
+#[test]
+fn fwc_live_read_error_schemas_require_complete_bounded_metadata() {
+    for case in CASES.iter().filter(|case| {
+        matches!(
+            case.command,
+            "list" | "show" | "schema" | "search" | "status"
+        )
+    }) {
+        let validator = validator(case.file);
+        for truth_source in ["host", "mesh"] {
+            let mut payload = error_payload(*case);
+            payload["_truth_source"] = json!(truth_source);
+            payload["error"]["actual"] = json!(truth_source);
+            payload["error"]["required"] = json!("mesh");
+            payload = with_live_read_metadata(
+                payload,
+                truth_source,
+                "connector-selection",
+                "/rpc/discover",
+            );
+            assert_valid(&validator, &payload, case.file);
+
+            for field in ["read_provenance", "decision_trace"] {
+                let mut incomplete = payload.clone();
+                incomplete.as_object_mut().unwrap().remove(field);
+                assert!(
+                    !validator.is_valid(&incomplete),
+                    "{} must reject unpaired live read metadata: {field}",
+                    case.file
+                );
+            }
+            for (pointer, value) in [
+                ("/read_provenance/replication_proven", json!(true)),
+                ("/read_provenance/authority", json!("connector-provider")),
+                ("/read_provenance/responses", json!([])),
+                ("/decision_trace/used_fallback", json!(true)),
+                (
+                    "/decision_trace/attempts/0/elapsed/nanos",
+                    json!(1_000_000_000),
+                ),
+            ] {
+                let mut malformed = payload.clone();
+                *malformed.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    !validator.is_valid(&malformed),
+                    "{} must reject malformed live read metadata at {pointer}",
+                    case.file
+                );
+            }
+            let mut malformed = payload.clone();
+            malformed["read_provenance"]["responses"][0]["local_connectors"] =
+                json!(if truth_source == "mesh" { 0 } else { 1 });
+            assert!(
+                !validator.is_valid(&malformed),
+                "discovery counts must be paired"
+            );
+            malformed["read_provenance"]["responses"][0]["mesh_connectors"] =
+                json!(if truth_source == "mesh" { 1 } else { 0 });
+            assert_valid(&validator, &malformed, case.file);
+            malformed["read_provenance"]["responses"][0]["unverified"] = json!(true);
+            assert!(
+                !validator.is_valid(&malformed),
+                "unknown evidence fields must be rejected"
+            );
+        }
     }
 }
 
@@ -1928,6 +2039,71 @@ fn fwc_status_schema_validates_connector_success() {
     assert_valid(&validator, &payload, "status.schema.json connector success");
     assert_eq!(payload["scope"], "connector");
     assert_eq!(payload["provenance"]["scope"], "connector-status");
+}
+
+#[test]
+fn fwc_status_schema_validates_mesh_read_origin_without_promoting_host_health() {
+    let validator = validator("status.schema.json");
+    let mut payload = status_connector_success_payload("mesh");
+    payload["provenance"]["mesh_backed"] = json!(true);
+    payload["provenance"]["transport"] = json!("host-verified-mesh-peer");
+    let route = json!({
+        "truth_source": "mesh-backed",
+        "entry_node": "node-a",
+        "served_by": "node-b",
+        "hop_count": 1,
+        "decision": "rendezvous-mesh-candidate"
+    });
+    payload["read_provenance"]["responses"][0]["route"] = route.clone();
+    payload["evidence_handles"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "kind": "mesh-read",
+            "route": route
+        }));
+    assert_valid(&validator, &payload, "mesh connector status");
+    assert_eq!(payload["host_health"]["_truth_source"], "host");
+
+    for field in ["read_provenance", "decision_trace"] {
+        let mut incomplete = payload.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert!(
+            !validator.is_valid(&incomplete),
+            "live status requires {field}"
+        );
+    }
+    let mut malformed = payload.clone();
+    malformed["provenance"]["transport"] = json!("node-local-root-app");
+    assert!(
+        !validator.is_valid(&malformed),
+        "mesh transport and origin must agree"
+    );
+    malformed = payload.clone();
+    malformed["host_health"]
+        .as_object_mut()
+        .unwrap()
+        .remove("_truth_source");
+    assert!(
+        !validator.is_valid(&malformed),
+        "host health must identify its own origin"
+    );
+    malformed = payload.clone();
+    malformed["read_provenance"]["responses"][0]["route"]["hop_count"] = json!(2);
+    assert!(
+        !validator.is_valid(&malformed),
+        "read route must preserve the one-hop contract"
+    );
+    malformed = payload;
+    malformed["evidence_handles"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["route"] = json!({});
+    assert!(
+        !validator.is_valid(&malformed),
+        "mesh evidence requires complete executor identity"
+    );
 }
 
 #[test]

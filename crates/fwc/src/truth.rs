@@ -56,11 +56,12 @@ use crate::intent::IntentProvenance;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KnowledgeState {
-    /// Answer derived from mesh-backed distributed state.
+    /// Answer derived from an authenticated mesh source.
     ///
-    /// The mesh object store was queried and returned a durable,
-    /// replicated answer. This is the highest-confidence source for
-    /// runtime state that has been committed to the mesh.
+    /// The evidence may be distributed object state or a peer response whose
+    /// signature and request binding the selected host verified. This labels
+    /// the answer's origin, not a guarantee of replication, quorum coverage,
+    /// mesh-wide completeness, or freshness; those require separate evidence.
     MeshBacked,
 
     /// Answer from the live host admin API (node-local authoritative).

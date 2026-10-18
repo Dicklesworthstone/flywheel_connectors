@@ -109,6 +109,29 @@ fn host_success_payload() -> Value {
         ],
         "schema_version": SEARCH_SCHEMA_VERSION,
         "_truth_source": "host",
+        "read_provenance": {
+            "authority": "selected-host",
+            "scope": "operation-search",
+            "replication_proven": false,
+            "responses": [{
+                "path": "/rpc/introspect/fcp.github",
+                "truth_source": "host-backed",
+                "attested": true
+            }]
+        },
+        "decision_trace": {
+            "attempts": [{
+                "source": "host-backed",
+                "outcome": "success",
+                "elapsed": { "secs": 0, "nanos": 123 },
+                "detail": null
+            }],
+            "selected_source": "host-backed",
+            "strategy": "prefer-host",
+            "reason": "Classified the source attested by the selected host.",
+            "used_fallback": false,
+            "correlation_id": "01234567-89ab-cdef-0123-456789abcdef"
+        },
         "availability": availability(CommandAvailability::LiveRuntime),
         "provenance": provenance("live_host_introspection", true)
     })
@@ -248,6 +271,40 @@ fn search_schema_validates_host_success_payload() {
     assert_valid(&payload);
     assert_eq!(payload["_truth_source"], "host");
     assert_eq!(payload["source"], "host-admin-api");
+}
+
+#[test]
+fn search_schema_requires_live_read_evidence_and_preserves_mesh_routes() {
+    let validator = validator();
+    let mut payload = host_success_payload();
+    for field in ["read_provenance", "decision_trace"] {
+        let mut incomplete = payload.clone();
+        incomplete.as_object_mut().unwrap().remove(field);
+        assert!(
+            !validator.is_valid(&incomplete),
+            "live search requires {field}"
+        );
+    }
+    payload["_truth_source"] = json!("mesh");
+    payload["read_provenance"]["responses"][0]["truth_source"] = json!("mesh-backed");
+    payload["decision_trace"]["attempts"][0]["source"] = json!("mesh-backed");
+    payload["decision_trace"]["selected_source"] = json!("mesh-backed");
+    payload["decision_trace"]["strategy"] = json!("best-available");
+    let route = json!({
+        "truth_source": "mesh-backed",
+        "entry_node": "node-a",
+        "served_by": "node-b",
+        "hop_count": 1,
+        "decision": "rendezvous-mesh-candidate"
+    });
+    payload["read_provenance"]["responses"][0]["route"] = route.clone();
+    payload["provenance"]["read_routes"] = json!([route]);
+    assert_valid(&payload);
+    payload["provenance"]["read_routes"][0]["served_by"] = json!("");
+    assert!(
+        !validator.is_valid(&payload),
+        "mesh read provenance requires an executor"
+    );
 }
 
 #[test]
