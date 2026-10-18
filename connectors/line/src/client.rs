@@ -200,6 +200,7 @@ impl LineClient {
     /// message twice — see [`MessageReplaySafety`]. Every caller must supply
     /// one, so a messaging endpoint added later cannot inherit a retry loop
     /// without its author deciding the question (br-kxd3e).
+    #[allow(clippy::too_many_lines)]
     async fn post_message(
         &self,
         runtime: &ConnectorRuntime,
@@ -209,7 +210,6 @@ impl LineClient {
     ) -> LineResult<SentMessageResponse> {
         let ctx = runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
-        let url = url.clone();
         let body_clone = body.clone();
         let client = self.client.clone();
         let token = self.channel_access_token.clone();
@@ -265,9 +265,10 @@ impl LineClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: LineError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -530,11 +531,13 @@ impl LineClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.channel_access_token.is_empty()
     }
@@ -583,9 +586,10 @@ impl LineClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: LineError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };

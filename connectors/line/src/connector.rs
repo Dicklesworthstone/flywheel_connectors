@@ -604,6 +604,8 @@ impl LineConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
         let provisioning = self.provisioning_readiness();
@@ -911,6 +913,8 @@ fn line_message_output_schema() -> Value {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -1418,6 +1422,7 @@ impl FcpConnector for LineConnector {
 }
 
 impl LineConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
@@ -1452,7 +1457,7 @@ impl LineConnector {
 
         let output = match operation {
             OP_PUSH => {
-                let to = req.input.get("to").and_then(|v| v.as_str()).ok_or(
+                let to = req.input.get("to").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
@@ -1480,7 +1485,7 @@ impl LineConnector {
                 let resp = client
                     .push_message(runtime, to, messages)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 let mut output = serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize response: {e}"),
                 })?;
@@ -1496,7 +1501,7 @@ impl LineConnector {
                 let reply_token = req
                     .input
                     .get("reply_token")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'reply_token' field".into(),
@@ -1523,7 +1528,7 @@ impl LineConnector {
                 let resp = client
                     .reply_message(runtime, reply_token, messages)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 let mut output = serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize response: {e}"),
                 })?;
@@ -1571,7 +1576,7 @@ impl LineConnector {
                 let resp = client
                     .multicast(runtime, &to, messages)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 let mut output = serde_json::to_value(resp).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize response: {e}"),
                 })?;
@@ -1584,7 +1589,7 @@ impl LineConnector {
                 output
             }
             OP_PROFILE_GET => {
-                let user_id = req.input.get("user_id").and_then(|v| v.as_str()).ok_or(
+                let user_id = req.input.get("user_id").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'user_id' field".into(),
@@ -1593,13 +1598,13 @@ impl LineConnector {
                 let profile = client
                     .get_profile(runtime, user_id)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 serde_json::to_value(profile).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize profile: {e}"),
                 })?
             }
             OP_GROUP_PROFILE => {
-                let group_id = req.input.get("group_id").and_then(|v| v.as_str()).ok_or(
+                let group_id = req.input.get("group_id").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'group_id' field".into(),
@@ -1608,23 +1613,23 @@ impl LineConnector {
                 let summary = client
                     .get_group_summary(runtime, group_id)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 serde_json::to_value(summary).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize group summary: {e}"),
                 })?
             }
             OP_GROUP_MEMBERS => {
-                let group_id = req.input.get("group_id").and_then(|v| v.as_str()).ok_or(
+                let group_id = req.input.get("group_id").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'group_id' field".into(),
                     },
                 )?;
-                let start = req.input.get("start").and_then(|v| v.as_str());
+                let start = req.input.get("start").and_then(Value::as_str);
                 let members = client
                     .get_group_members(runtime, group_id, start)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 serde_json::to_value(members).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize group members: {e}"),
                 })?
@@ -1633,7 +1638,7 @@ impl LineConnector {
                 let menus = client
                     .list_rich_menus(runtime)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 serde_json::to_value(menus).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize rich menus: {e}"),
                 })?
@@ -1648,14 +1653,14 @@ impl LineConnector {
                 let resp = client
                     .create_rich_menu(runtime, &menu)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 json!({ "richMenuId": resp.rich_menu_id })
             }
             OP_RICH_MENU_DELETE => {
                 let rich_menu_id = req
                     .input
                     .get("rich_menu_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'rich_menu_id' field".into(),
@@ -1663,11 +1668,14 @@ impl LineConnector {
                 client
                     .delete_rich_menu(runtime, rich_menu_id)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 json!({ "deleted": true })
             }
             OP_HEALTH => {
-                client.health_check().await.map_err(|e| e.to_fcp_error())?;
+                client
+                    .health_check()
+                    .await
+                    .map_err(|e| crate::error::LineError::to_fcp_error(&e))?;
                 json!({ "status": "healthy" })
             }
             _ => {

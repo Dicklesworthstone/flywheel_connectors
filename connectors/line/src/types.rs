@@ -329,12 +329,11 @@ impl Template {
                 )?;
                 let expected_shape = columns
                     .first()
-                    .map(CarouselColumn::uses_image_or_title)
-                    .unwrap_or(false);
+                    .is_some_and(CarouselColumn::uses_image_or_title);
                 let expected_action_count =
                     columns.first().map_or(0, |column| column.actions.len());
                 for (index, column) in columns.iter().enumerate() {
-                    let column_field = format!("{}.columns[{index}]", field);
+                    let column_field = format!("{field}.columns[{index}]");
                     column.validate(&column_field)?;
                     if column.uses_image_or_title() != expected_shape {
                         return Err(MessageValidationError::new(
@@ -360,7 +359,7 @@ impl Template {
                     "columns",
                 )?;
                 for (index, column) in columns.iter().enumerate() {
-                    column.validate(&format!("{}.columns[{index}]", field))?;
+                    column.validate(&format!("{field}.columns[{index}]"))?;
                 }
                 Ok(())
             }
@@ -419,7 +418,7 @@ impl Action {
 }
 
 impl CarouselColumn {
-    fn uses_image_or_title(&self) -> bool {
+    const fn uses_image_or_title(&self) -> bool {
         self.thumbnail_image_url.is_some() || self.title.is_some()
     }
 
@@ -473,7 +472,7 @@ fn validate_actions(
     label_max: usize,
 ) -> Result<(), MessageValidationError> {
     for (index, action) in actions.iter().enumerate() {
-        action.validate(&format!("{}.actions[{index}]", field), label_max)?;
+        action.validate(&format!("{field}.actions[{index}]"), label_max)?;
     }
     Ok(())
 }

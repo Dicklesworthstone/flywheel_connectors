@@ -129,11 +129,10 @@ async fn setup_connector_with_checker(
     base_url: &str,
     checker: Option<Arc<InMemoryThreadOwnershipChecker>>,
 ) -> (LineConnector, Ed25519SigningKey, InstanceId) {
-    let mut connector = match checker {
-        Some(checker) => LineConnector::new()
-            .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory),
-        None => LineConnector::new(),
-    };
+    let mut connector = checker.map_or_else(LineConnector::new, |checker| {
+        LineConnector::new()
+            .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory)
+    });
     let signing_key = Ed25519SigningKey::generate();
     let instance_id = InstanceId::new();
     connector
