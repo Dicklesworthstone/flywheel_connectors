@@ -1076,19 +1076,32 @@ async fn test_list_satisfaction_ratings_no_filter() {
 }
 
 // ============================================================================
-// Replay safety on retry (br-kxd3e)
+// Replay safety on retry with Idempotency-Key (br-kxd3e / br-d018i)
 // ============================================================================
 //
-// Zendesk has no idempotency key wired here, so a 5xx retry on create_ticket
-// files a second support ticket. The assertion is the REQUEST COUNT.
+// Zendesk Ticketing API (`POST /api/v2/tickets.json`) honors `Idempotency-Key`
+// across retries, returning `201 Created` with `x-idempotency-lookup: hit` on
+// replay rather than creating a duplicate ticket.
 
 #[fcp_async_core::runtime::test]
-async fn create_ticket_is_not_retried_after_a_5xx() {
+async fn create_ticket_retries_after_5xx_with_stable_idempotency_key() {
     let _ctx = AsyncTestContext::for_scenario("zendesk-create-ticket-replay-safety");
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/tickets.json"))
         .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tickets.json"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("x-idempotency-lookup", "hit")
+                .set_body_json(json!({
+                    "ticket": { "id": 1, "subject": "help", "status": "new" }
+                })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -1099,18 +1112,29 @@ async fn create_ticket_is_not_retried_after_a_5xx() {
 
     let result = client
         .create_ticket(&json!({ "subject": "help", "comment": { "body": "x" } }))
-        .await;
-    assert!(result.is_err());
+        .await
+        .expect("create_ticket with Idempotency-Key must retry 503 and succeed on replay");
+    assert_eq!(result["ticket"]["id"], 1);
 
     let requests = mock_server
         .received_requests()
         .await
         .expect("recorded requests");
+    assert_eq!(requests.len(), 2);
+    let key_0 = requests[0]
+        .headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .expect("Idempotency-Key header on attempt 1");
+    let key_1 = requests[1]
+        .headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .expect("Idempotency-Key header on attempt 2");
+    assert!(!key_0.is_empty());
     assert_eq!(
-        requests.len(),
-        1,
-        "a 503 means Zendesk received the create — retrying files a SECOND \
-         support ticket"
+        key_0, key_1,
+        "both attempts must send the identical Idempotency-Key so Zendesk deduplicates the replay"
     );
 }
 
@@ -1151,4 +1175,15 @@ async fn create_ticket_still_retries_a_429() {
         2,
         "429 means Zendesk did NOT file the ticket, so backoff must be preserved"
     );
+    let key_0 = requests[0]
+        .headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .expect("Idempotency-Key header on attempt 1");
+    let key_1 = requests[1]
+        .headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .expect("Idempotency-Key header on attempt 2");
+    assert_eq!(key_0, key_1);
 }

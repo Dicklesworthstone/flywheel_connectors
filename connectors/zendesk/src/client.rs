@@ -196,14 +196,21 @@ impl ZendeskClient {
     // ── Ticket operations ─────────────────────────────────────────
 
     /// Create a new ticket.
+    ///
+    /// Generates a stable `Idempotency-Key` UUID per logical operation so
+    /// retries after transient 5xx or post-connect errors return Zendesk's
+    /// cached `201 Created` response (`x-idempotency-lookup: hit`) instead of
+    /// filing a duplicate support ticket (br-d018i).
     pub async fn create_ticket(
         &self,
         ticket_data: &serde_json::Value,
     ) -> ZendeskResult<serde_json::Value> {
         let url = format!("{}/tickets.json", self.base_url);
         let body = serde_json::json!({ "ticket": ticket_data });
-        // NOT replay-safe: a duplicate is a second support ticket.
-        let data = self.post_json(&url, &body, false).await?;
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let data = self
+            .post_json_idempotent(&url, &body, &idempotency_key)
+            .await?;
         Ok(data)
     }
 
@@ -407,22 +414,28 @@ impl ZendeskClient {
         self.execute(|| self.http.get(url), true).await
     }
 
-    /// POST with retry.
+    /// POST with a stable `Idempotency-Key` header (br-d018i).
     ///
-    /// `replay_safe` states whether repeating this request can duplicate a
-    /// side effect (br-kxd3e). Zendesk documents an `Idempotency-Key` header
-    /// on some POST endpoints; threading it would make these retries genuinely
-    /// safe rather than refused, and is recorded as a follow-up on the bead
-    /// rather than done blind, because claiming dedup on an endpoint that does
-    /// not honour the header would be false assurance.
-    async fn post_json(
+    /// Zendesk Ticketing API (`POST /api/v2/tickets.json`) deduplicates
+    /// requests carrying `Idempotency-Key` within its 2-hour caching window,
+    /// returning the cached `201 Created` response (`x-idempotency-lookup: hit`)
+    /// on replay rather than creating a duplicate ticket.
+    async fn post_json_idempotent(
         &self,
         url: &str,
         body: &serde_json::Value,
-        replay_safe: bool,
+        idempotency_key: &str,
     ) -> ZendeskResult<serde_json::Value> {
-        self.execute(|| self.http.post(url).json(body), replay_safe)
-            .await
+        self.execute(
+            || {
+                self.http
+                    .post(url)
+                    .header("Idempotency-Key", idempotency_key)
+                    .json(body)
+            },
+            true,
+        )
+        .await
     }
 
     async fn put_json(
