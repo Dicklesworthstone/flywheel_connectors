@@ -11,6 +11,10 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::error::{TwitchError, TwitchResult};
+use crate::types::{
+    Channel, Clip, CreateClipResponse, Game, HelixResponse, ModifyChannelRequest,
+    SendChatMessageResponse, Stream, TokenResponse, User, ValidatedToken,
+};
 
 /// Percent-encode set for `application/x-www-form-urlencoded` values: encode
 /// everything except the RFC 3986 unreserved characters (`-`, `_`, `.`, `~`).
@@ -19,7 +23,6 @@ const FORM_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
-use crate::types::*;
 
 /// Twitch Helix API client with OAuth2 client credentials.
 pub struct TwitchClient {
@@ -52,6 +55,10 @@ impl std::fmt::Debug for TwitchClient {
 
 impl TwitchClient {
     /// Create a new Twitch client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be built.
     pub fn new(
         base_url: &str,
         token_url: &str,
@@ -85,6 +92,10 @@ impl TwitchClient {
     /// never in the URL query string: reqwest's `Error` `Display` appends the
     /// full request URL, so a secret placed in the query would leak into any
     /// transport-error message or log. The body keeps the secret off the URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token request fails.
     pub async fn acquire_token(&mut self) -> TwitchResult<()> {
         // Build the form body manually (the workspace `reqwest` is compiled
         // without the feature that provides `RequestBuilder::form`). Values are
@@ -126,6 +137,10 @@ impl TwitchClient {
     }
 
     /// Validate the current OAuth token with Twitch's /validate endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if token validation fails.
     pub async fn validate_token(&self) -> TwitchResult<ValidatedToken> {
         let token = self.token()?;
         let resp = self
@@ -208,9 +223,10 @@ impl TwitchClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: TwitchError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -248,6 +264,10 @@ impl TwitchClient {
     }
 
     /// List live streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn list_streams(
         &self,
         runtime: &ConnectorRuntime,
@@ -269,6 +289,10 @@ impl TwitchClient {
     }
 
     /// Get a specific stream by user login.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn get_stream(
         &self,
         runtime: &ConnectorRuntime,
@@ -279,6 +303,10 @@ impl TwitchClient {
     }
 
     /// Get user info by login.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn get_user(
         &self,
         runtime: &ConnectorRuntime,
@@ -289,6 +317,10 @@ impl TwitchClient {
     }
 
     /// Get channel info.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn get_channel(
         &self,
         runtime: &ConnectorRuntime,
@@ -299,6 +331,10 @@ impl TwitchClient {
     }
 
     /// Modify channel information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn modify_channel(
         &self,
         runtime: &ConnectorRuntime,
@@ -363,13 +399,13 @@ impl TwitchClient {
                     status,
                     message: text,
                 };
-                if !matches!(decision, RetryDecision::Terminal) {
+                if matches!(decision, RetryDecision::Terminal) {
+                    AttemptOutcome::Terminal(err)
+                } else {
                     AttemptOutcome::Retryable {
                         error: err,
                         retry_after: None,
                     }
-                } else {
-                    AttemptOutcome::Terminal(err)
                 }
             }
         })
@@ -377,6 +413,10 @@ impl TwitchClient {
     }
 
     /// List clips for a broadcaster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn list_clips(
         &self,
         runtime: &ConnectorRuntime,
@@ -391,6 +431,10 @@ impl TwitchClient {
     }
 
     /// Create a clip.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn create_clip(
         &self,
         runtime: &ConnectorRuntime,
@@ -464,6 +508,10 @@ impl TwitchClient {
     }
 
     /// Send a chat message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn send_chat_message(
         &self,
         runtime: &ConnectorRuntime,
@@ -542,6 +590,10 @@ impl TwitchClient {
     }
 
     /// List games by name or ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails.
     pub async fn list_games(
         &self,
         runtime: &ConnectorRuntime,
@@ -559,6 +611,10 @@ impl TwitchClient {
     }
 
     /// Health check: validate the OAuth token and verify Helix reachability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the health check fails.
     pub async fn health_check(&self) -> TwitchResult<ValidatedToken> {
         let validation = self.validate_token().await?;
         let token = self.token()?;
@@ -590,12 +646,14 @@ impl TwitchClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if token is set.
-    pub fn has_token(&self) -> bool {
+    #[must_use]
+    pub const fn has_token(&self) -> bool {
         self.access_token.is_some()
     }
 }

@@ -158,6 +158,8 @@ impl TwitchConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
 
@@ -226,7 +228,7 @@ impl TwitchConnector {
                 critical: true,
             });
 
-            let oauth_ready = self.client.as_ref().is_some_and(|c| c.has_token());
+            let oauth_ready = self.client.as_ref().is_some_and(TwitchClient::has_token);
             checks.push(DoctorCheck {
                 name: "oauth_token".into(),
                 passed: oauth_ready,
@@ -250,6 +252,8 @@ impl Default for TwitchConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -657,6 +661,7 @@ impl FcpConnector for TwitchConnector {
 }
 
 impl TwitchConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
@@ -686,59 +691,67 @@ impl TwitchConnector {
 
         let output = match operation {
             OP_STREAMS_LIST => {
-                let game_id = req.input.get("game_id").and_then(|v| v.as_str());
-                let user_login = req.input.get("user_login").and_then(|v| v.as_str());
+                let game_id = req.input.get("game_id").and_then(serde_json::Value::as_str);
+                let user_login = req
+                    .input
+                    .get("user_login")
+                    .and_then(serde_json::Value::as_str);
                 let first = req
                     .input
                     .get("first")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok());
                 let resp = client
                     .list_streams(runtime, game_id, user_login, first)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let count = resp.data.len();
                 json!({ "streams": resp.data, "count": count })
             }
             OP_STREAMS_GET => {
-                let user_login = req.input.get("user_login").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let user_login = req
+                    .input
+                    .get("user_login")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'user_login' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_stream(runtime, user_login)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let is_live = !resp.data.is_empty();
                 let stream = resp.data.into_iter().next();
                 json!({ "stream": stream, "is_live": is_live })
             }
             OP_USERS_GET => {
-                let login = req.input.get("login").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let login = req
+                    .input
+                    .get("login")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'login' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_user(runtime, login)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let user = resp.data.into_iter().next();
-                match user {
-                    Some(u) => serde_json::to_value(u).map_err(|e| FcpError::Internal {
+                if let Some(u) = user {
+                    serde_json::to_value(u).map_err(|e| FcpError::Internal {
                         message: format!("Failed to serialize user: {e}"),
-                    })?,
-                    None => json!({ "error": "User not found" }),
+                    })?
+                } else {
+                    json!({ "error": "User not found" })
                 }
             }
             OP_CHANNELS_GET => {
                 let broadcaster_id = req
                     .input
                     .get("broadcaster_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'broadcaster_id' field".into(),
@@ -746,20 +759,21 @@ impl TwitchConnector {
                 let resp = client
                     .get_channel(runtime, broadcaster_id)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let channel = resp.data.into_iter().next();
-                match channel {
-                    Some(c) => serde_json::to_value(c).map_err(|e| FcpError::Internal {
+                if let Some(c) = channel {
+                    serde_json::to_value(c).map_err(|e| FcpError::Internal {
                         message: format!("Failed to serialize channel: {e}"),
-                    })?,
-                    None => json!({ "error": "Channel not found" }),
+                    })?
+                } else {
+                    json!({ "error": "Channel not found" })
                 }
             }
             OP_CLIPS_LIST => {
                 let broadcaster_id = req
                     .input
                     .get("broadcaster_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'broadcaster_id' field".into(),
@@ -767,22 +781,22 @@ impl TwitchConnector {
                 let first = req
                     .input
                     .get("first")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok());
                 let resp = client
                     .list_clips(runtime, broadcaster_id, first)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let count = resp.data.len();
                 json!({ "clips": resp.data, "count": count })
             }
             OP_GAMES_LIST => {
-                let name = req.input.get("name").and_then(|v| v.as_str());
-                let id = req.input.get("id").and_then(|v| v.as_str());
+                let name = req.input.get("name").and_then(serde_json::Value::as_str);
+                let id = req.input.get("id").and_then(serde_json::Value::as_str);
                 let resp = client
                     .list_games(runtime, name, id)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::TwitchError::to_fcp_error(&e))?;
                 let count = resp.data.len();
                 json!({ "games": resp.data, "count": count })
             }
@@ -844,7 +858,7 @@ mod tests {
             .and_then(toml::Value::as_table)
             .and_then(|operation| operation.get(field))
             .ok_or_else(|| format!("{operation_id} should declare {field}"))?;
-        if schema.as_table().is_none_or(|table| table.is_empty()) {
+        if schema.as_table().is_none_or(toml::map::Map::is_empty) {
             return Err(format!(
                 "{operation_id}.{field} should be a non-empty schema table"
             ));
