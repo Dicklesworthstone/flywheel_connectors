@@ -401,3 +401,27 @@ fn mesh_provenance_and_receipt_fields_survive_batch_result_adaptation() {
     result.output = Some(output.clone());
     assert_eq!(member_outcome("a", result).unwrap(), output);
 }
+
+#[test]
+fn inconsistent_member_results_are_unknown_and_never_retryable() {
+    let operation = member("a", &[]);
+    let mut output_with_error = failure(&operation);
+    output_with_error.output = Some(json!({"effect_may_have_completed": true}));
+    let mut success_with_error = success(&operation);
+    success_with_error.error = failure(&operation).error;
+    let mut success_without_output = success(&operation);
+    success_without_output.output = None;
+    let mut failure_without_error = failure(&operation);
+    failure_without_error.error = None;
+    for result in [
+        output_with_error,
+        success_with_error,
+        success_without_output,
+        failure_without_error,
+    ] {
+        let error =
+            member_outcome("a", result).expect_err("inconsistent result is not authoritative");
+        assert_eq!(error.code, "BATCH_OUTCOME_UNKNOWN");
+        assert_eq!(error.retry_after_ms, None);
+    }
+}

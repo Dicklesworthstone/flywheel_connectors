@@ -5,6 +5,20 @@ into a later operation's input. This uses the ordinary batch DAG and ordinary
 invoke authorization; it does not mint tokens, approve operations, acquire
 leases, or retry failed work.
 
+Submit the batch to `POST /rpc/batch` or `POST /rpc/batch-invoke`. Both routes
+use the bounded asynchronous executor: a newly available slot can start another
+ready operation, and a dependent can start as soon as its own prerequisites
+succeed. Unrelated slow operations do not impose a tier or chunk barrier.
+Results remain in the original submission order.
+
+Each member follows the same local or authenticated mesh route as an individual
+invoke. Remote-only connectors and elected singleton writers are therefore
+reachable from batches, and successful outputs retain the invocation's route
+provenance and receipt fields. Discovery and forwarding consume the original
+batch deadline; an individual member's deadline may only shorten that budget.
+Submitted capability, principal, approval and idempotency checks still apply
+at the chosen executor.
+
 ## Request syntax
 
 Inside a member's `request.input`, use a single-key reference object:
@@ -124,6 +138,14 @@ result-delivery failure accounting; it does not turn a known successful source
 effect into a failed external action. Already admitted work drains under the
 original budget, and known results remain available. There is no automatic
 retry and no attempt to undo a provider action.
+
+The host rejects duplicate invocation request IDs, invalid invocation types,
+invalid idempotency keys and invalid dependency graphs before starting any
+member. Distinct DAG IDs must not alias the same durable invocation identity.
+Invocation transport refusals retain their HTTP status in an
+`INVOKE_HTTP_<status>` error code without inventing a retry hint; connector
+errors retain their own codes and retry hints. Missing or inconsistent result
+envelopes produce `BATCH_OUTCOME_UNKNOWN` and cannot release a dependent.
 
 Planning, resolution, queueing and execution share the original batch deadline.
 No per-reference timeout is reset and no detached binding tasks are started.

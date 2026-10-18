@@ -56,15 +56,16 @@ use fcp_evidence::{
     OwnerMigrationVerificationContext, SoftwareBillOfMaterials, SupplyChainAttestation,
     TrustedV3OwnerMap, verify_hybrid_owner_object,
 };
-use fcp_host::discovery::RoutedReadResponse;
+#[cfg(test)]
+use fcp_host::BatchStatus;
+use fcp_host::RoutedReadResponse;
 use fcp_host::{
     AdaptiveWarmPoolConfig, AdaptiveWarmPoolController, BatchExecutor, BatchInvokeRequest,
     BatchInvokeResponse, BatchOperation, BatchOperationError, BatchOptions, BatchScheduleHint,
-    BatchScheduleReport, BatchSchedulerMode, BatchStatus, BudgetAction, BudgetPolicyEngine,
-    BudgetReportRequest, BudgetReportResponse, CacheMetadata, CacheValidator,
-    CancellationController, CancellationRegistration, CancellationRequest, CancellationResponse,
-    CancellationScope, CancellationTerminator, CapabilityTokenVerifyRequest, ConfigRevisionRecord,
-    ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
+    BudgetAction, BudgetPolicyEngine, BudgetReportRequest, BudgetReportResponse, CacheMetadata,
+    CacheValidator, CancellationController, CancellationRegistration, CancellationRequest,
+    CancellationResponse, CancellationScope, CancellationTerminator, CapabilityTokenVerifyRequest,
+    ConfigRevisionRecord, ConnectorAdminState, ConnectorAdminStatus, ConnectorArchetype,
     ConnectorArtifactMetadataResponse, ConnectorArtifactRegistrationRequest,
     ConnectorArtifactRegistrationResponse, ConnectorConfigApplyRequest,
     ConnectorConfigApplyResponse, ConnectorConfigDiffRequest, ConnectorConfigDiffResponse,
@@ -150,6 +151,7 @@ use fcp_sandbox::{
     WasiConnectorRunner, host_matches_allow_list,
 };
 use fcp_telemetry::{TelemetryConfig, TelemetryError, metrics, otlp_readiness};
+#[cfg(test)]
 use futures_util::future::join_all;
 use futures_util::future::{AbortHandle, Abortable};
 use hyper::body::Incoming;
@@ -161,14 +163,16 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tower::ServiceExt;
 
+#[path = "fcp-host/connector_state_transfer.rs"]
+mod connector_state_transfer;
+#[path = "fcp-host/http_batch.rs"]
+mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
 mod session;
-#[path = "fcp-host/connector_state_transfer.rs"]
-mod connector_state_transfer;
 
 use native_rpc::{NativeInvocationTermination, NativeRpc, invocation_deadline};
 
@@ -10189,6 +10193,21 @@ async fn budget_report_handler(
     Ok(Json(report))
 }
 
+/// The entry host reports discovery origin after verifying peer advertisements.
+/// Mixed inventories retain host truth; these headers do not attest replication
+/// or quorum, and never come from an upstream response or provider JSON.
+fn discovery_origin_headers(mut headers: HeaderMap, mesh_backed: bool) -> HeaderMap {
+    headers.insert(
+        "x-fcp-truth-source",
+        HeaderValue::from_static(if mesh_backed {
+            "mesh-backed"
+        } else {
+            "host-backed"
+        }),
+    );
+    headers
+}
+
 async fn discover_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -10220,6 +10239,8 @@ async fn discover_handler(
         .await;
     let cache_hit = result.cache_hit;
     let mut response = result.response;
+    let local_count = response.connectors.len();
+    let mesh_count = mesh_connectors.len();
     if !mesh_connectors.is_empty() {
         response.connectors.extend(mesh_connectors);
         response.cache = None;
@@ -10232,7 +10253,18 @@ async fn discover_handler(
         duration_ms = started_at.elapsed().as_millis() as u64,
         "discovery request complete"
     );
-    let response_headers = cache_headers(response.cache.as_ref());
+    // A mixed inventory retains the weaker host source. A remote contribution
+    // must not promote unrelated local records, or an empty inventory, to mesh
+    // truth. Counts let clients disclose the mixed origin without overstating it.
+    let mut response_headers = discovery_origin_headers(
+        cache_headers(response.cache.as_ref()),
+        local_count == 0 && mesh_count > 0,
+    );
+    response_headers.insert(
+        "x-fcp-truth-local-connectors",
+        HeaderValue::from(local_count),
+    );
+    response_headers.insert("x-fcp-truth-mesh-connectors", HeaderValue::from(mesh_count));
     (response_headers, Json(response))
 }
 
@@ -14325,10 +14357,21 @@ async fn invoke_handler(
 /// Other requests use verified peer advertisements (answer stamped `mesh-backed`).
 async fn route_invoke(
     state: &Arc<AppState>,
-    mut request: InvokeRequest,
+    request: InvokeRequest,
     asserted_principal: Option<String>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    let deadline = invocation_deadline(Instant::now(), request.deadline_ms);
+    route_invoke_with_deadline(state, request, asserted_principal, None).await
+}
+
+/// Shared routing boundary for individual and batch invocations. Discovery,
+/// local admission, and remote delivery consume the same original batch budget.
+async fn route_invoke_with_deadline(
+    state: &Arc<AppState>,
+    mut request: InvokeRequest,
+    asserted_principal: Option<String>,
+    parent_deadline: Option<Instant>,
+) -> Result<InvokeResponse, (StatusCode, String)> {
+    let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, parent_deadline);
     let Some(router) = state.mesh.clone() else {
         constrain_invoke_deadline(&mut request, deadline);
         return invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
@@ -15710,117 +15753,8 @@ async fn record_invoke_budget_usage(
     true
 }
 
-fn batch_timeout_error() -> BatchOperationError {
-    BatchOperationError {
-        code: "BATCH_TIMEOUT".to_string(),
-        message: "batch timeout exceeded".to_string(),
-        retry_after_ms: None,
-    }
-}
-
-fn dependency_failed_error() -> BatchOperationError {
-    BatchOperationError {
-        code: "DEP_FAILED".to_string(),
-        message: "dependency failed".to_string(),
-        retry_after_ms: None,
-    }
-}
-
-fn batch_error_from_host_error(err: HostError) -> BatchOperationError {
-    let code = match err {
-        HostError::ConnectorNotFound(_) => "CONNECTOR_NOT_FOUND",
-        HostError::InvalidFilter(_) => "INVALID_REQUEST",
-        HostError::RegistryError(_) => "CONNECTOR_ERROR",
-        HostError::PreflightFailed(_) => "PREFLIGHT_DENIED",
-        HostError::ZoneEnvelopeRequired(_) => "ZONE_ENVELOPE_REQUIRED",
-        HostError::CacheError(_) => "CACHE_ERROR",
-        HostError::Unavailable(_) => "UNAVAILABLE",
-        HostError::Internal(_) => "INTERNAL_ERROR",
-    };
-
-    BatchOperationError {
-        code: code.to_string(),
-        message: err.to_string(),
-        retry_after_ms: None,
-    }
-}
-
-fn skipped_batch_result(id: String, error: Option<BatchOperationError>) -> OperationResult {
-    OperationResult {
-        id,
-        status: OperationResultStatus::Skipped,
-        output: None,
-        error,
-        duration_ms: 0,
-    }
-}
-
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-fn dependency_failed_in_batch(
-    operation: &HttpBatchOperation,
-    results_map: &HashMap<String, OperationResult>,
-) -> bool {
-    operation.depends_on.iter().any(|dependency_id| {
-        results_map
-            .get(dependency_id.as_str())
-            .is_some_and(|result| result.status != OperationResultStatus::Success)
-    })
-}
-
-fn batch_status(aborted: bool, completed: usize, failed: usize) -> BatchStatus {
-    if aborted && failed > 0 {
-        BatchStatus::Aborted
-    } else if failed == 0 {
-        BatchStatus::Success
-    } else if completed == 0 {
-        BatchStatus::AllFailed
-    } else {
-        BatchStatus::PartialSuccess
-    }
-}
-
-fn build_batch_response(
-    request: &HttpBatchInvokeRequest,
-    mut results_map: HashMap<String, OperationResult>,
-    aborted: bool,
-    started_at: Instant,
-    schedule_report: Option<BatchScheduleReport>,
-) -> BatchInvokeResponse {
-    let results: Vec<OperationResult> = request
-        .operations
-        .iter()
-        .map(|operation| {
-            results_map
-                .remove(operation.id.as_str())
-                .unwrap_or_else(|| skipped_batch_result(operation.id.clone(), None))
-        })
-        .collect();
-
-    let completed = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Success)
-        .count();
-    let failed = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Error)
-        .count();
-    let skipped = results
-        .iter()
-        .filter(|result| result.status == OperationResultStatus::Skipped)
-        .count();
-
-    BatchInvokeResponse {
-        status: batch_status(aborted, completed, failed),
-        completed,
-        failed,
-        skipped,
-        results,
-        total_duration_ms: elapsed_millis(started_at),
-        schedule_report,
-    }
 }
 
 async fn execute_batch_operation(
@@ -15832,12 +15766,12 @@ async fn execute_batch_operation(
     let started_at = Instant::now();
     // Each admitted member owns its result/finalization even if the batch's
     // HTTP waiter disappears. Unstarted members remain with the scheduler.
-    let result = invoke_jobs::execute(
+    let result = Box::pin(route_invoke_with_deadline(
         &state,
         operation.request,
         principal_override.as_deref().map(ToOwned::to_owned),
         batch_deadline,
-    )
+    ))
     .await;
     let duration_ms = elapsed_millis(started_at);
     match result {
@@ -15865,21 +15799,31 @@ async fn execute_batch_operation(
                 duration_ms,
             }
         }
-        Ok(response) => OperationResult {
-            id: operation.id,
-            status: OperationResultStatus::Success,
-            output: Some(
-                serde_json::to_value(&response)
-                    .unwrap_or_else(|_| json!({ "status": "serialization_error" })),
-            ),
-            error: None,
-            duration_ms,
+        Ok(response) => match serde_json::to_value(&response) {
+            Ok(output) => OperationResult {
+                id: operation.id,
+                status: OperationResultStatus::Success,
+                output: Some(output),
+                error: None,
+                duration_ms,
+            },
+            Err(_) => OperationResult {
+                id: operation.id,
+                status: OperationResultStatus::Error,
+                output: None,
+                error: Some(BatchOperationError {
+                    code: "BATCH_OUTCOME_UNKNOWN".to_owned(),
+                    message: "completed invocation response could not be encoded; reconcile before retrying".to_owned(),
+                    retry_after_ms: None,
+                }),
+                duration_ms,
+            },
         },
         Err(error) => OperationResult {
             id: operation.id,
             status: OperationResultStatus::Error,
             output: None,
-            error: Some(batch_error_from_host_error(error)),
+            error: Some(http_batch::route_failure(error)),
             duration_ms,
         },
     }
@@ -15890,135 +15834,7 @@ async fn batch_invoke_handler(
     headers: HeaderMap,
     Json(request): Json<HttpBatchInvokeRequest>,
 ) -> Result<Json<BatchInvokeResponse>, (StatusCode, String)> {
-    let started_at = Instant::now();
-    let asserted_principal = extract_principal_header(&headers).map(Arc::<str>::from);
-    tracing::debug!(
-        event = "batch_invoke_request",
-        operation_count = request.operations.len(),
-        max_parallelism = request.options.max_parallelism,
-        stop_on_first_error = request.options.stop_on_first_error,
-        timeout_ms = request.options.timeout_ms,
-        asserted_principal = asserted_principal.as_deref(),
-        "processing batch invoke request"
-    );
-
-    let executor = BatchExecutor::new();
-    let planning_request = request.planning_request();
-    let (plan, schedule_report) = executor
-        .plan_with_schedule_report(&planning_request)
-        .map_err(map_host_error)?;
-    let schedule_report = matches!(request.options.scheduler.mode, BatchSchedulerMode::Adaptive)
-        .then_some(schedule_report);
-    let timeout = Duration::from_millis(request.options.timeout_ms);
-    // Preserve the original batch budget through every member's preflight,
-    // queue and IO. An unrepresentable huge timeout still uses the elapsed
-    // checks below; it must not become an already-expired Instant.
-    let batch_deadline = started_at.checked_add(timeout);
-    let max_parallelism = usize::try_from(request.options.max_parallelism)
-        .unwrap_or(usize::MAX)
-        .max(1);
-
-    let operation_map: HashMap<String, HttpBatchOperation> = request
-        .operations
-        .iter()
-        .cloned()
-        .map(|operation| (operation.id.clone(), operation))
-        .collect();
-    let mut results_map: HashMap<String, OperationResult> =
-        HashMap::with_capacity(request.operations.len());
-    let mut aborted = false;
-
-    for tier in &plan.tiers {
-        if aborted {
-            for operation_id in &tier.operation_ids {
-                results_map.insert(
-                    operation_id.clone(),
-                    skipped_batch_result(operation_id.clone(), None),
-                );
-            }
-            continue;
-        }
-
-        for chunk in tier.operation_ids.chunks(max_parallelism) {
-            if started_at.elapsed() >= timeout {
-                aborted = true;
-                let timeout_error = batch_timeout_error();
-                for operation_id in chunk {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), Some(timeout_error.clone())),
-                    );
-                }
-                continue;
-            }
-
-            // stop_on_first_error tripped in an earlier chunk of this tier:
-            // short-circuit the remaining chunks instead of executing them
-            // (the tier-level check above only catches subsequent tiers).
-            if aborted {
-                for operation_id in chunk {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), None),
-                    );
-                }
-                continue;
-            }
-
-            let mut ready = Vec::new();
-            for operation_id in chunk {
-                let operation = operation_map
-                    .get(operation_id.as_str())
-                    .expect("planned batch operation must exist");
-                if dependency_failed_in_batch(operation, &results_map) {
-                    results_map.insert(
-                        operation_id.clone(),
-                        skipped_batch_result(operation_id.clone(), Some(dependency_failed_error())),
-                    );
-                } else {
-                    ready.push(operation.clone());
-                }
-            }
-
-            if ready.is_empty() {
-                continue;
-            }
-
-            let chunk_results = join_all(ready.into_iter().map(|operation| {
-                execute_batch_operation(
-                    Arc::clone(&state),
-                    operation,
-                    asserted_principal.clone(),
-                    batch_deadline,
-                )
-            }))
-            .await;
-
-            let chunk_failed = chunk_results
-                .iter()
-                .any(|result| result.status == OperationResultStatus::Error);
-            for result in chunk_results {
-                results_map.insert(result.id.clone(), result);
-            }
-            if request.options.stop_on_first_error && chunk_failed {
-                aborted = true;
-            }
-        }
-    }
-
-    let response =
-        build_batch_response(&request, results_map, aborted, started_at, schedule_report);
-    tracing::info!(
-        event = "batch_invoke_response",
-        operation_count = request.operations.len(),
-        completed = response.completed,
-        failed = response.failed,
-        skipped = response.skipped,
-        status = ?response.status,
-        duration_ms = started_at.elapsed().as_millis() as u64,
-        "batch invoke request complete"
-    );
-    Ok(Json(response))
+    http_batch::execute(state, headers, request).await.map(Json)
 }
 
 async fn supply_chain_verify_handler(
