@@ -199,7 +199,7 @@ impl WhatsAppWebhook {
     /// Numbers shorter than 6 chars are fully redacted.
     #[must_use]
     pub fn redact_phone(phone: &str) -> String {
-        let digits: Vec<char> = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: Vec<char> = phone.chars().filter(char::is_ascii_digit).collect();
         if digits.len() < 6 {
             return "***".to_string();
         }
@@ -210,6 +210,7 @@ impl WhatsAppWebhook {
     }
 
     /// Parse a single webhook change into events.
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn parse_change(
         &self,
         change: &WebhookChange,
@@ -235,7 +236,8 @@ impl WhatsAppWebhook {
         Ok(events)
     }
 
-    /// Convert an incoming message to a WebhookEvent.
+    /// Convert an incoming message to a `WebhookEvent`.
+    #[allow(clippy::unused_self)]
     fn message_to_event(
         &self,
         msg: &IncomingMessage,
@@ -261,8 +263,7 @@ impl WhatsAppWebhook {
         let phone_number_id = value
             .metadata
             .as_ref()
-            .map(|m| m.phone_number_id.as_str())
-            .unwrap_or("");
+            .map_or("", |m| m.phone_number_id.as_str());
 
         let payload = serde_json::json!({
             "message": {
@@ -276,7 +277,7 @@ impl WhatsAppWebhook {
             },
             "metadata": {
                 "phone_number_id": phone_number_id,
-                "display_phone_number": value.metadata.as_ref().map(|m| m.display_phone_number.as_str()).unwrap_or(""),
+                "display_phone_number": value.metadata.as_ref().map_or("", |m| m.display_phone_number.as_str()),
                 "entry_id": entry_id,
             }
         });
@@ -294,7 +295,8 @@ impl WhatsAppWebhook {
             .with_headers(headers.clone())
     }
 
-    /// Convert a status update to a WebhookEvent.
+    /// Convert a status update to a `WebhookEvent`.
+    #[allow(clippy::unused_self)]
     fn status_to_event(
         &self,
         status: &MessageStatus,
@@ -320,8 +322,7 @@ impl WhatsAppWebhook {
         let phone_number_id = value
             .metadata
             .as_ref()
-            .map(|m| m.phone_number_id.as_str())
-            .unwrap_or("");
+            .map_or("", |m| m.phone_number_id.as_str());
 
         let payload = serde_json::json!({
             "status": {
@@ -332,7 +333,7 @@ impl WhatsAppWebhook {
             },
             "metadata": {
                 "phone_number_id": phone_number_id,
-                "display_phone_number": value.metadata.as_ref().map(|m| m.display_phone_number.as_str()).unwrap_or(""),
+                "display_phone_number": value.metadata.as_ref().map_or("", |m| m.display_phone_number.as_str()),
                 "entry_id": entry_id,
             }
         });

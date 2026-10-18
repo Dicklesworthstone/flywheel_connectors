@@ -188,9 +188,10 @@ impl WhatsAppClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: WhatsAppError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -272,10 +273,10 @@ impl WhatsAppClient {
                             .map(Duration::from_secs);
                         return AttemptOutcome::Retryable {
                             error: WhatsAppError::RateLimited {
-                                retry_after_ms: retry_after
-                                    .unwrap_or(Duration::from_secs(30))
-                                    .as_millis()
-                                    as u64,
+                                retry_after_ms: u64::try_from(
+                                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                                )
+                                .unwrap_or(u64::MAX),
                             },
                             retry_after,
                         };
@@ -346,11 +347,13 @@ impl WhatsAppClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode (credential injection).
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.access_token.is_empty()
     }

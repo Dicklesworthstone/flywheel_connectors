@@ -510,6 +510,8 @@ impl WhatsAppConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
 
@@ -589,7 +591,10 @@ impl WhatsAppConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self
+                .client
+                .as_ref()
+                .is_some_and(WhatsAppClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -634,6 +639,8 @@ impl Default for WhatsAppConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -1038,6 +1045,7 @@ impl WhatsAppConnector {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
@@ -1068,24 +1076,25 @@ impl WhatsAppConnector {
 
         let output = match operation {
             OP_SEND_TEXT => {
-                let to = req.input.get("to").and_then(|v| v.as_str()).ok_or(
+                let to = req.input.get("to").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
                     },
                 )?;
-                let text = req.input.get("text").and_then(|v| v.as_str()).ok_or(
+                let text = req.input.get("text").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'text' field".into(),
                     },
                 )?;
-                let preview_url = match req.input.get("preview_url") {
-                    Some(value) => value.as_bool().ok_or(FcpError::InvalidRequest {
+                let preview_url = if let Some(value) = req.input.get("preview_url") {
+                    value.as_bool().ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Field 'preview_url' must be a boolean".into(),
-                    })?,
-                    None => false,
+                    })?
+                } else {
+                    false
                 };
 
                 let claimant_agent_id = self.chat_coordination_agent_id();
@@ -1105,11 +1114,11 @@ impl WhatsAppConnector {
                 let resp = client
                     .send_text_message(runtime, to, text, preview_url)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::WhatsAppError::to_fcp_error(&e))?;
 
                 let mut output = json!({
-                    "message_id": resp.messages.first().map(|m| m.id.as_str()).unwrap_or(""),
-                    "wa_id": resp.contacts.first().map(|c| c.wa_id.as_str()).unwrap_or("")
+                    "message_id": resp.messages.first().map_or("", |m| m.id.as_str()),
+                    "wa_id": resp.contacts.first().map_or("", |c| c.wa_id.as_str())
                 });
                 whatsapp_insert_coordination(
                     &mut output,
@@ -1120,7 +1129,7 @@ impl WhatsAppConnector {
                 output
             }
             OP_SEND_TEMPLATE => {
-                let to = req.input.get("to").and_then(|v| v.as_str()).ok_or(
+                let to = req.input.get("to").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
@@ -1129,27 +1138,30 @@ impl WhatsAppConnector {
                 let template_name = req
                     .input
                     .get("template_name")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'template_name' field".into(),
                     })?;
-                let language_code = match req.input.get("language_code") {
-                    Some(value) => value.as_str().ok_or(FcpError::InvalidRequest {
+                let language_code = if let Some(value) = req.input.get("language_code") {
+                    value.as_str().ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Field 'language_code' must be a string".into(),
-                    })?,
-                    None => "en_US",
+                    })?
+                } else {
+                    "en_US"
                 };
-                let components: Vec<serde_json::Value> = match req.input.get("components") {
-                    Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
-                        FcpError::InvalidRequest {
-                            code: 1005,
-                            message: format!("Invalid 'components' field: {error}"),
-                        }
-                    })?,
-                    None => Vec::new(),
-                };
+                let components: Vec<serde_json::Value> =
+                    if let Some(value) = req.input.get("components") {
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            FcpError::InvalidRequest {
+                                code: 1005,
+                                message: format!("Invalid 'components' field: {error}"),
+                            }
+                        })?
+                    } else {
+                        Vec::new()
+                    };
 
                 let claimant_agent_id = self.chat_coordination_agent_id();
                 let coordination = self
@@ -1171,11 +1183,11 @@ impl WhatsAppConnector {
                 let resp = client
                     .send_template_message(runtime, to, template_name, language_code, &components)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::WhatsAppError::to_fcp_error(&e))?;
 
                 let mut output = json!({
-                    "message_id": resp.messages.first().map(|m| m.id.as_str()).unwrap_or(""),
-                    "wa_id": resp.contacts.first().map(|c| c.wa_id.as_str()).unwrap_or("")
+                    "message_id": resp.messages.first().map_or("", |m| m.id.as_str()),
+                    "wa_id": resp.contacts.first().map_or("", |c| c.wa_id.as_str())
                 });
                 whatsapp_insert_coordination(
                     &mut output,
@@ -1189,7 +1201,7 @@ impl WhatsAppConnector {
                 let resp = client
                     .get_profile(runtime)
                     .await
-                    .map_err(|e| e.to_fcp_error())?;
+                    .map_err(|e| crate::error::WhatsAppError::to_fcp_error(&e))?;
                 let profile = resp.data.into_iter().next().unwrap_or(BusinessProfile {
                     about: None,
                     address: None,
@@ -1207,14 +1219,14 @@ impl WhatsAppConnector {
                     message: "Webhook not configured (set app_secret and webhook_verify_token)"
                         .into(),
                 })?;
-                let mode = req.input.get("hub_mode").and_then(|v| v.as_str()).ok_or(
+                let mode = req.input.get("hub_mode").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'hub_mode' field".into(),
                     },
                 )?;
                 let Some(verify_challenge) =
-                    req.input.get("hub_verify_token").and_then(|v| v.as_str())
+                    req.input.get("hub_verify_token").and_then(Value::as_str)
                 else {
                     return Err(FcpError::InvalidRequest {
                         code: 1005,
@@ -1224,7 +1236,7 @@ impl WhatsAppConnector {
                 let challenge = req
                     .input
                     .get("hub_challenge")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'hub_challenge' field".into(),
@@ -1260,7 +1272,7 @@ impl WhatsAppConnector {
                         }
                     })?;
 
-                let body_str = req.input.get("body").and_then(|v| v.as_str()).ok_or(
+                let body_str = req.input.get("body").and_then(Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'body' field (must be raw JSON string)".into(),
