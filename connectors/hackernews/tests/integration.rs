@@ -187,7 +187,7 @@ async fn client_item_user_and_story_endpoints_decode_contracts() {
             "id": 8863,
             "type": "story",
             "by": "dhouston",
-            "time": 1175714200,
+            "time": 1_175_714_200,
             "title": "My YC app: Dropbox",
             "url": "http://www.getdropbox.com",
             "score": 111,
@@ -205,7 +205,7 @@ async fn client_item_user_and_story_endpoints_decode_contracts() {
         .and(path("/v0/user/jl.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "jl",
-            "created": 1173923446,
+            "created": 1_173_923_446,
             "karma": 2937,
             "about": "Test user"
         })))
@@ -314,7 +314,7 @@ async fn invoke_item_get_preserves_public_item_evidence() {
             "id": 8863,
             "type": "story",
             "by": "dhouston",
-            "time": 1175714200,
+            "time": 1_175_714_200,
             "title": "My YC app: Dropbox",
             "url": "http://www.getdropbox.com",
             "score": 111,
@@ -358,11 +358,7 @@ fn introspection_emits_v3_compliance_evidence() {
     assert_eq!(operations.len(), 9);
     assert_eq!(resource_types.len(), 3);
     assert!(value["auth_caps"].is_null());
-    assert!(
-        value["events"]
-            .as_array()
-            .is_some_and(|events| events.is_empty())
-    );
+    assert!(value["events"].as_array().is_some_and(Vec::is_empty));
     assert!(operations.iter().all(|operation| {
         operation["id"]
             .as_str()

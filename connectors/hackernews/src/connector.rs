@@ -101,6 +101,7 @@ struct RetryReadiness {
     jitter_enabled: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize)]
 struct ProvisioningReadiness {
     provider: &'static str,
@@ -287,6 +288,7 @@ impl HackerNewsConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let provisioning = self.provisioning_readiness();
         let mut checks = Vec::new();
@@ -525,6 +527,7 @@ fn hackernews_resource_types() -> Vec<ResourceTypeInfo> {
 }
 
 /// Build the typed operations catalog from the embedded manifest.
+#[must_use]
 pub fn operations_info() -> Vec<OperationInfo> {
     static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
     OPERATIONS
@@ -769,7 +772,10 @@ impl HackerNewsConnector {
     /// Apply an optional limit to a list of IDs.
     fn apply_limit(ids: Vec<u64>, limit: Option<u64>) -> Vec<u64> {
         match limit {
-            Some(n) => ids.into_iter().take(n as usize).collect(),
+            Some(n) => ids
+                .into_iter()
+                .take(usize::try_from(n).unwrap_or(usize::MAX))
+                .collect(),
             None => ids,
         }
     }
@@ -807,12 +813,14 @@ impl HackerNewsConnector {
 
         let output = match operation {
             OP_ITEM_GET => {
-                let id = req.input.get("id").and_then(|v| v.as_u64()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing or invalid 'id' field (must be integer)".into(),
-                    },
-                )?;
+                    })?;
                 let item = client
                     .get_item(runtime, id)
                     .await
@@ -822,12 +830,14 @@ impl HackerNewsConnector {
                 })?
             }
             OP_USER_GET => {
-                let username = req.input.get("username").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let username = req
+                    .input
+                    .get("username")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'username' field".into(),
-                    },
-                )?;
+                    })?;
                 let user = client
                     .get_user(runtime, username)
                     .await
@@ -837,7 +847,7 @@ impl HackerNewsConnector {
                 })?
             }
             OP_TOP_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .top_stories(runtime)
                     .await
@@ -845,7 +855,7 @@ impl HackerNewsConnector {
                 json!(Self::apply_limit(ids, limit))
             }
             OP_NEW_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .new_stories(runtime)
                     .await
@@ -853,7 +863,7 @@ impl HackerNewsConnector {
                 json!(Self::apply_limit(ids, limit))
             }
             OP_BEST_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .best_stories(runtime)
                     .await
@@ -861,7 +871,7 @@ impl HackerNewsConnector {
                 json!(Self::apply_limit(ids, limit))
             }
             OP_ASK_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .ask_stories(runtime)
                     .await
@@ -869,7 +879,7 @@ impl HackerNewsConnector {
                 json!(Self::apply_limit(ids, limit))
             }
             OP_SHOW_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .show_stories(runtime)
                     .await
@@ -877,7 +887,7 @@ impl HackerNewsConnector {
                 json!(Self::apply_limit(ids, limit))
             }
             OP_JOB_STORIES => {
-                let limit = req.input.get("limit").and_then(|v| v.as_u64());
+                let limit = req.input.get("limit").and_then(serde_json::Value::as_u64);
                 let ids = client
                     .job_stories(runtime)
                     .await
@@ -1303,7 +1313,7 @@ mod tests {
                 "id": 8863,
                 "type": "story",
                 "by": "dhouston",
-                "time": 1175714200,
+                "time": 1_175_714_200,
                 "text": null,
                 "dead": false,
                 "parent": null,
@@ -1323,7 +1333,7 @@ mod tests {
                 "id": 8863,
                 "type": "story",
                 "by": "dhouston",
-                "time": 1175714200,
+                "time": 1_175_714_200,
                 "text": null,
                 "dead": false,
                 "parent": null,
@@ -1349,10 +1359,10 @@ mod tests {
             &user_output,
             &json!({
                 "id": "jl",
-                "created": 1173923446,
+                "created": 1_173_923_446,
                 "karma": 2937,
                 "about": null,
-                "submitted": [8265435, 8168423]
+                "submitted": [8_265_435, 8_168_423]
             }),
         )?;
         assert_schema_rejects(&user_output, &json!({"id": "jl", "karma": 2937}))?;
@@ -1364,7 +1374,7 @@ mod tests {
         assert_schema_rejects(&feed_input, &json!({"limit": 10, "extra": true}))?;
 
         let feed_output = operation_schema(&manifest, OP_TOP_STORIES, "output_schema")?;
-        assert_schema_accepts(&feed_output, &json!([8863, 2921983]))?;
+        assert_schema_accepts(&feed_output, &json!([8863, 2_921_983]))?;
         assert_schema_rejects(&feed_output, &json!([8863, "2921983"]))?;
 
         let health_input = operation_schema(&manifest, OP_HEALTH, "input_schema")?;

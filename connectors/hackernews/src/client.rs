@@ -23,6 +23,7 @@ pub struct HackerNewsClient {
 impl std::fmt::Debug for HackerNewsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HackerNewsClient")
+            .field("client", &self.client)
             .field("base_url", &self.base_url)
             .field("retry_config", &self.retry_config)
             .finish()
@@ -54,6 +55,7 @@ impl HackerNewsClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -106,12 +108,12 @@ impl HackerNewsClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok())
                         .map(Duration::from_secs);
+                    let retry_after_ms = u64::try_from(
+                        retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
                     return AttemptOutcome::Retryable {
-                        error: HackerNewsError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
-                        },
+                        error: HackerNewsError::RateLimited { retry_after_ms },
                         retry_after,
                     };
                 }
@@ -174,12 +176,12 @@ impl HackerNewsClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok())
                         .map(Duration::from_secs);
+                    let retry_after_ms = u64::try_from(
+                        retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
                     return AttemptOutcome::Retryable {
-                        error: HackerNewsError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
-                        },
+                        error: HackerNewsError::RateLimited { retry_after_ms },
                         retry_after,
                     };
                 }
@@ -224,6 +226,10 @@ impl HackerNewsClient {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Get an item by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the item does not exist or the HTTP request fails.
     pub async fn get_item(&self, runtime: &ConnectorRuntime, id: u64) -> HackerNewsResult<Item> {
         let url = format!("{}/item/{}.json", self.base_url, id);
         let item = self.get_nullable_item(runtime, &url).await?;
@@ -231,6 +237,10 @@ impl HackerNewsClient {
     }
 
     /// Get a user by username.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the username contains invalid path characters or the HTTP request fails.
     pub async fn get_user(
         &self,
         runtime: &ConnectorRuntime,
@@ -242,42 +252,70 @@ impl HackerNewsClient {
     }
 
     /// Get top story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn top_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/topstories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Get new story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn new_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/newstories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Get best story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn best_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/beststories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Get Ask HN story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn ask_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/askstories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Get Show HN story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn show_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/showstories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Get job story IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
     pub async fn job_stories(&self, runtime: &ConnectorRuntime) -> HackerNewsResult<Vec<u64>> {
         let url = format!("{}/jobstories.json", self.base_url);
         self.get_with_retry(runtime, &url).await
     }
 
     /// Health check: fetch top stories endpoint to verify API reachability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upstream endpoint is unreachable or returns a non-success status.
     pub async fn health_check(&self) -> HackerNewsResult<()> {
         let url = format!("{}/topstories.json", self.base_url);
         let resp = self
@@ -310,12 +348,13 @@ impl HackerNewsClient {
 
 /// Fuzz-only entry points for Hacker News path parser guards.
 ///
-/// Bead flywheel_connectors-73u29.
+/// Bead `flywheel_connectors-73u29`.
 #[doc(hidden)]
 pub mod __fuzz {
     use super::HackerNewsClient;
 
     /// Return whether a candidate item/user id is safe for URL path interpolation.
+    #[must_use]
     pub fn sanitize_path_segment_candidate(value: &str) -> bool {
         HackerNewsClient::sanitize_path_segment(value).is_ok()
     }

@@ -86,7 +86,7 @@ mod tests {
             "id": 8863,
             "type": "story",
             "by": "dhouston",
-            "time": 1175714200,
+            "time": 1_175_714_200,
             "title": "My YC app: Dropbox - Throw away your USB drive",
             "url": "http://www.getdropbox.com/u/2/screencast.html",
             "score": 111,
@@ -104,27 +104,27 @@ mod tests {
     #[test]
     fn comment_deserialization() {
         let json = serde_json::json!({
-            "id": 2921983,
+            "id": 2_921_983,
             "type": "comment",
             "by": "norvig",
-            "time": 1314211127,
+            "time": 1_314_211_127,
             "text": "<p>Aw shucks, thanks...</p>",
-            "parent": 2921506,
-            "kids": [2922097, 2922429]
+            "parent": 2_921_506,
+            "kids": [2_922_097, 2_922_429]
         });
         let item: Item = serde_json::from_value(json).unwrap();
         assert_eq!(item.item_type.as_deref(), Some("comment"));
-        assert_eq!(item.parent, Some(2921506));
+        assert_eq!(item.parent, Some(2_921_506));
         assert!(item.text.is_some());
     }
 
     #[test]
     fn job_deserialization() {
         let json = serde_json::json!({
-            "id": 192327,
+            "id": 192_327,
             "type": "job",
             "by": "justin",
-            "time": 1210981217,
+            "time": 1_210_981_217,
             "title": "Justin.tv is looking for a lead architect",
             "url": "http://www.justin.tv/jobs",
             "score": 6
@@ -140,16 +140,16 @@ mod tests {
     #[test]
     fn poll_deserialization() {
         let json = serde_json::json!({
-            "id": 126809,
+            "id": 126_809,
             "type": "poll",
             "by": "pg",
-            "time": 1204403652,
+            "time": 1_204_403_652,
             "title": "Poll: What would you work on?",
             "text": "",
             "score": 46,
             "descendants": 54,
-            "kids": [126822, 126823],
-            "parts": [126810, 126811]
+            "kids": [126_822, 126_823],
+            "parts": [126_810, 126_811]
         });
         let item: Item = serde_json::from_value(json).unwrap();
         assert_eq!(item.item_type.as_deref(), Some("poll"));
@@ -171,10 +171,10 @@ mod tests {
     fn user_deserialization() {
         let json = serde_json::json!({
             "id": "jl",
-            "created": 1173923446,
+            "created": 1_173_923_446,
             "karma": 2937,
             "about": "This is a test",
-            "submitted": [8265435, 8168423, 8090946]
+            "submitted": [8_265_435, 8_168_423, 8_090_946]
         });
         let user: User = serde_json::from_value(json).unwrap();
         assert_eq!(user.id, "jl");
@@ -186,7 +186,7 @@ mod tests {
     fn user_without_about() {
         let json = serde_json::json!({
             "id": "anon",
-            "created": 1234567890,
+            "created": 1_234_567_890,
             "karma": 1
         });
         let user: User = serde_json::from_value(json).unwrap();
@@ -201,7 +201,7 @@ mod tests {
             "type": "comment",
             "dead": true,
             "by": "spammer",
-            "time": 1234567890,
+            "time": 1_234_567_890,
             "text": "spam",
             "parent": 55554
         });
@@ -215,7 +215,7 @@ mod tests {
             id: 12345,
             item_type: Some("story".into()),
             by: Some("user".into()),
-            time: Some(1234567890),
+            time: Some(1_234_567_890),
             text: None,
             dead: false,
             parent: None,
