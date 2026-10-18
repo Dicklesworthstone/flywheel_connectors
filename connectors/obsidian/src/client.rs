@@ -94,6 +94,10 @@ impl ObsidianClient {
     }
 
     /// List all markdown notes in the vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the folder path is invalid or directory traversal fails.
     pub fn list_notes(&self, folder: Option<&str>) -> ObsidianResult<Vec<NoteEntry>> {
         let search_root = match folder {
             Some(f) => {
@@ -156,6 +160,10 @@ impl ObsidianClient {
     }
 
     /// Get a single note by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the note does not exist, or reading fails.
     pub fn get_note(&self, note_path: &str) -> ObsidianResult<Note> {
         let full_path = self.safe_note_path(note_path)?;
         if !full_path.exists() {
@@ -184,6 +192,10 @@ impl ObsidianClient {
     }
 
     /// Create a new note (atomic: uses `create_new` to avoid TOCTOU).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the note already exists, or writing fails.
     pub fn create_note(&self, note_path: &str, content: &str) -> ObsidianResult<Note> {
         let full_path = self.safe_note_path(note_path)?;
         if let Some(parent) = full_path.parent() {
@@ -209,6 +221,10 @@ impl ObsidianClient {
     }
 
     /// Update an existing note.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the note does not exist, or writing fails.
     pub fn update_note(&self, note_path: &str, content: &str) -> ObsidianResult<Note> {
         let full_path = self.safe_note_path(note_path)?;
         // Open with write+truncate but WITHOUT create — fails if file doesn't exist.
@@ -231,6 +247,10 @@ impl ObsidianClient {
     }
 
     /// Delete a note.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the note does not exist, or deletion fails.
     pub fn delete_note(&self, note_path: &str) -> ObsidianResult<()> {
         let full_path = self.safe_note_path(note_path)?;
         // Remove directly — if the file doesn't exist, map to NotFound,
@@ -245,6 +265,10 @@ impl ObsidianClient {
     }
 
     /// Search notes for a text pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the vault directory fails.
     pub fn search(&self, query: &str) -> ObsidianResult<Vec<SearchResult>> {
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
@@ -298,9 +322,13 @@ impl ObsidianClient {
     }
 
     /// List all tags across the vault.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the vault directory fails.
     pub fn list_tags(&self) -> ObsidianResult<Vec<TagInfo>> {
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
-        self.collect_tags(&self.vault_path, &mut tag_counts)?;
+        Self::collect_tags(&self.vault_path, &mut tag_counts)?;
         let mut tags: Vec<TagInfo> = tag_counts
             .into_iter()
             .map(|(tag, count)| TagInfo { tag, count })
@@ -309,7 +337,7 @@ impl ObsidianClient {
         Ok(tags)
     }
 
-    fn collect_tags(&self, dir: &Path, counts: &mut HashMap<String, usize>) -> ObsidianResult<()> {
+    fn collect_tags(dir: &Path, counts: &mut HashMap<String, usize>) -> ObsidianResult<()> {
         let read_dir = std::fs::read_dir(dir)?;
         for entry in read_dir {
             let entry = entry?;
@@ -317,7 +345,7 @@ impl ObsidianClient {
             if path.is_dir() {
                 let name = entry.file_name();
                 if !name.to_string_lossy().starts_with('.') {
-                    self.collect_tags(&path, counts)?;
+                    Self::collect_tags(&path, counts)?;
                 }
             } else if path.extension().is_some_and(|ext| ext == "md")
                 && let Ok(content) = std::fs::read_to_string(&path)
@@ -331,6 +359,10 @@ impl ObsidianClient {
     }
 
     /// Get backlinks for a note (other notes linking to this one).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the note path is invalid or reading the vault directory fails.
     pub fn get_backlinks(&self, note_path: &str) -> ObsidianResult<Vec<Backlink>> {
         // Derive the link target name from the note path
         let target_name = Path::new(note_path)
@@ -393,10 +425,14 @@ impl ObsidianClient {
     }
 
     /// Get vault health information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the vault directory fails.
     pub fn vault_health(&self) -> ObsidianResult<VaultHealth> {
         let mut note_count = 0_usize;
         let mut total_size = 0_u64;
-        self.count_notes(&self.vault_path, &mut note_count, &mut total_size)?;
+        Self::count_notes(&self.vault_path, &mut note_count, &mut total_size)?;
 
         let writable = self.check_writable();
 
@@ -409,7 +445,7 @@ impl ObsidianClient {
         })
     }
 
-    fn count_notes(&self, dir: &Path, count: &mut usize, size: &mut u64) -> ObsidianResult<()> {
+    fn count_notes(dir: &Path, count: &mut usize, size: &mut u64) -> ObsidianResult<()> {
         let read_dir = std::fs::read_dir(dir)?;
         for entry in read_dir {
             let entry = entry?;
@@ -417,7 +453,7 @@ impl ObsidianClient {
             if path.is_dir() {
                 let name = entry.file_name();
                 if !name.to_string_lossy().starts_with('.') {
-                    self.count_notes(&path, count, size)?;
+                    Self::count_notes(&path, count, size)?;
                 }
             } else if path.extension().is_some_and(|ext| ext == "md") {
                 *count += 1;
@@ -440,11 +476,13 @@ impl ObsidianClient {
     }
 
     /// Get the vault path (for diagnostics).
+    #[must_use]
     pub fn vault_path(&self) -> &Path {
         &self.vault_path
     }
 
     /// Create a `ConnectorRuntime` suitable for this connector.
+    #[must_use]
     pub fn create_runtime() -> ConnectorRuntime {
         ConnectorRuntime::new(
             ConnectorRuntimeConfig::default()
@@ -454,6 +492,10 @@ impl ObsidianClient {
 }
 
 /// Sanitize a path segment to prevent directory traversal attacks.
+///
+/// # Errors
+///
+/// Returns an error if the path is empty, absolute, contains `..`, or contains null bytes.
 pub fn sanitize_path_segment(path: &str) -> ObsidianResult<()> {
     if path.is_empty() {
         return Err(ObsidianError::InvalidInput("empty path".into()));
@@ -565,7 +607,7 @@ fn format_system_time(time: Option<std::time::SystemTime>) -> String {
         Some(t) => {
             let duration = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let dt = chrono::DateTime::from_timestamp(
-                duration.as_secs() as i64,
+                i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
                 duration.subsec_nanos(),
             );
             dt.map_or_else(|| "unknown".to_string(), |d| d.to_rfc3339())
@@ -848,7 +890,7 @@ mod tests {
     fn format_system_time_works() {
         let t = std::time::SystemTime::now();
         let formatted = format_system_time(Some(t));
-        assert!(formatted.contains("T")); // ISO 8601
+        assert!(formatted.contains('T')); // ISO 8601
     }
 
     #[test]

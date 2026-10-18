@@ -45,6 +45,7 @@ pub enum ObsidianError {
 
 impl ObsidianError {
     /// Whether this error is retryable.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Io(e) => matches!(
@@ -64,11 +65,13 @@ impl ObsidianError {
     }
 
     /// Suggested retry-after delay.
+    #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         None
     }
 
     /// Convert to FCP error taxonomy.
+    #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Io(e) => FcpError::Internal {

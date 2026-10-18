@@ -204,11 +204,10 @@ impl ObsidianConnector {
 
     fn provisioning_readiness(&self) -> Option<ProvisioningReadiness> {
         self.config.as_ref().map(|config| ProvisioningReadiness {
-            vault_path: self
-                .client
-                .as_ref()
-                .map(|client| client.vault_path().to_string_lossy().to_string())
-                .unwrap_or_else(|| config.vault_path.clone()),
+            vault_path: self.client.as_ref().map_or_else(
+                || config.vault_path.clone(),
+                |client| client.vault_path().to_string_lossy().to_string(),
+            ),
             request_timeout_ms: config.request_timeout_ms,
             local_only: true,
             markdown_only: true,
@@ -238,6 +237,7 @@ impl ObsidianConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let provisioning = self.provisioning_readiness();
         let mut checks = Vec::new();
@@ -342,6 +342,8 @@ impl Default for ObsidianConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -577,7 +579,7 @@ pub fn operations_info() -> Vec<OperationInfo> {
             ai_hints: AgentHint {
                 when_to_use: "When you need to see what tags are used in the vault".into(),
                 common_mistakes: Vec::new(),
-                examples: vec![r#"{}"#.into()],
+                examples: vec![r"{}".into()],
                 related: vec![CapabilityId::from_static(CAP_READ)],
             },
             rate_limit: None,
@@ -642,7 +644,7 @@ pub fn operations_info() -> Vec<OperationInfo> {
             ai_hints: AgentHint {
                 when_to_use: "When you need to check if the vault is accessible and healthy".into(),
                 common_mistakes: Vec::new(),
-                examples: vec![r#"{}"#.into()],
+                examples: vec![r"{}".into()],
                 related: Vec::new(),
             },
             rate_limit: None,
@@ -832,6 +834,7 @@ impl FcpConnector for ObsidianConnector {
 }
 
 impl ObsidianConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
@@ -862,36 +865,42 @@ impl ObsidianConnector {
 
         let output = match operation {
             OP_NOTES_LIST => {
-                let folder = req.input.get("folder").and_then(|v| v.as_str());
+                let folder = req.input.get("folder").and_then(serde_json::Value::as_str);
                 let notes = client.list_notes(folder).map_err(|e| e.to_fcp_error())?;
                 let count = notes.len();
                 json!({ "notes": notes, "count": count })
             }
             OP_NOTES_GET => {
-                let path = req.input.get("path").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let path = req
+                    .input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
-                    },
-                )?;
+                    })?;
                 let note = client.get_note(path).map_err(|e| e.to_fcp_error())?;
                 serde_json::to_value(note).map_err(|e| FcpError::Internal {
                     message: format!("Failed to serialize note: {e}"),
                 })?
             }
             OP_NOTES_CREATE => {
-                let path = req.input.get("path").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let path = req
+                    .input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
-                    },
-                )?;
-                let content = req.input.get("content").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let content = req
+                    .input
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
-                    },
-                )?;
+                    })?;
                 let note = client
                     .create_note(path, content)
                     .map_err(|e| e.to_fcp_error())?;
@@ -900,18 +909,22 @@ impl ObsidianConnector {
                 })?
             }
             OP_NOTES_UPDATE => {
-                let path = req.input.get("path").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let path = req
+                    .input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
-                    },
-                )?;
-                let content = req.input.get("content").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let content = req
+                    .input
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
-                    },
-                )?;
+                    })?;
                 let note = client
                     .update_note(path, content)
                     .map_err(|e| e.to_fcp_error())?;
@@ -920,22 +933,26 @@ impl ObsidianConnector {
                 })?
             }
             OP_NOTES_DELETE => {
-                let path = req.input.get("path").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let path = req
+                    .input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
-                    },
-                )?;
+                    })?;
                 client.delete_note(path).map_err(|e| e.to_fcp_error())?;
                 json!({ "deleted": true, "path": path })
             }
             OP_SEARCH => {
-                let query = req.input.get("query").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let query = req
+                    .input
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'query' field".into(),
-                    },
-                )?;
+                    })?;
                 let results = client.search(query).map_err(|e| e.to_fcp_error())?;
                 let count = results.len();
                 json!({ "results": results, "count": count })
@@ -946,12 +963,14 @@ impl ObsidianConnector {
                 json!({ "tags": tags, "count": count })
             }
             OP_BACKLINKS_GET => {
-                let path = req.input.get("path").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let path = req
+                    .input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
-                    },
-                )?;
+                    })?;
                 let backlinks = client.get_backlinks(path).map_err(|e| e.to_fcp_error())?;
                 let count = backlinks.len();
                 json!({ "backlinks": backlinks, "count": count })
