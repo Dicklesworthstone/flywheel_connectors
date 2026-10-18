@@ -54,7 +54,7 @@ pub fn group_x25519_public_key_from_edwards_verifying_key(
 }
 
 /// Montgomery image of an Ed25519 verifying key, as X25519 bytes.
-pub(crate) fn montgomery_from_verifying_key(
+pub fn montgomery_from_verifying_key(
     verifying_key: &Ed25519VerifyingKey,
 ) -> CryptoResult<[u8; 32]> {
     Ok(edwards_point(verifying_key)?.to_montgomery().to_bytes())
@@ -85,6 +85,7 @@ pub fn participant_scalar(signing_share: &FrostSigningShare) -> CryptoResult<Sca
 ///
 /// Never returns an error today; the signature is kept for symmetry
 /// with the rest of the derivation API.
+#[allow(clippy::unnecessary_wraps)]
 pub fn lagrange_coefficients(subset: &[u16]) -> CryptoResult<Vec<Scalar>> {
     let scalars: Vec<Scalar> = subset
         .iter()
@@ -100,10 +101,10 @@ pub fn lagrange_coefficients(subset: &[u16]) -> CryptoResult<Vec<Scalar>> {
                 continue;
             }
             let _ = subset_j;
-            let x_j_scalar = scalars[j];
-            let x_i_scalar = scalars[i];
-            numerator *= x_j_scalar;
-            denominator *= x_j_scalar - x_i_scalar;
+            let peer_scalar = scalars[j];
+            let self_scalar = scalars[i];
+            numerator *= peer_scalar;
+            denominator *= peer_scalar - self_scalar;
         }
         coefficients.push(numerator * denominator.invert());
     }

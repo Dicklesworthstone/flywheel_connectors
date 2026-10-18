@@ -3,7 +3,7 @@
 //!
 //! # Protocol
 //! Given input challenge $x$ and delay parameter $T$:
-//! 1. Map $x$ to a group generator $g = H_G(x) \in (\mathbb{Z}/N\mathbb{Z})^\times / \{\pm 1\}$.
+//! 1. Map $x$ to a group generator $g = `H_G(x)` \in (\mathbb{Z}/N\mathbb{Z})^\times / \{\pm 1\}$.
 //! 2. Compute $y = g^{2^T} \bmod N$ via $T$ sequential squarings.
 //! 3. Derive a 64-bit Fiat-Shamir prime challenge $\ell = \text{HashToPrime}(g, y, T)$
 //!    using `blake3` and deterministic 64-bit Miller-Rabin primality testing.
@@ -24,7 +24,7 @@ pub const VDF_PROOF_MAX_BYTES: usize = 128;
 /// Default delay iterations $T$ for owner-key operations ($T = 10{,}000$).
 pub const DEFAULT_OWNER_KEY_VDF_ITERATIONS: u64 = 10_000;
 
-/// 512-bit modulus $N = 2^{512} - C$, where $C = 0x1_0000_0000_0000_0277$?
+/// 512-bit modulus $N = 2^{512} - C$, where $C = `0x1_0000_0000_0000_0277`$?
 /// We use $C = 569$ (`N = 2^512 - 569`), which is odd and makes reduction
 /// $2^{512} \equiv 569 \pmod N$ exact and overflow-free in 64-bit limbs.
 const MODULUS_C: u64 = 569;
@@ -253,7 +253,7 @@ impl WesolowskiVdf {
 
     /// Verify a [`VdfProof`] against `challenge` and expected delay parameter `expected_iterations`.
     ///
-    /// Executes in $O(\log T + \log \ell)$ time (< 1ms on x86_64).
+    /// Executes in $O(\log T + \log \ell)$ time (< 1ms on `x86_64`).
     ///
     /// # Errors
     /// Returns [`VdfError`] if the proof is malformed or fails the Wesolowski verification equation.
@@ -346,11 +346,12 @@ fn hash_to_prime(
 }
 
 /// Deterministic Miller-Rabin primality test for all 64-bit integers.
+#[allow(clippy::cast_possible_truncation)]
 fn is_prime_u64(n: u64) -> bool {
+    const SMALL_PRIMES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
     if n < 2 {
         return false;
     }
-    const SMALL_PRIMES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
     for &p in &SMALL_PRIMES {
         if n == p {
             return true;
@@ -387,6 +388,7 @@ fn is_prime_u64(n: u64) -> bool {
     true
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn mod_pow_u64(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
     let mut result = 1u64;
     let m = u128::from(modulus);
@@ -402,13 +404,14 @@ fn mod_pow_u64(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
 }
 
 /// Compute $2^T \bmod \ell$ in $O(\log T)$ steps.
+#[allow(clippy::cast_possible_truncation)]
 fn pow_two_mod_u64(iterations: u64, modulus: u64) -> u64 {
     if modulus <= 1 {
         return 0;
     }
     let m = u128::from(modulus);
     let mut result = 1u64;
-    let top_bit = 63 - iterations.leading_zeros();
+    let top_bit = iterations.ilog2();
     for bit_idx in (0..=top_bit).rev() {
         let sq = (u128::from(result) * u128::from(result)) % m;
         result = if ((iterations >> bit_idx) & 1) == 1 {
@@ -442,6 +445,7 @@ fn mod_square(a: &[u64; 8]) -> [u64; 8] {
 }
 
 /// Multiply two 512-bit integers modulo $N = 2^{512} - 569$.
+#[allow(clippy::cast_possible_truncation)]
 fn mod_mul(a: &[u64; 8], b: &[u64; 8]) -> [u64; 8] {
     let mut prod = [0u64; 16];
     for i in 0..8 {
@@ -480,17 +484,17 @@ fn mod_mul(a: &[u64; 8], b: &[u64; 8]) -> [u64; 8] {
         carry = c2;
     }
 
-    if cmp_u512(&low, &MODULUS_N) != std::cmp::Ordering::Less {
-        sub_u512(&low, &MODULUS_N)
-    } else {
+    if cmp_u512(&low, &MODULUS_N) == std::cmp::Ordering::Less {
         low
+    } else {
+        sub_u512(&low, &MODULUS_N)
     }
 }
 
 fn cmp_u512(a: &[u64; 8], b: &[u64; 8]) -> std::cmp::Ordering {
     for idx in (0..8).rev() {
         match a[idx].cmp(&b[idx]) {
-            std::cmp::Ordering::Equal => continue,
+            std::cmp::Ordering::Equal => {}
             non_eq => return non_eq,
         }
     }
@@ -510,10 +514,10 @@ fn sub_u512(a: &[u64; 8], b: &[u64; 8]) -> [u64; 8] {
 }
 
 fn canonicalize_signed(a: &[u64; 8]) -> [u64; 8] {
-    let reduced = if cmp_u512(a, &MODULUS_N) != std::cmp::Ordering::Less {
-        sub_u512(a, &MODULUS_N)
-    } else {
+    let reduced = if cmp_u512(a, &MODULUS_N) == std::cmp::Ordering::Less {
         *a
+    } else {
+        sub_u512(a, &MODULUS_N)
     };
     if reduced == ZERO_U512 {
         return reduced;

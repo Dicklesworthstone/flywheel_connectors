@@ -93,7 +93,7 @@ impl std::fmt::Debug for ThresholdHpkePublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThresholdHpkePublicKey")
             .field("group_x25519", &self.group_x25519)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -201,7 +201,12 @@ impl ThresholdHpkeCiphertext {
 }
 
 fn hex_short(bytes: &[u8]) -> String {
-    bytes.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(12);
+    for b in bytes.iter().take(6) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Threshold-HPKE specific failures, surfaced through
@@ -240,7 +245,7 @@ pub fn decap_share(
 ) -> CryptoResult<DecapShare> {
     let participant_scalar = derive::participant_scalar(key_package.signing_share())?;
     let ephemeral = decompress_ephemeral(ct)?;
-    let contribution_ed = ephemeral * &participant_scalar;
+    let contribution_ed = ephemeral * participant_scalar;
     let group_x25519 = group_pk_bytes(key_package)?;
     Ok(DecapShare {
         participant: key_package.participant(),
@@ -306,12 +311,12 @@ pub fn combine_decap(
             .decompress()
             .ok_or(ThresholdHpkeError::InconsistentShares)?;
         let scaled = point * lambda;
-        combined_ed = Some(match combined_ed {
-            Some(accumulator) => accumulator + scaled,
-            None => scaled,
-        });
+        combined_ed = Some(combined_ed.map_or(scaled, |accumulator| accumulator + scaled));
     }
-    let combined_ed = combined_ed.expect("threshold >= 1 guarantees at least one share");
+    let combined_ed = combined_ed.ok_or(ThresholdHpkeError::InsufficientShares {
+        got: 0,
+        required: threshold,
+    })?;
 
     // The DH u-coordinate matches X25519(s, E_m).
     let dh = combined_ed.to_montgomery().to_bytes();
@@ -365,7 +370,7 @@ pub fn encap_with_rng<R: CryptoRng + RngCore>(
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
     let ephemeral_scalar = Scalar::from_bytes_mod_order(seed);
-    let ephemeral_point = ED25519_BASEPOINT_POINT * &ephemeral_scalar;
+    let ephemeral_point = ED25519_BASEPOINT_POINT * ephemeral_scalar;
     let ephemeral_pk = ephemeral_point.compress().to_bytes();
 
     // Sealer-side DH: e · X_ed, computed on the Edwards group public
@@ -373,7 +378,7 @@ pub fn encap_with_rng<R: CryptoRng + RngCore>(
     let group_ed = CompressedEdwardsY(pk.group_ed)
         .decompress()
         .ok_or_else(|| CryptoError::HpkeFailed("threshold group key not decompressible".into()))?;
-    let dh_ed = group_ed * &ephemeral_scalar;
+    let dh_ed = group_ed * ephemeral_scalar;
     let dh = dh_ed.to_montgomery().to_bytes();
     if dh == [0u8; POINT_SIZE] {
         return Err(CryptoError::HpkeFailed(
@@ -387,8 +392,8 @@ pub fn encap_with_rng<R: CryptoRng + RngCore>(
     let shared_secret = extract_and_expand(&dh, &kem_context);
     let (key, base_nonce) = key_schedule(&shared_secret, info);
 
-    let aead = ChaCha20Poly1305::new((&key).into());
-    let aead_body = aead
+    let cipher = ChaCha20Poly1305::new((&key).into());
+    let aead_body = cipher
         .encrypt(
             Nonce::from_slice(&base_nonce),
             Payload {
@@ -418,7 +423,7 @@ fn group_pk_bytes(key_package: &FrostKeyPackage) -> CryptoResult<[u8; POINT_SIZE
     derive::group_x25519_public_key_from_edwards_verifying_key(key_package.group_public_key())
 }
 
-/// RFC 9180 §4 DHKEM ExtractAndExpand: `prk = LabeledExtract("", suite,
+/// RFC 9180 §4 DHKEM `ExtractAndExpand`: `prk = LabeledExtract("", suite,
 /// "eae_prk", dh)`; `shared_secret = LabeledExpand(prk, suite,
 /// "shared_secret", kem_context)`.
 fn extract_and_expand(dh: &[u8; POINT_SIZE], kem_context: &[u8]) -> [u8; N_SECRET] {
@@ -473,7 +478,7 @@ fn key_schedule(shared_secret: &[u8; N_SECRET], info: &[u8]) -> ([u8; N_KEY], [u
     (key, base_nonce)
 }
 
-/// RFC 9180 §4 LabeledExtract input:
+/// RFC 9180 §4 `LabeledExtract` input:
 /// `"HPKE-v1" || suite_id || label || ikm`. No label-length byte.
 fn labeled_ikm(suite_id: &[u8], label: &[u8], ikm: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(7 + suite_id.len() + label.len() + ikm.len());
@@ -492,17 +497,21 @@ fn hkdf_extract_to_prk_bytes(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; N_SECRET] 
     prk
 }
 
-/// RFC 9180 §4 LabeledExtract returning the PRK bytes.
+/// RFC 9180 §4 `LabeledExtract` returning the PRK bytes.
 fn labeled_extract_bytes(suite_id: &[u8], label: &[u8], ikm: &[u8]) -> [u8; N_SECRET] {
     hkdf_extract_to_prk_bytes(None, &labeled_ikm(suite_id, label, ikm))
 }
 
-/// RFC 9180 §4 LabeledExpand info:
+/// RFC 9180 §4 `LabeledExpand` info:
 /// `I2OSP(L,2) || "HPKE-v1" || suite_id || label || info`.
 /// Neither the label nor info is length-prefixed.
 fn labeled_expand_info<const N: usize>(suite_id: &[u8], label: &[u8], context: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 7 + suite_id.len() + label.len() + context.len());
-    out.extend_from_slice(&(N as u16).to_be_bytes());
+    out.extend_from_slice(
+        &u16::try_from(N)
+            .expect("HKDF output length fits in u16")
+            .to_be_bytes(),
+    );
     out.extend_from_slice(b"HPKE-v1");
     out.extend_from_slice(suite_id);
     out.extend_from_slice(label);
@@ -528,7 +537,7 @@ mod tests {
         // HMAC-SHA256/HKDF (not using either Rust helper or seal/open).
         // DH = 00..1f, KEM context = 20..5f. The intermediate values
         // catch both extra-length-byte and reversed Extract-salt defects.
-        let dh: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let dh: [u8; 32] = std::array::from_fn(|index| u8::try_from(index).unwrap());
         let kem_context: Vec<u8> = (32u8..96).collect();
         let kem_suite = b"KEM\x00\x20";
         let eae_prk = labeled_extract_bytes(kem_suite, b"eae_prk", &dh);
