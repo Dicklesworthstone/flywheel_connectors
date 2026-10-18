@@ -1706,10 +1706,12 @@ impl BlueBubblesClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: BlueBubblesError::from_transport_error(e),
-                            retry_after: None,
-                        };
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            BlueBubblesError::from_transport_error(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -1734,15 +1736,13 @@ impl BlueBubblesClient {
 
                 if !resp.status().is_success() {
                     let text = resp.text().await.unwrap_or_default();
-                    let decision = classify_http_status(status, None);
-                    let err = BlueBubblesError::from_api_response(status, &text);
-                    if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
-                    }
-                    return AttemptOutcome::Terminal(err);
+                    // BlueBubbles `tempGuid` is only an in-flight `sendCache` / optimistic UI
+                    // correlation key (evicted once dispatched to IMCore), not a durable
+                    // server-side deduplication key. Fail closed on 5xx to prevent duplicate
+                    // attachment deliveries.
+                    return AttemptOutcome::Terminal(BlueBubblesError::from_api_response(
+                        status, &text,
+                    ));
                 }
 
                 match decode_optional_json_value(resp).await {
@@ -2128,10 +2128,12 @@ impl BlueBubblesClient {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return AttemptOutcome::Retryable {
-                            error: BlueBubblesError::from_transport_error(e),
-                            retry_after: None,
-                        };
+                        let replayable = !transport_error_reached_service(&e);
+                        return AttemptOutcome::retryable_if_replayable(
+                            BlueBubblesError::from_transport_error(e),
+                            None,
+                            replayable,
+                        );
                     }
                 };
 
@@ -2156,15 +2158,13 @@ impl BlueBubblesClient {
 
                 if !resp.status().is_success() {
                     let text = resp.text().await.unwrap_or_default();
-                    let decision = classify_http_status(status, None);
-                    let err = BlueBubblesError::from_api_response(status, &text);
-                    if !matches!(decision, RetryDecision::Terminal) {
-                        return AttemptOutcome::Retryable {
-                            error: err,
-                            retry_after: None,
-                        };
-                    }
-                    return AttemptOutcome::Terminal(err);
+                    // BlueBubbles `tempGuid` is only an in-flight `sendCache` / optimistic UI
+                    // correlation key (evicted once dispatched to IMCore), not a durable
+                    // server-side deduplication key. Fail closed on 5xx to prevent duplicate
+                    // initial messages or duplicate chat creation attempts.
+                    return AttemptOutcome::Terminal(BlueBubblesError::from_api_response(
+                        status, &text,
+                    ));
                 }
 
                 match decode_json_value(resp).await {
@@ -2978,5 +2978,93 @@ mod tests {
         assert_eq!(availability.edit.reason, "helper_disconnected");
         assert!(!availability.typing.supported);
         assert_eq!(availability.typing.reason, "helper_disconnected");
+    }
+
+    #[test]
+    fn send_message_and_create_chat_fail_closed_after_5xx_while_429_still_retries() {
+        use fcp_sdk::ConnectorRuntimeConfig;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fcp_async_core::runtime::block_on_sync(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/server/info"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "status": 200,
+                    "data": {
+                        "os_version": "15.7",
+                        "server_version": "1.9.0",
+                        "private_api": true,
+                        "helper_connected": true
+                    }
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/v1/message/text"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .set_body_json(json!({"status": 503, "message": "IMCore timeout"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/api/v1/chat/new"))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .set_body_json(json!({"status": 503, "message": "IMCore timeout"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = BlueBubblesClient::build(
+                &server.uri(),
+                "passcode",
+                HttpRetryConfig {
+                    max_retries: 2,
+                    initial_delay_ms: 1,
+                    max_delay_ms: 5,
+                    jitter_enabled: false,
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let runtime = ConnectorRuntime::new(ConnectorRuntimeConfig::default());
+
+            let send_err = client
+                .send_message(
+                    &runtime,
+                    "iMessage;-;+15551234567",
+                    "Hello",
+                    SendMessageOptions::default(),
+                )
+                .await
+                .expect_err("5xx on send_message must fail closed without retrying");
+            assert!(matches!(
+                send_err,
+                BlueBubblesError::Api {
+                    status_code: 503,
+                    ..
+                }
+            ));
+
+            let chat_err = client
+                .create_chat(&runtime, "+15551234567", "Initial message")
+                .await
+                .expect_err("5xx on create_chat must fail closed without retrying");
+            assert!(matches!(
+                chat_err,
+                BlueBubblesError::Api {
+                    status_code: 503,
+                    ..
+                }
+            ));
+        })
+        .unwrap();
     }
 }
