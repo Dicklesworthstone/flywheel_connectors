@@ -1,4 +1,4 @@
-//! WhatsApp Business API client.
+//! `WhatsApp` Business API client.
 
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{
@@ -36,7 +36,7 @@ fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> WhatsAppResult<&'a 
     Ok(trimmed)
 }
 
-/// WhatsApp API client with retry and runtime integration.
+/// `WhatsApp` API client with retry and runtime integration.
 pub struct WhatsAppClient {
     client: Client,
     base_url: String,
@@ -52,12 +52,12 @@ impl std::fmt::Debug for WhatsAppClient {
             .field("phone_number_id", &self.phone_number_id)
             .field("access_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl WhatsAppClient {
-    /// Create a new WhatsApp client.
+    /// Create a new `WhatsApp` client.
     ///
     /// # Errors
     ///
@@ -142,7 +142,7 @@ impl WhatsAppClient {
     /// Send an arbitrary message payload with retry.
     ///
     /// br-kxd3e: every caller of this helper DELIVERS a message, and the
-    /// WhatsApp Cloud API has no idempotency key, so a replay that reached
+    /// `WhatsApp` Cloud API has no idempotency key, so a replay that reached
     /// Meta sends the message a second time. Only a connect-phase failure —
     /// the one class that proves no request bytes were written — is retried
     /// here. A 429 is refused WITHOUT the message being sent and stays

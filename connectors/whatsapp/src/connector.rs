@@ -1,4 +1,4 @@
-//! WhatsApp connector implementation.
+//! `WhatsApp` connector implementation.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +58,7 @@ const PERSONAL_BRIDGE_CONFIG_KEYS: &[&str] = &[
     "free_response_chats",
 ];
 
-/// WhatsApp connector configuration.
+/// `WhatsApp` connector configuration.
 #[derive(Clone, Deserialize)]
 struct WhatsAppConfig {
     #[serde(default = "default_base_url")]
@@ -248,12 +248,12 @@ fn normalize_whatsapp_identifier(value: &str) -> String {
     let without_prefix = value
         .trim()
         .strip_prefix("whatsapp:")
-        .unwrap_or(value.trim());
+        .unwrap_or_else(|| value.trim());
     let before_jid_suffix = without_prefix.split('@').next().unwrap_or(without_prefix);
     before_jid_suffix
         .trim_start_matches('+')
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -436,7 +436,7 @@ impl DoctorResult {
     }
 }
 
-/// WhatsApp connector state.
+/// `WhatsApp` connector state.
 pub struct WhatsAppConnector {
     base: BaseConnector,
     config: Option<WhatsAppConfig>,
@@ -1050,7 +1050,7 @@ impl WhatsAppConnector {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -1067,29 +1067,33 @@ impl WhatsAppConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "WhatsApp client missing after configure".into(),
         })?;
 
         let output = match operation {
             OP_SEND_TEXT => {
-                let to = req.input.get("to").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let to = req
+                    .input
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
-                    },
-                )?;
-                let text = req.input.get("text").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let text = req
+                    .input
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'text' field".into(),
-                    },
-                )?;
+                    })?;
                 let preview_url = if let Some(value) = req.input.get("preview_url") {
-                    value.as_bool().ok_or(FcpError::InvalidRequest {
+                    value.as_bool().ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Field 'preview_url' must be a boolean".into(),
                     })?
@@ -1129,22 +1133,24 @@ impl WhatsAppConnector {
                 output
             }
             OP_SEND_TEMPLATE => {
-                let to = req.input.get("to").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let to = req
+                    .input
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
-                    },
-                )?;
+                    })?;
                 let template_name = req
                     .input
                     .get("template_name")
                     .and_then(Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'template_name' field".into(),
                     })?;
                 let language_code = if let Some(value) = req.input.get("language_code") {
-                    value.as_str().ok_or(FcpError::InvalidRequest {
+                    value.as_str().ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Field 'language_code' must be a string".into(),
                     })?
@@ -1214,17 +1220,22 @@ impl WhatsAppConnector {
                 })?
             }
             OP_WEBHOOK_VERIFY => {
-                let webhook = self.webhook.as_ref().ok_or(FcpError::InvalidRequest {
-                    code: 1008,
-                    message: "Webhook not configured (set app_secret and webhook_verify_token)"
-                        .into(),
-                })?;
-                let mode = req.input.get("hub_mode").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let webhook = self
+                    .webhook
+                    .as_ref()
+                    .ok_or_else(|| FcpError::InvalidRequest {
+                        code: 1008,
+                        message: "Webhook not configured (set app_secret and webhook_verify_token)"
+                            .into(),
+                    })?;
+                let mode = req
+                    .input
+                    .get("hub_mode")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'hub_mode' field".into(),
-                    },
-                )?;
+                    })?;
                 let Some(verify_challenge) =
                     req.input.get("hub_verify_token").and_then(Value::as_str)
                 else {
@@ -1237,7 +1248,7 @@ impl WhatsAppConnector {
                     .input
                     .get("hub_challenge")
                     .and_then(Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'hub_challenge' field".into(),
                     })?;
@@ -1251,19 +1262,25 @@ impl WhatsAppConnector {
                 json!({ "challenge": result })
             }
             OP_WEBHOOK_RECEIVE => {
-                let webhook = self.webhook.as_ref().ok_or(FcpError::InvalidRequest {
-                    code: 1008,
-                    message: "Webhook not configured (set app_secret and webhook_verify_token)"
-                        .into(),
-                })?;
-                let config = self.config.as_ref().ok_or(FcpError::Internal {
+                let webhook = self
+                    .webhook
+                    .as_ref()
+                    .ok_or_else(|| FcpError::InvalidRequest {
+                        code: 1008,
+                        message: "Webhook not configured (set app_secret and webhook_verify_token)"
+                            .into(),
+                    })?;
+                let config = self.config.as_ref().ok_or_else(|| FcpError::Internal {
                     message: "WhatsApp config missing after configure".into(),
                 })?;
 
-                let headers_value = req.input.get("headers").ok_or(FcpError::InvalidRequest {
-                    code: 1005,
-                    message: "Missing 'headers' field".into(),
-                })?;
+                let headers_value =
+                    req.input
+                        .get("headers")
+                        .ok_or_else(|| FcpError::InvalidRequest {
+                            code: 1005,
+                            message: "Missing 'headers' field".into(),
+                        })?;
                 let headers: std::collections::HashMap<String, String> =
                     serde_json::from_value(headers_value.clone()).map_err(|e| {
                         FcpError::InvalidRequest {
@@ -1272,12 +1289,14 @@ impl WhatsAppConnector {
                         }
                     })?;
 
-                let body_str = req.input.get("body").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let body_str = req
+                    .input
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'body' field (must be raw JSON string)".into(),
-                    },
-                )?;
+                    })?;
 
                 let events = webhook
                     .verify_and_parse(&headers, body_str.as_bytes())

@@ -1,4 +1,4 @@
-//! WhatsApp Business API types.
+//! `WhatsApp` Business API types.
 
 use serde::{Deserialize, Serialize};
 
@@ -138,13 +138,13 @@ pub struct MessageRef {
     pub id: String,
 }
 
-/// WhatsApp API error response.
+/// `WhatsApp` API error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorResponse {
     pub error: ApiErrorDetail,
 }
 
-/// Error detail from the WhatsApp API.
+/// Error detail from the `WhatsApp` API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorDetail {
     pub message: String,

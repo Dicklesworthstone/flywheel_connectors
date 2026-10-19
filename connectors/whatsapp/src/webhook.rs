@@ -1,4 +1,4 @@
-//! WhatsApp webhook handler with signature verification.
+//! `WhatsApp` webhook handler with signature verification.
 //!
 //! Implements Meta's webhook verification protocol:
 //! - Challenge-response for endpoint registration
@@ -29,12 +29,12 @@ use crate::types::{
 const DEFAULT_DLQ_MAX_SIZE: usize = 1000;
 const SIGNATURE_HEADER: &str = "x-hub-signature-256";
 
-/// WhatsApp webhook handler.
+/// `WhatsApp` webhook handler.
 ///
 /// Provides:
 /// - Challenge-response verification for Meta webhook registration
 /// - HMAC-SHA256 signature verification (X-Hub-Signature-256 header)
-/// - Typed event parsing from WebhookNotification payloads
+/// - Typed event parsing from `WebhookNotification` payloads
 /// - Message-ID-based replay detection
 /// - Dead letter queue for events that fail processing
 #[derive(Debug)]
@@ -46,7 +46,7 @@ pub struct WhatsAppWebhook {
 }
 
 impl WhatsAppWebhook {
-    /// Create a new WhatsApp webhook handler.
+    /// Create a new `WhatsApp` webhook handler.
     ///
     /// # Arguments
     /// - `app_secret`: Meta app secret for HMAC-SHA256 signature verification
@@ -106,7 +106,7 @@ impl WhatsAppWebhook {
         Ok(challenge.to_string())
     }
 
-    /// Verify signature and parse a WhatsApp webhook notification.
+    /// Verify signature and parse a `WhatsApp` webhook notification.
     ///
     /// Meta sends POST requests with:
     /// - `X-Hub-Signature-256` header: `sha256=<hex>` HMAC-SHA256 of the body
@@ -399,7 +399,7 @@ fn deterministic_event_id(
 /// The early return on length mismatch is acceptable here because:
 /// - For HMAC signature verification (the primary security use), both inputs are
 ///   always 32 bytes (SHA-256 output), so the branch is never taken.
-/// - For verify_token comparison, the token length is not a meaningful secret
+/// - For `verify_token` comparison, the token length is not a meaningful secret
 ///   (it's configured in Meta's dashboard and sent as a query parameter).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

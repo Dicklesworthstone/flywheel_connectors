@@ -1,4 +1,4 @@
-//! WhatsApp connector error types.
+//! `WhatsApp` connector error types.
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use fcp_sdk::ConnectorErrorMapping;
 use fcp_sdk::migration::classify_http_status;
 use thiserror::Error;
 
-/// WhatsApp connector errors.
+/// `WhatsApp` connector errors.
 #[derive(Error, Debug)]
 pub enum WhatsAppError {
     /// HTTP transport error.
@@ -19,7 +19,7 @@ pub enum WhatsAppError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// WhatsApp API returned an error response.
+    /// `WhatsApp` API returned an error response.
     #[error("WhatsApp API error ({code}): {message}")]
     Api {
         code: u32,
@@ -28,7 +28,7 @@ pub enum WhatsAppError {
         subcode: Option<u32>,
     },
 
-    /// Rate limited by WhatsApp API.
+    /// Rate limited by `WhatsApp` API.
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
 
@@ -40,7 +40,7 @@ pub enum WhatsAppError {
     #[error("Invalid phone number: {0}")]
     InvalidPhoneNumber(String),
 
-    /// Template message rejected by WhatsApp.
+    /// Template message rejected by `WhatsApp`.
     #[error("Template rejected: {0}")]
     TemplateRejected(String),
 
@@ -73,8 +73,7 @@ impl WhatsAppError {
             } => {
                 if matches!(error_type.as_str(), "HttpError" | "HealthCheckError") {
                     return u16::try_from(*code)
-                        .ok()
-                        .is_some_and(|status| classify_http_status(status, None).is_retryable());
+                        .is_ok_and(|status| classify_http_status(status, None).is_retryable());
                 }
                 matches!(*code, 1 | 2 | 4 | 368)
             }
