@@ -4,6 +4,7 @@
 //! over a REST API.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 pub mod client;
 pub mod connector;
