@@ -2582,6 +2582,29 @@ struct LiveAuthArgs {
     approval_token_file: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug, Clone, Default, Serialize)]
+struct WorkflowAuthArgs {
+    /// Default credentials for steps targeting one connector.
+    #[command(flatten)]
+    #[serde(flatten)]
+    default_auth: LiveAuthArgs,
+
+    /// Capability for one workflow step. Repeat for each separately authorized step.
+    #[arg(long = "step-capability-token", value_name = "STEP=TOKEN")]
+    #[serde(skip_serializing)]
+    step_capability_token: Vec<String>,
+
+    /// Read a workflow step's capability from a base64, JSON, or raw CBOR file.
+    #[arg(long = "step-capability-token-file", value_name = "STEP=PATH")]
+    #[serde(skip_serializing)]
+    step_capability_token_file: Vec<String>,
+
+    /// Holder signing key for the capability explicitly assigned to this step.
+    #[arg(long = "step-holder-key-file", value_name = "STEP=PATH")]
+    #[serde(skip_serializing)]
+    step_holder_key_file: Vec<String>,
+}
+
 #[derive(Args, Debug, Serialize)]
 struct InvokeArgs {
     /// Connector id, alias, or family name.
@@ -3124,7 +3147,7 @@ struct RecipeRunArgs {
     zone: Option<String>,
 
     #[command(flatten)]
-    auth: LiveAuthArgs,
+    auth: WorkflowAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -3178,7 +3201,7 @@ struct PipelineRunArgs {
     zone: Option<String>,
 
     #[command(flatten)]
-    auth: LiveAuthArgs,
+    auth: WorkflowAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -23457,6 +23480,7 @@ enum LiveAuthError {
     InvalidCapabilityToken { source: String, message: String },
     InvalidApprovalToken { source: String, message: String },
     InvalidHolderProof { message: String },
+    InvalidWorkflowAuth { message: String },
 }
 
 impl LiveAuthError {
@@ -23467,6 +23491,7 @@ impl LiveAuthError {
             Self::InvalidCapabilityToken { .. } => "invalid-capability-token",
             Self::InvalidApprovalToken { .. } => "invalid-approval-token",
             Self::InvalidHolderProof { .. } => "invalid-holder-proof",
+            Self::InvalidWorkflowAuth { .. } => "invalid-workflow-auth",
         }
     }
 
@@ -23480,7 +23505,9 @@ impl LiveAuthError {
             Self::InvalidApprovalToken { source, message } => {
                 format!("Failed to parse an approval token from {source}: {message}")
             }
-            Self::InvalidHolderProof { message } => message.clone(),
+            Self::InvalidHolderProof { message } | Self::InvalidWorkflowAuth { message } => {
+                message.clone()
+            }
         }
     }
 }
@@ -28428,6 +28455,136 @@ fn resolve_live_pipeline_operations(
     Ok(operations)
 }
 
+fn parse_workflow_step_bindings(
+    values: &[String],
+    flag: &str,
+    step_ids: &BTreeSet<&str>,
+) -> std::result::Result<BTreeMap<String, String>, LiveAuthError> {
+    let mut bindings = BTreeMap::new();
+    for raw in values {
+        let Some((step_id, value)) = raw.split_once('=') else {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} requires STEP=VALUE."),
+            });
+        };
+        let step_id = step_id.trim();
+        if !step_ids.contains(step_id) {
+            // Do not echo an unrecognized key: a bare base64 token can itself
+            // contain '=' and would otherwise be printed as a step name.
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "{flag} names an unknown step. Valid steps: {}.",
+                    step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+        if value.trim().is_empty() {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} has an empty value for step `{step_id}`."),
+            });
+        }
+        if bindings.insert(step_id.to_owned(), value.to_owned()).is_some() {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} was specified more than once for step `{step_id}`."),
+            });
+        }
+    }
+    Ok(bindings)
+}
+
+fn resolve_workflow_auth(
+    args: &WorkflowAuthArgs,
+    plan: &pipe::PipelinePlan,
+    operations: &BTreeMap<String, ResolvedHostOperation>,
+) -> std::result::Result<BTreeMap<String, ResolvedLiveAuth>, LiveAuthError> {
+    let step_ids = plan.steps.iter().map(|step| step.id.as_str()).collect();
+    let inline = parse_workflow_step_bindings(
+        &args.step_capability_token,
+        "--step-capability-token",
+        &step_ids,
+    )?;
+    let files = parse_workflow_step_bindings(
+        &args.step_capability_token_file,
+        "--step-capability-token-file",
+        &step_ids,
+    )?;
+    let holder_keys = parse_workflow_step_bindings(
+        &args.step_holder_key_file,
+        "--step-holder-key-file",
+        &step_ids,
+    )?;
+    for step_id in inline.keys() {
+        if files.contains_key(step_id) {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "Step `{step_id}` has both --step-capability-token and --step-capability-token-file; choose one."
+                ),
+            });
+        }
+    }
+    for step_id in holder_keys.keys() {
+        if !inline.contains_key(step_id) && !files.contains_key(step_id) {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "--step-holder-key-file for step `{step_id}` requires that step's own capability token."
+                ),
+            });
+        }
+    }
+
+    let mut default_connectors = BTreeSet::new();
+    for step in &plan.steps {
+        let resolved = operations.get(&step.operation).ok_or_else(|| {
+            LiveAuthError::InvalidWorkflowAuth {
+                message: format!("Step `{}` is missing resolved live metadata.", step.id),
+            }
+        })?;
+        if !inline.contains_key(&step.id) && !files.contains_key(&step.id) {
+            default_connectors.insert(resolved.connector.summary.id.as_str());
+        }
+    }
+    if default_connectors.len() > 1 {
+        return Err(LiveAuthError::InvalidWorkflowAuth {
+            message: "Steps without explicit credentials target multiple connectors. Assign --step-capability-token-file STEP=PATH to each separately authorized step; default credentials may cover only one connector.".to_owned(),
+        });
+    }
+
+    let default_requested = args.default_auth.capability_token.is_some()
+        || args.default_auth.capability_token_file.is_some()
+        || args.default_auth.holder_key_file.is_some();
+    let default_auth = if default_requested || !default_connectors.is_empty() {
+        Some(resolve_live_auth(&args.default_auth)?)
+    } else {
+        None
+    };
+    let mut auth_by_step = BTreeMap::new();
+    for step in &plan.steps {
+        let auth = if inline.contains_key(&step.id) || files.contains_key(&step.id) {
+            let step_args = LiveAuthArgs {
+                capability_token: inline.get(&step.id).cloned(),
+                capability_token_file: files.get(&step.id).map(PathBuf::from),
+                // A different capability never inherits the default holder key.
+                holder_key_file: holder_keys.get(&step.id).map(PathBuf::from),
+                approval_token: args.default_auth.approval_token.clone(),
+                approval_token_file: args.default_auth.approval_token_file.clone(),
+            };
+            resolve_live_auth(&step_args).map_err(|error| {
+                LiveAuthError::InvalidWorkflowAuth {
+                    message: format!(
+                        "Invalid credentials for step `{}`: {} Use --step-capability-token-file STEP=PATH and --step-holder-key-file STEP=PATH for this step.",
+                        step.id,
+                        error.message()
+                    ),
+                }
+            })?
+        } else {
+            default_auth.clone().ok_or(LiveAuthError::MissingCapabilityToken)?
+        };
+        auth_by_step.insert(step.id.clone(), auth);
+    }
+    Ok(auth_by_step)
+}
+
 fn live_pipeline_operation_metadata(
     operations: &BTreeMap<String, ResolvedHostOperation>,
 ) -> BTreeMap<String, pipe::PipelineOperationMetadata> {
@@ -28468,8 +28625,15 @@ fn execute_live_pipeline_plan(
     mode: PipelinePlanMode,
     host: &ResolvedHostConfig,
     zone: &str,
-    auth: &ResolvedLiveAuth,
+    auth_by_step: &BTreeMap<String, ResolvedLiveAuth>,
 ) -> Result<LivePipelineExecutionResult> {
+    for step in &plan.steps {
+        anyhow::ensure!(
+            auth_by_step.contains_key(&step.id),
+            "pipeline step `{}` is missing resolved credentials",
+            step.id
+        );
+    }
     let client = HostAdminClient::new(&host.endpoint)?;
     let steps_by_id = plan
         .steps
@@ -28492,6 +28656,9 @@ fn execute_live_pipeline_plan(
         })?;
         let resolved = operations.get(&step.operation).ok_or_else(|| {
             anyhow::anyhow!("pipeline step `{step_id}` is missing resolved live metadata")
+        })?;
+        let auth = auth_by_step.get(step_id).ok_or_else(|| {
+            anyhow::anyhow!("pipeline step `{step_id}` is missing resolved credentials")
         })?;
 
         let dependency_failures = step
@@ -29109,7 +29276,14 @@ fn recipe_run_dispatch(
             ],
         ));
     };
-    let auth = match resolve_live_auth(&args.auth) {
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let resolved_operations =
+        match resolve_live_pipeline_operations("recipe", &plan, &client, &catalog) {
+            Ok(operations) => operations,
+            Err(outcome) => return Ok(outcome),
+        };
+    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -29122,18 +29296,12 @@ fn recipe_run_dispatch(
                         recipe.slug,
                         host.endpoint
                     ),
+                    "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
                     "Provide approval tokens with `--approval-token-file` when recipe steps require explicit authorization.".to_owned(),
                 ],
             ));
         }
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
-    let resolved_operations =
-        match resolve_live_pipeline_operations("recipe", &plan, &client, &catalog) {
-            Ok(operations) => operations,
-            Err(outcome) => return Ok(outcome),
-        };
     let estimate = pipe::estimate_pipeline(
         &plan,
         &live_pipeline_operation_metadata(&resolved_operations),
@@ -29642,7 +29810,14 @@ fn pipeline_run_dispatch(
             ],
         ));
     };
-    let auth = match resolve_live_auth(&args.auth) {
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let resolved_operations =
+        match resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog) {
+            Ok(operations) => operations,
+            Err(outcome) => return Ok(outcome),
+        };
+    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -29655,18 +29830,12 @@ fn pipeline_run_dispatch(
                         path.display(),
                         host.endpoint
                     ),
+                    "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
                     "Provide approval tokens with `--approval-token-file` when pipeline steps require explicit authorization.".to_owned(),
                 ],
             ));
         }
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
-    let resolved_operations =
-        match resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog) {
-            Ok(operations) => operations,
-            Err(outcome) => return Ok(outcome),
-        };
     let estimate = pipe::estimate_pipeline(
         &plan,
         &live_pipeline_operation_metadata(&resolved_operations),
@@ -32765,6 +32934,10 @@ fn is_sensitive_flag(flag: &str) -> bool {
     matches!(
         flag,
         "--capability-token"
+            | "--source-capability-token"
+            | "--step-capability-token"
+            | "--step-capability-token-file"
+            | "--step-holder-key-file"
             | "--approval-token"
             | "--token"
             | "--api-token"
@@ -35252,6 +35425,80 @@ max_state_replication_staleness_secs = 120
         proof
     }
 
+    fn test_workflow_holder_auth(
+        directory: &Path,
+        step_id: &str,
+        seed: u8,
+    ) -> (String, PathBuf, Ed25519SigningKey) {
+        use base64::Engine as _;
+
+        let key_path = directory.join(format!("{step_id}-holder.raw"));
+        fs::write(&key_path, [seed; 32]).expect("workflow holder key should write");
+        let key = Ed25519SigningKey::from_bytes(&[seed; 32]).expect("workflow holder key");
+        let instance = fcp_core::InstanceId::new();
+        let claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .expect("workflow capability claims")
+            .subject(&format!("agent:{step_id}"))
+            .holder_node(&format!("node:{step_id}"))
+            .token_id(step_id.as_bytes())
+            .target_instance(instance.as_str());
+        let issuer = Ed25519SigningKey::from_bytes(&[0x42; 32]).expect("workflow issuer");
+        let token = fcp_crypto::cose::CoseToken::sign(&issuer, &claims)
+            .expect("workflow capability should sign");
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(token.to_cbor().expect("workflow capability should encode"));
+        (encoded, key_path, key)
+    }
+
+    fn assert_workflow_holder_request(
+        request: &Value,
+        expected_token: &str,
+        key: &Ed25519SigningKey,
+    ) -> fcp_core::HolderProof {
+        let token = super::parse_capability_token_str(expected_token, "workflow fixture").unwrap();
+        assert_eq!(
+            request["capability_token"],
+            serde_json::to_value(&token).unwrap()
+        );
+        let claims = token.raw().claims_unverified().unwrap();
+        let request_id: RequestId = serde_json::from_value(
+            request
+                .get("request_id")
+                .or_else(|| request.get("id"))
+                .expect("workflow wire request ID")
+                .clone(),
+        )
+        .unwrap();
+        let operation: fcp_core::OperationId =
+            serde_json::from_value(request["operation"].clone()).unwrap();
+        let proof: fcp_core::HolderProof =
+            serde_json::from_value(request["holder_proof"].clone()).unwrap();
+        assert_eq!(
+            proof.holder_node.as_str(),
+            claims.get_holder_node().expect("workflow holder claim")
+        );
+        if request.get("request_id").is_some() {
+            assert_eq!(
+                request["principal"],
+                claims.get_subject().expect("workflow principal claim")
+            );
+        }
+        let signable = fcp_core::HolderProof::signable_bytes(
+            &request_id,
+            &operation,
+            claims.get_jti().expect("workflow token JTI"),
+        );
+        key.verifying_key()
+            .verify(
+                &signable,
+                &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
+            )
+            .expect("workflow holder signature must bind its own token and actual request");
+        proof
+    }
+
     #[test]
     fn live_holder_key_accepts_raw_hex_and_bounded_whitespace() {
         fn assert_zeroizes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
@@ -37206,6 +37453,47 @@ deny_ptrace = true
         .expect("auth list should work");
         assert_eq!(listed.exit_code, CliExitCode::Success);
         assert_eq!(listed.payload["summary"]["credential_count"], 0);
+    }
+
+    #[test]
+    fn workflow_auth_diagnostics_redact_received_and_normalized_credentials() {
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--extract",
+            ".connector[",
+            "pipeline",
+            "run",
+            "not-opened.toml",
+            "--step-capability-token=notify=INLINE_SECRET",
+            "--step-capability-token-file",
+            "notify=TOKEN_PATH_SECRET",
+            "--step-holder-key-file=notify=KEY_PATH_SECRET",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-extract-filter");
+        for view in ["received", "normalized"] {
+            let arguments = payload["input"][view].as_array().unwrap();
+            assert_eq!(arguments[7], "--step-capability-token=<redacted>");
+            assert_eq!(arguments[9], "<redacted>");
+            assert_eq!(arguments[10], "--step-holder-key-file=<redacted>");
+        }
+        let encoded = payload.to_string();
+        for secret in ["INLINE_SECRET", "TOKEN_PATH_SECRET", "KEY_PATH_SECRET"] {
+            assert!(!encoded.contains(secret));
+        }
+
+        let source_args = [
+            "fwc",
+            "pipe",
+            "--source-capability-token",
+            "SOURCE_SECRET",
+            "--source-capability-token=SECOND_SOURCE_SECRET",
+        ]
+        .map(str::to_owned);
+        let redacted = super::redact_sensitive_args(&source_args);
+        assert_eq!(redacted[3], "<redacted>");
+        assert_eq!(redacted[4], "--source-capability-token=<redacted>");
     }
 
     #[test]
@@ -46154,6 +46442,319 @@ default = "#general"
         assert_eq!(payload["validation"]["execution_order"][1], "notify");
     }
 
+    fn workflow_auth_pipeline_fixture(directory: &Path) -> PathBuf {
+        let path = directory.join("workflow-auth.toml");
+        fs::write(
+            &path,
+            r#"
+[pipeline]
+name = "workflow-auth"
+
+[[steps]]
+id = "fetch"
+operation = "github.search_issues"
+lease_seq = 41
+input = { query = "first" }
+
+[[steps]]
+id = "again"
+operation = "GitHub.search_issues"
+lease_seq = 42
+depends_on = ["fetch"]
+input = { query = "second" }
+
+[[steps]]
+id = "notify"
+operation = "slack.post_message"
+lease_seq = 7
+depends_on = ["again"]
+input = { text = "{{steps.again.output.title}}" }
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn workflow_auth_mock_catalog() -> Vec<(String, Value)> {
+        let mut routes = pipe_mock_catalog(false);
+        // Two distinct selectors resolve to the same canonical connector.
+        routes.insert(2, routes[1].clone());
+        routes
+    }
+
+    #[test]
+    fn execute_pipeline_binds_every_step_and_preserves_same_connector_defaults() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let fetch = test_workflow_holder_auth(tempdir.path(), "fetch", 0x81);
+        let again = test_workflow_holder_auth(tempdir.path(), "again", 0x82);
+        let notify = test_workflow_holder_auth(tempdir.path(), "notify", 0x83);
+        let notify_token_path = tempdir.path().join("notify-token.cbor");
+        fs::write(
+            &notify_token_path,
+            super::parse_capability_token_str(&notify.0, "notify fixture")
+                .unwrap()
+                .raw()
+                .to_cbor()
+                .unwrap(),
+        )
+        .unwrap();
+
+        for use_default in [false, true] {
+            let mut routes = workflow_auth_mock_catalog();
+            for result in [
+                json!({"title": "first result"}),
+                json!({"title": "second result"}),
+                json!({"delivered": true}),
+            ] {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(result),
+                ));
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipeline".to_owned(),
+                "run".to_owned(),
+                path.display().to_string(),
+            ];
+            if use_default {
+                args.extend([
+                    "--capability-token".to_owned(),
+                    fetch.0.clone(),
+                    "--holder-key-file".to_owned(),
+                    fetch.1.display().to_string(),
+                ]);
+            } else {
+                for (step_id, auth) in [("fetch", &fetch), ("again", &again)] {
+                    args.extend([
+                        "--step-capability-token".to_owned(),
+                        format!("{step_id}={}", auth.0),
+                        "--step-holder-key-file".to_owned(),
+                        format!("{step_id}={}", auth.1.display()),
+                    ]);
+                }
+            }
+            args.extend([
+                "--step-capability-token-file".to_owned(),
+                format!("notify={}", notify_token_path.display()),
+                "--step-holder-key-file".to_owned(),
+                format!("notify={}", notify.1.display()),
+            ]);
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("workflow mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["execution"]["executed_steps"], 3);
+            assert_eq!(payload["execution"]["outputs"]["notify"]["delivered"], true);
+
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 10);
+            let mut request_ids = std::collections::BTreeSet::new();
+            let selected = [
+                (&fetch, "fcp.github:enterprise:v1", "github.search_issues", 41),
+                (
+                    if use_default { &fetch } else { &again },
+                    "fcp.github:enterprise:v1",
+                    "github.search_issues",
+                    42,
+                ),
+                (&notify, "fcp.slack:team:v1", "slack.post_message", 7),
+            ];
+            for (step_requests, (auth, connector, operation, lease)) in
+                requests[4..].chunks_exact(2).zip(selected)
+            {
+                let preflight: Value = serde_json::from_str(&step_requests[0].1).unwrap();
+                let invoke: Value = serde_json::from_str(&step_requests[1].1).unwrap();
+                assert_workflow_holder_request(&preflight, &auth.0, &auth.2);
+                assert_workflow_holder_request(&invoke, &auth.0, &auth.2);
+                assert_eq!(preflight["connector_id"], connector);
+                assert_eq!(invoke["connector_id"], connector);
+                assert_eq!(preflight["operation"], operation);
+                assert_eq!(invoke["operation"], operation);
+                assert_eq!(preflight["lease_seq"], lease);
+                assert_eq!(invoke["lease_seq"], lease);
+                assert_eq!(preflight["request_id"], invoke["id"]);
+                assert_eq!(preflight["capability_token"], invoke["capability_token"]);
+                assert_eq!(preflight["holder_proof"], invoke["holder_proof"]);
+                assert_eq!(preflight["params"], invoke["input"]);
+                assert!(request_ids.insert(invoke["id"].as_str().unwrap().to_owned()));
+            }
+            let notify_invoke: Value = serde_json::from_str(&requests[9].1).unwrap();
+            assert_eq!(notify_invoke["input"], json!({"text": "second result"}));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_rejects_invalid_step_credentials_before_any_effect() {
+        let tempdir = TempDir::new().unwrap();
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let fetch = test_workflow_holder_auth(tempdir.path(), "fetch", 0x81);
+        let notify = test_workflow_holder_auth(tempdir.path(), "notify", 0x83);
+        let token_binding = format!("notify={}", notify.0);
+        let key_binding = format!("notify={}", notify.1.display());
+        let secret_marker = "UNRECOGNIZED_SECRET_INPUT";
+        let cases = [
+            ("cross-connector-default", true, vec![]),
+            (
+                "unknown-step",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    format!("{secret_marker}=opaque"),
+                ],
+            ),
+            (
+                "malformed-binding",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    secret_marker.to_owned(),
+                ],
+            ),
+            (
+                "empty-binding",
+                true,
+                vec![
+                    "--step-capability-token-file".to_owned(),
+                    "notify=".to_owned(),
+                ],
+            ),
+            (
+                "duplicate-binding",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                ],
+            ),
+            (
+                "conflicting-sources",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-capability-token-file".to_owned(),
+                    "notify=must-not-be-opened".to_owned(),
+                ],
+            ),
+            (
+                "orphan-holder",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    format!("fetch={}", fetch.1.display()),
+                ],
+            ),
+            (
+                "default-holder-must-not-be-inherited",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                ],
+            ),
+            (
+                "invalid-later-token",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    "notify=not-a-token".to_owned(),
+                ],
+            ),
+            (
+                "missing-default",
+                false,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding,
+                    "--step-holder-key-file".to_owned(),
+                    key_binding,
+                ],
+            ),
+        ];
+        for (case, supply_default, overrides) in cases {
+            let (host, server, request_log) =
+                spawn_mock_host_sequence_with_body_log(workflow_auth_mock_catalog());
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipeline".to_owned(),
+                "run".to_owned(),
+                path.display().to_string(),
+            ];
+            if supply_default {
+                args.extend([
+                    "--capability-token".to_owned(),
+                    fetch.0.clone(),
+                    "--holder-key-file".to_owned(),
+                    fetch.1.display().to_string(),
+                ]);
+            }
+            args.extend(overrides);
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("workflow validation mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Validation.into(), "{case}: {payload}");
+            assert_eq!(
+                payload["error"]["type"],
+                if supply_default {
+                    "invalid-workflow-auth"
+                } else {
+                    "missing-capability-token"
+                },
+                "{case}: {payload}"
+            );
+            assert!(!payload.to_string().contains(secret_marker));
+            assert!(!payload.to_string().contains(&fetch.0));
+            assert!(!payload.to_string().contains(&notify.0));
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 4, "{case}");
+            assert!(requests.iter().all(|(route, _)| {
+                !route.contains("/rpc/preflight") && !route.contains("/rpc/invoke")
+            }));
+        }
+    }
+
+    #[test]
+    fn workflow_auth_serialization_omits_step_credentials() {
+        let args = super::WorkflowAuthArgs {
+            default_auth: LiveAuthArgs {
+                capability_token: Some("DEFAULT_SECRET".to_owned()),
+                holder_key_file: Some(PathBuf::from("DEFAULT_KEY")),
+                ..LiveAuthArgs::default()
+            },
+            step_capability_token: vec!["notify=STEP_SECRET".to_owned()],
+            step_capability_token_file: vec!["notify=TOKEN_PATH".to_owned()],
+            step_holder_key_file: vec!["notify=HOLDER_PATH".to_owned()],
+        };
+        let encoded = serde_json::to_string(&args).unwrap();
+        for private_value in [
+            "DEFAULT_SECRET",
+            "DEFAULT_KEY",
+            "STEP_SECRET",
+            "TOKEN_PATH",
+            "HOLDER_PATH",
+        ] {
+            assert!(!encoded.contains(private_value));
+        }
+    }
+
     #[test]
     fn execute_pipeline_preserves_step_lease_evidence_for_dry_run_and_invoke() {
         let temp_dir = tempfile::tempdir().expect("pipeline tempdir");
@@ -46383,6 +46984,7 @@ default = "#general"
                 mock_preflight_response_json(true),
             ),
         ]);
+        let (notify_token, notify_key_path, _) = test_workflow_holder_auth(&root, "notify", 0x91);
         let path_str = path.display().to_string();
         let (exit_code, payload) = execute_json(&[
             "fwc",
@@ -46394,6 +46996,10 @@ default = "#general"
             &path_str,
             "--capability-token",
             &capability_token,
+            "--step-capability-token",
+            &format!("notify={notify_token}"),
+            "--step-holder-key-file",
+            &format!("notify={}", notify_key_path.display()),
             "--param",
             "owner=octocat",
             "--param",
@@ -46718,6 +47324,8 @@ depends_on = ["missing"]
         let tempdir = TempDir::new().expect("recipe holder tempdir");
         let (capability_token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
         let key_path_text = key_path.display().to_string();
+        let (notify_token, notify_key_path, notify_key) =
+            test_workflow_holder_auth(tempdir.path(), "notify", 0x91);
         let github_connector = mock_connector_summary_custom_json(
             "fcp.github:enterprise:v1",
             "GitHub Enterprise",
@@ -46821,6 +47429,10 @@ depends_on = ["missing"]
             &capability_token,
             "--holder-key-file",
             &key_path_text,
+            "--step-capability-token",
+            &format!("notify={notify_token}"),
+            "--step-holder-key-file",
+            &format!("notify={}", notify_key_path.display()),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -46867,7 +47479,12 @@ depends_on = ["missing"]
         let notify_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
         let fetch_proof = assert_live_holder_request(&fetch_preflight, &signing_key);
         assert_live_holder_request(&fetch_invoke, &signing_key);
-        let notify_proof = assert_live_holder_request(&notify_preflight, &signing_key);
+        let notify_proof =
+            assert_workflow_holder_request(&notify_preflight, &notify_token, &notify_key);
+        assert_ne!(
+            fetch_preflight["capability_token"],
+            notify_preflight["capability_token"]
+        );
         assert_eq!(fetch_preflight["request_id"], fetch_invoke["id"]);
         assert_eq!(fetch_preflight["holder_proof"], fetch_invoke["holder_proof"]);
         assert_ne!(fetch_preflight["request_id"], notify_preflight["request_id"]);
