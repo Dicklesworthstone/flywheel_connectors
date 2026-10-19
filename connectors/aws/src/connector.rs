@@ -66,7 +66,7 @@ pub struct AwsConfig {
     pub retry: HttpRetryConfig,
     #[serde(default = "default_timeout_ms")]
     pub request_timeout_ms: u64,
-    /// Override S3 endpoint (e.g. for LocalStack).
+    /// Override S3 endpoint (e.g. for `LocalStack`).
     #[serde(default)]
     pub s3_base_url: Option<String>,
     /// Override EC2 endpoint.
@@ -505,11 +505,10 @@ impl AwsConnector {
             checks.push(DoctorCheck {
                 name: "sts_self_check_target".into(),
                 passed: readiness.sts_self_check_supported,
-                message: Some(if let Some(sts_url) = &readiness.endpoint_overrides.sts {
-                    format!("Self-check will probe custom STS endpoint: {sts_url}")
-                } else {
-                    "Self-check will probe default STS with SigV4-signed requests; set sts_base_url for deterministic testing".into()
-                }),
+                message: Some(readiness.endpoint_overrides.sts.as_ref().map_or_else(
+                    || "Self-check will probe default STS with SigV4-signed requests; set sts_base_url for deterministic testing".into(),
+                    |sts_url| format!("Self-check will probe custom STS endpoint: {sts_url}"),
+                )),
                 critical: false,
             });
         }

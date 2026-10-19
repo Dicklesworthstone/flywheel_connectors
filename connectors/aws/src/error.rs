@@ -48,8 +48,8 @@ impl AwsError {
             Self::Api { code, .. } => {
                 matches!(code, 500 | 502 | 503 | 504 | 529)
             }
-            Self::ServiceError { .. } => false,
-            Self::Json(_)
+            Self::ServiceError { .. }
+            | Self::Json(_)
             | Self::Unauthorized(_)
             | Self::NotFound(_)
             | Self::Async(_)

@@ -797,14 +797,14 @@ fn sign_request(
         payload_hash: payload_hash.clone(),
     };
 
-    let signed = signer.sign(&signable);
+    let sig_output = signer.sign(&signable);
 
     let mut req = req
-        .header("Authorization", &signed.authorization)
-        .header("X-Amz-Date", &signed.x_amz_date)
+        .header("Authorization", &sig_output.authorization)
+        .header("X-Amz-Date", &sig_output.x_amz_date)
         .header("X-Amz-Content-Sha256", &payload_hash);
 
-    if let Some(token) = &signed.x_amz_security_token {
+    if let Some(token) = &sig_output.x_amz_security_token {
         req = req.header("X-Amz-Security-Token", token);
     }
 
