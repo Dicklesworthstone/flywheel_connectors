@@ -1,5 +1,7 @@
 //! Mastodon API client.
 
+#![allow(clippy::missing_errors_doc)]
+
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status};
@@ -63,7 +65,7 @@ impl std::fmt::Debug for MastodonClient {
             .field("base_url", &self.base_url)
             .field("access_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -92,6 +94,7 @@ impl MastodonClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -168,9 +171,10 @@ impl MastodonClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: MastodonError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -267,9 +271,10 @@ impl MastodonClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: MastodonError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -348,9 +353,10 @@ impl MastodonClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: MastodonError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };

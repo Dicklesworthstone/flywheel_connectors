@@ -1,5 +1,7 @@
 //! Mastodon connector implementation.
 
+#![allow(clippy::too_many_lines)]
+
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -265,14 +267,14 @@ fn input_schema_for(operation: &str) -> Value {
     match operation {
         OP_TIMELINE_HOME => timeline_home_input_schema(),
         OP_TIMELINE_PUBLIC => timeline_public_input_schema(),
-        OP_STATUSES_GET | OP_STATUSES_DELETE | OP_STATUSES_FAVOURITE | OP_STATUSES_BOOST => {
-            id_input_schema()
-        }
+        OP_STATUSES_GET
+        | OP_STATUSES_DELETE
+        | OP_STATUSES_FAVOURITE
+        | OP_STATUSES_BOOST
+        | OP_ACCOUNTS_GET => id_input_schema(),
         OP_STATUSES_POST => status_post_input_schema(),
-        OP_ACCOUNTS_GET => id_input_schema(),
         OP_NOTIFICATIONS_LIST => notifications_input_schema(),
         OP_SEARCH => search_input_schema(),
-        OP_ACCOUNTS_VERIFY | OP_HEALTH => empty_input_schema(),
         _ => empty_input_schema(),
     }
 }
@@ -372,7 +374,7 @@ impl MastodonConnector {
 
     /// Stable connector instance identity used for bound capability-token verification.
     #[must_use]
-    pub fn instance_id(&self) -> &InstanceId {
+    pub const fn instance_id(&self) -> &InstanceId {
         &self.base.instance_id
     }
 
@@ -383,6 +385,7 @@ impl MastodonConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
 
@@ -447,6 +450,7 @@ impl Default for MastodonConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -849,7 +853,7 @@ impl MastodonConnector {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -875,10 +879,10 @@ impl MastodonConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Mastodon client missing after configure".into(),
         })?;
 
@@ -887,7 +891,7 @@ impl MastodonConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(Value::as_u64)
                     .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
                 let statuses = client
                     .get_home_timeline(runtime, limit)
@@ -901,12 +905,12 @@ impl MastodonConnector {
                 let local = req
                     .input
                     .get("local")
-                    .and_then(|v| v.as_bool())
+                    .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(Value::as_u64)
                     .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
                 let statuses = client
                     .get_public_timeline(runtime, local, limit)
@@ -917,12 +921,14 @@ impl MastodonConnector {
                 })?
             }
             OP_STATUSES_GET => {
-                let id = req.input.get("id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'id' field".into(),
-                    },
-                )?;
+                    })?;
                 let status = client
                     .get_status(runtime, id)
                     .await
@@ -932,20 +938,22 @@ impl MastodonConnector {
                 })?
             }
             OP_STATUSES_POST => {
-                let status_text = req.input.get("status").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let status_text = req
+                    .input
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'status' field".into(),
-                    },
-                )?;
-                let visibility = req.input.get("visibility").and_then(|v| v.as_str());
-                let in_reply_to_id = req.input.get("in_reply_to_id").and_then(|v| v.as_str());
+                    })?;
+                let visibility = req.input.get("visibility").and_then(Value::as_str);
+                let in_reply_to_id = req.input.get("in_reply_to_id").and_then(Value::as_str);
                 let sensitive = req
                     .input
                     .get("sensitive")
-                    .and_then(|v| v.as_bool())
+                    .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let spoiler_text = req.input.get("spoiler_text").and_then(|v| v.as_str());
+                let spoiler_text = req.input.get("spoiler_text").and_then(Value::as_str);
                 let status = client
                     .post_status(
                         runtime,
@@ -962,12 +970,14 @@ impl MastodonConnector {
                 })?
             }
             OP_STATUSES_DELETE => {
-                let id = req.input.get("id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'id' field".into(),
-                    },
-                )?;
+                    })?;
                 let status = client
                     .delete_status(runtime, id)
                     .await
@@ -977,12 +987,14 @@ impl MastodonConnector {
                 })?
             }
             OP_STATUSES_FAVOURITE => {
-                let id = req.input.get("id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'id' field".into(),
-                    },
-                )?;
+                    })?;
                 let status = client
                     .favourite_status(runtime, id)
                     .await
@@ -992,12 +1004,14 @@ impl MastodonConnector {
                 })?
             }
             OP_STATUSES_BOOST => {
-                let id = req.input.get("id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'id' field".into(),
-                    },
-                )?;
+                    })?;
                 let status = client
                     .boost_status(runtime, id)
                     .await
@@ -1007,12 +1021,14 @@ impl MastodonConnector {
                 })?
             }
             OP_ACCOUNTS_GET => {
-                let id = req.input.get("id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let id = req
+                    .input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'id' field".into(),
-                    },
-                )?;
+                    })?;
                 let account = client
                     .get_account(runtime, id)
                     .await
@@ -1034,7 +1050,7 @@ impl MastodonConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(Value::as_u64)
                     .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
                 let notifications = client
                     .get_notifications(runtime, limit)
@@ -1045,17 +1061,19 @@ impl MastodonConnector {
                 })?
             }
             OP_SEARCH => {
-                let q = req.input.get("q").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let q = req
+                    .input
+                    .get("q")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'q' field".into(),
-                    },
-                )?;
-                let search_type = req.input.get("type").and_then(|v| v.as_str());
+                    })?;
+                let search_type = req.input.get("type").and_then(Value::as_str);
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(Value::as_u64)
                     .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
                 let results = client
                     .search(runtime, q, search_type, limit)
@@ -1417,7 +1435,7 @@ mod tests {
         ];
         for op_name in &read_ops {
             let op = ops.iter().find(|o| o.id.as_str() == *op_name);
-            assert!(op.is_some(), "Missing op: {}", op_name);
+            assert!(op.is_some(), "Missing op: {op_name}");
             let op = op.unwrap();
             assert_eq!(
                 op.capability.as_str(),
@@ -1438,7 +1456,7 @@ mod tests {
         ];
         for op_name in &write_ops {
             let op = ops.iter().find(|o| o.id.as_str() == *op_name);
-            assert!(op.is_some(), "Missing op: {}", op_name);
+            assert!(op.is_some(), "Missing op: {op_name}");
             let op = op.unwrap();
             assert_eq!(
                 op.capability.as_str(),
