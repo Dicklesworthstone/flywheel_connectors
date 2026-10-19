@@ -674,6 +674,7 @@ mod mesh {
                 let reply = router.forward(&TailscaleNodeId::new(op.id.clone()), MeshForwardBody::Invoke {
                     request_json: op.input.to_string(),
                     asserted_principal: None,
+                    origin_attempt_id: None,
                 }).await.map_err(|error| BatchOperationError {
                     code: "MESH_FORWARD_FAILED".to_owned(),
                     message: error.summary(),

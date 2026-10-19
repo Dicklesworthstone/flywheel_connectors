@@ -679,6 +679,7 @@ async fn peer_forward_endpoint_rejects_forged_misaddressed_and_replayed_envelope
     let body = || MeshForwardBody::Invoke {
         request_json: serde_json::to_string(&request).expect("request json"),
         asserted_principal: None,
+        origin_attempt_id: None,
     };
     let now_ms = u64::try_from(
         std::time::SystemTime::now()

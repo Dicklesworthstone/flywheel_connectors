@@ -55,6 +55,8 @@ pub const DEFAULT_MESH_FORWARD_REPLAY_CAPACITY: usize = 16_384;
 pub const DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS: u64 = 5 * 60_000;
 /// Hard cap on the forwarded request body (bytes of JSON).
 pub const MAX_MESH_FORWARD_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Hard cap on the JSON body of a forwarded cancellation request.
+pub const MAX_MESH_CANCELLATION_BODY_BYTES: usize = 16 * 1024;
 /// Hard cap on connectors listed in one advertisement.
 pub const MAX_ADVERTISED_CONNECTORS: usize = 4096;
 
@@ -142,7 +144,7 @@ pub enum MeshForwardError {
     /// A reply did not bind to the request it claims to answer.
     #[error("mesh forward reply binding mismatch: {0}")]
     ReplyBindingMismatch(String),
-    /// The body exceeded [`MAX_MESH_FORWARD_BODY_BYTES`].
+    /// The body exceeded its method-specific size limit.
     #[error("mesh forward body is {len} bytes (limit {limit})")]
     BodyTooLarge {
         /// Body length.
@@ -417,6 +419,17 @@ pub enum MeshForwardBody {
         /// re-checked against the capability token by the executor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         asserted_principal: Option<String>,
+        /// Nonzero origin-local attempt id for cancellation of this exact dispatch.
+        /// Omitted by legacy senders, whose signed bytes remain unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_attempt_id: Option<u64>,
+    },
+    /// Cancel one origin-authenticated invocation attempt.
+    Cancel {
+        /// Exact JSON-encoded cancellation request signed by the origin.
+        request_json: String,
+        /// Nonzero attempt id assigned by the origin to the original dispatch.
+        origin_attempt_id: u64,
     },
     /// Evaluate the host preflight for a would-be invoke without executing.
     Preflight {
@@ -473,6 +486,7 @@ impl MeshForwardBody {
     pub const fn method(&self) -> &'static str {
         match self {
             Self::Invoke { .. } => "invoke",
+            Self::Cancel { .. } => "cancel",
             Self::Preflight { .. } => "preflight",
             Self::Simulate { .. } => "simulate",
             Self::Introspect { .. } => "introspect",
@@ -489,8 +503,21 @@ impl MeshForwardBody {
             Self::Invoke {
                 request_json,
                 asserted_principal,
+                origin_attempt_id,
+            } => {
+                out.field(request_json.as_bytes())
+                    .opt_field(asserted_principal.as_deref().map(str::as_bytes));
+                if let Some(attempt_id) = origin_attempt_id {
+                    out.field(b"origin_attempt_id").u64(*attempt_id);
+                }
             }
-            | Self::Preflight {
+            Self::Cancel {
+                request_json,
+                origin_attempt_id,
+            } => {
+                out.field(request_json.as_bytes()).u64(*origin_attempt_id);
+            }
+            Self::Preflight {
                 request_json,
                 asserted_principal,
             }
@@ -523,6 +550,7 @@ impl MeshForwardBody {
             Self::Invoke {
                 request_json,
                 asserted_principal,
+                ..
             }
             | Self::Preflight {
                 request_json,
@@ -539,8 +567,37 @@ impl MeshForwardBody {
                 connector_id,
                 zone_id,
             } => connector_id.len().saturating_add(zone_id.len()),
-            Self::ConnectorStateExport { request_json } => request_json.len(),
+            Self::Cancel { request_json, .. }
+            | Self::ConnectorStateExport { request_json } => request_json.len(),
         }
+    }
+
+    fn validate(&self) -> Result<(), MeshForwardError> {
+        if matches!(
+            self,
+            Self::Invoke {
+                origin_attempt_id: Some(0),
+                ..
+            } | Self::Cancel {
+                origin_attempt_id: 0,
+                ..
+            }
+        ) {
+            return Err(MeshForwardError::Malformed {
+                field: "origin_attempt_id",
+                detail: "attempt id must be nonzero".to_owned(),
+            });
+        }
+        let limit = if matches!(self, Self::Cancel { .. }) {
+            MAX_MESH_CANCELLATION_BODY_BYTES
+        } else {
+            MAX_MESH_FORWARD_BODY_BYTES
+        };
+        let len = self.body_len();
+        if len > limit {
+            return Err(MeshForwardError::BodyTooLarge { len, limit });
+        }
+        Ok(())
     }
 }
 
@@ -572,7 +629,8 @@ impl MeshForwardEnvelope {
     /// # Errors
     ///
     /// Returns [`MeshForwardError::BodyTooLarge`] when the body exceeds
-    /// [`MAX_MESH_FORWARD_BODY_BYTES`].
+    /// its method-specific limit, or [`MeshForwardError::Malformed`] for
+    /// a zero invocation or cancellation attempt id.
     pub fn sign(
         signing_key: &Ed25519SigningKey,
         origin_node: TailscaleNodeId,
@@ -580,13 +638,7 @@ impl MeshForwardEnvelope {
         issued_at_ms: u64,
         body: MeshForwardBody,
     ) -> Result<Self, MeshForwardError> {
-        let len = body.body_len();
-        if len > MAX_MESH_FORWARD_BODY_BYTES {
-            return Err(MeshForwardError::BodyTooLarge {
-                len,
-                limit: MAX_MESH_FORWARD_BODY_BYTES,
-            });
-        }
+        body.validate()?;
         let mut envelope = Self {
             schema_version: MESH_FORWARD_SCHEMA_VERSION.to_owned(),
             origin_node,
@@ -649,13 +701,7 @@ impl MeshForwardEnvelope {
                 limit: MAX_MESH_FORWARD_HOPS,
             });
         }
-        let len = self.body.body_len();
-        if len > MAX_MESH_FORWARD_BODY_BYTES {
-            return Err(MeshForwardError::BodyTooLarge {
-                len,
-                limit: MAX_MESH_FORWARD_BODY_BYTES,
-            });
-        }
+        self.body.validate()?;
         validate_nonce_hex(&self.nonce)?;
         let key = directory.verifying_key(&self.origin_node)?;
         let signature = decode_signature_hex(&self.signature)?;
@@ -1286,6 +1332,7 @@ mod tests {
         MeshForwardBody::Invoke {
             request_json: r#"{"type":"invoke","input":{"b":1,"a":2}}"#.to_owned(),
             asserted_principal: Some("agent:test".to_owned()),
+            origin_attempt_id: None,
         }
     }
 
@@ -1362,6 +1409,227 @@ mod tests {
     }
 
     #[test]
+    fn legacy_invoke_keeps_its_wire_and_signed_bytes() {
+        let legacy_wire =
+            r#"{"method":"invoke","request_json":"{}","asserted_principal":"agent:test"}"#;
+        let body: MeshForwardBody = serde_json::from_str(legacy_wire).unwrap();
+        assert!(matches!(
+            &body,
+            MeshForwardBody::Invoke {
+                origin_attempt_id: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&body).unwrap(), legacy_wire);
+
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let envelope = MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            NOW,
+            body,
+        )
+        .unwrap();
+        let legacy_bytes = SigningBytes::new()
+            .field(MESH_FORWARD_SCHEMA_VERSION.as_bytes())
+            .field(b"node-a")
+            .field(b"node-b")
+            .u64(1)
+            .u64(NOW)
+            .field(envelope.nonce.as_bytes())
+            .field(b"invoke")
+            .field(b"{}")
+            .opt_field(Some(b"agent:test"))
+            .finish();
+        assert_eq!(envelope.signing_bytes(), legacy_bytes);
+        mesh.key("node-a")
+            .verifying_key()
+            .verify_with_context(
+                FORWARD_SIGNING_CONTEXT,
+                &legacy_bytes,
+                &decode_signature_hex(&envelope.signature).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cancellation_and_invoke_attempts_round_trip_and_bind_every_field() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        for attempt_id in [1, u64::MAX] {
+            for body in [
+                MeshForwardBody::Invoke {
+                    request_json: "{}".to_owned(),
+                    asserted_principal: Some("agent:test".to_owned()),
+                    origin_attempt_id: Some(attempt_id),
+                },
+                MeshForwardBody::Cancel {
+                    request_json: "{}".to_owned(),
+                    origin_attempt_id: attempt_id,
+                },
+            ] {
+                let envelope = MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    body,
+                )
+                .unwrap();
+                let decoded: MeshForwardEnvelope =
+                    serde_json::from_str(&serde_json::to_string(&envelope).unwrap()).unwrap();
+                assert_eq!(decoded, envelope);
+                decoded.verify(&directory, NOW, 30_000).unwrap();
+
+                let mut changed_request = envelope.clone();
+                let mut changed_attempt = envelope.clone();
+                let mut changed_method = envelope.clone();
+                match &envelope.body {
+                    MeshForwardBody::Invoke { .. } => {
+                        changed_request.body = MeshForwardBody::Invoke {
+                            request_json: r#"{"changed":true}"#.to_owned(),
+                            asserted_principal: Some("agent:test".to_owned()),
+                            origin_attempt_id: Some(attempt_id),
+                        };
+                        changed_attempt.body = MeshForwardBody::Invoke {
+                            request_json: "{}".to_owned(),
+                            asserted_principal: Some("agent:test".to_owned()),
+                            origin_attempt_id: None,
+                        };
+                        changed_method.body = MeshForwardBody::Cancel {
+                            request_json: "{}".to_owned(),
+                            origin_attempt_id: attempt_id,
+                        };
+                    }
+                    MeshForwardBody::Cancel { .. } => {
+                        changed_request.body = MeshForwardBody::Cancel {
+                            request_json: r#"{"changed":true}"#.to_owned(),
+                            origin_attempt_id: attempt_id,
+                        };
+                        changed_attempt.body = MeshForwardBody::Cancel {
+                            request_json: "{}".to_owned(),
+                            origin_attempt_id: if attempt_id == 1 { 2 } else { 1 },
+                        };
+                        changed_method.body = MeshForwardBody::Invoke {
+                            request_json: "{}".to_owned(),
+                            asserted_principal: None,
+                            origin_attempt_id: Some(attempt_id),
+                        };
+                    }
+                    _ => unreachable!(),
+                }
+                for tampered in [changed_request, changed_attempt, changed_method] {
+                    assert!(matches!(
+                        tampered.verify(&directory, NOW, 30_000),
+                        Err(MeshForwardError::SignatureInvalid { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_attempt_ids_fail_even_with_an_authentic_peer_signature() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        for body in [
+            MeshForwardBody::Invoke {
+                request_json: "{}".to_owned(),
+                asserted_principal: None,
+                origin_attempt_id: Some(0),
+            },
+            MeshForwardBody::Cancel {
+                request_json: "{}".to_owned(),
+                origin_attempt_id: 0,
+            },
+        ] {
+            assert!(matches!(
+                MeshForwardEnvelope::sign(
+                    mesh.key("node-a"),
+                    node("node-a"),
+                    node("node-b"),
+                    NOW,
+                    body.clone(),
+                ),
+                Err(MeshForwardError::Malformed {
+                    field: "origin_attempt_id",
+                    ..
+                })
+            ));
+            let mut envelope = MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                invoke_body(),
+            )
+            .unwrap();
+            envelope.body = body;
+            envelope.signature = mesh
+                .key("node-a")
+                .sign_with_context(FORWARD_SIGNING_CONTEXT, &envelope.signing_bytes())
+                .to_hex();
+            assert!(matches!(
+                envelope.verify(&directory, NOW, 30_000),
+                Err(MeshForwardError::Malformed {
+                    field: "origin_attempt_id",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_body_limit_is_enforced_when_signing_and_receiving() {
+        let mesh = Mesh::new(&["node-a", "node-b"]);
+        let directory = mesh.directory("node-b");
+        let request_json =
+            serde_json::to_string(&"x".repeat(MAX_MESH_CANCELLATION_BODY_BYTES - 2)).unwrap();
+        assert_eq!(request_json.len(), MAX_MESH_CANCELLATION_BODY_BYTES);
+        let mut envelope = MeshForwardEnvelope::sign(
+            mesh.key("node-a"),
+            node("node-a"),
+            node("node-b"),
+            NOW,
+            MeshForwardBody::Cancel {
+                request_json: request_json.clone(),
+                origin_attempt_id: 1,
+            },
+        )
+        .unwrap();
+        envelope.verify(&directory, NOW, 30_000).unwrap();
+
+        let oversized = MeshForwardBody::Cancel {
+            request_json: format!("{request_json} "),
+            origin_attempt_id: 1,
+        };
+        assert!(matches!(
+            MeshForwardEnvelope::sign(
+                mesh.key("node-a"),
+                node("node-a"),
+                node("node-b"),
+                NOW,
+                oversized.clone(),
+            ),
+            Err(MeshForwardError::BodyTooLarge { len, limit })
+                if len == MAX_MESH_CANCELLATION_BODY_BYTES + 1
+                    && limit == MAX_MESH_CANCELLATION_BODY_BYTES
+        ));
+        envelope.body = oversized;
+        envelope.signature = mesh
+            .key("node-a")
+            .sign_with_context(FORWARD_SIGNING_CONTEXT, &envelope.signing_bytes())
+            .to_hex();
+        assert!(matches!(
+            envelope.verify(&directory, NOW, 30_000),
+            Err(MeshForwardError::BodyTooLarge { len, limit })
+                if len == MAX_MESH_CANCELLATION_BODY_BYTES + 1
+                    && limit == MAX_MESH_CANCELLATION_BODY_BYTES
+        ));
+    }
+
+    #[test]
     fn forward_rejects_tampering_in_every_signed_field() {
         let mesh = Mesh::new(&["node-a", "node-b", "node-c"]);
         let directory = mesh.directory("node-b");
@@ -1378,6 +1646,7 @@ mod tests {
         tampered.body = MeshForwardBody::Invoke {
             request_json: r#"{"type":"invoke","input":{"b":1,"a":3}}"#.to_owned(),
             asserted_principal: Some("agent:test".to_owned()),
+            origin_attempt_id: None,
         };
         assert!(matches!(
             tampered.verify(&directory, NOW, 30_000),
@@ -1388,6 +1657,7 @@ mod tests {
         tampered.body = MeshForwardBody::Invoke {
             request_json: r#"{"type":"invoke","input":{"b":1,"a":2}}"#.to_owned(),
             asserted_principal: Some("agent:root".to_owned()),
+            origin_attempt_id: None,
         };
         assert!(matches!(
             tampered.verify(&directory, NOW, 30_000),
@@ -1438,6 +1708,7 @@ mod tests {
         escalated.body = MeshForwardBody::Invoke {
             request_json: "{}".to_owned(),
             asserted_principal: None,
+            origin_attempt_id: None,
         };
         assert!(matches!(
             escalated.verify(&mesh.directory("node-b"), NOW, 30_000),
@@ -1630,6 +1901,7 @@ mod tests {
             MeshForwardBody::Invoke {
                 request_json: request_json.clone(),
                 asserted_principal: Some("user:alice".to_owned()),
+                origin_attempt_id: None,
             },
             MeshForwardBody::Preflight {
                 request_json,
@@ -1784,6 +2056,7 @@ mod tests {
         let body = MeshForwardBody::Invoke {
             request_json: "x".repeat(MAX_MESH_FORWARD_BODY_BYTES + 1),
             asserted_principal: None,
+            origin_attempt_id: None,
         };
         assert!(matches!(
             MeshForwardEnvelope::sign(

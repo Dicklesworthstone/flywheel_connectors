@@ -970,6 +970,7 @@ mod tests {
             MeshForwardBody::Invoke {
                 request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                 asserted_principal: None,
+                origin_attempt_id: None,
             },
         )).unwrap();
         let fixture = server.join().unwrap();
@@ -1156,6 +1157,7 @@ mod tests {
                 MeshForwardBody::Invoke {
                     request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                     asserted_principal: None,
+                    origin_attempt_id: None,
                 },
             )).unwrap();
             let fixture = server.join().unwrap();

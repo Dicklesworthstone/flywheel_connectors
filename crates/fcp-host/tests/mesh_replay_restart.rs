@@ -71,6 +71,7 @@ impl Fixture {
             MeshForwardBody::Invoke {
                 request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                 asserted_principal: Some("test-principal".to_owned()),
+                origin_attempt_id: None,
             },
         )
         .unwrap()

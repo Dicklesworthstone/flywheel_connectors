@@ -497,6 +497,7 @@ mod tests {
             MeshForwardBody::Invoke {
                 request_json: "secret-payload-canary".to_owned(),
                 asserted_principal: Some("secret-principal-canary".to_owned()),
+                origin_attempt_id: None,
             },
         )
         .unwrap();

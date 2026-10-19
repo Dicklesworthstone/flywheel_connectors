@@ -58,6 +58,17 @@ pub const fn default_cancellation_deadline(archetype: ConnectorArchetype) -> Dur
     }
 }
 
+/// Signed origin and invocation generation that admitted a relayed operation.
+/// This binding is retained after completion so an old relay cannot cancel a
+/// newer invocation that reuses the same client operation ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCancellationBinding {
+    /// Authenticated mesh node that originally forwarded the invocation.
+    pub origin_node: String,
+    /// Invocation attempt allocated by that origin before forwarding.
+    pub origin_attempt_id: u64,
+}
+
 /// Deadline policy recorded when a subprocess-backed operation is tracked.
 /// Registrations without a backing subprocess
 /// ([`CancellationController::track_with_owner`]) never expire.
@@ -75,6 +86,8 @@ pub struct CancellationScope {
     /// Optional concrete-runtime terminator. Unsupported runtimes must not
     /// be falsely reported as force-terminated.
     pub terminator: Option<CancellationTerminator>,
+    /// Signed mesh origin and invocation generation, when this is a relay.
+    pub relay: Option<RelayCancellationBinding>,
 }
 
 impl CancellationScope {
@@ -86,6 +99,7 @@ impl CancellationScope {
             archetype,
             deadline_override: None,
             terminator: None,
+            relay: None,
         }
     }
 
@@ -183,6 +197,9 @@ struct TrackedOperation {
     /// closes br-jdaro, where knowing the client-chosen operation ID
     /// was sufficient to cancel any in-flight operation.
     owner: Option<String>,
+    /// Kept separately from scope so completed tombstones still reject stale
+    /// mesh cancellations after the runtime termination handle is disarmed.
+    relay: Option<RelayCancellationBinding>,
     /// Subprocess-backed deadline policy. `None` for bookkeeping-only
     /// registrations ([`CancellationController::track_with_owner`]),
     /// which never expire and are never force-terminated.
@@ -269,6 +286,7 @@ impl CancellationController {
                     completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
+                    relay: None,
                     scope: None,
                     cancel_requested_at: None,
                     cancel_reason: None,
@@ -307,6 +325,13 @@ impl CancellationController {
         owner: Option<&str>,
         scope: CancellationScope,
     ) -> HostResult<CancellationRegistration> {
+        if scope.relay.as_ref().is_some_and(|relay| {
+            relay.origin_node.trim().is_empty() || relay.origin_attempt_id == 0
+        }) {
+            return Err(HostError::PreflightFailed(
+                "relayed invocation requires a nonempty origin and nonzero attempt ID".to_owned(),
+            ));
+        }
         let registration = CancellationRegistration {
             operation_id: operation_id.to_string(),
             identity: Arc::new(()),
@@ -329,6 +354,7 @@ impl CancellationController {
                     completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
+                    relay: scope.relay.clone(),
                     scope: Some(scope),
                     cancel_requested_at: None,
                     cancel_reason: None,
@@ -478,6 +504,49 @@ impl CancellationController {
         asserted_principal: Option<&str>,
         now: DateTime<Utc>,
     ) -> HostResult<CancellationResponse> {
+        self.cancel_matching(request, asserted_principal, None, now)
+    }
+
+    /// Cancel only the invocation admitted by this authenticated mesh origin.
+    /// The verified principal, retained origin, and origin attempt must all
+    /// match under the same lock that performs the cancellation transition.
+    /// Completed matching invocations return `TooLate`; a reused operation ID
+    /// never transfers cancellation authority to the new invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::ConnectorNotFound`] when the operation is absent,
+    /// or [`HostError::PreflightFailed`] for missing or mismatched authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn cancel_relay(
+        &self,
+        request: &CancellationRequest,
+        verified_principal: &str,
+        relay: &RelayCancellationBinding,
+        now: DateTime<Utc>,
+    ) -> HostResult<CancellationResponse> {
+        if verified_principal.trim().is_empty()
+            || relay.origin_node.trim().is_empty()
+            || relay.origin_attempt_id == 0
+        {
+            return Err(HostError::PreflightFailed(
+                "mesh cancellation requires a verified principal, origin, and attempt ID"
+                    .to_owned(),
+            ));
+        }
+        self.cancel_matching(request, Some(verified_principal), Some(relay), now)
+    }
+
+    fn cancel_matching(
+        &self,
+        request: &CancellationRequest,
+        asserted_principal: Option<&str>,
+        relay: Option<&RelayCancellationBinding>,
+        now: DateTime<Utc>,
+    ) -> HostResult<CancellationResponse> {
         let start = Instant::now();
 
         let outcome = {
@@ -490,6 +559,14 @@ impl CancellationController {
                     )));
                 }
                 Some(op) => {
+                    if let Some(relay) = relay
+                        && (op.owner.is_none() || op.relay.as_ref() != Some(relay))
+                    {
+                        return Err(HostError::PreflightFailed(format!(
+                            "mesh cancellation origin or invocation generation mismatch for operation {}",
+                            request.operation_id
+                        )));
+                    }
                     // br-jdaro: reject mismatched principal BEFORE any
                     // state mutation. If no owner was recorded at track
                     // time, fall through to the legacy permissive path.
@@ -1225,6 +1302,139 @@ mod tests {
         assert_eq!(expired.len(), 1);
         controller.remove("removed");
         assert!(!expired[0].terminator.as_ref().unwrap().abort());
+    }
+
+    #[test]
+    fn relay_cancellation_fences_owner_origin_and_reused_operation_ids() {
+        let controller = CancellationController::new();
+        let binding = RelayCancellationBinding {
+            origin_node: "entry-a".to_owned(),
+            origin_attempt_id: 41,
+        };
+        let scope_for = |relay: RelayCancellationBinding| {
+            let mut scope =
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+            scope.relay = Some(relay);
+            scope
+        };
+        let registration = controller
+            .track_operation("relayed", Some("owner"), scope_for(binding.clone()))
+            .unwrap();
+        let request = cancel_request("relayed", CancelReason::UserRequested);
+        let other_origin = RelayCancellationBinding {
+            origin_node: "entry-b".to_owned(),
+            ..binding.clone()
+        };
+        let next = RelayCancellationBinding {
+            origin_attempt_id: 42,
+            ..binding.clone()
+        };
+
+        for (principal, relay) in [
+            ("other", &binding),
+            ("owner", &other_origin),
+            ("owner", &next),
+        ] {
+            assert!(matches!(
+                controller.cancel_relay(&request, principal, relay, fixed_now()),
+                Err(HostError::PreflightFailed(_))
+            ));
+            assert!(!controller.is_cancel_requested("relayed"));
+            assert!(controller.audit_events().is_empty());
+        }
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled
+        );
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Pending
+        );
+        controller.complete_registration(&registration);
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::TooLate
+        );
+        assert!(matches!(
+            controller.cancel_relay(&request, "owner", &other_origin, fixed_now()),
+            Err(HostError::PreflightFailed(_))
+        ));
+
+        controller
+            .track_operation("relayed", Some("owner"), scope_for(next.clone()))
+            .unwrap();
+        assert!(matches!(
+            controller.cancel_relay(&request, "owner", &binding, fixed_now()),
+            Err(HostError::PreflightFailed(_))
+        ));
+        assert!(!controller.is_cancel_requested("relayed"));
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &next, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn relay_cancellation_rejects_missing_authority_without_changing_local_cancel() {
+        let controller = CancellationController::new();
+        for (origin, attempt) in [("", 1), ("   ", 1), ("entry", 0)] {
+            let mut scope =
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+            scope.relay = Some(RelayCancellationBinding {
+                origin_node: origin.to_owned(),
+                origin_attempt_id: attempt,
+            });
+            assert!(matches!(
+                controller.track_operation("invalid", Some("owner"), scope),
+                Err(HostError::PreflightFailed(_))
+            ));
+        }
+        assert_eq!(controller.tracked_count(), 0);
+
+        let binding = RelayCancellationBinding {
+            origin_node: "entry".to_owned(),
+            origin_attempt_id: 1,
+        };
+        let mut scope =
+            CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+        scope.relay = Some(binding.clone());
+        controller.track_operation("unowned", None, scope).unwrap();
+        controller.track_with_owner("local", Some("owner"));
+
+        for operation_id in ["unowned", "local"] {
+            let request = cancel_request(operation_id, CancelReason::UserRequested);
+            assert!(matches!(
+                controller.cancel_relay(&request, "owner", &binding, fixed_now()),
+                Err(HostError::PreflightFailed(_))
+            ));
+            assert!(!controller.is_cancel_requested(operation_id));
+        }
+        assert!(controller.audit_events().is_empty());
+        for (operation_id, principal) in [("unowned", None), ("local", Some("owner"))] {
+            assert_eq!(
+                controller
+                    .cancel(
+                        &cancel_request(operation_id, CancelReason::UserRequested),
+                        principal,
+                        fixed_now(),
+                    )
+                    .unwrap()
+                    .outcome,
+                CancellationOutcome::Cancelled
+            );
+        }
     }
 
     fn fixed_now() -> DateTime<Utc> {

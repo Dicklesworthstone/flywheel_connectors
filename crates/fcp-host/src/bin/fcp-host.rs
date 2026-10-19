@@ -169,6 +169,8 @@ mod connector_state_transfer;
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
+#[path = "fcp-host/mesh_cancel.rs"]
+mod mesh_cancel;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
@@ -12249,6 +12251,7 @@ async fn maybe_orchestrate_mcp_sampling(
         downstream_request.clone(),
         asserted_principal.map(ToOwned::to_owned),
         Some(deadline),
+        None,
     )
     .await?;
     Ok((
@@ -12320,10 +12323,7 @@ async fn cancel_self_handler(
         "processing owner-scoped cancellation request"
     );
 
-    let response = state
-        .cancellation
-        .cancel(&request, Some(verified_principal.as_str()), Utc::now())
-        .map_err(map_host_error)?;
+    let response = mesh_cancel::route(&state, &request, &verified_principal).await?;
 
     tracing::info!(
         event = "cancel_self_response",
@@ -14374,7 +14374,7 @@ async fn route_invoke_with_deadline(
     let deadline = http_batch::route_deadline(Instant::now(), request.deadline_ms, parent_deadline);
     let Some(router) = state.mesh.clone() else {
         constrain_invoke_deadline(&mut request, deadline);
-        return invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
+        return invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
             .await
             .map_err(map_host_error);
     };
@@ -14431,7 +14431,7 @@ async fn route_invoke_with_deadline(
         .await;
     }
     constrain_invoke_deadline(&mut request, deadline);
-    let mut response = invoke_jobs::execute(state, request, asserted_principal, Some(deadline))
+    let mut response = invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
         .await
         .map_err(map_host_error)?;
     stamp_invoke_route(
@@ -14482,8 +14482,9 @@ async fn execute_local_invoke(
     state: &Arc<AppState>,
     request: InvokeRequest,
     asserted_principal: Option<String>,
+    relay: Option<fcp_host::RelayCancellationBinding>,
 ) -> Result<InvokeResponse, (StatusCode, String)> {
-    invoke_jobs::execute(state, request, asserted_principal, None)
+    invoke_jobs::execute(state, request, asserted_principal, None, relay)
         .await
         .map_err(map_host_error)
 }
@@ -14931,6 +14932,7 @@ async fn run_mesh_forward_job(
             Ok(fcp_mesh::invoke_route::MeshForwardBody::Invoke {
                 request_json,
                 asserted_principal: asserted_principal.map(str::to_owned),
+                origin_attempt_id: Some(ticket.attempt_id),
             })
         })();
         let body = match prepared {
@@ -15408,9 +15410,11 @@ fn mesh_query_response_bindings(
             ])
         }
         MeshForwardBody::Preflight { .. } => Ok(Vec::new()),
-        MeshForwardBody::Invoke { .. } | MeshForwardBody::ConnectorStateExport { .. } => {
+        MeshForwardBody::Invoke { .. }
+        | MeshForwardBody::Cancel { .. }
+        | MeshForwardBody::ConnectorStateExport { .. } => {
             Err(map_host_error(HostError::Internal(
-                "invoke and exact-root state transfer must not use read-only mesh failover"
+                "invoke, cancellation and exact-root state transfer must not use read-only mesh failover"
                     .to_string(),
             )))
         }
@@ -15547,12 +15551,17 @@ async fn mesh_forward_handler(
         MeshForwardBody::Invoke {
             request_json,
             asserted_principal,
+            origin_attempt_id,
         } => match serde_json::from_str::<InvokeRequest>(request_json) {
             Ok(request) => mesh_reply_body(
                 Box::pin(execute_local_invoke(
                     &state,
                     request,
                     asserted_principal.clone(),
+                    origin_attempt_id.map(|origin_attempt_id| fcp_host::RelayCancellationBinding {
+                        origin_node: envelope.origin_node.as_str().to_owned(),
+                        origin_attempt_id,
+                    }),
                 ))
                 .await,
             ),
@@ -15561,6 +15570,11 @@ async fn mesh_forward_handler(
                 format!("forwarded invoke request is not a valid InvokeRequest: {error}"),
             ))),
         },
+        MeshForwardBody::Cancel { request_json, origin_attempt_id } => {
+            mesh_reply_body(
+                mesh_cancel::execute(&state, &envelope, request_json, *origin_attempt_id).await,
+            )
+        }
         MeshForwardBody::Preflight {
             request_json,
             asserted_principal,
@@ -33106,7 +33120,7 @@ done"#;
         )
     }
 
-    async fn issue_cancel_self_test_token(
+    pub(super) async fn issue_cancel_self_test_token(
         lifecycle: &HostAdminStateStore,
         principal_id: &str,
     ) -> fcp_core::CapabilityToken {
