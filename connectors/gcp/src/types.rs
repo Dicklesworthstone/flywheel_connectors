@@ -12,8 +12,8 @@ pub enum GcpAuth {
     /// Bearer access token (recommended for simplified auth).
     #[serde(rename = "access_token")]
     AccessToken { access_token: String },
-    /// Service account JSON key (client_email, private_key).
-    /// The project_id is provided at the top-level config, not duplicated here.
+    /// Service account JSON key (`client_email`, `private_key`).
+    /// The `project_id` is provided at the top-level config, not duplicated here.
     #[serde(rename = "service_account")]
     ServiceAccount {
         client_email: String,
@@ -51,7 +51,7 @@ impl GcpAuth {
         matches!(self, Self::ServiceAccount { .. })
     }
 
-    /// Returns the static bearer token for access_token mode.
+    /// Returns the static bearer token for `access_token` mode.
     ///
     /// For `access_token` mode, returns the token directly.
     /// For `service_account` mode, returns `None` — the caller must use
@@ -64,7 +64,7 @@ impl GcpAuth {
         }
     }
 
-    /// Returns the service-account credentials if in service_account mode.
+    /// Returns the service-account credentials if in `service_account` mode.
     #[must_use]
     pub fn service_account_credentials(&self) -> Option<(&str, &str)> {
         match self {

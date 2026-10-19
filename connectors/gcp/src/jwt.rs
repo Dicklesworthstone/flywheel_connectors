@@ -1,4 +1,4 @@
-//! JWT assertion builder and Google OAuth2 token exchange for service-account auth.
+//! JWT assertion builder and Google `OAuth2` token exchange for service-account auth.
 //!
 //! Implements the [Google OAuth2 Service Account](https://developers.google.com/identity/protocols/oauth2/service-account)
 //! flow: construct a signed JWT assertion, then exchange it for a short-lived access token.
@@ -35,7 +35,7 @@ fn urlencoded(s: &str) -> String {
     out
 }
 
-/// Google OAuth2 token endpoint.
+/// Google `OAuth2` token endpoint.
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// JWT grant type for service-account assertion.
@@ -77,14 +77,14 @@ impl CachedToken {
     }
 }
 
-/// Build a signed JWT assertion for Google OAuth2 service-account auth.
+/// Build a signed JWT assertion for Google `OAuth2` service-account auth.
 ///
 /// # Arguments
 ///
 /// * `client_email` - The service account email (becomes the `iss` and `sub` claims).
 /// * `private_key_pem` - The RSA private key in PEM format (PKCS#8).
-/// * `scopes` - Space-separated OAuth2 scopes.
-/// * `token_uri` - The token endpoint (default: Google's OAuth2 endpoint).
+/// * `scopes` - Space-separated `OAuth2` scopes.
+/// * `token_uri` - The token endpoint (default: Google's `OAuth2` endpoint).
 ///
 /// # Errors
 ///
@@ -140,7 +140,7 @@ pub(crate) fn build_jwt_assertion(
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
-/// Exchange a signed JWT assertion for an access token via Google's OAuth2 endpoint.
+/// Exchange a signed JWT assertion for an access token via Google's `OAuth2` endpoint.
 ///
 /// # Errors
 ///

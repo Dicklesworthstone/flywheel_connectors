@@ -1,3 +1,5 @@
+#![allow(clippy::missing_errors_doc, clippy::unused_async)]
+
 use fcp_prelude::log_redaction::redact_url;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,7 +15,10 @@ use fcp_sdk::migration::{
 
 use crate::error::{GcpError, GcpResult};
 use crate::jwt::{self, CachedToken};
-use crate::types::*;
+use crate::types::{
+    CloudRunService, CloudRunServiceList, DEFAULT_GCP_SCOPES, GcpApiError, GcpAuth, Instance,
+    InstanceList, ObjectList, Project, StorageObject,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> GcpResult<&'a str> {
@@ -65,7 +70,7 @@ pub struct GcpClient {
     auth: GcpAuth,
     project_id: String,
     retry_config: HttpRetryConfig,
-    /// Cached service-account access token (only used in service_account mode).
+    /// Cached service-account access token (only used in `service_account` mode).
     sa_token_cache: Mutex<Option<CachedToken>>,
     /// Override token endpoint for testing.
     token_endpoint: Option<String>,
@@ -81,7 +86,7 @@ impl std::fmt::Debug for GcpClient {
         f.debug_struct("GcpClient")
             .field("project_id", &self.project_id)
             .field("auth", &self.auth)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -144,7 +149,7 @@ impl GcpClient {
     }
 
     /// Set a custom token endpoint (overrides the Google default).
-    /// Intended for testing with mock OAuth2 servers.
+    /// Intended for testing with mock `OAuth2` servers.
     pub fn set_token_endpoint(&mut self, endpoint: String) {
         self.token_endpoint = Some(endpoint);
     }
@@ -159,8 +164,8 @@ impl GcpClient {
 
     /// Obtain a bearer token for API requests.
     ///
-    /// - **access_token mode**: returns the configured static token.
-    /// - **service_account mode**: builds a JWT assertion, exchanges it for an
+    /// - **`access_token` mode**: returns the configured static token.
+    /// - **`service_account` mode**: builds a JWT assertion, exchanges it for an
     ///   access token (caching for the token's lifetime), and returns the access token.
     /// - **secretless mode**: returns an empty string (egress proxy injects credentials).
     ///
@@ -179,7 +184,7 @@ impl GcpClient {
             let cache = self
                 .sa_token_cache
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = cache.as_ref()
                 && !cached.is_expired()
             {
@@ -216,7 +221,7 @@ impl GcpClient {
             let mut cache = self
                 .sa_token_cache
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *cache = Some(cached);
         }
 
@@ -615,8 +620,8 @@ impl GcpClient {
 
 // ── Free functions for request handling ──
 
-/// Authenticate a request with a static bearer token (access_token mode only).
-/// For service_account mode, the caller must obtain a token via
+/// Authenticate a request with a static bearer token (`access_token` mode only).
+/// For `service_account` mode, the caller must obtain a token via
 /// [`GcpClient::get_bearer_token`] and apply it manually.
 fn authenticate_request_static(req: RequestBuilder, token: &str) -> RequestBuilder {
     if token.is_empty() {
@@ -656,7 +661,10 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: GcpError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
@@ -680,7 +688,7 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
         if let Ok(gcp_err) = serde_json::from_str::<GcpApiError>(&text)
             && let Some(detail) = gcp_err.error
         {
-            let code = detail.code.unwrap_or(u32::from(status));
+            let code = detail.code.unwrap_or_else(|| u32::from(status));
             let message = detail.message.unwrap_or_else(|| text.clone());
             let err = GcpError::Api { code, message };
             if err.is_retryable() {
@@ -756,7 +764,10 @@ async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: GcpError::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };

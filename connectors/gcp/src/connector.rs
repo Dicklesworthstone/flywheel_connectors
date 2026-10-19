@@ -90,7 +90,7 @@ impl std::fmt::Debug for GcpConfig {
         f.debug_struct("GcpConfig")
             .field("project_id", &self.project_id)
             .field("auth", &self.auth)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -127,10 +127,10 @@ impl GcpConfig {
 
     fn provisioning_readiness(&self) -> ProvisioningReadiness {
         let service_endpoints = vec![
-            endpoint_policy("compute", &self.compute_base_url, COMPUTE_API_HOST),
-            endpoint_policy("storage", &self.storage_base_url, STORAGE_API_HOST),
-            endpoint_policy("run", &self.run_base_url, RUN_API_HOST),
-            endpoint_policy("crm", &self.crm_base_url, CRM_API_HOST),
+            endpoint_policy("compute", self.compute_base_url.as_deref(), COMPUTE_API_HOST),
+            endpoint_policy("storage", self.storage_base_url.as_deref(), STORAGE_API_HOST),
+            endpoint_policy("run", self.run_base_url.as_deref(), RUN_API_HOST),
+            endpoint_policy("crm", self.crm_base_url.as_deref(), CRM_API_HOST),
         ];
         let network_ok = service_endpoints.iter().all(|endpoint| endpoint.ok);
         let network_message = if network_ok {
@@ -162,6 +162,7 @@ impl GcpConfig {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize)]
 struct ProvisioningReadiness {
     auth_mode: &'static str,
@@ -274,7 +275,7 @@ fn is_local_test_host(host: &str) -> bool {
 
 fn endpoint_policy(
     service: &'static str,
-    base_url: &Option<String>,
+    base_url: Option<&str>,
     expected_host: &'static str,
 ) -> EndpointReadiness {
     let Some(base_url) = base_url else {
@@ -513,6 +514,7 @@ impl GcpConnector {
         result
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn attach_self_check_details(
         mut report: SelfCheckReport,
         provisioning: Option<ProvisioningReadiness>,
