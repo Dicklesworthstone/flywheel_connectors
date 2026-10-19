@@ -260,10 +260,12 @@ fn validate_config(config: &LineConfig) -> FcpResult<()> {
     }
 
     let base_url = parse_base_url(&config.base_url)?;
-    let host = base_url.host_str().ok_or(FcpError::InvalidRequest {
-        code: 1001,
-        message: "base_url must include a host".into(),
-    })?;
+    let host = base_url
+        .host_str()
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1001,
+            message: "base_url must include a host".into(),
+        })?;
     let is_local_host = is_local_test_host(host);
 
     if !base_url.username().is_empty() || base_url.password().is_some() {
@@ -562,7 +564,7 @@ impl LineConnector {
         })
     }
 
-    fn diagnostic_details(&self, live_probe: Option<serde_json::Value>) -> serde_json::Value {
+    fn diagnostic_details(&self, live_probe: Option<&serde_json::Value>) -> serde_json::Value {
         json!({
             "configured": self.config.is_some(),
             "client_initialized": self.client.is_some(),
@@ -597,7 +599,7 @@ impl LineConnector {
     fn attach_self_check_details(
         &self,
         mut report: SelfCheckReport,
-        live_probe: Option<serde_json::Value>,
+        live_probe: Option<&serde_json::Value>,
     ) -> SelfCheckReport {
         report.details = Some(self.diagnostic_details(live_probe));
         report
@@ -885,7 +887,7 @@ fn parse_messages(input: &serde_json::Value) -> FcpResult<Vec<Message>> {
             code: 1005,
             message: format!("Invalid 'messages' field: {e}"),
         })?
-        .ok_or(FcpError::InvalidRequest {
+        .ok_or_else(|| FcpError::InvalidRequest {
             code: 1005,
             message: "Missing 'messages' field".into(),
         })?;
@@ -1373,7 +1375,7 @@ impl FcpConnector for LineConnector {
             }
         };
 
-        Ok(self.attach_self_check_details(report, live_probe))
+        Ok(self.attach_self_check_details(report, live_probe.as_ref()))
     }
 
     async fn simulate(&self, req: SimulateRequest) -> FcpResult<SimulateResponse> {
@@ -1427,7 +1429,7 @@ impl LineConnector {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -1448,21 +1450,23 @@ impl LineConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "LINE client missing after configure".into(),
         })?;
 
         let output = match operation {
             OP_PUSH => {
-                let to = req.input.get("to").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let to = req
+                    .input
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
-                    },
-                )?;
+                    })?;
                 let messages = parse_messages(&req.input)?;
                 let (zone_id, claimant_agent_id) = self.chat_coordination_context();
                 let coordination = self
@@ -1502,7 +1506,7 @@ impl LineConnector {
                     .input
                     .get("reply_token")
                     .and_then(Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'reply_token' field".into(),
                     })?;
@@ -1550,7 +1554,7 @@ impl LineConnector {
                         code: 1005,
                         message: format!("Invalid 'to' field: {e}"),
                     })?
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'to' field".into(),
                     })?;
@@ -1589,12 +1593,14 @@ impl LineConnector {
                 output
             }
             OP_PROFILE_GET => {
-                let user_id = req.input.get("user_id").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let user_id = req
+                    .input
+                    .get("user_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'user_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let profile = client
                     .get_profile(runtime, user_id)
                     .await
@@ -1604,12 +1610,14 @@ impl LineConnector {
                 })?
             }
             OP_GROUP_PROFILE => {
-                let group_id = req.input.get("group_id").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let group_id = req
+                    .input
+                    .get("group_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'group_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let summary = client
                     .get_group_summary(runtime, group_id)
                     .await
@@ -1619,12 +1627,14 @@ impl LineConnector {
                 })?
             }
             OP_GROUP_MEMBERS => {
-                let group_id = req.input.get("group_id").and_then(Value::as_str).ok_or(
-                    FcpError::InvalidRequest {
+                let group_id = req
+                    .input
+                    .get("group_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'group_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let start = req.input.get("start").and_then(Value::as_str);
                 let members = client
                     .get_group_members(runtime, group_id, start)
@@ -1661,7 +1671,7 @@ impl LineConnector {
                     .input
                     .get("rich_menu_id")
                     .and_then(Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'rich_menu_id' field".into(),
                     })?;

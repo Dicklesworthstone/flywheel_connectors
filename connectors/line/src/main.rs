@@ -1,6 +1,7 @@
 //! FCP LINE Connector - Main entrypoint.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::io::{BufRead, Write};
 

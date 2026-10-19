@@ -1,5 +1,7 @@
 //! LINE Messaging API types.
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
