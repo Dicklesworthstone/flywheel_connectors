@@ -46,6 +46,7 @@ pub enum SquareError {
 
 impl SquareError {
     /// Whether this error is retryable.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
@@ -59,6 +60,7 @@ impl SquareError {
     }
 
     /// Suggested retry-after delay.
+    #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
@@ -67,12 +69,13 @@ impl SquareError {
     }
 
     /// Convert to FCP error taxonomy.
+    #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {
                 service: "square".into(),
                 message: e.to_string(),
-                status_code: e.status().map(|s| s.as_u16()),
+                status_code: e.status().map(reqwest::StatusCode::as_u16),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
             },

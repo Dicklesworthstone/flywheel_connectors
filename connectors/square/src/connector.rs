@@ -1,5 +1,7 @@
 //! Square connector implementation.
 
+#![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+
 use std::{
     sync::{OnceLock, atomic::Ordering},
     time::{Duration, Instant},
@@ -20,7 +22,14 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{client::SquareClient, error::SquareError, types::*};
+use crate::{
+    client::SquareClient,
+    error::SquareError,
+    types::{
+        CreateOrderRequest, CreatePaymentRequest, Money, OrderInput, OrderLineItemInput,
+        RefundPaymentRequest,
+    },
+};
 
 #[cfg(test)]
 use fcp_prelude::{IdempotencyClass, RiskLevel, SafetyTier};
@@ -158,10 +167,9 @@ fn normalize_square_base_url(base_url: &str) -> Result<String, String> {
     }
 
     if local_test_host {
-        let authority = match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
+        let authority = parsed
+            .port()
+            .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
         Ok(format!("{}://{authority}/v2", parsed.scheme()))
     } else {
         Ok(format!("https://{host}/v2"))
@@ -428,6 +436,7 @@ impl SquareConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
         let provisioning = self.provisioning_readiness();
@@ -513,7 +522,10 @@ impl SquareConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self
+                .client
+                .as_ref()
+                .is_some_and(SquareClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -586,6 +598,7 @@ impl Default for SquareConnector {
 }
 
 /// Build the typed operations catalog from the strict manifest.
+#[must_use]
 pub fn operations_info() -> Vec<OperationInfo> {
     static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
     OPERATIONS
@@ -936,8 +949,8 @@ impl SquareConnector {
 
         let output = match operation {
             OP_PAYMENTS_LIST => {
-                let cursor = req.input.get("cursor").and_then(|v| v.as_str());
-                let location_id = req.input.get("location_id").and_then(|v| v.as_str());
+                let cursor = req.input.get("cursor").and_then(serde_json::Value::as_str);
+                let location_id = req.input.get("location_id").and_then(serde_json::Value::as_str);
                 let list = client
                     .list_payments(runtime, cursor, location_id)
                     .await
@@ -947,7 +960,7 @@ impl SquareConnector {
                 })?
             }
             OP_PAYMENTS_GET => {
-                let payment_id = req.input.get("payment_id").and_then(|v| v.as_str()).ok_or(
+                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'payment_id' field".into(),
@@ -962,7 +975,7 @@ impl SquareConnector {
                 })?
             }
             OP_PAYMENTS_CREATE => {
-                let source_id = req.input.get("source_id").and_then(|v| v.as_str()).ok_or(
+                let source_id = req.input.get("source_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'source_id' field".into(),
@@ -971,7 +984,7 @@ impl SquareConnector {
                 let idempotency_key = req
                     .input
                     .get("idempotency_key")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'idempotency_key' field".into(),
@@ -996,17 +1009,17 @@ impl SquareConnector {
                     location_id: req
                         .input
                         .get("location_id")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
                     customer_id: req
                         .input
                         .get("customer_id")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
                     note: req
                         .input
                         .get("note")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
                 };
 
@@ -1022,12 +1035,12 @@ impl SquareConnector {
                 let idempotency_key = req
                     .input
                     .get("idempotency_key")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'idempotency_key' field".into(),
                     })?;
-                let payment_id = req.input.get("payment_id").and_then(|v| v.as_str()).ok_or(
+                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'payment_id' field".into(),
@@ -1053,7 +1066,7 @@ impl SquareConnector {
                     reason: req
                         .input
                         .get("reason")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
                 };
 
@@ -1078,7 +1091,7 @@ impl SquareConnector {
                         code: 1005,
                         message: format!("Invalid 'location_ids': {e}"),
                     })?;
-                let cursor = req.input.get("cursor").and_then(|v| v.as_str());
+                let cursor = req.input.get("cursor").and_then(serde_json::Value::as_str);
 
                 let list = client
                     .list_orders(runtime, &location_ids, cursor)
@@ -1089,7 +1102,7 @@ impl SquareConnector {
                 })?
             }
             OP_ORDERS_GET => {
-                let order_id = req.input.get("order_id").and_then(|v| v.as_str()).ok_or(
+                let order_id = req.input.get("order_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'order_id' field".into(),
@@ -1107,7 +1120,7 @@ impl SquareConnector {
                 let location_id = req
                     .input
                     .get("location_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'location_id' field".into(),
@@ -1135,7 +1148,7 @@ impl SquareConnector {
                     idempotency_key: req
                         .input
                         .get("idempotency_key")
-                        .and_then(|v| v.as_str())
+                        .and_then(serde_json::Value::as_str)
                         .map(String::from),
                 };
 
@@ -1148,8 +1161,8 @@ impl SquareConnector {
                 })?
             }
             OP_CATALOG_LIST => {
-                let cursor = req.input.get("cursor").and_then(|v| v.as_str());
-                let types = req.input.get("types").and_then(|v| v.as_str());
+                let cursor = req.input.get("cursor").and_then(serde_json::Value::as_str);
+                let types = req.input.get("types").and_then(serde_json::Value::as_str);
                 let list = client
                     .list_catalog(runtime, cursor, types)
                     .await
@@ -1159,7 +1172,7 @@ impl SquareConnector {
                 })?
             }
             OP_CUSTOMERS_LIST => {
-                let cursor = req.input.get("cursor").and_then(|v| v.as_str());
+                let cursor = req.input.get("cursor").and_then(serde_json::Value::as_str);
                 let list = client
                     .list_customers(runtime, cursor)
                     .await
@@ -1172,7 +1185,7 @@ impl SquareConnector {
                 let customer_id = req
                     .input
                     .get("customer_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'customer_id' field".into(),

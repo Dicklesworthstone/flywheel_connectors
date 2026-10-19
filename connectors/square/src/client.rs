@@ -1,5 +1,7 @@
 //! Square API client.
 
+#![allow(clippy::missing_errors_doc)]
+
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{
     AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
@@ -11,7 +13,11 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::error::{SquareError, SquareResult};
-use crate::types::*;
+use crate::types::{
+    CatalogList, CreateOrderRequest, CreatePaymentRequest, CustomerList, CustomerResponse,
+    LocationList, OrderList, OrderResponse, PaymentList, PaymentResponse, RefundPaymentRequest,
+    RefundResponse,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> SquareResult<&'a str> {
@@ -78,12 +84,14 @@ impl SquareClient {
     }
 
     /// Get the base URL.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
-    pub fn is_secretless(&self) -> bool {
+    #[must_use]
+    pub const fn is_secretless(&self) -> bool {
         self.access_token.is_empty()
     }
 
@@ -132,9 +140,10 @@ impl SquareClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: SquareError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -245,9 +254,10 @@ impl SquareClient {
                     // it, so replaying cannot duplicate anything.
                     return AttemptOutcome::Retryable {
                         error: SquareError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };

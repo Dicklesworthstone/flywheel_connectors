@@ -73,12 +73,15 @@ async fn handle_message(connector: &mut SquareConnector, message: &str) -> serde
         }
     };
 
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let id = request.get("id").cloned();
     let params = request
         .get("params")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let result: FcpResult<serde_json::Value> = async {
         match method {
@@ -148,33 +151,20 @@ async fn handle_message(connector: &mut SquareConnector, message: &str) -> serde
     }
     .await;
 
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
+    let mut response = match result {
+        Ok(value) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": value
+        }),
+        Err(e) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": e.to_response()
+        }),
+    };
+    if let Some(id) = id {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("id".to_string(), id);
         }
     }
+    response
 }
