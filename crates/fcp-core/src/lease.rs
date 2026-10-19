@@ -18,7 +18,7 @@ use fcp_crypto::{canonical_signing_bytes, canonicalize::to_deterministic_cbor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ObjectHeader, ObjectId, SignatureSet, TailscaleNodeId, ZoneId};
+use crate::{ObjectEncryptionKind, ObjectHeader, ObjectId, SignatureSet, TailscaleNodeId, ZoneId};
 
 /// Domain-separated schema ID for quorum signatures over durable lease authority.
 pub const LEASE_QUORUM_SIGNING_SCHEMA_ID: &str = "fcp.lease.quorum-signing.v1";
@@ -343,7 +343,7 @@ impl Lease {
 
         Self {
             header: ObjectHeader {
-                encryption_kind: Default::default(),
+                encryption_kind: ObjectEncryptionKind::default(),
                 schema: params.schema,
                 zone_id: params.zone_id,
                 created_at,

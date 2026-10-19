@@ -16,9 +16,9 @@ use serde_json::Value;
 use crate::{
     ApprovalScope, ApprovalToken, CapabilityGrant, CapabilityId, CapabilityObject,
     ConfidentialityLevel, ConnectorId, Decision, DecisionReceipt, FlowCheckResult, IntegrityLevel,
-    InvokeRequest, NodeId, NodeSignature, ObjectHeader, ObjectId, OperationId, PrincipalId,
-    Provenance, ProvenanceRecord, ProvenanceViolation, RoleObject, SafetyTier, SanitizerReceipt,
-    TaintFlag, TaintFlags, TaintLevel, UsageMetricKind, ZoneId,
+    InvokeRequest, NodeId, NodeSignature, ObjectEncryptionKind, ObjectHeader, ObjectId,
+    OperationId, PrincipalId, Provenance, ProvenanceRecord, ProvenanceViolation, RoleObject,
+    SafetyTier, SanitizerReceipt, TaintFlag, TaintFlags, TaintLevel, UsageMetricKind, ZoneId,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2428,7 +2428,7 @@ pub fn simulate_policy_decision(
     };
     let decision = engine.evaluate_invoke(&decision_input);
     let header = ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: ObjectEncryptionKind::default(),
         schema: SchemaId::new("fcp.core", "DecisionReceipt", Version::new(1, 0, 0)),
         zone_id: invoke.zone_id.clone(),
         created_at: now_ms / 1000,

@@ -2275,12 +2275,10 @@ impl CoordinationClass {
             "health",
             "whoami",
         ];
-        if let Some(first) = Self::action_tokens(op_name).next() {
+        Self::action_tokens(op_name).next().is_some_and(|first| {
             let lower = first.to_ascii_lowercase();
             READ_PREFIXES.contains(&lower.as_str())
-        } else {
-            false
-        }
+        })
     }
 
     /// Whether an operation name starts with an explicit per-resource serialization verb
@@ -2318,12 +2316,10 @@ impl CoordinationClass {
             "suspend",
             "resume",
         ];
-        if let Some(first) = Self::action_tokens(op_name).next() {
+        Self::action_tokens(op_name).next().is_some_and(|first| {
             let lower = first.to_ascii_lowercase();
             FENCING_PREFIXES.contains(&lower.as_str())
-        } else {
-            false
-        }
+        })
     }
 
     /// Whether an operation name starts with a mutating verb (`create`, `send`, `refund`, `update`, `delete`, etc.).
@@ -2355,12 +2351,10 @@ impl CoordinationClass {
         if Self::is_fencing_named_operation(op_name) {
             return true;
         }
-        if let Some(first) = Self::action_tokens(op_name).next() {
+        Self::action_tokens(op_name).next().is_some_and(|first| {
             let lower = first.to_ascii_lowercase();
             QUORUM_WRITE_PREFIXES.contains(&lower.as_str())
-        } else {
-            false
-        }
+        })
     }
 
     /// Classify an operation per the 2026.Q3.v1 I-CONFLUENCE rubric.
