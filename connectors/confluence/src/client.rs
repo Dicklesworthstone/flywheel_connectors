@@ -1,5 +1,7 @@
 //! Confluence API client with retry support.
 
+#![allow(clippy::missing_errors_doc)]
+
 use base64::Engine;
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
@@ -223,12 +225,14 @@ impl ConfluenceClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
-    pub fn is_secretless(&self) -> bool {
+    #[must_use]
+    pub const fn is_secretless(&self) -> bool {
         self.api_token.is_empty()
     }
 
@@ -249,7 +253,7 @@ impl ConfluenceClient {
             let auth = auth.clone();
             let query: Vec<(String, String)> = query
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
                 .collect();
             async move {
                 debug!(attempt, "GET {}", redact_url(&url));
@@ -272,7 +276,6 @@ impl ConfluenceClient {
         .await
     }
 
-    /// Generic POST with retry.
     /// Generic POST with retry.
     ///
     /// br-kxd3e: every caller of this helper CREATES content, and Confluence
@@ -398,9 +401,10 @@ impl ConfluenceClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: Error::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -457,7 +461,10 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: Error::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };

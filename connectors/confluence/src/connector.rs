@@ -1,5 +1,7 @@
 //! Confluence connector implementation.
 
+#![allow(clippy::too_many_lines)]
+
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -115,7 +117,7 @@ impl ConfluenceConnector {
 
     /// Stable connector instance identity used for bound capability-token verification.
     #[must_use]
-    pub fn instance_id(&self) -> &fcp_prelude::InstanceId {
+    pub const fn instance_id(&self) -> &fcp_prelude::InstanceId {
         &self.base.instance_id
     }
 
@@ -126,6 +128,7 @@ impl ConfluenceConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
 
@@ -191,7 +194,10 @@ impl ConfluenceConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self
+                .client
+                .as_ref()
+                .is_some_and(ConfluenceClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -232,6 +238,7 @@ fn required_capability(operation: &str) -> FcpResult<CapabilityId> {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -878,11 +885,11 @@ impl ConfluenceConnector {
 
         let output = match operation {
             OP_SPACES_LIST => {
-                let start = req.input.get("start").and_then(|v| v.as_u64()).unwrap_or(0);
+                let start = req.input.get("start").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(25);
                 let resp = client
                     .list_spaces(runtime, start, limit)
@@ -893,7 +900,7 @@ impl ConfluenceConnector {
                 })?
             }
             OP_SPACES_GET => {
-                let space_key = req.input.get("space_key").and_then(|v| v.as_str()).ok_or(
+                let space_key = req.input.get("space_key").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'space_key' field".into(),
@@ -908,17 +915,17 @@ impl ConfluenceConnector {
                 })?
             }
             OP_PAGES_LIST => {
-                let space_key = req.input.get("space_key").and_then(|v| v.as_str()).ok_or(
+                let space_key = req.input.get("space_key").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'space_key' field".into(),
                     },
                 )?;
-                let start = req.input.get("start").and_then(|v| v.as_u64()).unwrap_or(0);
+                let start = req.input.get("start").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(25);
                 let resp = client
                     .list_pages(runtime, space_key, start, limit)
@@ -929,7 +936,7 @@ impl ConfluenceConnector {
                 })?
             }
             OP_PAGES_GET => {
-                let page_id = req.input.get("page_id").and_then(|v| v.as_str()).ok_or(
+                let page_id = req.input.get("page_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'page_id' field".into(),
@@ -944,19 +951,19 @@ impl ConfluenceConnector {
                 })?
             }
             OP_PAGES_CREATE => {
-                let space_key = req.input.get("space_key").and_then(|v| v.as_str()).ok_or(
+                let space_key = req.input.get("space_key").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'space_key' field".into(),
                     },
                 )?;
-                let title = req.input.get("title").and_then(|v| v.as_str()).ok_or(
+                let title = req.input.get("title").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'title' field".into(),
                     },
                 )?;
-                let body_content = req.input.get("body").and_then(|v| v.as_str()).ok_or(
+                let body_content = req.input.get("body").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'body' field".into(),
@@ -975,7 +982,7 @@ impl ConfluenceConnector {
                     }
                 });
 
-                if let Some(parent_id) = req.input.get("parent_id").and_then(|v| v.as_str()) {
+                if let Some(parent_id) = req.input.get("parent_id").and_then(serde_json::Value::as_str) {
                     create_body["ancestors"] = json!([{ "id": parent_id }]);
                 }
 
@@ -988,19 +995,19 @@ impl ConfluenceConnector {
                 })?
             }
             OP_PAGES_UPDATE => {
-                let page_id = req.input.get("page_id").and_then(|v| v.as_str()).ok_or(
+                let page_id = req.input.get("page_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'page_id' field".into(),
                     },
                 )?;
-                let title = req.input.get("title").and_then(|v| v.as_str()).ok_or(
+                let title = req.input.get("title").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'title' field".into(),
                     },
                 )?;
-                let body_content = req.input.get("body").and_then(|v| v.as_str()).ok_or(
+                let body_content = req.input.get("body").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'body' field".into(),
@@ -1009,7 +1016,7 @@ impl ConfluenceConnector {
                 let version_number = req
                     .input
                     .get("version_number")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .ok_or(FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing or invalid 'version_number' field".into(),
@@ -1017,7 +1024,7 @@ impl ConfluenceConnector {
                 let version_message = req
                     .input
                     .get("version_message")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
 
                 let update_body = json!({
@@ -1045,7 +1052,7 @@ impl ConfluenceConnector {
                 })?
             }
             OP_PAGES_DELETE => {
-                let page_id = req.input.get("page_id").and_then(|v| v.as_str()).ok_or(
+                let page_id = req.input.get("page_id").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'page_id' field".into(),
@@ -1058,17 +1065,17 @@ impl ConfluenceConnector {
                 json!({ "deleted": true })
             }
             OP_SEARCH => {
-                let cql = req.input.get("cql").and_then(|v| v.as_str()).ok_or(
+                let cql = req.input.get("cql").and_then(serde_json::Value::as_str).ok_or(
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'cql' field".into(),
                     },
                 )?;
-                let start = req.input.get("start").and_then(|v| v.as_u64()).unwrap_or(0);
+                let start = req.input.get("start").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(25);
                 let resp = client
                     .search(runtime, cql, start, limit)
