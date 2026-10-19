@@ -58,7 +58,7 @@ jobs:
           cargo +nightly-2026-08-31 test --locked -p fcp-host --test production_host_cancellation -- --nocapture --test-threads=1 2>&1 | tee production-host-tests.log
       - name: Retain compiler and process-verification output
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-host-verification-${{ github.sha }}
           path: |
