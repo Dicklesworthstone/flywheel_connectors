@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 // OAuth token types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// OAuth2 client credentials token response.
+/// `OAuth2` client credentials token response.
 #[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,

@@ -24,7 +24,7 @@ const FORM_VALUE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-/// Twitch Helix API client with OAuth2 client credentials.
+/// Twitch Helix API client with `OAuth2` client credentials.
 pub struct TwitchClient {
     client: Client,
     base_url: String,
@@ -49,7 +49,7 @@ impl std::fmt::Debug for TwitchClient {
                 &self.access_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -85,7 +85,7 @@ impl TwitchClient {
         })
     }
 
-    /// Acquire an OAuth2 token via client credentials grant.
+    /// Acquire an `OAuth2` token via client credentials grant.
     ///
     /// The `client_id`/`client_secret` are sent in the
     /// `application/x-www-form-urlencoded` request body (per RFC 6749 §4.4.2),
