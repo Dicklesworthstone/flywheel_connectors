@@ -1038,7 +1038,7 @@ impl CalendlyConnector {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -1062,10 +1062,10 @@ impl CalendlyConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Calendly client missing after configure".into(),
         })?;
 
@@ -1116,7 +1116,7 @@ impl CalendlyConnector {
                     .input
                     .get("event_uuid")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
                     })?;
@@ -1161,7 +1161,7 @@ impl CalendlyConnector {
                     .input
                     .get("event_uuid")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
                     })?;
@@ -1184,7 +1184,7 @@ impl CalendlyConnector {
                     .input
                     .get("owner_uri")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'owner_uri' field".into(),
                     })?;
@@ -1192,7 +1192,7 @@ impl CalendlyConnector {
                     .input
                     .get("owner_type")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'owner_type' field".into(),
                     })?;
@@ -1214,7 +1214,7 @@ impl CalendlyConnector {
                     .input
                     .get("event_uuid")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'event_uuid' field".into(),
                     })?;

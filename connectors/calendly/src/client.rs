@@ -1,5 +1,7 @@
 //! Calendly API client.
 
+#![allow(clippy::missing_errors_doc)]
+
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -27,7 +29,7 @@ impl std::fmt::Debug for CalendlyClient {
             .field("base_url", &self.base_url)
             .field("access_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
