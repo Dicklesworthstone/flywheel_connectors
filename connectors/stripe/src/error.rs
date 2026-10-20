@@ -22,6 +22,12 @@ pub enum StripeError {
         error_type: Option<String>,
     },
 
+    /// A generated idempotency key protects retries inside one invocation,
+    /// not another invocation. Do not retain the key, request, or upstream
+    /// error here: they may contain credentials or payment/customer data.
+    #[error("Stripe mutation outcome unknown; reconcile the original operation before invoking again; automatic retry suppressed")]
+    MutationOutcomeUnknown,
+
     #[error("Rate limited")]
     RateLimited { retry_after_ms: u64 },
 
@@ -41,7 +47,10 @@ impl StripeError {
         match self {
             Self::Http(_) | Self::RateLimited { .. } => true,
             Self::Api { status_code, .. } => matches!(status_code, Some(500..=599 | 429)),
-            Self::Json(_) | Self::Unauthorized | Self::NotFound { .. } => false,
+            Self::Json(_)
+            | Self::MutationOutcomeUnknown
+            | Self::Unauthorized
+            | Self::NotFound { .. } => false,
         }
     }
 
@@ -67,6 +76,13 @@ impl StripeError {
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),
+            },
+            Self::MutationOutcomeUnknown => FcpError::External {
+                service: "stripe".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
             },
             Self::Api {
                 message,
