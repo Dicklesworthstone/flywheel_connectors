@@ -40,6 +40,16 @@ pub enum StripeError {
     #[error("Stripe forbids retrying this request (HTTP {status_code})")]
     RetryForbidden { status_code: u16 },
 
+    /// The provider requested a retry or reported an in-progress conflict.
+    /// This never licenses a fresh key for the same mutation. The client must
+    /// suppress this error at the invocation boundary when it generated the
+    /// key itself and the original operation may already have executed.
+    #[error("Stripe request can be retried with the original operation identity within its retry window (HTTP {status_code})")]
+    RetryableResponse {
+        status_code: u16,
+        retry_after: Option<Duration>,
+    },
+
     #[error("Rate limited")]
     RateLimited { retry_after_ms: u64 },
 
@@ -57,7 +67,7 @@ impl StripeError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Http(_) | Self::RateLimited { .. } => true,
+            Self::Http(_) | Self::RateLimited { .. } | Self::RetryableResponse { .. } => true,
             Self::Api { status_code, .. } => matches!(status_code, Some(500..=599 | 429)),
             Self::Json(_)
             | Self::MutationOutcomeUnknown
@@ -75,6 +85,7 @@ impl StripeError {
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
+            Self::RetryableResponse { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -113,6 +124,16 @@ impl StripeError {
                     retry_after: None,
                 }
             }
+            Self::RetryableResponse {
+                status_code,
+                retry_after,
+            } => FcpError::External {
+                service: "stripe".into(),
+                message: self.to_string(),
+                status_code: Some(*status_code),
+                retryable: true,
+                retry_after: *retry_after,
+            },
             Self::Api {
                 message,
                 status_code,
@@ -190,6 +211,31 @@ impl ConnectorErrorMapping for StripeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directed_retries_preserve_status_and_delay_across_error_mapping() {
+        for status_code in [400, 409, 424, 503] {
+            for retry_after in [None, Some(Duration::ZERO), Some(Duration::from_secs(7))] {
+                let error = StripeError::RetryableResponse {
+                    status_code,
+                    retry_after,
+                };
+                assert!(ConnectorErrorMapping::is_retryable(&error));
+                assert_eq!(ConnectorErrorMapping::retry_after(&error), retry_after);
+                assert!(matches!(
+                    ConnectorErrorMapping::to_fcp_error(&error),
+                    FcpError::External {
+                        service,
+                        status_code: Some(code),
+                        retryable: true,
+                        retry_after: delay,
+                        message,
+                    } if service == "stripe" && code == status_code && delay == retry_after
+                        && message.contains("original operation identity")
+                ));
+            }
+        }
+    }
 
     #[test]
     fn display_api() {

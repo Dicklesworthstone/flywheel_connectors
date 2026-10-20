@@ -683,24 +683,22 @@ impl StripeClient {
                             });
                         }
 
-                        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                            return AttemptOutcome::Terminal(StripeError::Unauthorized);
+                        let should_retry = stripe_should_retry(response.headers());
+                        if should_retry != Some(true) {
+                            // Preserve actionable authentication/resource errors
+                            // unless the provider explicitly requests recovery.
+                            // Both remain non-retryable under a `false` hint.
+                            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                                return AttemptOutcome::Terminal(StripeError::Unauthorized);
+                            }
+                            if status == StatusCode::NOT_FOUND {
+                                let body = response.text().await.unwrap_or_default();
+                                return AttemptOutcome::Terminal(StripeError::NotFound {
+                                    resource: body,
+                                });
+                            }
                         }
-
-                        if status == StatusCode::NOT_FOUND {
-                            let body = response.text().await.unwrap_or_default();
-                            return AttemptOutcome::Terminal(StripeError::NotFound {
-                                resource: body,
-                            });
-                        }
-
-                        if !status.is_success()
-                            && response
-                                .headers()
-                                .get("stripe-should-retry")
-                                .and_then(|value| value.to_str().ok())
-                                .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
-                        {
+                        if !status.is_success() && should_retry == Some(false) {
                             // A Terminal(Api { 500, .. }) would still tell the
                             // host to retry. Carry the refusal across that boundary.
                             return AttemptOutcome::Terminal(StripeError::RetryForbidden {
@@ -709,19 +707,33 @@ impl StripeClient {
                         }
 
                         if status == StatusCode::TOO_MANY_REQUESTS {
-                            let retry_after_secs = response
-                                .headers()
-                                .get("retry-after")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .unwrap_or(60);
-                            let retry_after = Duration::from_secs(retry_after_secs);
+                            let retry_after = stripe_retry_after(response.headers())
+                                .unwrap_or(Duration::from_secs(60));
 
                             return AttemptOutcome::Retryable {
                                 error: StripeError::RateLimited {
-                                    retry_after_ms: retry_after_secs.saturating_mul(1000),
+                                    retry_after_ms: u64::try_from(retry_after.as_millis())
+                                        .unwrap_or(u64::MAX),
                                 },
                                 retry_after: Some(retry_after),
+                            };
+                        }
+
+                        if !status.is_success()
+                            && (should_retry == Some(true) || status == StatusCode::CONFLICT)
+                        {
+                            // The provider's hint overrides status-only error
+                            // classification. A 409 can mean another attempt
+                            // with this key is still executing. Reuse the same
+                            // key/body, not a fresh invocation's generated key.
+                            replay_guard.observe_retryable_response();
+                            let retry_after = stripe_retry_after(response.headers());
+                            return AttemptOutcome::Retryable {
+                                error: StripeError::RetryableResponse {
+                                    status_code: status.as_u16(),
+                                    retry_after,
+                                },
+                                retry_after,
                             };
                         }
 
@@ -795,6 +807,42 @@ impl StripeClient {
     }
 }
 
+/// Only an unambiguous `true` can opt into retries beyond status defaults.
+/// A `false` anywhere wins, including repeated or comma-joined fields from an
+/// intermediary. Unknown values alone do not invent provider retry guidance.
+fn stripe_should_retry(headers: &header::HeaderMap) -> Option<bool> {
+    let mut retry = false;
+    let mut malformed = false;
+    for value in headers.get_all("stripe-should-retry") {
+        let Ok(value) = value.to_str() else {
+            malformed = true;
+            continue;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("false") {
+                return Some(false);
+            }
+            if directive.eq_ignore_ascii_case("true") {
+                retry = true;
+            } else {
+                malformed = true;
+            }
+        }
+    }
+    (retry && !malformed).then_some(true)
+}
+
+/// Stripe's numeric retry delay is expressed in seconds. Invalid values fall
+/// back to the existing backoff policy (or the rate-limit default).
+fn stripe_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 /// Reject unusable keys before considering a POST replay-safe. Never normalize
 /// a key: trimming or rewriting it could merge two distinct caller operations.
 fn validate_idempotency_key(key: &str) -> StripeResult<()> {
@@ -839,6 +887,14 @@ impl<'a> AttemptReplayGuard<'a> {
         self.may_have_executed = !matches!(status, 400 | 401 | 402 | 403 | 404 | 422 | 429);
     }
 
+    const fn observe_retryable_response(&mut self) {
+        // A directive can request a retry even for a normally terminal 4xx.
+        // That is permission to replay the SAME identity, not proof that the
+        // operation had no effects. Re-arm a status-disarmed guard before the
+        // retry loop can yield, so exhaustion or cancellation fails closed.
+        self.may_have_executed = true;
+    }
+
     fn observe_transport_error(&mut self, error: &reqwest::Error) {
         // Body/response errors (including total-request timeouts) may follow a
         // committed mutation. Only pre-transmission failures disarm the guard.
@@ -873,6 +929,94 @@ mod replay_scope_tests {
     use super::*;
     use fcp_prelude::FcpError;
     use fcp_sdk::ConnectorErrorMapping;
+
+    #[test]
+    fn provider_retry_guidance_requires_an_unambiguous_boolean() {
+        for (values, expected) in [
+            (vec![], None),
+            (vec!["true"], Some(true)),
+            (vec![" TRUE "], Some(true)),
+            (vec!["true", "true"], Some(true)),
+            (vec!["true,true"], Some(true)),
+            (vec!["false"], Some(false)),
+            (vec!["unknown"], None),
+            (vec![""], None),
+            (vec!["true", "unknown"], None),
+            (vec!["true,unknown"], None),
+        ] {
+            let mut headers = header::HeaderMap::new();
+            for value in values {
+                headers.append("stripe-should-retry", value.parse().unwrap());
+            }
+            assert_eq!(stripe_should_retry(&headers), expected);
+        }
+    }
+
+    #[test]
+    fn any_provider_retry_refusal_overrides_other_header_values() {
+        for values in [
+            vec!["true", "false"],
+            vec!["false", "true"],
+            vec!["true, false"],
+            vec!["unknown", "FaLsE", "true"],
+            vec!["true, unknown, false"],
+        ] {
+            let mut headers = header::HeaderMap::new();
+            for value in values {
+                headers.append("stripe-should-retry", value.parse().unwrap());
+            }
+            assert_eq!(stripe_should_retry(&headers), Some(false));
+        }
+
+        let mut headers = header::HeaderMap::new();
+        headers.append(
+            "stripe-should-retry",
+            header::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        headers.append("stripe-should-retry", "true".parse().unwrap());
+        assert_eq!(stripe_should_retry(&headers), None);
+        headers.append("stripe-should-retry", "false".parse().unwrap());
+        assert_eq!(stripe_should_retry(&headers), Some(false));
+    }
+
+    #[test]
+    fn provider_retry_delay_preserves_numeric_seconds() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(stripe_retry_after(&headers), None);
+        for (value, expected) in [
+            ("0", Some(Duration::ZERO)),
+            (" 12 ", Some(Duration::from_secs(12))),
+            ("18446744073709551615", Some(Duration::from_secs(u64::MAX))),
+            ("18446744073709551616", None),
+            ("-1", None),
+            ("1.5", None),
+            ("nonsense", None),
+        ] {
+            headers.insert("retry-after", value.parse().unwrap());
+            assert_eq!(stripe_retry_after(&headers), expected);
+        }
+    }
+
+    #[test]
+    fn provider_directed_retry_rearms_previously_disarmed_statuses() {
+        for status in [400, 401, 402, 403, 404, 422] {
+            let ambiguous = AtomicBool::new(false);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_status(status);
+                guard.observe_retryable_response();
+            }
+            assert!(ambiguous.load(Ordering::Relaxed), "status {status}");
+            let result: StripeResult<()> = Err(StripeError::RetryableResponse {
+                status_code: status,
+                retry_after: Some(Duration::from_secs(1)),
+            });
+            let error = finish_stripe_attempts(result, ReplayScope::ThisInvocation, &ambiguous)
+                .unwrap_err();
+            assert!(matches!(error, StripeError::MutationOutcomeUnknown));
+            assert!(!error.is_retryable());
+        }
+    }
 
     #[test]
     fn pre_transmission_failure_does_not_clear_prior_ambiguity() {
