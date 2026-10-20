@@ -180,6 +180,7 @@ fn private_regular(file: &File) -> io::Result<()> {
     ))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn storage(stage: &'static str, error: io::Error) -> HostError {
     HostError::Internal(format!(
         "retained membership source {stage} failed ({:?})",
@@ -250,13 +251,10 @@ impl SourceCache {
         let mut cache = Self {
             path: path.to_owned(),
             lock,
-            binding: blake3::derive_key(
+            binding: hex::encode(blake3::derive_key(
                 "fcp.mesh.retained-source.publisher.v1",
                 endpoint.as_str().as_bytes(),
-            )
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
+            )),
             journal,
             current: None,
             poisoned: false,

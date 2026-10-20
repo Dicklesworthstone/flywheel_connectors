@@ -76,10 +76,10 @@ impl FetchFailure {
     }
 
     fn into_error(self) -> crate::HostError {
-        match self.status {
-            Some(status) => invalid(&format!("remote directory returned HTTP {status}")),
-            None => invalid(self.detail),
-        }
+        self.status.map_or_else(
+            || invalid(self.detail),
+            |status| invalid(&format!("remote directory returned HTTP {status}")),
+        )
     }
 }
 

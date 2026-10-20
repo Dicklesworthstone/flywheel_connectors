@@ -418,6 +418,7 @@ fn chacha20_xor_scalar(
     output
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn poly1305_accumulate_block(h_lo: &mut u128, h_hi: &mut u64, block: &[u8], r: u128) {
     let mut padded = [0u8; 17];
     padded[..block.len()].copy_from_slice(block);
@@ -482,13 +483,13 @@ fn poly1305_feed_padded(h_lo: &mut u128, h_hi: &mut u64, data: &[u8], r: u128) {
 fn poly1305_aead_tag_scalar(otk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
     let mut r_bytes = [0u8; 16];
     r_bytes.copy_from_slice(&otk[..16]);
-    r_bytes[3] &= 15;
-    r_bytes[7] &= 15;
-    r_bytes[11] &= 15;
-    r_bytes[15] &= 15;
-    r_bytes[4] &= 252;
-    r_bytes[8] &= 252;
-    r_bytes[12] &= 252;
+    r_bytes[3] &= 0x0f;
+    r_bytes[7] &= 0x0f;
+    r_bytes[11] &= 0x0f;
+    r_bytes[15] &= 0x0f;
+    r_bytes[4] &= 0xfc;
+    r_bytes[8] &= 0xfc;
+    r_bytes[12] &= 0xfc;
     let r = u128::from_le_bytes(r_bytes);
 
     let mut s_bytes = [0u8; 16];

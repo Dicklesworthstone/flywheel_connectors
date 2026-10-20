@@ -54,6 +54,7 @@ use std::path::Path;
 use std::ptr;
 use std::time::Duration;
 
+use fcp_manifest::NetworkConstraints;
 use tracing::{debug, info, warn};
 
 use crate::sandbox::{
@@ -62,9 +63,14 @@ use crate::sandbox::{
     WindowsAppContainerLifecycleAction, WindowsAppContainerLifecycleReport,
     WindowsAppContainerProcessLaunchEvidence, WindowsAppContainerProcessLaunchMechanism,
     WindowsAppContainerProfile, WindowsAppContainerProfileApi, WindowsFirewallLifecycleAction,
-    WindowsFirewallPlanStatus, WindowsFirewallPolicyEvidence, WindowsIntegrityOperationMode,
-    WindowsIntegrityPolicyEvidence, plan_windows_firewall_policy, plan_windows_integrity_policy,
-    prepare_windows_appcontainer_lifecycle,
+    WindowsFirewallPlanStatus, WindowsFirewallPolicyApi, WindowsFirewallPolicyEvidence,
+    WindowsFirewallPolicyPlan, WindowsFirewallPolicyReport, WindowsFirewallRuleApplyOutcome,
+    WindowsFirewallRuleCleanupOutcome, WindowsFirewallRuleSpec, WindowsIntegrityLifecycleAction,
+    WindowsIntegrityOperationMode, WindowsIntegrityPolicyEvidence, WindowsIntegrityPolicyReport,
+    WindowsIntegrityTokenApiResult, WindowsIntegrityTokenCleanupDecision,
+    WindowsSandboxReadinessReport, apply_windows_firewall_policy, cleanup_windows_firewall_policy,
+    evaluate_windows_sandbox_readiness, plan_windows_firewall_policy,
+    plan_windows_integrity_policy, prepare_windows_appcontainer_lifecycle,
 };
 
 // ============================================================================
@@ -740,6 +746,162 @@ impl WindowsSandbox {
             );
         }
     }
+
+    /// Apply operation-level Windows Firewall egress rules for a connector binary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plan is invalid or the native Windows Firewall API
+    /// rejects rule installation.
+    pub fn apply_firewall_policy(
+        &self,
+        program: &Path,
+        policy: &CompiledPolicy,
+        constraints: Option<&NetworkConstraints>,
+    ) -> Result<WindowsFirewallPolicyReport, SandboxError> {
+        let connector_seed = windows_appcontainer_connector_seed(policy);
+        let plan = plan_windows_firewall_policy(
+            &connector_seed,
+            program,
+            policy.block_direct_network,
+            constraints,
+        )?;
+        let mut api = NativeWindowsFirewallApi;
+        let report = apply_windows_firewall_policy(plan, &mut api)?;
+        let evidence = WindowsFirewallPolicyEvidence::from_report(&report);
+        if let Ok(jsonl) = evidence.to_jsonl_line() {
+            debug!(evidence_jsonl = %jsonl, "Windows firewall policy applied");
+        }
+        Ok(report)
+    }
+
+    /// Remove Windows Firewall egress rules previously installed for a policy plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native Windows Firewall API fails to remove a rule.
+    pub fn cleanup_firewall_policy(
+        &self,
+        plan: WindowsFirewallPolicyPlan,
+    ) -> Result<WindowsFirewallPolicyReport, SandboxError> {
+        let mut api = NativeWindowsFirewallApi;
+        let report = cleanup_windows_firewall_policy(plan, &mut api)?;
+        let evidence = WindowsFirewallPolicyEvidence::from_report(&report);
+        if let Ok(jsonl) = evidence.to_jsonl_line() {
+            debug!(evidence_jsonl = %jsonl, "Windows firewall policy cleaned up");
+        }
+        Ok(report)
+    }
+
+    /// Evaluate consolidated Windows sandbox readiness and `ProfileLevel` promotion
+    /// for a launched child process and its firewall policy report.
+    #[must_use]
+    pub fn evaluate_readiness(
+        &self,
+        policy: &CompiledPolicy,
+        appcontainer_report: &WindowsAppContainerLifecycleReport,
+        child: Option<&WindowsAppContainerChild>,
+        firewall_report: &WindowsFirewallPolicyReport,
+    ) -> WindowsSandboxReadinessReport {
+        let connector_seed = windows_appcontainer_connector_seed(policy);
+        let integrity_plan = plan_windows_integrity_policy(
+            &connector_seed,
+            policy.platform_flags.windows_low_integrity,
+            WindowsIntegrityOperationMode::StartupInfoExChild,
+            self.appcontainer_available,
+        );
+        let integrity_report = match child {
+            Some(child) if child.integrity_level == WindowsIntegrityLevel::Low => {
+                WindowsIntegrityPolicyReport {
+                    plan: integrity_plan,
+                    action: WindowsIntegrityLifecycleAction::AppliedLowIntegrityChildToken,
+                    token_api_result: WindowsIntegrityTokenApiResult::TokenPrepared,
+                    step_order: vec![
+                        "integrity_level_decision",
+                        "open_process_token",
+                        "duplicate_primary_token",
+                        "allocate_integrity_sid",
+                        "set_token_integrity_level",
+                    ],
+                    cleanup: WindowsIntegrityTokenCleanupDecision::DropSourceAndChildTokens,
+                    skip_reason: None,
+                }
+            }
+            Some(_) => WindowsIntegrityPolicyReport {
+                plan: integrity_plan,
+                action: WindowsIntegrityLifecycleAction::SkippedMediumIntegrity,
+                token_api_result: WindowsIntegrityTokenApiResult::NotAttempted,
+                step_order: vec!["integrity_level_decision"],
+                cleanup: WindowsIntegrityTokenCleanupDecision::None,
+                skip_reason: None,
+            },
+            None => WindowsIntegrityPolicyReport {
+                skip_reason: integrity_plan.unsupported_reason,
+                plan: integrity_plan,
+                action: if self.appcontainer_available {
+                    WindowsIntegrityLifecycleAction::PlannedLowIntegrityChildToken
+                } else {
+                    WindowsIntegrityLifecycleAction::RejectedAppContainerInactive
+                },
+                token_api_result: WindowsIntegrityTokenApiResult::NotAttempted,
+                step_order: vec!["integrity_level_decision"],
+                cleanup: WindowsIntegrityTokenCleanupDecision::None,
+            },
+        };
+        let launch_mechanism = if child.is_some() {
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities
+        } else {
+            WindowsAppContainerProcessLaunchMechanism::SkippedInactive
+        };
+        let readiness = evaluate_windows_sandbox_readiness(
+            &connector_seed,
+            appcontainer_report,
+            launch_mechanism,
+            child.is_some(),
+            &integrity_report,
+            firewall_report,
+        );
+        if let Ok(jsonl) = readiness.to_jsonl_line() {
+            debug!(evidence_jsonl = %jsonl, "Windows sandbox readiness evaluated");
+        }
+        readiness
+    }
+}
+
+/// RAII guard that removes applied Windows Firewall rules when dropped.
+#[derive(Debug)]
+pub struct WindowsFirewallPolicyGuard {
+    plan: Option<WindowsFirewallPolicyPlan>,
+}
+
+impl WindowsFirewallPolicyGuard {
+    /// Create a guard that will clean up `plan` on drop.
+    #[must_use]
+    pub const fn new(plan: WindowsFirewallPolicyPlan) -> Self {
+        Self { plan: Some(plan) }
+    }
+
+    /// Explicitly clean up the guarded firewall rules and return the cleanup report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rule removal fails.
+    pub fn cleanup(mut self) -> Result<WindowsFirewallPolicyReport, SandboxError> {
+        let plan = self.plan.take().ok_or_else(|| {
+            SandboxError::InvalidConfig("WindowsFirewallPolicyGuard already cleaned up".into())
+        })?;
+        let mut api = NativeWindowsFirewallApi;
+        cleanup_windows_firewall_policy(plan, &mut api)
+    }
+}
+
+impl Drop for WindowsFirewallPolicyGuard {
+    fn drop(&mut self) {
+        if let Some(plan) = self.plan.take() {
+            let mut api = NativeWindowsFirewallApi;
+            let _ = cleanup_windows_firewall_policy(plan, &mut api);
+        }
+    }
 }
 
 /// Running Windows `AppContainer` child process plus its lifetime-bound job object.
@@ -970,7 +1132,8 @@ impl Sandbox for WindowsSandbox {
 
         if write {
             for writable in &policy.writable_paths {
-                if path.starts_with(writable) {
+                let writable = crate::sandbox::resolve_policy_path(writable);
+                if path.starts_with(&writable) {
                     return Ok(());
                 }
             }
@@ -983,13 +1146,15 @@ impl Sandbox for WindowsSandbox {
         // Windows system paths are generally readable
         let system_paths = ["C:\\Windows\\System32", "C:\\Windows\\SysWOW64"];
         for sys_path in system_paths {
-            if path.starts_with(sys_path) {
+            let sys_path = crate::sandbox::resolve_policy_path(Path::new(sys_path));
+            if path.starts_with(&sys_path) {
                 return Ok(());
             }
         }
 
         for readable in policy.readonly_paths.iter().chain(&policy.writable_paths) {
-            if path.starts_with(readable) {
+            let readable = crate::sandbox::resolve_policy_path(readable);
+            if path.starts_with(&readable) {
                 return Ok(());
             }
         }
@@ -1401,6 +1566,268 @@ impl WindowsAppContainerProfileApi for NativeWindowsAppContainerApi {
     fn delete_profile(&mut self, profile_name: &str) -> Result<(), SandboxError> {
         delete_appcontainer_profile(profile_name)
     }
+}
+
+struct NativeWindowsFirewallApi;
+
+impl WindowsFirewallPolicyApi for NativeWindowsFirewallApi {
+    fn rule_names_for_connector(
+        &mut self,
+        connector_id_hash: &str,
+    ) -> Result<Vec<String>, SandboxError> {
+        let search_pattern = format!("Name=fcp-fw-{connector_id_hash}-");
+        if let Ok(reg_output) = std::process::Command::new(r"C:\Windows\System32\reg.exe")
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+                "/f",
+                &search_pattern,
+                "/d",
+            ])
+            .output()
+        {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&reg_output.stdout),
+                String::from_utf8_lossy(&reg_output.stderr)
+            );
+            let lower = combined.to_ascii_lowercase();
+            if lower.contains("0 match(es) found") {
+                return Ok(Vec::new());
+            }
+            if reg_output.status.success() {
+                return Ok(parse_netsh_rule_names_for_connector(
+                    &String::from_utf8_lossy(&reg_output.stdout),
+                    connector_id_hash,
+                ));
+            }
+        }
+
+        let output = run_netsh_advfirewall(&["show", "rule", "name=all", "dir=out"])?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if is_netsh_no_matching_rules(&combined) {
+            return Ok(Vec::new());
+        }
+        if !output.status.success() {
+            return Err(classify_netsh_failure(
+                "rule_names_for_connector",
+                &combined,
+            ));
+        }
+        Ok(parse_netsh_rule_names_for_connector(
+            &String::from_utf8_lossy(&output.stdout),
+            connector_id_hash,
+        ))
+    }
+
+    fn upsert_rule(
+        &mut self,
+        rule: &WindowsFirewallRuleSpec,
+    ) -> Result<WindowsFirewallRuleApplyOutcome, SandboxError> {
+        let name_arg = format!("name={}", rule.name);
+        let probe = run_netsh_advfirewall(&["show", "rule", &name_arg, "dir=out", "verbose"])?;
+        let probe_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let rule_exists = probe.status.success() && !is_netsh_no_matching_rules(&probe_combined);
+
+        if rule_exists {
+            let probe_stdout = String::from_utf8_lossy(&probe.stdout);
+            if netsh_rule_matches_spec(&probe_stdout, rule) {
+                return Ok(WindowsFirewallRuleApplyOutcome::AlreadyCurrent);
+            }
+            let args = build_netsh_upsert_args(rule, true);
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let update = run_netsh_advfirewall(&arg_refs)?;
+            let update_combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&update.stdout),
+                String::from_utf8_lossy(&update.stderr)
+            );
+            if !update.status.success() {
+                return Err(classify_netsh_failure(
+                    "upsert_rule_update",
+                    &update_combined,
+                ));
+            }
+            return Ok(WindowsFirewallRuleApplyOutcome::Updated);
+        }
+
+        let args = build_netsh_upsert_args(rule, false);
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let create = run_netsh_advfirewall(&arg_refs)?;
+        let create_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr)
+        );
+        if !create.status.success() {
+            return Err(classify_netsh_failure(
+                "upsert_rule_create",
+                &create_combined,
+            ));
+        }
+        Ok(WindowsFirewallRuleApplyOutcome::Created)
+    }
+
+    fn remove_rule(
+        &mut self,
+        rule_name: &str,
+    ) -> Result<WindowsFirewallRuleCleanupOutcome, SandboxError> {
+        let name_arg = format!("name={rule_name}");
+        let output = run_netsh_advfirewall(&["delete", "rule", &name_arg, "dir=out"])?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if is_netsh_no_matching_rules(&combined) {
+            return Ok(WindowsFirewallRuleCleanupOutcome::Missing);
+        }
+        if !output.status.success() {
+            return Err(classify_netsh_failure("remove_rule", &combined));
+        }
+        Ok(WindowsFirewallRuleCleanupOutcome::Removed)
+    }
+}
+
+fn run_netsh_advfirewall(args: &[&str]) -> Result<std::process::Output, SandboxError> {
+    let mut cmd = std::process::Command::new(r"C:\Windows\System32\netsh.exe");
+    cmd.arg("advfirewall").arg("firewall").args(args);
+    cmd.output().map_err(|err| {
+        SandboxError::SyscallFailed(format!("windows_firewall_api_unavailable: {err}"))
+    })
+}
+
+fn is_netsh_no_matching_rules(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("no rules match the specified criteria")
+}
+
+fn classify_netsh_failure(operation: &'static str, output: &str) -> SandboxError {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("requires elevation") || lower.contains("access is denied") {
+        SandboxError::ApplyFailed(format!("windows_firewall_privilege_denied ({operation})"))
+    } else {
+        SandboxError::SyscallFailed(format!("windows_firewall_{operation}_failed"))
+    }
+}
+
+fn parse_netsh_rule_names_for_connector(stdout: &str, connector_id_hash: &str) -> Vec<String> {
+    let prefix = format!("fcp-fw-{connector_id_hash}-");
+    let reg_marker = format!("Name={prefix}");
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Rule Name:") {
+            let name = rest.trim();
+            if name.starts_with(&prefix) && !names.iter().any(|existing| existing == name) {
+                names.push(name.to_owned());
+            }
+        }
+        let mut search_slice = trimmed;
+        while let Some(idx) = search_slice.find(&reg_marker) {
+            let after_eq = &search_slice[idx + "Name=".len()..];
+            let end = after_eq.find('|').unwrap_or(after_eq.len());
+            let name = after_eq[..end].trim();
+            if name.starts_with(&prefix) && !names.iter().any(|existing| existing == name) {
+                names.push(name.to_owned());
+            }
+            search_slice = &after_eq[end..];
+        }
+    }
+    names.sort();
+    names
+}
+
+fn build_netsh_upsert_args(rule: &WindowsFirewallRuleSpec, update_existing: bool) -> Vec<String> {
+    let program = rule.application_path.display().to_string();
+    let protocol = rule.protocol.as_str().to_ascii_uppercase();
+    let remote_ip = &rule.remote_address;
+    let remote_port = rule.remote_port.to_string();
+
+    if update_existing {
+        vec![
+            "set".to_owned(),
+            "rule".to_owned(),
+            format!("name={}", rule.name),
+            "dir=out".to_owned(),
+            "new".to_owned(),
+            "action=allow".to_owned(),
+            format!("program={program}"),
+            format!("protocol={protocol}"),
+            format!("remoteip={remote_ip}"),
+            format!("remoteport={remote_port}"),
+            "enable=yes".to_owned(),
+            "profile=any".to_owned(),
+        ]
+    } else {
+        vec![
+            "add".to_owned(),
+            "rule".to_owned(),
+            format!("name={}", rule.name),
+            "dir=out".to_owned(),
+            "action=allow".to_owned(),
+            format!("program={program}"),
+            format!("protocol={protocol}"),
+            format!("remoteip={remote_ip}"),
+            format!("remoteport={remote_port}"),
+            "enable=yes".to_owned(),
+            "profile=any".to_owned(),
+        ]
+    }
+}
+
+fn netsh_rule_matches_spec(stdout: &str, rule: &WindowsFirewallRuleSpec) -> bool {
+    let mut enabled_ok = false;
+    let mut direction_ok = false;
+    let mut action_ok = false;
+    let mut protocol_ok = false;
+    let mut remote_ip_ok = false;
+    let mut remote_port_ok = false;
+    let mut program_ok = false;
+
+    let expected_program = rule.application_path.display().to_string();
+    let expected_port = rule.remote_port.to_string();
+    let expected_ip = rule.remote_address.as_str();
+    let expected_ip_v4_cidr = format!("{expected_ip}/32");
+    let expected_ip_v6_cidr = format!("{expected_ip}/128");
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("Enabled:") {
+            enabled_ok = val.trim().eq_ignore_ascii_case("yes");
+        } else if let Some(val) = trimmed.strip_prefix("Direction:") {
+            direction_ok = val.trim().eq_ignore_ascii_case("out");
+        } else if let Some(val) = trimmed.strip_prefix("Action:") {
+            action_ok = val.trim().eq_ignore_ascii_case("allow");
+        } else if let Some(val) = trimmed.strip_prefix("Protocol:") {
+            protocol_ok = val.trim().eq_ignore_ascii_case(rule.protocol.as_str());
+        } else if let Some(val) = trimmed.strip_prefix("RemoteIP:") {
+            let candidate = val.trim();
+            remote_ip_ok = candidate.eq_ignore_ascii_case(expected_ip)
+                || candidate.eq_ignore_ascii_case(&expected_ip_v4_cidr)
+                || candidate.eq_ignore_ascii_case(&expected_ip_v6_cidr);
+        } else if let Some(val) = trimmed.strip_prefix("RemotePort:") {
+            remote_port_ok = val.trim() == expected_port;
+        } else if let Some(val) = trimmed.strip_prefix("Program:") {
+            program_ok = val.trim().eq_ignore_ascii_case(&expected_program);
+        }
+    }
+
+    enabled_ok
+        && direction_ok
+        && action_ok
+        && protocol_ok
+        && remote_ip_ok
+        && remote_port_ok
+        && program_ok
 }
 
 fn create_appcontainer_profile(
@@ -2004,15 +2431,12 @@ mod tests {
         assert_eq!(exit_code, 0);
         eprintln!("WINDOWS_APPCONTAINER_E2E_ALLOWED_PROCESS_STARTUP=true");
 
-        let user_profile = std::env::var_os("USERPROFILE").expect("USERPROFILE is available");
-        let denied_write_command = format!(
-            "echo denied>\"{}\\fcp-appcontainer-denied-write.txt\" && exit /B 86 || exit /B 5",
-            user_profile.to_string_lossy()
-        );
+        let _user_profile = std::env::var_os("USERPROFILE").expect("USERPROFILE is available");
+        let denied_write_command = "echo denied > %USERPROFILE%\\fcp-appcontainer-denied-write.txt && exit /B 86 || exit /B 5";
         let denied_child = sandbox
             .spawn_appcontainer_process(
                 Path::new("C:\\Windows\\System32\\cmd.exe"),
-                &[OsStr::new("/C"), OsStr::new(&denied_write_command)],
+                &[OsStr::new("/C"), OsStr::new(denied_write_command)],
                 &policy,
             )
             .expect("launch AppContainer child for denied user-profile write");
@@ -2031,6 +2455,463 @@ mod tests {
                 None => std::env::remove_var(FCP_SANDBOX_WINDOWS_APPCONTAINER_ENV),
             }
         }
+    }
+
+    #[test]
+    fn test_parse_netsh_rule_names_filters_and_deduplicates_connector_rules() {
+        let sample = "\
+Rule Name:                            fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            Out
+
+Rule Name:                            fcp-fw-otherconnector-tcp-443-aaaa1111bbbb2222
+----------------------------------------------------------------------
+Enabled:                              Yes
+
+Rule Name:                            fcp-fw-0123456789abcdef-tcp-8443-cccc3333dddd4444
+----------------------------------------------------------------------
+Enabled:                              Yes
+
+Rule Name:                            fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222
+";
+        let rules = parse_netsh_rule_names_for_connector(sample, "0123456789abcdef");
+        assert_eq!(
+            rules,
+            vec![
+                "fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222".to_owned(),
+                "fcp-fw-0123456789abcdef-tcp-8443-cccc3333dddd4444".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_netsh_rule_matches_spec_handles_cidr_and_case_insensitive_fields() {
+        let spec = WindowsFirewallRuleSpec {
+            name: "fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222".into(),
+            application_path: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            direction: crate::sandbox::WindowsFirewallRuleDirection::Outbound,
+            action: crate::sandbox::WindowsFirewallRuleAction::Allow,
+            protocol: crate::sandbox::WindowsFirewallRuleProtocol::Tcp,
+            remote_address: "127.0.0.1".into(),
+            remote_port: 443,
+            remote_address_class: "loopback_ip",
+        };
+        let matching_stdout = "\
+Rule Name:                            fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222
+Enabled:                              Yes
+Direction:                            Out
+Profiles:                             Domain,Private,Public
+Grouping:
+LocalIP:                              Any
+RemoteIP:                             127.0.0.1/32
+Protocol:                             TCP
+LocalPort:                            Any
+RemotePort:                           443
+Edge traversal:                       No
+Program:                              c:\\windows\\system32\\cmd.exe
+Action:                               Allow
+";
+        assert!(netsh_rule_matches_spec(matching_stdout, &spec));
+
+        let mismatched_port = matching_stdout.replace(
+            "RemotePort:                           443",
+            "RemotePort:                           8443",
+        );
+        assert!(!netsh_rule_matches_spec(&mismatched_port, &spec));
+    }
+
+    #[test]
+    fn test_build_netsh_upsert_args_and_failure_classification() {
+        let spec = WindowsFirewallRuleSpec {
+            name: "fcp-fw-0123456789abcdef-tcp-443-aaaa1111bbbb2222".into(),
+            application_path: PathBuf::from(r"C:\fcp\connector.exe"),
+            direction: crate::sandbox::WindowsFirewallRuleDirection::Outbound,
+            action: crate::sandbox::WindowsFirewallRuleAction::Allow,
+            protocol: crate::sandbox::WindowsFirewallRuleProtocol::Tcp,
+            remote_address: "198.51.100.7".into(),
+            remote_port: 443,
+            remote_address_class: "public_ip",
+        };
+        let add_args = build_netsh_upsert_args(&spec, false);
+        assert_eq!(add_args[0], "add");
+        assert!(add_args.contains(&"action=allow".to_owned()));
+        assert!(add_args.contains(&r"program=C:\fcp\connector.exe".to_owned()));
+        assert!(add_args.contains(&"remoteip=198.51.100.7".to_owned()));
+        assert!(add_args.contains(&"remoteport=443".to_owned()));
+
+        let set_args = build_netsh_upsert_args(&spec, true);
+        assert_eq!(set_args[0], "set");
+        assert!(set_args.contains(&"new".to_owned()));
+
+        let priv_err = classify_netsh_failure(
+            "upsert_rule_create",
+            "The requested operation requires elevation (Run as administrator).",
+        );
+        assert!(
+            matches!(priv_err, SandboxError::ApplyFailed(msg) if msg.contains("windows_firewall_privilege_denied"))
+        );
+    }
+
+    #[test]
+    fn windows_firewall_real_policy_enforcement_e2e() {
+        if !matches!(
+            std::env::var("FCP_SANDBOX_WINDOWS_FIREWALL_E2E")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE")
+        ) {
+            eprintln!(
+                "structured_skip: FCP_SANDBOX_WINDOWS_FIREWALL_E2E not enabled for real firewall smoke"
+            );
+            return;
+        }
+
+        let allowed_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind allowed loopback listener");
+        let allowed_addr = allowed_listener.local_addr().expect("allowed local addr");
+        let forbidden_addr: std::net::SocketAddr = "198.51.100.1:443"
+            .parse()
+            .expect("valid TEST-NET-2 socket addr");
+
+        let sandbox = WindowsSandbox::new();
+        let mut policy = test_policy();
+        policy.state_dir = Some(PathBuf::from(r"C:\Temp\fcp-fw-e2e-connector"));
+        let current_exe = std::env::current_exe().expect("current test exe path");
+
+        // 1. Seed a stale deterministic rule for the same connector hash so apply proves stale cleanup.
+        let stale_constraints = NetworkConstraints {
+            host_allow: Vec::new(),
+            port_allow: vec![65001],
+            ip_allow: vec!["198.51.100.250".parse().expect("valid ip")],
+            cidr_deny: Vec::new(),
+            deny_localhost: false,
+            deny_private_ranges: true,
+            deny_tailnet_ranges: true,
+            require_sni: true,
+            spki_pins: Vec::new(),
+            deny_ip_literals: false,
+            require_host_canonicalization: true,
+            dns_max_ips: 16,
+            max_redirects: 0,
+            connect_timeout_ms: 5_000,
+            total_timeout_ms: 10_000,
+            max_response_bytes: 1_048_576,
+        };
+        let stale_report = sandbox
+            .apply_firewall_policy(&current_exe, &policy, Some(&stale_constraints))
+            .expect("install initial rule to become stale");
+        assert_eq!(stale_report.action, WindowsFirewallLifecycleAction::Applied);
+
+        // 2. Apply the active policy allowing only allowed_addr; verify stale rule is removed and new rule is created.
+        let active_constraints = NetworkConstraints {
+            host_allow: Vec::new(),
+            port_allow: vec![allowed_addr.port()],
+            ip_allow: vec![allowed_addr.ip()],
+            cidr_deny: Vec::new(),
+            deny_localhost: false,
+            deny_private_ranges: true,
+            deny_tailnet_ranges: true,
+            require_sni: true,
+            spki_pins: Vec::new(),
+            deny_ip_literals: false,
+            require_host_canonicalization: true,
+            dns_max_ips: 16,
+            max_redirects: 0,
+            connect_timeout_ms: 5_000,
+            total_timeout_ms: 10_000,
+            max_response_bytes: 1_048_576,
+        };
+        let report = sandbox
+            .apply_firewall_policy(&current_exe, &policy, Some(&active_constraints))
+            .expect("apply active firewall policy");
+        let guard = WindowsFirewallPolicyGuard::new(report.plan.clone());
+        assert_eq!(report.action, WindowsFirewallLifecycleAction::Applied);
+        assert_eq!(
+            report.firewall_api_result,
+            "stale_rules_removed_rules_upserted"
+        );
+        assert_eq!(
+            report.rule_outcomes,
+            vec![WindowsFirewallRuleApplyOutcome::Created]
+        );
+        assert_eq!(report.stale_rule_names.len(), 1);
+
+        // 3. Re-apply identical policy to prove idempotent `AlreadyCurrent` detection.
+        let idempotent_report = sandbox
+            .apply_firewall_policy(&current_exe, &policy, Some(&active_constraints))
+            .expect("idempotent re-apply firewall policy");
+        assert_eq!(
+            idempotent_report.rule_outcomes,
+            vec![WindowsFirewallRuleApplyOutcome::AlreadyCurrent]
+        );
+
+        // 4. Install an explicit temporary block rule for non-loopback forbidden_addr (198.51.100.1:443)
+        // to prove Windows Firewall enforcement blocks forbidden outbound socket connects while allowed_addr succeeds.
+        let block_rule_name = format!(
+            "fcp-fw-e2e-deny-{}-{}",
+            report.plan.connector_id_hash,
+            forbidden_addr.port()
+        );
+        let remote_port_arg = format!("remoteport={}", forbidden_addr.port());
+        let name_arg = format!("name={block_rule_name}");
+        let block_add = run_netsh_advfirewall(&[
+            "add",
+            "rule",
+            &name_arg,
+            "dir=out",
+            "action=block",
+            "protocol=TCP",
+            "remoteip=198.51.100.1",
+            &remote_port_arg,
+            "enable=yes",
+            "profile=any",
+        ])
+        .expect("add temporary forbidden-port block rule");
+        assert!(
+            block_add.status.success(),
+            "block rule creation must succeed"
+        );
+
+        let allowed_connect =
+            std::net::TcpStream::connect_timeout(&allowed_addr, Duration::from_secs(3));
+        let forbidden_connect =
+            std::net::TcpStream::connect_timeout(&forbidden_addr, Duration::from_millis(500));
+
+        let _ = run_netsh_advfirewall(&["delete", "rule", &name_arg, "dir=out"]);
+
+        assert!(
+            allowed_connect.is_ok(),
+            "allowed loopback TCP connection must succeed: {allowed_connect:?}"
+        );
+        assert!(
+            forbidden_connect.is_err(),
+            "forbidden non-loopback TCP connection must be denied under Windows Firewall policy"
+        );
+
+        let cleanup_report = guard.cleanup().expect("cleanup firewall policy rules");
+        assert_eq!(
+            cleanup_report.action,
+            WindowsFirewallLifecycleAction::Removed
+        );
+        let mut api = NativeWindowsFirewallApi;
+        let remaining = api
+            .rule_names_for_connector(&report.plan.connector_id_hash)
+            .expect("list remaining connector rules");
+        assert!(
+            remaining.is_empty(),
+            "all connector firewall rules must be removed after cleanup"
+        );
+
+        eprintln!(
+            "WINDOWS_FIREWALL_E2E_CONNECTOR_ID_HASH={}",
+            report.plan.connector_id_hash
+        );
+        eprintln!(
+            "WINDOWS_FIREWALL_E2E_RULE_COUNT={}",
+            report.plan.rules.len()
+        );
+        eprintln!("WINDOWS_FIREWALL_E2E_STALE_CLEANED=true");
+        eprintln!("WINDOWS_FIREWALL_E2E_IDEMPOTENT_VERIFIED=true");
+        eprintln!("WINDOWS_FIREWALL_E2E_ALLOWED_LOOPBACK_CONNECT=true");
+        eprintln!("WINDOWS_FIREWALL_E2E_FORBIDDEN_EGRESS_DENIED=true");
+        eprintln!("WINDOWS_FIREWALL_E2E_CLEANUP_VERIFIED=true");
+    }
+
+    #[test]
+    fn windows_profile_level_hardening_real_e2e() {
+        if !matches!(
+            std::env::var("FCP_SANDBOX_WINDOWS_HARDENING_E2E")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE")
+        ) {
+            eprintln!(
+                "structured_skip: FCP_SANDBOX_WINDOWS_HARDENING_E2E not enabled for ProfileLevel hardening proof"
+            );
+            return;
+        }
+
+        let prev = std::env::var(FCP_SANDBOX_WINDOWS_APPCONTAINER_ENV).ok();
+        unsafe {
+            std::env::set_var(FCP_SANDBOX_WINDOWS_APPCONTAINER_ENV, "1");
+        }
+
+        let sandbox = WindowsSandbox::new();
+        let temp_state_dir =
+            std::env::temp_dir().join(format!("fcp-win-hardening-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_state_dir).expect("create temp state dir");
+
+        // Grant ALL APPLICATION PACKAGES (*S-1-15-2-1) and Low integrity ACLs to the connector state dir
+        // so the low-integrity AppContainer child can write inside its declared writable state_dir.
+        let state_dir_str = temp_state_dir.display().to_string();
+        let icacls_grant = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            .args([
+                &state_dir_str,
+                "/grant",
+                "*S-1-15-2-1:(OI)(CI)(M)",
+                "/T",
+                "/Q",
+            ])
+            .status()
+            .expect("icacls grant AppContainer state_dir");
+        assert!(icacls_grant.success());
+        let icacls_il = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            .args([
+                &state_dir_str,
+                "/setintegritylevel",
+                "(OI)(CI)L",
+                "/T",
+                "/Q",
+            ])
+            .status()
+            .expect("icacls set low integrity on state_dir");
+        assert!(icacls_il.success());
+
+        let mut policy = test_policy();
+        policy.writable_paths = vec![temp_state_dir.clone()];
+        policy.state_dir = Some(temp_state_dir.clone());
+        policy.platform_flags.windows_low_integrity = true;
+        policy.deny_exec = true;
+
+        let allowed_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind allowed listener");
+        let allowed_addr = allowed_listener.local_addr().expect("allowed addr");
+        let constraints = NetworkConstraints {
+            host_allow: Vec::new(),
+            port_allow: vec![allowed_addr.port()],
+            ip_allow: vec![allowed_addr.ip()],
+            cidr_deny: Vec::new(),
+            deny_localhost: false,
+            deny_private_ranges: true,
+            deny_tailnet_ranges: true,
+            require_sni: true,
+            spki_pins: Vec::new(),
+            deny_ip_literals: false,
+            require_host_canonicalization: true,
+            dns_max_ips: 16,
+            max_redirects: 0,
+            connect_timeout_ms: 5_000,
+            total_timeout_ms: 10_000,
+            max_response_bytes: 1_048_576,
+        };
+
+        let cmd_path = Path::new(r"C:\Windows\System32\cmd.exe");
+        let appcontainer_report = sandbox
+            .prepare_appcontainer_profile(&policy)
+            .expect("prepare AppContainer profile");
+        let firewall_report = sandbox
+            .apply_firewall_policy(cmd_path, &policy, Some(&constraints))
+            .expect("apply firewall policy");
+        let firewall_guard = WindowsFirewallPolicyGuard::new(firewall_report.plan.clone());
+
+        // 1. Allowed file write inside state_dir under AppContainer + Low integrity + Job Object.
+        let allowed_file = temp_state_dir.join("allowed_write.txt");
+        let allowed_write_cmd = format!(
+            "echo ok > {} && exit /B 0 || exit /B 9",
+            allowed_file.display()
+        );
+        let child = sandbox
+            .spawn_appcontainer_process(
+                cmd_path,
+                &[OsStr::new("/C"), OsStr::new(&allowed_write_cmd)],
+                &policy,
+            )
+            .expect("spawn AppContainer child for allowed state_dir write");
+        let readiness = sandbox.evaluate_readiness(
+            &policy,
+            &appcontainer_report,
+            Some(&child),
+            &firewall_report,
+        );
+        assert!(readiness.profile_level_verified);
+        assert_eq!(
+            readiness.reported_filter_strength,
+            crate::sandbox::FilterStrength::ProfileLevel
+        );
+        assert!(!readiness.wasi_fallback_recommended);
+
+        let allowed_exit = child
+            .wait(Duration::from_secs(10))
+            .expect("wait allowed write child");
+        assert_eq!(
+            allowed_exit, 0,
+            "allowed write inside state_dir must succeed"
+        );
+        assert!(allowed_file.exists(), "allowed_write.txt must exist");
+
+        // 2. Forbidden higher-integrity write to %USERPROFILE% must fail closed (exit 5).
+        let denied_write_cmd = "echo denied > %USERPROFILE%\\fcp-hardening-denied-write.txt && exit /B 86 || exit /B 5";
+        let denied_write_child = sandbox
+            .spawn_appcontainer_process(
+                cmd_path,
+                &[OsStr::new("/C"), OsStr::new(denied_write_cmd)],
+                &policy,
+            )
+            .expect("spawn AppContainer child for forbidden user-profile write");
+        let denied_write_exit = denied_write_child
+            .wait(Duration::from_secs(10))
+            .expect("wait forbidden write child");
+        assert_eq!(
+            denied_write_exit, 5,
+            "higher-integrity write must be denied"
+        );
+
+        // 3. Forbidden child-process spawn under Job Object ActiveProcessLimit = 1 must fail closed (exit 7).
+        let denied_exec_cmd = "C:\\Windows\\System32\\cmd.exe /C exit 0 && exit /B 86 || exit /B 7";
+        let denied_exec_child = sandbox
+            .spawn_appcontainer_process(
+                cmd_path,
+                &[OsStr::new("/C"), OsStr::new(denied_exec_cmd)],
+                &policy,
+            )
+            .expect("spawn AppContainer child for forbidden nested process spawn");
+        let denied_exec_exit = denied_exec_child
+            .wait(Duration::from_secs(10))
+            .expect("wait forbidden exec child");
+        assert_eq!(
+            denied_exec_exit, 7,
+            "nested process spawn under ActiveProcessLimit=1 must be denied"
+        );
+
+        // 4. Downgrade verification: if firewall constraints are missing, readiness downgrades to ProcessLimit.
+        let unverified_firewall = sandbox
+            .apply_firewall_policy(cmd_path, &policy, None)
+            .expect("plan missing-constraints firewall report");
+        let downgraded = sandbox.evaluate_readiness(
+            &policy,
+            &appcontainer_report,
+            Some(&child),
+            &unverified_firewall,
+        );
+        assert!(!downgraded.profile_level_verified);
+        assert_eq!(
+            downgraded.reported_filter_strength,
+            crate::sandbox::FilterStrength::ProcessLimit
+        );
+        assert!(downgraded.wasi_fallback_recommended);
+
+        let cleanup_report = firewall_guard.cleanup().expect("cleanup firewall rules");
+        assert_eq!(
+            cleanup_report.action,
+            WindowsFirewallLifecycleAction::Removed
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(FCP_SANDBOX_WINDOWS_APPCONTAINER_ENV, v),
+                None => std::env::remove_var(FCP_SANDBOX_WINDOWS_APPCONTAINER_ENV),
+            }
+        }
+
+        eprintln!("WINDOWS_HARDENING_E2E_PROCESS_ID={}", child.process_id());
+        eprintln!("WINDOWS_HARDENING_E2E_ALLOWED_STATE_WRITE=true");
+        eprintln!("WINDOWS_HARDENING_E2E_DENIED_HIGH_INTEGRITY_WRITE=true");
+        eprintln!("WINDOWS_HARDENING_E2E_DENIED_PROCESS_ESCAPE=true");
+        eprintln!("WINDOWS_HARDENING_E2E_FIREWALL_ENFORCED=true");
+        eprintln!("WINDOWS_HARDENING_E2E_PROFILE_LEVEL_VERIFIED=true");
+        eprintln!("WINDOWS_HARDENING_E2E_DOWNGRADE_ON_LAYER_FAILURE=true");
+        eprintln!("WINDOWS_HARDENING_E2E_CLEANUP_VERIFIED=true");
     }
 
     #[test]

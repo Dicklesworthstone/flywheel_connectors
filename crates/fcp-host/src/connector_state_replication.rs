@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HostError, HostResult};
 
-pub(super) mod runtime;
+pub mod runtime;
 
 /// Maximum number of objects in one transfer, including the root.
 pub const MAX_CONNECTOR_STATE_TRANSFER_OBJECTS: usize = 4096;
@@ -631,6 +631,7 @@ fn invalid(message: &str) -> HostError {
     HostError::InvalidFilter(message.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn state_transfer_error(error: ConnectorStateStoreError) -> HostError {
     // Decoder errors can include CBOR values, and storage errors can include
     // local paths. These diagnostics cross the HTTP and signed mesh boundary;

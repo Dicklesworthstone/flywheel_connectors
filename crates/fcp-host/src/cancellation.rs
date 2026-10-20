@@ -157,6 +157,7 @@ pub async fn force_terminate_child(child: &mut Child, grace: Duration) {
 
 /// Tracks the state of an in-flight operation.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct TrackedOperation {
     /// Distinguishes successive registrations using the same client ID.
     registration: Arc<()>,

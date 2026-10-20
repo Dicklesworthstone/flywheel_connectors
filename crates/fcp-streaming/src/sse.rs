@@ -152,7 +152,7 @@ fn sse_response_should_stop(
 }
 
 /// FCP deliberately retains retries for transient HTTP failures, unlike the
-/// browser EventSource API. Authentication, protocol and retention failures
+/// browser `EventSource` API. Authentication, protocol and retention failures
 /// are permanent; an unchanged request must not loop or hide them.
 fn sse_error_can_reconnect(error: &StreamError) -> bool {
     if error.is_terminal_backpressure() {
@@ -169,10 +169,12 @@ fn sse_error_can_reconnect(error: &StreamError) -> bool {
     }
 }
 
+type SseRequestHeaders = (Vec<(String, String)>, Option<String>);
+
 fn sse_request_headers(
     config: &SseConfig,
     explicit_id: Option<&str>,
-) -> StreamResult<(Vec<(String, String)>, Option<String>)> {
+) -> StreamResult<SseRequestHeaders> {
     let mut configured_ids = config
         .headers
         .iter()
@@ -495,14 +497,12 @@ impl SseParser {
                     self.event_id = Some(value.to_string());
                 }
             }
-            "retry" => {
-                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    // Arbitrarily large digit strings remain a valid hint;
-                    // the reconnect policy bounds them to its local ceiling.
-                    let ms = value.parse().unwrap_or(u64::MAX);
-                    self.retry = Some(ms);
-                    self.reconnect_retry = Some(ms);
-                }
+            "retry" if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                // Arbitrarily large digit strings remain a valid hint;
+                // the reconnect policy bounds them to its local ceiling.
+                let ms = value.parse().unwrap_or(u64::MAX);
+                self.retry = Some(ms);
+                self.reconnect_retry = Some(ms);
             }
             _ => {} // Unknown field, ignore
         }

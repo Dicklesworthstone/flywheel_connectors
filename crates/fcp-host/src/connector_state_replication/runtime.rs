@@ -10,6 +10,8 @@
 //! continuity on every use. Snapshots expire by monotonic age, without extending
 //! their age on access, and are reclaimed lazily on cache activity or service drop.
 
+#![allow(clippy::missing_errors_doc)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -83,7 +85,7 @@ struct State {
 }
 
 #[derive(Default)]
-pub(crate) struct TransferRuntime {
+pub struct TransferRuntime {
     state: Mutex<State>,
     cache: Mutex<ExportCache>,
 }
@@ -99,7 +101,7 @@ impl TransferRuntime {
 
     /// Called after grant and transport authorization, before constructing
     /// source work, starting a paged fetch, or decoding an export response.
-    pub(crate) fn admit(
+    pub fn admit(
         &self,
         peer: &str,
         limits: ConnectorStateTransferLimits,
@@ -122,7 +124,7 @@ impl TransferRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn active(&self) -> usize {
+    pub fn active(&self) -> usize {
         self.state
             .lock()
             .expect("test admission state")
@@ -139,17 +141,19 @@ struct ExportKey {
     request_json: String,
 }
 
-pub(crate) struct ExportSnapshot {
+pub struct ExportSnapshot {
     wire: String,
     digest: String,
     created_at: Instant,
 }
 
 impl ExportSnapshot {
-    pub(crate) fn wire(&self) -> &str {
+    #[must_use]
+    pub fn wire(&self) -> &str {
         &self.wire
     }
-    pub(crate) fn digest(&self) -> &str {
+    #[must_use]
+    pub fn digest(&self) -> &str {
         &self.digest
     }
 }
@@ -205,22 +209,23 @@ impl ExportCache {
     }
 }
 
-pub(crate) enum ExportLookup<'a> {
+pub enum ExportLookup<'a> {
     Ready(Arc<ExportSnapshot>),
     Build(ExportBuild<'a>),
 }
 
 /// A cancelled or failed builder releases its key without publishing bytes.
+///
 /// Duplicate builders fail immediately: they never queue or repeat ancestry
 /// verification while the same export is already being constructed.
-pub(crate) struct ExportBuild<'a> {
+pub struct ExportBuild<'a> {
     runtime: &'a TransferRuntime,
     key: ExportKey,
     max_wire_bytes: usize,
 }
 
 impl TransferRuntime {
-    pub(crate) fn begin_export<'a>(
+    pub fn begin_export<'a>(
         &'a self,
         permit: &'a TransferPermit<'_>,
         request: &ConnectorStateExportRequest,
@@ -260,7 +265,7 @@ impl TransferRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn cache_builds_started(&self) -> u64 {
+    pub fn cache_builds_started(&self) -> u64 {
         self.cache.lock().expect("test export cache").builds_started
     }
 }
@@ -268,7 +273,7 @@ impl TransferRuntime {
 impl ExportBuild<'_> {
     /// Only the caller's fully validated, stably encoded export may be passed
     /// here. Hash once before locking; neither I/O nor callbacks run in a lock.
-    pub(crate) fn finish(self, wire: String) -> HostResult<Arc<ExportSnapshot>> {
+    pub fn finish(self, wire: String) -> HostResult<Arc<ExportSnapshot>> {
         if wire.is_empty() || wire.len() > self.max_wire_bytes || wire.len() > MAX_CACHE_BYTES {
             return Err(HostError::InvalidFilter(
                 "connector-state snapshot exceeds its bounds".to_owned(),
@@ -305,7 +310,7 @@ impl Drop for ExportBuild<'_> {
 
 /// Owning a permit is necessary but never sufficient authority to transfer
 /// state. Grant expiry and peer continuity are still checked by the caller.
-pub(crate) struct TransferPermit<'a> {
+pub struct TransferPermit<'a> {
     runtime: &'a TransferRuntime,
     peer: String,
     limits: ConnectorStateTransferLimits,
@@ -314,7 +319,7 @@ pub(crate) struct TransferPermit<'a> {
 impl TransferPermit<'_> {
     /// Internal helpers cannot use another service's or another-sized permit.
     /// This checks resource ownership only, never grant or transport authority.
-    pub(crate) fn check(
+    pub fn check(
         &self,
         runtime: &TransferRuntime,
         peer: &str,

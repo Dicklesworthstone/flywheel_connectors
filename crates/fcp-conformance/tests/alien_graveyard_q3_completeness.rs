@@ -173,3 +173,24 @@ fn test_top5_bucket_set_matches_score_pipeline() {
         );
     }
 }
+
+#[test]
+fn test_every_bucket_has_research_proof_or_deferral_doc() {
+    let research_root = repo_root().join("docs").join("research");
+    for ch in 'a'..='j' {
+        let bucket_readme = research_root.join(format!("q.{ch}")).join("README.md");
+        assert!(
+            bucket_readme.is_file(),
+            "Phase Q bucket Q.{} must have a proof/fallback artifact at {}",
+            ch.to_ascii_uppercase(),
+            bucket_readme.display()
+        );
+        let content = fs::read_to_string(&bucket_readme).expect("bucket README readable");
+        assert!(
+            content.contains(&format!("Phase Q.{}", ch.to_ascii_uppercase()))
+                && content.contains("Fallback"),
+            "bucket artifact {} must document its Phase Q.<bucket> identity and fallback contract",
+            bucket_readme.display()
+        );
+    }
+}

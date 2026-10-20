@@ -146,7 +146,7 @@ fn test_state_model_serialize_crdt() {
 
 fn test_header(created_at: u64) -> ObjectHeader {
     ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: fcp_core::ObjectEncryptionKind::default(),
         schema: SchemaId::new("fcp.test", "ConnectorStateObject", Version::new(1, 0, 0)),
         zone_id: ZoneId::work(),
         created_at,

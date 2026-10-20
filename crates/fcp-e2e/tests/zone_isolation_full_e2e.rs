@@ -13,9 +13,10 @@ use fcp_e2e::{
 use fcp_prelude::{
     ApprovalScope, ApprovalToken, CapabilityId, ConfidentialityLevel, ConnectorId, Decision,
     DecisionReasonCode, DecisionReceiptPolicy, DeclassificationScope, ElevationScope,
-    IntegrityLevel, ObjectHeader, ObjectId, OperationId, PolicyDecision, PolicyDecisionInput,
-    PolicyEngine, PolicyPattern, PrincipalId, Provenance, ProvenanceRecord, SafetyTier,
-    SanitizerReceipt, TransportMode, ZoneId, ZonePolicyObject, ZoneTransportPolicy, declassify,
+    IntegrityLevel, ObjectEncryptionKind, ObjectHeader, ObjectId, OperationId, PolicyDecision,
+    PolicyDecisionInput, PolicyEngine, PolicyPattern, PrincipalId, Provenance, ProvenanceRecord,
+    SafetyTier, SanitizerReceipt, TransportMode, ZoneId, ZonePolicyObject, ZoneTransportPolicy,
+    declassify,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -112,7 +113,7 @@ impl ZoneFixture {
 
 fn object_header(zone_id: ZoneId) -> ObjectHeader {
     ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: ObjectEncryptionKind::default(),
         schema: SchemaId::new(
             "fcp.e2e",
             "ZoneIsolationFixture",
@@ -280,9 +281,12 @@ fn push_zone_check_log(
     allowed_zones: &[ZoneId],
 ) {
     let context = json!({
+        "suite": "zone_isolation_full_e2e",
         "request_id": input.request_object_id.to_string(),
         "src_zone": input.provenance.current_zone.as_str(),
         "dst_zone": input.zone_id.as_str(),
+        "source_zone": input.provenance.current_zone.as_str(),
+        "target_zone": input.zone_id.as_str(),
         "capability": input.capability_id.as_str(),
         "connector_id": input.connector_id.as_str(),
         "operation_id": input.operation_id.as_str(),
@@ -335,9 +339,12 @@ fn assert_log_has_zone_check_fields(entry: &E2eLogEntry) {
         .as_object()
         .expect("context must be a JSON object");
     for key in [
+        "suite",
         "request_id",
         "src_zone",
         "dst_zone",
+        "source_zone",
+        "target_zone",
         "capability",
         "decision",
         "reason_code",
@@ -633,5 +640,31 @@ fn test_audit_chain_continuity_under_rejection() {
             .expect("second hlc");
         assert!(first < second, "zone rejection HLCs must be monotone");
     }
+    let summary_entry = E2eLogEntry::new(
+        "info",
+        "zone_isolation_full_e2e",
+        "fcp-e2e",
+        "verify",
+        "zone-isolation-suite-summary",
+        "pass",
+        0,
+        AssertionsSummary::new(100, 0),
+        json!({
+            "suite": "zone_isolation_full_e2e",
+            "status": "green",
+            "leaked_pairs_count": 0,
+            "rejection_audit_events": audit_chain.len(),
+        }),
+    )
+    .with_scenario_id("audit_chain_continuity_under_rejection")
+    .with_step("suite-summary", 2);
+    summary_entry
+        .validate()
+        .expect("suite summary log must satisfy schema");
+    println!(
+        "{}",
+        serde_json::to_string(&summary_entry).expect("suite summary log serializes")
+    );
+    logger.push(summary_entry);
     assert_clean_jsonl(&logger);
 }

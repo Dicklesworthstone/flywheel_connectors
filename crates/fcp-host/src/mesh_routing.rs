@@ -535,24 +535,21 @@ impl MeshRouter {
             return Ok(None);
         };
         let prepared = directory::prepare(&lookup, &mut settings)?;
-        let path = match lookup(MESH_REPLAY_JOURNAL_ENV) {
-            Some(raw) => {
-                let value = raw.trim();
-                if value.is_empty() {
-                    return Err(HostError::InvalidFilter(format!(
-                        "{MESH_REPLAY_JOURNAL_ENV} must be a nonempty persistent file path"
-                    )));
-                }
-                PathBuf::from(value)
+        let path = if let Some(raw) = lookup(MESH_REPLAY_JOURNAL_ENV) {
+            let value = raw.trim();
+            if value.is_empty() {
+                return Err(HostError::InvalidFilter(format!(
+                    "{MESH_REPLAY_JOURNAL_ENV} must be a nonempty persistent file path"
+                )));
             }
-            None => {
-                let key_file = lookup(MESH_SIGNING_KEY_FILE_ENV).ok_or_else(|| {
-                    HostError::InvalidFilter(format!(
-                        "mesh replay protection requires {MESH_SIGNING_KEY_FILE_ENV}"
-                    ))
-                })?;
-                companion(Path::new(key_file.trim()), ".mesh-replay")
-            }
+            PathBuf::from(value)
+        } else {
+            let key_file = lookup(MESH_SIGNING_KEY_FILE_ENV).ok_or_else(|| {
+                HostError::InvalidFilter(format!(
+                    "mesh replay protection requires {MESH_SIGNING_KEY_FILE_ENV}"
+                ))
+            })?;
+            companion(Path::new(key_file.trim()), ".mesh-replay")
         };
         let mut router = Self::with_replay_journal(settings, limits, &path)?;
         router.membership = prepared
@@ -653,24 +650,24 @@ impl MeshRouter {
     }
 
     fn trusted_directory(&self) -> Result<Arc<MeshPeerDirectory>, MeshForwardError> {
-        match &self.membership {
-            Some(membership) => membership.snapshot(),
-            None => Ok(Arc::clone(&self.directory)),
-        }
+        self.membership.as_ref().map_or_else(
+            || Ok(Arc::clone(&self.directory)),
+            directory::DirectoryGuard::snapshot,
+        )
     }
 
     fn trusted_peer(&self, node_id: &TailscaleNodeId) -> Result<PeerSnapshot, MeshForwardError> {
-        match &self.membership {
-            Some(membership) => membership.peer_snapshot(node_id),
-            None => PeerSnapshot::unversioned(Arc::clone(&self.directory), node_id),
-        }
+        self.membership.as_ref().map_or_else(
+            || PeerSnapshot::unversioned(Arc::clone(&self.directory), node_id),
+            |membership| membership.peer_snapshot(node_id),
+        )
     }
 
     fn ensure_current_peer(&self, snapshot: &PeerSnapshot) -> Result<(), MeshForwardError> {
-        match &self.membership {
-            Some(membership) => membership.check_peer_snapshot(snapshot),
-            None => self.ensure_current_directory(snapshot.directory()),
-        }
+        self.membership.as_ref().map_or_else(
+            || self.ensure_current_directory(snapshot.directory()),
+            |membership| membership.check_peer_snapshot(snapshot),
+        )
     }
 
     fn ensure_current_directory(

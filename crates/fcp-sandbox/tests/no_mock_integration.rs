@@ -923,6 +923,110 @@ fn windows_appcontainer_process_launch_skip_artifact_is_redaction_safe_jsonl()
     Ok(())
 }
 
+#[test]
+fn windows_sandbox_readiness_and_firewall_evidence_are_redaction_safe_jsonl()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut section = strict_sandbox_section();
+    section.profile = SandboxProfile::Permissive;
+    let policy = CompiledPolicy::from_manifest(
+        &section,
+        Some(PathBuf::from("/tmp/fcp-windows-hardening-state")),
+    )?
+    .with_platform_flags(PlatformFlags {
+        windows_low_integrity: true,
+        windows_appcontainer_capabilities: vec![WINDOWS_APPCONTAINER_INTERNET_CLIENT.to_string()],
+        ..PlatformFlags::default()
+    });
+
+    let connector_id = "fcp.secret-customer@example.com:windows-hardening";
+    let profile = policy.windows_appcontainer_profile(connector_id)?;
+    let raw_profile_name = profile.name.clone();
+    let appcontainer_report = WindowsAppContainerLifecycleReport {
+        profile,
+        action: WindowsAppContainerLifecycleAction::Created,
+        sid_present: true,
+        cleanup: WindowsAppContainerCleanupDecision::None,
+        skip_reason: None,
+    };
+
+    let mut fw_constraints = permissive_constraints();
+    fw_constraints.host_allow.clear();
+    fw_constraints.port_allow = vec![443];
+    fw_constraints.ip_allow = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))];
+    let fw_plan = plan_windows_firewall_policy(
+        connector_id,
+        Path::new(r"C:\Users\secret-customer\connectors\fcp-secret.exe"),
+        true,
+        Some(&fw_constraints),
+    )?;
+    let fw_report = WindowsFirewallPolicyReport {
+        plan: fw_plan,
+        action: WindowsFirewallLifecycleAction::Applied,
+        rule_outcomes: vec![WindowsFirewallRuleApplyOutcome::Created],
+        cleanup: WindowsFirewallCleanupDecision::None,
+        firewall_api_result: "rules_upserted",
+        skip_reason: None,
+        stale_rule_names: Vec::new(),
+        stale_rule_cleanup_outcomes: Vec::new(),
+    };
+    let fw_evidence = WindowsFirewallPolicyEvidence::from_report(&fw_report);
+    let fw_line = fw_evidence.to_jsonl_line()?;
+    let fw_value: Value = serde_json::from_str(&fw_line)?;
+
+    assert_eq!(fw_value["schema"], "fcp.windows_firewall_policy.v1");
+    assert_eq!(fw_value["os"], "windows");
+    assert_eq!(fw_value["lifecycle_action"], "applied");
+    assert_eq!(fw_value["allow_rule_count"].as_u64(), Some(1));
+    assert_eq!(fw_value["cleanup"], "none");
+    assert!(!fw_line.contains(connector_id));
+    assert!(!fw_line.contains("secret-customer"));
+
+    let integrity_plan = plan_windows_integrity_policy(
+        connector_id,
+        true,
+        WindowsIntegrityOperationMode::StartupInfoExChild,
+        true,
+    );
+    let integrity_report = WindowsIntegrityPolicyReport {
+        plan: integrity_plan,
+        action: WindowsIntegrityLifecycleAction::AppliedLowIntegrityChildToken,
+        token_api_result: WindowsIntegrityTokenApiResult::TokenPrepared,
+        cleanup: WindowsIntegrityTokenCleanupDecision::DropSourceAndChildTokens,
+        skip_reason: None,
+        step_order: Vec::new(),
+    };
+
+    let readiness = evaluate_windows_sandbox_readiness(
+        connector_id,
+        &appcontainer_report,
+        WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+        true,
+        &integrity_report,
+        &fw_report,
+    );
+    let readiness_line = readiness.to_jsonl_line()?;
+    let readiness_value: Value = serde_json::from_str(&readiness_line)?;
+
+    assert_eq!(
+        readiness_value["schema"],
+        "fcp.windows_sandbox_readiness.v1"
+    );
+    assert_eq!(readiness_value["reported_filter_strength"], "profile_level");
+    assert_eq!(
+        readiness_value["profile_level_verified"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        readiness_value["wasi_fallback_recommended"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(readiness_value["firewall_status"], "active_verified");
+    assert!(!readiness_line.contains(connector_id));
+    assert!(!readiness_line.contains("secret-customer"));
+    assert!(!readiness_line.contains(&raw_profile_name));
+    Ok(())
+}
+
 // ============================================================================
 // 10. NoOpSandbox
 // ============================================================================

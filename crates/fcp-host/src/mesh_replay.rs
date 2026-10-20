@@ -148,6 +148,7 @@ impl DurableMeshReplayGuard {
     ///
     /// Refuses invalid limits, another writer, an incorrect node/window binding,
     /// malformed or oversized data, clock rollback, and any required I/O failure.
+    #[allow(clippy::too_many_lines)]
     pub fn open(
         path: &Path,
         local_node: &TailscaleNodeId,

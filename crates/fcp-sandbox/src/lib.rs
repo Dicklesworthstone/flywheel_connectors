@@ -98,7 +98,7 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "windows")]
-pub use windows::{WindowsAppContainerChild, WindowsSandbox};
+pub use windows::{WindowsAppContainerChild, WindowsFirewallPolicyGuard, WindowsSandbox};
 
 pub use egress::*;
 pub use sandbox::*;

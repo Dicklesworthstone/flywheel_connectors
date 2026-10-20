@@ -188,7 +188,7 @@ impl BatchExecutor {
     /// Returns invalid limits or whole-batch validation/planning errors before
     /// any handler is called. Execution and retention failures are accounted for
     /// in the returned response rather than discarding known partial results.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::missing_panics_doc)]
     pub async fn execute_async_bounded<'a, F, Fut>(
         &self,
         request: &'a BatchInvokeRequest,

@@ -1,7 +1,7 @@
 //! Bounded FCP-message accounting for standalone invocation.
 //!
 //! The metered unit is the compact UTF-8 JSON serialization of the complete
-//! typed InvokeRequest plus InvokeResponse, not only input/output values. Outer
+//! typed `InvokeRequest` plus `InvokeResponse`, not only input/output values. Outer
 //! transport framing, rejected-request errors and provider HTTP traffic are not
 //! part of this local counter and still require host/egress enforcement.
 //!
@@ -122,7 +122,7 @@ impl StandaloneInvocation {
             }
             _ => {}
         }
-        let actual = json_bytes(response, completion.limit).map_err(|_| output_unknown())?;
+        let actual = json_bytes(response, completion.limit).map_err(|()| output_unknown())?;
         // A bounded error response may be released, but failure is not proof
         // of zero effects/transfer. Keep its entire reservation charged.
         if response.status == InvokeStatus::Ok
@@ -154,19 +154,18 @@ impl UsageLedger {
             &InvokeResponse::ok(request.id.clone(), serde_json::Value::from(0)),
             max_response_bytes,
         )
-        .map_err(|_| invalid("Response cap cannot fit a complete FCP response"))?;
+        .map_err(|()| invalid("Response cap cannot fit a complete FCP response"))?;
         // Derive bytes from the actual complete message, not a field supplied
         // by its caller. Counting is allocation-free and outside the ledger lock.
         let request_bytes = match scope.constraints.max_bytes {
             Some(limit) => json_bytes(request, limit)
-                .map_err(|_| denied("Invocation request exceeds the signed byte budget"))?,
+                .map_err(|()| denied("Invocation request exceeds the signed byte budget"))?,
             None => 0,
         };
         let mut entries = self.lock()?;
         self.check_scope(&entries, &scope)?;
         let mut response_limit = max_response_bytes;
-        let mut charge = 0;
-        if let Some(limit) = scope.constraints.max_bytes {
+        let charge = if let Some(limit) = scope.constraints.max_bytes {
             let spent = scope
                 .key
                 .as_ref()
@@ -188,10 +187,12 @@ impl UsageLedger {
                     "Signed byte allowance cannot fit a complete FCP response",
                 ));
             }
-            charge = request_bytes
+            request_bytes
                 .checked_add(response_limit)
-                .ok_or_else(|| denied("Signed capability byte budget exhausted"))?;
-        }
+                .ok_or_else(|| denied("Signed capability byte budget exhausted"))?
+        } else {
+            0
+        };
         let mut reservation = None;
         if scope.constraints.max_calls.is_some() || scope.constraints.max_bytes.is_some() {
             let key = scope

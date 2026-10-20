@@ -6,7 +6,12 @@ use std::thread::{self, JoinHandle};
 use fcp_core::TailscaleNodeId;
 use fcp_mesh::invoke_route::MeshPeerDirectory;
 
-use super::*;
+use super::{
+    CheckpointReadError, Duration, Ed25519VerifyingKey, HostResult, Instant, MembershipValidity,
+    MeshForwardError, MeshPeerDirectoryCheckpoint, PathBuf, PeerContinuity, PeerSnapshot,
+    SignedMeshPeerDirectory, invalid, read_checkpoint, read_peer_file, storage_error,
+    unix_now_ms, write_checkpoint,
+};
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -193,6 +198,7 @@ struct Refresher {
 }
 
 impl Refresher {
+    #[allow(clippy::too_many_lines)]
     fn refresh(&mut self, membership: &LiveMembership) -> HostResult<()> {
         if self.storage_failed {
             return Err(invalid("membership checkpoint failure requires restart"));

@@ -84,12 +84,11 @@ impl MeshForwardLimits {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> HostResult<Self> {
         let defaults = Self::default();
         let read = |name: &str, default: usize| -> HostResult<usize> {
-            match lookup(name) {
-                None => Ok(default),
-                Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            lookup(name).map_or(Ok(default), |raw| {
+                raw.trim().parse::<usize>().map_err(|_| {
                     HostError::InvalidFilter(format!("{name} must be a positive integer"))
-                }),
-            }
+                })
+            })
         };
         let limits = Self {
             max_in_flight: read(MESH_FORWARD_MAX_IN_FLIGHT_ENV, defaults.max_in_flight)?,

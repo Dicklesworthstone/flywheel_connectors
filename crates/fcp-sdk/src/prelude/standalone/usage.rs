@@ -378,6 +378,7 @@ mod tests {
         let ledger = Arc::new(UsageLedger::default());
         let token = token(Some(7), b"concurrent", None);
         let admitted = std::thread::scope(|scope| {
+            #[allow(clippy::needless_collect)]
             let handles: Vec<_> = (0..32)
                 .map(|_| {
                     let ledger = Arc::clone(&ledger);

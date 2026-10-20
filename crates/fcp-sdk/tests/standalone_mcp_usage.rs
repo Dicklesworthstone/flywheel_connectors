@@ -1,6 +1,6 @@
 //! Signed admission through the real MCP subprocess, not a replacement handler.
 //!
-//! Build `fcp-mcp-bridge` first, set FCP_MCP_BRIDGE_BIN to its absolute path, then
+//! Build `fcp-mcp-bridge` first, set `FCP_MCP_BRIDGE_BIN` to its absolute path, then
 //! run `cargo test -p fcp-sdk --test standalone_mcp_usage -- --ignored` on the
 //! same worker. These opt-in tests need no external service or credentials.
 //! They live in the SDK suite to reuse its existing signing test dependencies.
@@ -70,6 +70,7 @@ impl McpProcess {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn call(&mut self, method: &str, params: Value) -> Value {
         self.sequence += 1;
         let frame = serde_json::to_vec(&json!({

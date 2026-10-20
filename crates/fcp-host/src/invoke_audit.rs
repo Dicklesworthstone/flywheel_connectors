@@ -619,20 +619,20 @@ impl InvokeAuditChain {
     /// Report local persistence and write availability without exposing paths.
     #[must_use]
     pub fn durability_status(&self) -> InvokeAuditDurabilityStatus {
-        self.journal
-            .as_ref()
-            .map_or_else(
-                InvokeAuditDurabilityStatus::default,
-                |journal| match journal.lock() {
-                    Ok(journal) => journal.status(),
-                    Err(_) => InvokeAuditDurabilityStatus {
+        self.journal.as_ref().map_or_else(
+            InvokeAuditDurabilityStatus::default,
+            |journal| {
+                journal.lock().map_or_else(
+                    |_| InvokeAuditDurabilityStatus {
                         storage: "local_journal".to_string(),
                         writable: false,
                         unavailable_reason: Some("journal_lock_poisoned".to_string()),
                         ..InvokeAuditDurabilityStatus::default()
                     },
-                },
-            )
+                    |journal| journal.status(),
+                )
+            },
+        )
     }
 
     fn persist_entry(&self, entry: &AuditEntry) -> Result<(), AuditError> {

@@ -690,6 +690,13 @@ impl WindowsAppContainerProcessLaunchEvidence {
         self
     }
 
+    /// Override the reported filter strength after full readiness aggregation.
+    #[must_use]
+    pub const fn with_final_filter_strength(mut self, strength: FilterStrength) -> Self {
+        self.final_filter_strength = strength;
+        self
+    }
+
     /// Render this record as a single JSONL line.
     pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
@@ -1864,9 +1871,271 @@ impl WindowsFirewallPolicyEvidence {
         Self::from_report(&report)
     }
 
+    /// Override the reported filter strength after full readiness aggregation.
+    #[must_use]
+    pub const fn with_final_filter_strength(mut self, strength: FilterStrength) -> Self {
+        self.final_filter_strength = strength;
+        self
+    }
+
     /// Render this record as a single JSONL line.
     pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+}
+
+/// Readiness status for an individual Windows sandbox enforcement layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsSandboxLayerStatus {
+    /// The layer is active and verified for the current connector run.
+    ActiveVerified,
+    /// The layer was planned or configured without runtime enforcement proof.
+    PlannedOnly,
+    /// The layer was skipped because prerequisites or opt-in were absent.
+    SkippedInactive,
+    /// The layer degraded or failed and blocks `ProfileLevel` promotion.
+    DegradedOrFailed,
+}
+
+/// Consolidated Windows sandbox doctor/readiness report and `ProfileLevel` promotion decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsSandboxReadinessReport {
+    /// Schema marker for downstream evidence and doctor consumers.
+    pub schema: &'static str,
+    /// Operating-system family for this report.
+    pub os: &'static str,
+    /// Hashed connector id or connector seed.
+    pub connector_id_hash: String,
+    /// Hashed `AppContainer` profile name.
+    pub profile_name_hash: String,
+    /// Status of the `AppContainer` profile and `STARTUPINFOEX` launch layer.
+    pub appcontainer_status: WindowsSandboxLayerStatus,
+    /// Status of the Job Object resource-limit and `ActiveProcessLimit` layer.
+    pub job_object_status: WindowsSandboxLayerStatus,
+    /// Status of the low-integrity primary child token layer.
+    pub integrity_status: WindowsSandboxLayerStatus,
+    /// Status of the Windows Firewall / network egress enforcement layer.
+    pub firewall_status: WindowsSandboxLayerStatus,
+    /// Whether all required Windows layers are active and verified for this run.
+    pub profile_level_verified: bool,
+    /// Final `FilterStrength` reported for this connector run.
+    pub reported_filter_strength: FilterStrength,
+    /// Whether the WASI fallback remains recommended for strict-profile parity.
+    pub wasi_fallback_recommended: bool,
+    /// Deterministic downgrade or skip reasons when `ProfileLevel` is not promoted.
+    pub downgrade_reasons: Vec<String>,
+    /// Primary structured skip or downgrade reason when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+impl WindowsSandboxReadinessReport {
+    /// Render this readiness report as a single JSONL line.
+    pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+fn evaluate_windows_appcontainer_layer(
+    appcontainer_report: &WindowsAppContainerLifecycleReport,
+    launch_mechanism: WindowsAppContainerProcessLaunchMechanism,
+    downgrade_reasons: &mut Vec<String>,
+) -> WindowsSandboxLayerStatus {
+    if appcontainer_report.sid_present
+        && matches!(
+            appcontainer_report.action,
+            WindowsAppContainerLifecycleAction::Created
+                | WindowsAppContainerLifecycleAction::ReusedExisting
+        )
+        && launch_mechanism
+            == WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities
+    {
+        WindowsSandboxLayerStatus::ActiveVerified
+    } else if appcontainer_report.action == WindowsAppContainerLifecycleAction::SkippedInactive
+        || launch_mechanism == WindowsAppContainerProcessLaunchMechanism::SkippedInactive
+    {
+        downgrade_reasons.push(
+            appcontainer_report
+                .skip_reason
+                .clone()
+                .unwrap_or_else(|| "appcontainer_inactive".to_owned()),
+        );
+        WindowsSandboxLayerStatus::SkippedInactive
+    } else {
+        downgrade_reasons.push(
+            appcontainer_report
+                .skip_reason
+                .clone()
+                .unwrap_or_else(|| "appcontainer_launch_not_verified".to_owned()),
+        );
+        WindowsSandboxLayerStatus::DegradedOrFailed
+    }
+}
+
+fn evaluate_windows_integrity_layer(
+    integrity_report: &WindowsIntegrityPolicyReport,
+    downgrade_reasons: &mut Vec<String>,
+) -> WindowsSandboxLayerStatus {
+    match integrity_report.action {
+        WindowsIntegrityLifecycleAction::AppliedLowIntegrityChildToken
+            if integrity_report.plan.requested_level == WindowsIntegrityLevelRequest::Low
+                && integrity_report.token_api_result
+                    == WindowsIntegrityTokenApiResult::TokenPrepared =>
+        {
+            WindowsSandboxLayerStatus::ActiveVerified
+        }
+        WindowsIntegrityLifecycleAction::PlannedLowIntegrityChildToken => {
+            downgrade_reasons.push("integrity_low_token_planned_only".to_owned());
+            WindowsSandboxLayerStatus::PlannedOnly
+        }
+        WindowsIntegrityLifecycleAction::SkippedMediumIntegrity => {
+            downgrade_reasons.push("integrity_medium_inherited_not_low_primary_token".to_owned());
+            WindowsSandboxLayerStatus::SkippedInactive
+        }
+        WindowsIntegrityLifecycleAction::RejectedAppContainerInactive => {
+            downgrade_reasons.push(
+                integrity_report
+                    .skip_reason
+                    .unwrap_or("windows_appcontainer_not_active_createprocessasuser_path_unwired")
+                    .to_owned(),
+            );
+            WindowsSandboxLayerStatus::SkippedInactive
+        }
+        WindowsIntegrityLifecycleAction::RejectedUnsafeLaunchPath
+        | WindowsIntegrityLifecycleAction::TokenSetupFailed
+        | WindowsIntegrityLifecycleAction::AppliedLowIntegrityChildToken => {
+            downgrade_reasons.push(
+                integrity_report
+                    .skip_reason
+                    .unwrap_or("integrity_token_setup_failed")
+                    .to_owned(),
+            );
+            WindowsSandboxLayerStatus::DegradedOrFailed
+        }
+    }
+}
+
+fn evaluate_windows_firewall_layer(
+    firewall_report: &WindowsFirewallPolicyReport,
+    appcontainer_status: WindowsSandboxLayerStatus,
+    downgrade_reasons: &mut Vec<String>,
+) -> WindowsSandboxLayerStatus {
+    if firewall_report.plan.default_decision == WindowsFirewallDefaultDecision::Deny
+        && ((firewall_report.plan.status == WindowsFirewallPlanStatus::NoEgress
+            && firewall_report.action == WindowsFirewallLifecycleAction::PlannedNoEgress
+            && appcontainer_status == WindowsSandboxLayerStatus::ActiveVerified)
+            || (firewall_report.plan.status == WindowsFirewallPlanStatus::IpAllowRules
+                && firewall_report.action == WindowsFirewallLifecycleAction::Applied
+                && !firewall_report
+                    .stale_rule_cleanup_outcomes
+                    .contains(&WindowsFirewallStaleRuleCleanupOutcome::Failed)))
+    {
+        WindowsSandboxLayerStatus::ActiveVerified
+    } else if firewall_report.action == WindowsFirewallLifecycleAction::PlannedOnly
+        || (firewall_report.plan.status == WindowsFirewallPlanStatus::NoEgress
+            && firewall_report.action == WindowsFirewallLifecycleAction::PlannedNoEgress)
+    {
+        downgrade_reasons.push(
+            firewall_report
+                .skip_reason
+                .or(firewall_report.plan.unsupported_reason)
+                .unwrap_or("firewall_policy_planned_only")
+                .to_owned(),
+        );
+        WindowsSandboxLayerStatus::PlannedOnly
+    } else if matches!(
+        firewall_report.action,
+        WindowsFirewallLifecycleAction::SkippedDirectNetworkAllowed
+            | WindowsFirewallLifecycleAction::NotInstalledMissingNetworkConstraints
+            | WindowsFirewallLifecycleAction::SkippedHostAllowRequiresNetworkGuard
+    ) {
+        downgrade_reasons.push(
+            firewall_report
+                .skip_reason
+                .or(firewall_report.plan.unsupported_reason)
+                .unwrap_or("firewall_policy_skipped")
+                .to_owned(),
+        );
+        WindowsSandboxLayerStatus::SkippedInactive
+    } else {
+        downgrade_reasons.push(
+            firewall_report
+                .skip_reason
+                .or(firewall_report.plan.unsupported_reason)
+                .unwrap_or("firewall_policy_degraded_or_unverified")
+                .to_owned(),
+        );
+        WindowsSandboxLayerStatus::DegradedOrFailed
+    }
+}
+
+/// Evaluate Windows sandbox layer readiness and gate `FilterStrength::ProfileLevel` promotion.
+///
+/// Windows reports [`FilterStrength::ProfileLevel`] **only** when `AppContainer`
+/// child-process launch, Job Object attachment, low-integrity primary token
+/// enforcement, and default-deny network egress enforcement are all active and
+/// verified for the connector run. Any missing, skipped, or degraded layer
+/// downgrades the reported strength to [`FilterStrength::ProcessLimit`] and
+/// keeps the WASI fallback recommendation active.
+#[must_use]
+pub fn evaluate_windows_sandbox_readiness(
+    connector_id: &str,
+    appcontainer_report: &WindowsAppContainerLifecycleReport,
+    launch_mechanism: WindowsAppContainerProcessLaunchMechanism,
+    job_object_attached: bool,
+    integrity_report: &WindowsIntegrityPolicyReport,
+    firewall_report: &WindowsFirewallPolicyReport,
+) -> WindowsSandboxReadinessReport {
+    let mut downgrade_reasons = Vec::new();
+    let appcontainer_status = evaluate_windows_appcontainer_layer(
+        appcontainer_report,
+        launch_mechanism,
+        &mut downgrade_reasons,
+    );
+    let job_object_status = if job_object_attached {
+        WindowsSandboxLayerStatus::ActiveVerified
+    } else if appcontainer_status == WindowsSandboxLayerStatus::SkippedInactive {
+        downgrade_reasons.push("job_object_not_attached_inactive_launch".to_owned());
+        WindowsSandboxLayerStatus::SkippedInactive
+    } else {
+        downgrade_reasons.push("job_object_not_attached".to_owned());
+        WindowsSandboxLayerStatus::DegradedOrFailed
+    };
+    let integrity_status =
+        evaluate_windows_integrity_layer(integrity_report, &mut downgrade_reasons);
+    let firewall_status = evaluate_windows_firewall_layer(
+        firewall_report,
+        appcontainer_status,
+        &mut downgrade_reasons,
+    );
+
+    let profile_level_verified = appcontainer_status == WindowsSandboxLayerStatus::ActiveVerified
+        && job_object_status == WindowsSandboxLayerStatus::ActiveVerified
+        && integrity_status == WindowsSandboxLayerStatus::ActiveVerified
+        && firewall_status == WindowsSandboxLayerStatus::ActiveVerified;
+
+    let reported_filter_strength = if profile_level_verified {
+        FilterStrength::ProfileLevel
+    } else {
+        FilterStrength::ProcessLimit
+    };
+    let skip_reason = downgrade_reasons.first().cloned();
+
+    WindowsSandboxReadinessReport {
+        schema: "fcp.windows_sandbox_readiness.v1",
+        os: "windows",
+        connector_id_hash: stable_fnv1a64_hex(connector_id),
+        profile_name_hash: stable_fnv1a64_hex(&appcontainer_report.profile.name),
+        appcontainer_status,
+        job_object_status,
+        integrity_status,
+        firewall_status,
+        profile_level_verified,
+        reported_filter_strength,
+        wasi_fallback_recommended: !profile_level_verified,
+        downgrade_reasons,
+        skip_reason,
     }
 }
 
@@ -5026,5 +5295,243 @@ mod tests {
     fn platform_matrix_windows_is_process_limit() {
         let sandbox = crate::windows::WindowsSandbox::new();
         assert_eq!(sandbox.filter_strength(), FilterStrength::ProcessLimit);
+    }
+
+    #[test]
+    fn test_windows_sandbox_readiness_promotes_to_profile_level_only_when_all_layers_verified() {
+        let profile = fake_windows_appcontainer_profile();
+        let appcontainer_report = WindowsAppContainerLifecycleReport::active(
+            profile,
+            WindowsAppContainerLifecycleAction::Created,
+        );
+        let integrity_plan = plan_windows_integrity_policy(
+            "secret-tenant@example.com",
+            true,
+            WindowsIntegrityOperationMode::StartupInfoExChild,
+            true,
+        );
+        let mut integrity_api = FakeWindowsIntegrityTokenApi::default();
+        let integrity_report = apply_windows_integrity_policy(integrity_plan, &mut integrity_api);
+
+        let constraints = windows_firewall_constraints(&[], &[443], &["198.51.100.7"]);
+        let firewall_plan = plan_windows_firewall_policy(
+            "secret-tenant@example.com",
+            Path::new(r"C:\Users\secret\connector.exe"),
+            true,
+            Some(&constraints),
+        )
+        .unwrap();
+        let mut firewall_api = FakeWindowsFirewallApi::default();
+        let firewall_report =
+            apply_windows_firewall_policy(firewall_plan, &mut firewall_api).unwrap();
+
+        let readiness = evaluate_windows_sandbox_readiness(
+            "secret-tenant@example.com",
+            &appcontainer_report,
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+            true,
+            &integrity_report,
+            &firewall_report,
+        );
+        let line = readiness.to_jsonl_line().unwrap();
+
+        assert_eq!(
+            readiness.appcontainer_status,
+            WindowsSandboxLayerStatus::ActiveVerified
+        );
+        assert_eq!(
+            readiness.job_object_status,
+            WindowsSandboxLayerStatus::ActiveVerified
+        );
+        assert_eq!(
+            readiness.integrity_status,
+            WindowsSandboxLayerStatus::ActiveVerified
+        );
+        assert_eq!(
+            readiness.firewall_status,
+            WindowsSandboxLayerStatus::ActiveVerified
+        );
+        assert!(readiness.profile_level_verified);
+        assert_eq!(
+            readiness.reported_filter_strength,
+            FilterStrength::ProfileLevel
+        );
+        assert!(!readiness.wasi_fallback_recommended);
+        assert!(readiness.downgrade_reasons.is_empty());
+        assert!(readiness.skip_reason.is_none());
+        assert!(line.contains("fcp.windows_sandbox_readiness.v1"));
+        assert!(line.contains("\"reported_filter_strength\":\"profile_level\""));
+        assert!(!line.contains("secret-tenant@example.com"));
+        assert!(!line.contains("fcp-test-connector"));
+    }
+
+    #[test]
+    fn test_windows_sandbox_readiness_promotes_no_egress_sentinel_with_active_appcontainer() {
+        let profile = WindowsAppContainerProfile {
+            name: "fcp-test-connector-0123456789abcdef".into(),
+            capabilities: Vec::new(),
+        };
+        let appcontainer_report = WindowsAppContainerLifecycleReport::active(
+            profile,
+            WindowsAppContainerLifecycleAction::ReusedExisting,
+        );
+        let integrity_plan = plan_windows_integrity_policy(
+            "connector",
+            true,
+            WindowsIntegrityOperationMode::StartupInfoExChild,
+            true,
+        );
+        let mut integrity_api = FakeWindowsIntegrityTokenApi::default();
+        let integrity_report = apply_windows_integrity_policy(integrity_plan, &mut integrity_api);
+
+        let constraints = windows_firewall_constraints(&["none.invalid"], &[0], &[]);
+        let firewall_plan = plan_windows_firewall_policy(
+            "connector",
+            Path::new(r"C:\fcp\connector.exe"),
+            true,
+            Some(&constraints),
+        )
+        .unwrap();
+        let mut firewall_api = FakeWindowsFirewallApi::default();
+        let firewall_report =
+            apply_windows_firewall_policy(firewall_plan, &mut firewall_api).unwrap();
+
+        let readiness = evaluate_windows_sandbox_readiness(
+            "connector",
+            &appcontainer_report,
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+            true,
+            &integrity_report,
+            &firewall_report,
+        );
+
+        assert!(readiness.profile_level_verified);
+        assert_eq!(
+            readiness.reported_filter_strength,
+            FilterStrength::ProfileLevel
+        );
+        assert!(!readiness.wasi_fallback_recommended);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_windows_sandbox_readiness_downgrades_when_any_layer_fails_or_skips() {
+        let profile = fake_windows_appcontainer_profile();
+        let active_appcontainer = WindowsAppContainerLifecycleReport::active(
+            profile.clone(),
+            WindowsAppContainerLifecycleAction::Created,
+        );
+        let inactive_appcontainer = WindowsAppContainerLifecycleReport::inactive(profile);
+
+        let low_integrity_plan = plan_windows_integrity_policy(
+            "connector",
+            true,
+            WindowsIntegrityOperationMode::StartupInfoExChild,
+            true,
+        );
+        let mut integrity_api = FakeWindowsIntegrityTokenApi::default();
+        let verified_integrity =
+            apply_windows_integrity_policy(low_integrity_plan.clone(), &mut integrity_api);
+
+        let mut failing_integrity_api = FakeWindowsIntegrityTokenApi::with_failure(
+            WindowsIntegrityTokenApiResult::PrivilegeDenied,
+        );
+        let failed_integrity =
+            apply_windows_integrity_policy(low_integrity_plan, &mut failing_integrity_api);
+
+        let ip_constraints = windows_firewall_constraints(&[], &[443], &["198.51.100.7"]);
+        let firewall_plan = plan_windows_firewall_policy(
+            "connector",
+            Path::new(r"C:\fcp\connector.exe"),
+            true,
+            Some(&ip_constraints),
+        )
+        .unwrap();
+        let mut firewall_api = FakeWindowsFirewallApi::default();
+        let verified_firewall =
+            apply_windows_firewall_policy(firewall_plan.clone(), &mut firewall_api).unwrap();
+
+        let missing_firewall_plan = plan_windows_firewall_policy(
+            "connector",
+            Path::new(r"C:\fcp\connector.exe"),
+            true,
+            None,
+        )
+        .unwrap();
+        let skipped_firewall =
+            apply_windows_firewall_policy(missing_firewall_plan, &mut firewall_api).unwrap();
+
+        // Case 1: AppContainer inactive -> ProcessLimit
+        let r1 = evaluate_windows_sandbox_readiness(
+            "connector",
+            &inactive_appcontainer,
+            WindowsAppContainerProcessLaunchMechanism::SkippedInactive,
+            false,
+            &verified_integrity,
+            &verified_firewall,
+        );
+        assert!(!r1.profile_level_verified);
+        assert_eq!(r1.reported_filter_strength, FilterStrength::ProcessLimit);
+        assert!(r1.wasi_fallback_recommended);
+        assert_eq!(
+            r1.appcontainer_status,
+            WindowsSandboxLayerStatus::SkippedInactive
+        );
+
+        // Case 2: Job Object not attached -> ProcessLimit
+        let r2 = evaluate_windows_sandbox_readiness(
+            "connector",
+            &active_appcontainer,
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+            false,
+            &verified_integrity,
+            &verified_firewall,
+        );
+        assert!(!r2.profile_level_verified);
+        assert_eq!(r2.reported_filter_strength, FilterStrength::ProcessLimit);
+        assert_eq!(
+            r2.job_object_status,
+            WindowsSandboxLayerStatus::DegradedOrFailed
+        );
+
+        // Case 3: Integrity token setup failed -> ProcessLimit
+        let r3 = evaluate_windows_sandbox_readiness(
+            "connector",
+            &active_appcontainer,
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+            true,
+            &failed_integrity,
+            &verified_firewall,
+        );
+        assert!(!r3.profile_level_verified);
+        assert_eq!(r3.reported_filter_strength, FilterStrength::ProcessLimit);
+        assert_eq!(
+            r3.integrity_status,
+            WindowsSandboxLayerStatus::DegradedOrFailed
+        );
+        assert_eq!(
+            r3.skip_reason.as_deref(),
+            Some("windows_integrity_token_privilege_denied")
+        );
+
+        // Case 4: Firewall constraints unavailable -> ProcessLimit
+        let r4 = evaluate_windows_sandbox_readiness(
+            "connector",
+            &active_appcontainer,
+            WindowsAppContainerProcessLaunchMechanism::StartupInfoExSecurityCapabilities,
+            true,
+            &verified_integrity,
+            &skipped_firewall,
+        );
+        assert!(!r4.profile_level_verified);
+        assert_eq!(r4.reported_filter_strength, FilterStrength::ProcessLimit);
+        assert_eq!(
+            r4.firewall_status,
+            WindowsSandboxLayerStatus::SkippedInactive
+        );
+        assert_eq!(
+            r4.skip_reason.as_deref(),
+            Some("operation_network_constraints_unavailable_to_windows_sandbox")
+        );
     }
 }

@@ -246,11 +246,47 @@ fn manifest_obligations_have_operator_artifact_hints() {
 fn current_readme_row_is_gated_before_it_can_be_marked_proven() {
     let root = workspace_root();
     let manifest = load_manifest(&root);
+    let feature = zone_isolation_feature(&manifest);
     let status = current_readme_status(&root);
-    let verdict = evaluate_feature_gate(zone_isolation_feature(&manifest), &status, &[], "abc123")
+
+    let accepted = accepted_shas(feature);
+    let mut records = Vec::new();
+    for artifact in required_artifacts(feature) {
+        let id = string_field(artifact, "id");
+        let hint = string_field(artifact, "artifact_hint");
+        let markers = artifact
+            .get("green_markers")
+            .and_then(Value::as_array)
+            .expect("green_markers must be an array");
+        for &sha in &accepted {
+            let rel_path = hint.replace("${GITHUB_SHA}", sha);
+            let full_path = root.join(&rel_path);
+            if let Ok(content) = fs::read_to_string(&full_path) {
+                let all_present = markers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .all(|marker| content.contains(marker));
+                if all_present {
+                    records.push(EvidenceRecord {
+                        obligation_id: id,
+                        status: "green",
+                        git_sha: sha,
+                        generated_age_hours: 1,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    let verdict = evaluate_feature_gate(feature, &status, &records, "abc123")
         .expect("current README row must be consistent with proof obligations");
 
-    assert_eq!(verdict, GateVerdict::NonProven);
+    if status == "PROVEN" {
+        assert_eq!(verdict, GateVerdict::ProvenPinned);
+    } else {
+        assert_eq!(verdict, GateVerdict::NonProven);
+    }
 }
 
 #[test]

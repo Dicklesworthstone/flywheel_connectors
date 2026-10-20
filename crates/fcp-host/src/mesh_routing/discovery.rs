@@ -76,14 +76,14 @@ impl CachedAdvertisement {
         if &self.peer != peer {
             return false;
         }
-        match &self.advertisement {
-            Some(advertisement) => {
+        self.advertisement.as_ref().map_or_else(
+            || self.checked_at.elapsed() < FAILURE_CACHE_TTL,
+            |advertisement| {
                 self.checked_at.elapsed() < SUCCESS_CACHE_TTL
                     && advertisement.issued_at_ms.abs_diff(now_ms)
                         <= DEFAULT_MESH_ADVERTISEMENT_MAX_AGE_MS
-            }
-            None => self.checked_at.elapsed() < FAILURE_CACHE_TTL,
-        }
+            },
+        )
     }
 }
 

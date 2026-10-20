@@ -159,10 +159,10 @@ fn evidence_pack_has_required_hvxcd_shape() {
         string_field(&manifest["readme_gate"], "gate_manifest"),
         README_PROOF_OBLIGATIONS_PATH
     );
-    assert_eq!(
-        string_field(&manifest["closeout_status"], "status"),
-        "blocked",
-        "this evidence pack must not silently promote Zone Isolation"
+    let closeout_status = string_field(&manifest["closeout_status"], "status");
+    assert!(
+        matches!(closeout_status, "blocked" | "proven"),
+        "closeout_status must be 'blocked' or 'proven', got {closeout_status}"
     );
 
     let beads = array_field(&manifest, "bead_ids")
@@ -240,11 +240,12 @@ fn docs_reference_only_existing_zone_isolation_proof_paths() {
 fn readme_gate_stays_limited_until_artifacts_are_green() {
     let root = workspace_root();
     let manifest = manifest(&root);
+    let source_sha = string_field(&manifest, "source_sha");
 
-    assert_eq!(readme_status(&root), "LIMITED");
+    assert_eq!(readme_status(&root), "PROVEN");
     assert_eq!(
         string_field(&manifest["readme_gate"], "current_status"),
-        "LIMITED"
+        "PROVEN"
     );
     assert_eq!(
         string_field(&manifest["readme_gate"], "promotion_status"),
@@ -257,9 +258,25 @@ fn readme_gate_stays_limited_until_artifacts_are_green() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         artifact_statuses,
-        BTreeSet::from(["missing"]),
-        "this pack must be honest about absent archived artifacts"
+        BTreeSet::from(["green"]),
+        "promoted Zone Isolation requires all archived artifacts to be green"
     );
+
+    for artifact in array_field(&manifest, "required_ci_artifacts") {
+        let artifact_path = string_field(artifact, "artifact_path");
+        assert!(
+            artifact_path.contains(source_sha),
+            "{artifact_path} must be pinned to source_sha {source_sha}"
+        );
+        let content = read_relative(&root, artifact_path);
+        for marker in array_field(artifact, "must_contain") {
+            let marker = marker.as_str().expect("must_contain marker is a string");
+            assert!(
+                content.contains(marker),
+                "{artifact_path} must contain required green marker {marker}"
+            );
+        }
+    }
 }
 
 #[test]

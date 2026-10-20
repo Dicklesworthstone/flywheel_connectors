@@ -844,7 +844,10 @@ impl DurableObjectStore {
             config.allow_legacy_unauth,
             access,
         )?;
-        state._writer_lock = writer_lock;
+        #[allow(clippy::used_underscore_binding)]
+        {
+            state._writer_lock = writer_lock;
+        }
 
         Ok(Self {
             state: Arc::new(Mutex::new(state)),

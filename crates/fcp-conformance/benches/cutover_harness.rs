@@ -31,8 +31,9 @@ use fcp_crypto::{
 };
 use fcp_mesh::gossip::{GossipConfig, GossipMessage, PriorityGossipPolicy, RevocationPushMessage};
 use fcp_prelude::{
-    ObjectHeader, ObjectId, Provenance, RevocationDecision, RevocationFreshnessClass,
-    RevocationObject, RevocationRegistry, RevocationScope, RevocationSlaChecker, ZoneId,
+    ObjectEncryptionKind, ObjectHeader, ObjectId, Provenance, RevocationDecision,
+    RevocationFreshnessClass, RevocationObject, RevocationRegistry, RevocationScope,
+    RevocationSlaChecker, ZoneId,
 };
 use fcp_protocol::{
     FCPC_HEADER_LEN, FCPC_TAG_LEN, FcpcFrame, FcpcFrameFlags, MeshSessionId, SessionDirection,
@@ -45,7 +46,7 @@ use semver::Version;
 
 fn test_header() -> ObjectHeader {
     ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: ObjectEncryptionKind::default(),
         schema: SchemaId::new("fcp.bench", "CutoverHarness", Version::new(1, 0, 0)),
         zone_id: ZoneId::work(),
         created_at: 1_700_000_000,

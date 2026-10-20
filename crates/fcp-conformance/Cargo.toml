@@ -30,6 +30,7 @@ fcp-core = { path = "../fcp-core" }
 fcp-prelude = { path = "../fcp-prelude" }
 fcp-protocol = { path = "../fcp-protocol" }
 fcp-crypto = { path = "../fcp-crypto" }
+fcp-crypto-hw = { path = "../fcp-crypto-hw" }
 fcp-auth-schema = { path = "../fcp-auth-schema" }
 fcp-cbor = { path = "../fcp-cbor" }
 fcp-manifest = { path = "../fcp-manifest" }

@@ -1814,6 +1814,8 @@ struct DoctorSelfTestArgs {
 enum DoctorLocalCheck {
     /// Verify audit-chain status artifacts and operator readiness thresholds.
     Audit,
+    /// Report cryptographic hardware acceleration and Apple Secure Enclave HPKE status.
+    HwAccel,
     /// Verify the Lean formal-proof gate and local proof artifacts.
     Lean,
     /// Verify migration dirty-tracking, pre-copy, and post-copy local thresholds.
@@ -1827,6 +1829,8 @@ enum DoctorLocalCheck {
 enum DoctorProbe {
     /// Verify HLC and HierVV local invariants and warning thresholds.
     Hlc,
+    /// Report cryptographic hardware acceleration and Apple Secure Enclave HPKE status.
+    HwAccel,
     /// Verify masked IBLT and layered filter local invariants and warning thresholds.
     Iblt,
     /// Verify migration dirty-tracking, pre-copy, and post-copy local thresholds.
@@ -14250,7 +14254,10 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
     let uses_local_doctor_source = matches!(
         args.check,
         Some(
-            DoctorLocalCheck::Lean | DoctorLocalCheck::Migration | DoctorLocalCheck::RealityCadence
+            DoctorLocalCheck::HwAccel
+                | DoctorLocalCheck::Lean
+                | DoctorLocalCheck::Migration
+                | DoctorLocalCheck::RealityCadence
         )
     ) || args.probe.is_some()
         || args.command.is_some();
@@ -14264,6 +14271,10 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
 
     if matches!(args.check, Some(DoctorLocalCheck::Audit)) {
         return doctor_audit_dispatch(args, explicit_host);
+    }
+
+    if matches!(args.check, Some(DoctorLocalCheck::HwAccel)) {
+        return doctor_hw_accel_probe_dispatch();
     }
 
     if matches!(args.check, Some(DoctorLocalCheck::Lean)) {
@@ -14280,6 +14291,10 @@ fn doctor_dispatch(args: &DoctorArgs, explicit_host: Option<&str>) -> Result<Dis
 
     if matches!(args.probe, Some(DoctorProbe::Hlc)) {
         return doctor_hlc_probe_dispatch();
+    }
+
+    if matches!(args.probe, Some(DoctorProbe::HwAccel)) {
+        return doctor_hw_accel_probe_dispatch();
     }
 
     if matches!(args.probe, Some(DoctorProbe::Iblt)) {
@@ -15309,6 +15324,46 @@ fn doctor_swarm_pressure_probe_dispatch(
     envelope.inject_into(&mut payload);
     inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
     Ok(DispatchOutcome { payload, exit_code })
+}
+
+fn doctor_hw_accel_probe_dispatch() -> Result<DispatchOutcome> {
+    let report = fcp_crypto_hw::doctor_hw_accel_report();
+    let table = fcp_crypto_hw::function_table();
+    let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "doctor");
+    let mut payload = json!({
+        "status": "ok",
+        "command": "doctor",
+        "probe": "hw-accel",
+        "source": "local-algorithm-probe",
+        "message": "Cryptographic hardware acceleration and HPKE decapsulation path inspected.",
+        "apple_secure_enclave_available": report.apple_secure_enclave_available,
+        "hpke_decap_path": report.hpke_decap_path,
+        "report": {
+            "schema_version": "fcp.fwc.doctor.hw-accel.v1",
+            "host_os": report.host_os,
+            "host_arch": report.host_arch,
+            "dispatch_tier": table.tier.as_str(),
+            "apple_secure_enclave_available": report.apple_secure_enclave_available,
+            "hpke_decap_path": report.hpke_decap_path,
+            "features_detected": report.features_detected,
+            "enclave_fallback_total": report.enclave_fallback_total,
+            "startup_unavailable_warn_count": report.startup_unavailable_warn_count,
+            "commands": [
+                "fwc doctor hw-accel --json",
+                "fwc doctor --probe hw-accel --json",
+            ],
+        },
+        "next_actions": [
+            "fwc doctor hw-accel --json",
+            "fwc doctor --probe hw-accel --json",
+        ],
+    });
+    envelope.inject_into(&mut payload);
+    inject_truth_source_metadata(&mut payload, KnowledgeState::Offline);
+    Ok(DispatchOutcome {
+        payload,
+        exit_code: CliExitCode::Success,
+    })
 }
 
 fn doctor_hlc_probe_dispatch() -> Result<DispatchOutcome> {
@@ -38436,6 +38491,34 @@ deny_ptrace = true
         };
         assert!(matches!(args.check, Some(DoctorLocalCheck::Audit)));
         assert!(args.zone.is_none());
+    }
+
+    #[test]
+    fn doctor_hw_accel_parses_and_reports_enclave_fields() {
+        let cli = Cli::try_parse_from(["fwc", "doctor", "hw-accel", "--json"])
+            .expect("doctor hw-accel should parse without --zone");
+        let Commands::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert!(matches!(args.check, Some(DoctorLocalCheck::HwAccel)));
+        assert!(args.zone.is_none());
+
+        let (exit_code, payload) = execute_json(&["fwc", "doctor", "hw-accel", "--json"]);
+        assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["command"], "doctor");
+        assert_eq!(payload["probe"], "hw-accel");
+        assert!(payload["apple_secure_enclave_available"].is_boolean());
+        assert!(
+            matches!(
+                payload["hpke_decap_path"].as_str(),
+                Some("enclave" | "software")
+            ),
+            "hpke_decap_path must be enclave or software"
+        );
+        assert_eq!(
+            payload["report"]["schema_version"],
+            "fcp.fwc.doctor.hw-accel.v1"
+        );
     }
 
     #[test]

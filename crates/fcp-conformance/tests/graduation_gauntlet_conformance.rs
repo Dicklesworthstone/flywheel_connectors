@@ -825,9 +825,11 @@ fn all_proven_connectors_pass_gauntlet() {
         }
     }
 
-    if proven_connectors.is_empty() {
-        eprintln!("no literal PROVEN connector README statuses found");
-    }
+    assert!(
+        proven_connectors.len() >= 49,
+        "expected >= 49 PROVEN connectors across batches 1-4, got {}",
+        proven_connectors.len()
+    );
 
     for connector in proven_connectors {
         let output = run_gauntlet([connector.as_os_str()]);

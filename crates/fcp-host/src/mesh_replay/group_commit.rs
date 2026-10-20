@@ -13,7 +13,7 @@ use super::{
     VerifiedMeshReplayNonce, encode_record, replay_unavailable,
 };
 
-pub(crate) const MAX_REPLAY_GROUP_SIZE: usize = 16;
+pub const MAX_REPLAY_GROUP_SIZE: usize = 16;
 
 type AdmissionResult = Result<(), MeshForwardError>;
 

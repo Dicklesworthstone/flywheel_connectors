@@ -44,8 +44,18 @@ fn test_p99_breach_triggers_gate() {
     );
 }
 
+fn resolve_artifact_root() -> PathBuf {
+    let direct = PathBuf::from(ARTIFACT_ROOT);
+    if direct.exists() {
+        return direct;
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(ARTIFACT_ROOT)
+}
+
 fn assert_machine_budget_or_skip(machine_class: &str) -> Result<(), String> {
-    let root = Path::new(ARTIFACT_ROOT);
+    let root = resolve_artifact_root();
     if !root.exists() {
         eprintln!(
             "SKIP: {ARTIFACT_ROOT} is absent; angoc.1.1/angoc.1.2 StatPack artifacts have not landed yet"
@@ -53,9 +63,10 @@ fn assert_machine_budget_or_skip(machine_class: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let report = load_latest_report(root, machine_class)?.ok_or_else(|| {
+    let report = load_latest_report(&root, machine_class)?.ok_or_else(|| {
         format!(
-            "no pq signing StatPack artifact found for machine class {machine_class} under {ARTIFACT_ROOT}"
+            "no pq signing StatPack artifact found for machine class {machine_class} under {}",
+            root.display()
         )
     })?;
     assert_budget(&report)
@@ -118,12 +129,18 @@ fn matches_machine_class(json: &Value, path: &Path, machine_class: &str) -> bool
 fn extract_hybrid_verify_p99_ms(json: &Value) -> Option<f64> {
     for path in [
         &["benchmarks", "verify_hybrid", "p99_ms"][..],
+        &["benchmarks", "verify_hybrid", "p99"][..],
         &["benchmarks", "hybrid_verify", "p99_ms"][..],
+        &["benchmarks", "hybrid_verify", "p99"][..],
         &["statpack", "verify_hybrid", "p99_ms"][..],
+        &["statpack", "verify_hybrid", "p99"][..],
         &["verify_hybrid", "p99_ms"][..],
+        &["verify_hybrid", "p99"][..],
         &["hybrid_verify", "p99_ms"][..],
+        &["hybrid_verify", "p99"][..],
         &["hybrid_verify_p99_ms"][..],
         &["p99_ms"][..],
+        &["p99"][..],
     ] {
         if let Some(value) = number_at_path(json, path) {
             return Some(value);

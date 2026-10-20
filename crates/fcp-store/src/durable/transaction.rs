@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 /// admitted, the worker owns the guards until the complete transaction returns;
 /// dropping its async waiter cannot expose half-published state or admit a
 /// second writer while the first one is still changing durable storage.
-pub(crate) async fn run<T, R, F>(
+pub async fn run<T, R, F>(
     state: Arc<Mutex<T>>,
     writer: Arc<Mutex<()>>,
     commit: F,

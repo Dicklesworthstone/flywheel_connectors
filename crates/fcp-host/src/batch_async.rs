@@ -133,9 +133,8 @@ where
         let Some(sink) = self.sink.as_mut() else {
             return self.status == BatchDeliveryStatus::Complete;
         };
-        let pending = match catch_unwind(AssertUnwindSafe(|| sink.begin(result))) {
-            Ok(pending) => pending,
-            Err(_) => return self.stop(BatchDeliveryStatus::Panicked),
+        let Ok(pending) = catch_unwind(AssertUnwindSafe(|| sink.begin(result))) else {
+            return self.stop(BatchDeliveryStatus::Panicked);
         };
         let mut pending = pin!(AssertUnwindSafe(pending).catch_unwind());
         // Borrow the same pinned delivery future on every bounded timer wake.
@@ -462,15 +461,14 @@ impl BatchExecutor {
                 // AssertUnwindSafe is deliberately local to the handler boundary.
                 // After any panic we stop admission rather than calling a factory
                 // whose captured state may have been left partially mutated.
-                match catch_unwind(AssertUnwindSafe(|| handler(operation))) {
-                    Ok(future) => active.push(async move {
+                if let Ok(future) = catch_unwind(AssertUnwindSafe(|| handler(operation))) {
+                    active.push(async move {
                         (index, AssertUnwindSafe(future).catch_unwind().await)
-                    }),
-                    Err(_) => {
-                        run.record_panicked(index);
-                        dependencies.complete(index);
-                        run.deliver_recorded(index, &mut delivery, context).await;
-                    }
+                    });
+                } else {
+                    run.record_panicked(index);
+                    dependencies.complete(index);
+                    run.deliver_recorded(index, &mut delivery, context).await;
                 }
                 cooperate(&mut cooperative_steps).await;
             }
@@ -760,8 +758,9 @@ impl<'a> BatchRun<'a> {
                 continue;
             }
             let operation = &self.request.operations[index];
-            let result = if let Some(started_at) = self.admitted_at[index] {
-                OperationResult {
+            let result = self.admitted_at[index].map_or_else(
+                || skipped(operation, skip_code, skip_message),
+                |started_at| OperationResult {
                     id: operation.id.clone(),
                     status: OperationResultStatus::Error,
                     output: None,
@@ -770,10 +769,8 @@ impl<'a> BatchRun<'a> {
                         "batch interrupted an admitted operation; side effects may have occurred; do not retry without reconciliation",
                     )),
                     duration_ms: elapsed_millis(started_at),
-                }
-            } else {
-                skipped(operation, skip_code, skip_message)
-            };
+                },
+            );
             let delivered = delivery
                 .deliver(&result, self.started_at, self.timeout, context)
                 .await;

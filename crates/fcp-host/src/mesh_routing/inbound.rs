@@ -120,8 +120,9 @@ impl InboundReplayWorker {
                 while let Ok(first) = receiver.recv() {
                     let mut group = Vec::with_capacity(MAX_REPLAY_GROUP_SIZE);
                     group.push(first);
-                    let outcomes = match state.lock() {
-                        Ok(mut guard) => {
+                    let outcomes = state.lock().map_or_else(
+                        |_| vec![Err(replay_unavailable("state_poisoned"))],
+                        |mut guard| {
                             // Drain only after obtaining the journal lock so
                             // work accumulated during a mutex wait can share
                             // the sync. Never delay a lone request to fill up.
@@ -133,9 +134,8 @@ impl InboundReplayWorker {
                             // One clock sample under the lock preserves order
                             // with embedded synchronous admission callers.
                             guard.accept_verified_batch(&identities, clock())
-                        }
-                        Err(_) => vec![Err(replay_unavailable("state_poisoned"))],
-                    };
+                        },
+                    );
                     // The journal lock and sync barrier end before any caller
                     // is notified. Cancellation never undoes a committed nonce.
                     for (request, result) in group.into_iter().zip(outcomes) {

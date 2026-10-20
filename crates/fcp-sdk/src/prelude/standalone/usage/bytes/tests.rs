@@ -76,7 +76,7 @@ fn fixture(
             "fixture.get".into(),
             CapabilityId::from_static("fixture.read"),
         )]),
-        forbidden_zones: Default::default(),
+        forbidden_zones: std::collections::BTreeSet::default(),
         authority: None,
     };
     let key = Ed25519SigningKey::from_bytes(&[43; 32]).unwrap();
@@ -126,6 +126,7 @@ fn remaining(session: &StandaloneSession, request: &InvokeRequest, bytes: u64) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn assert_unknown(error: FcpError) {
     let text = error.to_string();
     assert!(text.contains("outcome is unknown"));
@@ -360,6 +361,7 @@ fn concurrent_reservations_cannot_spend_the_same_remaining_bytes() {
         },
     );
     let admitted = std::thread::scope(|threads| {
+        #[allow(clippy::needless_collect)]
         let handles: Vec<_> = (0..32)
             .map(|_| {
                 let ledger = Arc::clone(&ledger);

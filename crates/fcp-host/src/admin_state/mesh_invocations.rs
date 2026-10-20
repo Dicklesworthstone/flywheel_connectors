@@ -50,8 +50,8 @@ pub enum MeshInvocationIdentity {
 
 /// Payload-free origin intent persisted before any peer send.
 ///
-/// This is an entry-host reservation, not an FCP OperationIntent or an
-/// executor-local InvocationAdmission. It never stores credentials, raw
+/// This is an entry-host reservation, not an FCP `OperationIntent` or an
+/// executor-local `InvocationAdmission`. It never stores credentials, raw
 /// idempotency keys, inputs, or result bodies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshInvocationIntent {
@@ -79,7 +79,7 @@ pub struct MeshInvocationIntent {
     pub idempotency: Option<InvocationIdempotency>,
     /// Exact-token alias of a verified principal's idempotency scope.
     ///
-    /// TokenBoundRelay already uses that namespace as its primary binding and
+    /// `TokenBoundRelay` already uses that namespace as its primary binding and
     /// leaves this absent. Old verified records without an alias remain
     /// readable, but their discarded credentials cannot be reconstructed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,9 +256,9 @@ pub struct MeshInvocationAttempt {
 pub enum MeshInvocationOutcome {
     /// Every selected target was conclusively not delivered.
     NotDelivered,
-    /// A matching, valid successful InvokeResponse was observed.
+    /// A matching, valid successful `InvokeResponse` was observed.
     Succeeded,
-    /// A matching, valid connector-error InvokeResponse was observed.
+    /// A matching, valid connector-error `InvokeResponse` was observed.
     ConnectorError,
     /// The connector result or required origin finalization is uncertain.
     OutcomeUnknown,
@@ -276,7 +276,7 @@ pub struct MeshInvocationTerminal {
     pub http_status: u16,
     /// Elapsed forwarding duration.
     pub duration_ms: u64,
-    /// Receipt reference from a validated InvokeResponse, when available.
+    /// Receipt reference from a validated `InvokeResponse`, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_id: Option<String>,
 }
@@ -780,7 +780,7 @@ impl HostAdminStateStore {
     /// Persist transport evidence for the exact currently selected executor.
     ///
     /// A signed HTTP response is transport evidence only. The caller must
-    /// validate the matching InvokeResponse before recording a known outcome.
+    /// validate the matching `InvokeResponse` before recording a known outcome.
     ///
     /// # Errors
     ///
@@ -830,8 +830,8 @@ impl HostAdminStateStore {
 
     /// Finish origin processing after response validation and finalization.
     ///
-    /// Succeeded and ConnectorError require a matching valid InvokeResponse,
-    /// not merely a signed HTTP status. NotDelivered requires transport proof
+    /// Succeeded and `ConnectorError` require a matching valid `InvokeResponse`,
+    /// not merely a signed HTTP status. `NotDelivered` requires transport proof
     /// for every selected executor. Unknown outcomes remain replay-fenced.
     ///
     /// # Errors
