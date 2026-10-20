@@ -28,6 +28,18 @@ pub enum StripeError {
     #[error("Stripe mutation outcome unknown; reconcile the original operation before invoking again; automatic retry suppressed")]
     MutationOutcomeUnknown,
 
+    #[error("invalid Stripe idempotency key: expected 1 to 255 visible ASCII bytes without whitespace")]
+    InvalidIdempotencyKey,
+
+    #[error("could not construct the Stripe request; check the configured endpoint and headers")]
+    RequestBuildFailed,
+
+    #[error("Stripe returned HTTP {status_code} redirect; configure the intended API endpoint explicitly")]
+    UnexpectedRedirect { status_code: u16 },
+
+    #[error("Stripe forbids retrying this request (HTTP {status_code})")]
+    RetryForbidden { status_code: u16 },
+
     #[error("Rate limited")]
     RateLimited { retry_after_ms: u64 },
 
@@ -49,6 +61,10 @@ impl StripeError {
             Self::Api { status_code, .. } => matches!(status_code, Some(500..=599 | 429)),
             Self::Json(_)
             | Self::MutationOutcomeUnknown
+            | Self::InvalidIdempotencyKey
+            | Self::RequestBuildFailed
+            | Self::UnexpectedRedirect { .. }
+            | Self::RetryForbidden { .. }
             | Self::Unauthorized
             | Self::NotFound { .. } => false,
         }
@@ -84,6 +100,19 @@ impl StripeError {
                 retryable: false,
                 retry_after: None,
             },
+            Self::InvalidIdempotencyKey | Self::RequestBuildFailed => FcpError::InvalidRequest {
+                code: 1005,
+                message: self.to_string(),
+            },
+            Self::UnexpectedRedirect { status_code } | Self::RetryForbidden { status_code } => {
+                FcpError::External {
+                    service: "stripe".into(),
+                    message: self.to_string(),
+                    status_code: Some(*status_code),
+                    retryable: false,
+                    retry_after: None,
+                }
+            }
             Self::Api {
                 message,
                 status_code,

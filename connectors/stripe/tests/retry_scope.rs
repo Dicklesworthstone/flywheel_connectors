@@ -254,3 +254,128 @@ async fn refund_with_a_generated_key_has_the_same_host_boundary_protection() {
     assert_unknown(&error);
     assert_same_key(&server, None).await;
 }
+
+#[fcp_async_core::runtime::test]
+async fn invalid_keys_never_reach_the_provider_or_become_retryable() {
+    let server = MockServer::start().await;
+    let client = client(&server, 2);
+    for key in [
+        String::new(),
+        " ".to_owned(),
+        "x".repeat(256),
+        "private-key\r\nInjected: yes".to_owned(),
+        "private-key\t".to_owned(),
+        "private-key\0".to_owned(),
+        "private-keyé".to_owned(),
+        " private-key".to_owned(),
+    ] {
+        let error = client
+            .create_payment_intent_with_idempotency(2000, "usd", None, Some(&key))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StripeError::InvalidIdempotencyKey));
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("private-key"));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn maximum_length_caller_key_is_preserved() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/payment_intents"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let key = "k".repeat(255);
+    let error = client(&server, 1)
+        .create_payment_intent_with_idempotency(2000, "usd", None, Some(&key))
+        .await
+        .unwrap_err();
+    assert!(error.is_retryable());
+    assert_same_key(&server, Some(&key)).await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn post_redirect_cannot_replay_body_or_key_at_another_origin() {
+    let server = MockServer::start().await;
+    let destination = MockServer::start().await;
+    let location = format!("{}/stolen?credential=private-key", destination.uri());
+    Mock::given(method("POST"))
+        .and(path("/v1/payment_intents"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", location.as_str()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server, 2)
+        .create_payment_intent_with_idempotency(2000, "usd", None, Some("order-stable-1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StripeError::UnexpectedRedirect { status_code: 307 }));
+    assert!(!error.is_retryable());
+    assert!(!error.to_string().contains("private-key"));
+    assert!(destination.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn get_redirect_is_not_followed_or_marked_retryable() {
+    let server = MockServer::start().await;
+    let destination = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/balance"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", destination.uri()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server, 2).get_balance().await.unwrap_err();
+    assert!(matches!(error, StripeError::UnexpectedRedirect { status_code: 302 }));
+    assert!(!error.is_retryable());
+    assert!(destination.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn provider_retry_refusal_stops_even_read_only_server_error_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/balance"))
+        .respond_with(ResponseTemplate::new(500).insert_header("Stripe-Should-Retry", "false"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server, 2).get_balance().await.unwrap_err();
+    assert!(matches!(error, StripeError::RetryForbidden { status_code: 500 }));
+    assert!(!error.is_retryable());
+    assert!(matches!(error.to_fcp_error(), FcpError::External { retryable: false, .. }));
+}
+
+#[fcp_async_core::runtime::test]
+async fn provider_retry_refusal_overrides_rate_limit_and_caller_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/payment_intents"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Stripe-Should-Retry", "false"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server, 2)
+        .create_payment_intent_with_idempotency(2000, "usd", None, Some("order-stable-1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StripeError::RetryForbidden { status_code: 429 }));
+    assert!(!error.is_retryable());
+    assert!(error.retry_after().is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn request_build_failure_is_not_retryable_or_reported_as_sent() {
+    let client = StripeClient::new("sk_test_scope_secret")
+        .unwrap()
+        .with_api_url("not a URL")
+        .with_retry_config(2);
+    let error = client.create_customer("test@example.com", None).await.unwrap_err();
+    assert!(matches!(error, StripeError::RequestBuildFailed));
+    assert!(!error.is_retryable());
+    assert!(matches!(error.to_fcp_error(), FcpError::InvalidRequest { code: 1005, .. }));
+}

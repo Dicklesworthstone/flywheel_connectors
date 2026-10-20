@@ -131,6 +131,9 @@ impl StripeClient {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("fcp-stripe/0.1.0")
+            // A redirect can replay the form body under a different endpoint
+            // below our retry/idempotency boundary. Require explicit routing.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(StripeError::Http)?;
 
@@ -580,6 +583,9 @@ impl StripeClient {
         body: &serde_json::Value,
         idempotency_key: Option<&str>,
     ) -> StripeResult<serde_json::Value> {
+        if let Some(key) = idempotency_key {
+            validate_idempotency_key(key)?;
+        }
         // Stripe's REST API only accepts `application/x-www-form-urlencoded`
         // request bodies (with bracket notation for nested fields); it does not
         // parse JSON. Encode the body here rather than sending `.json()`.
@@ -633,6 +639,9 @@ impl StripeClient {
         url: &str,
         idempotency_key: Option<&str>,
     ) -> StripeResult<serde_json::Value> {
+        if let Some(key) = idempotency_key {
+            validate_idempotency_key(key)?;
+        }
         self.execute(ReplayScope::AcrossInvocations, || {
             let mut req = self.apply_auth(self.http.delete(url));
             if let Some(key) = idempotency_key {
@@ -666,6 +675,14 @@ impl StripeClient {
                         let status = response.status();
                         replay_guard.observe_status(status.as_u16());
 
+                        if status.is_redirection() {
+                            // Never expose Location: it may contain credentials
+                            // or private request data supplied by an intermediary.
+                            return AttemptOutcome::Terminal(StripeError::UnexpectedRedirect {
+                                status_code: status.as_u16(),
+                            });
+                        }
+
                         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                             return AttemptOutcome::Terminal(StripeError::Unauthorized);
                         }
@@ -674,6 +691,20 @@ impl StripeClient {
                             let body = response.text().await.unwrap_or_default();
                             return AttemptOutcome::Terminal(StripeError::NotFound {
                                 resource: body,
+                            });
+                        }
+
+                        if !status.is_success()
+                            && response
+                                .headers()
+                                .get("stripe-should-retry")
+                                .and_then(|value| value.to_str().ok())
+                                .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
+                        {
+                            // A Terminal(Api { 500, .. }) would still tell the
+                            // host to retry. Carry the refusal across that boundary.
+                            return AttemptOutcome::Terminal(StripeError::RetryForbidden {
+                                status_code: status.as_u16(),
                             });
                         }
 
@@ -741,6 +772,10 @@ impl StripeClient {
                             Err(error) => AttemptOutcome::Terminal(StripeError::Http(error)),
                         }
                     }
+                    Err(error) if error.is_builder() => {
+                        replay_guard.observe_transport_error(&error);
+                        AttemptOutcome::Terminal(StripeError::RequestBuildFailed)
+                    }
                     Err(error) if error.is_timeout() || error.is_connect() => {
                         replay_guard.observe_transport_error(&error);
                         AttemptOutcome::Retryable {
@@ -758,6 +793,15 @@ impl StripeClient {
         .await;
         finish_stripe_attempts(result, replay_scope, &ambiguous_attempt)
     }
+}
+
+/// Reject unusable keys before considering a POST replay-safe. Never normalize
+/// a key: trimming or rewriting it could merge two distinct caller operations.
+fn validate_idempotency_key(key: &str) -> StripeResult<()> {
+    if key.is_empty() || key.len() > 255 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(StripeError::InvalidIdempotencyKey);
+    }
+    Ok(())
 }
 
 /// Stripe's API v1 GET/DELETE requests are idempotent. A caller-supplied key
@@ -829,6 +873,54 @@ mod replay_scope_tests {
     use super::*;
     use fcp_prelude::FcpError;
     use fcp_sdk::ConnectorErrorMapping;
+
+    #[test]
+    fn pre_transmission_failure_does_not_clear_prior_ambiguity() {
+        let error = Client::new().get("not a URL").build().unwrap_err();
+        assert!(error.is_builder());
+        for prior_ambiguity in [false, true] {
+            let ambiguous = AtomicBool::new(prior_ambiguity);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_transport_error(&error);
+            }
+            assert_eq!(ambiguous.load(Ordering::Relaxed), prior_ambiguity);
+        }
+    }
+
+    #[test]
+    fn idempotency_key_validation_has_exact_boundaries_and_does_not_echo_keys() {
+        for key in ["!".to_owned(), "a".repeat(255), "order:payment/1".to_owned()] {
+            validate_idempotency_key(&key).unwrap();
+        }
+        for key in [
+            String::new(), " ".to_owned(), "a".repeat(256),
+            "private-key\r\nInjected: yes".to_owned(), "private-key\t".to_owned(),
+            "private-key\0".to_owned(), "private-key\u{7f}".to_owned(),
+            "private-keyé".to_owned(), " private-key".to_owned(),
+        ] {
+            let error = validate_idempotency_key(&key).unwrap_err();
+            assert!(!error.to_string().contains("private-key"));
+            assert!(!error.is_retryable());
+            assert!(matches!(error.to_fcp_error(), FcpError::InvalidRequest { code: 1005, .. }));
+        }
+    }
+
+    #[test]
+    fn explicit_retry_refusals_survive_the_host_error_boundary() {
+        for error in [
+            StripeError::UnexpectedRedirect { status_code: 307 },
+            StripeError::RetryForbidden { status_code: 500 },
+            StripeError::RetryForbidden { status_code: 429 },
+        ] {
+            assert!(!ConnectorErrorMapping::is_retryable(&error));
+            assert!(ConnectorErrorMapping::retry_after(&error).is_none());
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External { retryable: false, retry_after: None, .. }
+            ));
+        }
+    }
 
     #[test]
     fn response_classification_fails_closed() {
