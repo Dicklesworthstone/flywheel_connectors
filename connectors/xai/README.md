@@ -1,6 +1,6 @@
 # xAI Connector V3 Contract
 
-> **Status**: manifest/runtime contract documented
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/xai_connector_verification.sh`

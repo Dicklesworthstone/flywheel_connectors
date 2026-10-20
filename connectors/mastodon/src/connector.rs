@@ -300,7 +300,7 @@ fn output_schema_for(operation: &str) -> Value {
 struct MastodonConfig {
     /// Mastodon instance URL (e.g., `"https://mastodon.social"`).
     instance_url: String,
-    /// OAuth2 access token.
+    /// `OAuth2` access token.
     access_token: String,
     #[serde(default)]
     retry: HttpRetryConfig,

@@ -1,6 +1,6 @@
 # Telegram Connector V3 Contract
 
-> **Status**: runtime contract documented; no-live-credential Bot API/webhook loopback proof tracked
+> **Status**: PROVEN runtime contract documented; no-live-credential Bot API/webhook loopback proof tracked
 > **Bead**: `flywheel_connectors-6n7.2`
 > **Parent**: `flywheel_connectors-6n7`
 > **Verification script**: `scripts/e2e/telegram_connector_verification.sh`

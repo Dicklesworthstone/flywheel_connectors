@@ -313,7 +313,7 @@ mod tests {
             "total_records": 2,
             "meetings": [
                 {
-                    "id": 123456789,
+                    "id": 123_456_789,
                     "topic": "Stand-up",
                     "type": 2,
                     "start_time": "2026-03-21T10:00:00Z",
@@ -321,7 +321,7 @@ mod tests {
                     "status": "waiting"
                 },
                 {
-                    "id": 987654321,
+                    "id": 987_654_321,
                     "topic": "Sprint Planning",
                     "type": 2,
                     "duration": 60
@@ -436,14 +436,14 @@ mod tests {
             "total_records": 1,
             "meetings": [{
                 "uuid": "rec-uuid-1",
-                "id": 111222333,
+                "id": 111_222_333,
                 "topic": "Recorded Meeting",
                 "start_time": "2026-03-15T09:00:00Z",
                 "duration": 45,
                 "recording_files": [{
                     "id": "file-1",
                     "file_type": "MP4",
-                    "file_size": 1048576,
+                    "file_size": 1_048_576,
                     "status": "completed"
                 }]
             }]
@@ -460,7 +460,7 @@ mod tests {
             "page_size": 30,
             "total_records": 1,
             "webinars": [{
-                "id": 999888777,
+                "id": 999_888_777,
                 "topic": "Product Launch",
                 "start_time": "2026-04-01T18:00:00Z",
                 "duration": 120,

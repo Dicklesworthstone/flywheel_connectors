@@ -8,6 +8,7 @@ name = "Confluence"
 version = "0.1.0"
 description = "Tenant-scoped Atlassian Confluence Cloud connector for spaces, pages, CQL search, and health operations"
 archetype = "operational"
+status = "proven"
 homepage = "https://developer.atlassian.com/cloud/confluence/rest/v2/"
 
 [zones]

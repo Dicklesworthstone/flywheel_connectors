@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "Tencent QQ bot connector for channel, group, and C2C sends plus gateway discovery, stateful gateway event projection, and health verification"
 archetypes = ["operational"]
 format = "native"
+status = "proven"
 
 [zones]
 home = "z:community"

@@ -62,12 +62,13 @@ impl MastodonError {
 
     /// Convert to FCP error taxonomy.
     #[must_use]
+    #[allow(clippy::redundant_closure_for_method_calls)]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {
                 service: "mastodon".into(),
                 message: e.to_string(),
-                status_code: e.status().map(reqwest::StatusCode::as_u16),
+                status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
             },

@@ -1398,7 +1398,9 @@ mod tests {
             assert_eq!(operation.idempotency, manifest_operation.idempotency);
             assert_eq!(
                 operation.requires_approval,
-                approval_mode_from_manifest(manifest_operation.requires_approval)
+                Some(approval_mode_from_manifest(
+                    manifest_operation.requires_approval
+                ))
             );
             assert_eq!(
                 serde_json::to_value(&operation.ai_hints).map_err(|error| error.to_string())?,

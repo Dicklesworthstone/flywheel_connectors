@@ -1,7 +1,8 @@
 # WeCom Connector V3 Contract
 
-> **Status**: accepted first-slice contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.1.12.1`
+> **Verification script**: `scripts/e2e/wecom_connector_verification.sh`
 > **Unblocks**:
 > - `flywheel_connectors-j05nu.1.12.2`
 > - `flywheel_connectors-j05nu.1.12.6`
@@ -223,3 +224,18 @@ This contract is grounded in the current connector implementation:
 - `connectors/wecom/src/main.rs` confirms the connector is currently a request-response JSON-RPC loop with no streaming implementation.
 - `connectors/wecom/manifest.toml` defines the current capability families, zone posture, sandbox profile, and production host assumptions.
 - The WeCom developer portal documents the broader enterprise messaging platform, including the richer outbound and inbound surfaces that remain explicit non-goals for this first slice.
+
+## Operation Inventory
+
+See the operation table above (`send_text`, `send_markdown`, `send_image`, `send_file`, `upload_media`, `download_media`, `get_user`, `list_departments`, `callback_verify_url`, `callback_ingest_event`, `health`).
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic loopback harness for local verification; never log raw `agent_secret`, access tokens, or AES callback keys.
+
+Rerun commands:
+- `bash scripts/e2e/wecom_connector_verification.sh`
+- `rch exec -- cargo test -p fcp-wecom --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-wecom --test host_forwarded_callback_e2e -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-wecom --all-targets -- -D warnings`

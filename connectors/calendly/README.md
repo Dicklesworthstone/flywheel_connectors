@@ -1,6 +1,6 @@
 # Calendly Connector V3 Contract
 
-> **Status**: implementation-reviewed and verification-backed
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.5.4.3`
 > **Parent**: `flywheel_connectors-j05nu.5.4`
 > **Verification script**: `scripts/e2e/calendly_connector_verification.sh`

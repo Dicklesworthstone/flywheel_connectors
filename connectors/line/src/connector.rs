@@ -1250,8 +1250,8 @@ impl FcpConnector for LineConnector {
                 code: 1001,
                 message: format!("Invalid LINE config: {e}"),
             })?;
-        config.base_url = config.base_url.trim().trim_end_matches('/').to_owned();
-        config.channel_access_token = config.channel_access_token.trim().to_owned();
+        config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
+        config.channel_access_token = config.channel_access_token.trim().to_string();
         validate_config(&config)?;
 
         self.retry_config = config.retry.clone();

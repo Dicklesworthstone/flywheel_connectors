@@ -603,17 +603,17 @@ fn extract_tags(content: &str) -> Vec<String> {
 }
 
 fn format_system_time(time: Option<std::time::SystemTime>) -> String {
-    match time {
-        Some(t) => {
+    time.map_or_else(
+        || "unknown".into(),
+        |t| {
             let duration = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let dt = chrono::DateTime::from_timestamp(
                 i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
                 duration.subsec_nanos(),
             );
             dt.map_or_else(|| "unknown".to_string(), |d| d.to_rfc3339())
-        }
-        None => "unknown".into(),
-    }
+        },
+    )
 }
 
 #[cfg(test)]

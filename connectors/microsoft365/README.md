@@ -1,6 +1,6 @@
 # Microsoft 365 Outlook/Exchange V3 Contract
 
-> **Status**: planning contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.7.1`
 > **Unblocks**: `flywheel_connectors-j05nu.7.2`
 > **Verification script**: `scripts/e2e/microsoft365_connector_verification.sh`

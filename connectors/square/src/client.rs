@@ -59,7 +59,7 @@ impl std::fmt::Debug for SquareClient {
             .field("base_url", &self.base_url)
             .field("access_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

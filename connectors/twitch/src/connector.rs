@@ -937,6 +937,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn manifest_operation_schemas_compile_and_validate_core_payloads() -> Result<(), String> {
         let manifest = twitch_manifest()?;
         let operations = manifest_operations(&manifest)?;

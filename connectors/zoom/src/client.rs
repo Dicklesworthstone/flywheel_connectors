@@ -1,5 +1,7 @@
 //! Zoom API client with Server-to-Server OAuth.
 
+#![allow(clippy::missing_errors_doc)]
+
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{
     AttemptOutcome, HttpRetryConfig, RetryLoop, classify_http_status,
@@ -12,7 +14,10 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::error::{ZoomError, ZoomResult};
-use crate::types::*;
+use crate::types::{
+    ApiErrorResponse, CreateMeetingRequest, Meeting, MeetingList, RecordingList, TokenResponse,
+    UpdateMeetingRequest, User, UserList, WebinarList,
+};
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> ZoomResult<&'a str> {
@@ -60,7 +65,7 @@ impl std::fmt::Debug for ZoomClient {
             .field("client_id", &"[REDACTED]")
             .field("client_secret", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -95,16 +100,19 @@ impl ZoomClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Get the OAuth base URL (for diagnostics).
+    #[must_use]
     pub fn oauth_base_url(&self) -> &str {
         &self.oauth_base_url
     }
 
     /// Check if using secretless mode (credential injection).
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.client_id.is_empty() || self.client_secret.is_empty()
     }
@@ -146,6 +154,7 @@ impl ZoomClient {
     }
 
     /// Execute a GET request with retry and token acquisition.
+    #[allow(clippy::too_many_lines)]
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
@@ -240,9 +249,10 @@ impl ZoomClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: ZoomError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -463,6 +473,7 @@ impl ZoomClient {
     /// idempotency key, so a replay that reached Zoom schedules a second
     /// meeting. Note the token-mint failures above stay retryable on purpose:
     /// if minting the OAuth token failed, the create request was never sent.
+    #[allow(clippy::too_many_lines)]
     async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
@@ -562,9 +573,10 @@ impl ZoomClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: ZoomError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -600,6 +612,7 @@ impl ZoomClient {
     }
 
     /// Execute a PATCH request that returns 204 No Content.
+    #[allow(clippy::too_many_lines)]
     async fn patch_no_content(
         &self,
         runtime: &ConnectorRuntime,
@@ -692,9 +705,10 @@ impl ZoomClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: ZoomError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -706,13 +720,13 @@ impl ZoomClient {
                     code: u32::from(status),
                     message: text,
                 };
-                if !matches!(decision, RetryDecision::Terminal) {
+                if matches!(decision, RetryDecision::Terminal) {
+                    AttemptOutcome::Terminal(err)
+                } else {
                     AttemptOutcome::Retryable {
                         error: err,
                         retry_after: None,
                     }
-                } else {
-                    AttemptOutcome::Terminal(err)
                 }
             }
         })
@@ -799,9 +813,10 @@ impl ZoomClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: ZoomError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(30))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -813,13 +828,13 @@ impl ZoomClient {
                     code: u32::from(status),
                     message: text,
                 };
-                if !matches!(decision, RetryDecision::Terminal) {
+                if matches!(decision, RetryDecision::Terminal) {
+                    AttemptOutcome::Terminal(err)
+                } else {
                     AttemptOutcome::Retryable {
                         error: err,
                         retry_after: None,
                     }
-                } else {
-                    AttemptOutcome::Terminal(err)
                 }
             }
         })

@@ -1,9 +1,9 @@
 # Google Meet Connector V3 Contract
 
-> **Status**: runtime contract documented; live-session boundary documented
+> **Status**: PROVEN runtime contract documented; live-session boundary documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
-> **Verification script**: none tracked; use the commands below
+> **Verification script**: `scripts/e2e/google_meet_connector_verification.sh`
 > **Meet API upstream**: https://developers.google.com/workspace/meet/api/reference/rest/v2
 > **Meet spaces upstream**: https://developers.google.com/workspace/meet/api/reference/rest/v2/spaces
 > **Meet conference records upstream**: https://developers.google.com/workspace/meet/api/reference/rest/v2/conferenceRecords
@@ -241,7 +241,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Verification Bundle
 
-There is no dedicated tracked `scripts/e2e/google_meet_connector_verification.sh` bundle in this checkout. The closeout surface is the crate-local test suite plus direct `rch` proof commands.
+The tracked verification bundle is `scripts/e2e/google_meet_connector_verification.sh`. It runs the graduation gauntlet, manifest check, crate-local compilation, formatting, integration/conformance suites, `local_non_mock` loopback acceptance suite, JSONL redaction/evidence checks, and clippy through `rch`.
 
 The verification surface captures:
 

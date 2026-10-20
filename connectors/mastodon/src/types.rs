@@ -54,7 +54,7 @@ pub struct Status {
     #[serde(default)]
     pub media_attachments: Vec<MediaAttachment>,
     #[serde(default)]
-    pub reblog: Option<Box<Status>>,
+    pub reblog: Option<Box<Self>>,
     #[serde(default)]
     pub favourited: Option<bool>,
     #[serde(default)]

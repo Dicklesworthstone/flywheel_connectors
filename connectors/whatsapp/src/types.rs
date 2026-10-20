@@ -286,13 +286,13 @@ mod tests {
                 "message": "Invalid parameter",
                 "type": "OAuthException",
                 "code": 100,
-                "error_subcode": 2018001,
+                "error_subcode": 2_018_001,
                 "fbtrace_id": "abc123"
             }
         });
         let err: ApiErrorResponse = serde_json::from_value(json).unwrap();
         assert_eq!(err.error.code, 100);
-        assert_eq!(err.error.error_subcode, Some(2018001));
+        assert_eq!(err.error.error_subcode, Some(2_018_001));
     }
 
     #[test]

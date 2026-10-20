@@ -83,7 +83,7 @@ async fn handle_message(connector: &mut LineConnector, message: &str) -> serde_j
     let params = request
         .get("params")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let result: FcpResult<serde_json::Value> = async {
         match method {

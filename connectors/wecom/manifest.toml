@@ -8,6 +8,7 @@ name = "WeCom Enterprise Messaging"
 version = "0.1.0"
 description = "Tenant-scoped WeCom connector for enterprise app messaging, host-forwarded callback ingest, media transfer, directory lookups, and health verification"
 archetype = "operational"
+status = "proven"
 homepage = "https://developer.work.weixin.qq.com/"
 
 # Auth and scope model:

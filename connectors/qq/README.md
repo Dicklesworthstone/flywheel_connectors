@@ -1,7 +1,8 @@
 # QQ Connector V3 Contract
 
-> **Status**: accepted first-slice contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.1.14.1`
+> **Verification script**: `scripts/e2e/qq_gateway_projection_verification.sh`
 > **Unblocks**:
 > - `flywheel_connectors-j05nu.1.14.2`
 > - `flywheel_connectors-j05nu.1.14.6`
@@ -249,3 +250,18 @@ This contract is grounded in the current connector implementation and the offici
 - QQ bot start guide and access-ticket docs describe the AppID / AppSecret model and the deprecation of the older token path.
 - QQ's send-message docs define the C2C, group, channel, and channel-DM endpoint families plus the platform's active / passive send rules and rate-limit constraints.
 - QQ's OpenAPI error docs describe the layered HTTP + business-code failure model that follow-on error mapping should preserve.
+
+## Operation Inventory
+
+See the operation table above (`qq.messages.send_channel`, `qq.messages.send_group`, `qq.messages.send_c2c`, `qq.gateway.get`, `qq.events.normalize`, `qq.gateway.project_event`, `qq.gateway.drain_events`, `qq.health`).
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic loopback harness for local verification; never log raw QQ `app_secret`, access tokens, or unredacted user messages.
+
+Rerun commands:
+- `bash scripts/e2e/qq_gateway_projection_verification.sh`
+- `rch exec -- cargo test -p fcp-qq --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-qq --test gateway_projection_e2e -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-qq --all-targets -- -D warnings`

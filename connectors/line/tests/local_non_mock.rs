@@ -150,7 +150,6 @@ fn write_http_response(stream: &mut TcpStream, response: &LoopbackResponse) {
 
 const fn status_reason(status: u16) -> &'static str {
     match status {
-        200 => "OK",
         401 => "Unauthorized",
         429 => "Too Many Requests",
         _ => "OK",

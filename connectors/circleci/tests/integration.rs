@@ -1,7 +1,7 @@
-//! Connector-local no-mock CircleCI integration proof.
+//! Connector-local no-mock `CircleCI` integration proof.
 //!
-//! These tests exercise the real CircleCI client against a local HTTP server.
-//! No live CircleCI service is called.
+//! These tests exercise the real `CircleCI` client against a local HTTP server.
+//! No live `CircleCI` service is called.
 
 #![allow(
     clippy::missing_errors_doc,

@@ -199,6 +199,7 @@ fn assert_instance_egress_constraints(constraints: &toml::Table) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn assert_schema_accepts(schema: &Value, payload: Value) {
     let validator = jsonschema::validator_for(schema).expect("schema should compile");
     let errors = validator
@@ -211,14 +212,11 @@ fn assert_schema_accepts(schema: &Value, payload: Value) {
     );
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn assert_schema_rejects(schema: &Value, payload: Value) {
     let validator = jsonschema::validator_for(schema).expect("schema should compile");
-    let errors = validator
-        .iter_errors(&payload)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
     assert!(
-        !errors.is_empty(),
+        validator.iter_errors(&payload).next().is_some(),
         "schema should reject payload {payload:#}"
     );
 }

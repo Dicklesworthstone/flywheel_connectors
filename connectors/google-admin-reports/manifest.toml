@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "FCP connector for Google Workspace Admin SDK Reports API (audit logs, usage reports)"
 archetypes = ["operational"]
 format = "wasi"
+status = "proven"
 
 [connector.state]
 model = "stateless"

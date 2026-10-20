@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "Groq LPU inference connector using the OpenAI-compatible chat, streaming, model, and legacy completions API"
 archetypes = ["operational", "streaming"]
 format = "native"
+status = "proven"
 
 [connector.state]
 model = "stateless"

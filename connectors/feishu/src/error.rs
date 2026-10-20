@@ -50,12 +50,13 @@ pub enum FeishuError {
 
 impl FeishuError {
     /// Whether this error is retryable.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
             Self::HttpStatus { status, .. } => classify_http_status(*status, None).is_retryable(),
             // Feishu error codes: 99991400 = request throttled
-            Self::Api { code, .. } => *code == 99991400,
+            Self::Api { code, .. } => *code == 99_991_400,
             Self::Json(_) | Self::Unauthorized(_) | Self::InvalidInput(_) | Self::Config(_) => {
                 false
             }
@@ -63,6 +64,7 @@ impl FeishuError {
     }
 
     /// Suggested retry-after delay.
+    #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
@@ -71,6 +73,7 @@ impl FeishuError {
     }
 
     /// Convert to FCP error taxonomy.
+    #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {
@@ -179,7 +182,7 @@ mod tests {
     #[test]
     fn api_throttle_error_is_retryable() {
         let err = FeishuError::Api {
-            code: 99991400,
+            code: 99_991_400,
             message: "request throttled".into(),
         };
         assert!(err.is_retryable());
@@ -188,7 +191,7 @@ mod tests {
     #[test]
     fn api_other_error_not_retryable() {
         let err = FeishuError::Api {
-            code: 99991663,
+            code: 99_991_663,
             message: "token expired".into(),
         };
         assert!(!err.is_retryable());
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn api_error_maps_to_fcp() {
         let err = FeishuError::Api {
-            code: 99991663,
+            code: 99_991_663,
             message: "token expired".into(),
         };
         let fcp_err = ConnectorErrorMapping::to_fcp_error(&err);
@@ -266,7 +269,7 @@ mod tests {
     #[test]
     fn error_display_format() {
         let err = FeishuError::Api {
-            code: 99991663,
+            code: 99_991_663,
             message: "token expired".into(),
         };
         let display = format!("{err}");

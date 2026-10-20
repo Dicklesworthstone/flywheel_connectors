@@ -248,7 +248,7 @@ async fn invoke_meetings_list_preserves_pagination_evidence() {
         .and(header("authorization", "Bearer t-list"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "meetings": [{
-                "id": 123456789,
+                "id": 123_456_789,
                 "topic": "Sprint sync"
             }],
             "total_records": 3,

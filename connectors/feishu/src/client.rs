@@ -98,10 +98,11 @@ impl std::fmt::Debug for FeishuClient {
                     .and_then(|guard| guard.as_ref().map(|_| "[REDACTED]")),
             )
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+#[allow(clippy::missing_errors_doc)]
 impl FeishuClient {
     /// Create a new Feishu client.
     pub fn new(
@@ -402,12 +403,16 @@ impl FeishuClient {
                 PostReplaySafety::NothingToDuplicate,
             )
             .await?;
-        let document = meta.metas.first().cloned().unwrap_or(DriveDocumentMeta {
-            doc_token: Some(file_token.to_owned()),
-            doc_type: Some(file_type.to_owned()),
-            title: None,
-            url: None,
-        });
+        let document = meta
+            .metas
+            .first()
+            .cloned()
+            .unwrap_or_else(|| DriveDocumentMeta {
+                doc_token: Some(file_token.to_owned()),
+                doc_type: Some(file_type.to_owned()),
+                title: None,
+                url: None,
+            });
 
         let mut comment_url = self.build_url(&[
             "open-apis",
@@ -614,11 +619,13 @@ impl FeishuClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if credentials are configured.
+    #[must_use]
     pub fn has_credentials(&self) -> bool {
         !self.app_id.trim().is_empty() && !self.app_secret.trim().is_empty()
     }
@@ -735,9 +742,10 @@ impl FeishuClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: FeishuError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -787,13 +795,15 @@ impl FeishuClient {
                     return AttemptOutcome::Terminal(err);
                 }
 
-                match api_resp.data {
-                    Some(data) => AttemptOutcome::Success(data),
-                    None => AttemptOutcome::Terminal(FeishuError::Api {
-                        code: -1,
-                        message: "No data in response".into(),
-                    }),
-                }
+                api_resp.data.map_or_else(
+                    || {
+                        AttemptOutcome::Terminal(FeishuError::Api {
+                            code: -1,
+                            message: "No data in response".into(),
+                        })
+                    },
+                    AttemptOutcome::Success,
+                )
             }
         })
         .await
@@ -841,9 +851,10 @@ impl FeishuClient {
                         .map(Duration::from_secs);
                     return AttemptOutcome::Retryable {
                         error: FeishuError::RateLimited {
-                            retry_after_ms: retry_after
-                                .unwrap_or(Duration::from_secs(60))
-                                .as_millis() as u64,
+                            retry_after_ms: u64::try_from(
+                                retry_after.unwrap_or(Duration::from_secs(60)).as_millis(),
+                            )
+                            .unwrap_or(u64::MAX),
                         },
                         retry_after,
                     };
@@ -894,13 +905,15 @@ impl FeishuClient {
                     return AttemptOutcome::Terminal(err);
                 }
 
-                match api_resp.data {
-                    Some(data) => AttemptOutcome::Success(data),
-                    None => AttemptOutcome::Terminal(FeishuError::Api {
-                        code: -1,
-                        message: "No data in response".into(),
-                    }),
-                }
+                api_resp.data.map_or_else(
+                    || {
+                        AttemptOutcome::Terminal(FeishuError::Api {
+                            code: -1,
+                            message: "No data in response".into(),
+                        })
+                    },
+                    AttemptOutcome::Success,
+                )
             }
         })
         .await

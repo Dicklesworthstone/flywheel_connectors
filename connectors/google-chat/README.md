@@ -1,9 +1,9 @@
 # Google Chat Connector V3 Contract
 
-> **Status**: runtime contract documented; capability-enforcement drift documented
+> **Status**: PROVEN runtime contract documented; capability-enforcement drift documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
-> **Verification script**: none tracked; use the commands below
+> **Verification script**: `scripts/e2e/google_chat_connector_verification.sh`
 > **Chat API upstream**: https://developers.google.com/workspace/chat/api/reference/rest
 > **Messages upstream**: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages
 > **Media upload upstream**: https://developers.google.com/workspace/chat/upload-media-attachments
@@ -228,7 +228,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Verification Bundle
 
-There is no dedicated tracked `scripts/e2e/google_chat_connector_verification.sh` bundle in this checkout. The closeout surface is the crate-local test suite plus direct `rch` proof commands.
+The tracked verification bundle is `scripts/e2e/google_chat_connector_verification.sh`. It runs the graduation gauntlet, manifest check, crate-local compilation, formatting, integration/conformance suites, `local_non_mock` loopback acceptance suite, JSONL redaction/evidence checks, and clippy through `rch`.
 
 The verification surface captures:
 

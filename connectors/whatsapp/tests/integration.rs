@@ -1,7 +1,7 @@
-//! WhatsApp connector integration tests (flywheel_connectors-j05nu.1.5).
+//! `WhatsApp` connector integration tests (`flywheel_connectors-j05nu.1.5`).
 //!
 //! Deterministic integration tests using wiremock to exercise the real
-//! `FcpConnector` surface against mock WhatsApp Business API responses.
+//! `FcpConnector` surface against mock `WhatsApp` Business API responses.
 //! No real API calls. Covers lifecycle and self-check behavior, outbound sends
 //! and profile fetches, webhook verification and replay filtering, and FCP2
 //! capability verification.
@@ -150,12 +150,8 @@ fn assert_schema_accepts(schema: &Value, payload: &Value) {
 
 fn assert_schema_rejects(schema: &Value, payload: &Value) {
     let validator = jsonschema::validator_for(schema).expect("schema should compile");
-    let errors = validator
-        .iter_errors(payload)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
     assert!(
-        !errors.is_empty(),
+        validator.iter_errors(payload).next().is_some(),
         "schema should reject payload {payload:#}"
     );
 }

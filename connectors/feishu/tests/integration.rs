@@ -74,7 +74,6 @@ fn generate_valid_token(
     let capability = match op {
         OP_CHATS_LIST => "feishu.chats.read",
         OP_MESSAGES_SEND | OP_MESSAGES_REPLY => "feishu.messages.write",
-        OP_WEBHOOK_INGEST_REQUEST => "feishu.webhook.ingest",
         OP_COMMENTS_CONTEXT_GET => "feishu.comments.read",
         OP_COMMENTS_PAIRINGS_MANAGE | OP_COMMENTS_REPLY | OP_COMMENTS_REACTION => {
             "feishu.comments.write"
@@ -118,6 +117,7 @@ fn feishu_webhook_signature(
     hex::encode(hasher.finalize())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn signed_webhook_input(raw_body: String, policy: serde_json::Value) -> serde_json::Value {
     let timestamp = "1715000000";
     let nonce = "integration-nonce";
@@ -153,6 +153,7 @@ fn configured_ingress_webhook_input(raw_body: String, policy: Value) -> Value {
     input
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn feishu_event_body(event_id: &str, event_type: &str, event: Value) -> String {
     serde_json::to_string(&json!({
         "schema": "2.0",
@@ -597,7 +598,7 @@ async fn invoke_chats_list_preserves_pagination_evidence() {
         .and(path("/open-apis/im/v1/chats"))
         .and(query_param("page_token", "page-1"))
         .and(query_param("page_size", "50"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -643,7 +644,7 @@ async fn invoke_messages_send_emits_mutation_evidence() {
     Mock::given(method("POST"))
         .and(path("/open-apis/im/v1/messages"))
         .and(query_param("receive_id_type", "open_id"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -699,7 +700,7 @@ async fn invoke_messages_send_claims_recipient_and_denies_duplicate_before_http(
     Mock::given(method("POST"))
         .and(path("/open-apis/im/v1/messages"))
         .and(query_param("receive_id_type", "open_id"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -780,7 +781,7 @@ async fn invoke_messages_reply_claims_message_and_includes_coordination() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/open-apis/im/v1/messages/om_parent/reply"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1020,7 +1021,7 @@ async fn feishu_webhook_comment_loopback_evidence_bundle() {
             "/open-apis/drive/v1/files/doc_fixture_token/comments/comment_fixture_card/replies",
         ))
         .and(query_param("file_type", "docx"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1033,7 +1034,7 @@ async fn feishu_webhook_comment_loopback_evidence_bundle() {
             "/open-apis/drive/v2/files/doc_fixture_token/comments/reaction",
         ))
         .and(query_param("file_type", "docx"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1454,7 +1455,7 @@ async fn invoke_comment_automation_operations_emit_evidence() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/open-apis/drive/v1/metas/batch_query"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1475,7 +1476,7 @@ async fn invoke_comment_automation_operations_emit_evidence() {
         ))
         .and(query_param("file_type", "docx"))
         .and(query_param("user_id_type", "open_id"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1509,7 +1510,7 @@ async fn invoke_comment_automation_operations_emit_evidence() {
         .and(query_param("file_type", "docx"))
         .and(query_param("page_size", "100"))
         .and(query_param("user_id_type", "open_id"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1534,16 +1535,16 @@ async fn invoke_comment_automation_operations_emit_evidence() {
             "/open-apis/drive/v1/files/doc_context/comments/comment_context/replies",
         ))
         .and(query_param("file_type", "docx"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "code": 1069302,
+            "code": 1_069_302,
             "msg": "reply is not allowed for whole-comment fallback"
         })))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/open-apis/drive/v1/files/doc_context/new_comments"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",
@@ -1558,7 +1559,7 @@ async fn invoke_comment_automation_operations_emit_evidence() {
             "/open-apis/drive/v2/files/doc_context/comments/reaction",
         ))
         .and(query_param("file_type", "docx"))
-        .and(header("authorization", &format!("Bearer {TENANT_TOKEN}")))
+        .and(header("authorization", format!("Bearer {TENANT_TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "code": 0,
             "msg": "success",

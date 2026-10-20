@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "Synology Chat webhook connector for self-hosted chat delivery, forwarded outgoing-webhook normalization, and health checks"
 archetypes = ["operational"]
 format = "native"
+status = "proven"
 
 [zones]
 home = "z:work"

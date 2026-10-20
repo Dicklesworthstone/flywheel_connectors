@@ -154,16 +154,14 @@ impl std::fmt::Debug for FeishuWebhookIngressConfig {
                 &self
                     .verification_token
                     .as_ref()
-                    .map(|_| "[REDACTED]")
-                    .unwrap_or("[UNSET]"),
+                    .map_or("[UNSET]", |_| "[REDACTED]"),
             )
             .field(
                 "encrypt_key",
                 &self
                     .encrypt_key
                     .as_ref()
-                    .map(|_| "[REDACTED]")
-                    .unwrap_or("[UNSET]"),
+                    .map_or("[UNSET]", |_| "[REDACTED]"),
             )
             .field("max_body_bytes", &self.max_body_bytes)
             .field("require_json_content_type", &self.require_json_content_type)
@@ -262,6 +260,7 @@ impl FeishuWebhookIngressConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct FeishuWebhookIngressSummary {
     enabled: bool,
     transport: String,
@@ -275,6 +274,7 @@ struct FeishuWebhookIngressSummary {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct FeishuWebhookStateConfig {
     #[serde(default)]
     dedupe_state_path: Option<String>,
@@ -519,7 +519,7 @@ fn parse_base_url(base_url: &str) -> FcpResult<reqwest::Url> {
 }
 
 fn validate_base_url(base_url: &reqwest::Url) -> FcpResult<()> {
-    let host = base_url.host_str().ok_or(FcpError::InvalidRequest {
+    let host = base_url.host_str().ok_or_else(|| FcpError::InvalidRequest {
         code: 1001,
         message: "base_url must include a host".into(),
     })?;
@@ -622,8 +622,7 @@ fn base_url_diagnostic(base_url: &str) -> (bool, String) {
 fn current_time_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,8 +763,8 @@ impl FeishuWebhookStateStore {
                     policy_reason_code: None,
                 });
             entry.finalized_at_ms = Some(now_ms);
-            entry.event_type = event_type.to_owned();
-            entry.event_id = event_id.to_owned();
+            event_type.clone_into(&mut entry.event_type);
+            event_id.clone_into(&mut entry.event_id);
             entry.outcome = Some(outcome.to_owned());
             entry.policy_reason_code = policy_decision
                 .get("reason_code")
@@ -909,6 +908,7 @@ impl FeishuWebhookStateStore {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn record_comment_session_locked(
         &self,
         state: &mut FeishuWebhookStateFile,
@@ -1113,7 +1113,7 @@ fn validate_chats_page_size(page_size: u64) -> FcpResult<u32> {
             message: format!("page_size must be between 1 and {MAX_CHATS_PAGE_SIZE}"),
         });
     }
-    Ok(page_size as u32)
+    Ok(u32::try_from(page_size).unwrap_or(u32::MAX))
 }
 
 fn validate_comment_file_type(file_type: &str) -> FcpResult<&str> {
@@ -1249,7 +1249,7 @@ fn validate_operation_input(operation: &str, input: &serde_json::Value) -> FcpRe
             required_string_input(input, "message_id")?;
         }
         OP_CHATS_LIST => {
-            if let Some(page_size) = input.get("page_size").and_then(|value| value.as_u64()) {
+            if let Some(page_size) = input.get("page_size").and_then(serde_json::Value::as_u64) {
                 validate_chats_page_size(page_size)?;
             }
         }
@@ -1560,6 +1560,7 @@ fn verify_webhook_signature(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn webhook_response(
     status_code: u16,
     reason_code: &str,
@@ -1682,12 +1683,14 @@ fn webhook_event_id(payload: &Value, raw_body: &str) -> String {
         .or_else(|| string_at_path(payload, &["event", "message", "message_id"]))
         .or_else(|| string_at_path(payload, &["event", "message_id"]))
         .or_else(|| string_at_path(payload, &["event", "comment_id"]))
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            let mut hasher = Sha256::new();
-            hasher.update(raw_body.as_bytes());
-            format!("sha256:{}", hex::encode(hasher.finalize()))
-        })
+        .map_or_else(
+            || {
+                let mut hasher = Sha256::new();
+                hasher.update(raw_body.as_bytes());
+                format!("sha256:{}", hex::encode(hasher.finalize()))
+            },
+            str::to_string,
+        )
 }
 
 fn webhook_event_type(payload: &Value) -> &str {
@@ -1915,6 +1918,7 @@ fn policy_with_connector_pairings(
     policy
 }
 
+#[allow(clippy::too_many_lines)]
 fn comment_policy_decision(policy: &Value, event: &Value) -> (bool, Value) {
     let comment_policy = policy
         .get("comment")
@@ -2203,6 +2207,7 @@ fn invoke_webhook_ingest_request_with_state(
     invoke_webhook_ingest_request_with_context(input, webhook_state, None)
 }
 
+#[allow(clippy::too_many_lines)]
 fn invoke_webhook_ingest_request_with_context(
     input: &Value,
     webhook_state: Option<&FeishuWebhookStateStore>,
@@ -2636,15 +2641,17 @@ fn contract_details(config: Option<&FeishuConfig>) -> serde_json::Value {
         "auth_boundary": {
             "binding": FEISHU_BINDING_MODEL,
             "token_type": FEISHU_AUTH_MODEL,
-            "credential_mode": config.map(auth_mode_label).unwrap_or("unconfigured"),
+            "credential_mode": config.map_or("unconfigured", auth_mode_label),
             "base_url": config.map(|cfg| cfg.base_url.clone()),
             "cross_tenant_supported": false,
             "user_impersonation_supported": false,
             "webhook_receiver_included": true,
             "webhook_transport": FEISHU_WEBHOOK_TRANSPORT_HOST_FORWARDED,
             "webhook_ingress": config
-                .map(|cfg| cfg.webhook_ingress.summary())
-                .unwrap_or_else(|| FeishuWebhookIngressConfig::default().summary()),
+                .map_or_else(
+                    || FeishuWebhookIngressConfig::default().summary(),
+                    |cfg| cfg.webhook_ingress.summary(),
+                ),
             "webhook_state": config.map(|cfg| cfg.webhook_state.summary()),
             "websocket_events_included": false,
             "listener_socket_opened": false,
@@ -2764,6 +2771,7 @@ impl FeishuConnector {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn diagnostic_details(&self, live_probe: Option<serde_json::Value>) -> serde_json::Value {
         json!({
             "configured": self.config.is_some(),
@@ -2793,8 +2801,10 @@ impl FeishuConnector {
             "webhook_ingress": self
                 .config
                 .as_ref()
-                .map(|config| config.webhook_ingress.summary())
-                .unwrap_or_else(|| FeishuWebhookIngressConfig::default().summary()),
+                .map_or_else(
+                    || FeishuWebhookIngressConfig::default().summary(),
+                    |config| config.webhook_ingress.summary(),
+                ),
             "webhook_state": self.webhook_state.summary().ok(),
             "operator_guidance": operator_guidance(),
             "contract": contract_details(self.config.as_ref()),
@@ -3004,6 +3014,8 @@ fn feishu_resource_types() -> Vec<ResourceTypeInfo> {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -3735,7 +3747,7 @@ impl FcpConnector for FeishuConnector {
                             "base_url": self.config.as_ref().map(|config| config.base_url.clone()),
                             "status": "retryable_error",
                             "retryable": true,
-                            "retry_after_ms": err.retry_after().map(|duration| duration.as_millis() as u64),
+                            "retry_after_ms": err.retry_after().map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
                             "error": err.to_string(),
                         })),
                     ))
@@ -3795,18 +3807,15 @@ impl FcpConnector for FeishuConnector {
             ));
         }
 
-        let verifier = match self.verifier.as_ref() {
-            Some(verifier) => verifier,
-            None => {
-                let error = FcpError::Internal {
-                    message: "Capability verifier missing after successful handshake".into(),
-                };
-                return Ok(SimulateResponse::denied(
-                    req.id,
-                    error.to_string(),
-                    error.error_code(),
-                ));
-            }
+        let Some(verifier) = self.verifier.as_ref() else {
+            let error = FcpError::Internal {
+                message: "Capability verifier missing after successful handshake".into(),
+            };
+            return Ok(SimulateResponse::denied(
+                req.id,
+                error.to_string(),
+                error.error_code(),
+            ));
         };
 
         match verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[]) {
@@ -3896,43 +3905,50 @@ impl FeishuConnector {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = required_capability_for_operation(operation)?;
         verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Feishu client missing after configure".into(),
         })?;
 
         let output = match operation {
             OP_MESSAGES_SEND => {
-                let receive_id = req.input.get("receive_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let receive_id = req
+                    .input
+                    .get("receive_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'receive_id' field".into(),
-                    },
-                )?;
-                let msg_type = req.input.get("msg_type").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let msg_type = req
+                    .input
+                    .get("msg_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'msg_type' field".into(),
-                    },
-                )?;
-                let content = req.input.get("content").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let content = req
+                    .input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
-                    },
-                )?;
+                    })?;
                 let receive_id_type = req
                     .input
                     .get("receive_id_type")
@@ -3978,24 +3994,30 @@ impl FeishuConnector {
                 output
             }
             OP_MESSAGES_REPLY => {
-                let message_id = req.input.get("message_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let message_id = req
+                    .input
+                    .get("message_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'message_id' field".into(),
-                    },
-                )?;
-                let msg_type = req.input.get("msg_type").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let msg_type = req
+                    .input
+                    .get("msg_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'msg_type' field".into(),
-                    },
-                )?;
-                let content = req.input.get("content").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                    })?;
+                let content = req
+                    .input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
-                    },
-                )?;
+                    })?;
 
                 let reply_req = ReplyMessageRequest {
                     msg_type: msg_type.into(),
@@ -4034,12 +4056,14 @@ impl FeishuConnector {
                 output
             }
             OP_MESSAGES_GET => {
-                let message_id = req.input.get("message_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let message_id = req
+                    .input
+                    .get("message_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'message_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_message(runtime, message_id)
                     .await
@@ -4053,7 +4077,7 @@ impl FeishuConnector {
                 let page_size = req
                     .input
                     .get("page_size")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .map(validate_chats_page_size)
                     .transpose()?;
                 let resp = client
@@ -4065,12 +4089,14 @@ impl FeishuConnector {
                 })?
             }
             OP_CHATS_GET => {
-                let chat_id = req.input.get("chat_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let chat_id = req
+                    .input
+                    .get("chat_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'chat_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_chat(runtime, chat_id)
                     .await
@@ -4080,12 +4106,14 @@ impl FeishuConnector {
                 })?
             }
             OP_USERS_GET => {
-                let user_id = req.input.get("user_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let user_id = req
+                    .input
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'user_id' field".into(),
-                    },
-                )?;
+                    })?;
                 let user_id_type = req
                     .input
                     .get("user_id_type")
@@ -4105,7 +4133,7 @@ impl FeishuConnector {
                     .input
                     .get("document_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'document_id' field".into(),
                     })?;
@@ -4122,7 +4150,7 @@ impl FeishuConnector {
                     .input
                     .get("spreadsheet_token")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'spreadsheet_token' field".into(),
                     })?;
@@ -4139,7 +4167,7 @@ impl FeishuConnector {
                     .input
                     .get("calendar_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'calendar_id' field".into(),
                     })?;
@@ -4202,18 +4230,16 @@ impl FeishuConnector {
                         .await
                     {
                         Ok(result) => ("thread_reply", false, result),
-                        Err(crate::error::FeishuError::Api { code: 1069302, .. })
-                            if fallback_to_whole_comment =>
-                        {
-                            (
-                                "whole_comment",
-                                true,
-                                client
-                                    .add_whole_comment(runtime, file_token, file_type, content)
-                                    .await
-                                    .map_err(|e| e.to_fcp_error())?,
-                            )
-                        }
+                        Err(crate::error::FeishuError::Api {
+                            code: 1_069_302, ..
+                        }) if fallback_to_whole_comment => (
+                            "whole_comment",
+                            true,
+                            client
+                                .add_whole_comment(runtime, file_token, file_type, content)
+                                .await
+                                .map_err(|e| e.to_fcp_error())?,
+                        ),
                         Err(error) => return Err(error.to_fcp_error()),
                     }
                 };
@@ -5031,6 +5057,7 @@ mod tests {
         signed_webhook_input_with_key(raw_body, policy, "encrypt-key")
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn signed_webhook_input_with_key(raw_body: String, policy: Value, encrypt_key: &str) -> Value {
         let timestamp = "1715000000";
         let nonce = "nonce-123";

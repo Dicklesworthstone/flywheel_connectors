@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "FCP connector for Slack (channels, messages, users, files, reactions, policy-gated Socket Mode events)"
 archetypes = ["operational", "streaming", "bidirectional"]
 format = "wasi"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"

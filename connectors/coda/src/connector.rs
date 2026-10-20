@@ -455,7 +455,7 @@ impl CodaConnector {
     fn attach_self_check_details(
         &self,
         mut report: SelfCheckReport,
-        live_probe: Option<serde_json::Value>,
+        live_probe: Option<&serde_json::Value>,
     ) -> SelfCheckReport {
         report.details = Some(json!({
             "configured": self.config.is_some(),
@@ -474,6 +474,7 @@ impl CodaConnector {
     }
 
     /// Run connector diagnostics.
+    #[allow(clippy::too_many_lines)]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
         let provisioning = self.provisioning_readiness();
@@ -534,13 +535,13 @@ impl CodaConnector {
                 critical: false,
             });
             let (network_ok, network_message) = match reqwest::Url::parse(&config.base_url) {
-                Ok(parsed) => {
-                    let host = parsed.host_str().unwrap_or_default();
+                Ok(url) => {
+                    let host = url.host_str().unwrap_or_default();
                     let local_test_host = is_local_test_host(host);
-                    let scheme_ok = parsed.scheme() == "https"
-                        || (parsed.scheme() == "http" && local_test_host);
+                    let scheme_ok = url.scheme() == "https"
+                        || (url.scheme() == "http" && local_test_host);
                     let host_ok = host == CODA_HOST || local_test_host;
-                    let path_ok = host != CODA_HOST || parsed.path() == "/apis/v1";
+                    let path_ok = host != CODA_HOST || url.path() == "/apis/v1";
                     let passed = scheme_ok && host_ok && path_ok;
                     let message = if passed {
                         if local_test_host {
@@ -625,6 +626,8 @@ impl Default for CodaConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     let hint = |when: &str, mistakes: Vec<String>, related: Vec<&'static str>| -> AgentHint {
         AgentHint {
@@ -987,7 +990,7 @@ impl FcpConnector for CodaConnector {
         let Some(config) = &self.config else {
             return Ok(self.attach_self_check_details(
                 SelfCheckReport::degraded("not_configured", "Connector is not configured"),
-                Some(json!({
+                Some(&json!({
                     "ready": false,
                     "reason": "configure with workspace_id and api_token before self_check",
                 })),
@@ -996,7 +999,7 @@ impl FcpConnector for CodaConnector {
         let Some(client) = &self.client else {
             return Ok(self.attach_self_check_details(
                 SelfCheckReport::failed("client_missing", "Coda client is not initialized"),
-                Some(json!({
+                Some(&json!({
                     "ready": false,
                     "reason": "client_missing",
                 })),
@@ -1005,7 +1008,7 @@ impl FcpConnector for CodaConnector {
         let Some(runtime) = &self.runtime else {
             return Ok(self.attach_self_check_details(
                 SelfCheckReport::failed("runtime_missing", "Connector runtime is not initialized"),
-                Some(json!({
+                Some(&json!({
                     "ready": false,
                     "reason": "runtime_missing",
                 })),
@@ -1023,7 +1026,7 @@ impl FcpConnector for CodaConnector {
                             config.workspace_id, current_workspace_id
                         ),
                     ),
-                    Some(json!({
+                    Some(&json!({
                         "ready": false,
                         "base_url": config.base_url.clone(),
                         "configured_workspace_id": config.workspace_id.clone(),
@@ -1037,7 +1040,7 @@ impl FcpConnector for CodaConnector {
                 let current_workspace_id = user.workspace.id.clone();
                 Ok(self.attach_self_check_details(
                     SelfCheckReport::ok(),
-                    Some(json!({
+                    Some(&json!({
                         "ready": true,
                         "base_url": config.base_url.clone(),
                         "configured_workspace_id": config.workspace_id.clone(),
@@ -1071,7 +1074,7 @@ impl FcpConnector for CodaConnector {
                 };
                 Ok(self.attach_self_check_details(
                     report,
-                    Some(json!({
+                    Some(&json!({
                         "ready": false,
                         "base_url": config.base_url.clone(),
                         "retryable": retryable,
@@ -1241,15 +1244,16 @@ impl CodaConnector {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap =
-            Self::required_capability(operation).ok_or(FcpError::InvalidRequest {
+            Self::required_capability(operation).ok_or_else(|| FcpError::InvalidRequest {
                 code: 1004,
                 message: format!("Unknown operation: {operation}"),
             })?;
@@ -1259,13 +1263,13 @@ impl CodaConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let config = self.config.as_ref().ok_or(FcpError::Internal {
+        let config = self.config.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector config missing after configure".into(),
         })?;
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Coda client missing after configure".into(),
         })?;
 
@@ -1280,8 +1284,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let query = req.input.get("query").and_then(|v| v.as_str());
                 let mut resp = client
@@ -1319,8 +1323,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let resp = client
                     .list_pages(runtime, doc_id, limit, page_token)
@@ -1348,8 +1352,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let resp = client
                     .list_tables(runtime, doc_id, limit, page_token)
@@ -1378,8 +1382,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let resp = client
                     .list_columns(runtime, doc_id, table_id_or_name, limit, page_token)
@@ -1396,8 +1400,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let query = req.input.get("query").and_then(|v| v.as_str());
                 let resp = client
@@ -1425,7 +1429,7 @@ impl CodaConnector {
                 let doc_id = require_str(&req.input, "doc_id")?;
                 let table_id = require_str(&req.input, "table_id_or_name")?;
                 self.scoped_doc(runtime, client, config, doc_id).await?;
-                let rows = req.input.get("rows").ok_or(FcpError::InvalidRequest {
+                let rows = req.input.get("rows").ok_or_else(|| FcpError::InvalidRequest {
                     code: 1005,
                     message: "Missing 'rows' field".into(),
                 })?;
@@ -1459,7 +1463,7 @@ impl CodaConnector {
                     .input
                     .get("row_ids")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing or invalid 'row_ids' field".into(),
                     })?;
@@ -1485,8 +1489,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let resp = client
                     .list_formulas(runtime, doc_id, limit, page_token)
@@ -1514,8 +1518,8 @@ impl CodaConnector {
                 let limit = req
                     .input
                     .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let page_token = req.input.get("page_token").and_then(|v| v.as_str());
                 let resp = client
                     .list_controls(runtime, doc_id, limit, page_token)

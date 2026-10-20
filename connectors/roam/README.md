@@ -1,8 +1,9 @@
 # Roam Connector V3 Contract
 
-> **Status**: retrofit contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.12.6`
 > **Connector**: `fcp.roam`
+> **Verification script**: `scripts/e2e/roam_connector_verification.sh`
 
 ## Purpose
 
@@ -74,3 +75,18 @@ The readiness contract should surface these operator truths:
 - whether concrete secret material is available or the connector is still waiting for credential injection
 - whether a live `roam.pages.list` probe succeeds against the configured graph
 - that the connector is intentionally limited to page/block graph access rather than broader Roam account workflows
+
+## Operation Inventory
+
+See the runtime operations above (`roam.pages.list`, `roam.pages.get`, `roam.blocks.list`, `roam.blocks.create`).
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic local loopback harness or `WireMock` server for verification; never log raw Roam bearer tokens.
+
+Rerun commands:
+- `bash scripts/e2e/roam_connector_verification.sh`
+- `rch exec -- cargo test -p fcp-roam --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-roam --test integration -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-roam --all-targets -- -D warnings`

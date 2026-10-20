@@ -14,7 +14,7 @@ version = "0.1.0"
 description = "FCP connector for Roam Research (pages, blocks, graph)"
 archetypes = ["knowledge"]
 format = "wasi"
-status = "ready"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"

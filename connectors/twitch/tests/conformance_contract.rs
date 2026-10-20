@@ -128,6 +128,7 @@ fn operation_metadata_is_read_only_safe_and_approval_free() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn manifest_operation_schemas_compile_and_validate_declared_payloads() -> Result<(), String> {
     let manifest = manifest()?;
 

@@ -1,6 +1,6 @@
 # Synology Chat Connector V3 Contract
 
-> **Status**: accepted first-slice contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.1.16.1`
 > **Verification script**: `scripts/e2e/synology_chat_connector_verification.sh`
 > **Unblocks**:
@@ -187,3 +187,18 @@ This contract is grounded in the current connector implementation and the publis
 - `connectors/synology-chat/src/types.rs` defines the current config surface and validation rules.
 - `connectors/synology-chat/manifest.toml` defines the work-zone posture, capability families, and intentionally operator-configured network placement.
 - Synology's published Chat specs confirm that incoming and outgoing webhooks exist at the product level; the current connector implements incoming-webhook outbound delivery plus explicit host-forwarded outgoing-webhook normalization, but still not a hosted listener.
+
+## Operation Inventory
+
+See the operation table above (`send_message`, `send_file_url`, `send_payload`, `ingest_outgoing_webhook`, `webhook_normalize`, `health`).
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic loopback harness for local verification; never log raw Synology webhook tokens or unredacted chat payloads.
+
+Rerun commands:
+- `bash scripts/e2e/synology_chat_connector_verification.sh`
+- `rch exec -- cargo test -p fcp-synology-chat --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-synology-chat --test integration -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-synology-chat --all-targets -- -D warnings`

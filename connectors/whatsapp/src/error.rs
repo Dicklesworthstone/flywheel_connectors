@@ -216,7 +216,7 @@ mod tests {
             code: 100,
             message: "Invalid parameter".into(),
             error_type: "OAuthException".into(),
-            subcode: Some(2018001),
+            subcode: Some(2_018_001),
         };
         let fcp_err = ConnectorErrorMapping::to_fcp_error(&err);
         assert!(matches!(fcp_err, FcpError::External { .. }));

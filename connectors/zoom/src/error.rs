@@ -46,14 +46,14 @@ pub enum ZoomError {
 
 impl ZoomError {
     /// Whether this error is retryable.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
             Self::Api { code, .. } => {
                 // Treat as HTTP status codes for retryability
                 u16::try_from(*code)
-                    .ok()
-                    .is_some_and(|status| classify_http_status(status, None).is_retryable())
+                    .is_ok_and(|status| classify_http_status(status, None).is_retryable())
             }
             Self::Json(_) | Self::Unauthorized(_) | Self::InvalidInput(_) | Self::Config(_) => {
                 false
@@ -62,6 +62,7 @@ impl ZoomError {
     }
 
     /// Suggested retry-after delay.
+    #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
@@ -70,6 +71,7 @@ impl ZoomError {
     }
 
     /// Convert to FCP error taxonomy.
+    #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {

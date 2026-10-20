@@ -1,4 +1,4 @@
-//! Local loopback acceptance coverage for the FCP WhatsApp connector.
+//! Local loopback acceptance coverage for the FCP `WhatsApp` connector.
 
 #![allow(
     clippy::future_not_send,
@@ -62,7 +62,7 @@ impl LoopbackFixture {
     fn start(expected_requests: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         let address = listener.local_addr().expect("read listener address");
-        let handle = thread::spawn(move || handle_requests(listener, expected_requests));
+        let handle = thread::spawn(move || handle_requests(&listener, expected_requests));
 
         Self {
             base_url: format!("http://{address}"),
@@ -83,7 +83,7 @@ impl LoopbackFixture {
     }
 }
 
-fn handle_requests(listener: TcpListener, expected_requests: usize) -> Vec<RequestObservation> {
+fn handle_requests(listener: &TcpListener, expected_requests: usize) -> Vec<RequestObservation> {
     let mut observations = Vec::with_capacity(expected_requests);
     for _ in 0..expected_requests {
         let (mut stream, _) = listener.accept().expect("accept connector request");

@@ -1,5 +1,9 @@
 # Microsoft Foundry Connector
 
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
+> **Bead**: `flywheel_connectors-angoc.16.5`
+> **Verification script**: `scripts/e2e/microsoft_foundry_connector_verification.sh`
+
 `fcp.microsoft-foundry` is the direct Microsoft Foundry / Azure OpenAI v1 provider connector. It is separate from `microsoft365` Graph, generic `azure`, and `azure-speech`.
 
 ## Operations
@@ -54,3 +58,14 @@ ubs connectors/microsoft-foundry scripts/e2e/microsoft_foundry_connector_verific
 ```
 
 The bundle captures manifest schema/hash validation, formatting, check, conformance, WireMock integration, optional live smoke, local non-mock loopback acceptance, clippy, and redaction checks for secrets, prompts, completions, raw hostnames, and loopback endpoints.
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic loopback harness or `WireMock` fixture for local verification; never log raw API keys, Entra tokens, prompts, or completions.
+
+Rerun commands:
+- `scripts/e2e/microsoft_foundry_connector_verification.sh`
+- `rch exec -- cargo test -p fcp-microsoft-foundry --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-microsoft-foundry --test integration -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-microsoft-foundry --all-targets -- -D warnings`

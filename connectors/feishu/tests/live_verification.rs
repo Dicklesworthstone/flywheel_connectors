@@ -146,7 +146,6 @@ fn generate_valid_token(
     let capability = match op {
         OP_MESSAGES_SEND => "feishu.messages.write",
         OP_CHATS_GET => "feishu.chats.read",
-        OP_HEALTH => "feishu.users.read",
         _ => "feishu.users.read",
     };
     let now = Utc::now();

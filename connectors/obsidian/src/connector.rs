@@ -819,7 +819,7 @@ impl FcpConnector for ObsidianConnector {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
-        let result = self.invoke_inner(req).await;
+        let result = self.invoke_inner(req);
         self.base.record_request(result.is_ok());
         result
     }
@@ -835,11 +835,11 @@ impl FcpConnector for ObsidianConnector {
 
 impl ObsidianConnector {
     #[allow(clippy::too_many_lines)]
-    async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
+    fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -859,7 +859,7 @@ impl ObsidianConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Obsidian client missing after configure".into(),
         })?;
 
@@ -875,7 +875,7 @@ impl ObsidianConnector {
                     .input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
                     })?;
@@ -889,7 +889,7 @@ impl ObsidianConnector {
                     .input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
                     })?;
@@ -897,7 +897,7 @@ impl ObsidianConnector {
                     .input
                     .get("content")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
                     })?;
@@ -913,7 +913,7 @@ impl ObsidianConnector {
                     .input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
                     })?;
@@ -921,7 +921,7 @@ impl ObsidianConnector {
                     .input
                     .get("content")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'content' field".into(),
                     })?;
@@ -937,7 +937,7 @@ impl ObsidianConnector {
                     .input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
                     })?;
@@ -949,7 +949,7 @@ impl ObsidianConnector {
                     .input
                     .get("query")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'query' field".into(),
                     })?;
@@ -967,7 +967,7 @@ impl ObsidianConnector {
                     .input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'path' field".into(),
                     })?;

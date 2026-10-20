@@ -178,7 +178,7 @@ async fn mock_bot_info(server: &MockServer, status: u16) {
 
     Mock::given(method("GET"))
         .and(path("/v2/bot/info"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(response)
         .mount(server)
         .await;
@@ -203,7 +203,7 @@ async fn client_health_check_statuses_and_secretless_auth_contracts() {
     let success_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v2/bot/info"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&success_server)
         .await;
@@ -356,7 +356,7 @@ async fn invoke_reply_sends_template_message_json() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v2/bot/message/reply"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -404,7 +404,7 @@ async fn invoke_push_sends_flex_message_json() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v2/bot/message/push"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -457,7 +457,7 @@ async fn invoke_push_claims_recipient_and_denies_duplicate_before_http() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v2/bot/message/push"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -512,7 +512,7 @@ async fn invoke_multicast_sends_carousel_and_rejects_oversized_carousel() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v2/bot/message/multicast"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -584,7 +584,7 @@ async fn invoke_group_members_preserves_pagination_evidence() {
     Mock::given(method("GET"))
         .and(path("/v2/bot/group/C123/members/ids"))
         .and(query_param("start", "next-1"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "memberIds": ["U1", "U2"],
             "next": "next-2"
@@ -620,7 +620,7 @@ async fn invoke_rich_menu_delete_emits_destructive_evidence() {
     let server = MockServer::start().await;
     Mock::given(method("DELETE"))
         .and(path("/v2/bot/richmenu/richmenu-abc123"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;

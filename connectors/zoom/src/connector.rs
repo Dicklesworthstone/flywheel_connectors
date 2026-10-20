@@ -411,7 +411,7 @@ impl ZoomConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self.client.as_ref().is_some_and(ZoomClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -435,6 +435,8 @@ impl Default for ZoomConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn operations_info() -> Vec<OperationInfo> {
     vec![
         OperationInfo {
@@ -962,11 +964,12 @@ impl FcpConnector for ZoomConnector {
 }
 
 impl ZoomConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -987,10 +990,10 @@ impl ZoomConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Zoom client missing after configure".into(),
         })?;
 
@@ -1004,8 +1007,8 @@ impl ZoomConnector {
                 let page_size = req
                     .input
                     .get("page_size")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let next_page_token = req.input.get("next_page_token").and_then(|v| v.as_str());
 
                 let list = client
@@ -1017,8 +1020,8 @@ impl ZoomConnector {
                 })?
             }
             OP_MEETINGS_GET => {
-                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or_else(
+                    || FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'meeting_id' field".into(),
                     },
@@ -1037,7 +1040,7 @@ impl ZoomConnector {
                     .get("user_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("me");
-                let topic = req.input.get("topic").and_then(|v| v.as_str()).ok_or(
+                let topic = req.input.get("topic").and_then(|v| v.as_str()).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'topic' field".into(),
@@ -1049,8 +1052,8 @@ impl ZoomConnector {
                     meeting_type: req
                         .input
                         .get("type")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u8),
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u8::try_from(v).ok()),
                     start_time: req
                         .input
                         .get("start_time")
@@ -1059,8 +1062,8 @@ impl ZoomConnector {
                     duration: req
                         .input
                         .get("duration")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok()),
                     timezone: req
                         .input
                         .get("timezone")
@@ -1087,8 +1090,8 @@ impl ZoomConnector {
                 })?
             }
             OP_MEETINGS_UPDATE => {
-                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or_else(
+                    || FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'meeting_id' field".into(),
                     },
@@ -1103,8 +1106,8 @@ impl ZoomConnector {
                     meeting_type: req
                         .input
                         .get("type")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u8),
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u8::try_from(v).ok()),
                     start_time: req
                         .input
                         .get("start_time")
@@ -1113,8 +1116,8 @@ impl ZoomConnector {
                     duration: req
                         .input
                         .get("duration")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok()),
                     timezone: req
                         .input
                         .get("timezone")
@@ -1139,8 +1142,8 @@ impl ZoomConnector {
                 json!({ "status": "updated" })
             }
             OP_MEETINGS_DELETE => {
-                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or(
-                    FcpError::InvalidRequest {
+                let meeting_id = req.input.get("meeting_id").and_then(|v| v.as_str()).ok_or_else(
+                    || FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'meeting_id' field".into(),
                     },
@@ -1156,8 +1159,8 @@ impl ZoomConnector {
                 let page_size = req
                     .input
                     .get("page_size")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
                 let next_page_token = req.input.get("next_page_token").and_then(|v| v.as_str());
 
                 let list = client
@@ -1169,7 +1172,7 @@ impl ZoomConnector {
                 })?
             }
             OP_USERS_GET => {
-                let user_id = req.input.get("user_id").and_then(|v| v.as_str()).ok_or(
+                let user_id = req.input.get("user_id").and_then(|v| v.as_str()).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'user_id' field".into(),
@@ -1209,8 +1212,8 @@ impl ZoomConnector {
                 let page_size = req
                     .input
                     .get("page_size")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
 
                 let list = client
                     .list_webinars(runtime, user_id, page_size)

@@ -1,5 +1,7 @@
 //! Coda API client.
 
+#![allow(clippy::missing_errors_doc)]
+
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
@@ -29,7 +31,7 @@ impl std::fmt::Debug for CodaClient {
             .field("base_url", &self.base_url)
             .field("api_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -395,11 +397,13 @@ impl CodaClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.api_token.is_empty()
     }
@@ -551,8 +555,7 @@ async fn send_request(request: RequestBuilder, label: &str) -> CodaResult<String
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
-            .map(|s| s * 1000)
-            .unwrap_or(30_000);
+            .map_or(30_000, |s| s * 1000);
         return Err(CodaError::RateLimited { retry_after_ms });
     }
 

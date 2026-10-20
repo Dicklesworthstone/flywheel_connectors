@@ -60,6 +60,7 @@ fn encode<T: serde::Serialize>(value: &T) -> FcpResult<serde_json::Value> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_message(connector: &mut CircleCiConnector, message: &str) -> serde_json::Value {
     let request: serde_json::Value = match serde_json::from_str(message) {
         Ok(v) => v,
@@ -79,7 +80,7 @@ async fn handle_message(connector: &mut CircleCiConnector, message: &str) -> ser
     let params = request
         .get("params")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let result: FcpResult<serde_json::Value> = async {
         match method {

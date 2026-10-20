@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn api_response_error() {
         let json = serde_json::json!({
-            "code": 99991663,
+            "code": 99_991_663,
             "msg": "tenant access token is expired"
         });
         let resp: ApiResponse<serde_json::Value> = serde_json::from_value(json).unwrap();

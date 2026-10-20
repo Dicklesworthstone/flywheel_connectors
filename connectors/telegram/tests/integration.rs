@@ -11,6 +11,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::unreadable_literal)]
+#![allow(clippy::large_futures)]
 
 use chrono::{Duration, Utc};
 use fcp_crypto::cose::CapabilityTokenBuilder;

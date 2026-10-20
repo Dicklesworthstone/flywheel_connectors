@@ -1,6 +1,6 @@
 # Stripe Connector V3 Contract
 
-> **Status**: runtime contract documented; operation metadata is manifest-derived
+> **Status**: PROVEN runtime contract documented; operation metadata is manifest-derived
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/stripe_connector_verification.sh`

@@ -164,7 +164,7 @@ async fn mock_whoami(server: &MockServer, status: u16) {
 
     Mock::given(method("GET"))
         .and(path("/whoami"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(response)
         .mount(server)
         .await;
@@ -302,7 +302,7 @@ async fn invoke_docs_list_preserves_pagination_and_scope_evidence() {
         .and(query_param("workspaceId", "ws-123"))
         .and(query_param("limit", "2"))
         .and(query_param("pageToken", "next-1"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [
                 {
@@ -353,7 +353,7 @@ async fn invoke_rows_delete_tracks_async_mutation_evidence() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/docs/doc-1"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "doc-1",
             "type": "doc",
@@ -364,7 +364,7 @@ async fn invoke_rows_delete_tracks_async_mutation_evidence() {
         .await;
     Mock::given(method("DELETE"))
         .and(path("/docs/doc-1/tables/grid-tasks/rows"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .and(body_json(json!({ "rowIds": ["row-1"] })))
         .respond_with(ResponseTemplate::new(202).set_body_json(json!({
             "requestId": "req-del",
@@ -374,7 +374,7 @@ async fn invoke_rows_delete_tracks_async_mutation_evidence() {
         .await;
     Mock::given(method("GET"))
         .and(path("/mutationStatus/req-del"))
-        .and(header("authorization", &format!("Bearer {TOKEN}")))
+        .and(header("authorization", format!("Bearer {TOKEN}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "requestId": "req-del",
             "completed": true,

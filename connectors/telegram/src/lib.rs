@@ -13,6 +13,7 @@
     clippy::field_reassign_with_default,
     clippy::future_not_send,
     clippy::large_enum_variant,
+    clippy::large_futures,
     clippy::manual_let_else,
     clippy::map_unwrap_or,
     clippy::missing_const_for_fn,

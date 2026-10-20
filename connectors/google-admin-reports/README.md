@@ -1,9 +1,9 @@
 # Google Admin Reports Connector V3 Contract
 
-> **Status**: runtime contract documented; manifest/runtime identity drift documented
+> **Status**: PROVEN runtime contract documented; manifest/runtime identity drift documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
-> **Verification script**: none tracked; use the commands below
+> **Verification script**: `scripts/e2e/google_admin_reports_connector_verification.sh`
 > **Reports overview**: https://developers.google.com/workspace/admin/reports/v1/get-start/overview
 > **Activities upstream**: https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list
 > **User usage upstream**: https://developers.google.com/workspace/admin/reports/reference/rest/v1/userUsageReport/get
@@ -169,7 +169,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 
 ## Verification Bundle
 
-There is no dedicated tracked `scripts/e2e/google_admin_reports_connector_verification.sh` bundle in this checkout. The closeout surface is the crate-local test suite plus direct `rch` proof commands.
+The tracked verification bundle is `scripts/e2e/google_admin_reports_connector_verification.sh`. It runs the graduation gauntlet, manifest check, crate-local compilation, formatting, integration suite, `local_non_mock` loopback acceptance suite, JSONL redaction/evidence checks, and clippy through `rch`.
 
 The verification surface captures:
 

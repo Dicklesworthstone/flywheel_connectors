@@ -51,8 +51,7 @@ impl SquareError {
         match self {
             Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
             Self::Api { code, .. } => u16::try_from(*code)
-                .ok()
-                .is_some_and(|status| classify_http_status(status, None).is_retryable()),
+                .is_ok_and(|status| classify_http_status(status, None).is_retryable()),
             Self::Json(_) | Self::Unauthorized(_) | Self::InvalidInput(_) | Self::Config(_) => {
                 false
             }
@@ -70,12 +69,13 @@ impl SquareError {
 
     /// Convert to FCP error taxonomy.
     #[must_use]
+    #[allow(clippy::redundant_closure_for_method_calls)]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {
                 service: "square".into(),
                 message: e.to_string(),
-                status_code: e.status().map(reqwest::StatusCode::as_u16),
+                status_code: e.status().map(|s| s.as_u16()),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
             },

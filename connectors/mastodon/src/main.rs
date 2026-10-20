@@ -1,6 +1,7 @@
 //! FCP Mastodon Connector - Main entrypoint.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::io::{BufRead, Write};
 
@@ -59,6 +60,7 @@ fn encode<T: serde::Serialize>(value: &T) -> FcpResult<serde_json::Value> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_message(connector: &mut MastodonConnector, message: &str) -> serde_json::Value {
     let request: serde_json::Value = match serde_json::from_str(message) {
         Ok(v) => v,

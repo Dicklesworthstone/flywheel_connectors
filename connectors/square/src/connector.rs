@@ -917,7 +917,7 @@ impl SquareConnector {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = match operation {
@@ -940,10 +940,10 @@ impl SquareConnector {
         let _bound =
             verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Square client missing after configure".into(),
         })?;
 
@@ -960,7 +960,7 @@ impl SquareConnector {
                 })?
             }
             OP_PAYMENTS_GET => {
-                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or(
+                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'payment_id' field".into(),
@@ -975,7 +975,7 @@ impl SquareConnector {
                 })?
             }
             OP_PAYMENTS_CREATE => {
-                let source_id = req.input.get("source_id").and_then(serde_json::Value::as_str).ok_or(
+                let source_id = req.input.get("source_id").and_then(serde_json::Value::as_str).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'source_id' field".into(),
@@ -985,14 +985,14 @@ impl SquareConnector {
                     .input
                     .get("idempotency_key")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'idempotency_key' field".into(),
                     })?;
                 let amount_money_val =
                     req.input
                         .get("amount_money")
-                        .ok_or(FcpError::InvalidRequest {
+                        .ok_or_else(|| FcpError::InvalidRequest {
                             code: 1005,
                             message: "Missing 'amount_money' field".into(),
                         })?;
@@ -1036,11 +1036,11 @@ impl SquareConnector {
                     .input
                     .get("idempotency_key")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'idempotency_key' field".into(),
                     })?;
-                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or(
+                let payment_id = req.input.get("payment_id").and_then(serde_json::Value::as_str).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'payment_id' field".into(),
@@ -1049,7 +1049,7 @@ impl SquareConnector {
                 let amount_money_val =
                     req.input
                         .get("amount_money")
-                        .ok_or(FcpError::InvalidRequest {
+                        .ok_or_else(|| FcpError::InvalidRequest {
                             code: 1005,
                             message: "Missing 'amount_money' field".into(),
                         })?;
@@ -1082,7 +1082,7 @@ impl SquareConnector {
                 let location_ids_val =
                     req.input
                         .get("location_ids")
-                        .ok_or(FcpError::InvalidRequest {
+                        .ok_or_else(|| FcpError::InvalidRequest {
                             code: 1005,
                             message: "Missing 'location_ids' field".into(),
                         })?;
@@ -1102,7 +1102,7 @@ impl SquareConnector {
                 })?
             }
             OP_ORDERS_GET => {
-                let order_id = req.input.get("order_id").and_then(serde_json::Value::as_str).ok_or(
+                let order_id = req.input.get("order_id").and_then(serde_json::Value::as_str).ok_or_else(||
                     FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'order_id' field".into(),
@@ -1121,14 +1121,14 @@ impl SquareConnector {
                     .input
                     .get("location_id")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'location_id' field".into(),
                     })?;
                 let line_items_val =
                     req.input
                         .get("line_items")
-                        .ok_or(FcpError::InvalidRequest {
+                        .ok_or_else(|| FcpError::InvalidRequest {
                             code: 1005,
                             message: "Missing 'line_items' field".into(),
                         })?;
@@ -1186,7 +1186,7 @@ impl SquareConnector {
                     .input
                     .get("customer_id")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'customer_id' field".into(),
                     })?;

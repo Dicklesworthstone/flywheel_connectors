@@ -18,6 +18,7 @@ archetypes = [
     "streaming",
 ]
 format = "wasi"
+status = "proven"
 
 [connector.state]
 model = "singleton_writer"

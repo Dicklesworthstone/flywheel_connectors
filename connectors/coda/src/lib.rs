@@ -1,6 +1,7 @@
 //! Coda document platform connector for FCP.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 pub mod client;
 pub mod connector;

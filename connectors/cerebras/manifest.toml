@@ -14,6 +14,7 @@ version = "0.1.0"
 description = "Cerebras Inference connector using the OpenAI-compatible chat, streaming, and model APIs"
 archetypes = ["operational", "streaming"]
 format = "native"
+status = "proven"
 
 [connector.state]
 model = "stateless"

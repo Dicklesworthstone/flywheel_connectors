@@ -355,85 +355,86 @@ async fn setup_handshake(connector: &mut TelegramConnector) -> Ed25519SigningKey
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
 
-    connector
-        .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
-            "zone_dir": unique_zone_dir("loopback-acceptance"),
-            "host_public_key": verifying_key.to_bytes(),
-            "nonce": vec![0_u8; 32],
-            "capabilities_requested": ["telegram.send", "telegram.read"]
-        }))
-        .await
-        .expect("handshake should succeed");
+    Box::pin(connector.handle_handshake(json!({
+        "protocol_version": "1.0.0",
+        "zone": "z:work",
+        "zone_dir": unique_zone_dir("loopback-acceptance"),
+        "host_public_key": verifying_key.to_bytes(),
+        "nonce": vec![0_u8; 32],
+        "capabilities_requested": ["telegram.send", "telegram.read"]
+    })))
+    .await
+    .expect("handshake should succeed");
 
     signing_key
 }
 
-#[fcp_async_core::test]
-async fn loopback_acceptance_exercises_send_media_and_file_paths() {
+#[test]
+fn loopback_acceptance_exercises_send_media_and_file_paths() {
+    thread::Builder::new()
+        .name("telegram-local-non-mock".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            fcp_async_core::runtime::block_on_sync(
+                run_loopback_acceptance_exercises_send_media_and_file_paths(),
+            )
+            .expect("telegram local_non_mock runtime");
+        })
+        .expect("spawn telegram local_non_mock thread")
+        .join()
+        .expect("telegram local_non_mock thread should succeed");
+}
+
+async fn run_loopback_acceptance_exercises_send_media_and_file_paths() {
     let fixture = LoopbackTelegramFixture::start();
     let mut connector = TelegramConnector::new();
 
-    connector
-        .handle_configure(json!({
-            "credential": test_bot_credential(),
-            "base_url": fixture.base_url(),
-            "poll_timeout": 1
-        }))
-        .await
-        .expect("configure connector against loopback Telegram fixture");
-    let signing_key = setup_handshake(&mut connector).await;
+    Box::pin(connector.handle_configure(json!({
+        "credential": test_bot_credential(),
+        "base_url": fixture.base_url(),
+        "poll_timeout": 1
+    })))
+    .await
+    .expect("configure connector against loopback Telegram fixture");
+    let signing_key = Box::pin(setup_handshake(&mut connector)).await;
 
-    let send_message = connector
-        .handle_invoke(json!({
-            "operation": "telegram.send_message",
-            "input": {
-                "chat_id": CHAT_ID,
-                "text": "Local acceptance message"
-            },
-            "capability_token": generate_valid_token(
-                &signing_key,
-                &connector,
-                "telegram.send_message"
-            )
-        }))
-        .await
-        .expect("send message through loopback fixture");
-    let send_media = connector
-        .handle_invoke(json!({
-            "operation": "telegram.send_media",
-            "input": {
-                "chat_id": CHAT_ID,
-                "media_type": "photo",
-                "media": "local-photo-id",
-                "caption": "local acceptance media"
-            },
-            "capability_token": generate_valid_token(
-                &signing_key,
-                &connector,
-                "telegram.send_media"
-            )
-        }))
-        .await
-        .expect("send media through loopback fixture");
-    let file = connector
-        .handle_invoke(json!({
-            "operation": "telegram.get_file",
-            "input": {
-                "file_id": "local-file-id"
-            },
-            "capability_token": generate_valid_token(
-                &signing_key,
-                &connector,
-                "telegram.get_file"
-            )
-        }))
-        .await
-        .expect("get file through loopback fixture");
+    let send_message_token =
+        generate_valid_token(&signing_key, &connector, "telegram.send_message");
+    let send_message = Box::pin(connector.handle_invoke(json!({
+        "operation": "telegram.send_message",
+        "input": {
+            "chat_id": CHAT_ID,
+            "text": "Local acceptance message"
+        },
+        "capability_token": send_message_token
+    })))
+    .await
+    .expect("send message through loopback fixture");
+    let send_media_token = generate_valid_token(&signing_key, &connector, "telegram.send_media");
+    let send_media = Box::pin(connector.handle_invoke(json!({
+        "operation": "telegram.send_media",
+        "input": {
+            "chat_id": CHAT_ID,
+            "media_type": "photo",
+            "media": "local-photo-id",
+            "caption": "local acceptance media"
+        },
+        "capability_token": send_media_token
+    })))
+    .await
+    .expect("send media through loopback fixture");
+    let file_token = generate_valid_token(&signing_key, &connector, "telegram.get_file");
+    let file = Box::pin(connector.handle_invoke(json!({
+        "operation": "telegram.get_file",
+        "input": {
+            "file_id": "local-file-id"
+        },
+        "capability_token": file_token
+    })))
+    .await
+    .expect("get file through loopback fixture");
 
-    connector
-        .handle_shutdown(json!({}))
+    Box::pin(connector.handle_shutdown(json!({})))
         .await
         .expect("shutdown should stop Telegram polling");
 

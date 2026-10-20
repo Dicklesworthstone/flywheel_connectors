@@ -1,7 +1,8 @@
 # Confluence Connector V3 Contract
 
-> **Status**: planning contract
+> **Status**: PROVEN (2026-10-20; 12/12 graduation gauntlet, verifier + unit/integration/local_non_mock suites verified)
 > **Bead**: `flywheel_connectors-j05nu.5.2.1`
+> **Verification script**: `scripts/e2e/confluence_connector_verification.sh`
 > **Unblocks**: `flywheel_connectors-j05nu.5.2.2`
 > **Primary upstreams**:
 > - https://developer.atlassian.com/cloud/confluence/using-the-rest-api/
@@ -168,3 +169,18 @@ This contract is grounded in Atlassian's current official documentation:
 - The current Cloud reference documents search under the v1 `/wiki/rest/api/search` family.
 - Atlassian Support documents scoped API tokens, token expiry windows, and the requirement to use `api.atlassian.com/ex/confluence/{cloudId}` for scoped-token calls.
 - The Confluence Cloud reference also documents attachment, comment, and space-permission groups, which confirms those are real provider surfaces but not part of this first implementation slice.
+
+## Operation Inventory
+
+See the operation list above (`spaces_list`, `spaces_get`, `pages_list`, `pages_get`, `pages_create`, `pages_update`, `pages_delete`, `search`, `health`).
+
+## Operator Guidance
+
+Prerequisites:
+- Use the deterministic loopback/WireMock harness for local verification; never log raw Atlassian API tokens or unredacted page bodies.
+
+Rerun commands:
+- `bash scripts/e2e/confluence_connector_verification.sh`
+- `rch exec -- cargo test -p fcp-confluence --test local_non_mock -- --nocapture`
+- `rch exec -- cargo test -p fcp-confluence --test integration -- --nocapture`
+- `rch exec -- cargo clippy -p fcp-confluence --all-targets -- -D warnings`

@@ -1,6 +1,6 @@
 # PostgreSQL Connector V3 Contract
 
-> **Status**: runtime contract documented with HTTP-facade and capability-token drift
+> **Status**: PROVEN runtime contract documented with HTTP-facade and capability-token drift
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/postgresql_connector_verification.sh`

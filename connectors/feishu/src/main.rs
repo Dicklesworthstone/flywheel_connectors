@@ -1,6 +1,7 @@
 //! FCP Feishu Connector - Main entrypoint.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::io::{BufRead, Write};
 
@@ -59,6 +60,7 @@ fn encode<T: serde::Serialize>(value: &T) -> FcpResult<serde_json::Value> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_message(connector: &mut FeishuConnector, message: &str) -> serde_json::Value {
     let request: serde_json::Value = match serde_json::from_str(message) {
         Ok(v) => v,
@@ -73,12 +75,15 @@ async fn handle_message(connector: &mut FeishuConnector, message: &str) -> serde
         }
     };
 
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let id = request.get("id").cloned();
     let params = request
         .get("params")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
 
     let result: FcpResult<serde_json::Value> = async {
         match method {
