@@ -1,4 +1,5 @@
 use fcp_prelude::log_redaction::redact_url;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -14,6 +15,87 @@ use fcp_sdk::migration::{
 use crate::error::{GcpError, GcpResult};
 use crate::jwt::{self, CachedToken};
 use crate::types::*;
+
+// A list operation either traverses the complete continuation chain or fails.
+// These bounds prevent a faulty provider from exhausting connector resources;
+// reaching a bound must never silently turn a prefix into a complete inventory.
+const MAX_LIST_PAGES: usize = 1_000;
+const MAX_LIST_ITEMS: usize = 100_000;
+const MAX_LIST_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LIST_TOKEN_BYTES: usize = 8 * 1024;
+
+struct ListPage<T> {
+    items: Vec<T>,
+    next_page_token: Option<String>,
+    response_bytes: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct ListEnvelope<L> {
+    #[serde(default)]
+    unreachable: Vec<String>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+    #[serde(flatten)]
+    page: L,
+}
+
+#[derive(Default)]
+struct ListProgress {
+    pages: usize,
+    items: usize,
+    bytes: usize,
+    seen_tokens: BTreeSet<String>,
+}
+
+impl ListProgress {
+    fn accept(&mut self, items: usize, bytes: usize, next: Option<&str>) -> GcpResult<()> {
+        let pages = self
+            .pages
+            .checked_add(1)
+            .filter(|n| *n <= MAX_LIST_PAGES)
+            .ok_or(GcpError::IncompleteListing {
+                reason: "page limit exceeded",
+            })?;
+        let items = self
+            .items
+            .checked_add(items)
+            .filter(|n| *n <= MAX_LIST_ITEMS)
+            .ok_or(GcpError::IncompleteListing {
+                reason: "item limit exceeded",
+            })?;
+        let bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= MAX_LIST_BYTES)
+            .ok_or(GcpError::IncompleteListing {
+                reason: "response byte limit exceeded",
+            })?;
+        if let Some(token) = next.filter(|token| !token.is_empty()) {
+            if token.len() > MAX_LIST_TOKEN_BYTES {
+                return Err(GcpError::IncompleteListing {
+                    reason: "pagination cursor too large",
+                });
+            }
+            if self.seen_tokens.contains(token) {
+                return Err(GcpError::IncompleteListing {
+                    reason: "pagination cursor repeated",
+                });
+            }
+            if pages == MAX_LIST_PAGES {
+                return Err(GcpError::IncompleteListing {
+                    reason: "page limit exceeded",
+                });
+            }
+            self.seen_tokens.insert(token.to_owned());
+        }
+        self.pages = pages;
+        self.items = items;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
 
 /// Validate a user-supplied path segment to prevent URL path injection.
 fn sanitize_path_segment<'a>(value: &'a str, field: &str) -> GcpResult<&'a str> {
@@ -114,6 +196,9 @@ impl GcpClient {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            // Keep authentication and opaque continuation tokens on the
+            // explicitly configured service endpoint, including on later pages.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(GcpError::Http)?;
 
@@ -225,6 +310,7 @@ impl GcpClient {
 
     // ── Compute Engine ──
 
+    /// Retrieve the complete continuation chain, or fail without partial results.
     pub async fn list_instances(
         &self,
         runtime: &ConnectorRuntime,
@@ -235,22 +321,8 @@ impl GcpClient {
             "{}/compute/v1/projects/{}/zones/{}/instances",
             self.compute_base, self.project_id, zone
         );
-        let token = self.get_bearer_token().await?;
-        let ctx = runtime.request_context();
-        let policy = self.retry_config.to_retry_policy();
-
-        RetryLoop::execute(&ctx, &policy, |attempt| {
-            let url = url.clone();
-            let client = self.client.clone();
-            let token = token.clone();
-            async move {
-                debug!(attempt, "Listing compute instances");
-                let req = authenticate_request_static(client.get(&url), &token);
-                handle_list_response::<InstanceList, Instance>(req, attempt, |list| {
-                    list.items.unwrap_or_default()
-                })
-                .await
-            }
+        self.list_all::<InstanceList, Instance>(runtime, &url, |list| {
+            (list.items.unwrap_or_default(), list.next_page_token)
         })
         .await
     }
@@ -317,6 +389,7 @@ impl GcpClient {
 
     // ── Cloud Storage ──
 
+    /// Retrieve all object pages, including continuations after empty pages.
     pub async fn list_objects(
         &self,
         runtime: &ConnectorRuntime,
@@ -324,22 +397,8 @@ impl GcpClient {
     ) -> GcpResult<Vec<StorageObject>> {
         let bucket = sanitize_path_segment(bucket, "bucket")?;
         let url = format!("{}/storage/v1/b/{}/o", self.storage_base, bucket);
-        let token = self.get_bearer_token().await?;
-        let ctx = runtime.request_context();
-        let policy = self.retry_config.to_retry_policy();
-
-        RetryLoop::execute(&ctx, &policy, |attempt| {
-            let url = url.clone();
-            let client = self.client.clone();
-            let token = token.clone();
-            async move {
-                debug!(attempt, "Listing storage objects");
-                let req = authenticate_request_static(client.get(&url), &token);
-                handle_list_response::<ObjectList, StorageObject>(req, attempt, |list| {
-                    list.items.unwrap_or_default()
-                })
-                .await
-            }
+        self.list_all::<ObjectList, StorageObject>(runtime, &url, |list| {
+            (list.items.unwrap_or_default(), list.next_page_token)
         })
         .await
     }
@@ -433,6 +492,7 @@ impl GcpClient {
 
     // ── Cloud Run ──
 
+    /// Retrieve all service pages; unreachable resources are not a complete list.
     pub async fn list_services(
         &self,
         runtime: &ConnectorRuntime,
@@ -443,22 +503,8 @@ impl GcpClient {
             "{}/v2/projects/{}/locations/{}/services",
             self.run_base, self.project_id, location
         );
-        let token = self.get_bearer_token().await?;
-        let ctx = runtime.request_context();
-        let policy = self.retry_config.to_retry_policy();
-
-        RetryLoop::execute(&ctx, &policy, |attempt| {
-            let url = url.clone();
-            let client = self.client.clone();
-            let token = token.clone();
-            async move {
-                debug!(attempt, "Listing Cloud Run services");
-                let req = authenticate_request_static(client.get(&url), &token);
-                handle_list_response::<CloudRunServiceList, CloudRunService>(req, attempt, |list| {
-                    list.services.unwrap_or_default()
-                })
-                .await
-            }
+        self.list_all::<CloudRunServiceList, CloudRunService>(runtime, &url, |list| {
+            (list.services.unwrap_or_default(), list.next_page_token)
         })
         .await
     }
@@ -512,6 +558,54 @@ impl GcpClient {
     }
 
     // ── Generic HTTP helpers ──
+
+    /// Collect every page under one request deadline and cancellation context.
+    /// Retries repeat only the current page; previously accepted pages are not
+    /// refetched or appended twice. Empty pages can still carry a continuation.
+    async fn list_all<L, T>(
+        &self,
+        runtime: &ConnectorRuntime,
+        url: &str,
+        extract: fn(L) -> (Vec<T>, Option<String>),
+    ) -> GcpResult<Vec<T>>
+    where
+        L: serde::de::DeserializeOwned + Send + 'static,
+        T: Send + 'static,
+    {
+        let token = self.get_bearer_token().await?;
+        let ctx = runtime.request_context();
+        let policy = self.retry_config.to_retry_policy();
+        let mut progress = ListProgress::default();
+        let mut next_page_token: Option<String> = None;
+        let mut items = Vec::new();
+
+        loop {
+            let page = RetryLoop::execute(&ctx, &policy, |attempt| {
+                let mut req = authenticate_request_static(self.client.get(url), &token);
+                if let Some(cursor) = next_page_token.as_deref() {
+                    // Opaque provider data, never a URL, path or pre-encoded
+                    // query fragment. Keep every other request parameter fixed.
+                    req = req.query(&[("pageToken", cursor)]);
+                }
+                async move {
+                    debug!(attempt, "Fetching GCP inventory page");
+                    handle_list_response::<L, T>(req, attempt, extract).await
+                }
+            })
+            .await?;
+
+            progress.accept(
+                page.items.len(),
+                page.response_bytes,
+                page.next_page_token.as_deref(),
+            )?;
+            items.extend(page.items);
+            next_page_token = page.next_page_token.filter(|cursor| !cursor.is_empty());
+            if next_page_token.is_none() {
+                return Ok(items);
+            }
+        }
+    }
 
     async fn get_single<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
@@ -731,15 +825,18 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
 async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
     req: RequestBuilder,
     attempt: u32,
-    extract: impl FnOnce(L) -> Vec<T>,
-) -> AttemptOutcome<Vec<T>, GcpError> {
-    let resp = match req.send().await {
+    extract: impl FnOnce(L) -> (Vec<T>, Option<String>),
+) -> AttemptOutcome<ListPage<T>, GcpError> {
+    let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            // Only a connect-phase failure proves the request never left us.
-            // Read path: always retryable.
+            // GET is replayable. Builder failures are not transient, and the
+            // URL may contain a private continuation token: never retain it.
+            if e.is_builder() {
+                return AttemptOutcome::Terminal(GcpError::Http(e.without_url()));
+            }
             return AttemptOutcome::Retryable {
-                error: GcpError::Http(e),
+                error: GcpError::Http(e.without_url()),
                 retry_after: None,
             };
         }
@@ -769,14 +866,13 @@ async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
     }
 
     if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
         let err = GcpError::Api {
             code: u32::from(status),
-            message: text,
+            // Error bodies can echo the cursor or credentials. Status and the
+            // existing typed auth/rate-limit errors suffice for recovery.
+            message: format!("List request failed (HTTP {status})"),
         };
         if status >= 500 {
-            // A 5xx means the provider received the request and may already
-            // have created the resource.
             return AttemptOutcome::Retryable {
                 error: err,
                 retry_after: None,
@@ -785,23 +881,157 @@ async fn handle_list_response<L: serde::de::DeserializeOwned, T>(
         return AttemptOutcome::Terminal(err);
     }
 
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return AttemptOutcome::Terminal(GcpError::Http(e)),
+    let body = match read_list_body(&mut resp).await {
+        Ok(body) => body,
+        Err(GcpError::Http(error)) => {
+            return AttemptOutcome::Retryable {
+                error: GcpError::Http(error),
+                retry_after: None,
+            };
+        }
+        Err(error) => return AttemptOutcome::Terminal(error),
     };
 
-    match serde_json::from_str::<L>(&text) {
-        Ok(list) => AttemptOutcome::Success(extract(list)),
-        Err(e) => {
-            debug!(attempt, "Failed to parse list response: {e}");
-            AttemptOutcome::Terminal(GcpError::Json(e))
+    match serde_json::from_slice::<ListEnvelope<L>>(&body) {
+        Ok(envelope) => {
+            if !envelope.unreachable.is_empty() || envelope.error.is_some() {
+                return AttemptOutcome::Terminal(GcpError::IncompleteListing {
+                    reason: "provider reported incomplete results",
+                });
+            }
+            let (items, next_page_token) = extract(envelope.page);
+            AttemptOutcome::Success(ListPage {
+                items,
+                next_page_token,
+                response_bytes: body.len(),
+            })
+        }
+        Err(_) => {
+            debug!(attempt, "Invalid GCP inventory page; partial results discarded");
+            AttemptOutcome::Terminal(GcpError::IncompleteListing {
+                reason: "invalid list response",
+            })
         }
     }
+}
+
+/// Enforce the per-page bound while reading, including chunked responses with
+/// no Content-Length. The shared request context also bounds the entire read.
+async fn read_list_body(response: &mut reqwest::Response) -> GcpResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_LIST_PAGE_BYTES as u64)
+    {
+        return Err(GcpError::IncompleteListing {
+            reason: "page byte limit exceeded",
+        });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| GcpError::Http(error.without_url()))?
+    {
+        if chunk.len() > MAX_LIST_PAGE_BYTES - body.len() {
+            return Err(GcpError::IncompleteListing {
+                reason: "page byte limit exceeded",
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_budget_accepts_exact_final_boundaries() {
+        let mut progress = ListProgress {
+            pages: MAX_LIST_PAGES - 1,
+            items: MAX_LIST_ITEMS - 1,
+            bytes: MAX_LIST_BYTES - 1,
+            ..ListProgress::default()
+        };
+        progress.accept(1, 1, None).unwrap();
+        assert_eq!(progress.pages, MAX_LIST_PAGES);
+        assert_eq!(progress.items, MAX_LIST_ITEMS);
+        assert_eq!(progress.bytes, MAX_LIST_BYTES);
+    }
+
+    #[test]
+    fn list_budget_refuses_a_continuation_at_the_page_limit() {
+        let mut progress = ListProgress {
+            pages: MAX_LIST_PAGES - 1,
+            ..ListProgress::default()
+        };
+        let error = progress.accept(1, 2, Some("private-cursor")).unwrap_err();
+        assert!(matches!(error, GcpError::IncompleteListing { .. }));
+        assert!(!error.to_string().contains("private-cursor"));
+        assert_eq!(progress.pages, MAX_LIST_PAGES - 1);
+        assert!(progress.seen_tokens.is_empty());
+        // No further continuation is needed for an empty final page.
+        progress.accept(0, 2, Some("")).unwrap();
+    }
+
+    #[test]
+    fn list_budget_rejects_excess_items_and_bytes_without_mutation() {
+        let mut progress = ListProgress::default();
+        for (items, bytes) in [
+            (MAX_LIST_ITEMS + 1, 1),
+            (1, MAX_LIST_BYTES + 1),
+            (usize::MAX, 1),
+            (1, usize::MAX),
+        ] {
+            assert!(progress.accept(items, bytes, Some("cursor")).is_err());
+            assert_eq!(progress.pages, 0);
+            assert!(progress.seen_tokens.is_empty());
+        }
+        progress.accept(MAX_LIST_ITEMS, MAX_LIST_BYTES, Some("cursor")).unwrap();
+        assert!(progress.accept(1, 0, None).is_err());
+        assert!(progress.accept(0, 1, None).is_err());
+    }
+
+    #[test]
+    fn list_budget_uses_checked_counters() {
+        let mut progress = ListProgress {
+            pages: usize::MAX,
+            ..ListProgress::default()
+        };
+        assert!(progress.accept(0, 0, None).is_err());
+        progress.pages = 0;
+        progress.items = usize::MAX;
+        assert!(progress.accept(1, 0, None).is_err());
+        progress.items = 0;
+        progress.bytes = usize::MAX;
+        assert!(progress.accept(0, 1, None).is_err());
+    }
+
+    #[test]
+    fn list_cursor_cycles_are_detected_even_across_empty_pages() {
+        let mut progress = ListProgress::default();
+        progress.accept(2, 20, Some("private-first")).unwrap();
+        progress.accept(0, 20, Some("private-second")).unwrap();
+        let error = progress.accept(0, 20, Some("private-first")).unwrap_err();
+        assert_eq!(progress.pages, 2);
+        assert!(!error.to_string().contains("private-first"));
+        assert!(matches!(error, GcpError::IncompleteListing { .. }));
+    }
+
+    #[test]
+    fn list_cursors_are_opaque_and_have_a_byte_bound() {
+        let mut progress = ListProgress::default();
+        for cursor in [" a ", "a", "a+&b=#c", "https://elsewhere.invalid/?q=1"] {
+            progress.accept(0, 2, Some(cursor)).unwrap();
+            assert!(progress.seen_tokens.contains(cursor));
+        }
+        let exact = "x".repeat(MAX_LIST_TOKEN_BYTES);
+        progress.accept(0, 2, Some(&exact)).unwrap();
+        let oversized = "é".repeat(MAX_LIST_TOKEN_BYTES / 2 + 1);
+        assert!(progress.accept(0, 2, Some(&oversized)).is_err());
+        assert!(!progress.seen_tokens.contains(&oversized));
+    }
 
     #[test]
     fn client_debug_redacts_auth() {
