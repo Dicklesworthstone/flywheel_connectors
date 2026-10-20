@@ -1,0 +1,7 @@
+INFO {"span":"fcp.proof.lean_verify","file":"lean/Fcp/Zone/Lattice.lean","verdict":"green","theorems_total":1,"theorems_proven":1,"sorries_remaining":0,"duration_s":1}
+INFO {"span":"fcp.proof.lean_verify","file":"lean/Fcp/Capability/Typestate.lean","verdict":"green","theorems_total":1,"theorems_proven":1,"sorries_remaining":0,"duration_s":2}
+INFO {"span":"fcp.proof.lean_verify","file":"lean/Fcp/Audit/HashChain.lean","verdict":"green","theorems_total":1,"theorems_proven":1,"sorries_remaining":0,"duration_s":1}
+INFO {"span":"fcp.proof.lean_verify","file":"lean/Fcp/Crypto/HybridSignature.lean","verdict":"green","theorems_total":1,"theorems_proven":1,"sorries_remaining":0,"duration_s":2}
+INFO {"span":"fcp.proof.lean_verify","file":"lean/Fcp/Mesh/CrdtMerge.lean","verdict":"green","theorems_total":1,"theorems_proven":1,"sorries_remaining":0,"duration_s":1}
+Build completed successfully (14 jobs).
+INFO {"target":"lean-verify","total_proofs":5,"green":5,"red":0,"duration_seconds":8}

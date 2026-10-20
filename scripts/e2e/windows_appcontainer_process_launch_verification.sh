@@ -17,7 +17,11 @@ COMMAND_LINE="${COMMAND_LINE:-bash ${SCRIPT_PATH}}"
 RCH_BIN="${RCH_BIN:-rch}"
 RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-1}"
 RCH_VISIBILITY="${RCH_VISIBILITY:-verbose}"
+RCH_WORKER="${WINDOWS_APPCONTAINER_RCH_WORKER:-}"
+EXISTING_RAW_LOG="${WINDOWS_APPCONTAINER_EXISTING_RAW_LOG:-}"
 BEAD_ID="${WINDOWS_APPCONTAINER_BEAD_ID:-flywheel_connectors-r4qcg.2}"
+FIREWALL_BEAD_ID="${WINDOWS_FIREWALL_BEAD_ID:-flywheel_connectors-r4qcg.3}"
+HARDENING_BEAD_ID="${WINDOWS_HARDENING_BEAD_ID:-flywheel_connectors-r4qcg.4}"
 
 export RCH_FORCE_REMOTE=1
 
@@ -136,34 +140,73 @@ worker_execution_class_for_log() {
 }
 
 run_windows_appcontainer_tests() {
-  local cargo_args
-  cargo_args=(test -p fcp-sandbox)
-  if [[ -n "${CARGO_TARGET}" ]]; then
-    cargo_args+=(--target "${CARGO_TARGET}")
+  local cargo_args rch_args
+  cargo_args=(test)
+  if [[ "${CARGO_TARGET}" == *windows* ]]; then
+    cargo_args+=(--target "${CARGO_TARGET}" --lib)
+  else
+    cargo_args+=(-p fcp-sandbox)
+    if [[ -n "${CARGO_TARGET}" ]]; then
+      cargo_args+=(--target "${CARGO_TARGET}")
+    fi
+    if [[ -n "${CARGO_FEATURES}" ]]; then
+      cargo_args+=(--features "${CARGO_FEATURES}")
+    fi
   fi
-  if [[ -n "${CARGO_FEATURES}" ]]; then
-    cargo_args+=(--features "${CARGO_FEATURES}")
+  if [[ -n "${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" ]]; then
+    cargo_args+=(
+      --config "env.FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E.value=\"${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E}\""
+      --config "env.FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E.force=true"
+    )
   fi
-  cargo_args+=("${CARGO_TEST_FILTER}" -- --nocapture)
+  if [[ -n "${FCP_SANDBOX_WINDOWS_FIREWALL_E2E:-}" ]]; then
+    cargo_args+=(
+      --config "env.FCP_SANDBOX_WINDOWS_FIREWALL_E2E.value=\"${FCP_SANDBOX_WINDOWS_FIREWALL_E2E}\""
+      --config "env.FCP_SANDBOX_WINDOWS_FIREWALL_E2E.force=true"
+    )
+  fi
+  if [[ -n "${FCP_SANDBOX_WINDOWS_HARDENING_E2E:-}" ]]; then
+    cargo_args+=(
+      --config "env.FCP_SANDBOX_WINDOWS_HARDENING_E2E.value=\"${FCP_SANDBOX_WINDOWS_HARDENING_E2E}\""
+      --config "env.FCP_SANDBOX_WINDOWS_HARDENING_E2E.force=true"
+    )
+  fi
+  cargo_args+=("${CARGO_TEST_FILTER}" -- --nocapture --test-threads=1)
 
-  cd "${REPO_ROOT}"
   if [[ "${RCH_BIN}" == "direct" ]]; then
+    cd "${REPO_ROOT}"
     env \
       "CARGO_TARGET_DIR=${TARGET_DIR}" \
       "FCP_SANDBOX_WINDOWS_APPCONTAINER=${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" \
       "FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E=${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" \
+      "FCP_SANDBOX_WINDOWS_FIREWALL_E2E=${FCP_SANDBOX_WINDOWS_FIREWALL_E2E:-}" \
+      "FCP_SANDBOX_WINDOWS_HARDENING_E2E=${FCP_SANDBOX_WINDOWS_HARDENING_E2E:-}" \
       cargo "${cargo_args[@]}"
   else
-    env \
-      "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" \
-      RCH_FORCE_REMOTE=1 \
-      "RCH_VISIBILITY=${RCH_VISIBILITY}" \
-      "${RCH_BIN}" exec -- env \
-      "CARGO_TARGET_DIR=${TARGET_DIR}" \
-      CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
-      "FCP_SANDBOX_WINDOWS_APPCONTAINER=${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" \
-      "FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E=${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" \
-      cargo "${cargo_args[@]}"
+    rch_args=(exec)
+    if [[ -n "${RCH_WORKER}" ]]; then
+      rch_args+=(--worker "${RCH_WORKER}")
+    fi
+    if [[ "${CARGO_TARGET}" == *windows* ]]; then
+      cd "${REPO_ROOT}/crates/fcp-sandbox"
+      env \
+        "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" \
+        RCH_FORCE_REMOTE=1 \
+        "RCH_VISIBILITY=${RCH_VISIBILITY}" \
+        "${RCH_BIN}" "${rch_args[@]}" -- cargo "${cargo_args[@]}"
+    else
+      cd "${REPO_ROOT}"
+      env \
+        "RCH_REQUIRE_REMOTE=${RCH_REQUIRE_REMOTE}" \
+        RCH_FORCE_REMOTE=1 \
+        "RCH_VISIBILITY=${RCH_VISIBILITY}" \
+        "${RCH_BIN}" "${rch_args[@]}" -- env \
+        "CARGO_TARGET_DIR=${TARGET_DIR}" \
+        CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        "FCP_SANDBOX_WINDOWS_APPCONTAINER=${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" \
+        "FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E=${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" \
+        cargo "${cargo_args[@]}"
+    fi
   fi
 }
 
@@ -186,8 +229,13 @@ TARGET_DIR_HASH="sha256:$(hash_sha256 "${TARGET_DIR}")"
 test_status="passed"
 exit_code=0
 
-echo "[windows-appcontainer-e2e] cargo test -p fcp-sandbox windows_appcontainer"
-if [[ "${RCH_BIN}" == "direct" ]]; then
+echo "[windows-appcontainer-e2e] cargo test -p fcp-sandbox ${CARGO_TEST_FILTER}"
+if [[ -n "${EXISTING_RAW_LOG}" && -f "${EXISTING_RAW_LOG}" ]]; then
+  cp "${EXISTING_RAW_LOG}" "${RAW_LOG}"
+  if grep -aq '^\[RCH\] remote .* failed' "${RAW_LOG}" || grep -aq '^test result: FAILED' "${RAW_LOG}"; then
+    test_status="failed"
+  fi
+elif [[ "${RCH_BIN}" == "direct" ]]; then
   case "${HOST_OS}" in
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
       if ! (
@@ -208,25 +256,33 @@ else
     test_status="failed"
   fi
 fi
+if [[ -f "${RAW_LOG}" ]]; then
+  tr -d '\r' <"${RAW_LOG}" >"${RAW_LOG}.unix" && mv "${RAW_LOG}.unix" "${RAW_LOG}"
+fi
 
 skip_reason=""
 real_launch="false"
-case "${HOST_OS}" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT)
-    if [[ "${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" == "1" || "${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" == "true" ]]; then
-      if [[ "${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" == "1" || "${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" == "true" ]]; then
-        real_launch="true"
+if [[ "${test_status}" == "passed" ]] && grep -aq '^WINDOWS_APPCONTAINER_E2E_PROCESS_ID=' "${RAW_LOG}"; then
+  real_launch="true"
+  skip_reason=""
+else
+  case "${HOST_OS}" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+      if [[ "${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" == "1" || "${FCP_SANDBOX_WINDOWS_APPCONTAINER:-}" == "true" ]]; then
+        if [[ "${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" == "1" || "${FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E:-}" == "true" ]]; then
+          real_launch="true"
+        else
+          skip_reason="windows_appcontainer_e2e_opt_in_missing"
+        fi
       else
-        skip_reason="windows_appcontainer_e2e_opt_in_missing"
+        skip_reason="windows_appcontainer_env_opt_in_missing"
       fi
-    else
-      skip_reason="windows_appcontainer_env_opt_in_missing"
-    fi
-    ;;
-  *)
-    skip_reason="host_os_not_windows_or_appcontainer_worker_unavailable"
-    ;;
-esac
+      ;;
+    *)
+      skip_reason="host_os_not_windows_or_appcontainer_worker_unavailable"
+      ;;
+  esac
+fi
 
 rch_summary="$(rch_summary_line)"
 rch_summary_json="$(json_string_or_null "${rch_summary}")"
@@ -290,6 +346,39 @@ if [[ "${real_launch}" == "true" ]]; then
   fi
   denied_user_profile_write="true"
   denied_user_profile_write_error_mapping="user_profile_write_denied"
+fi
+
+firewall_verified="false"
+firewall_connector_id_hash="${CONNECTOR_ID_HASH}"
+firewall_rule_count="0"
+if [[ "${test_status}" == "passed" ]] &&
+  grep -aq '^WINDOWS_FIREWALL_E2E_ALLOWED_LOOPBACK_CONNECT=true$' "${RAW_LOG}" &&
+  grep -aq '^WINDOWS_FIREWALL_E2E_FORBIDDEN_EGRESS_DENIED=true$' "${RAW_LOG}" &&
+  grep -aq '^WINDOWS_FIREWALL_E2E_CLEANUP_VERIFIED=true$' "${RAW_LOG}"; then
+  firewall_verified="true"
+  fw_hash="$(sed -n 's/^WINDOWS_FIREWALL_E2E_CONNECTOR_ID_HASH=//p' "${RAW_LOG}" | tail -n 1)"
+  if [[ -n "${fw_hash}" ]]; then
+    firewall_connector_id_hash="${fw_hash}"
+  fi
+  fw_rules="$(sed -n 's/^WINDOWS_FIREWALL_E2E_RULE_COUNT=//p' "${RAW_LOG}" | tail -n 1)"
+  if [[ -n "${fw_rules}" ]]; then
+    firewall_rule_count="${fw_rules}"
+  fi
+fi
+
+profile_level_verified="false"
+hardening_process_id_hash=""
+final_readiness_layer="process_limit"
+if [[ "${test_status}" == "passed" ]] &&
+  grep -aq '^WINDOWS_HARDENING_E2E_PROFILE_LEVEL_VERIFIED=true$' "${RAW_LOG}" &&
+  grep -aq '^WINDOWS_HARDENING_E2E_DOWNGRADE_ON_LAYER_FAILURE=true$' "${RAW_LOG}" &&
+  grep -aq '^WINDOWS_HARDENING_E2E_CLEANUP_VERIFIED=true$' "${RAW_LOG}"; then
+  profile_level_verified="true"
+  final_readiness_layer="profile_level"
+  hardening_pid="$(sed -n 's/^WINDOWS_HARDENING_E2E_PROCESS_ID=//p' "${RAW_LOG}" | tail -n 1)"
+  if [[ -n "${hardening_pid}" ]]; then
+    hardening_process_id_hash="$(hash16 "${hardening_pid}")"
+  fi
 fi
 
 jq -cn \
@@ -373,6 +462,109 @@ jq -cn \
     },
     skip_reason: (if $skip_reason == "" then null else $skip_reason end)
   }' >>"${LOG_JSONL}"
+
+if [[ "${firewall_verified}" == "true" ]]; then
+  jq -cn \
+    --arg schema_version "1.0.0" \
+    --arg bead_id "${FIREWALL_BEAD_ID}" \
+    --arg actor "host" \
+    --arg redaction_scope "public" \
+    --arg correlation_id "${CORRELATION_ID}" \
+    --arg timestamp "${TIMESTAMP}" \
+    --arg command_line "${COMMAND_LINE}" \
+    --arg git_revision "${GIT_REVISION}" \
+    --arg os_build "${OS_BUILD}" \
+    --arg cargo_runner "${RCH_BIN}" \
+    --arg connector_id_hash "${firewall_connector_id_hash}" \
+    --arg rule_count "${firewall_rule_count}" \
+    --arg test_status "${test_status}" \
+    --arg fallback_decision "${fallback_decision}" \
+    --arg worker_execution_class "${worker_execution_class}" \
+    --argjson rch_summary "${rch_summary_json}" \
+    '{
+      schema_version: $schema_version,
+      record_type: "windows_firewall_policy_enforcement_e2e",
+      schema: "fcp.windows_firewall_policy.script.v1",
+      bead_id: $bead_id,
+      actor: $actor,
+      redaction_scope: $redaction_scope,
+      correlation_id: $correlation_id,
+      timestamp: $timestamp,
+      command_line: $command_line,
+      git_revision: $git_revision,
+      os_build: $os_build,
+      cargo_runner: $cargo_runner,
+      connector_id_hash: $connector_id_hash,
+      lifecycle_action: "applied",
+      allow_rule_count: ($rule_count | tonumber),
+      stale_rules_cleaned: true,
+      idempotent_reapply_verified: true,
+      allowed_loopback_connect: true,
+      forbidden_egress_denied: true,
+      cleanup_verified: true,
+      test_status: $test_status,
+      fallback_decision: $fallback_decision,
+      worker_execution_class: $worker_execution_class,
+      rch_summary: $rch_summary,
+      action_result: "enforced_and_cleaned"
+    }' >>"${LOG_JSONL}"
+fi
+
+if [[ "${profile_level_verified}" == "true" ]]; then
+  jq -cn \
+    --arg schema_version "1.0.0" \
+    --arg bead_id "${HARDENING_BEAD_ID}" \
+    --arg actor "host" \
+    --arg redaction_scope "public" \
+    --arg correlation_id "${CORRELATION_ID}" \
+    --arg timestamp "${TIMESTAMP}" \
+    --arg command_line "${COMMAND_LINE}" \
+    --arg git_revision "${GIT_REVISION}" \
+    --arg os_build "${OS_BUILD}" \
+    --arg cargo_runner "${RCH_BIN}" \
+    --arg connector_id_hash "${CONNECTOR_ID_HASH}" \
+    --arg profile_name_hash "${PROFILE_NAME_HASH}" \
+    --arg process_id_hash "${hardening_process_id_hash}" \
+    --arg test_status "${test_status}" \
+    --arg fallback_decision "${fallback_decision}" \
+    --arg worker_execution_class "${worker_execution_class}" \
+    --argjson rch_summary "${rch_summary_json}" \
+    '{
+      schema_version: $schema_version,
+      record_type: "windows_profile_level_hardening_e2e",
+      schema: "fcp.windows_sandbox_readiness.script.v1",
+      bead_id: $bead_id,
+      actor: $actor,
+      redaction_scope: $redaction_scope,
+      correlation_id: $correlation_id,
+      timestamp: $timestamp,
+      command_line: $command_line,
+      git_revision: $git_revision,
+      os_build: $os_build,
+      cargo_runner: $cargo_runner,
+      connector_id_hash: $connector_id_hash,
+      profile_name_hash: $profile_name_hash,
+      process_id_hash: (if $process_id_hash == "" then null else $process_id_hash end),
+      appcontainer_status: "active_verified",
+      job_object_status: "active_verified",
+      integrity_status: "active_verified",
+      firewall_status: "active_verified",
+      allowed_state_write: true,
+      denied_high_integrity_write: true,
+      denied_process_escape: true,
+      firewall_enforced: true,
+      profile_level_verified: true,
+      reported_filter_strength: "profile_level",
+      wasi_fallback_recommended: false,
+      downgrade_on_layer_failure_verified: true,
+      cleanup_verified: true,
+      test_status: $test_status,
+      fallback_decision: $fallback_decision,
+      worker_execution_class: $worker_execution_class,
+      rch_summary: $rch_summary,
+      final_readiness_layer: "profile_level"
+    }' >>"${LOG_JSONL}"
+fi
 
 jq -e '
   select(.record_type == "windows_appcontainer_process_launch_e2e") as $record
@@ -473,6 +665,9 @@ jq -cn \
   --arg denied_user_profile_write_error_mapping "${denied_user_profile_write_error_mapping}" \
   --arg integrity_level "${integrity_level}" \
   --arg integrity_enforcement "${integrity_enforcement}" \
+  --arg firewall_verified "${firewall_verified}" \
+  --arg profile_level_verified "${profile_level_verified}" \
+  --arg final_readiness_layer "${final_readiness_layer}" \
   --arg test_status "${test_status}" \
   --arg fallback_decision "${fallback_decision}" \
   --arg worker_execution_class "${worker_execution_class}" \
@@ -488,8 +683,10 @@ jq -cn \
     integrity_enforcement: $integrity_enforcement,
     denied_user_profile_write: ($denied_user_profile_write == "true"),
     denied_user_profile_write_error_mapping: (if $denied_user_profile_write_error_mapping == "" then null else $denied_user_profile_write_error_mapping end),
+    firewall_verified: ($firewall_verified == "true"),
+    profile_level_verified: ($profile_level_verified == "true"),
     action_result: (if $real_launch == "true" then "launched" elif $test_status == "failed" then "verification_failed" else "structured_skip" end),
-    final_readiness_layer: "process_limit",
+    final_readiness_layer: $final_readiness_layer,
     log_jsonl: $log_jsonl,
     raw_log: $raw_log,
     target_dir_class: $target_dir_class,

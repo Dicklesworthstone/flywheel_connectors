@@ -1,0 +1,60 @@
+{
+  "schema": "fcp.kyopb.external_review_packet.v1",
+  "bead_id": "flywheel_connectors-kyopb.1.3.1.1.6.3",
+  "parent_bead_id": "flywheel_connectors-kyopb.1.3.1.1.6",
+  "created_at": "2026-10-20T06:22:00Z",
+  "review_status": "awaiting_external_review",
+  "self_review_equivalent_to_external": false,
+  "design_docs": [
+    "docs/post-quantum/lattice_trapdoor_delegation.md",
+    "docs/post-quantum/lattice_primitive_decision_2026-05-07.md",
+    "docs/post-quantum/lattice_primitive_route_packet_2026-05-08.md",
+    "docs/post-quantum/throughput_benchmark.md",
+    "docs/post-quantum/kyopb_external_review_packet.md"
+  ],
+  "implementation_files": [
+    "crates/fcp-crypto-pq/src/lib.rs",
+    "crates/fcp-crypto-pq/src/lattice.rs",
+    "crates/fcp-crypto-pq/benches/lattice_delegation.rs",
+    "lean/Fcp/Crypto/LatticeDelegation.lean",
+    "scripts/e2e/lattice_delegation_assurance_gauntlet.sh"
+  ],
+  "lean_theorems": [
+    "lattice_delegation_chain_corruption_rejected",
+    "lattice_delegation_sis_assumption_boundary_complete",
+    "lattice_trapdoor_capability_unforgeability_reduces_to_sis_assumptions"
+  ],
+  "proof_gauntlet_artifacts": [
+    {
+      "run_id": "kyopb-lockfile-main-sagestork-20260604T0913Z",
+      "sha256": "bbc080478c1c83535936859c2dea5bcc39cc808370d72293cb864f5d17410705",
+      "rows_passed": 29,
+      "redaction_scan": "pass"
+    },
+    {
+      "run_id": "kyopb-lockfile-main-sagestork-20260604Tcurrentmain-b9c9c0d90",
+      "sha256": "3bbee2a29e55a44f8f0994e602707feb572346b8003de4ada48b5f84e7be6e70",
+      "rows_passed": 29,
+      "redaction_scan": "pass"
+    }
+  ],
+  "profiles_covered": [
+    "SMALL_TEST",
+    "V4_REFERENCE"
+  ],
+  "benchmark_groups": [
+    "trap_gen",
+    "delegate",
+    "sample_pre",
+    "verify",
+    "full_crypto_route",
+    "host_dispatcher_pipeline"
+  ],
+  "redaction_policy": {
+    "trapdoor_coefficients_logged": false,
+    "preimage_coefficients_logged": false,
+    "secret_seeds_logged": false,
+    "expanded_secret_matrices_logged": false,
+    "pii_or_private_paths_logged": false
+  }
+}

@@ -1,16 +1,29 @@
-# Windows AppContainer Runbook
+# Windows AppContainer, Firewall & `ProfileLevel` Hardening Runbook
 
-**Bead:** `flywheel_connectors-r4qcg.2`
+**Beads:** `flywheel_connectors-r4qcg.2`, `flywheel_connectors-r4qcg.3`, `flywheel_connectors-r4qcg.4`
 **Audience:** Operators and agents validating the Windows sandbox path.
 
 Windows remains `ProcessLimit` unless a connector process is launched through
-the AppContainer process-launch path and the run emits evidence showing the
-profile SID, capability decision, launch mechanism, low-integrity enforcement,
-and Job Object attachment.
+the AppContainer process-launch path **and** all four required Windows layers
+(`AppContainer` profile + `STARTUPINFOEXW` child launch, Job Object limits,
+low-integrity primary child token via `CreateProcessAsUserW`, and default-deny
+Windows Firewall egress policy enforcement) are active and verified for the run.
 
-## Verify AppContainer Is Functioning
+## Verify AppContainer, Firewall & `ProfileLevel` Readiness
 
-1. Run the Windows workflow from GitHub Actions or a Windows worker.
+1. Run the Windows workflow from GitHub Actions or against a Windows `rch`
+   worker (such as `wsurf`):
+
+```bash
+WINDOWS_APPCONTAINER_RCH_WORKER=wsurf \
+WINDOWS_APPCONTAINER_CARGO_TARGET=x86_64-pc-windows-msvc \
+WINDOWS_APPCONTAINER_CARGO_TEST_FILTER=windows \
+FCP_SANDBOX_WINDOWS_APPCONTAINER_E2E=1 \
+FCP_SANDBOX_WINDOWS_FIREWALL_E2E=1 \
+FCP_SANDBOX_WINDOWS_HARDENING_E2E=1 \
+bash scripts/e2e/windows_appcontainer_process_launch_verification.sh
+```
+
 2. Confirm the artifact path. The local script default is
    `artifacts/e2e/windows-appcontainer/<run-id>/`; the GitHub Actions lane may
    place the process-launch bundle under:
@@ -19,8 +32,11 @@ and Job Object attachment.
 artifacts/e2e/windows_appcontainer/<run-id>/
 ```
 
-3. Inspect `process-launch/windows_appcontainer_process_launch.jsonl`.
-4. Treat the lane as a skip unless at least one record shows:
+3. Inspect `windows_appcontainer_process_launch.jsonl` and `summary.json`.
+4. Treat the lane as a skip unless `windows_appcontainer_process_launch.jsonl`
+   contains the live `windows_appcontainer_process_launch_e2e`,
+   `windows_firewall_policy_enforcement_e2e`, and
+   `windows_profile_level_hardening_e2e` records:
 
 ```json
 {
@@ -39,6 +55,44 @@ artifacts/e2e/windows_appcontainer/<run-id>/
   "test_status": "passed",
   "fallback_decision": "not_needed",
   "action_result": "launched"
+}
+```
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "windows_firewall_policy_enforcement_e2e",
+  "bead_id": "flywheel_connectors-r4qcg.3",
+  "lifecycle_action": "applied",
+  "allow_rule_count": 1,
+  "stale_rules_cleaned": true,
+  "idempotent_reapply_verified": true,
+  "allowed_loopback_connect": true,
+  "forbidden_egress_denied": true,
+  "cleanup_verified": true,
+  "action_result": "enforced_and_cleaned"
+}
+```
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "windows_profile_level_hardening_e2e",
+  "bead_id": "flywheel_connectors-r4qcg.4",
+  "appcontainer_status": "active_verified",
+  "job_object_status": "active_verified",
+  "integrity_status": "active_verified",
+  "firewall_status": "active_verified",
+  "allowed_state_write": true,
+  "denied_high_integrity_write": true,
+  "denied_process_escape": true,
+  "firewall_enforced": true,
+  "profile_level_verified": true,
+  "reported_filter_strength": "profile_level",
+  "wasi_fallback_recommended": false,
+  "downgrade_on_layer_failure_verified": true,
+  "cleanup_verified": true,
+  "final_readiness_layer": "profile_level"
 }
 ```
 
@@ -141,14 +195,31 @@ if ($hr -ne 0) {
 If manual cleanup is required, record the profile name hash, reason, operator,
 and timestamp in the bead or incident record. Never run broad profile cleanup.
 
+### Manual Firewall Rule Cleanup
+
+Connector firewall rules are prefixed with `fcp-fw-<connector_id_hash>-` and are
+normally cleaned up automatically by `WindowsFirewallPolicyGuard::cleanup()` or
+`WindowsSandbox::cleanup_firewall_policy()`. To inspect or delete an orphaned
+connector rule manually from an elevated command prompt:
+
+```powershell
+# Inspect rules for a specific connector hash:
+reg query "HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules" /f "Name=fcp-fw-<connector_id_hash>-" /d
+
+# Delete a specific rule by exact name:
+netsh advfirewall firewall delete rule name="fcp-fw-<connector_id_hash>-tcp-443-<addr_hash>" dir=out
+```
+
 ## Differences From Linux And macOS
 
 | Platform | Primary sandbox proof | Readiness layer |
 |---|---|---|
 | Linux | seccomp/Landlock/user namespace depending on profile | `syscall_level` when active |
 | macOS | SBPL profile via sandbox APIs | `profile_level` |
-| Windows | Job Object limits plus AppContainer launch evidence | `process_limit` until launch proof is active |
+| Windows | Job Object limits + AppContainer launch + Low-Integrity primary child token + Windows Firewall egress policy | `profile_level` when all 4 layers are verified via `evaluate_windows_sandbox_readiness` (`process_limit` + `wasi_fallback_recommended: true` if any layer is missing or degraded) |
 
-Windows AppContainer support is an additional launch path, not evidence that
-all Windows sandbox features are complete. Low-integrity child launch evidence
-is covered by this bead; firewall egress hardening remains separate.
+Windows `evaluate_windows_sandbox_readiness` promotes `reported_filter_strength`
+to `profile_level` **only** when `appcontainer_status`, `job_object_status`,
+`integrity_status`, and `firewall_status` are all `active_verified`. Any skipped
+or degraded layer keeps `reported_filter_strength` at `process_limit` with
+`wasi_fallback_recommended: true`.

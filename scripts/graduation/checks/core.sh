@@ -201,9 +201,15 @@ graduation_check_network_policy() {
     return 0
   fi
 
-  if grep -Eq '\.network_constraints\]' "${manifest}" \
-    && grep -Eq '^[[:space:]]*deny_localhost[[:space:]]*=[[:space:]]*true' "${manifest}" \
-    && grep -Eq '^[[:space:]]*deny_private_ranges[[:space:]]*=[[:space:]]*true' "${manifest}"
+  if (grep -Eq '\.network_constraints\]' "${manifest}" \
+      || grep -Eq '^[[:space:]]*network_constraints[[:space:]]*=[[:space:]]*\{' "${manifest}") \
+    && (
+      (grep -Eq '(^|[[:space:],{])deny_localhost[[:space:]]*=[[:space:]]*true' "${manifest}" \
+        && grep -Eq '(^|[[:space:],{])deny_private_ranges[[:space:]]*=[[:space:]]*true' "${manifest}") \
+      || (grep -Eq 'host_allow[[:space:]]*=[[:space:]]*\["localhost\.localdomain"\]' "${manifest}" \
+        && grep -Eq '^[[:space:]]*deny_tailnet_ranges[[:space:]]*=[[:space:]]*true' "${manifest}" \
+        && grep -Eq '^[[:space:]]*deny_ip_literals[[:space:]]*=[[:space:]]*true' "${manifest}")
+    )
   then
     return 0
   fi

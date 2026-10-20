@@ -150,13 +150,17 @@ emit_inventory() {
   if [[ "${format}" == "markdown" ]]; then
     printf '| Category | Connector | README status |\n'
     printf '|----------|-----------|---------------|\n'
-    printf '%s\n' "${rows[@]}" | sort | while IFS='|' read -r category connector status; do
-      printf "| \`%s\` | \`%s\` | %s |\n" "${category}" "${connector}" "${status}"
-    done
+    if [[ "${#rows[@]}" -gt 0 ]]; then
+      printf '%s\n' "${rows[@]}" | sort | while IFS='|' read -r category connector status; do
+        printf "| \`%s\` | \`%s\` | %s |\n" "${category}" "${connector}" "${status}"
+      done
+    fi
     return 0
   fi
 
-  printf '%s\n' "${rows[@]}" | sort | cut -d'|' -f2
+  if [[ "${#rows[@]}" -gt 0 ]]; then
+    printf '%s\n' "${rows[@]}" | sort | cut -d'|' -f2
+  fi
 }
 
 FORMAT="plain"

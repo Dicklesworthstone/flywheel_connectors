@@ -1,0 +1,10 @@
+{
+  "schema": "fcp.kyopb.finding_disposition.v1",
+  "bead_id": "flywheel_connectors-kyopb.1.3.1.1.6.3",
+  "packet_path": "artifacts/proofs/kyopb_review_packet/2026-10-20/review_packet.json",
+  "review_status": "pending_external_reviewer",
+  "reviewer_identity": null,
+  "review_date": null,
+  "skip_reason": "External lattice-cryptography reviewer sign-off required; per bead acceptance criteria, self-review must not be used to close this gate.",
+  "findings": []
+}

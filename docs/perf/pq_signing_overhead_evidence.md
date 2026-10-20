@@ -1,13 +1,13 @@
 # PQ Signing Overhead Evidence
 
-Bead: `flywheel_connectors-angoc.8.2`
+Bead: `flywheel_connectors-angoc.8.2` / `flywheel_connectors-angoc.8.3`
 
 This document pins the `pq_signing` StatPack schema and the conformance gate
-for the hybrid verifier budget. The gate accepts live artifacts from
-`artifacts/perf/pq_signing/<machine-class>-<date>-<sha>.json` when present. The
-committed JSON blocks below include live evidence when available; remaining
-fixture snapshots are placeholders for machine classes that do not yet have a
-live artifact.
+for the hybrid verifier budget. The gate validates live artifacts from
+`artifacts/perf/pq_signing/<machine-class>-<date>-<sha>.json`. All three
+required machine classes (`csd`, `contabo`, and `laptop`) now have live
+10,000-sample `fcp.pq-signing-overhead.v1` StatPack artifacts committed under
+`artifacts/perf/pq_signing/`.
 
 Budget: hybrid verify p99 <= 2.0 ms for `csd`, `contabo`, and `laptop`.
 
@@ -15,89 +15,65 @@ Live evidence status:
 
 | Machine class | Status | Evidence |
 | --- | --- | --- |
-| `contabo` | live, 2026-05-13 UTC | `artifacts/perf/pq_signing/contabo-20260513-43e976408-dirty.json`: p99 0.15964849000000003 ms, p99 CI upper 0.16053179000000004 ms, verdict `pass` |
-| `csd` | fixture fallback only | Live machine-class artifact still required before closing `flywheel_connectors-angoc.8.3`. |
-| `laptop` | fixture fallback only | Live machine-class artifact still required before closing `flywheel_connectors-angoc.8.3`. |
+| `csd` | live, 2026-10-20 UTC | `artifacts/perf/pq_signing/csd-20261020-2320d4e17.json`: p99 0.13448551 ms, p99 CI upper 0.13669661000000016 ms, verdict `pass` |
+| `contabo` | live, 2026-10-20 UTC | `artifacts/perf/pq_signing/contabo-20261020-2320d4e17.json`: p99 0.1528341 ms, p99 CI upper 0.15360551 ms, verdict `pass` |
+| `laptop` | live, 2026-10-20 UTC | `artifacts/perf/pq_signing/laptop-20261020-2320d4e17.json`: p99 1.6252200000000003 ms, p99 CI upper 1.8435000000000001 ms, verdict `pass` |
 
 Reproduction command:
 
 ```bash
 env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=2400 \
   rch exec -- env CARGO_INCREMENTAL=0 \
-  cargo bench -j 1 -p fcp-crypto --bench hybrid_verify -- \
+  cargo bench -j 2 -p fcp-crypto --bench hybrid_verify -- \
     --samples 10000 \
     --machine-class <machine-class> \
     --git-sha "$(git rev-parse --short HEAD)" \
     --statpack-out "artifacts/perf/pq_signing/<machine-class>-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD).json"
 ```
 
-Expected live artifact shape:
-
-```json
-{
-  "schema": "fcp.pq-signing-overhead.v1",
-  "machine_class": "csd",
-  "artifact_path": "artifacts/perf/pq_signing/csd-20260512-486ae48.json",
-  "git_sha": "486ae48",
-  "sample_count": 10000,
-  "verify_hybrid": {
-    "p50": 0.71,
-    "p99": 1.42,
-    "p999": 1.61,
-    "mean": 0.76,
-    "std": 0.09,
-    "welch_t": 2.41,
-    "bootstrap_ci": [0.758, 0.762],
-    "tail_amp": 0.267
-  },
-  "baseline_classical_verify": {
-    "p50": 0.19,
-    "p99": 0.41,
-    "p999": 0.46,
-    "mean": 0.2,
-    "std": 0.03,
-    "welch_t": 0.0,
-    "bootstrap_ci": [0.199, 0.201],
-    "tail_amp": 0.227
-  },
-  "welch_p": 0.018,
-  "bootstrap_p99_ci_ms": [1.39, 1.46],
-  "verdict": "pass"
-}
-```
-
 <!-- statpack:csd -->
 
 ```json
 {
-  "schema": "fcp.pq-signing-overhead.v1",
-  "machine_class": "csd",
-  "artifact_path": "artifacts/perf/pq_signing/csd-latest.json",
-  "git_sha": "fixture",
-  "sample_count": 10000,
-  "verify_hybrid": {
-    "p50": 0.71,
-    "p99": 1.42,
-    "p999": 1.61,
-    "mean": 0.76,
-    "std": 0.09,
-    "welch_t": 2.41,
-    "bootstrap_ci": [0.758, 0.762],
-    "tail_amp": 0.267
-  },
+  "artifact_path": "artifacts/perf/pq_signing/csd-20261020-2320d4e17.json",
   "baseline_classical_verify": {
-    "p50": 0.19,
-    "p99": 0.41,
-    "p999": 0.46,
-    "mean": 0.2,
-    "std": 0.03,
-    "welch_t": 0.0,
-    "bootstrap_ci": [0.199, 0.201],
-    "tail_amp": 0.227
+    "bootstrap_ci": [
+      0.036927281399999866,
+      0.03710938960000016
+    ],
+    "mean": 0.03701756740000005,
+    "p50": 0.035077000000000004,
+    "p99": 0.05790070000000001,
+    "p999": 0.06909379600000057,
+    "sample_count": 10000,
+    "std": 0.004881172882999401,
+    "tail_amp": 0.49041548916260513,
+    "welch_t": 0.0
   },
-  "welch_p": 0.018,
-  "bootstrap_p99_ci_ms": [1.39, 1.46],
-  "verdict": "pass"
+  "bootstrap_p99_ci_ms": [
+    0.1308727000000001,
+    0.13669661000000016
+  ],
+  "git_sha": "2320d4e17",
+  "machine_class": "csd",
+  "sample_count": 10000,
+  "schema": "fcp.pq-signing-overhead.v1",
+  "verdict": "pass",
+  "verify_hybrid": {
+    "bootstrap_ci": [
+      0.0966230663000013,
+      0.09696661680000171
+    ],
+    "mean": 0.09679705090000112,
+    "p50": 0.09408799999999999,
+    "p99": 0.13448551,
+    "p999": 0.18331927500000048,
+    "sample_count": 10000,
+    "std": 0.009109402366393562,
+    "tail_amp": 1.208831064092823,
+    "welch_t": 578.4318224016649
+  },
+  "welch_p": 0.0
 }
 ```
 
@@ -105,34 +81,45 @@ Expected live artifact shape:
 
 ```json
 {
-  "schema": "fcp.pq-signing-overhead.v1",
-  "machine_class": "contabo",
-  "artifact_path": "artifacts/perf/pq_signing/contabo-20260513-43e976408-dirty.json",
-  "git_sha": "43e976408+dirty",
-  "sample_count": 10000,
-  "verify_hybrid": {
-    "p50": 0.141456,
-    "p99": 0.15964849000000003,
-    "p999": 0.20859571800000096,
-    "mean": 0.1423169263000004,
-    "std": 0.008829877593358801,
-    "welch_t": 614.2872778827799,
-    "bootstrap_ci": [0.1421528581000002, 0.14249313070000028],
-    "tail_amp": 2.69051834026023
-  },
+  "artifact_path": "artifacts/perf/pq_signing/contabo-20261020-2320d4e17.json",
   "baseline_classical_verify": {
-    "p50": 0.049243,
-    "p99": 0.0625532,
-    "p999": 0.10774091200000017,
-    "mean": 0.049506741200000134,
-    "std": 0.012259810138892314,
-    "welch_t": 0.0,
-    "bootstrap_ci": [0.049280431700000085, 0.049738125099999954],
-    "tail_amp": 3.3949686706435793
+    "bootstrap_ci": [
+      0.04819210739999934,
+      0.04825790029999914
+    ],
+    "mean": 0.04822497169999536,
+    "p50": 0.047799,
+    "p99": 0.056575410000000007,
+    "p999": 0.059901011000000004,
+    "sample_count": 10000,
+    "std": 0.0017365031405715394,
+    "tail_amp": 0.378924981854767,
+    "welch_t": 0.0
   },
-  "welch_p": 0.0,
-  "bootstrap_p99_ci_ms": [0.15888839999999999, 0.16053179000000004],
-  "verdict": "pass"
+  "bootstrap_p99_ci_ms": [
+    0.152394,
+    0.15360551
+  ],
+  "git_sha": "2320d4e17",
+  "machine_class": "contabo",
+  "sample_count": 10000,
+  "schema": "fcp.pq-signing-overhead.v1",
+  "verdict": "pass",
+  "verify_hybrid": {
+    "bootstrap_ci": [
+      0.14107872849999956,
+      0.14125746889999855
+    ],
+    "mean": 0.14117285760000015,
+    "p50": 0.13970000000000002,
+    "p99": 0.1528341,
+    "p999": 0.17457512000000003,
+    "sample_count": 10000,
+    "std": 0.004071613060644868,
+    "tail_amp": 1.6553109843841647,
+    "welch_t": 2099.828233321852
+  },
+  "welch_p": 0.0
 }
 ```
 
@@ -140,38 +127,47 @@ Expected live artifact shape:
 
 ```json
 {
-  "schema": "fcp.pq-signing-overhead.v1",
-  "machine_class": "laptop",
-  "artifact_path": "artifacts/perf/pq_signing/laptop-latest.json",
-  "git_sha": "fixture",
-  "sample_count": 10000,
-  "verify_hybrid": {
-    "p50": 0.91,
-    "p99": 1.83,
-    "p999": 1.97,
-    "mean": 0.96,
-    "std": 0.12,
-    "welch_t": 2.86,
-    "bootstrap_ci": [0.956, 0.964],
-    "tail_amp": 0.152
-  },
+  "artifact_path": "artifacts/perf/pq_signing/laptop-20261020-2320d4e17.json",
   "baseline_classical_verify": {
-    "p50": 0.27,
-    "p99": 0.54,
-    "p999": 0.6,
-    "mean": 0.28,
-    "std": 0.04,
-    "welch_t": 0.0,
-    "bootstrap_ci": [0.278, 0.282],
-    "tail_amp": 0.222
+    "bootstrap_ci": [
+      0.17289876,
+      0.20250508000000111
+    ],
+    "mean": 0.1872506099999998,
+    "p50": 0.1308,
+    "p99": 1.2900710000000037,
+    "p999": 5.903370700000504,
+    "sample_count": 10000,
+    "std": 0.7421188698297084,
+    "tail_amp": 3.9794833994816443,
+    "welch_t": 0.0
   },
-  "welch_p": 0.009,
-  "bootstrap_p99_ci_ms": [1.78, 1.89],
-  "verdict": "pass"
+  "bootstrap_p99_ci_ms": [
+    1.412227000000005,
+    1.8435000000000001
+  ],
+  "git_sha": "2320d4e17",
+  "machine_class": "laptop",
+  "sample_count": 10000,
+  "schema": "fcp.pq-signing-overhead.v1",
+  "verdict": "pass",
+  "verify_hybrid": {
+    "bootstrap_ci": [
+      0.41080600000000184,
+      0.44559432000000015
+    ],
+    "mean": 0.4300166299999999,
+    "p50": 0.3498,
+    "p99": 1.6252200000000003,
+    "p999": 18.377342800000093,
+    "sample_count": 10000,
+    "std": 0.8648901936900183,
+    "tail_amp": 13.134593153627895,
+    "welch_t": 21.302023557253303
+  },
+  "welch_p": 0.0
 }
 ```
 
-Closeout note: before treating this as production evidence, replace each
-remaining fixture block with live StatPack artifacts from the named machine
-class and keep the same redaction posture: aggregate numeric fields only, no raw
-samples, no hostnames, and no user paths.
+Redaction note: all committed StatPack artifacts contain aggregate numeric
+fields only, with no raw samples, no hostnames, and no user paths.

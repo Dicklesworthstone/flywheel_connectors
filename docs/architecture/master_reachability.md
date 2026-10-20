@@ -44,12 +44,12 @@ Each row records:
 ### 3. Zone Isolation
 
 - claim: Zone Isolation
-- status: LIMITED
+- status: PROVEN
 - code_path: `crates/fcp-core/src/zone_keys.rs`
-- test_path: `crates/fcp-host/src/bin/fcp-host.rs`
-- test_fn: `verify_live_request_empty_allowed_zones_requires_zone_envelope`
+- test_path: `crates/fcp-e2e/tests/zone_isolation_full_e2e.rs`
+- test_fn: `test_audit_chain_continuity_under_rejection`
 - proof_path: `lean/Fcp/Zone/Lattice.lean`
-- pending: "graduation to PROVEN tracked by flywheel_connectors-angoc.2 (Phase C)"
+- no_formal_model_reason: "Lean 4.29.1 zone-lattice proof + 5-zone cross-zone E2E JSONL artifact pinned in docs/formal/zone-isolation-closeout-evidence.json"
 
 ### 4. Capability Tokens (CWT/COSE)
 
@@ -266,7 +266,7 @@ Each row records:
 - Total README rows: 24
 - Rows with `code_path` + `test_path` + (`proof_path` OR `no_formal_model_reason`): 24
 - Rows with formal-model proof artifact: 3 (Zone Isolation lean lattice, Capability Tokens typestate compile-fail, Symbol-First golden vectors); plus 2 pending (Threshold Owner Key, Mesh-Native cutover) tracked by named angoc beads
-- Rows still `LIMITED` or `STEADY-STATE TARGET`: 2 (Zone Isolation, Mesh-Native Architecture) — each has an explicit pending bead pointer
+- Rows still `STEADY-STATE TARGET`: 1 (Mesh-Native Architecture) — has an explicit pending bead pointer (`23 PROVEN`, `0 LIMITED`, `1 STEADY-STATE TARGET`)
 
 ## Cross-references
 

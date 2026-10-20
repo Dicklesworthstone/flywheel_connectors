@@ -4,7 +4,9 @@
     {
       "feature": "Zone Isolation",
       "gate_status": "PROVEN",
-      "accepted_shas": [],
+      "accepted_shas": [
+        "2320d4e175d10309b3b39b8e97a36da057b6e021"
+      ],
       "required_artifacts": [
         {
           "id": "lean-verify-zone-lattice",

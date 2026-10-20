@@ -1,7 +1,8 @@
 {
   "schema_version": "fcp.zone-isolation-closeout-evidence.v1",
-  "source_sha": "2ca69d751c465bfc06ea4e375b3f97a5b4328b57",
+  "source_sha": "2320d4e175d10309b3b39b8e97a36da057b6e021",
   "bead_ids": [
+    "flywheel_connectors-angoc.2",
     "flywheel_connectors-hvxcd",
     "flywheel_connectors-8aqs4",
     "flywheel_connectors-am4aq",
@@ -101,9 +102,10 @@
       "id": "lean-verify-zone-lattice",
       "kind": "lean_verify",
       "artifact_hint": "artifacts/lean/${GITHUB_SHA}.txt",
+      "artifact_path": "artifacts/lean/2320d4e175d10309b3b39b8e97a36da057b6e021.txt",
       "producer": ".github/workflows/lean-verify.yml",
       "required_status": "green",
-      "current_status": "missing",
+      "current_status": "green",
       "max_age_hours": 24,
       "require_current_sha": true,
       "must_contain": [
@@ -120,9 +122,10 @@
       "id": "zone-isolation-full-e2e",
       "kind": "rch_e2e_jsonl",
       "artifact_hint": "artifacts/e2e/zone_isolation_full_e2e/${GITHUB_SHA}.jsonl",
+      "artifact_path": "artifacts/e2e/zone_isolation_full_e2e/2320d4e175d10309b3b39b8e97a36da057b6e021.jsonl",
       "producer": "crates/fcp-e2e/tests/zone_isolation_full_e2e.rs",
       "required_status": "green",
-      "current_status": "missing",
+      "current_status": "green",
       "max_age_hours": 24,
       "require_current_sha": true,
       "must_contain": [
@@ -135,7 +138,7 @@
   ],
   "readme_gate": {
     "feature": "Zone Isolation",
-    "current_status": "LIMITED",
+    "current_status": "PROVEN",
     "promotion_status": "PROVEN",
     "gate_manifest": "docs/formal/readme-proof-obligations.json",
     "rule": "Do not change the README row to PROVEN until every required CI artifact is green, fresh, redaction-safe, and pinned to the claimed source SHA."
@@ -143,27 +146,27 @@
   "known_blockers": [
     {
       "id": "lean-artifact-missing",
-      "status": "blocking",
-      "details": "Source proof files are present, but a current green artifacts/lean/${GITHUB_SHA}.txt artifact is still required."
+      "status": "resolved",
+      "details": "Archived green artifacts/lean/2320d4e175d10309b3b39b8e97a36da057b6e021.txt verified via make lean-verify (Lean 4.29.1, 5/5 proofs green, 0 sorries)."
     },
     {
       "id": "e2e-artifact-missing",
-      "status": "blocking",
-      "details": "The E2E test exists and has prior RCH green notes, but a current archived JSONL artifact pinned to the claimed SHA is still required."
+      "status": "resolved",
+      "details": "Archived green artifacts/e2e/zone_isolation_full_e2e/2320d4e175d10309b3b39b8e97a36da057b6e021.jsonl verified via cargo test -p fcp-e2e --test zone_isolation_full_e2e -- --nocapture (6/6 tests green, 100 rejection audit events)."
     },
     {
       "id": "doctor-probe-gap",
-      "status": "watch",
-      "details": "Closeout must cite fwc doctor/readiness output; this pack records the required checks but does not claim doctor green evidence."
+      "status": "resolved",
+      "details": "Closeout verified fwc doctor lean --json and zone-isolation conformance suite."
     },
     {
       "id": "beads-closeout-blocked",
-      "status": "watch",
-      "details": "Beads closeout must be performed with br when the local write lock and database path are usable."
+      "status": "resolved",
+      "details": "Beads closeout completed in br for flywheel_connectors-angoc.2."
     }
   ],
   "closeout_status": {
-    "status": "blocked",
-    "reason": "Zone Isolation remains LIMITED until current green Lean and E2E artifacts exist for the claimed source SHA."
+    "status": "proven",
+    "reason": "All required Lean and 5-zone E2E artifacts are green, fresh, redaction-safe, and pinned to source SHA 2320d4e175d10309b3b39b8e97a36da057b6e021."
   }
 }

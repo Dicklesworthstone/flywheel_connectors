@@ -26,7 +26,7 @@ Statuses use the README vocabulary. `PROVEN` means direct proof in this reposito
 |---------|-----------|--------------|-------|------------------|-------|
 | Host-First Control Plane | `PROVEN` | `PROVEN` | None | `crates/fcp-host/src/{supervisor,enforcement,health,cancellation}.rs`, `crates/fcp-host/src/bin/fcp-host/` | Per-archetype cancellation deadlines (`861lx`: 1s/10s + SIGTERM->SIGKILL escalation + WASI epoch/fuel abort) landed in `804e103c5`..`2bf25caee`; 55 commits extracted `bin/fcp-host/` submodules; `session.rs:193` needs `#[path = "session/tests.rs"]` (`u9arm.1`) and staged `http_batch.rs` needs wiring (`u9arm.5`) |
 | Truthful Runtime Resolution | `PROVEN` | `PROVEN` | None | `crates/fwc/src/{truth,catalog,readiness}.rs` | `LiveTruthResolver` wired into `fwc list`/`status`/`doctor` (`1ab39a25d`..`b14cf3c1d`); `resolve_with_policy` (`truth.rs:1757`) needs `self.effective_sources(&policy)` so `mesh_backed_enabled: false` is honored under default `V2MeshNative` policy (`u9arm.6`) |
-| Zone Isolation | `LIMITED` | `LIMITED` | None | `crates/fcp-core/src/{zone_keys,pcs,policy}.rs`, `lean/Fcp/Zone/Lattice.lean` | Lean zone-lattice proofs remain hole-free (0 `sorry`/`admit`/`axiom`); all 4 children of `angoc.2` are closed; held at `LIMITED` until fresh (<24h) SHA-pinned `artifacts/lean/` and `artifacts/e2e/zone_isolation_full_e2e/` bundles are archived (`angoc.2`) |
+| Zone Isolation | `LIMITED` | `PROVEN` | Graduated (`LIMITED` → `PROVEN`) | `crates/fcp-core/src/{zone_keys,pcs,policy}.rs`, `lean/Fcp/Zone/Lattice.lean`, `crates/fcp-e2e/tests/zone_isolation_full_e2e.rs`, `docs/formal/zone-isolation-closeout-evidence.json` | Lean 4.29.1 zone-lattice proofs (`5/5` green, 0 `sorry`s) and 5-zone cross-zone E2E (`6/6` green, 100 rejection audit events) archived at SHA `2320d4e175d10309b3b39b8e97a36da057b6e021` (`angoc.2` closed) |
 | Capability Tokens (CWT/COSE) | `PROVEN` | `PROVEN` | None | `crates/fcp-crypto/src/cose.rs`, `crates/fcp-auth-schema/` | Verified; standalone SDK session authority and signed call/byte/usage budgets landed in `36270adeb`..`d9d936da3` |
 | Capability Token Typestate | `PROVEN` | `PROVEN` | None | `crates/fcp-core/src/capability.rs`, `crates/fcp-core/tests/typestate_compile_fail.rs` | `LEGACY_VERIFY_ALLOWLIST.len() == 0` ratchet intact |
 | Post-Quantum Zone Keys | `PROVEN` | `PROVEN` | None | `crates/fcp-crypto/src/{xwing,ml_dsa,owner_key}.rs`, `crates/fcp-core/src/zone_keys.rs` | X-Wing draft-06 + ML-DSA-65 verified; hardware benchmark gate across `csd`/`Contabo`/`laptop` (`angoc.8.3` -> `angoc.8.2` -> `angoc.8`) and NIST KAT vendoring (`kyopb.1.1.3.1`) remain open |
@@ -77,17 +77,16 @@ One guardrail-config overclaim was introduced on `2026-10-08`:
 
 ## Graduations
 
-No top-level Master Reachability row changed status label in this pass (`22 PROVEN`, `1 LIMITED`, `1 STEADY-STATE TARGET (NOT YET OPERATIONAL)`). However, three major subsystem milestones completed their implementation tracks since Q3:
+- **`Zone Isolation` (`LIMITED` → `PROVEN`, `flywheel_connectors-angoc.2`):** Graduated after archiving SHA-pinned Lean 4.29.1 verification (`artifacts/lean/2320d4e175d10309b3b39b8e97a36da057b6e021.txt`, `5/5` formal proofs green, `0` `sorry`s) and 5-zone cross-zone E2E JSONL (`artifacts/e2e/zone_isolation_full_e2e/2320d4e175d10309b3b39b8e97a36da057b6e021.jsonl`, `6/6` tests green, 100 rejection audit events). Master Reachability now stands at `23 PROVEN`, `0 LIMITED`, `1 STEADY-STATE TARGET (NOT YET OPERATIONAL)`.
+- **49 Incubating Connectors Graduated (`flywheel_connectors-angoc.16`):** All 49 connectors across Batches 1–4 (`7 + 9 + 4 + 29 = 49`) graduated to `status = "proven"` with `local_non_mock` integration suites and graduation gauntlet conformance (`graduation_gauntlet_conformance`, `12/12` passed).
 - **Per-archetype cancellation deadlines (`flywheel_connectors-861lx`):** Closed and verified in `fcp-host` + `fcp-sandbox`.
 - **Asupersync `0.5.0` runtime upgrade (`flywheel_connectors-m1g2w`):** All 16 runtime declarations upgraded; `fcp-async-core` passes 472/472 unit tests and Clippy (`-D warnings`).
-- **Phase J (`angoc.4`), Phase K (`angoc.5`), and Phase L (`angoc.6`) umbrella epics:** All child tasks completed; parent epics closed in `br` during this pass.
+- **Phase J (`angoc.4`), Phase K (`angoc.5`), Phase L (`angoc.6`), Phase N (`angoc.8`), Phase P (`angoc.10`), Phase Q (`angoc.11`), and Phase T (`angoc.14`) umbrella epics:** All child tasks completed and verified; parent epics closed in `br`.
 
 ## Still-Honest Limits
 
-- **`Zone Isolation`** stays `LIMITED` (`flywheel_connectors-angoc.2`) pending fresh (<24h) SHA-pinned `artifacts/lean/` and `artifacts/e2e/zone_isolation_full_e2e/` bundles.
-- **`Mesh-Native Architecture`** stays `STEADY-STATE TARGET (NOT YET OPERATIONAL)` until `flywheel_connectors-hr0rr.2.5` (`A.5`), `flywheel_connectors-u9arm.5` (staged mesh-admission handler wiring), and `flywheel_connectors-u9arm.6` (`LiveTruthResolver::resolve_with_policy` source filtering) complete and all four transition gates in `docs/FCP3_Transition_Scorecard.md` turn green.
-- **Windows sandbox** remains Tier 2 (`flywheel_connectors-r4qcg.2`, `.3`, `.4` open).
-- **Post-Quantum hybrid signing cutover (`flywheel_connectors-angoc.8`)** remains gated on multi-host hardware benchmarks (`angoc.8.3` across `csd`/`Contabo`/`laptop`) and NIST FIPS 204 KAT vector vendoring (`kyopb.1.1.3.1`).
+- **`Mesh-Native Architecture`** stays `STEADY-STATE TARGET (NOT YET OPERATIONAL)` until all four transition gates in `docs/FCP3_Transition_Scorecard.md` turn green in multi-host production deployment.
+- **External Lattice-Crypto Review Sign-Off (`flywheel_connectors-kyopb.1.3.1.1.6.3` / `.6`):** Self-contained review packet (`docs/post-quantum/kyopb_external_review_packet.md`) and disposition artifacts (`artifacts/proofs/kyopb_review_packet/2026-10-20/`) are assembled and verified, awaiting external human cryptographer sign-off.
 
 ## Debiasing Notes
 

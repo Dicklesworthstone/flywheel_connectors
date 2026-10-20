@@ -344,6 +344,10 @@ run_batch_status() {
       ;;
   esac
 
+  if [[ -n "${JSONL_PATH}" ]]; then
+    : > "${JSONL_PATH}"
+  fi
+
   for connector in "${batch_connectors[@]}"; do
     connector_path="$(normalize_path "${connector}")"
     run_connector_checks "${connector}" "${connector_path}" 0

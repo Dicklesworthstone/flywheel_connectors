@@ -125,8 +125,20 @@ local_target/
 tmp_target/
 tmp_target_*/
 
-# Build/test artifacts directory
-artifacts/
+# Build/test artifacts directory (preserve curated proof artifacts)
+artifacts/*
+!artifacts/lean/
+artifacts/lean/*
+!artifacts/lean/*.txt
+!artifacts/e2e/
+artifacts/e2e/*
+!artifacts/e2e/zone_isolation_full_e2e/
+artifacts/e2e/zone_isolation_full_e2e/*
+!artifacts/e2e/zone_isolation_full_e2e/*.jsonl
+!artifacts/proofs/
+artifacts/proofs/*
+!artifacts/proofs/kyopb_review_packet/
+!artifacts/proofs/kyopb_review_packet/**
 # Downloaded tool binaries (tla2tools.jar etc.; CI downloads its own copies)
 tools/
 
