@@ -1,4 +1,4 @@
-//! CircleCI connector error types.
+//! `CircleCI` connector error types.
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use fcp_sdk::ConnectorErrorMapping;
 use fcp_sdk::migration::classify_http_status;
 use thiserror::Error;
 
-/// CircleCI connector errors.
+/// `CircleCI` connector errors.
 #[derive(Error, Debug)]
 pub enum Error {
     /// HTTP transport error.
@@ -19,11 +19,11 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// CircleCI API returned an error response.
+    /// `CircleCI` API returned an error response.
     #[error("CircleCI API error ({status}): {message}")]
     Api { status: u16, message: String },
 
-    /// Rate limited by CircleCI API.
+    /// Rate limited by `CircleCI` API.
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
 
@@ -46,6 +46,7 @@ pub enum Error {
 
 impl Error {
     /// Whether this error is retryable.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(_) | Self::RateLimited { .. } | Self::Async(_) => true,
@@ -57,6 +58,7 @@ impl Error {
     }
 
     /// Suggested retry-after delay.
+    #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after_ms } => Some(Duration::from_millis(*retry_after_ms)),
@@ -65,6 +67,7 @@ impl Error {
     }
 
     /// Convert to FCP error taxonomy.
+    #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
             Self::Http(e) => FcpError::External {

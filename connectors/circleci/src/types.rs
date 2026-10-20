@@ -1,4 +1,4 @@
-//! CircleCI API types.
+//! `CircleCI` API types.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 // Pipeline types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Pipeline representation from CircleCI API v2.
+/// Pipeline representation from `CircleCI` API v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pipeline {
     pub id: String,
@@ -74,7 +74,7 @@ pub struct TriggerPipelineRequest {
 // Workflow types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Workflow representation from CircleCI API v2.
+/// Workflow representation from `CircleCI` API v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub id: String,
@@ -94,7 +94,7 @@ pub struct Workflow {
 // Job types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Job representation from CircleCI API v2.
+/// Job representation from `CircleCI` API v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -115,7 +115,7 @@ pub struct Job {
 // Project types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Project representation from CircleCI API v2.
+/// Project representation from `CircleCI` API v2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub slug: String,
@@ -138,7 +138,7 @@ pub struct ProjectVcsInfo {
 // API response types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Paginated list response from CircleCI.
+/// Paginated list response from `CircleCI`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
@@ -146,7 +146,7 @@ pub struct PaginatedResponse<T> {
     pub next_page_token: Option<String>,
 }
 
-/// CircleCI API error response.
+/// `CircleCI` API error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorResponse {
     pub message: String,

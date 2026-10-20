@@ -1,4 +1,4 @@
-//! CircleCI connector implementation.
+//! `CircleCI` connector implementation.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ const CAP_WORKFLOWS_WRITE: &str = "circleci.workflows.write";
 const CAP_JOBS_READ: &str = "circleci.jobs.read";
 const CAP_PROJECTS_READ: &str = "circleci.projects.read";
 
-/// CircleCI connector configuration.
+/// `CircleCI` connector configuration.
 #[derive(Clone, Deserialize)]
 struct CircleCiConfig {
     #[serde(default = "default_base_url")]
@@ -203,7 +203,7 @@ impl DoctorResult {
     }
 }
 
-/// CircleCI connector state.
+/// `CircleCI` connector state.
 #[derive(Debug)]
 pub struct CircleCiConnector {
     base: BaseConnector,
@@ -241,6 +241,7 @@ impl CircleCiConnector {
     }
 
     /// Run connector diagnostics.
+    #[must_use]
     pub fn doctor(&self) -> DoctorResult {
         let mut checks = Vec::new();
 
@@ -298,7 +299,10 @@ impl CircleCiConnector {
                 critical: true,
             });
 
-            let secretless = self.client.as_ref().is_some_and(|c| c.is_secretless());
+            let secretless = self
+                .client
+                .as_ref()
+                .is_some_and(CircleCiClient::is_secretless);
             checks.push(DoctorCheck {
                 name: "credential_mode".into(),
                 passed: !secretless,
@@ -322,6 +326,7 @@ impl Default for CircleCiConnector {
 }
 
 /// Build the typed operations catalog.
+#[must_use]
 pub fn operations_info() -> Vec<OperationInfo> {
     static OPERATIONS: OnceLock<Vec<OperationInfo>> = OnceLock::new();
     OPERATIONS
@@ -353,8 +358,8 @@ fn operation_order(operation_id: &str) -> usize {
         .unwrap_or(OPERATION_ORDER.len())
 }
 
-fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> Option<ApprovalMode> {
-    Some(ApprovalMode::from(mode))
+fn approval_mode_from_manifest(mode: ManifestApprovalMode) -> ApprovalMode {
+    ApprovalMode::from(mode)
 }
 
 fn operation_info_from_manifest(id: String, operation: &OperationSection) -> OperationInfo {
@@ -374,7 +379,7 @@ fn operation_info_from_manifest(id: String, operation: &OperationSection) -> Ope
             .rate_limit
             .as_ref()
             .map(|rate_limit| rate_limit.0.clone()),
-        requires_approval: approval_mode_from_manifest(operation.requires_approval),
+        requires_approval: Some(approval_mode_from_manifest(operation.requires_approval)),
     }
 }
 
@@ -455,40 +460,43 @@ impl FcpConnector for CircleCiConnector {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        let mut snapshot = if let Some(config) = self.config.as_ref() {
-            let credential_injection_required = self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.is_secretless());
-            let (manifest_network_policy_aligned, manifest_network_policy_message) =
-                base_url_manifest_alignment(&config.base_url);
+        let mut snapshot = self.config.as_ref().map_or_else(
+            || {
+                let mut snapshot = HealthSnapshot::degraded("not configured");
+                snapshot.details = Some(json!({
+                    "configured": false,
+                    "client_initialized": false,
+                }));
+                snapshot
+            },
+            |config| {
+                let credential_injection_required = self
+                    .client
+                    .as_ref()
+                    .is_some_and(CircleCiClient::is_secretless);
+                let (manifest_network_policy_aligned, manifest_network_policy_message) =
+                    base_url_manifest_alignment(&config.base_url);
 
-            let mut snapshot = if credential_injection_required {
-                HealthSnapshot::degraded("credential injection required")
-            } else if manifest_network_policy_aligned {
-                HealthSnapshot::ready()
-            } else {
-                HealthSnapshot::degraded("base_url outside manifest policy")
-            };
-            snapshot.details = Some(json!({
-                "configured": true,
-                "client_initialized": self.client.is_some(),
-                "base_url": config.base_url.as_str(),
-                "request_timeout_ms": config.request_timeout_ms,
-                "auth_mode": if credential_injection_required { "credential_injection" } else { "api_token" },
-                "credential_injection_required": credential_injection_required,
-                "manifest_network_policy_aligned": manifest_network_policy_aligned,
-                "manifest_network_policy_message": manifest_network_policy_message,
-            }));
-            snapshot
-        } else {
-            let mut snapshot = HealthSnapshot::degraded("not configured");
-            snapshot.details = Some(json!({
-                "configured": false,
-                "client_initialized": false,
-            }));
-            snapshot
-        };
+                let mut snapshot = if credential_injection_required {
+                    HealthSnapshot::degraded("credential injection required")
+                } else if manifest_network_policy_aligned {
+                    HealthSnapshot::ready()
+                } else {
+                    HealthSnapshot::degraded("base_url outside manifest policy")
+                };
+                snapshot.details = Some(json!({
+                    "configured": true,
+                    "client_initialized": self.client.is_some(),
+                    "base_url": config.base_url.as_str(),
+                    "request_timeout_ms": config.request_timeout_ms,
+                    "auth_mode": if credential_injection_required { "credential_injection" } else { "api_token" },
+                    "credential_injection_required": credential_injection_required,
+                    "manifest_network_policy_aligned": manifest_network_policy_aligned,
+                    "manifest_network_policy_message": manifest_network_policy_message,
+                }));
+                snapshot
+            },
+        );
         snapshot.uptime_ms =
             u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         snapshot
@@ -638,20 +646,21 @@ impl FcpConnector for CircleCiConnector {
 }
 
 impl CircleCiConnector {
+    #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
         self.base.check_ready()?;
         let operation = req.operation.as_str();
 
-        let verifier = self.verifier.as_ref().ok_or(FcpError::Internal {
+        let verifier = self.verifier.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Capability verifier missing after successful handshake".into(),
         })?;
         let required_cap = required_capability(operation)?;
         verifier.verify_bound(req.capability_token, &required_cap, &req.operation, &[])?;
 
-        let runtime = self.runtime.as_ref().ok_or(FcpError::Internal {
+        let runtime = self.runtime.as_ref().ok_or_else(|| FcpError::Internal {
             message: "Connector runtime missing after configure".into(),
         })?;
-        let client = self.client.as_ref().ok_or(FcpError::Internal {
+        let client = self.client.as_ref().ok_or_else(|| FcpError::Internal {
             message: "CircleCI client missing after configure".into(),
         })?;
 
@@ -661,7 +670,7 @@ impl CircleCiConnector {
                     .input
                     .get("project_slug")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'project_slug' field".into(),
                     })?;
@@ -679,7 +688,7 @@ impl CircleCiConnector {
                     .input
                     .get("pipeline_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'pipeline_id' field".into(),
                     })?;
@@ -696,7 +705,7 @@ impl CircleCiConnector {
                     .input
                     .get("project_slug")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'project_slug' field".into(),
                     })?;
@@ -723,7 +732,7 @@ impl CircleCiConnector {
                     .input
                     .get("pipeline_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'pipeline_id' field".into(),
                     })?;
@@ -741,7 +750,7 @@ impl CircleCiConnector {
                     .input
                     .get("workflow_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'workflow_id' field".into(),
                     })?;
@@ -758,7 +767,7 @@ impl CircleCiConnector {
                     .input
                     .get("workflow_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'workflow_id' field".into(),
                     })?;
@@ -775,14 +784,14 @@ impl CircleCiConnector {
                     .input
                     .get("workflow_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'workflow_id' field".into(),
                     })?;
                 let from_failed = req
                     .input
                     .get("from_failed")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let resp = client
                     .rerun_workflow(runtime, workflow_id, from_failed)
@@ -797,7 +806,7 @@ impl CircleCiConnector {
                     .input
                     .get("workflow_id")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'workflow_id' field".into(),
                     })?;
@@ -815,16 +824,18 @@ impl CircleCiConnector {
                     .input
                     .get("project_slug")
                     .and_then(|v| v.as_str())
-                    .ok_or(FcpError::InvalidRequest {
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing 'project_slug' field".into(),
                     })?;
-                let job_number = req.input.get("job_number").and_then(|v| v.as_u64()).ok_or(
-                    FcpError::InvalidRequest {
+                let job_number = req
+                    .input
+                    .get("job_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| FcpError::InvalidRequest {
                         code: 1005,
                         message: "Missing or invalid 'job_number' field".into(),
-                    },
-                )?;
+                    })?;
                 let resp = client
                     .get_job(runtime, project_slug, job_number)
                     .await

@@ -1,4 +1,4 @@
-//! CircleCI API client with retry support.
+//! `CircleCI` API client with retry support.
 
 use fcp_prelude::log_redaction::redact_url;
 use fcp_sdk::ConnectorRuntime;
@@ -16,7 +16,7 @@ use crate::types::{
     ApiErrorResponse, Job, MessageResponse, PaginatedResponse, Pipeline, Project, Workflow,
 };
 
-/// CircleCI API client with retry and runtime integration.
+/// `CircleCI` API client with retry and runtime integration.
 pub struct CircleCiClient {
     client: Client,
     base_url: String,
@@ -30,7 +30,7 @@ impl std::fmt::Debug for CircleCiClient {
             .field("base_url", &self.base_url)
             .field("api_token", &"[REDACTED]")
             .field("retry_config", &self.retry_config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -50,8 +50,9 @@ fn sanitize_path_segment(segment: &str) -> Result<&str> {
     Ok(segment)
 }
 
+#[allow(clippy::missing_errors_doc)]
 impl CircleCiClient {
-    /// Create a new CircleCI client.
+    /// Create a new `CircleCI` client.
     ///
     /// # Errors
     ///
@@ -287,11 +288,13 @@ impl CircleCiClient {
     }
 
     /// Get the base URL (for diagnostics).
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     /// Check if using secretless mode.
+    #[must_use]
     pub fn is_secretless(&self) -> bool {
         self.api_token.is_empty()
     }
@@ -339,9 +342,9 @@ impl CircleCiClient {
     /// Generic POST with retry, returning deserialized JSON.
     ///
     /// `replay_safe` states whether repeating this request can duplicate a
-    /// side effect (br-kxd3e). CircleCI offers no idempotency key, so a POST
+    /// side effect (br-kxd3e). `CircleCI` offers no idempotency key, so a POST
     /// that starts work must set it to `false`: a 5xx or a timeout can both be
-    /// reported after CircleCI already queued the run.
+    /// reported after `CircleCI` already queued the run.
     async fn post_with_retry<T: serde::de::DeserializeOwned>(
         &self,
         runtime: &ConnectorRuntime,
@@ -405,7 +408,10 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: Error::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
@@ -458,7 +464,10 @@ async fn handle_response_as_list<T: serde::de::DeserializeOwned>(
             .map(Duration::from_secs);
         return AttemptOutcome::Retryable {
             error: Error::RateLimited {
-                retry_after_ms: retry_after.unwrap_or(Duration::from_secs(30)).as_millis() as u64,
+                retry_after_ms: u64::try_from(
+                    retry_after.unwrap_or(Duration::from_secs(30)).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
             },
             retry_after,
         };
