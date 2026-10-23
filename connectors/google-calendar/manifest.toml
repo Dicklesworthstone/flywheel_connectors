@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:03af9e040d13d590435dd4ee9cc90edc223de9583217f9969eb3cc0ecaee3f1a"
+interface_hash = "blake3-256:fcp.interface.v2:2de73f709e5548ef6fc473e0284995ab8aa1ba8b6d88fe785c5b0a3d643c2911"
 
 [connector]
 id = "fcp.google-calendar"
@@ -138,17 +138,32 @@ capability = "gcal.write"
 risk_level = "medium"
 safety_tier = "risky"
 requires_approval = "policy"
-idempotency = "strict"
+idempotency = "best_effort"
 
 [provides.operations."gcal.update_event".input_schema]
 required = ["calendar_id", "event_id"]
 type = "object"
+anyOf = [{ required = ["summary"] }, { required = ["description"] }, { required = ["location"] }, { required = ["start"] }, { required = ["end"] }, { required = ["attendees"] }]
 [provides.operations."gcal.update_event".input_schema.properties.calendar_id]
 type = "string"
 [provides.operations."gcal.update_event".input_schema.properties.event_id]
 type = "string"
 [provides.operations."gcal.update_event".input_schema.properties.summary]
 type = "string"
+[provides.operations."gcal.update_event".input_schema.properties.description]
+type = "string"
+[provides.operations."gcal.update_event".input_schema.properties.location]
+type = "string"
+[provides.operations."gcal.update_event".input_schema.properties.start]
+type = "string"
+description = "New start time (RFC 3339 with an offset)"
+[provides.operations."gcal.update_event".input_schema.properties.end]
+type = "string"
+description = "New end time (RFC 3339 with an offset)"
+[provides.operations."gcal.update_event".input_schema.properties.attendees]
+type = "array"
+items = { type = "object" }
+description = "Replace attendee list; [] removes all attendees. Omit to preserve existing attendees."
 
 [provides.operations."gcal.update_event".output_schema]
 required = ["event"]
@@ -172,8 +187,8 @@ total_timeout_ms = 30000
 max_response_bytes = 1048576
 
 [provides.operations."gcal.update_event".ai_hints]
-when_to_use = "Update an existing calendar event."
-common_mistakes = ["Using PATCH semantics but omitting unchanged fields causes them to be cleared — always include all fields you want to keep", "Updating a recurring event without specifying a single instance ID modifies all occurrences in the series"]
+when_to_use = "Update specified fields of an existing calendar event while preserving omitted fields. Provide at least one change."
+common_mistakes = ["Sending an empty attendees array removes all attendees; omit it to preserve them", "Updating a recurring event without specifying a single instance ID modifies all occurrences in the series"]
 examples = ['{"calendar_id": "primary", "event_id": "abc123", "summary": "Updated standup"}']
 related = ["gcal.get_event"]
 

@@ -771,6 +771,11 @@ impl GoogleCalendarConnector {
                     json!({
                         "type": "object",
                         "required": ["calendar_id", "event_id"],
+                        "anyOf": [
+                            { "required": ["summary"] }, { "required": ["description"] },
+                            { "required": ["location"] }, { "required": ["start"] },
+                            { "required": ["end"] }, { "required": ["attendees"] }
+                        ],
                         "properties": {
                             "calendar_id": { "type": "string", "description": "Calendar ID" },
                             "event_id": { "type": "string", "description": "Event ID to update" },
@@ -779,7 +784,7 @@ impl GoogleCalendarConnector {
                             "location": { "type": "string", "description": "New event location" },
                             "start": { "type": "string", "description": "New start time (RFC 3339)" },
                             "end": { "type": "string", "description": "New end time (RFC 3339)" },
-                            "attendees": { "type": "array", "items": { "type": "object" }, "description": "Updated attendee list" }
+                            "attendees": { "type": "array", "items": { "type": "object" }, "description": "Replace attendee list; [] removes all attendees. Omit to preserve existing attendees." }
                         }
                     }),
                     json!({ "type": "object", "properties": { "event": { "type": "object" } } }),
@@ -788,7 +793,7 @@ impl GoogleCalendarConnector {
                     SafetyTier::Risky,
                     IdempotencyClass::BestEffort,
                     AgentHint {
-                        when_to_use: "Update fields of an existing calendar event. Only specified fields are changed.".into(),
+                        when_to_use: "Update fields of an existing calendar event. Only specified fields are changed; omitted fields are preserved. Provide at least one change.".into(),
                         common_mistakes: vec![
                             "Not providing the event_id of the existing event".into(),
                         ],
@@ -1213,60 +1218,10 @@ impl GoogleCalendarConnector {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let calendar_id = require_str(&input, "calendar_id")?;
         let event_id = require_str(&input, "event_id")?;
-
-        let summary = input
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let description = input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let location = input
-            .get("location")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        let start = input
-            .get("start")
-            .and_then(|v| v.as_str())
-            .map(|s| EventDateTime {
-                date_time: Some(s.to_string()),
-                date: None,
-                time_zone: None,
-            });
-        let end = input
-            .get("end")
-            .and_then(|v| v.as_str())
-            .map(|s| EventDateTime {
-                date_time: Some(s.to_string()),
-                date: None,
-                time_zone: None,
-            });
-
-        let attendees: Vec<Attendee> = input
-            .get("attendees")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let event = Event {
-            id: None,
-            status: None,
-            summary,
-            description,
-            location,
-            start,
-            end,
-            creator: None,
-            organizer: None,
-            attendees,
-            html_link: None,
-            hangout_link: None,
-            recurrence: vec![],
-        };
+        let patch = event_update_patch(&input)?;
 
         let updated = client
-            .update_event(calendar_id, event_id, &event)
+            .update_event(calendar_id, event_id, &patch)
             .await
             .map_err(|e: GoogleCalendarError| e.to_fcp_error())?;
 
@@ -1419,6 +1374,59 @@ impl Default for GoogleCalendarConnector {
 
 // ── Helper functions ──────────────────────────────────────────────
 
+/// Build a sparse provider patch without converting absent fields to null or
+/// empty arrays. In particular, a title-only update must not remove guests.
+fn event_update_patch(input: &serde_json::Value) -> FcpResult<serde_json::Value> {
+    let mut patch = serde_json::Map::new();
+    for field in ["summary", "description", "location", "start", "end"] {
+        if let Some(value) = input.get(field) {
+            let text = value.as_str().ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: format!("Field {field} must be a string"),
+            })?;
+            let value = if matches!(field, "start" | "end") {
+                chrono::DateTime::parse_from_rfc3339(text).map_err(|_| {
+                    FcpError::InvalidRequest {
+                        code: 1003,
+                        message: format!(
+                            "Field {field} must be an RFC 3339 datetime with an offset"
+                        ),
+                    }
+                })?;
+                json!({ "dateTime": text })
+            } else {
+                value.clone()
+            };
+            patch.insert(field.to_string(), value);
+        }
+    }
+    if let Some(attendees) = input.get("attendees") {
+        if !attendees
+            .as_array()
+            .is_some_and(|entries| entries.iter().all(serde_json::Value::is_object))
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Field attendees must be an array of attendee objects".into(),
+            });
+        }
+        serde_json::from_value::<Vec<Attendee>>(attendees.clone()).map_err(|_| {
+            FcpError::InvalidRequest {
+                code: 1003,
+                message: "Field attendees must be an array of attendee objects".into(),
+            }
+        })?;
+        patch.insert("attendees".into(), attendees.clone());
+    }
+    if patch.is_empty() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "At least one event field must be supplied for an update".into(),
+        });
+    }
+    Ok(serde_json::Value::Object(patch))
+}
+
 fn require_str<'a>(input: &'a serde_json::Value, field: &str) -> FcpResult<&'a str> {
     input
         .get(field)
@@ -1464,6 +1472,23 @@ mod tests {
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_prelude::CapabilityConstraints;
+
+    #[test]
+    fn event_patch_preserves_omission_and_wraps_only_supplied_times() {
+        let patch = event_update_patch(&json!({
+            "calendar_id": "primary", "event_id": "evt123",
+            "start": "2026-10-23T10:00:00-04:00",
+            "location": "Room 2"
+        }))
+        .unwrap();
+        assert_eq!(
+            patch,
+            json!({
+                "start": { "dateTime": "2026-10-23T10:00:00-04:00" },
+                "location": "Room 2"
+            })
+        );
+    }
 
     #[test]
     fn validate_calendar_base_url_accepts_googleapis_hosts() {

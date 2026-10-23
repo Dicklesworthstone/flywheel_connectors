@@ -13,7 +13,7 @@ use fcp_google_calendar::{
 };
 use fcp_prelude::{CapabilityConstraints, CapabilityToken, FcpError, InstanceId};
 use serde_json::json;
-use wiremock::matchers::{bearer_token, header, method, path};
+use wiremock::matchers::{bearer_token, body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -221,6 +221,40 @@ async fn api_error_display_does_not_leak_token() {
 }
 
 // ── Client operations ───────────────────────────────────────────────
+
+#[fcp_async_core::runtime::test]
+async fn manifest_and_runtime_publish_sparse_event_update_contract() {
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+        .expect("manifest and interface hash must validate");
+    let declared = &manifest.provides.operations["gcal.update_event"];
+    let connector = GoogleCalendarConnector::new();
+    let introspection = connector.handle_introspect().await.unwrap();
+    let runtime = introspection["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["id"] == "gcal.update_event")
+        .unwrap();
+    assert_eq!(runtime["idempotency"], "best_effort");
+    assert_eq!(
+        declared.input_schema["anyOf"],
+        runtime["input_schema"]["anyOf"]
+    );
+    for field in [
+        "summary",
+        "description",
+        "location",
+        "start",
+        "end",
+        "attendees",
+    ] {
+        assert_eq!(
+            declared.input_schema["properties"][field]["type"],
+            runtime["input_schema"]["properties"][field]["type"],
+            "schema mismatch for {field}"
+        );
+    }
+}
 
 #[fcp_async_core::runtime::test]
 async fn client_list_calendars() {
@@ -455,6 +489,115 @@ async fn invoke_get_event_through_connector() {
         .unwrap();
 
     assert_eq!(result["event"]["id"], "evt001");
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_update_event_preserves_unspecified_fields() {
+    let server = MockServer::start().await;
+    let mut existing = event_json("evt123", "Renamed meeting");
+    existing["description"] = json!("Keep this description");
+    existing["attendees"] = json!([{ "email": "guest@example.com" }]);
+    existing["recurrence"] = json!(["RRULE:FREQ=WEEKLY"]);
+    Mock::given(method("PATCH"))
+        .and(path("/calendars/primary/events/evt123"))
+        .and(body_json(json!({ "summary": "Renamed meeting" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&existing))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut connector = GoogleCalendarConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
+    setup_configure(&mut connector, &server.uri()).await;
+    let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
+    let result = connector
+        .handle_invoke(json!({
+            "operation": "gcal.update_event",
+            "input": {
+                "calendar_id": "primary", "event_id": "evt123",
+                "summary": "Renamed meeting"
+            },
+            "capability_token": token
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result["event"]["summary"], "Renamed meeting");
+    assert_eq!(result["event"]["description"], existing["description"]);
+    assert_eq!(
+        result["event"]["attendees"][0]["email"],
+        "guest@example.com"
+    );
+    assert_eq!(result["event"]["recurrence"], existing["recurrence"]);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "a patch needs no read-modify-write race");
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_update_event_can_explicitly_clear_attendees() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/calendars/primary/events/evt123"))
+        .and(body_json(json!({ "attendees": [], "description": "" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(event_json("evt123", "Meeting")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut connector = GoogleCalendarConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
+    setup_configure(&mut connector, &server.uri()).await;
+    let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
+    connector
+        .handle_invoke(json!({
+            "operation": "gcal.update_event",
+            "input": {
+                "calendar_id": "primary", "event_id": "evt123",
+                "attendees": [], "description": ""
+            },
+            "capability_token": token
+        }))
+        .await
+        .unwrap();
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_update_event_rejects_invalid_fields_without_writes() {
+    let server = MockServer::start().await;
+    let mut connector = GoogleCalendarConnector::new();
+    let signing_key = Ed25519SigningKey::generate();
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
+    setup_configure(&mut connector, &server.uri()).await;
+
+    for invalid in [
+        json!({}),
+        json!({ "summary": null }),
+        json!({ "location": 42 }),
+        json!({ "start": "tomorrow" }),
+        json!({ "end": { "dateTime": "2026-10-23T10:00:00Z" } }),
+        json!({ "attendees": "guest@example.com" }),
+        json!({ "attendees": [{ "email": 42 }] }),
+        json!({ "attendees": [[]] }),
+    ] {
+        let mut input = invalid;
+        input["calendar_id"] = json!("primary");
+        input["event_id"] = json!("evt123");
+        let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
+        let error = connector
+            .handle_invoke(json!({
+                "operation": "gcal.update_event", "input": input,
+                "capability_token": token
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FcpError::InvalidRequest { .. }),
+            "{error:?}"
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[fcp_async_core::runtime::test]

@@ -249,13 +249,17 @@ impl GoogleCalendarClient {
         self.post_json(&url, &body).await
     }
 
-    /// Update an existing event.
-    #[instrument(skip(self, event))]
+    /// Update only the supplied fields of an existing event.
+    ///
+    /// Calendar's PATCH semantics preserve omitted fields, including attendees,
+    /// recurrence, reminders, and conference data. Supplied arrays replace the
+    /// corresponding array, so an explicit empty array clears it.
+    #[instrument(skip(self, patch))]
     pub async fn update_event(
         &self,
         calendar_id: &str,
         event_id: &str,
-        event: &Event,
+        patch: &serde_json::Value,
     ) -> GCalResult<Event> {
         let encoded_cal =
             percent_encoding::utf8_percent_encode(calendar_id, percent_encoding::NON_ALPHANUMERIC);
@@ -265,8 +269,7 @@ impl GoogleCalendarClient {
             "{}/calendars/{encoded_cal}/events/{encoded_evt}",
             self.base_url
         );
-        let body = serde_json::to_value(event).map_err(GoogleCalendarError::Json)?;
-        self.put_json(&url, &body).await
+        self.patch_json(&url, patch).await
     }
 
     /// Delete an event.
@@ -410,13 +413,13 @@ impl GoogleCalendarClient {
         decode_json_response(response)
     }
 
-    async fn put_json<T: serde::de::DeserializeOwned>(
+    async fn patch_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> GCalResult<T> {
         let response = self
-            .execute_with_retry("PUT", url, Some(body), GoogleResponseMode::Json, true)
+            .execute_with_retry("PATCH", url, Some(body), GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
