@@ -22,6 +22,14 @@ pub enum GoogleCalendarError {
     #[error("Google Calendar API error: {message} (code: {code})")]
     Api { code: u32, message: String },
 
+    /// Caller-provided event ID cannot be used as a provider deduplication key.
+    #[error("event_id must contain 5 to 1024 lowercase letters a-v or digits 0-9")]
+    InvalidEventId,
+
+    /// A write may have committed but its result could not be established.
+    #[error("Calendar write outcome is unknown; verify the calendar before retrying")]
+    AmbiguousWrite { status_code: Option<u16> },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
@@ -127,6 +135,17 @@ impl GoogleCalendarError {
             },
             Self::CalendarNotFound { calendar_id } => FcpError::ResourceNotFound {
                 resource: format!("calendar:{calendar_id}"),
+            },
+            Self::InvalidEventId => FcpError::InvalidRequest {
+                code: 1003,
+                message: self.to_string(),
+            },
+            Self::AmbiguousWrite { status_code } => FcpError::External {
+                service: "google-calendar".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),

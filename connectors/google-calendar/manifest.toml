@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:2de73f709e5548ef6fc473e0284995ab8aa1ba8b6d88fe785c5b0a3d643c2911"
+interface_hash = "blake3-256:fcp.interface.v2:d28babba7e619e2f444b4910923091948b660e74d1dfd44a74e996152776d7b7"
 
 [connector]
 id = "fcp.google-calendar"
@@ -51,12 +51,25 @@ required = ["calendar_id", "summary", "start", "end"]
 type = "object"
 [provides.operations."gcal.create_event".input_schema.properties.calendar_id]
 type = "string"
+[provides.operations."gcal.create_event".input_schema.properties.event_id]
+type = "string"
+minLength = 5
+maxLength = 1024
+pattern = "^[a-v0-9]+$"
+description = "Optional stable provider ID. Reuse it with identical input to recover a create safely; omit for an unkeyed create."
 [provides.operations."gcal.create_event".input_schema.properties.summary]
 type = "string"
+[provides.operations."gcal.create_event".input_schema.properties.description]
+type = "string"
+[provides.operations."gcal.create_event".input_schema.properties.location]
+type = "string"
 [provides.operations."gcal.create_event".input_schema.properties.start]
-type = "object"
+type = "string"
 [provides.operations."gcal.create_event".input_schema.properties.end]
-type = "object"
+type = "string"
+[provides.operations."gcal.create_event".input_schema.properties.attendees]
+type = "array"
+items = { type = "object" }
 
 [provides.operations."gcal.create_event".output_schema]
 required = ["event"]
@@ -80,9 +93,9 @@ total_timeout_ms = 30000
 max_response_bytes = 1048576
 
 [provides.operations."gcal.create_event".ai_hints]
-when_to_use = "Create a new calendar event."
-common_mistakes = ["Not specifying timezone in start/end", "Using wrong calendar_id"]
-examples = ['{"calendar_id": "primary", "summary": "Team standup", "start": {"dateTime": "2026-03-02T09:00:00-05:00"}, "end": {"dateTime": "2026-03-02T09:30:00-05:00"}}']
+when_to_use = "Create a new calendar event. Supply event_id to permit provider-keyed retries and reuse that ID with identical input when recovering an uncertain result."
+common_mistakes = ["Not specifying timezone in start/end", "Using wrong calendar_id", "Reusing event_id with different fields causes a conflict; use gcal.update_event for changes", "Retrying an uncertain create without event_id can create a duplicate event"]
+examples = ['{"calendar_id": "primary", "event_id": "fcp0123456789abcdef", "summary": "Team standup", "start": "2026-03-02T09:00:00-05:00", "end": "2026-03-02T09:30:00-05:00"}']
 related = ["gcal.get_event", "gcal.list_events"]
 
 # ────────────────────────────────────────────────────────────────

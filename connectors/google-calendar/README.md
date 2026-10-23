@@ -7,6 +7,7 @@
 > **Calendar API upstream**: https://developers.google.com/workspace/calendar/api/v3/reference
 > **Events upstream**: https://developers.google.com/workspace/calendar/api/v3/reference/events
 > **Partial updates upstream**: https://developers.google.com/workspace/calendar/api/v3/reference/events/patch
+> **Event IDs and duplicate recovery upstream**: https://developers.google.com/workspace/calendar/api/guides/create-events
 > **Freebusy upstream**: https://developers.google.com/workspace/calendar/api/v3/reference/freebusy/query
 
 ## Purpose
@@ -45,6 +46,8 @@ Important runtime truths the contract preserves:
 - Runtime request timeout is 30 seconds.
 - The client uses the shared retry loop with three retries, 1000 ms initial delay, 60 second max delay, and jitter.
 - Event updates use sparse `PATCH` requests: omitted fields, attendees, recurrence, reminders, and conference data are preserved. An explicit `attendees: []` removes all attendees; empty strings clear text fields. Malformed supplied fields and empty updates are rejected before any provider call.
+- Event creation accepts an optional `event_id` containing 5–1024 lowercase letters `a`–`v` or digits `0`–`9`. With an ID, retry attempts reuse the same payload and a private request fingerprint; a duplicate is recovered only when the existing active event has the same ID and fingerprint. Reuse the same ID and input to recover a creation, and use `gcal.update_event` to change it.
+- Without `event_id`, event creation retains fail-closed retry behavior. Ambiguous unkeyed writes and quick-add results return nonretryable errors so an outer invocation cannot silently create another event. Requests rejected before transmission or rate-limited without execution retain their safe retry behavior.
 - Calendar IDs, event IDs, query values, quick-add text, sync tokens, and page tokens are percent-encoded before provider calls.
 - Provider 401, 404, 429 with `Retry-After`, retryable transport/5xx classes, malformed JSON, and API error bodies map into typed connector and FCP errors.
 - Handshake installs a `CapabilityVerifier`.
@@ -58,12 +61,11 @@ This README documents the runtime truth and keeps current drift visible:
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 - Manifest `event_caps.streaming = true`, but runtime handshake reports `streaming = false`, runtime introspection has no events, and no watch/channel flow is implemented.
 - Runtime `simulate` returns allowed for any syntactically valid `SimulateRequest`; it does not validate operation inventory, readiness, input schema, capability, or capability token.
-- Manifest `gcal.create_event` declares `start` and `end` as objects, while runtime requires RFC3339 strings and wraps them as `EventDateTime.dateTime`.
 - Manifest output names for list/delete operations drift from runtime output names. Runtime `list_events` returns `events`, `next_page_token`, and `summary`; runtime `delete_event` returns `status: deleted`.
 - Runtime `handle_shutdown` shuts down the client runtime but does not clear config, client, verifier, session, or configured/handshaken flags.
 - The dedicated tracked verification shell script is `scripts/e2e/google_calendar_connector_verification.sh`.
 
-A follow-up parity bead should align simulation, manifest/runtime event capability, creation start/end schemas, output schemas, interface proof, and shutdown state reset.
+A follow-up parity bead should align simulation, manifest/runtime event capability, output schemas, interface proof, and shutdown state reset.
 
 ## First-Slice Scope
 
@@ -123,7 +125,7 @@ The current Google Calendar README slice documents the existing runtime surface:
 | `gcal.get_calendar` | `GET /users/me/calendarList/{calendar_id}` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads one calendar-list entry. |
 | `gcal.list_events` | `GET /calendars/{calendar_id}/events` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads event pages for one calendar and optional time window. |
 | `gcal.get_event` | `GET /calendars/{calendar_id}/events/{event_id}` | `gcal.read` | `Safe` | `Low` | `Strict` | Reads one event by provider ID. |
-| `gcal.create_event` | `POST /calendars/{calendar_id}/events` | `gcal.write` | `Risky` | `Medium` | `None` | Creates a calendar event and can notify attendees by provider policy. |
+| `gcal.create_event` | `POST /calendars/{calendar_id}/events` | `gcal.write` | `Risky` | `Medium` | `None` | Creates an event; optional `event_id` enables provider-keyed retry and duplicate recovery. |
 | `gcal.update_event` | `PATCH /calendars/{calendar_id}/events/{event_id}` | `gcal.write` | `Risky` | `Medium` | `BestEffort` | Changes only supplied fields; explicit arrays replace the corresponding arrays. |
 | `gcal.delete_event` | `DELETE /calendars/{calendar_id}/events/{event_id}` | `gcal.delete` | `Risky` | `High` | `None` | Deletes an event or recurring event series/instance. |
 | `gcal.quick_add` | `POST /calendars/{calendar_id}/events/quickAdd?text={text}` | `gcal.write` | `Risky` | `Medium` | `None` | Lets Google parse natural-language event text into an event. |
