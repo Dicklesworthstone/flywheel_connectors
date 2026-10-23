@@ -308,6 +308,10 @@ use fcp_audit::HybridLogicalClock;
 use fcp_crypto::{
     Ed25519Signature, Ed25519VerifyingKey, canonicalize::to_deterministic_cbor, cose::CoseToken,
 };
+use fcp_host::mesh_routing::{
+    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryMembershipStatus,
+    MeshInventoryResponse, MeshInventoryStatus,
+};
 use fcp_host::{
     BatchInvokeResponse as HostBatchInvokeResponse, BatchOptions as HostBatchOptions,
     BudgetReportRequest as HostBudgetReportRequest,
@@ -326,9 +330,8 @@ use fcp_host::{
     DoctorReport as HostDoctorReport, DoctorRequest as HostDoctorRequest,
     EventQueryRequest as HostEventQueryRequest, EventQueryResponse as HostEventQueryResponse,
     HostEvent as HostAdminEvent, HostEventKind, HostHealthResponse, HostPreflightRequest,
-    HostSimulateRequest, HostSimulateResponse,
-    IntrospectionResponse as HostIntrospectionResponse, LifecycleTransitionRequest,
-    LifecycleTransitionResponse, ManagedConnectorConfig,
+    HostSimulateRequest, HostSimulateResponse, IntrospectionResponse as HostIntrospectionResponse,
+    LifecycleTransitionRequest, LifecycleTransitionResponse, ManagedConnectorConfig,
     PreflightResponse as HostPreflightResponse, RuntimeNetworkEnforcement, SimulatePhase,
     ToolDescriptor as HostToolDescriptor,
 };
@@ -911,10 +914,10 @@ struct MeshArgs {
 #[derive(Subcommand, Debug, Serialize)]
 #[serde(tag = "subcommand", content = "args", rename_all = "kebab-case")]
 enum MeshCommand {
-    /// Show persisted mesh targeting state for the current host context.
+    /// Inspect live mesh inventory, or persisted targeting state with --offline.
     Status(MeshStatusArgs),
 
-    /// List known mesh target candidates for the current host context.
+    /// List advertised mesh connector locations, or offline target candidates.
     Nodes(MeshNodesArgs),
 
     /// Set the active default node for the current host context.
@@ -941,12 +944,42 @@ enum MeshCommand {
 }
 
 #[derive(Args, Debug, Default, Serialize)]
-struct MeshStatusArgs {}
+struct MeshStatusArgs {
+    /// Inspect persisted target state without contacting a configured host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    /// Fail unless the command resolves from at least this truth source.
+    #[arg(long, value_enum)]
+    require_source: Option<RequiredTruthSource>,
+
+    /// Read the host admin bearer secret from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
+}
 
 #[derive(Args, Debug, Default, Serialize)]
 struct MeshNodesArgs {
-    /// Optional connector id/alias to inspect connector-specific target candidates.
+    /// Optional canonical connector id or family to filter advertised locations.
     connector: Option<String>,
+
+    /// Restrict advertised connectors to this exact execution zone.
+    #[arg(long)]
+    zone: Option<String>,
+
+    /// Inspect persisted target candidates without contacting a configured host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    /// Fail unless the command resolves from at least this truth source.
+    #[arg(long, value_enum)]
+    require_source: Option<RequiredTruthSource>,
+
+    /// Read the host admin bearer secret from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5490,6 +5523,51 @@ impl HostAdminClient {
         self.get_json("/rpc/mesh/cutover-gates")
     }
 
+    fn mesh_inventory(&self, token: &str) -> Result<MeshInventoryResponse> {
+        const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+        let response = self
+            .client
+            .get(format!("{}{MESH_INVENTORY_ROUTE}", self.base_url))
+            .bearer_auth(token)
+            .header("x-fcp-zone", "z:owner")
+            .timeout(self.read_timeout)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("mesh inventory exceeded the host read deadline")
+                } else {
+                    anyhow::anyhow!("failed to query the selected host's mesh inventory")
+                }
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "mesh inventory returned HTTP {}",
+            response.status().as_u16(),
+        );
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_RESPONSE_BYTES),
+            "mesh inventory response exceeds the size limit",
+        );
+        let mut body = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| anyhow::anyhow!("failed to read the mesh inventory response"))?;
+        anyhow::ensure!(
+            body.len() as u64 <= MAX_RESPONSE_BYTES,
+            "mesh inventory response exceeds the size limit",
+        );
+        let inventory: MeshInventoryResponse = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("host returned an invalid mesh inventory response"))?;
+        anyhow::ensure!(
+            inventory.schema_version == MESH_INVENTORY_SCHEMA_VERSION,
+            "host returned an unsupported mesh inventory schema",
+        );
+        Ok(inventory)
+    }
+
     fn discover(&self, filter: Option<&HostDiscoveryFilter>) -> Result<HostDiscoveryResponse> {
         self.post_read_json("/rpc/discover", &json!({ "filter": filter }))
     }
@@ -9326,8 +9404,8 @@ fn format_audit_gaps_toon(gaps: &[AuditGapReport], blocking_only: bool) -> Strin
 
 fn mesh_dispatch(args: &MeshArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     match &args.command {
-        MeshCommand::Status(args) => mesh_status_dispatch(args),
-        MeshCommand::Nodes(args) => mesh_nodes_dispatch(args),
+        MeshCommand::Status(args) => mesh_status_dispatch(args, explicit_host),
+        MeshCommand::Nodes(args) => mesh_nodes_dispatch(args, explicit_host),
         MeshCommand::Use(args) => mesh_use_dispatch(args),
         MeshCommand::Target(args) => mesh_target_dispatch(args),
         MeshCommand::Availability(args) => {
@@ -11315,12 +11393,251 @@ fn mesh_availability_dispatch(
     })
 }
 
-fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
+fn mesh_inventory_credential(
+    path: Option<&Path>,
+) -> std::result::Result<zeroize::Zeroizing<String>, &'static str> {
+    const MAX_TOKEN_BYTES: u64 = 65_536;
+    let raw = if let Some(path) = path {
+        let file = std::fs::File::open(path).map_err(|_| "invalid-admin-credential")?;
+        let mut value = zeroize::Zeroizing::new(String::new());
+        file.take(MAX_TOKEN_BYTES + 1)
+            .read_to_string(&mut value)
+            .map_err(|_| "invalid-admin-credential")?;
+        value
+    } else {
+        zeroize::Zeroizing::new(
+            std::env::var("FCP_HOST_ADMIN_BEARER_TOKEN").map_err(|error| match error {
+                std::env::VarError::NotPresent => "missing-admin-credential",
+                std::env::VarError::NotUnicode(_) => "invalid-admin-credential",
+            })?,
+        )
+    };
+    let token = raw.trim();
+    if raw.len() as u64 > MAX_TOKEN_BYTES
+        || token.is_empty()
+        || !token.is_ascii()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("invalid-admin-credential");
+    }
+    Ok(zeroize::Zeroizing::new(token.to_owned()))
+}
+
+fn mesh_inventory_connector_matches(connector_id: &str, selector: &str) -> bool {
+    let normalized = normalize_connector_selector(selector);
+    let canonical = normalize_connector_selector(connector_id);
+    let family = canonical.split(':').next().unwrap_or(&canonical);
+    [
+        &canonical,
+        canonical.strip_prefix("fcp.").unwrap_or(&canonical),
+        family,
+        family.strip_prefix("fcp.").unwrap_or(family),
+    ]
+    .iter()
+    .any(|candidate| *candidate == normalized)
+}
+
+fn mesh_live_inventory_dispatch(
+    subcommand: &str,
+    host: &ResolvedHostConfig,
+    connector: Option<&str>,
+    zone: Option<&str>,
+    requirement: Option<RequiredTruthSource>,
+    admin_token_file: Option<&Path>,
+) -> Result<DispatchOutcome> {
+    // This is the selected host's inventory observation. Verified advertisements
+    // establish their origin and freshness, not a live peer execution or quorum.
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        subcommand,
+        requirement,
+        KnowledgeState::HostBacked,
+    ) {
+        return Ok(outcome);
+    }
+    let token = match mesh_inventory_credential(admin_token_file) {
+        Ok(token) => token,
+        Err(kind) => {
+            let payload = json!({
+                "status": "error",
+                "command": "mesh",
+                "subcommand": subcommand,
+                "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+                "_truth_source": "unavailable",
+                "error": {
+                    "type": kind,
+                    "message": "Live mesh inventory requires a valid host admin bearer secret from --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN.",
+                    "recoverable": true,
+                },
+                "next_actions": [format!("fwc mesh {subcommand} --host <endpoint> --admin-token-file <path>")],
+            });
+            return Ok(DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::PolicyDenied,
+            });
+        }
+    };
+    let client = HostAdminClient::without_redirects(&host.endpoint)?;
+    let mut inventory = match client.mesh_inventory(&token) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return Ok(DispatchOutcome {
+                payload: json!({
+                    "status": "error",
+                    "command": "mesh",
+                    "subcommand": subcommand,
+                    "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+                    "_truth_source": "unavailable",
+                    "error": {
+                        "type": "mesh-inventory-unavailable",
+                        "message": error.to_string(),
+                        "recoverable": true,
+                    },
+                    "next_actions": [
+                        "Check the selected host endpoint and owner admin credential before retrying.",
+                        format!("Use `fwc mesh {subcommand} --offline` only for persisted target planning."),
+                    ],
+                }),
+                exit_code: CliExitCode::Transport,
+            });
+        }
+    };
+    let unavailable_peers = inventory
+        .nodes
+        .iter()
+        .filter(|node| !node.is_local && node.inventory_status == MeshInventoryStatus::Unavailable)
+        .count();
+    let inventory_complete = inventory.membership_status
+        != MeshInventoryMembershipStatus::Unavailable
+        && unavailable_peers == 0;
+    if connector.is_some() || zone.is_some() {
+        for node in &mut inventory.nodes {
+            node.connectors.retain(|candidate| {
+                connector.is_none_or(|selector| {
+                    mesh_inventory_connector_matches(&candidate.connector_id, selector)
+                }) && zone
+                    .is_none_or(|zone| candidate.zones.iter().any(|candidate| candidate == zone))
+            });
+        }
+        inventory.nodes.retain(|node| !node.connectors.is_empty());
+        if !inventory_complete {
+            inventory.warnings.push(
+                "Some peer inventories are unavailable; an empty filtered result does not prove the connector is absent from the mesh.".to_owned(),
+            );
+        }
+    }
+    let node_count = inventory.nodes.len();
+    let verified_peer_count = inventory
+        .nodes
+        .iter()
+        .filter(|node| !node.is_local && node.inventory_status == MeshInventoryStatus::Verified)
+        .count();
+    let connector_count = inventory
+        .nodes
+        .iter()
+        .flat_map(|node| &node.connectors)
+        .map(|connector| &connector.connector_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut payload = json!({
+        "status": "ok",
+        "command": "mesh",
+        "subcommand": subcommand,
+        "source": "host-admin-api",
+        "inventory_source": "host-mesh-inventory",
+        "inventory_schema_version": inventory.schema_version,
+        "generated_at_ms": inventory.generated_at_ms,
+        "mesh_configured": inventory.mesh_configured,
+        "local_node_id": inventory.local_node_id,
+        "membership_status": inventory.membership_status,
+        "connector_filter": connector,
+        "zone_filter": zone,
+        "node_count": node_count,
+        "connector_count": connector_count,
+        "verified_peer_count": verified_peer_count,
+        "unavailable_peer_count": unavailable_peers,
+        "advertised_inventory_complete": inventory_complete,
+        "nodes": inventory.nodes,
+        "warnings": inventory.warnings,
+        "live_inventory": {
+            "available": true,
+            "source": "host-mesh-inventory",
+            "scope": "local-registry-and-fresh-peer-advertisements",
+            "peer_liveness_proven": false,
+            "replica_coverage_proven": false,
+            "quorum_proven": false,
+        },
+        "next_actions": [
+            "fwc mesh nodes <connector> --zone <zone> --host <endpoint> --admin-token-file <path>",
+            "fwc mesh status --offline",
+        ],
+    });
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "mesh");
+    envelope.inject_into(&mut payload);
+    attach_live_host_admin_contract(
+        &mut payload,
+        "mesh",
+        &host.endpoint,
+        "mesh-advertised-inventory",
+        !inventory_complete,
+        vec![json!({
+            "kind": "mesh-inventory",
+            "generated_at_ms": inventory.generated_at_ms,
+            "membership_status": inventory.membership_status,
+            "verified_peer_count": verified_peer_count,
+            "unavailable_peer_count": unavailable_peers,
+        })],
+    );
+    resolve_live_read_outcome(
+        "mesh",
+        None,
+        "mesh-advertised-inventory",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![HostReadProvenance {
+            path: MESH_INVENTORY_ROUTE.to_owned(),
+            truth_source: KnowledgeState::HostBacked,
+            attested: false,
+            route: None,
+            local_connectors: None,
+            mesh_connectors: None,
+        }],
+    )
+}
+
+fn mesh_status_dispatch(
+    args: &MeshStatusArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
+        return mesh_live_inventory_dispatch(
+            "status",
+            &host,
+            None,
+            None,
+            args.require_source,
+            args.admin_token_file.as_deref(),
+        );
+    }
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        "status",
+        args.require_source,
+        KnowledgeState::Offline,
+    ) {
+        return Ok(outcome);
+    }
     let (path, config) = load_context_config()?;
     let (context_name, context) = active_context_entry(&config)?;
     let known_nodes = mesh_known_nodes(&context.mesh_targets, context.default_zone.as_deref());
     let mut warnings = vec![
-        "Per-node mesh inventory is not yet exposed by the current fcp-host CLI/API; showing persisted target state only.".to_owned(),
+        "Offline planning view: showing persisted target state only; no live mesh inventory was queried.".to_owned(),
     ];
 
     let active_session = cli_session_store().active_session().ok().flatten();
@@ -11349,7 +11666,7 @@ fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
         "live_inventory": {
             "available": false,
             "source": "none",
-            "reason": "current fcp-host routes do not expose authoritative per-node mesh inventory",
+            "reason": "offline planning view; query a configured host for current mesh advertisements",
         },
         "next_actions": [
             "fwc mesh nodes".to_owned(),
@@ -11366,12 +11683,49 @@ fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
     })
 }
 
-fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
+fn mesh_nodes_dispatch(
+    args: &MeshNodesArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    let zone = match args.zone.as_deref().map(str::parse::<ZoneId>).transpose() {
+        Ok(zone) => zone,
+        Err(_) => {
+            return Ok(DispatchOutcome {
+                payload: json!({
+                    "status": "error",
+                    "command": "mesh",
+                    "subcommand": "nodes",
+                    "error": {"type": "invalid-zone", "message": "--zone must be a valid exact zone id such as z:work.", "recoverable": true},
+                }),
+                exit_code: CliExitCode::Validation,
+            });
+        }
+    };
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
+        return mesh_live_inventory_dispatch(
+            "nodes",
+            &host,
+            args.connector.as_deref(),
+            zone.as_ref().map(ZoneId::as_str),
+            args.require_source,
+            args.admin_token_file.as_deref(),
+        );
+    }
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        "nodes",
+        args.require_source,
+        KnowledgeState::Offline,
+    ) {
+        return Ok(outcome);
+    }
     let (path, config) = load_context_config()?;
     let (context_name, context) = active_context_entry(&config)?;
     let target_state = &context.mesh_targets;
     let mut warnings = vec![
-        "Per-node mesh inventory is not yet exposed by the current fcp-host CLI/API; showing persisted target candidates only.".to_owned(),
+        "Offline planning view: showing persisted target candidates only; no live mesh inventory was queried.".to_owned(),
     ];
     let mut nodes = mesh_known_nodes(target_state, context.default_zone.as_deref());
 
@@ -11390,6 +11744,25 @@ fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
             ));
         }
     }
+    if let Some(zone) = zone.as_ref() {
+        nodes.retain(|node| {
+            let selected_target = args
+                .connector
+                .as_ref()
+                .and_then(|connector| target_state.connector_targets.get(connector));
+            if let Some(target) = selected_target {
+                target.zone.as_deref() == Some(zone.as_str())
+            } else {
+                (target_state.active_node.as_ref() == Some(&node.node)
+                    && context.default_zone.as_deref() == Some(zone.as_str()))
+                    || (args.connector.is_none()
+                        && target_state.connector_targets.values().any(|target| {
+                            target.node == node.node
+                                && target.zone.as_deref() == Some(zone.as_str())
+                        }))
+            }
+        });
+    }
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "mesh");
     let mut payload = json!({
@@ -11400,6 +11773,7 @@ fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
         "current_context": &context_name,
         "context": mesh_context_summary_value(&context_name, context),
         "connector_filter": &args.connector,
+        "zone_filter": zone.as_ref().map(ZoneId::as_str),
         "inventory_source": "persisted-targets",
         "node_count": nodes.len(),
         "nodes": nodes,
@@ -43260,7 +43634,7 @@ deny_ptrace = true
             .active_node = Some("stale-laptop".to_owned());
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "status"]);
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "status", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -43372,7 +43746,7 @@ deny_ptrace = true
         );
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes"]);
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -43420,7 +43794,8 @@ deny_ptrace = true
         );
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "mesh", "nodes", "github", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -43442,7 +43817,8 @@ deny_ptrace = true
             .active_node = Some("laptop".to_owned());
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "mesh", "nodes", "github", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -43477,6 +43853,347 @@ deny_ptrace = true
                 warning.contains("there is no active default node to fall back to")
             })
         }));
+    }
+
+    fn mock_mesh_inventory_response_json() -> Value {
+        json!({
+            "schema_version": "fcp.mesh.inventory.v1",
+            "generated_at_ms": 10_000,
+            "local_node_id": "entry-host",
+            "mesh_configured": true,
+            "membership_status": "owner_signed",
+            "nodes": [
+                {
+                    "node_id": "entry-host", "is_local": true,
+                    "inventory_status": "local",
+                    "advertisement_issued_at_ms": null, "advertisement_age_ms": null,
+                    "connectors": [{
+                        "connector_id": "fcp.github:enterprise:v1",
+                        "zones": ["z:private"], "singleton_writer": false,
+                    }],
+                },
+                {
+                    "node_id": "peer-work", "is_local": false,
+                    "inventory_status": "verified",
+                    "advertisement_issued_at_ms": 9_000, "advertisement_age_ms": 1_000,
+                    "connectors": [
+                        {"connector_id": "fcp.github:enterprise:v1", "zones": ["z:work"], "singleton_writer": false},
+                        {"connector_id": "fcp.slack:enterprise:v1", "zones": ["z:work"], "singleton_writer": true},
+                    ],
+                },
+                {
+                    "node_id": "peer-unavailable", "is_local": false,
+                    "inventory_status": "unavailable",
+                    "advertisement_issued_at_ms": null, "advertisement_age_ms": null,
+                    "connectors": [],
+                },
+            ],
+            "warnings": ["Advertisements do not prove peer liveness or state replication."],
+        })
+    }
+
+    #[test]
+    fn execute_mesh_status_reads_live_inventory_without_promoting_advertisements_to_liveness() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret\n").unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "status",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+            "--require-source",
+            "mesh-or-host",
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["membership_status"], "owner_signed");
+        assert_eq!(payload["node_count"], 3);
+        assert_eq!(payload["connector_count"], 2);
+        assert_eq!(payload["verified_peer_count"], 1);
+        assert_eq!(payload["unavailable_peer_count"], 1);
+        assert_eq!(payload["advertised_inventory_complete"], false);
+        assert_eq!(payload["live_inventory"]["available"], true);
+        assert_eq!(payload["live_inventory"]["peer_liveness_proven"], false);
+        assert_eq!(payload["live_inventory"]["replica_coverage_proven"], false);
+        assert_eq!(payload["live_inventory"]["quorum_proven"], false);
+        assert_eq!(payload["nodes"][1]["advertisement_age_ms"], 1_000);
+        assert!(!payload.to_string().contains("mesh-owner-test-secret"));
+    }
+
+    #[test]
+    fn execute_mesh_nodes_filters_advertised_connectors_and_zones_without_using_saved_targets() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        let mut config = super::default_context_config();
+        config
+            .contexts
+            .get_mut("local")
+            .unwrap()
+            .mesh_targets
+            .active_node = Some("stale-target".to_owned());
+        super::save_context_config(&path, &config).unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "nodes",
+            "github",
+            "--zone",
+            "z:work",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["node_count"], 1);
+        assert_eq!(payload["connector_count"], 1);
+        assert_eq!(payload["nodes"][0]["node_id"], "peer-work");
+        assert_eq!(
+            payload["nodes"][0]["connectors"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            payload["nodes"][0]["connectors"][0]["connector_id"],
+            "fcp.github:enterprise:v1"
+        );
+        assert_eq!(
+            payload["nodes"][0]["connectors"][0]["zones"],
+            json!(["z:work"])
+        );
+        assert_eq!(payload["unavailable_peer_count"], 1);
+        assert!(!payload.to_string().contains("stale-target"));
+    }
+
+    #[test]
+    fn execute_mesh_nodes_empty_filter_does_not_claim_absence_when_peer_inventory_is_unknown() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "nodes",
+            "github",
+            "--zone",
+            "z:owner",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["node_count"], 0);
+        assert_eq!(payload["advertised_inventory_complete"], false);
+        assert!(
+            payload["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .unwrap()
+                        .contains("does not prove the connector is absent")
+                })
+        );
+    }
+
+    #[test]
+    fn execute_mesh_inventory_require_source_rejects_unproven_mesh_before_contacting_host() {
+        let (_tempdir, _path, _guard) = temp_context_config();
+        for subcommand in ["status", "nodes"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "mesh",
+                subcommand,
+                "--require-source",
+                "mesh",
+                "--admin-token-file",
+                "/not-opened/admin-token",
+            ]);
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+            assert_eq!(payload["_truth_source"], "host");
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "mesh",
+                subcommand,
+                "--offline",
+                "--require-source",
+                "any-live",
+            ]);
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+            assert_eq!(payload["_truth_source"], "offline");
+        }
+    }
+
+    #[test]
+    fn execute_mesh_inventory_explicit_offline_ignores_configured_host_and_admin_token_file() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let _session_guard = super::install_test_session_dir(tempdir.path().join("sessions"));
+        for subcommand in ["status", "nodes"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "mesh",
+                subcommand,
+                "--offline",
+                "--admin-token-file",
+                "/not-opened/admin-token",
+            ]);
+            assert_eq!(exit, CliExitCode::Success.into());
+            assert_eq!(payload["_truth_source"], "offline");
+        }
+    }
+
+    #[test]
+    fn execute_mesh_inventory_rejects_invalid_live_response_without_offline_fallback() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        super::save_context_config(&path, &super::default_context_config()).unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                json!({"secret": "must-not-echo-response-body"}),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "status",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into());
+        assert_eq!(payload["_truth_source"], "unavailable");
+        assert_eq!(payload["error"]["type"], "mesh-inventory-unavailable");
+        assert!(payload.get("target_state").is_none());
+        assert!(!payload.to_string().contains("must-not-echo-response-body"));
+    }
+
+    #[test]
+    fn mesh_inventory_connector_filter_matches_exact_family_and_variant_without_prefix_bleed() {
+        for selector in [
+            "github",
+            "fcp.github",
+            "github:enterprise:v1",
+            "fcp.github:enterprise:v1",
+        ] {
+            assert!(super::mesh_inventory_connector_matches(
+                "fcp.github:enterprise:v1",
+                selector
+            ));
+        }
+        for selector in ["git", "github:base:v1", "", "slack"] {
+            assert!(!super::mesh_inventory_connector_matches(
+                "fcp.github:enterprise:v1",
+                selector
+            ));
+        }
+    }
+
+    #[test]
+    fn mesh_inventory_client_sends_owner_auth_and_refuses_redirects_without_echoing_body() {
+        let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+        sink.set_nonblocking(true).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let redirect = format!("http://{}/credential-sink", sink.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "inventory client did not connect"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("inventory host accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let body = "must-not-echo-admin-secret";
+            write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        let error = super::HostAdminClient::without_redirects(&endpoint)
+            .unwrap()
+            .mesh_inventory("test-owner-credential")
+            .unwrap_err();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /rpc/mesh/inventory "));
+        assert!(request.contains("authorization: bearer test-owner-credential\r\n"));
+        assert!(request.contains("x-fcp-zone: z:owner\r\n"));
+        assert!(error.to_string().contains("HTTP 307"));
+        assert!(!error.to_string().contains("must-not-echo-admin-secret"));
+        assert_eq!(
+            sink.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

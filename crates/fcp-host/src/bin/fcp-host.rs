@@ -8318,6 +8318,10 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         )
         .route("/rpc/admin/events", post(event_query_handler))
         .route(
+            fcp_host::mesh_routing::MESH_INVENTORY_ROUTE,
+            get(mesh_inventory_handler),
+        )
+        .route(
             "/rpc/admin/events/acknowledge",
             post(event_acknowledge_handler),
         )
@@ -10729,6 +10733,41 @@ async fn mesh_cutover_gates_handler(
         "mesh cutover-gates request complete"
     );
     Ok(Json(payload))
+}
+
+/// Operator-facing inventory is protected by the admin middleware. It exposes
+/// membership and zone declarations, never peer keys, endpoints or credentials.
+async fn mesh_inventory_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<fcp_host::mesh_routing::MeshInventoryResponse> {
+    let started_at = Instant::now();
+    // Reading the configured registry does not run connector health checks or
+    // spawn a child. A read of topology must not consume invocation capacity.
+    let local_connectors = state
+        .registry
+        .inventory()
+        .await
+        .into_iter()
+        .map(|config| fcp_mesh::invoke_route::AdvertisedConnector {
+            singleton_writer: connector_config_declares_singleton_writer(&config),
+            summary_json: None,
+            zones: config.allowed_zones,
+            connector_id: config.id,
+        })
+        .collect();
+    let inventory = match state.mesh.as_ref() {
+        Some(router) => router.inventory(local_connectors).await,
+        None => fcp_host::mesh_routing::MeshInventoryResponse::local_only(local_connectors),
+    };
+    tracing::debug!(
+        event = "mesh_inventory_response",
+        truth_source = "host-backed",
+        membership_status = ?inventory.membership_status,
+        node_count = inventory.nodes.len(),
+        duration_ms = %started_at.elapsed().as_millis(),
+        "collected current mesh inventory evidence"
+    );
+    Json(inventory)
 }
 
 async fn connector_artifact_metadata_handler(
@@ -33241,6 +33280,19 @@ done"#;
             .with_state(Arc::clone(&state))
     }
 
+    fn mesh_inventory_test_app(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                fcp_host::mesh_routing::MESH_INVENTORY_ROUTE,
+                get(mesh_inventory_handler),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                admin_auth_middleware,
+            ))
+            .with_state(state)
+    }
+
     fn credential_pool_admin_test_app(state: Arc<AppState>) -> axum::Router {
         let protected = axum::Router::new()
             .route(
@@ -34699,6 +34751,56 @@ done"#;
         assert!(!rendered.contains("redaction-sentinel-otlp-secret"));
         assert!(!rendered.contains("redaction-sentinel-account"));
         assert!(!rendered.contains("api-key@collector"));
+        Ok(())
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mesh_inventory_route_requires_admin_and_preserves_single_host_truth()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use fcp_host::mesh_routing::{
+            MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryMembershipStatus,
+            MeshInventoryResponse, MeshInventoryStatus,
+        };
+
+        let app = mesh_inventory_test_app(cancel_route_test_state());
+        let denied = send_json_request(
+            app.clone(),
+            axum::http::Method::GET,
+            MESH_INVENTORY_ROUTE,
+            json!({}),
+            &[],
+        )
+        .await?;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let response = send_json_request(
+            app,
+            axum::http::Method::GET,
+            MESH_INVENTORY_ROUTE,
+            json!({}),
+            &[
+                ("authorization", "Bearer topsecret"),
+                ("x-fcp-zone", "z:owner"),
+            ],
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let inventory: MeshInventoryResponse =
+            serde_json::from_value(response_body_json(response).await?)?;
+        assert_eq!(inventory.schema_version, MESH_INVENTORY_SCHEMA_VERSION);
+        assert!(!inventory.mesh_configured);
+        assert_eq!(
+            inventory.membership_status,
+            MeshInventoryMembershipStatus::NotConfigured
+        );
+        assert_eq!(inventory.local_node_id, None);
+        assert_eq!(inventory.nodes.len(), 1);
+        assert!(inventory.nodes[0].is_local);
+        assert_eq!(
+            inventory.nodes[0].inventory_status,
+            MeshInventoryStatus::Local
+        );
+        assert_eq!(inventory.nodes[0].node_id, None);
+        assert!(inventory.nodes[0].connectors.is_empty());
         Ok(())
     }
 

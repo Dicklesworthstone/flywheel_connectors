@@ -76,6 +76,7 @@ mod admission;
 mod directory;
 mod discovery;
 mod inbound;
+mod inventory;
 
 use inbound::InboundReplayWorker;
 
@@ -92,6 +93,10 @@ pub use directory::{
     MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
 };
 use discovery::PeerDiscovery;
+pub use inventory::{
+    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryConnector,
+    MeshInventoryMembershipStatus, MeshInventoryNode, MeshInventoryResponse, MeshInventoryStatus,
+};
 
 /// Env var naming this node's mesh id.
 pub const MESH_NODE_ID_ENV: &str = "FCP_HOST_MESH_NODE_ID";

@@ -432,6 +432,43 @@ mod tests {
         }
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn mesh_inventory_withholds_expired_or_fenced_membership() {
+        use crate::mesh_routing::{MeshInventoryMembershipStatus, MeshInventoryStatus};
+
+        for failure in ["expired", "source_rejected", "storage_failed"] {
+            let fixture = Fixture::new();
+            let router = fixture.router();
+            match failure {
+                "expired" => {
+                    fixture
+                        .membership
+                        .publication
+                        .write()
+                        .unwrap()
+                        .validity
+                        .expired
+                        .store(true, Ordering::Release);
+                }
+                "source_rejected" => fixture.membership.refuse("signed_source_rejected"),
+                _ => fixture.membership.refuse("checkpoint_storage_failed"),
+            }
+            let inventory = router.inventory(vec![]).await;
+            assert!(inventory.mesh_configured);
+            assert_eq!(
+                inventory.membership_status,
+                MeshInventoryMembershipStatus::Unavailable
+            );
+            assert_eq!(inventory.nodes.len(), 1);
+            assert!(inventory.nodes[0].is_local);
+            assert_eq!(
+                inventory.nodes[0].inventory_status,
+                MeshInventoryStatus::Local
+            );
+            assert_eq!(inventory.nodes[0].node_id.as_deref(), Some("local"));
+        }
+    }
+
     fn holder_proof_request(
         holder: &str,
         signing_key: &Ed25519SigningKey,
