@@ -8,6 +8,12 @@
 //! The protected pull route also accepts ordered multi-donor recovery plans.
 //! Each donor needs its own exact-root grant and a pinned transport incarnation.
 //! Only downloads can fail over; import attempts are never retried.
+//! Set FCP_HOST_CONNECTOR_STATE_PAGE_CONCURRENCY=2 on a recipient to overlap
+//! continuation round trips. The default is one; values outside 1..=2 fail
+//! startup before storage is opened. This does not widen any grant, change a
+//! recovery plan or its deadline, or activate a replica.
+//! The same protected operator route accepts an explicit `inspect` command for
+//! read-only verification. Inspection neither resolves nor contacts a donor.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fcp_host::ConnectorStateExportRequest;
 use fcp_host::mesh_routing::MeshRouter;
 use fcp_host::{
+    ConnectorStateInspectionRequest, ConnectorStateInspectionResponse,
     ConnectorStatePullRequest, ConnectorStatePullResponse, ConnectorStateRecoveryRequest,
     ConnectorStateRecoveryResponse, ConnectorStateReplicationService,
     ConnectorStateTransferDirection, ConnectorStateTransferGrant, ConnectorStateTransferScope,
@@ -29,6 +36,7 @@ use fcp_store::{
 use super::*;
 
 pub(super) const CONFIG_FILE_ENV: &str = "FCP_HOST_CONNECTOR_STATE_TRANSFER_CONFIG_FILE";
+const PAGE_CONCURRENCY_ENV: &str = "FCP_HOST_CONNECTOR_STATE_PAGE_CONCURRENCY";
 pub(super) const PULL_REQUEST_MAX_BYTES: usize = MAX_CONNECTOR_STATE_RECOVERY_REQUEST_BYTES;
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const REPLICA_NAMESPACE: &str = "connector-state-replicas-v1";
@@ -232,11 +240,45 @@ fn open_service(
     Ok(service)
 }
 
+/// Validate the complete setting pair before reading source state or creating
+/// a retained store. A lone tuning setting must not silently disable transfer.
+fn validate_transfer_settings(
+    config_path: Option<String>,
+    page_concurrency: Option<String>,
+) -> HostResult<Option<(String, usize)>> {
+    let Some(path) = config_path else {
+        if page_concurrency.is_some() {
+            return Err(invalid(
+                "state-transfer page concurrency requires state-transfer configuration",
+            ));
+        }
+        return Ok(None);
+    };
+    let pages = match page_concurrency.as_deref().map(str::trim) {
+        None | Some("1") => 1,
+        Some("2") => 2,
+        Some(_) => return Err(invalid("state-transfer page concurrency must be 1 or 2")),
+    };
+    Ok(Some((path, pages)))
+}
+
 pub(super) fn from_env(
     bind: &BindTarget,
     mesh: Option<&MeshRouter>,
 ) -> HostResult<Option<Arc<ConnectorStateReplicationService>>> {
-    let Some(path) = read_optional_trimmed_env_string(CONFIG_FILE_ENV)? else {
+    // Preserve explicit empty/non-Unicode values as errors rather than letting
+    // a generic optional-string reader silently restore serial defaults.
+    let raw_page_concurrency = match std::env::var(PAGE_CONCURRENCY_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(invalid("state-transfer page concurrency must be 1 or 2"));
+        }
+    };
+    let Some((path, page_concurrency)) = validate_transfer_settings(
+        read_optional_trimmed_env_string(CONFIG_FILE_ENV)?,
+        raw_page_concurrency,
+    )? else {
         return Ok(None);
     };
     if mesh.is_none() {
@@ -266,7 +308,8 @@ pub(super) fn from_env(
     }
     let config: TransferConfig = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("state-transfer configuration is malformed"))?;
-    open_service(config, bind).map(|service| Some(Arc::new(service)))
+    let service = open_service(config, bind)?.with_page_concurrency(page_concurrency)?;
+    Ok(Some(Arc::new(service)))
 }
 
 // The constituent request structs deny unknown fields, so a malformed recovery
@@ -274,6 +317,7 @@ pub(super) fn from_env(
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum StatePullCommand {
+    Inspection(Box<ConnectorStateInspectionRequest>),
     Single(Box<ConnectorStatePullRequest>),
     Recovery(ConnectorStateRecoveryRequest),
 }
@@ -281,6 +325,7 @@ pub(super) enum StatePullCommand {
 #[derive(Serialize)]
 #[serde(untagged)]
 pub(super) enum StatePullResponse {
+    Inspection(ConnectorStateInspectionResponse),
     Single(ConnectorStatePullResponse),
     Recovery(ConnectorStateRecoveryResponse),
 }
@@ -290,8 +335,18 @@ pub(super) async fn pull_handler(
     Path(connector_id): Path<String>,
     Json(request): Json<StatePullCommand>,
 ) -> Result<Json<StatePullResponse>, (StatusCode, String)> {
+    let inspection_only = matches!(&request, StatePullCommand::Inspection(_));
     let operation = async {
         match request {
+            StatePullCommand::Inspection(request) => {
+                inspect(
+                    state.connector_state_replication.as_deref(),
+                    &connector_id,
+                    *request,
+                )
+                .await
+                .map(StatePullResponse::Inspection)
+            }
             StatePullCommand::Single(request) => pull(&state, &connector_id, *request)
                 .await
                 .map(StatePullResponse::Single),
@@ -305,11 +360,33 @@ pub(super) async fn pull_handler(
         .map_err(|_| {
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                "state-transfer deadline elapsed; an admitted durable write may still complete"
-                    .to_owned(),
+                if inspection_only {
+                    "state-inspection deadline elapsed; this request started no import and produced no conclusive observation"
+                } else {
+                    "state-transfer deadline elapsed; an admitted durable write may still complete"
+                }.to_owned(),
             )
         })?
         .map(Json)
+}
+
+/// Only the already-protected operator route may call this helper. Deliberately
+/// accept no router, URL, source path or donor callback: verification observes
+/// the registered local replica even while the donor is unreachable or removed.
+async fn inspect(
+    service: Option<&ConnectorStateReplicationService>,
+    connector_id: &str,
+    request: ConnectorStateInspectionRequest,
+) -> Result<ConnectorStateInspectionResponse, (StatusCode, String)> {
+    request.to_json().map_err(map_host_error)?;
+    let connector = parse_connector_id(connector_id)?;
+    if connector != request.inspect.request.scope.connector_id {
+        return Err((StatusCode::BAD_REQUEST, "state-inspection path and scope differ".to_owned()));
+    }
+    let service = service.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "connector-state transfer is not configured".to_owned())
+    })?;
+    service.inspect_replica(&request.inspect).await.map_err(map_host_error)
 }
 
 async fn pull(
@@ -508,5 +585,154 @@ pub(super) async fn export_reply(
     match result {
         Ok(wire) => (StatusCode::OK.as_u16(), wire),
         Err(error) => mesh_reply_body::<()>(Err(map_host_error(error))),
+    }
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+    use fcp_core::{ConnectorId, ObjectId, ZoneId};
+    use fcp_host::{ConnectorStateInspectionStatus, ConnectorStateTransferLimits};
+    use fcp_store::{MemoryObjectStore, MemoryObjectStoreConfig};
+
+    fn fixture() -> (ConnectorStateReplicationService, ConnectorStateInspectionRequest) {
+        let scope = ConnectorStateTransferScope {
+            connector_id: ConnectorId::from_static("fcp.test:request-response:v1"),
+            zone_id: ZoneId::work(),
+            instance_id: None,
+        };
+        let limits = ConnectorStateTransferLimits {
+            max_objects: 16,
+            max_canonical_bytes: 65_536,
+            max_wire_bytes: 131_072,
+        };
+        let writer = fcp_crypto::Ed25519SigningKey::from_bytes(&[0x5a; 32]).unwrap();
+        let objects = Arc::new(MemoryObjectStore::new(MemoryObjectStoreConfig::default()));
+        let replica = adapter(
+            objects, ObjectIdKey::from_bytes([42; 32]), &scope,
+            &[writer.verifying_key().to_bytes()],
+        );
+        let mut service = ConnectorStateReplicationService::new();
+        service.register_store(ConnectorStateTransferDirection::Import, scope.clone(), replica).unwrap();
+        let root_object_id = ObjectId::from_bytes([0x11; 32]);
+        service.add_grant(ConnectorStateTransferGrant {
+            grant_id: "inspect-root".to_owned(),
+            direction: ConnectorStateTransferDirection::Import,
+            peer_node: "node-donor".to_owned(),
+            scope: scope.clone(),
+            root_object_id,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            limits,
+        }).unwrap();
+        (service, ConnectorStateInspectionRequest {
+            inspect: ConnectorStatePullRequest {
+                peer_node: "node-donor".to_owned(),
+                request: ConnectorStateExportRequest {
+                    grant_id: "inspect-root".to_owned(), scope, root_object_id, limits,
+                },
+            },
+        })
+    }
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        fcp_async_core::runtime::block_on_sync(future).unwrap()
+    }
+
+    #[test]
+    fn inspection_command_is_unambiguous_and_never_decodes_as_a_pull() {
+        let (_, request) = fixture();
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(matches!(serde_json::from_value::<StatePullCommand>(value.clone()).unwrap(),
+            StatePullCommand::Inspection(_)));
+        let single = serde_json::to_value(&request.inspect).unwrap();
+        assert!(matches!(serde_json::from_value::<StatePullCommand>(single.clone()).unwrap(),
+            StatePullCommand::Single(_)));
+        for mixed in [
+            serde_json::json!({"inspect": single, "candidates": [single]}),
+            serde_json::json!({"inspect": single, "peer_node": "node-donor", "request": single["request"]}),
+            serde_json::json!({"inspect": null}),
+            serde_json::json!({"inspect": single, "activate": true}),
+        ] {
+            assert!(serde_json::from_value::<StatePullCommand>(mixed).is_err());
+        }
+    }
+
+    #[test]
+    fn inspection_reads_only_local_replica_without_any_mesh_router() {
+        let (service, request) = fixture();
+        let response = run(inspect(Some(&service), request.inspect.request.scope.connector_id.as_str(), request.clone())).unwrap();
+        assert_eq!(response.status, ConnectorStateInspectionStatus::RootNotFound);
+        response.validate_for(&request.inspect).unwrap();
+        let value = serde_json::to_value(StatePullResponse::Inspection(response)).unwrap();
+        assert_eq!(value["schema_version"], fcp_host::CONNECTOR_STATE_INSPECTION_SCHEMA_VERSION);
+        assert_eq!(value["status"], "root_not_found");
+        assert!(value.get("attempts").is_none());
+        assert!(value.get("replica_root_published").is_none());
+        assert!(value.get("objects").is_none());
+    }
+
+    #[test]
+    fn inspection_validates_path_and_configuration_before_reading() {
+        let (service, request) = fixture();
+        let wrong_path = "fcp.other:request-response:v1";
+        assert_eq!(run(inspect(None, wrong_path, request.clone())).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(run(inspect(Some(&service), wrong_path, request.clone())).unwrap_err().0, StatusCode::BAD_REQUEST);
+        let path = request.inspect.request.scope.connector_id.to_string();
+        assert_eq!(run(inspect(None, &path, request)).unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn inspection_rejects_wrong_grants_and_invalid_limits_instead_of_reporting_absence() {
+        let (service, request) = fixture();
+        let path = request.inspect.request.scope.connector_id.to_string();
+        let mut wrong = request.clone();
+        wrong.inspect.request.grant_id = "unknown-private-grant".to_owned();
+        let error = run(inspect(Some(&service), &path, wrong)).unwrap_err();
+        assert!(!error.0.is_success());
+        assert!(!error.1.contains("unknown-private-grant"));
+        let mut wrong = request;
+        wrong.inspect.request.limits.max_objects = 0;
+        assert!(run(inspect(Some(&service), &path, wrong)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn state_transfer_settings_preserve_absence_and_serial_default() {
+        assert_eq!(validate_transfer_settings(None, None).unwrap(), None);
+        let path = "/operator/transfer.json".to_owned();
+        assert_eq!(
+            validate_transfer_settings(Some(path.clone()), None).unwrap(),
+            Some((path, 1)),
+        );
+    }
+
+    #[test]
+    fn state_transfer_settings_accept_only_bounded_explicit_windows() {
+        for (raw, expected) in [("1", 1), ("2", 2), (" 2 ", 2)] {
+            let path = "/operator/transfer.json".to_owned();
+            assert_eq!(
+                validate_transfer_settings(Some(path.clone()), Some(raw.to_owned())).unwrap(),
+                Some((path, expected)),
+            );
+        }
+        for raw in ["0", "3", "-1", "1.5", "", "  ", "18446744073709551616", "secret-marker"] {
+            let error = validate_transfer_settings(
+                Some("/operator/transfer.json".to_owned()),
+                Some(raw.to_owned()),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("secret-marker"));
+        }
+    }
+
+    #[test]
+    fn page_concurrency_without_transfer_configuration_is_not_a_silent_fallback() {
+        for raw in ["1", "2", "0", ""] {
+            assert!(validate_transfer_settings(None, Some(raw.to_owned())).is_err());
+        }
     }
 }

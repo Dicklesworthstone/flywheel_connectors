@@ -27,6 +27,33 @@ use crate::{HostError, HostResult};
 // Discovery Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A read response with evidence of the host that actually answered it.
+///
+/// The entry host adds `read_route` only after authenticating and binding a mesh
+/// reply to the requested connector. Peer-supplied route fields are discarded.
+/// Local responses omit the route. Flattening preserves the existing response
+/// fields for clients that do not yet consume routing evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutedReadResponse<T> {
+    /// The connector's read-only response.
+    #[serde(flatten)]
+    pub response: T,
+    /// Entry-host evidence of a verified mesh forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_route: Option<fcp_kernel::InvokeRouteProvenance>,
+}
+
+impl<T> RoutedReadResponse<T> {
+    /// Wrap a response served directly by the entry host.
+    #[must_use]
+    pub const fn local(response: T) -> Self {
+        Self {
+            response,
+            read_route: None,
+        }
+    }
+}
+
 /// Filter for discovery requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoveryFilter {

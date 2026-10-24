@@ -1,7 +1,8 @@
 //! Live HTTP batches use the same completion-driven executor as library callers.
 //!
-//! Only the dependency graph is planned here. Capabilities, approval, revocation,
-//! fencing and durable invocation ownership remain in the ordinary invoke path.
+//! Dependency ordering and explicit same-zone input bindings are planned here.
+//! Capabilities, approval, revocation, fencing and durable invocation ownership
+//! remain in the ordinary invoke path.
 //! Dropping the HTTP waiter must not be interpreted as undoing an admitted effect.
 
 use std::future::Future;
@@ -9,6 +10,9 @@ use std::future::Future;
 use fcp_async_core::ExecutionContext;
 
 use super::*;
+
+#[path = "http_batch_dataflow.rs"]
+mod dataflow;
 
 pub(super) async fn execute(
     state: Arc<AppState>,
@@ -26,10 +30,10 @@ pub(super) async fn execute(
         "processing batch invoke request"
     );
 
-    let response = execute_with(&request, started_at, |operation, deadline| {
+    let response = execute_dataflow_with(&request, started_at, |operation, deadline| {
         execute_batch_operation(
             Arc::clone(&state),
-            operation.clone(),
+            operation,
             asserted_principal.clone(),
             deadline,
         )
@@ -52,14 +56,80 @@ pub(super) async fn execute(
 
 /// This adapter is also exercised with controlled futures in the bin tests.
 /// It does not spawn tasks or invent authorization on behalf of its handler.
+#[cfg(test)]
 async fn execute_with<'a, F, Fut>(
     request: &'a HttpBatchInvokeRequest,
     started_at: Instant,
-    mut handler: F,
+    handler: F,
 ) -> HostResult<BatchInvokeResponse>
 where
     F: FnMut(&'a HttpBatchOperation, Option<Instant>) -> Fut,
     Fut: Future<Output = OperationResult>,
+{
+    execute_with_observer(request, started_at, handler, |_| Ok(())).await
+}
+
+/// The production dataflow adapter hands fully resolved requests to the normal
+/// invoke path. No authority or idempotency fields are synthesized here.
+#[allow(clippy::future_not_send)]
+async fn execute_dataflow_with<F, Fut>(
+    request: &HttpBatchInvokeRequest,
+    started_at: Instant,
+    mut handler: F,
+) -> HostResult<BatchInvokeResponse>
+where
+    F: FnMut(HttpBatchOperation, Option<Instant>) -> Fut,
+    Fut: Future<Output = OperationResult>,
+{
+    BatchExecutor::new().plan_with_schedule_report(&request.planning_request())?;
+    validate_members(request)?;
+    let flow = dataflow::Dataflow::compile(request)?;
+    execute_with_observer(
+        request,
+        started_at,
+        |operation, deadline| {
+            let future = flow.resolve(operation).and_then(|resolved| {
+                // Resolution is synchronous bounded work. A ready callback can
+                // spend the final budget without yielding to a timer; check the
+                // original deadline again before constructing an invoke future.
+                if started_at.elapsed() >= Duration::from_millis(request.options.timeout_ms) {
+                    return Err(BatchOperationError {
+                        code: "BATCH_INPUT_TIMEOUT".into(),
+                        message: "batch input resolution exhausted the deadline before invocation".into(),
+                        retry_after_ms: None,
+                    });
+                }
+                Ok(handler(resolved, deadline))
+            });
+            async move {
+                match future {
+                    Ok(future) => future.await,
+                    Err(error) => OperationResult {
+                        id: operation.id.clone(),
+                        status: OperationResultStatus::Error,
+                        output: None,
+                        error: Some(error),
+                        duration_ms: 0,
+                    },
+                }
+            }
+        },
+        |result| flow.observe(result),
+    )
+    .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn execute_with_observer<'a, F, Fut, S>(
+    request: &'a HttpBatchInvokeRequest,
+    started_at: Instant,
+    mut handler: F,
+    observer: S,
+) -> HostResult<BatchInvokeResponse>
+where
+    F: FnMut(&'a HttpBatchOperation, Option<Instant>) -> Fut,
+    Fut: Future<Output = OperationResult>,
+    S: FnMut(&OperationResult) -> Result<(), BatchOperationError>,
 {
     let timeout = Duration::from_millis(request.options.timeout_ms);
     // Both planning and time waiting for earlier members consume the original
@@ -79,15 +149,23 @@ where
         .map(|operation| (operation.id.as_str(), operation))
         .collect();
 
+    // Live HTTP batches must not revert to unbounded provider-result retention.
+    // A withheld result is an unknown external effect, not a retry permit.
     let mut response = executor
-        .execute_async_with_context(&planning, &context, |planned| {
-            let operation = members[planned.id.as_str()];
-            let future = handler(operation, deadline);
-            async move { member_outcome(&operation.id, future.await) }
-        })
+        .execute_async_bounded_observed(
+            &planning,
+            Some(&context),
+            fcp_host::BatchResultLimits::default(),
+            |planned| {
+                let operation = members[planned.id.as_str()];
+                let future = handler(operation, deadline);
+                async move { member_outcome(&operation.id, future.await) }
+            },
+            observer,
+        )
         .await?;
-    response.total_duration_ms = elapsed_millis(started_at);
-    Ok(response)
+    response.response.total_duration_ms = elapsed_millis(started_at);
+    Ok(response.response)
 }
 
 fn validate_members(request: &HttpBatchInvokeRequest) -> HostResult<()> {
@@ -125,7 +203,7 @@ fn member_outcome(
         OperationResultStatus::Success if result.error.is_none() => result
             .output
             .ok_or_else(|| adapter_error("successful batch member omitted its output")),
-        OperationResultStatus::Error => Err(result
+        OperationResultStatus::Error if result.output.is_none() => Err(result
             .error
             .unwrap_or_else(|| adapter_error("failed batch member omitted its error"))),
         _ => Err(adapter_error(
@@ -166,3 +244,7 @@ pub(super) fn route_failure((status, message): (StatusCode, String)) -> BatchOpe
 #[cfg(test)]
 #[path = "http_batch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "http_batch_dataflow_tests.rs"]
+mod dataflow_tests;

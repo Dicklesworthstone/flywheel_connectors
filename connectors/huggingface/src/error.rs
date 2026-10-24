@@ -19,6 +19,13 @@ pub enum HuggingfaceError {
     #[error("Hugging Face API error {status}: {message}")]
     Api { status: u16, message: String },
 
+    /// Inference may already have consumed provider compute. Neither a
+    /// connector retry nor a new host invoke can safely repeat this request.
+    /// Do not retain upstream bodies or transport URLs in this error: they
+    /// can contain the input prompt or credentials.
+    #[error("inference outcome unknown; the request may already have executed; automatic retry suppressed")]
+    InferenceOutcomeUnknown { status: Option<u16> },
+
     #[error("Rate limited (retry after {retry_after_ms}ms)")]
     RateLimited { retry_after_ms: u64 },
 
@@ -46,6 +53,7 @@ impl HuggingfaceError {
             Self::RateLimited { .. } | Self::ModelLoading(_) => true,
             Self::Api { status, .. } => matches!(status, 500 | 502 | 503 | 504),
             Self::Json(_)
+            | Self::InferenceOutcomeUnknown { .. }
             | Self::Unauthorized(_)
             | Self::NotFound(_)
             | Self::Async(_)
@@ -81,6 +89,13 @@ impl HuggingfaceError {
                 status_code: Some(*status),
                 retryable: self.is_retryable(),
                 retry_after: self.retry_after(),
+            },
+            Self::InferenceOutcomeUnknown { status } => FcpError::External {
+                service: "huggingface".into(),
+                message: self.to_string(),
+                status_code: *status,
+                retryable: false,
+                retry_after: None,
             },
             Self::RateLimited { retry_after_ms } => FcpError::RateLimited {
                 retry_after_ms: *retry_after_ms,
@@ -219,5 +234,25 @@ mod tests {
             err.to_string(),
             "Async error: request deadline exceeded after 1500ms"
         );
+    }
+
+    #[test]
+    fn ambiguous_inference_stays_non_retryable_across_the_host_boundary() {
+        for status in [None, Some(200), Some(408), Some(500), Some(503)] {
+            let err = HuggingfaceError::InferenceOutcomeUnknown { status };
+            assert!(!err.is_retryable());
+            assert!(err.retry_after().is_none());
+            assert!(!ConnectorErrorMapping::is_retryable(&err));
+            assert!(matches!(
+                ConnectorErrorMapping::to_fcp_error(&err),
+                FcpError::External {
+                    status_code,
+                    retryable: false,
+                    retry_after: None,
+                    ref message,
+                    ..
+                } if status_code == status && message.contains("outcome unknown")
+            ));
+        }
     }
 }

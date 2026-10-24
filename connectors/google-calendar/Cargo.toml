@@ -47,6 +47,6 @@ ciborium.workspace = true
 wiremock.workspace = true
 futures-util.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
-fcp-e2e = { path = "../../crates/fcp-e2e" }
+fcp-e2e = { path = "../../crates/fcp-e2e", default-features = false, features = ["google_calendar"] }
 fcp-manifest = { path = "../../crates/fcp-manifest" }
 fcp-testkit = { path = "../../crates/fcp-testkit" }

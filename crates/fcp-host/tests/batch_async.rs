@@ -948,6 +948,7 @@ mod mesh {
                             MeshForwardBody::Invoke {
                                 request_json: op.input.to_string(),
                                 asserted_principal: None,
+                                origin_attempt_id: None,
                             },
                         )
                         .await

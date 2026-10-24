@@ -385,6 +385,7 @@ pub(super) fn execute<'a>(
     request: fcp_kernel::InvokeRequest,
     asserted_principal: Option<String>,
     parent_deadline: Option<Instant>,
+    relay: Option<fcp_host::RelayCancellationBinding>,
 ) -> std::pin::Pin<Box<dyn Future<Output = HostResult<InvokeResponse>> + Send + 'a>> {
     Box::pin(async move {
         request.validate_idempotency_key().map_err(|error| {
@@ -465,6 +466,7 @@ pub(super) fn execute<'a>(
                     started_at,
                     deadline,
                     job_audit,
+                    relay,
                 )
                 .await
             }) {
@@ -568,6 +570,7 @@ async fn dispatch(
     state: &std::sync::Arc<super::AppState>,
     request: fcp_kernel::InvokeRequest,
     deadline: Instant,
+    relay: Option<fcp_host::RelayCancellationBinding>,
 ) -> (HostResult<InvokeResponse>, bool) {
     let target = before_deadline(
         deadline,
@@ -578,7 +581,7 @@ async fn dispatch(
     )
     .await
     .and_then(std::convert::identity);
-    let (scope, runtime, warm_capture, wasi_capture, native_capture) = match target {
+    let (mut scope, runtime, warm_capture, wasi_capture, native_capture) = match target {
         Ok(target) => target,
         Err(error) => return (Err(error), false),
     };
@@ -591,6 +594,8 @@ async fn dispatch(
             false,
         );
     }
+    // Capture the signed origin registration on the exact runtime selected above.
+    scope.relay = relay;
     let registration = match super::track_verified_cancellation_owner(
         state.cancellation.as_ref(),
         &request.id.to_string(),
@@ -730,6 +735,7 @@ async fn run_owned(
     started_at: Instant,
     deadline: Instant,
     audit: fcp_host::InvokeAuditContext,
+    relay: Option<fcp_host::RelayCancellationBinding>,
 ) -> HostResult<InvokeResponse> {
     let remaining_ms = u64::try_from(
         deadline
@@ -775,7 +781,7 @@ async fn run_owned(
     };
 
     state.invoke_jobs.bind_attempt(&ticket)?;
-    let (source_result, dispatched) = dispatch(state, request.clone(), deadline).await;
+    let (source_result, dispatched) = dispatch(state, request.clone(), deadline, relay).await;
     let duration_ms = super::elapsed_millis(started_at);
     let terminal = terminal_observation(&source_result, dispatched, deadline, duration_ms);
     let finalize_by = finalization_deadline(deadline);

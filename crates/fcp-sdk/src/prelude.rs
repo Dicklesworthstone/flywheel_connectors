@@ -148,6 +148,10 @@ pub use jsonl::{JsonlConfig, serve_jsonl};
 mod standalone;
 pub use standalone::{StandaloneInvocation, StandaloneSession};
 
+/// Local-only manifest input and response contract validation.
+mod operation_contracts;
+pub use operation_contracts::OperationContractSet;
+
 // External crates commonly needed
 pub use serde::{Deserialize, Serialize};
 pub use serde_json::json;

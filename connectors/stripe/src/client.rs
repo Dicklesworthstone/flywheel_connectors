@@ -3,6 +3,7 @@
 //! Stripe uses form-encoded POST bodies for creates and query-string GET for reads.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fcp_prelude::CredentialId;
@@ -130,6 +131,9 @@ impl StripeClient {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("fcp-stripe/0.1.0")
+            // A redirect can replay the form body under a different endpoint
+            // below our retry/idempotency boundary. Require explicit routing.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(StripeError::Http)?;
 
@@ -559,7 +563,10 @@ impl StripeClient {
     // ── HTTP helpers ──────────────────────────────────────────────
 
     async fn get(&self, url: &str) -> StripeResult<serde_json::Value> {
-        self.execute(|| self.apply_auth(self.http.get(url))).await
+        self.execute(ReplayScope::AcrossInvocations, || {
+            self.apply_auth(self.http.get(url))
+        })
+        .await
     }
 
     async fn post_form(
@@ -576,6 +583,9 @@ impl StripeClient {
         body: &serde_json::Value,
         idempotency_key: Option<&str>,
     ) -> StripeResult<serde_json::Value> {
+        if let Some(key) = idempotency_key {
+            validate_idempotency_key(key)?;
+        }
         // Stripe's REST API only accepts `application/x-www-form-urlencoded`
         // request bodies (with bracket notation for nested fields); it does not
         // parse JSON. Encode the body here rather than sending `.json()`.
@@ -603,7 +613,12 @@ impl StripeClient {
             Some(key) => key.to_string(),
             None => format!("fcp2:retry:{}", Uuid::new_v4()),
         };
-        self.execute(|| {
+        let scope = if idempotency_key.is_some() {
+            ReplayScope::AcrossInvocations
+        } else {
+            ReplayScope::ThisInvocation
+        };
+        self.execute(scope, || {
             self.apply_auth(
                 self.http
                     .post(url)
@@ -624,7 +639,10 @@ impl StripeClient {
         url: &str,
         idempotency_key: Option<&str>,
     ) -> StripeResult<serde_json::Value> {
-        self.execute(|| {
+        if let Some(key) = idempotency_key {
+            validate_idempotency_key(key)?;
+        }
+        self.execute(ReplayScope::AcrossInvocations, || {
             let mut req = self.apply_auth(self.http.delete(url));
             if let Some(key) = idempotency_key {
                 req = req.header("Idempotency-Key", key);
@@ -636,45 +654,86 @@ impl StripeClient {
 
     async fn execute(
         &self,
+        replay_scope: ReplayScope,
         build_request: impl Fn() -> reqwest::RequestBuilder,
     ) -> StripeResult<serde_json::Value> {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
+        let ambiguous_attempt = AtomicBool::new(false);
 
-        RetryLoop::execute(&ctx, &policy, |attempt| {
+        let result = RetryLoop::execute(&ctx, &policy, |attempt| {
             let request = build_request();
+            let ambiguous_attempt = &ambiguous_attempt;
             async move {
                 debug!(attempt, "Stripe API request");
+                // The guard exists before send is polled, so cancellation or
+                // deadline expiry during send/body-read cannot erase ambiguity.
+                let mut replay_guard = AttemptReplayGuard::new(ambiguous_attempt);
 
                 match request.send().await {
                     Ok(response) => {
                         let status = response.status();
+                        replay_guard.observe_status(status.as_u16());
 
-                        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                            return AttemptOutcome::Terminal(StripeError::Unauthorized);
+                        if status.is_redirection() {
+                            // Never expose Location: it may contain credentials
+                            // or private request data supplied by an intermediary.
+                            return AttemptOutcome::Terminal(StripeError::UnexpectedRedirect {
+                                status_code: status.as_u16(),
+                            });
                         }
 
-                        if status == StatusCode::NOT_FOUND {
-                            let body = response.text().await.unwrap_or_default();
-                            return AttemptOutcome::Terminal(StripeError::NotFound {
-                                resource: body,
+                        let should_retry = stripe_should_retry(response.headers());
+                        if should_retry != Some(true) {
+                            // Preserve actionable authentication/resource errors
+                            // unless the provider explicitly requests recovery.
+                            // Both remain non-retryable under a `false` hint.
+                            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                                return AttemptOutcome::Terminal(StripeError::Unauthorized);
+                            }
+                            if status == StatusCode::NOT_FOUND {
+                                let body = response.text().await.unwrap_or_default();
+                                return AttemptOutcome::Terminal(StripeError::NotFound {
+                                    resource: body,
+                                });
+                            }
+                        }
+                        if !status.is_success() && should_retry == Some(false) {
+                            // A Terminal(Api { 500, .. }) would still tell the
+                            // host to retry. Carry the refusal across that boundary.
+                            return AttemptOutcome::Terminal(StripeError::RetryForbidden {
+                                status_code: status.as_u16(),
                             });
                         }
 
                         if status == StatusCode::TOO_MANY_REQUESTS {
-                            let retry_after_secs = response
-                                .headers()
-                                .get("retry-after")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .unwrap_or(60);
-                            let retry_after = Duration::from_secs(retry_after_secs);
+                            let retry_after = stripe_retry_after(response.headers())
+                                .unwrap_or(Duration::from_secs(60));
 
                             return AttemptOutcome::Retryable {
                                 error: StripeError::RateLimited {
-                                    retry_after_ms: retry_after_secs.saturating_mul(1000),
+                                    retry_after_ms: u64::try_from(retry_after.as_millis())
+                                        .unwrap_or(u64::MAX),
                                 },
                                 retry_after: Some(retry_after),
+                            };
+                        }
+
+                        if !status.is_success()
+                            && (should_retry == Some(true) || status == StatusCode::CONFLICT)
+                        {
+                            // The provider's hint overrides status-only error
+                            // classification. A 409 can mean another attempt
+                            // with this key is still executing. Reuse the same
+                            // key/body, not a fresh invocation's generated key.
+                            replay_guard.observe_retryable_response();
+                            let retry_after = stripe_retry_after(response.headers());
+                            return AttemptOutcome::Retryable {
+                                error: StripeError::RetryableResponse {
+                                    status_code: status.as_u16(),
+                                    retry_after,
+                                },
+                                retry_after,
                             };
                         }
 
@@ -725,17 +784,366 @@ impl StripeClient {
                             Err(error) => AttemptOutcome::Terminal(StripeError::Http(error)),
                         }
                     }
+                    Err(error) if error.is_builder() => {
+                        replay_guard.observe_transport_error(&error);
+                        AttemptOutcome::Terminal(StripeError::RequestBuildFailed)
+                    }
                     Err(error) if error.is_timeout() || error.is_connect() => {
+                        replay_guard.observe_transport_error(&error);
                         AttemptOutcome::Retryable {
                             error: StripeError::Http(error),
                             retry_after: None,
                         }
                     }
-                    Err(error) => AttemptOutcome::Terminal(StripeError::Http(error)),
+                    Err(error) => {
+                        replay_guard.observe_transport_error(&error);
+                        AttemptOutcome::Terminal(StripeError::Http(error))
+                    }
                 }
             }
         })
-        .await
+        .await;
+        finish_stripe_attempts(result, replay_scope, &ambiguous_attempt)
+    }
+}
+
+/// Only an unambiguous `true` can opt into retries beyond status defaults.
+/// A `false` anywhere wins, including repeated or comma-joined fields from an
+/// intermediary. Unknown values alone do not invent provider retry guidance.
+fn stripe_should_retry(headers: &header::HeaderMap) -> Option<bool> {
+    let mut retry = false;
+    let mut malformed = false;
+    for value in headers.get_all("stripe-should-retry") {
+        let Ok(value) = value.to_str() else {
+            malformed = true;
+            continue;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("false") {
+                return Some(false);
+            }
+            if directive.eq_ignore_ascii_case("true") {
+                retry = true;
+            } else {
+                malformed = true;
+            }
+        }
+    }
+    (retry && !malformed).then_some(true)
+}
+
+/// Stripe's numeric retry delay is expressed in seconds. Invalid values fall
+/// back to the existing backoff policy (or the rate-limit default).
+fn stripe_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Reject unusable keys before considering a POST replay-safe. Never normalize
+/// a key: trimming or rewriting it could merge two distinct caller operations.
+fn validate_idempotency_key(key: &str) -> StripeResult<()> {
+    if key.is_empty() || key.len() > 255 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(StripeError::InvalidIdempotencyKey);
+    }
+    Ok(())
+}
+
+/// Stripe's API v1 GET/DELETE requests are idempotent. A caller-supplied key
+/// permits the same POST and parameters to be replayed within Stripe's retention
+/// window. A generated key is unavailable to a later host invocation.
+#[derive(Clone, Copy)]
+enum ReplayScope {
+    AcrossInvocations,
+    ThisInvocation,
+}
+
+/// Records ambiguity monotonically across every attempt of an invocation.
+///
+/// A later connect failure, refusal, or cancelled backoff does not prove an
+/// earlier attempt failed to execute. Atomic storage also keeps request futures
+/// Send without holding a mutex across provider I/O.
+struct AttemptReplayGuard<'a> {
+    ambiguous_attempt: &'a AtomicBool,
+    may_have_executed: bool,
+}
+
+impl<'a> AttemptReplayGuard<'a> {
+    const fn new(ambiguous_attempt: &'a AtomicBool) -> Self {
+        Self {
+            ambiguous_attempt,
+            may_have_executed: true,
+        }
+    }
+
+    fn observe_status(&mut self, status: u16) {
+        // Preserve actionable Stripe content/authentication/refusal errors.
+        // 408 is ambiguous, 409 can mean the same key is still executing, and
+        // 424 can reflect a failed downstream payment dependency. Do not treat
+        // arbitrary 4xx responses as evidence of non-execution.
+        self.may_have_executed = !matches!(status, 400 | 401 | 402 | 403 | 404 | 422 | 429);
+    }
+
+    const fn observe_retryable_response(&mut self) {
+        // A directive can request a retry even for a normally terminal 4xx.
+        // That is permission to replay the SAME identity, not proof that the
+        // operation had no effects. Re-arm a status-disarmed guard before the
+        // retry loop can yield, so exhaustion or cancellation fails closed.
+        self.may_have_executed = true;
+    }
+
+    fn observe_transport_error(&mut self, error: &reqwest::Error) {
+        // Body/response errors (including total-request timeouts) may follow a
+        // committed mutation. Only pre-transmission failures disarm the guard.
+        self.may_have_executed = !(error.is_connect() || error.is_builder());
+    }
+}
+
+impl Drop for AttemptReplayGuard<'_> {
+    fn drop(&mut self) {
+        if self.may_have_executed {
+            self.ambiguous_attempt.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn finish_stripe_attempts<T>(
+    result: StripeResult<T>,
+    scope: ReplayScope,
+    ambiguous_attempt: &AtomicBool,
+) -> StripeResult<T> {
+    if matches!(scope, ReplayScope::ThisInvocation) && ambiguous_attempt.load(Ordering::Relaxed) {
+        // The SDK retry loop has stopped, but the host can still retry based on
+        // FcpError. Never hand it a retryable error that generates a fresh key.
+        result.map_err(|_| StripeError::MutationOutcomeUnknown)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod replay_scope_tests {
+    use super::*;
+    use fcp_prelude::FcpError;
+    use fcp_sdk::ConnectorErrorMapping;
+
+    #[test]
+    fn provider_retry_guidance_requires_an_unambiguous_boolean() {
+        for (values, expected) in [
+            (vec![], None),
+            (vec!["true"], Some(true)),
+            (vec![" TRUE "], Some(true)),
+            (vec!["true", "true"], Some(true)),
+            (vec!["true,true"], Some(true)),
+            (vec!["false"], Some(false)),
+            (vec!["unknown"], None),
+            (vec![""], None),
+            (vec!["true", "unknown"], None),
+            (vec!["true,unknown"], None),
+        ] {
+            let mut headers = header::HeaderMap::new();
+            for value in values {
+                headers.append("stripe-should-retry", value.parse().unwrap());
+            }
+            assert_eq!(stripe_should_retry(&headers), expected);
+        }
+    }
+
+    #[test]
+    fn any_provider_retry_refusal_overrides_other_header_values() {
+        for values in [
+            vec!["true", "false"],
+            vec!["false", "true"],
+            vec!["true, false"],
+            vec!["unknown", "FaLsE", "true"],
+            vec!["true, unknown, false"],
+        ] {
+            let mut headers = header::HeaderMap::new();
+            for value in values {
+                headers.append("stripe-should-retry", value.parse().unwrap());
+            }
+            assert_eq!(stripe_should_retry(&headers), Some(false));
+        }
+
+        let mut headers = header::HeaderMap::new();
+        headers.append(
+            "stripe-should-retry",
+            header::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        headers.append("stripe-should-retry", "true".parse().unwrap());
+        assert_eq!(stripe_should_retry(&headers), None);
+        headers.append("stripe-should-retry", "false".parse().unwrap());
+        assert_eq!(stripe_should_retry(&headers), Some(false));
+    }
+
+    #[test]
+    fn provider_retry_delay_preserves_numeric_seconds() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(stripe_retry_after(&headers), None);
+        for (value, expected) in [
+            ("0", Some(Duration::ZERO)),
+            (" 12 ", Some(Duration::from_secs(12))),
+            ("18446744073709551615", Some(Duration::from_secs(u64::MAX))),
+            ("18446744073709551616", None),
+            ("-1", None),
+            ("1.5", None),
+            ("nonsense", None),
+        ] {
+            headers.insert("retry-after", value.parse().unwrap());
+            assert_eq!(stripe_retry_after(&headers), expected);
+        }
+    }
+
+    #[test]
+    fn provider_directed_retry_rearms_previously_disarmed_statuses() {
+        for status in [400, 401, 402, 403, 404, 422] {
+            let ambiguous = AtomicBool::new(false);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_status(status);
+                guard.observe_retryable_response();
+            }
+            assert!(ambiguous.load(Ordering::Relaxed), "status {status}");
+            let result: StripeResult<()> = Err(StripeError::RetryableResponse {
+                status_code: status,
+                retry_after: Some(Duration::from_secs(1)),
+            });
+            let error = finish_stripe_attempts(result, ReplayScope::ThisInvocation, &ambiguous)
+                .unwrap_err();
+            assert!(matches!(error, StripeError::MutationOutcomeUnknown));
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn pre_transmission_failure_does_not_clear_prior_ambiguity() {
+        let error = Client::new().get("not a URL").build().unwrap_err();
+        assert!(error.is_builder());
+        for prior_ambiguity in [false, true] {
+            let ambiguous = AtomicBool::new(prior_ambiguity);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_transport_error(&error);
+            }
+            assert_eq!(ambiguous.load(Ordering::Relaxed), prior_ambiguity);
+        }
+    }
+
+    #[test]
+    fn idempotency_key_validation_has_exact_boundaries_and_does_not_echo_keys() {
+        for key in ["!".to_owned(), "a".repeat(255), "order:payment/1".to_owned()] {
+            validate_idempotency_key(&key).unwrap();
+        }
+        for key in [
+            String::new(), " ".to_owned(), "a".repeat(256),
+            "private-key\r\nInjected: yes".to_owned(), "private-key\t".to_owned(),
+            "private-key\0".to_owned(), "private-key\u{7f}".to_owned(),
+            "private-keyé".to_owned(), " private-key".to_owned(),
+        ] {
+            let error = validate_idempotency_key(&key).unwrap_err();
+            assert!(!error.to_string().contains("private-key"));
+            assert!(!error.is_retryable());
+            assert!(matches!(error.to_fcp_error(), FcpError::InvalidRequest { code: 1005, .. }));
+        }
+    }
+
+    #[test]
+    fn explicit_retry_refusals_survive_the_host_error_boundary() {
+        for error in [
+            StripeError::UnexpectedRedirect { status_code: 307 },
+            StripeError::RetryForbidden { status_code: 500 },
+            StripeError::RetryForbidden { status_code: 429 },
+        ] {
+            assert!(!ConnectorErrorMapping::is_retryable(&error));
+            assert!(ConnectorErrorMapping::retry_after(&error).is_none());
+            assert!(matches!(
+                error.to_fcp_error(),
+                FcpError::External { retryable: false, retry_after: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn response_classification_fails_closed() {
+        for status in [200, 201, 204, 301, 307, 308, 408, 409, 424, 500, 502, 503, 504] {
+            let ambiguous = AtomicBool::new(false);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_status(status);
+            }
+            assert!(ambiguous.load(Ordering::Relaxed), "status {status}");
+        }
+    }
+
+    #[test]
+    fn explicit_refusals_remain_actionable() {
+        for status in [400, 401, 402, 403, 404, 422, 429] {
+            let ambiguous = AtomicBool::new(false);
+            {
+                let mut guard = AttemptReplayGuard::new(&ambiguous);
+                guard.observe_status(status);
+            }
+            assert!(!ambiguous.load(Ordering::Relaxed), "status {status}");
+        }
+    }
+
+    #[test]
+    fn interrupted_send_is_ambiguous() {
+        let ambiguous = AtomicBool::new(false);
+        drop(AttemptReplayGuard::new(&ambiguous));
+        assert!(ambiguous.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn later_refusal_does_not_erase_an_earlier_ambiguous_attempt() {
+        let ambiguous = AtomicBool::new(false);
+        drop(AttemptReplayGuard::new(&ambiguous));
+        {
+            let mut guard = AttemptReplayGuard::new(&ambiguous);
+            guard.observe_status(429);
+        }
+        let result: StripeResult<()> = Err(StripeError::RateLimited { retry_after_ms: 1 });
+        let error = finish_stripe_attempts(result, ReplayScope::ThisInvocation, &ambiguous)
+            .expect_err("an earlier write may have executed");
+        assert!(matches!(error, StripeError::MutationOutcomeUnknown));
+        assert!(!ConnectorErrorMapping::is_retryable(&error));
+        assert!(ConnectorErrorMapping::retry_after(&error).is_none());
+        assert!(matches!(
+            ConnectorErrorMapping::to_fcp_error(&error),
+            FcpError::External { retryable: false, retry_after: None, .. }
+        ));
+    }
+
+    #[test]
+    fn successful_reconciliation_wins_over_earlier_ambiguity() {
+        let ambiguous = AtomicBool::new(true);
+        assert_eq!(
+            finish_stripe_attempts(Ok(42), ReplayScope::ThisInvocation, &ambiguous).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn caller_key_preserves_retryable_errors() {
+        let ambiguous = AtomicBool::new(true);
+        let result: StripeResult<()> = Err(StripeError::RateLimited { retry_after_ms: 7 });
+        let error = finish_stripe_attempts(result, ReplayScope::AcrossInvocations, &ambiguous)
+            .unwrap_err();
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after(), Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn no_attempt_does_not_claim_a_mutation_was_sent() {
+        let ambiguous = AtomicBool::new(false);
+        let result: StripeResult<()> = Err(StripeError::Unauthorized);
+        assert!(matches!(
+            finish_stripe_attempts(result, ReplayScope::ThisInvocation, &ambiguous),
+            Err(StripeError::Unauthorized)
+        ));
     }
 }
 

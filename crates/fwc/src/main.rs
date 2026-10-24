@@ -308,6 +308,10 @@ use fcp_audit::HybridLogicalClock;
 use fcp_crypto::{
     Ed25519Signature, Ed25519VerifyingKey, canonicalize::to_deterministic_cbor, cose::CoseToken,
 };
+use fcp_host::mesh_routing::{
+    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryMembershipStatus,
+    MeshInventoryResponse, MeshInventoryStatus,
+};
 use fcp_host::{
     BatchInvokeResponse as HostBatchInvokeResponse, BatchOptions as HostBatchOptions,
     BudgetReportRequest as HostBudgetReportRequest,
@@ -910,10 +914,10 @@ struct MeshArgs {
 #[derive(Subcommand, Debug, Serialize)]
 #[serde(tag = "subcommand", content = "args", rename_all = "kebab-case")]
 enum MeshCommand {
-    /// Show persisted mesh targeting state for the current host context.
+    /// Inspect live mesh inventory, or persisted targeting state with --offline.
     Status(MeshStatusArgs),
 
-    /// List known mesh target candidates for the current host context.
+    /// List advertised mesh connector locations, or offline target candidates.
     Nodes(MeshNodesArgs),
 
     /// Set the active default node for the current host context.
@@ -940,12 +944,42 @@ enum MeshCommand {
 }
 
 #[derive(Args, Debug, Default, Serialize)]
-struct MeshStatusArgs {}
+struct MeshStatusArgs {
+    /// Inspect persisted target state without contacting a configured host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    /// Fail unless the command resolves from at least this truth source.
+    #[arg(long, value_enum)]
+    require_source: Option<RequiredTruthSource>,
+
+    /// Read the host admin bearer secret from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
+}
 
 #[derive(Args, Debug, Default, Serialize)]
 struct MeshNodesArgs {
-    /// Optional connector id/alias to inspect connector-specific target candidates.
+    /// Optional canonical connector id or family to filter advertised locations.
     connector: Option<String>,
+
+    /// Restrict advertised connectors to this exact execution zone.
+    #[arg(long)]
+    zone: Option<String>,
+
+    /// Inspect persisted target candidates without contacting a configured host.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    /// Fail unless the command resolves from at least this truth source.
+    #[arg(long, value_enum)]
+    require_source: Option<RequiredTruthSource>,
+
+    /// Read the host admin bearer secret from a file; defaults to FCP_HOST_ADMIN_BEARER_TOKEN.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -2585,6 +2619,29 @@ struct LiveAuthArgs {
     approval_token_file: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug, Clone, Default, Serialize)]
+struct WorkflowAuthArgs {
+    /// Default credentials for steps targeting one connector.
+    #[command(flatten)]
+    #[serde(flatten)]
+    default_auth: LiveAuthArgs,
+
+    /// Capability for one workflow step. Repeat for each separately authorized step.
+    #[arg(long = "step-capability-token", value_name = "STEP=TOKEN")]
+    #[serde(skip_serializing)]
+    step_capability_token: Vec<String>,
+
+    /// Read a workflow step's capability from a base64, JSON, or raw CBOR file.
+    #[arg(long = "step-capability-token-file", value_name = "STEP=PATH")]
+    #[serde(skip_serializing)]
+    step_capability_token_file: Vec<String>,
+
+    /// Holder signing key for the capability explicitly assigned to this step.
+    #[arg(long = "step-holder-key-file", value_name = "STEP=PATH")]
+    #[serde(skip_serializing)]
+    step_holder_key_file: Vec<String>,
+}
+
 #[derive(Args, Debug, Serialize)]
 struct InvokeArgs {
     /// Connector id, alias, or family name.
@@ -3014,6 +3071,56 @@ struct PipeArgs {
     #[arg(long, value_name = "PATH")]
     map_file: Option<PathBuf>,
 
+    /// Source operation input as JSON. Defaults to an empty object.
+    #[arg(long, conflicts_with_all = ["file", "stdin"])]
+    input: Option<String>,
+
+    /// Read source operation input from a JSON file.
+    #[arg(long, conflicts_with = "stdin")]
+    file: Option<PathBuf>,
+
+    /// Read source operation input from stdin.
+    #[arg(long)]
+    stdin: bool,
+
+    /// Execution zone shared by both operations.
+    #[arg(long)]
+    zone: Option<String>,
+
+    /// Source capability token; required when the operations use different connectors.
+    #[arg(
+        long,
+        conflicts_with = "source_capability_token_file",
+        value_name = "TOKEN"
+    )]
+    #[serde(skip_serializing)]
+    source_capability_token: Option<String>,
+
+    /// Read the source connector's instance-bound capability token from a file.
+    #[arg(long, value_name = "PATH")]
+    source_capability_token_file: Option<PathBuf>,
+
+    /// Node signing key for a holder-bound source capability.
+    #[arg(long, value_name = "PATH")]
+    #[serde(skip_serializing)]
+    source_holder_key_file: Option<PathBuf>,
+
+    /// Expected singleton-writer lease sequence for the source operation.
+    #[arg(long)]
+    source_lease_seq: Option<u64>,
+
+    /// Expected singleton-writer lease sequence for the target operation.
+    #[arg(long)]
+    target_lease_seq: Option<u64>,
+
+    /// Stable key for deliberately retrying this pipe. Each stage gets its own derived key.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+
+    /// Target capability and approvals. Approval tokens are checked separately for each stage.
+    #[command(flatten)]
+    auth: LiveAuthArgs,
+
     /// Preview the mapped input without executing the target operation.
     #[arg(long)]
     dry_run: bool,
@@ -3077,7 +3184,7 @@ struct RecipeRunArgs {
     zone: Option<String>,
 
     #[command(flatten)]
-    auth: LiveAuthArgs,
+    auth: WorkflowAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -3131,7 +3238,7 @@ struct PipelineRunArgs {
     zone: Option<String>,
 
     #[command(flatten)]
-    auth: LiveAuthArgs,
+    auth: WorkflowAuthArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -4311,7 +4418,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Compare(args) => compare_dispatch(&args)?,
         Commands::Undo(args) => undo_dispatch(&args)?,
         Commands::Approvals(args) => approvals_dispatch(&args)?,
-        Commands::Pipe(args) => pipe_dispatch(args)?,
+        Commands::Pipe(args) => pipe_dispatch(args, cli.host.as_deref())?,
         Commands::Pipeline(args) => pipeline_dispatch(args, cli.host.as_deref())?,
         Commands::Recipe(args) => recipe_dispatch(args, cli.host.as_deref())?,
         Commands::Map(args) => map_dispatch(args, cli.host.as_deref())?,
@@ -5219,6 +5326,112 @@ struct HostConnectorCatalog {
     connectors: Vec<HostConnectorRecord>,
 }
 
+/// Origin attested by the selected host for one read response. This proves
+/// neither replica coverage nor quorum freshness; the host owns peer signature
+/// and response-binding verification before emitting route metadata. Discovery
+/// contributions arrive in headers; point reads retain the typed body route.
+#[derive(Clone, Debug, Serialize)]
+struct HostReadProvenance {
+    path: String,
+    truth_source: KnowledgeState,
+    attested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<fcp_kernel::InvokeRouteProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_connectors: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mesh_connectors: Option<usize>,
+}
+
+impl HostReadProvenance {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Result<Self> {
+        let source_header = headers.get_all("x-fcp-truth-source");
+        let mut values = source_header.iter();
+        let value = values.next();
+        anyhow::ensure!(
+            values.next().is_none(),
+            "host returned duplicate read truth headers"
+        );
+        let truth_source = match value
+            .map(reqwest::header::HeaderValue::to_str)
+            .transpose()?
+        {
+            None | Some("host-backed") => KnowledgeState::HostBacked,
+            Some("mesh-backed") => KnowledgeState::MeshBacked,
+            Some(_) => bail!("host returned an unsupported read truth source"),
+        };
+        let count = |name: &'static str| -> Result<Option<usize>> {
+            let header = headers.get_all(name);
+            let mut values = header.iter();
+            let value = values.next();
+            anyhow::ensure!(
+                values.next().is_none(),
+                "host returned duplicate read contribution headers"
+            );
+            value
+                .map(|value| {
+                    value
+                        .to_str()?
+                        .parse::<usize>()
+                        .context("host returned an invalid read contribution count")
+                })
+                .transpose()
+        };
+        let local_connectors = count("x-fcp-truth-local-connectors")?;
+        let mesh_connectors = count("x-fcp-truth-mesh-connectors")?;
+        anyhow::ensure!(
+            local_connectors.is_some() == mesh_connectors.is_some(),
+            "host returned incomplete read contribution counts"
+        );
+        if let (Some(local), Some(mesh)) = (local_connectors, mesh_connectors) {
+            let expected = if local == 0 && mesh > 0 {
+                KnowledgeState::MeshBacked
+            } else {
+                KnowledgeState::HostBacked
+            };
+            anyhow::ensure!(
+                truth_source == expected && value.is_some(),
+                "host read truth source contradicts its contribution counts"
+            );
+        }
+        Ok(Self {
+            path: String::new(),
+            truth_source,
+            attested: value.is_some(),
+            route: None,
+            local_connectors,
+            mesh_connectors,
+        })
+    }
+
+    fn validate_discovery(&self, connector_count: usize) -> Result<()> {
+        if let (Some(local), Some(mesh)) = (self.local_connectors, self.mesh_connectors) {
+            anyhow::ensure!(
+                local.checked_add(mesh) == Some(connector_count),
+                "host read contribution counts do not match discovery inventory"
+            );
+        } else {
+            anyhow::ensure!(
+                self.truth_source != KnowledgeState::MeshBacked,
+                "mesh discovery response omitted its contribution counts"
+            );
+        }
+        Ok(())
+    }
+
+    fn with_route(mut self, route: Option<fcp_kernel::InvokeRouteProvenance>) -> Result<Self> {
+        let actual = read_response_knowledge_state(&[route.as_ref()])?;
+        anyhow::ensure!(
+            !self.attested || self.truth_source == actual,
+            "host read response headers contradict its executor evidence"
+        );
+        self.truth_source = actual;
+        self.attested |= route.is_some();
+        self.route = route;
+        Ok(self)
+    }
+}
+
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
         Self::with_redirects(endpoint, true)
@@ -5282,8 +5495,76 @@ impl HostAdminClient {
         Ok((HostConnectorCatalog::from_response(&response), response))
     }
 
+    fn catalog_with_provenance(
+        &self,
+        filter: Option<&HostDiscoveryFilter>,
+    ) -> Result<(
+        HostConnectorCatalog,
+        HostDiscoveryResponse,
+        HostReadProvenance,
+    )> {
+        let (response, provenance): (HostDiscoveryResponse, _) = self.read_json_with_provenance(
+            self.client
+                .post(format!("{}/rpc/discover", self.base_url))
+                .json(&json!({ "filter": filter })),
+            "POST",
+            "/rpc/discover",
+        )?;
+        provenance.validate_discovery(response.connectors.len())?;
+        Ok((
+            HostConnectorCatalog::from_response(&response),
+            response,
+            provenance,
+        ))
+    }
+
     fn cutover_gates_snapshot(&self) -> Result<Value> {
         self.get_json("/rpc/mesh/cutover-gates")
+    }
+
+    fn mesh_inventory(&self, token: &str) -> Result<MeshInventoryResponse> {
+        const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+        let response = self
+            .client
+            .get(format!("{}{MESH_INVENTORY_ROUTE}", self.base_url))
+            .bearer_auth(token)
+            .header("x-fcp-zone", "z:owner")
+            .timeout(self.read_timeout)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("mesh inventory exceeded the host read deadline")
+                } else {
+                    anyhow::anyhow!("failed to query the selected host's mesh inventory")
+                }
+            })?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "mesh inventory returned HTTP {}",
+            response.status().as_u16(),
+        );
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_RESPONSE_BYTES),
+            "mesh inventory response exceeds the size limit",
+        );
+        let mut body = Vec::new();
+        response
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| anyhow::anyhow!("failed to read the mesh inventory response"))?;
+        anyhow::ensure!(
+            body.len() as u64 <= MAX_RESPONSE_BYTES,
+            "mesh inventory response exceeds the size limit",
+        );
+        let inventory: MeshInventoryResponse = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("host returned an invalid mesh inventory response"))?;
+        anyhow::ensure!(
+            inventory.schema_version == MESH_INVENTORY_SCHEMA_VERSION,
+            "host returned an unsupported mesh inventory schema",
+        );
+        Ok(inventory)
     }
 
     fn discover(&self, filter: Option<&HostDiscoveryFilter>) -> Result<HostDiscoveryResponse> {
@@ -5296,6 +5577,56 @@ impl HostAdminClient {
 
     fn introspect(&self, connector_id: &str) -> Result<HostIntrospectionResponse> {
         self.get_json(&format!("/rpc/introspect/{connector_id}"))
+    }
+
+    fn connector_with_provenance(
+        &self,
+        connector_id: &str,
+    ) -> Result<(HostConnectorInventoryResponse, HostReadProvenance)> {
+        let (response, provenance): (
+            fcp_host::RoutedReadResponse<HostConnectorInventoryResponse>,
+            _,
+        ) = self.get_json_with_provenance(&format!("/rpc/connectors/{connector_id}"))?;
+        anyhow::ensure!(
+            response.response.connector.id.as_str() == connector_id,
+            "host returned inventory for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
+    }
+
+    fn introspect_with_provenance(
+        &self,
+        connector_id: &str,
+    ) -> Result<(HostIntrospectionResponse, HostReadProvenance)> {
+        let (response, provenance): (fcp_host::RoutedReadResponse<HostIntrospectionResponse>, _) =
+            self.get_json_with_provenance(&format!("/rpc/introspect/{connector_id}"))?;
+        anyhow::ensure!(
+            response.response.connector.id.as_str() == connector_id,
+            "host returned introspection for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
+    }
+
+    fn connector_status_with_provenance(
+        &self,
+        connector_id: &str,
+    ) -> Result<(HostConnectorAdminStatus, HostReadProvenance)> {
+        let (response, provenance): (fcp_host::RoutedReadResponse<HostConnectorAdminStatus>, _) =
+            self.get_json_with_provenance(&format!("/rpc/connectors/{connector_id}/status"))?;
+        anyhow::ensure!(
+            response.response.connector_id.as_str() == connector_id,
+            "host returned runtime status for a different connector"
+        );
+        Ok((
+            response.response,
+            provenance.with_route(response.read_route)?,
+        ))
     }
 
     fn doctor(&self, request: &HostDoctorRequest) -> Result<HostDoctorReport> {
@@ -5617,6 +5948,17 @@ impl HostAdminClient {
         )
     }
 
+    fn get_json_with_provenance<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, HostReadProvenance)> {
+        self.read_json_with_provenance(
+            self.client.get(format!("{}{}", self.base_url, path)),
+            "GET",
+            path,
+        )
+    }
+
     fn post_read_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         self.read_json(
             self.client
@@ -5633,11 +5975,25 @@ impl HostAdminClient {
         method: &'static str,
         path: &str,
     ) -> Result<T> {
+        self.read_json_with_provenance(request, method, path)
+            .map(|(value, _)| value)
+    }
+
+    fn read_json_with_provenance<T: DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        method: &'static str,
+        path: &str,
+    ) -> Result<(T, HostReadProvenance)> {
         request
             .timeout(self.read_timeout)
             .send()
             .with_context(|| format!("{method} {path} from host admin API failed"))
-            .and_then(|response| Self::decode_response(response, method, path))
+            .and_then(|response| {
+                let mut provenance = HostReadProvenance::from_headers(response.headers())?;
+                provenance.path = path.to_owned();
+                Self::decode_response(response, method, path).map(|value| (value, provenance))
+            })
             .map_err(|error| {
                 if error.chain().any(|cause| {
                     cause
@@ -6413,12 +6769,18 @@ fn host_discovered_connector(
 fn load_live_discovered_connectors(
     client: &HostAdminClient,
     catalog: &HostConnectorCatalog,
-) -> Result<(Vec<DiscoveredConnector>, Vec<Value>)> {
+) -> Result<(
+    Vec<DiscoveredConnector>,
+    Vec<Value>,
+    Vec<HostReadProvenance>,
+)> {
     let mut connectors = Vec::with_capacity(catalog.connectors.len());
     let mut metadata_gaps = Vec::new();
+    let mut provenance = Vec::with_capacity(catalog.connectors.len());
 
     for connector in &catalog.connectors {
-        let introspection = client.introspect(connector.summary.id.as_str())?;
+        let (introspection, read_provenance) =
+            client.introspect_with_provenance(connector.summary.id.as_str())?;
         metadata_gaps.extend(host_metadata_gaps(&introspection).into_iter().map(|gap| {
             json!({
                 "connector": {
@@ -6430,9 +6792,10 @@ fn load_live_discovered_connectors(
             })
         }));
         connectors.push(host_discovered_connector(connector, &introspection));
+        provenance.push(read_provenance);
     }
 
-    Ok((connectors, metadata_gaps))
+    Ok((connectors, metadata_gaps, provenance))
 }
 
 fn host_connector_schema_glossary(
@@ -7665,18 +8028,12 @@ fn attach_tool_inventory_provenance(
 }
 
 fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("list", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
     let filter = HostDiscoveryFilter {
         category: args.category.clone(),
         ..HostDiscoveryFilter::default()
     };
-    let (catalog, response) = client.catalog(Some(&filter))?;
+    let (catalog, response, provenance) = client.catalog_with_provenance(Some(&filter))?;
     let filter_gaps = host_filter_gaps(args.zone.as_deref());
     let connectors = catalog
         .connectors
@@ -7708,33 +8065,42 @@ fn list_dispatch_host(args: &ListArgs, host: &str) -> Result<DispatchOutcome> {
         "list",
         catalog::DiscoveryDataSource::LiveHostInventory,
     );
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
     envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "list",
+        args.require_source,
+        "connector-inventory",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![provenance],
+    )
 }
 
 fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("show", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
         Err(error) => {
-            let mut outcome = connector_resolution_dispatch("show", &args.connector, &error);
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-            return Ok(outcome);
+            let outcome = connector_resolution_dispatch("show", &args.connector, &error);
+            return resolve_live_read_outcome(
+                "show",
+                args.require_source,
+                "connector-selection",
+                outcome,
+                vec![catalog_provenance],
+            );
         }
     };
-    let inventory = client.connector(connector.summary.id.as_str())?;
-    let introspection = client.introspect(connector.summary.id.as_str())?;
+    let (inventory, inventory_provenance) =
+        client.connector_with_provenance(connector.summary.id.as_str())?;
+    let (introspection, introspection_provenance) =
+        client.introspect_with_provenance(connector.summary.id.as_str())?;
+    let evidence = vec![inventory_provenance, introspection_provenance];
+    let inventory = &inventory;
+    let introspection = &introspection;
     let preview = introspection
         .tools
         .iter()
@@ -7760,19 +8126,24 @@ fn show_dispatch_host(args: &ShowArgs, host: &str) -> Result<DispatchOutcome> {
     let mut payload = serde_json::to_value(build_live_show_operator_contract(
         host,
         connector,
-        &inventory,
-        &introspection,
+        inventory,
+        introspection,
         preview,
         preview_truncated,
         risky_count,
         &example_operation,
     ))?;
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "show",
+        args.require_source,
+        "connector-details",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
@@ -7834,38 +8205,47 @@ fn ops_dispatch_host(args: &OpsArgs, host: &str) -> Result<DispatchOutcome> {
 
 #[allow(clippy::too_many_lines)]
 fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("schema", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
         Err(error) => {
-            let mut outcome = connector_resolution_dispatch("schema", &args.connector, &error);
-            inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-            return Ok(outcome);
+            let outcome = connector_resolution_dispatch("schema", &args.connector, &error);
+            return resolve_live_read_outcome(
+                "schema",
+                args.require_source,
+                "connector-selection",
+                outcome,
+                vec![catalog_provenance],
+            );
         }
     };
-    let inventory = client.connector(connector.summary.id.as_str())?;
-    let introspection = client.introspect(connector.summary.id.as_str())?;
-    let metadata_gaps = host_metadata_gaps(&introspection);
+    let (inventory, inventory_provenance) =
+        client.connector_with_provenance(connector.summary.id.as_str())?;
+    let (introspection, introspection_provenance) =
+        client.introspect_with_provenance(connector.summary.id.as_str())?;
+    let evidence = vec![inventory_provenance, introspection_provenance];
+    let inventory = &inventory;
+    let introspection = &introspection;
+    let metadata_gaps = host_metadata_gaps(introspection);
 
     if let Some(operation_selector) = args.operation.as_deref() {
         let operation = match resolve_host_tool(&introspection.tools, operation_selector) {
             Ok(operation) => operation,
             Err(error) => {
-                let mut outcome = host_operation_resolution_dispatch(
+                let outcome = host_operation_resolution_dispatch(
                     "schema",
                     &connector.slug,
                     operation_selector,
                     &error,
                 );
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-                return Ok(outcome);
+                return resolve_live_read_outcome(
+                    "schema",
+                    args.require_source,
+                    "operation-selection",
+                    outcome,
+                    evidence,
+                );
             }
         };
 
@@ -7887,11 +8267,10 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
                 catalog::DiscoveryDataSource::LiveHostIntrospection,
             );
             envelope.inject_into(&mut payload);
-            inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-            return Ok(DispatchOutcome {
+            return resolve_live_read_outcome("schema", args.require_source, "operation-schema", DispatchOutcome {
                 payload,
                 exit_code: CliExitCode::Success,
-            });
+            }, evidence);
         }
 
         let example_strs = if args.examples {
@@ -7916,8 +8295,8 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             "message": "Loaded operation schemas from `fcp-host` introspection.",
             "connector": {
                 "slug": &connector.slug,
-                "canonical_id": connector.summary.id.as_str(),
-                "name": &connector.summary.name,
+                "canonical_id": inventory.connector.id.as_str(),
+                "name": &inventory.connector.name,
             },
             "operation": {
                 "requested_selector": operation_selector,
@@ -7953,11 +8332,16 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
             catalog::DiscoveryDataSource::LiveHostIntrospection,
         );
         envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        return resolve_live_read_outcome(
+            "schema",
+            args.require_source,
+            "operation-schema",
+            DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::Success,
+            },
+            evidence,
+        );
     }
 
     let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "schema");
@@ -7969,10 +8353,10 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
         "message": "Loaded the connector inventory/introspection field glossary from `fcp-host`.",
         "connector": {
             "slug": &connector.slug,
-            "canonical_id": connector.summary.id.as_str(),
-            "name": &connector.summary.name,
+            "canonical_id": inventory.connector.id.as_str(),
+            "name": &inventory.connector.name,
         },
-        "schema": host_connector_schema_glossary(&inventory, &introspection, &metadata_gaps),
+        "schema": host_connector_schema_glossary(inventory, introspection, &metadata_gaps),
         "next_actions": [
             format!("fwc ops {} --host {host}", connector.slug),
             format!("fwc schema {} <operation> --host {host}", connector.slug),
@@ -7984,11 +8368,16 @@ fn schema_dispatch_host(args: &SchemaArgs, host: &str) -> Result<DispatchOutcome
         catalog::DiscoveryDataSource::LiveHostIntrospection,
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "schema",
+        args.require_source,
+        "connector-schema",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8132,10 +8521,12 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return list_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -8146,26 +8537,8 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
     // The truthfulness contract forbids silent downgrade: offline artifacts
     // are only a source when the operator asked for `--offline`, and a
     // configured-but-failed host propagates its transport error unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match list_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) if outcome.exit_code == CliExitCode::Success => {
-                    QueryResult::Complete(outcome.payload)
-                }
-                Ok(outcome) => QueryResult::Error(format!(
-                    "host list returned exit code {:?}",
-                    outcome.exit_code
-                )),
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match list_offline_payload(args) {
             Ok(payload) => QueryResult::Complete(payload),
             Err(error) => {
@@ -8174,9 +8547,6 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // list cache; Degraded/FallbackDerived are resolver-assigned outcomes,
-        // never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
@@ -8193,9 +8563,6 @@ fn list_dispatch(args: &ListArgs, host: Option<&str>) -> Result<DispatchOutcome>
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -9098,8 +9465,8 @@ fn format_audit_gaps_toon(gaps: &[AuditGapReport], blocking_only: bool) -> Strin
 
 fn mesh_dispatch(args: &MeshArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     match &args.command {
-        MeshCommand::Status(args) => mesh_status_dispatch(args),
-        MeshCommand::Nodes(args) => mesh_nodes_dispatch(args),
+        MeshCommand::Status(args) => mesh_status_dispatch(args, explicit_host),
+        MeshCommand::Nodes(args) => mesh_nodes_dispatch(args, explicit_host),
         MeshCommand::Use(args) => mesh_use_dispatch(args),
         MeshCommand::Target(args) => mesh_target_dispatch(args),
         MeshCommand::Availability(args) => {
@@ -11277,12 +11644,251 @@ fn mesh_availability_offline_dispatch(
     })
 }
 
-fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
+fn mesh_inventory_credential(
+    path: Option<&Path>,
+) -> std::result::Result<zeroize::Zeroizing<String>, &'static str> {
+    const MAX_TOKEN_BYTES: u64 = 65_536;
+    let raw = if let Some(path) = path {
+        let file = std::fs::File::open(path).map_err(|_| "invalid-admin-credential")?;
+        let mut value = zeroize::Zeroizing::new(String::new());
+        file.take(MAX_TOKEN_BYTES + 1)
+            .read_to_string(&mut value)
+            .map_err(|_| "invalid-admin-credential")?;
+        value
+    } else {
+        zeroize::Zeroizing::new(
+            std::env::var("FCP_HOST_ADMIN_BEARER_TOKEN").map_err(|error| match error {
+                std::env::VarError::NotPresent => "missing-admin-credential",
+                std::env::VarError::NotUnicode(_) => "invalid-admin-credential",
+            })?,
+        )
+    };
+    let token = raw.trim();
+    if raw.len() as u64 > MAX_TOKEN_BYTES
+        || token.is_empty()
+        || !token.is_ascii()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("invalid-admin-credential");
+    }
+    Ok(zeroize::Zeroizing::new(token.to_owned()))
+}
+
+fn mesh_inventory_connector_matches(connector_id: &str, selector: &str) -> bool {
+    let normalized = normalize_connector_selector(selector);
+    let canonical = normalize_connector_selector(connector_id);
+    let family = canonical.split(':').next().unwrap_or(&canonical);
+    [
+        &canonical,
+        canonical.strip_prefix("fcp.").unwrap_or(&canonical),
+        family,
+        family.strip_prefix("fcp.").unwrap_or(family),
+    ]
+    .iter()
+    .any(|candidate| *candidate == normalized)
+}
+
+fn mesh_live_inventory_dispatch(
+    subcommand: &str,
+    host: &ResolvedHostConfig,
+    connector: Option<&str>,
+    zone: Option<&str>,
+    requirement: Option<RequiredTruthSource>,
+    admin_token_file: Option<&Path>,
+) -> Result<DispatchOutcome> {
+    // This is the selected host's inventory observation. Verified advertisements
+    // establish their origin and freshness, not a live peer execution or quorum.
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        subcommand,
+        requirement,
+        KnowledgeState::HostBacked,
+    ) {
+        return Ok(outcome);
+    }
+    let token = match mesh_inventory_credential(admin_token_file) {
+        Ok(token) => token,
+        Err(kind) => {
+            let payload = json!({
+                "status": "error",
+                "command": "mesh",
+                "subcommand": subcommand,
+                "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+                "_truth_source": "unavailable",
+                "error": {
+                    "type": kind,
+                    "message": "Live mesh inventory requires a valid host admin bearer secret from --admin-token-file or FCP_HOST_ADMIN_BEARER_TOKEN.",
+                    "recoverable": true,
+                },
+                "next_actions": [format!("fwc mesh {subcommand} --host <endpoint> --admin-token-file <path>")],
+            });
+            return Ok(DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::PolicyDenied,
+            });
+        }
+    };
+    let client = HostAdminClient::without_redirects(&host.endpoint)?;
+    let mut inventory = match client.mesh_inventory(&token) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return Ok(DispatchOutcome {
+                payload: json!({
+                    "status": "error",
+                    "command": "mesh",
+                    "subcommand": subcommand,
+                    "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+                    "_truth_source": "unavailable",
+                    "error": {
+                        "type": "mesh-inventory-unavailable",
+                        "message": error.to_string(),
+                        "recoverable": true,
+                    },
+                    "next_actions": [
+                        "Check the selected host endpoint and owner admin credential before retrying.",
+                        format!("Use `fwc mesh {subcommand} --offline` only for persisted target planning."),
+                    ],
+                }),
+                exit_code: CliExitCode::Transport,
+            });
+        }
+    };
+    let unavailable_peers = inventory
+        .nodes
+        .iter()
+        .filter(|node| !node.is_local && node.inventory_status == MeshInventoryStatus::Unavailable)
+        .count();
+    let inventory_complete = inventory.membership_status
+        != MeshInventoryMembershipStatus::Unavailable
+        && unavailable_peers == 0;
+    if connector.is_some() || zone.is_some() {
+        for node in &mut inventory.nodes {
+            node.connectors.retain(|candidate| {
+                connector.is_none_or(|selector| {
+                    mesh_inventory_connector_matches(&candidate.connector_id, selector)
+                }) && zone
+                    .is_none_or(|zone| candidate.zones.iter().any(|candidate| candidate == zone))
+            });
+        }
+        inventory.nodes.retain(|node| !node.connectors.is_empty());
+        if !inventory_complete {
+            inventory.warnings.push(
+                "Some peer inventories are unavailable; an empty filtered result does not prove the connector is absent from the mesh.".to_owned(),
+            );
+        }
+    }
+    let node_count = inventory.nodes.len();
+    let verified_peer_count = inventory
+        .nodes
+        .iter()
+        .filter(|node| !node.is_local && node.inventory_status == MeshInventoryStatus::Verified)
+        .count();
+    let connector_count = inventory
+        .nodes
+        .iter()
+        .flat_map(|node| &node.connectors)
+        .map(|connector| &connector.connector_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut payload = json!({
+        "status": "ok",
+        "command": "mesh",
+        "subcommand": subcommand,
+        "source": "host-admin-api",
+        "inventory_source": "host-mesh-inventory",
+        "inventory_schema_version": inventory.schema_version,
+        "generated_at_ms": inventory.generated_at_ms,
+        "mesh_configured": inventory.mesh_configured,
+        "local_node_id": inventory.local_node_id,
+        "membership_status": inventory.membership_status,
+        "connector_filter": connector,
+        "zone_filter": zone,
+        "node_count": node_count,
+        "connector_count": connector_count,
+        "verified_peer_count": verified_peer_count,
+        "unavailable_peer_count": unavailable_peers,
+        "advertised_inventory_complete": inventory_complete,
+        "nodes": inventory.nodes,
+        "warnings": inventory.warnings,
+        "live_inventory": {
+            "available": true,
+            "source": "host-mesh-inventory",
+            "scope": "local-registry-and-fresh-peer-advertisements",
+            "peer_liveness_proven": false,
+            "replica_coverage_proven": false,
+            "quorum_proven": false,
+        },
+        "next_actions": [
+            "fwc mesh nodes <connector> --zone <zone> --host <endpoint> --admin-token-file <path>",
+            "fwc mesh status --offline",
+        ],
+    });
+    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "mesh");
+    envelope.inject_into(&mut payload);
+    attach_live_host_admin_contract(
+        &mut payload,
+        "mesh",
+        &host.endpoint,
+        "mesh-advertised-inventory",
+        !inventory_complete,
+        vec![json!({
+            "kind": "mesh-inventory",
+            "generated_at_ms": inventory.generated_at_ms,
+            "membership_status": inventory.membership_status,
+            "verified_peer_count": verified_peer_count,
+            "unavailable_peer_count": unavailable_peers,
+        })],
+    );
+    resolve_live_read_outcome(
+        "mesh",
+        None,
+        "mesh-advertised-inventory",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![HostReadProvenance {
+            path: MESH_INVENTORY_ROUTE.to_owned(),
+            truth_source: KnowledgeState::HostBacked,
+            attested: false,
+            route: None,
+            local_connectors: None,
+            mesh_connectors: None,
+        }],
+    )
+}
+
+fn mesh_status_dispatch(
+    args: &MeshStatusArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
+        return mesh_live_inventory_dispatch(
+            "status",
+            &host,
+            None,
+            None,
+            args.require_source,
+            args.admin_token_file.as_deref(),
+        );
+    }
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        "status",
+        args.require_source,
+        KnowledgeState::Offline,
+    ) {
+        return Ok(outcome);
+    }
     let (path, config) = load_context_config()?;
     let (context_name, context) = active_context_entry(&config)?;
     let known_nodes = mesh_known_nodes(&context.mesh_targets, context.default_zone.as_deref());
     let mut warnings = vec![
-        "Per-node mesh inventory is not yet exposed by the current fcp-host CLI/API; showing persisted target state only.".to_owned(),
+        "Offline planning view: showing persisted target state only; no live mesh inventory was queried.".to_owned(),
     ];
 
     let active_session = cli_session_store().active_session().ok().flatten();
@@ -11311,7 +11917,7 @@ fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
         "live_inventory": {
             "available": false,
             "source": "none",
-            "reason": "current fcp-host routes do not expose authoritative per-node mesh inventory",
+            "reason": "offline planning view; query a configured host for current mesh advertisements",
         },
         "next_actions": [
             "fwc mesh nodes".to_owned(),
@@ -11328,12 +11934,49 @@ fn mesh_status_dispatch(_args: &MeshStatusArgs) -> Result<DispatchOutcome> {
     })
 }
 
-fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
+fn mesh_nodes_dispatch(
+    args: &MeshNodesArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
+    let zone = match args.zone.as_deref().map(str::parse::<ZoneId>).transpose() {
+        Ok(zone) => zone,
+        Err(_) => {
+            return Ok(DispatchOutcome {
+                payload: json!({
+                    "status": "error",
+                    "command": "mesh",
+                    "subcommand": "nodes",
+                    "error": {"type": "invalid-zone", "message": "--zone must be a valid exact zone id such as z:work.", "recoverable": true},
+                }),
+                exit_code: CliExitCode::Validation,
+            });
+        }
+    };
+    if !args.offline
+        && let Some(host) = resolve_host_config(explicit_host)?
+    {
+        return mesh_live_inventory_dispatch(
+            "nodes",
+            &host,
+            args.connector.as_deref(),
+            zone.as_ref().map(ZoneId::as_str),
+            args.require_source,
+            args.admin_token_file.as_deref(),
+        );
+    }
+    if let Some(outcome) = enforce_required_truth_source_with_subcommand(
+        "mesh",
+        "nodes",
+        args.require_source,
+        KnowledgeState::Offline,
+    ) {
+        return Ok(outcome);
+    }
     let (path, config) = load_context_config()?;
     let (context_name, context) = active_context_entry(&config)?;
     let target_state = &context.mesh_targets;
     let mut warnings = vec![
-        "Per-node mesh inventory is not yet exposed by the current fcp-host CLI/API; showing persisted target candidates only.".to_owned(),
+        "Offline planning view: showing persisted target candidates only; no live mesh inventory was queried.".to_owned(),
     ];
     let mut nodes = mesh_known_nodes(target_state, context.default_zone.as_deref());
 
@@ -11352,6 +11995,25 @@ fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
             ));
         }
     }
+    if let Some(zone) = zone.as_ref() {
+        nodes.retain(|node| {
+            let selected_target = args
+                .connector
+                .as_ref()
+                .and_then(|connector| target_state.connector_targets.get(connector));
+            if let Some(target) = selected_target {
+                target.zone.as_deref() == Some(zone.as_str())
+            } else {
+                (target_state.active_node.as_ref() == Some(&node.node)
+                    && context.default_zone.as_deref() == Some(zone.as_str()))
+                    || (args.connector.is_none()
+                        && target_state.connector_targets.values().any(|target| {
+                            target.node == node.node
+                                && target.zone.as_deref() == Some(zone.as_str())
+                        }))
+            }
+        });
+    }
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "mesh");
     let mut payload = json!({
@@ -11362,6 +12024,7 @@ fn mesh_nodes_dispatch(args: &MeshNodesArgs) -> Result<DispatchOutcome> {
         "current_context": &context_name,
         "context": mesh_context_summary_value(&context_name, context),
         "connector_filter": &args.connector,
+        "zone_filter": zone.as_ref().map(ZoneId::as_str),
         "inventory_source": "persisted-targets",
         "node_count": nodes.len(),
         "nodes": nodes,
@@ -13128,15 +13791,12 @@ fn session_next_actions(session: &session::Session) -> Vec<String> {
 }
 
 fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("search", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
-    }
-
     let client = HostAdminClient::new(host)?;
-    let (catalog, _) = client.catalog(None)?;
-    let (connectors, metadata_gaps) = load_live_discovered_connectors(&client, &catalog)?;
+    let (catalog, _, catalog_provenance) = client.catalog_with_provenance(None)?;
+    let (connectors, metadata_gaps, introspection_provenance) =
+        load_live_discovered_connectors(&client, &catalog)?;
+    let mut evidence = vec![catalog_provenance];
+    evidence.extend(introspection_provenance);
     let filter_gaps = host_filter_gaps(args.zone.as_deref());
     let filters = search::SearchFilters {
         connector: args.connector.clone(),
@@ -13204,11 +13864,16 @@ fn search_dispatch_host(args: &SearchArgs, host: &str) -> Result<DispatchOutcome
         catalog::DiscoveryDataSource::LiveHostIntrospection,
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    resolve_live_read_outcome(
+        "search",
+        args.require_source,
+        "operation-search",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        evidence,
+    )
 }
 
 fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutcome> {
@@ -13219,10 +13884,12 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return search_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13237,26 +13904,8 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
     // the dispatchers as non-success outcomes: the queried source did answer,
     // so they resolve as `Complete` and their exit code is reattached to the
     // final dispatch unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
-    let mut outcome_exit_code: Option<CliExitCode> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match search_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => {
-                    if outcome.exit_code != CliExitCode::Success {
-                        outcome_exit_code = Some(outcome.exit_code);
-                    }
-                    QueryResult::Complete(outcome.payload)
-                }
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match search_offline_payload(args) {
             Ok(payload) => QueryResult::Complete(payload),
             Err(error) => {
@@ -13265,9 +13914,6 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // search cache; Degraded/FallbackDerived are resolver-assigned
-        // outcomes, never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13282,13 +13928,10 @@ fn search_dispatch(args: &SearchArgs, host: Option<&str>) -> Result<DispatchOutc
             }
             Ok(DispatchOutcome {
                 payload: resolved.value,
-                exit_code: outcome_exit_code.unwrap_or(CliExitCode::Success),
+                exit_code: CliExitCode::Success,
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -13450,10 +14093,12 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return show_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13467,26 +14112,9 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
     // Connector-resolution refusals surface from the builders as non-success
     // outcomes: the queried source did answer, so they resolve as `Complete`
     // and their exit code is reattached to the final dispatch unchanged.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let mut outcome_exit_code: Option<CliExitCode> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match show_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => {
-                    if outcome.exit_code != CliExitCode::Success {
-                        outcome_exit_code = Some(outcome.exit_code);
-                    }
-                    QueryResult::Complete(outcome.payload)
-                }
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match show_offline_payload(args) {
             Ok(outcome) => {
                 if outcome.exit_code != CliExitCode::Success {
@@ -13500,17 +14128,16 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // show cache; Degraded/FallbackDerived are resolver-assigned outcomes,
-        // never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
     match resolution {
         Ok(resolved) => {
-            if let Some(outcome) =
-                enforce_required_truth_source("show", args.require_source, resolved.knowledge_state)
-            {
+            if let Some(outcome) = enforce_required_truth_source(
+                "show",
+                args.require_source,
+                resolved.knowledge_state,
+            ) {
                 return Ok(outcome);
             }
             Ok(DispatchOutcome {
@@ -13519,9 +14146,6 @@ fn show_dispatch(args: &ShowArgs, host: Option<&str>) -> Result<DispatchOutcome>
             })
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -13745,10 +14369,12 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
         return Ok(outcome);
     }
 
-    // A.5: route the source ladder through `LiveTruthResolver` instead of
-    // hand-picking the host/offline branch, so the answer carries the
-    // resolver's decision trace and `--require-source` enforcement happens at
-    // one chokepoint for every read-only command.
+    if let Some(host) = resolved_host.as_ref() {
+        return schema_dispatch_host(args, &host.endpoint);
+    }
+
+    // Without a live endpoint, only explicitly requested offline artifacts
+    // can answer. Live builders classify their observed response origin.
     let resolver = LiveTruthResolver::new(ResolverConfig::from_environment());
     let strategy = if args.offline {
         ResolutionStrategy::OfflineOnly
@@ -13762,20 +14388,8 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
     // Selector-resolution refusals (connector/operation not found) are
     // complete source answers whose non-success exit codes must survive, so
     // the ladder carries whole `DispatchOutcome`s rather than bare payloads.
-    let mut host_error: Option<anyhow::Error> = None;
     let mut offline_error: Option<anyhow::Error> = None;
     let resolution = resolver.resolve_with_partials(strategy, |source| match source {
-        KnowledgeState::HostBacked => match resolved_host.as_ref() {
-            Some(host) => match schema_dispatch_host(args, &host.endpoint) {
-                Ok(outcome) => QueryResult::Complete(outcome),
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    host_error = Some(error);
-                    QueryResult::Unavailable(detail)
-                }
-            },
-            None => QueryResult::NotConfigured,
-        },
         KnowledgeState::Offline if args.offline => match schema_offline_payload(args) {
             Ok(outcome) => QueryResult::Complete(outcome),
             Err(error) => {
@@ -13784,9 +14398,6 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
                 QueryResult::Unavailable(detail)
             }
         },
-        // Mesh-backed has no fwc client yet (A.5 gate); node-local has no
-        // schema cache; Degraded/FallbackDerived are resolver-assigned
-        // outcomes, never queryable sources.
         _ => QueryResult::NotConfigured,
     });
 
@@ -13802,9 +14413,6 @@ fn schema_dispatch(args: &SchemaArgs, host: Option<&str>) -> Result<DispatchOutc
             Ok(resolved.value)
         }
         Err(resolution_error) => {
-            if let Some(error) = host_error {
-                return Err(error);
-            }
             if let Some(error) = offline_error {
                 return Err(error);
             }
@@ -16013,26 +16621,37 @@ fn status_dispatch(args: &StatusArgs, explicit_host: Option<&str>) -> Result<Dis
 }
 
 fn status_dispatch_host(args: &StatusArgs, host: &ResolvedHostConfig) -> Result<DispatchOutcome> {
-    if let Some(outcome) =
-        enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
-    {
-        return Ok(outcome);
+    // Fleet status includes the entry host's own health, so it cannot satisfy
+    // a mesh-only requirement. Selected connector status has its own origin.
+    if args.connector.is_none() {
+        if let Some(outcome) =
+            enforce_required_truth_source("status", args.require_source, KnowledgeState::HostBacked)
+        {
+            return Ok(outcome);
+        }
     }
 
     let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, discovery) = client.catalog(None)?;
-    let health = client.health()?;
+    let (catalog, discovery, catalog_provenance) = client.catalog_with_provenance(None)?;
+    let (health, health_provenance): (HostHealthResponse, _) =
+        client.get_json_with_provenance("/rpc/health")?;
 
     if let Some(selector) = args.connector.as_deref() {
         let connector = match catalog.resolve_connector(selector) {
             Ok(connector) => connector,
             Err(error) => {
-                let mut outcome = connector_resolution_dispatch("status", selector, &error);
-                inject_truth_source_metadata(&mut outcome.payload, KnowledgeState::HostBacked);
-                return Ok(outcome);
+                let outcome = connector_resolution_dispatch("status", selector, &error);
+                return resolve_live_read_outcome(
+                    "status",
+                    args.require_source,
+                    "connector-selection",
+                    outcome,
+                    vec![catalog_provenance],
+                );
             }
         };
-        let admin = client.connector_status(connector.summary.id.as_str())?;
+        let (admin, status_provenance) =
+            client.connector_status_with_provenance(connector.summary.id.as_str())?;
 
         let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "status");
         let mut payload = serde_json::to_value(build_connector_status_operator_contract(
@@ -16043,11 +16662,17 @@ fn status_dispatch_host(args: &StatusArgs, host: &ResolvedHostConfig) -> Result<
             discovery.registry_version,
         ))?;
         envelope.inject_into(&mut payload);
-        inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-        return Ok(DispatchOutcome {
-            payload,
-            exit_code: CliExitCode::Success,
-        });
+        payload["host_health"]["_truth_source"] = json!("host");
+        return resolve_live_read_outcome(
+            "status",
+            args.require_source,
+            "connector-runtime-status",
+            DispatchOutcome {
+                payload,
+                exit_code: CliExitCode::Success,
+            },
+            vec![status_provenance],
+        );
     }
 
     let connector_rows = catalog
@@ -16102,11 +16727,17 @@ fn status_dispatch_host(args: &StatusArgs, host: &ResolvedHostConfig) -> Result<
         })],
     );
     envelope.inject_into(&mut payload);
-    inject_truth_source_metadata(&mut payload, KnowledgeState::HostBacked);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    payload["host_health"]["_truth_source"] = json!("host");
+    resolve_live_read_outcome(
+        "status",
+        args.require_source,
+        "fleet-status",
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        },
+        vec![catalog_provenance, health_provenance],
+    )
 }
 
 /// Build a health dashboard from the host catalog's connector entries.
@@ -22512,7 +23143,7 @@ fn export_tools_options(args: &ExportToolsArgs) -> export_tools::ExportOptions {
 fn suggest_dispatch_host(args: &SuggestArgs, host: &str) -> Result<DispatchOutcome> {
     let client = HostAdminClient::new(host)?;
     let (catalog, _) = client.catalog(None)?;
-    let (all_connectors, metadata_gaps) = load_live_discovered_connectors(&client, &catalog)?;
+    let (all_connectors, metadata_gaps, _) = load_live_discovered_connectors(&client, &catalog)?;
 
     if let Some(after_op) = &args.after {
         let mut related_ids: Vec<String> = Vec::new();
@@ -23652,6 +24283,7 @@ enum LiveAuthError {
     InvalidCapabilityToken { source: String, message: String },
     InvalidApprovalToken { source: String, message: String },
     InvalidHolderProof { message: String },
+    InvalidWorkflowAuth { message: String },
 }
 
 impl LiveAuthError {
@@ -23662,6 +24294,7 @@ impl LiveAuthError {
             Self::InvalidCapabilityToken { .. } => "invalid-capability-token",
             Self::InvalidApprovalToken { .. } => "invalid-approval-token",
             Self::InvalidHolderProof { .. } => "invalid-holder-proof",
+            Self::InvalidWorkflowAuth { .. } => "invalid-workflow-auth",
         }
     }
 
@@ -23675,7 +24308,9 @@ impl LiveAuthError {
             Self::InvalidApprovalToken { source, message } => {
                 format!("Failed to parse an approval token from {source}: {message}")
             }
-            Self::InvalidHolderProof { message } => message.clone(),
+            Self::InvalidHolderProof { message } | Self::InvalidWorkflowAuth { message } => {
+                message.clone()
+            }
         }
     }
 }
@@ -24862,6 +25497,156 @@ fn invoke_response_knowledge_state(response: &InvokeResponse) -> KnowledgeState 
         Some(InvokeTruthSource::MeshBacked) => KnowledgeState::MeshBacked,
         Some(InvokeTruthSource::HostBacked) | None => KnowledgeState::HostBacked,
     }
+}
+
+/// Classify the responses used to build a read result, after checking the entry
+/// host's executor evidence. Mixed local/remote reads remain host-backed.
+fn read_response_knowledge_state(
+    routes: &[Option<&fcp_kernel::InvokeRouteProvenance>],
+) -> Result<KnowledgeState> {
+    let mut all_mesh = !routes.is_empty();
+    for route in routes {
+        let Some(route) = route else {
+            all_mesh = false;
+            continue;
+        };
+        if route.truth_source != InvokeTruthSource::MeshBacked {
+            bail!("host read response contains an unexpected route truth source");
+        }
+        let entry = route
+            .entry_node
+            .as_deref()
+            .filter(|node| !node.trim().is_empty());
+        let executor = route
+            .served_by
+            .as_deref()
+            .filter(|node| !node.trim().is_empty());
+        if entry.is_none()
+            || executor.is_none()
+            || entry == executor
+            || route.hop_count != 1
+            || route.decision.trim().is_empty()
+        {
+            bail!("host read response contains incomplete mesh executor evidence");
+        }
+    }
+    Ok(if all_mesh {
+        KnowledgeState::MeshBacked
+    } else {
+        KnowledgeState::HostBacked
+    })
+}
+
+fn attach_read_route_evidence(
+    payload: &mut Value,
+    routes: &[Option<&fcp_kernel::InvokeRouteProvenance>],
+) {
+    let routes = routes.iter().flatten().collect::<Vec<_>>();
+    if routes.is_empty() {
+        return;
+    }
+    if let Some(handles) = payload
+        .get_mut("evidence_handles")
+        .and_then(Value::as_array_mut)
+    {
+        handles.extend(routes.iter().map(|route| {
+            json!({
+                "kind": "mesh-read",
+                "route": route,
+            })
+        }));
+    } else if let Some(provenance) = payload.get_mut("provenance").and_then(Value::as_object_mut) {
+        provenance.insert("read_routes".to_owned(), json!(routes));
+    }
+}
+
+/// Classify already-received live evidence without inventing a second network
+/// query or treating an entry host's address as the answer's execution origin.
+/// Mixed answers retain the weaker host source; individual response evidence
+/// still exposes any authenticated mesh contributions.
+fn resolve_live_read_outcome(
+    command: &str,
+    requirement: Option<RequiredTruthSource>,
+    scope: &str,
+    mut outcome: DispatchOutcome,
+    evidence: Vec<HostReadProvenance>,
+) -> Result<DispatchOutcome> {
+    let actual = if !evidence.is_empty()
+        && evidence
+            .iter()
+            .all(|read| read.truth_source == KnowledgeState::MeshBacked)
+    {
+        KnowledgeState::MeshBacked
+    } else {
+        KnowledgeState::HostBacked
+    };
+    // The host has already selected and authenticated the answering source.
+    // Pin resolution to that observation: FWC_MESH_BACKED controls speculative
+    // source attempts, not permission to relabel a response that came via mesh.
+    let mut policy = if actual == KnowledgeState::MeshBacked {
+        truth::TruthPrecedencePolicy::v2_default()
+    } else {
+        truth::TruthPrecedencePolicy::v1_default()
+    };
+    policy.precedence = vec![actual];
+    policy.minimum_acceptable = actual;
+    policy.allow_fallback = false;
+    let strategy = policy.to_resolution_strategy();
+    let resolver = LiveTruthResolver::with_precedence_policy(
+        ResolverConfig::default().with_mesh_backed(actual == KnowledgeState::MeshBacked),
+        policy,
+    );
+    let mut payload = Some(outcome.payload);
+    let mut resolved = resolver.resolve_with_partials(strategy, |source| {
+        if source == actual {
+            payload
+                .take()
+                .map_or(QueryResult::NotConfigured, QueryResult::Complete)
+        } else {
+            QueryResult::NotConfigured
+        }
+    })?;
+    resolved.trace.reason = format!(
+        "The selected host returned {scope} with {} origin; mixed or unattested reads retain host-backed classification.",
+        actual.label(),
+    );
+    if let Some(refused) = enforce_required_truth_source(command, requirement, actual) {
+        outcome = refused;
+    } else {
+        outcome.payload = resolved.value;
+    }
+    inject_truth_source_metadata(&mut outcome.payload, actual);
+    attach_read_route_evidence(
+        &mut outcome.payload,
+        &evidence
+            .iter()
+            .map(|read| read.route.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    if actual == KnowledgeState::MeshBacked
+        && let Some(provenance) = outcome
+            .payload
+            .get_mut("provenance")
+            .and_then(Value::as_object_mut)
+    {
+        provenance.insert("caveat".to_owned(), json!(
+            "The host-admin API is the transport and attestation authority; this answer originated from authenticated mesh peers. Replication, quorum freshness and mesh-wide completeness require separate evidence."
+        ));
+        if provenance.contains_key("mesh_backed") {
+            provenance.insert("mesh_backed".to_owned(), json!(true));
+        }
+        if provenance.contains_key("transport") {
+            provenance.insert("transport".to_owned(), json!("host-verified-mesh-peer"));
+        }
+    }
+    outcome.payload["read_provenance"] = json!({
+        "authority": "selected-host",
+        "scope": scope,
+        "replication_proven": false,
+        "responses": evidence,
+    });
+    outcome.payload["decision_trace"] = serde_json::to_value(resolved.trace)?;
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -27841,60 +28626,395 @@ fn capability_export_payload(
     })
 }
 
-fn pipe_dispatch(args: &PipeArgs) -> Result<DispatchOutcome> {
-    // Parse the mapping spec.
-    let spec = if let Some(ref map_expr) = args.map {
-        pipe::parse_map_expression(map_expr).map_err(|e| anyhow::anyhow!("{e}"))?
-    } else if let Some(ref path) = args.map_file {
-        let content = std::fs::read_to_string(path)?;
-        pipe::parse_map_file(&content).map_err(|e| anyhow::anyhow!("{e}"))?
+fn pipe_error(stage: &str, error_type: &str, message: impl Into<String>) -> DispatchOutcome {
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "pipe",
+            "stage": stage,
+            "error": { "type": error_type, "message": message.into() },
+        }),
+        exit_code: CliExitCode::Validation,
+    }
+}
+
+struct PipeStageOutcome {
+    exit_code: CliExitCode,
+    evidence: Value,
+    output: Option<Value>,
+}
+
+/// Execute one literal JSON input through the same admission and invoke routes
+/// used by pipelines. Provider strings are data: never render them as templates.
+#[allow(clippy::too_many_arguments)]
+fn execute_pipe_stage(
+    client: &HostAdminClient,
+    resolved: &ResolvedHostOperation,
+    stage: &str,
+    input: &Value,
+    zone: &str,
+    auth: &ResolvedLiveAuth,
+    run_key: &str,
+    lease_seq: Option<u64>,
+    preflight_only: bool,
+) -> Result<PipeStageOutcome> {
+    let request_id = derive_live_request_id(
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        zone,
+        input,
+        Some(run_key),
+        Some(stage),
+    )?;
+    let idempotency_key = (!preflight_only).then(|| request_id.to_string());
+    let request = build_live_invoke_request(
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        zone,
+        input.clone(),
+        request_id.clone(),
+        auth,
+        idempotency_key.clone(),
+        lease_seq,
+        None,
+    )?;
+    let preflight = client.preflight(&HostPreflightRequest {
+        holder_proof: request.holder_proof.clone(),
+        request_id: request_id.clone(),
+        connector_id: request.connector_id.clone(),
+        operation: resolved.operation.name.clone(),
+        params: Some(input.clone()),
+        principal: auth.principal_hint.clone(),
+        zone_id: Some(request.zone_id.clone()),
+        lease_seq,
+        capability_token: Some(auth.capability_token.clone()),
+        approval_tokens: auth.approval_tokens.clone(),
+    })?;
+    let preflight_value = serde_json::to_value(&preflight)?;
+    let mut evidence = json!({
+        "stage": stage,
+        "connector_id": resolved.connector.summary.id.as_str(),
+        "operation": resolved.operation.name,
+        "request_id": request_id.to_string(),
+        "idempotency_key": idempotency_key,
+        "lease_seq": lease_seq,
+        "preflight": preflight_value,
+    });
+    if !preflight.allowed {
+        evidence["status"] = json!("denied");
+        let _ = append_history_entry(
+            history::OpStatus::Denied,
+            resolved.connector.summary.id.as_str(),
+            &resolved.operation.name,
+            Some(zone),
+            input,
+            Some(&preflight_value),
+            preflight.reason,
+            idempotency_key.as_deref(),
+            0,
+        );
+        return Ok(PipeStageOutcome {
+            exit_code: CliExitCode::PolicyDenied,
+            evidence,
+            output: None,
+        });
+    }
+    if preflight_only {
+        evidence["status"] = json!("preflight");
+        return Ok(PipeStageOutcome {
+            exit_code: CliExitCode::Success,
+            evidence,
+            output: None,
+        });
+    }
+    let started = std::time::Instant::now();
+    let response = client.invoke(&request)?;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response_value = serde_json::to_value(&response)?;
+    let success = response.status == InvokeStatus::Ok;
+    let _ = append_history_entry(
+        if success {
+            history::OpStatus::Success
+        } else {
+            history::OpStatus::Error
+        },
+        resolved.connector.summary.id.as_str(),
+        &resolved.operation.name,
+        Some(zone),
+        input,
+        Some(&response_value),
+        response.error.as_ref().map(ToString::to_string),
+        idempotency_key.as_deref(),
+        latency_ms,
+    );
+    evidence["status"] = json!(if success { "ok" } else { "error" });
+    evidence["response"] = response_value;
+    // Output is returned separately so --include-intermediate controls whether
+    // the successful source result appears in the user-facing response.
+    if let Some(object) = evidence["response"].as_object_mut() {
+        object.remove("result");
+    }
+    Ok(PipeStageOutcome {
+        exit_code: if success {
+            CliExitCode::Success
+        } else {
+            CliExitCode::Connector
+        },
+        evidence,
+        output: success.then_some(response.result).flatten(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
+    let mapping = match (&args.map, &args.map_file) {
+        (Some(expression), None) => pipe::parse_map_expression(expression),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|error| format!("Could not read mapping file: {error}"))
+            .and_then(|content| pipe::parse_map_file(&content)),
+        (Some(_), Some(_)) => Err("Choose --map or --map-file, not both.".to_owned()),
+        (None, None) => Err("No mapping provided. Use --map or --map-file.".to_owned()),
+    };
+    let mapping = match mapping {
+        Ok(mapping) => mapping,
+        Err(message) => return Ok(pipe_error("mapping", "invalid-mapping", message)),
+    };
+    let Some((source_connector, source_operation)) = parse_operation_reference(&args.source) else {
+        return Ok(invalid_operation_reference_dispatch("pipe", &args.source));
+    };
+    let Some((target_connector, target_operation)) = parse_operation_reference(&args.target) else {
+        return Ok(invalid_operation_reference_dispatch("pipe", &args.target));
+    };
+    let input_text = if let Some(input) = &args.input {
+        Ok(input.clone())
+    } else if let Some(path) = &args.file {
+        std::fs::read_to_string(path)
+    } else if args.stdin {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).map(|_| input)
     } else {
+        Ok("{}".to_owned())
+    };
+    let source_input = match input_text
+        .map_err(|error| error.to_string())
+        .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|error| error.to_string()))
+    {
+        Ok(input) => input,
+        Err(message) => return Ok(pipe_error("source", "invalid-source-input", message)),
+    };
+    let mut plan = json!({
+        "source_operation": args.source,
+        "target_operation": args.target,
+        "mapping": mapping,
+        "requires_approval": null,
+    });
+    // An unauthenticated dry-run remains an explicit offline plan. A live
+    // dry-run below materializes only a safe source and preflights the target.
+    let has_live_auth = args.auth.capability_token.is_some()
+        || args.auth.capability_token_file.is_some()
+        || args.auth.holder_key_file.is_some()
+        || args.source_capability_token.is_some()
+        || args.source_capability_token_file.is_some()
+        || args.source_holder_key_file.is_some()
+        || !args.auth.approval_token.is_empty()
+        || !args.auth.approval_token_file.is_empty();
+    if args.dry_run && !has_live_auth {
+        let mut payload = json!({
+            "status": "planned", "command": "pipe", "dry_run": true,
+            "plan": plan,
+            "message": "Offline pipe plan. Live validation and approval requirements need a host and capability tokens.",
+        });
+        CommandEnvelope::new(CommandAvailability::OfflineArtifact, "pipe")
+            .inject_into(&mut payload);
+        return Ok(DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Success,
+        });
+    }
+    let Some(host) = resolve_host_config(explicit_host)? else {
+        return Ok(missing_host_dispatch(
+            "pipe",
+            plan,
+            vec![
+                "Provide --host and instance-bound capability tokens for both connectors."
+                    .to_owned(),
+            ],
+        ));
+    };
+    let target_auth = match resolve_live_auth(&args.auth) {
+        Ok(auth) => auth,
+        Err(error) => return Ok(live_auth_dispatch("pipe", &error, &[])),
+    };
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let source = match resolve_host_operation_from_catalog(
+        "pipe",
+        &client,
+        &catalog,
+        source_connector,
+        source_operation,
+    ) {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
+    };
+    let target = match resolve_host_operation_from_catalog(
+        "pipe",
+        &client,
+        &catalog,
+        target_connector,
+        target_operation,
+    ) {
+        Ok(operation) => operation,
+        Err(outcome) => return Ok(outcome),
+    };
+    let source_auth = if args.source_capability_token.is_some()
+        || args.source_capability_token_file.is_some()
+    {
+        match resolve_live_auth(&LiveAuthArgs {
+            capability_token: args.source_capability_token.clone(),
+            capability_token_file: args.source_capability_token_file.clone(),
+            holder_key_file: args.source_holder_key_file.clone(),
+            approval_token: args.auth.approval_token.clone(),
+            approval_token_file: args.auth.approval_token_file.clone(),
+        }) {
+            Ok(auth) => auth,
+            Err(error) => return Ok(live_auth_dispatch("pipe", &error, &[])),
+        }
+    } else if source.connector.summary.id == target.connector.summary.id
+        && args.source_holder_key_file.is_none()
+    {
+        target_auth.clone()
+    } else {
+        return Ok(pipe_error(
+            "source",
+            "missing-source-capability-token",
+            "Provide --source-capability-token or --source-capability-token-file for the source instance; --capability-token authorizes the target.",
+        ));
+    };
+    let (valid, errors) =
+        validate_payload_against_schema(&source_input, &source.operation.input_schema);
+    if !valid {
+        let mut outcome = pipe_error(
+            "source",
+            "invalid-source-input",
+            "Source input does not match its live schema.",
+        );
+        outcome.payload["validation_errors"] = json!(errors);
+        return Ok(outcome);
+    }
+    if args.dry_run && !pipeline_dry_run_can_materialize_output(&source.operation) {
+        return Ok(pipe_error(
+            "source",
+            "unsafe-dry-run-source",
+            "A live pipe dry-run requires a safe, idempotent source with no approval requirement. Use an offline dry-run to inspect this plan.",
+        ));
+    }
+    plan["requires_approval"] = json!(host_tool_requires_approval(&target.operation));
+    let zone = resolved_zone(args.zone.as_deref(), &host);
+    let run_key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| RequestId::random().to_string());
+    let source_result = match execute_pipe_stage(
+        &client,
+        &source,
+        "source",
+        &source_input,
+        &zone,
+        &source_auth,
+        &run_key,
+        args.source_lease_seq,
+        false,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut outcome = pipe_error("source", "source-transport-error", error.to_string());
+            outcome.exit_code = CliExitCode::Transport;
+            return Ok(outcome);
+        }
+    };
+    if !source_result.exit_code.is_success() {
         return Ok(DispatchOutcome {
             payload: json!({
-                "status": "error",
+                "status": source_result.evidence["status"],
                 "command": "pipe",
-                "error": {
-                    "type": "missing-mapping",
-                    "message": "No mapping provided. Use --map or --map-file.",
-                },
-                "next_actions": [
-                    format!("fwc pipe {} {} --map 'field_a -> field_b'", args.source, args.target),
-                ],
+                "stage": "source",
+                "source": "host-admin-api",
+                "execution": { "source": source_result.evidence },
             }),
-            exit_code: CliExitCode::Validation,
+            exit_code: source_result.exit_code,
         });
+    }
+    let Some(source_output) = source_result.output else {
+        let mut outcome = pipe_error(
+            "source",
+            "missing-source-output",
+            "The source returned no output; the target was not attempted.",
+        );
+        outcome.exit_code = CliExitCode::Connector;
+        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        return Ok(outcome);
     };
-
-    // Build pipe plan.
-    let plan = pipe::PipePlan {
-        source_operation: args.source.clone(),
-        target_operation: args.target.clone(),
-        mapping: spec,
-        requires_approval: false,
-        preview_input: None,
+    let mapped = pipe::apply_mapping(&source_output, &mapping);
+    let (valid, errors) =
+        validate_payload_against_schema(&mapped.output, &target.operation.input_schema);
+    if !mapped.errors.is_empty() || !valid {
+        let mut outcome = pipe_error(
+            "mapping",
+            "invalid-target-input",
+            "The source output could not produce valid target input; the target was not attempted.",
+        );
+        outcome.payload["mapping_errors"] = json!(mapped.errors);
+        outcome.payload["validation_errors"] = json!(errors);
+        outcome.payload["intermediate"] = source_output;
+        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        return Ok(outcome);
+    }
+    let target_result = match execute_pipe_stage(
+        &client,
+        &target,
+        "target",
+        &mapped.output,
+        &zone,
+        &target_auth,
+        &run_key,
+        args.target_lease_seq,
+        args.dry_run,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut outcome = pipe_error("target", "target-transport-error", error.to_string());
+            outcome.exit_code = CliExitCode::Transport;
+            outcome.payload["execution"] = json!({"source": source_result.evidence});
+            outcome.payload["intermediate"] = source_output;
+            return Ok(outcome);
+        }
     };
-
-    let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "pipe");
     let mut payload = json!({
-        "status": "planned",
+        "status": if target_result.exit_code.is_success() {
+            "ok"
+        } else {
+            target_result.evidence["status"].as_str().unwrap_or("error")
+        },
         "command": "pipe",
-        "message": format!(
-            "Pipe plan: {} -> {} ({} mapping rule(s)). \
-             Execution requires host integration (not yet available).",
-            args.source, args.target, plan.mapping.rules.len()
-        ),
-        "plan": plan,
         "dry_run": args.dry_run,
-        "include_intermediate": args.include_intermediate,
-        "next_actions": [
-            format!("fwc schema {} --scaffold", args.source),
-            format!("fwc schema {} --required-only", args.target),
-        ],
+        "zone": zone,
+        "plan": plan,
+        "source": "host-admin-api",
+        "execution": { "source": source_result.evidence, "target": target_result.evidence },
     });
-    envelope.inject_into(&mut payload);
+    if args.dry_run {
+        payload["plan"]["preview_input"] = mapped.output;
+    } else if let Some(output) = target_result.output {
+        payload["result"] = output;
+    }
+    if args.include_intermediate || !target_result.exit_code.is_success() {
+        payload["intermediate"] = source_output;
+    }
+    CommandEnvelope::new(CommandAvailability::LiveRuntime, "pipe").inject_into(&mut payload);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: target_result.exit_code,
     })
 }
 
@@ -28144,6 +29264,136 @@ fn resolve_live_pipeline_operations(
     Ok(operations)
 }
 
+fn parse_workflow_step_bindings(
+    values: &[String],
+    flag: &str,
+    step_ids: &BTreeSet<&str>,
+) -> std::result::Result<BTreeMap<String, String>, LiveAuthError> {
+    let mut bindings = BTreeMap::new();
+    for raw in values {
+        let Some((step_id, value)) = raw.split_once('=') else {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} requires STEP=VALUE."),
+            });
+        };
+        let step_id = step_id.trim();
+        if !step_ids.contains(step_id) {
+            // Do not echo an unrecognized key: a bare base64 token can itself
+            // contain '=' and would otherwise be printed as a step name.
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "{flag} names an unknown step. Valid steps: {}.",
+                    step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+        if value.trim().is_empty() {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} has an empty value for step `{step_id}`."),
+            });
+        }
+        if bindings.insert(step_id.to_owned(), value.to_owned()).is_some() {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!("{flag} was specified more than once for step `{step_id}`."),
+            });
+        }
+    }
+    Ok(bindings)
+}
+
+fn resolve_workflow_auth(
+    args: &WorkflowAuthArgs,
+    plan: &pipe::PipelinePlan,
+    operations: &BTreeMap<String, ResolvedHostOperation>,
+) -> std::result::Result<BTreeMap<String, ResolvedLiveAuth>, LiveAuthError> {
+    let step_ids = plan.steps.iter().map(|step| step.id.as_str()).collect();
+    let inline = parse_workflow_step_bindings(
+        &args.step_capability_token,
+        "--step-capability-token",
+        &step_ids,
+    )?;
+    let files = parse_workflow_step_bindings(
+        &args.step_capability_token_file,
+        "--step-capability-token-file",
+        &step_ids,
+    )?;
+    let holder_keys = parse_workflow_step_bindings(
+        &args.step_holder_key_file,
+        "--step-holder-key-file",
+        &step_ids,
+    )?;
+    for step_id in inline.keys() {
+        if files.contains_key(step_id) {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "Step `{step_id}` has both --step-capability-token and --step-capability-token-file; choose one."
+                ),
+            });
+        }
+    }
+    for step_id in holder_keys.keys() {
+        if !inline.contains_key(step_id) && !files.contains_key(step_id) {
+            return Err(LiveAuthError::InvalidWorkflowAuth {
+                message: format!(
+                    "--step-holder-key-file for step `{step_id}` requires that step's own capability token."
+                ),
+            });
+        }
+    }
+
+    let mut default_connectors = BTreeSet::new();
+    for step in &plan.steps {
+        let resolved = operations.get(&step.operation).ok_or_else(|| {
+            LiveAuthError::InvalidWorkflowAuth {
+                message: format!("Step `{}` is missing resolved live metadata.", step.id),
+            }
+        })?;
+        if !inline.contains_key(&step.id) && !files.contains_key(&step.id) {
+            default_connectors.insert(resolved.connector.summary.id.as_str());
+        }
+    }
+    if default_connectors.len() > 1 {
+        return Err(LiveAuthError::InvalidWorkflowAuth {
+            message: "Steps without explicit credentials target multiple connectors. Assign --step-capability-token-file STEP=PATH to each separately authorized step; default credentials may cover only one connector.".to_owned(),
+        });
+    }
+
+    let default_requested = args.default_auth.capability_token.is_some()
+        || args.default_auth.capability_token_file.is_some()
+        || args.default_auth.holder_key_file.is_some();
+    let default_auth = if default_requested || !default_connectors.is_empty() {
+        Some(resolve_live_auth(&args.default_auth)?)
+    } else {
+        None
+    };
+    let mut auth_by_step = BTreeMap::new();
+    for step in &plan.steps {
+        let auth = if inline.contains_key(&step.id) || files.contains_key(&step.id) {
+            let step_args = LiveAuthArgs {
+                capability_token: inline.get(&step.id).cloned(),
+                capability_token_file: files.get(&step.id).map(PathBuf::from),
+                // A different capability never inherits the default holder key.
+                holder_key_file: holder_keys.get(&step.id).map(PathBuf::from),
+                approval_token: args.default_auth.approval_token.clone(),
+                approval_token_file: args.default_auth.approval_token_file.clone(),
+            };
+            resolve_live_auth(&step_args).map_err(|error| {
+                LiveAuthError::InvalidWorkflowAuth {
+                    message: format!(
+                        "Invalid credentials for step `{}`: {} Use --step-capability-token-file STEP=PATH and --step-holder-key-file STEP=PATH for this step.",
+                        step.id,
+                        error.message()
+                    ),
+                }
+            })?
+        } else {
+            default_auth.clone().ok_or(LiveAuthError::MissingCapabilityToken)?
+        };
+        auth_by_step.insert(step.id.clone(), auth);
+    }
+    Ok(auth_by_step)
+}
+
 fn live_pipeline_operation_metadata(
     operations: &BTreeMap<String, ResolvedHostOperation>,
 ) -> BTreeMap<String, pipe::PipelineOperationMetadata> {
@@ -28184,8 +29434,15 @@ fn execute_live_pipeline_plan(
     mode: PipelinePlanMode,
     host: &ResolvedHostConfig,
     zone: &str,
-    auth: &ResolvedLiveAuth,
+    auth_by_step: &BTreeMap<String, ResolvedLiveAuth>,
 ) -> Result<LivePipelineExecutionResult> {
+    for step in &plan.steps {
+        anyhow::ensure!(
+            auth_by_step.contains_key(&step.id),
+            "pipeline step `{}` is missing resolved credentials",
+            step.id
+        );
+    }
     let client = HostAdminClient::new(&host.endpoint)?;
     let steps_by_id = plan
         .steps
@@ -28208,6 +29465,9 @@ fn execute_live_pipeline_plan(
         })?;
         let resolved = operations.get(&step.operation).ok_or_else(|| {
             anyhow::anyhow!("pipeline step `{step_id}` is missing resolved live metadata")
+        })?;
+        let auth = auth_by_step.get(step_id).ok_or_else(|| {
+            anyhow::anyhow!("pipeline step `{step_id}` is missing resolved credentials")
         })?;
 
         let dependency_failures = step
@@ -28825,7 +30085,14 @@ fn recipe_run_dispatch(
             ],
         ));
     };
-    let auth = match resolve_live_auth(&args.auth) {
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let resolved_operations =
+        match resolve_live_pipeline_operations("recipe", &plan, &client, &catalog) {
+            Ok(operations) => operations,
+            Err(outcome) => return Ok(outcome),
+        };
+    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -28838,18 +30105,12 @@ fn recipe_run_dispatch(
                         recipe.slug,
                         host.endpoint
                     ),
+                    "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
                     "Provide approval tokens with `--approval-token-file` when recipe steps require explicit authorization.".to_owned(),
                 ],
             ));
         }
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
-    let resolved_operations =
-        match resolve_live_pipeline_operations("recipe", &plan, &client, &catalog) {
-            Ok(operations) => operations,
-            Err(outcome) => return Ok(outcome),
-        };
     let estimate = pipe::estimate_pipeline(
         &plan,
         &live_pipeline_operation_metadata(&resolved_operations),
@@ -29358,7 +30619,14 @@ fn pipeline_run_dispatch(
             ],
         ));
     };
-    let auth = match resolve_live_auth(&args.auth) {
+    let client = HostAdminClient::new(&host.endpoint)?;
+    let (catalog, _) = client.catalog(None)?;
+    let resolved_operations =
+        match resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog) {
+            Ok(operations) => operations,
+            Err(outcome) => return Ok(outcome),
+        };
+    let auth = match resolve_workflow_auth(&args.auth, &plan, &resolved_operations) {
         Ok(auth) => auth,
         Err(error) => {
             return Ok(live_auth_dispatch(
@@ -29371,18 +30639,12 @@ fn pipeline_run_dispatch(
                         path.display(),
                         host.endpoint
                     ),
+                    "Assign each separately authorized step with `--step-capability-token-file STEP=PATH` and its own `--step-holder-key-file STEP=PATH` when holder-bound.".to_owned(),
                     "Provide approval tokens with `--approval-token-file` when pipeline steps require explicit authorization.".to_owned(),
                 ],
             ));
         }
     };
-    let client = HostAdminClient::new(&host.endpoint)?;
-    let (catalog, _) = client.catalog(None)?;
-    let resolved_operations =
-        match resolve_live_pipeline_operations("pipeline", &plan, &client, &catalog) {
-            Ok(operations) => operations,
-            Err(outcome) => return Ok(outcome),
-        };
     let estimate = pipe::estimate_pipeline(
         &plan,
         &live_pipeline_operation_metadata(&resolved_operations),
@@ -32481,6 +33743,10 @@ fn is_sensitive_flag(flag: &str) -> bool {
     matches!(
         flag,
         "--capability-token"
+            | "--source-capability-token"
+            | "--step-capability-token"
+            | "--step-capability-token-file"
+            | "--step-holder-key-file"
             | "--approval-token"
             | "--token"
             | "--api-token"
@@ -34040,6 +35306,14 @@ max_state_replication_staleness_secs = 120
         routes: StdBTreeMap<String, Value>,
         expected_requests: usize,
     ) -> (String, thread::JoinHandle<()>) {
+        spawn_mock_host_with_response_headers(routes, expected_requests, StdBTreeMap::new())
+    }
+
+    fn spawn_mock_host_with_response_headers(
+        routes: StdBTreeMap<String, Value>,
+        expected_requests: usize,
+        response_headers: StdBTreeMap<String, Vec<(String, String)>>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock host should bind");
         listener
             .set_nonblocking(true)
@@ -34124,11 +35398,16 @@ max_state_replication_staleness_secs = 120
                     )
                 });
                 let body = bind_mock_invoke_response(&key, body, &request_body);
+                let headers = response_headers.get(&key).map_or_else(String::new, |headers| {
+                    headers.iter().map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>()
+                });
 
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{}\r\n{}",
                     body.len(),
+                    headers,
                     body
                 )
                 .expect("mock host should write response");
@@ -34946,6 +36225,80 @@ max_state_replication_staleness_secs = 120
                 &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
             )
             .expect("holder signature should bind the actual wire request");
+        proof
+    }
+
+    fn test_workflow_holder_auth(
+        directory: &Path,
+        step_id: &str,
+        seed: u8,
+    ) -> (String, PathBuf, Ed25519SigningKey) {
+        use base64::Engine as _;
+
+        let key_path = directory.join(format!("{step_id}-holder.raw"));
+        fs::write(&key_path, [seed; 32]).expect("workflow holder key should write");
+        let key = Ed25519SigningKey::from_bytes(&[seed; 32]).expect("workflow holder key");
+        let instance = fcp_core::InstanceId::new();
+        let claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .expect("workflow capability claims")
+            .subject(&format!("agent:{step_id}"))
+            .holder_node(&format!("node:{step_id}"))
+            .token_id(step_id.as_bytes())
+            .target_instance(instance.as_str());
+        let issuer = Ed25519SigningKey::from_bytes(&[0x42; 32]).expect("workflow issuer");
+        let token = fcp_crypto::cose::CoseToken::sign(&issuer, &claims)
+            .expect("workflow capability should sign");
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(token.to_cbor().expect("workflow capability should encode"));
+        (encoded, key_path, key)
+    }
+
+    fn assert_workflow_holder_request(
+        request: &Value,
+        expected_token: &str,
+        key: &Ed25519SigningKey,
+    ) -> fcp_core::HolderProof {
+        let token = super::parse_capability_token_str(expected_token, "workflow fixture").unwrap();
+        assert_eq!(
+            request["capability_token"],
+            serde_json::to_value(&token).unwrap()
+        );
+        let claims = token.raw().claims_unverified().unwrap();
+        let request_id: RequestId = serde_json::from_value(
+            request
+                .get("request_id")
+                .or_else(|| request.get("id"))
+                .expect("workflow wire request ID")
+                .clone(),
+        )
+        .unwrap();
+        let operation: fcp_core::OperationId =
+            serde_json::from_value(request["operation"].clone()).unwrap();
+        let proof: fcp_core::HolderProof =
+            serde_json::from_value(request["holder_proof"].clone()).unwrap();
+        assert_eq!(
+            proof.holder_node.as_str(),
+            claims.get_holder_node().expect("workflow holder claim")
+        );
+        if request.get("request_id").is_some() {
+            assert_eq!(
+                request["principal"],
+                claims.get_subject().expect("workflow principal claim")
+            );
+        }
+        let signable = fcp_core::HolderProof::signable_bytes(
+            &request_id,
+            &operation,
+            claims.get_jti().expect("workflow token JTI"),
+        );
+        key.verifying_key()
+            .verify(
+                &signable,
+                &fcp_crypto::Ed25519Signature::from_bytes(&proof.signature),
+            )
+            .expect("workflow holder signature must bind its own token and actual request");
         proof
     }
 
@@ -36903,6 +38256,47 @@ deny_ptrace = true
     }
 
     #[test]
+    fn workflow_auth_diagnostics_redact_received_and_normalized_credentials() {
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--extract",
+            ".connector[",
+            "pipeline",
+            "run",
+            "not-opened.toml",
+            "--step-capability-token=notify=INLINE_SECRET",
+            "--step-capability-token-file",
+            "notify=TOKEN_PATH_SECRET",
+            "--step-holder-key-file=notify=KEY_PATH_SECRET",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Validation.into());
+        assert_eq!(payload["error"]["type"], "invalid-extract-filter");
+        for view in ["received", "normalized"] {
+            let arguments = payload["input"][view].as_array().unwrap();
+            assert_eq!(arguments[7], "--step-capability-token=<redacted>");
+            assert_eq!(arguments[9], "<redacted>");
+            assert_eq!(arguments[10], "--step-holder-key-file=<redacted>");
+        }
+        let encoded = payload.to_string();
+        for secret in ["INLINE_SECRET", "TOKEN_PATH_SECRET", "KEY_PATH_SECRET"] {
+            assert!(!encoded.contains(secret));
+        }
+
+        let source_args = [
+            "fwc",
+            "pipe",
+            "--source-capability-token",
+            "SOURCE_SECRET",
+            "--source-capability-token=SECOND_SOURCE_SECRET",
+        ]
+        .map(str::to_owned);
+        let redacted = super::redact_sensitive_args(&source_args);
+        assert_eq!(redacted[3], "<redacted>");
+        assert_eq!(redacted[4], "--source-capability-token=<redacted>");
+    }
+
+    #[test]
     fn redact_sensitive_args_masks_auth_and_live_tokens() {
         let args = [
             "fwc",
@@ -37197,6 +38591,465 @@ deny_ptrace = true
         assert_eq!(payload["tool_provenance"][0]["availability"], "live");
     }
 
+    fn mock_mesh_read_response(mut response: Value) -> Value {
+        response["read_route"] = json!({
+            "truth_source": "mesh-backed",
+            "entry_node": "entry-host",
+            "served_by": "executor-peer",
+            "hop_count": 1,
+            "decision": "remote-advertisement",
+            "failed_attempts": ["unavailable-peer: transport failure"],
+        });
+        response
+    }
+
+    fn discovery_truth_headers(source: &str, local: usize, mesh: usize) -> Vec<(String, String)> {
+        vec![
+            ("x-fcp-truth-source".to_owned(), source.to_owned()),
+            ("x-fcp-truth-local-connectors".to_owned(), local.to_string()),
+            ("x-fcp-truth-mesh-connectors".to_owned(), mesh.to_string()),
+        ]
+    }
+
+    #[test]
+    fn live_read_provenance_validates_discovery_headers_and_body_counts() {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let unattested = super::HostReadProvenance::from_headers(&HeaderMap::new()).unwrap();
+        assert_eq!(unattested.truth_source, KnowledgeState::HostBacked);
+        assert!(!unattested.attested);
+
+        for (source, local, mesh, expected) in [
+            ("mesh-backed", 0, 1, KnowledgeState::MeshBacked),
+            ("host-backed", 1, 1, KnowledgeState::HostBacked),
+            ("host-backed", 0, 0, KnowledgeState::HostBacked),
+        ] {
+            let headers: HeaderMap = discovery_truth_headers(source, local, mesh)
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                        HeaderValue::from_str(&value).unwrap(),
+                    )
+                })
+                .collect();
+            let provenance = super::HostReadProvenance::from_headers(&headers).unwrap();
+            assert_eq!(provenance.truth_source, expected);
+            assert!(provenance.attested);
+            assert!(provenance.validate_discovery(local + mesh).is_ok());
+            assert!(provenance.validate_discovery(local + mesh + 1).is_err());
+        }
+        for headers in [
+            vec![("x-fcp-truth-source", "offline")],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-source", "host-backed"),
+            ],
+            vec![("x-fcp-truth-local-connectors", "1")],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-local-connectors", "1"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+            vec![
+                ("x-fcp-truth-source", "host-backed"),
+                ("x-fcp-truth-local-connectors", "0"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+            vec![
+                ("x-fcp-truth-source", "mesh-backed"),
+                ("x-fcp-truth-local-connectors", "-1"),
+                ("x-fcp-truth-mesh-connectors", "1"),
+            ],
+        ] {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                map.append(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            assert!(
+                super::HostReadProvenance::from_headers(&map).is_err(),
+                "{map:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_read_provenance_requires_consistent_point_executor_evidence() {
+        let mesh_route = fcp_kernel::InvokeRouteProvenance::mesh_backed(
+            "entry-host".to_owned(),
+            "executor-peer".to_owned(),
+            1,
+            "advertised_peer_forward",
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        let route_only = super::HostReadProvenance::from_headers(&headers)
+            .unwrap()
+            .with_route(Some(mesh_route.clone()))
+            .unwrap();
+        assert_eq!(route_only.truth_source, KnowledgeState::MeshBacked);
+        assert!(route_only.attested);
+        headers.insert(
+            "x-fcp-truth-source",
+            reqwest::header::HeaderValue::from_static("host-backed"),
+        );
+        assert!(
+            super::HostReadProvenance::from_headers(&headers)
+                .unwrap()
+                .with_route(Some(mesh_route))
+                .is_err()
+        );
+        headers.insert(
+            "x-fcp-truth-source",
+            reqwest::header::HeaderValue::from_static("mesh-backed"),
+        );
+        assert!(
+            super::HostReadProvenance::from_headers(&headers)
+                .unwrap()
+                .with_route(None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_read_provenance_rejects_mismatched_connector_identity() {
+        let mut inventory = mock_mesh_read_response(mock_inventory_response_json());
+        inventory["connector"]["id"] = json!("fcp.other:enterprise:v1");
+        let mut introspection = mock_mesh_read_response(mock_introspection_response_json());
+        introspection["connector"]["id"] = json!("fcp.other:enterprise:v1");
+        let mut status = mock_mesh_read_response(mock_connector_admin_status_json());
+        status["connector_id"] = json!("fcp.other:enterprise:v1");
+        for (path, value, method) in [
+            (
+                "/rpc/connectors/fcp.github:enterprise:v1",
+                inventory,
+                "inventory",
+            ),
+            (
+                "/rpc/introspect/fcp.github:enterprise:v1",
+                introspection,
+                "introspection",
+            ),
+            (
+                "/rpc/connectors/fcp.github:enterprise:v1/status",
+                status,
+                "status",
+            ),
+        ] {
+            let (host, server) =
+                spawn_mock_host(StdBTreeMap::from([(format!("GET {path}"), value)]), 1);
+            let client = super::HostAdminClient::new(&host).unwrap();
+            let result = match method {
+                "inventory" => client
+                    .connector_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                "introspection" => client
+                    .introspect_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                "status" => client
+                    .connector_status_with_provenance("fcp.github:enterprise:v1")
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different connector")
+            );
+            server
+                .join()
+                .expect("each mismatched response was rejected");
+        }
+    }
+
+    #[test]
+    fn live_read_provenance_remote_discovery_and_search_satisfy_mesh_requirement() {
+        let (host, server) = spawn_mock_host_with_response_headers(
+            mock_github_host_routes(StdBTreeMap::from([(
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_mesh_read_response(mock_introspection_response_json()),
+            )])),
+            3,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("mesh-backed", 0, 1),
+            )]),
+        );
+        for suffix in [&["list"][..], &["search", "github issue"][..]] {
+            let mut args = vec!["fwc", "--json", "--host", host.as_str()];
+            args.extend_from_slice(suffix);
+            args.extend_from_slice(&["--require-source", "mesh"]);
+            let (exit, payload) = execute_json(&args);
+            assert_eq!(exit, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["_truth_source"], "mesh");
+            assert_eq!(payload["decision_trace"]["selected_source"], "mesh-backed");
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["mesh_connectors"],
+                1
+            );
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["local_connectors"],
+                0
+            );
+            let schema: Value = serde_json::from_str(if suffix[0] == "list" {
+                include_str!("../schemas/list.schema.json")
+            } else {
+                include_str!("../schemas/search.schema.json")
+            })
+            .unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap_or_else(|error| panic!("mesh discovery violates schema: {error}"));
+        }
+        server
+            .join()
+            .expect("one request for list and two for search");
+    }
+
+    #[test]
+    fn live_read_provenance_mixed_inventory_retains_host_source_and_contributions() {
+        let mut local = mock_connector_summary_json();
+        local["id"] = json!("fcp.local:enterprise:v1");
+        local["name"] = json!("Local");
+        let discovery =
+            mock_discovery_response_with_connectors(vec![local, mock_connector_summary_json()]);
+        let (host, server) = spawn_mock_host_with_response_headers(
+            StdBTreeMap::from([("POST /rpc/discover".to_owned(), discovery)]),
+            2,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("host-backed", 1, 1),
+            )]),
+        );
+        for required in ["mesh-or-host", "mesh"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "list",
+                "--require-source",
+                required,
+            ]);
+            assert_eq!(payload["_truth_source"], "host");
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["mesh_connectors"],
+                1
+            );
+            assert_eq!(
+                payload["read_provenance"]["responses"][0]["local_connectors"],
+                1
+            );
+            assert_eq!(
+                exit,
+                if required == "mesh" {
+                    CliExitCode::Transport
+                } else {
+                    CliExitCode::Success
+                }
+                .into()
+            );
+            let schema: Value =
+                serde_json::from_str(include_str!("../schemas/list.schema.json")).unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap();
+        }
+        server.join().expect("mixed inventory query count");
+    }
+
+    #[test]
+    fn live_read_provenance_mesh_inventory_does_not_upgrade_host_introspection() {
+        let (host, server) = spawn_mock_host_with_response_headers(
+            mock_github_host_routes(StdBTreeMap::new()),
+            2,
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                discovery_truth_headers("mesh-backed", 0, 1),
+            )]),
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "search",
+            "github issue",
+            "--require-source",
+            "mesh",
+        ]);
+        assert_eq!(exit, CliExitCode::Transport.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(
+            payload["read_provenance"]["responses"][0]["truth_source"],
+            "mesh-backed"
+        );
+        assert_eq!(
+            payload["read_provenance"]["responses"][1]["truth_source"],
+            "host-backed"
+        );
+        server
+            .join()
+            .expect("discovery never taints a later local response");
+    }
+
+    #[test]
+    fn execute_mesh_reads_preserve_executor_and_satisfy_required_source() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_inventory_response_json()),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            12,
+        );
+        for suffix in [
+            &["show", "github"][..],
+            &["schema", "github"][..],
+            &["schema", "github", "create_issue"][..],
+            &["schema", "github", "create_issue", "--scaffold"][..],
+        ] {
+            let mut arguments = vec!["fwc", "--json", "--host", host.as_str()];
+            arguments.extend_from_slice(suffix);
+            arguments.extend_from_slice(&["--require-source", "mesh"]);
+            let (exit_code, payload) = execute_json(&arguments);
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["_truth_source"], "mesh");
+            let routes = payload["provenance"]["read_routes"].as_array().unwrap();
+            assert_eq!(routes.len(), 2);
+            for route in routes {
+                assert_eq!(route["entry_node"], "entry-host");
+                assert_eq!(route["served_by"], "executor-peer");
+                assert_eq!(route["hop_count"], 1);
+                assert_eq!(route["failed_attempts"].as_array().unwrap().len(), 1);
+            }
+            assert_eq!(payload["decision_trace"]["selected_source"], "mesh-backed");
+            assert_eq!(payload["decision_trace"]["attempts"].as_array().unwrap().len(), 1);
+            assert_eq!(payload["read_provenance"]["replication_proven"], false);
+            let schema: Value = serde_json::from_str(if suffix[0] == "show" {
+                include_str!("../schemas/show.schema.json")
+            } else {
+                include_str!("../schemas/schema.schema.json")
+            })
+            .unwrap();
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .validate(&payload)
+                .unwrap_or_else(|error| panic!("mesh read violates output schema: {error}"));
+        }
+        server.join().expect("mock host thread should complete");
+    }
+
+    #[test]
+    fn execute_show_mixed_read_sources_preserve_evidence_without_claiming_mesh() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            6,
+        );
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "--host", &host, "show", "github"]);
+        assert_eq!(exit_code, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(
+            payload["provenance"]["read_routes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (exit_code, refusal) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "show",
+            "github",
+            "--require-source",
+            "mesh",
+        ]);
+        assert_eq!(exit_code, CliExitCode::Transport.into());
+        assert_eq!(refusal["error"]["type"], "truth-source-unavailable");
+        assert_eq!(refusal["error"]["actual"], "host");
+        assert_eq!(
+            refusal["read_provenance"]["responses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/show.schema.json")).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&refusal)
+            .unwrap();
+        server.join().expect("mock host thread should complete");
+    }
+
+    #[test]
+    fn execute_show_rejects_incomplete_mesh_executor_evidence() {
+        let mut inventory = mock_mesh_read_response(mock_inventory_response_json());
+        inventory["read_route"]["served_by"] = json!("entry-host");
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    inventory,
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_mesh_read_response(mock_introspection_response_json()),
+                ),
+            ]),
+            2,
+        );
+        let args = super::ShowArgs {
+            connector: "github".to_owned(),
+            offline: false,
+            require_source: Some(RequiredTruthSource::Mesh),
+        };
+        let error =
+            super::show_dispatch_host(&args, &host).expect_err("same-node evidence is not mesh");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete mesh executor evidence")
+        );
+        server
+            .join()
+            .expect("malformed inventory must stop before introspection");
+    }
+
     #[test]
     fn execute_show_with_host_uses_inventory_and_introspection() {
         let (host, server) = spawn_mock_host(
@@ -37244,17 +39097,35 @@ deny_ptrace = true
 
     #[test]
     fn execute_show_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ]),
+            3,
+        );
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
-            "http://127.0.0.1:1",
+            &host,
             "show",
             "github",
             "--require-source",
             "mesh",
         ]);
 
+        server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "show");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -42217,7 +44088,7 @@ deny_ptrace = true
             .active_node = Some("stale-laptop".to_owned());
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "status"]);
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "status", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -42329,7 +44200,7 @@ deny_ptrace = true
         );
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes"]);
+        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -42377,7 +44248,8 @@ deny_ptrace = true
         );
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "mesh", "nodes", "github", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -42399,7 +44271,8 @@ deny_ptrace = true
             .active_node = Some("laptop".to_owned());
         super::save_context_config(&path, &config).expect("context config should save");
 
-        let (exit_code, payload) = execute_json(&["fwc", "--json", "mesh", "nodes", "github"]);
+        let (exit_code, payload) =
+            execute_json(&["fwc", "--json", "mesh", "nodes", "github", "--offline"]);
 
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -42434,6 +44307,347 @@ deny_ptrace = true
                 warning.contains("there is no active default node to fall back to")
             })
         }));
+    }
+
+    fn mock_mesh_inventory_response_json() -> Value {
+        json!({
+            "schema_version": "fcp.mesh.inventory.v1",
+            "generated_at_ms": 10_000,
+            "local_node_id": "entry-host",
+            "mesh_configured": true,
+            "membership_status": "owner_signed",
+            "nodes": [
+                {
+                    "node_id": "entry-host", "is_local": true,
+                    "inventory_status": "local",
+                    "advertisement_issued_at_ms": null, "advertisement_age_ms": null,
+                    "connectors": [{
+                        "connector_id": "fcp.github:enterprise:v1",
+                        "zones": ["z:private"], "singleton_writer": false,
+                    }],
+                },
+                {
+                    "node_id": "peer-work", "is_local": false,
+                    "inventory_status": "verified",
+                    "advertisement_issued_at_ms": 9_000, "advertisement_age_ms": 1_000,
+                    "connectors": [
+                        {"connector_id": "fcp.github:enterprise:v1", "zones": ["z:work"], "singleton_writer": false},
+                        {"connector_id": "fcp.slack:enterprise:v1", "zones": ["z:work"], "singleton_writer": true},
+                    ],
+                },
+                {
+                    "node_id": "peer-unavailable", "is_local": false,
+                    "inventory_status": "unavailable",
+                    "advertisement_issued_at_ms": null, "advertisement_age_ms": null,
+                    "connectors": [],
+                },
+            ],
+            "warnings": ["Advertisements do not prove peer liveness or state replication."],
+        })
+    }
+
+    #[test]
+    fn execute_mesh_status_reads_live_inventory_without_promoting_advertisements_to_liveness() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret\n").unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "status",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+            "--require-source",
+            "mesh-or-host",
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["membership_status"], "owner_signed");
+        assert_eq!(payload["node_count"], 3);
+        assert_eq!(payload["connector_count"], 2);
+        assert_eq!(payload["verified_peer_count"], 1);
+        assert_eq!(payload["unavailable_peer_count"], 1);
+        assert_eq!(payload["advertised_inventory_complete"], false);
+        assert_eq!(payload["live_inventory"]["available"], true);
+        assert_eq!(payload["live_inventory"]["peer_liveness_proven"], false);
+        assert_eq!(payload["live_inventory"]["replica_coverage_proven"], false);
+        assert_eq!(payload["live_inventory"]["quorum_proven"], false);
+        assert_eq!(payload["nodes"][1]["advertisement_age_ms"], 1_000);
+        assert!(!payload.to_string().contains("mesh-owner-test-secret"));
+    }
+
+    #[test]
+    fn execute_mesh_nodes_filters_advertised_connectors_and_zones_without_using_saved_targets() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        let mut config = super::default_context_config();
+        config
+            .contexts
+            .get_mut("local")
+            .unwrap()
+            .mesh_targets
+            .active_node = Some("stale-target".to_owned());
+        super::save_context_config(&path, &config).unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "nodes",
+            "github",
+            "--zone",
+            "z:work",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["node_count"], 1);
+        assert_eq!(payload["connector_count"], 1);
+        assert_eq!(payload["nodes"][0]["node_id"], "peer-work");
+        assert_eq!(
+            payload["nodes"][0]["connectors"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            payload["nodes"][0]["connectors"][0]["connector_id"],
+            "fcp.github:enterprise:v1"
+        );
+        assert_eq!(
+            payload["nodes"][0]["connectors"][0]["zones"],
+            json!(["z:work"])
+        );
+        assert_eq!(payload["unavailable_peer_count"], 1);
+        assert!(!payload.to_string().contains("stale-target"));
+    }
+
+    #[test]
+    fn execute_mesh_nodes_empty_filter_does_not_claim_absence_when_peer_inventory_is_unknown() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                mock_mesh_inventory_response_json(),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "nodes",
+            "github",
+            "--zone",
+            "z:owner",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Success.into());
+        assert_eq!(payload["node_count"], 0);
+        assert_eq!(payload["advertised_inventory_complete"], false);
+        assert!(
+            payload["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .unwrap()
+                        .contains("does not prove the connector is absent")
+                })
+        );
+    }
+
+    #[test]
+    fn execute_mesh_inventory_require_source_rejects_unproven_mesh_before_contacting_host() {
+        let (_tempdir, _path, _guard) = temp_context_config();
+        for subcommand in ["status", "nodes"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "mesh",
+                subcommand,
+                "--require-source",
+                "mesh",
+                "--admin-token-file",
+                "/not-opened/admin-token",
+            ]);
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+            assert_eq!(payload["_truth_source"], "host");
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "mesh",
+                subcommand,
+                "--offline",
+                "--require-source",
+                "any-live",
+            ]);
+            assert_eq!(exit, CliExitCode::Transport.into());
+            assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+            assert_eq!(payload["_truth_source"], "offline");
+        }
+    }
+
+    #[test]
+    fn execute_mesh_inventory_explicit_offline_ignores_configured_host_and_admin_token_file() {
+        let (tempdir, _path, _guard) = temp_context_config();
+        let _session_guard = super::install_test_session_dir(tempdir.path().join("sessions"));
+        for subcommand in ["status", "nodes"] {
+            let (exit, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                "http://127.0.0.1:9",
+                "mesh",
+                subcommand,
+                "--offline",
+                "--admin-token-file",
+                "/not-opened/admin-token",
+            ]);
+            assert_eq!(exit, CliExitCode::Success.into());
+            assert_eq!(payload["_truth_source"], "offline");
+        }
+    }
+
+    #[test]
+    fn execute_mesh_inventory_rejects_invalid_live_response_without_offline_fallback() {
+        let (tempdir, path, _guard) = temp_context_config();
+        let token_file = tempdir.path().join("admin-token");
+        fs::write(&token_file, "mesh-owner-test-secret").unwrap();
+        super::save_context_config(&path, &super::default_context_config()).unwrap();
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "GET /rpc/mesh/inventory".to_owned(),
+                json!({"secret": "must-not-echo-response-body"}),
+            )]),
+            1,
+        );
+        let (exit, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "mesh",
+            "status",
+            "--admin-token-file",
+            token_file.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert_eq!(exit, CliExitCode::Transport.into());
+        assert_eq!(payload["_truth_source"], "unavailable");
+        assert_eq!(payload["error"]["type"], "mesh-inventory-unavailable");
+        assert!(payload.get("target_state").is_none());
+        assert!(!payload.to_string().contains("must-not-echo-response-body"));
+    }
+
+    #[test]
+    fn mesh_inventory_connector_filter_matches_exact_family_and_variant_without_prefix_bleed() {
+        for selector in [
+            "github",
+            "fcp.github",
+            "github:enterprise:v1",
+            "fcp.github:enterprise:v1",
+        ] {
+            assert!(super::mesh_inventory_connector_matches(
+                "fcp.github:enterprise:v1",
+                selector
+            ));
+        }
+        for selector in ["git", "github:base:v1", "", "slack"] {
+            assert!(!super::mesh_inventory_connector_matches(
+                "fcp.github:enterprise:v1",
+                selector
+            ));
+        }
+    }
+
+    #[test]
+    fn mesh_inventory_client_sends_owner_auth_and_refuses_redirects_without_echoing_body() {
+        let sink = TcpListener::bind("127.0.0.1:0").unwrap();
+        sink.set_nonblocking(true).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let redirect = format!("http://{}/credential-sink", sink.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "inventory client did not connect"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("inventory host accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let body = "must-not-echo-admin-secret";
+            write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        let error = super::HostAdminClient::without_redirects(&endpoint)
+            .unwrap()
+            .mesh_inventory("test-owner-credential")
+            .unwrap_err();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /rpc/mesh/inventory "));
+        assert!(request.contains("authorization: bearer test-owner-credential\r\n"));
+        assert!(request.contains("x-fcp-zone: z:owner\r\n"));
+        assert!(error.to_string().contains("HTTP 307"));
+        assert!(!error.to_string().contains("must-not-echo-admin-secret"));
+        assert_eq!(
+            sink.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -43481,6 +45695,30 @@ deny_ptrace = true
     }
 
     #[test]
+    fn execute_search_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(mock_github_host_routes(StdBTreeMap::new()), 2);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "search",
+            "github issue",
+            "--require-source",
+            "mesh",
+        ]);
+
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Transport.into());
+        assert_eq!(payload["command"], "search");
+        assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
+        assert_eq!(payload["_truth_source"], "host");
+        assert_eq!(payload["error"]["type"], "truth-source-unavailable");
+        assert_eq!(payload["error"]["required"], "mesh");
+        assert_eq!(payload["error"]["actual"], "host");
+    }
+
+    #[test]
     fn execute_search_host_require_mesh_fails_truth_source_unavailable_without_network() {
         let (exit_code, payload) = execute_json(&[
             "fwc",
@@ -43701,11 +45939,28 @@ deny_ptrace = true
 
     #[test]
     fn execute_schema_host_require_mesh_fails_truth_source_unavailable() {
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/connectors/fcp.github:enterprise:v1".to_owned(),
+                    mock_inventory_response_json(),
+                ),
+                (
+                    "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                    mock_introspection_response_json(),
+                ),
+            ]),
+            3,
+        );
         let (exit_code, payload) = execute_json(&[
             "fwc",
             "--json",
             "--host",
-            "http://127.0.0.1:1",
+            &host,
             "schema",
             "github",
             "issues.create",
@@ -43713,6 +45968,7 @@ deny_ptrace = true
             "mesh",
         ]);
 
+        server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Transport.into());
         assert_eq!(payload["command"], "schema");
         assert_eq!(payload["schema_version"], TRUTH_SOURCE_SCHEMA_VERSION);
@@ -44944,6 +47200,391 @@ deny_ptrace = true
         assert_eq!(payload["response"]["completed"], 1);
     }
 
+    fn pipe_mock_catalog(source_risky: bool) -> Vec<(String, Value)> {
+        let github =
+            mock_connector_summary_custom_json("fcp.github:enterprise:v1", "GitHub", 1, "safe");
+        let slack = mock_connector_summary_custom_json("fcp.slack:team:v1", "Slack", 1, "safe");
+        let source = mock_tool_descriptor_json(
+            "github.search_issues",
+            "github.read",
+            "low",
+            if source_risky { "risky" } else { "safe" },
+            "strict",
+            None,
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            }),
+            json!({"type": "object"}),
+        );
+        // Even a safe target must remain uninvoked during a live pipe dry-run.
+        let target = mock_tool_descriptor_json(
+            "slack.post_message",
+            "slack.write",
+            "low",
+            "safe",
+            "strict",
+            None,
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"],
+            }),
+            json!({"type": "object"}),
+        );
+        vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_with_connectors(vec![github.clone(), slack.clone()]),
+            ),
+            (
+                "GET /rpc/introspect/fcp.github:enterprise:v1".to_owned(),
+                mock_introspection_response_with_tools(github, vec![source]),
+            ),
+            (
+                "GET /rpc/introspect/fcp.slack:team:v1".to_owned(),
+                mock_introspection_response_with_tools(slack, vec![target]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn execute_pipe_binds_real_requests_separate_authority_and_literal_output() {
+        use base64::Engine as _;
+
+        let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+        let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+        let (target_token, key_path, signing_key) = test_live_holder_auth(temp_dir.path());
+        let key_path_text = key_path.display().to_string();
+        let source_instance = fcp_core::InstanceId::new();
+        let claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .expect("source claims")
+            .target_instance(source_instance.as_str());
+        let issuer = Ed25519SigningKey::from_bytes(&[0x42; 32]).expect("test issuer");
+        let source_token =
+            fcp_crypto::cose::CoseToken::sign(&issuer, &claims).expect("source token should sign");
+        let source_token = base64::engine::general_purpose::STANDARD
+            .encode(source_token.to_cbor().expect("source token should encode"));
+        let title = "Untrusted {{steps.any.output}} and \"quotes\" stay literal";
+        let mut routes = pipe_mock_catalog(false);
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"title": title})),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"delivered": true})),
+            ),
+        ]);
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+            "--input",
+            r#"{"query":"open"}"#,
+            "--map",
+            "title -> text",
+            "--source-capability-token",
+            &source_token,
+            "--capability-token",
+            &target_token,
+            "--holder-key-file",
+            &key_path_text,
+            "--source-lease-seq",
+            "42",
+            "--target-lease-seq",
+            "7",
+            "--idempotency-key",
+            "pipe-fixture",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["result"]["delivered"], true);
+        assert!(payload.get("intermediate").is_none());
+        assert!(
+            payload["execution"]["source"]["response"]
+                .get("result")
+                .is_none()
+        );
+
+        let requests = request_log.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 7);
+        let source_preflight: Value = serde_json::from_str(&requests[3].1).unwrap();
+        let source_invoke: Value = serde_json::from_str(&requests[4].1).unwrap();
+        let target_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+        let target_invoke: Value = serde_json::from_str(&requests[6].1).unwrap();
+        assert_eq!(source_preflight["params"], json!({"query": "open"}));
+        assert_eq!(source_preflight["params"], source_invoke["input"]);
+        assert_eq!(target_preflight["params"], json!({"text": title}));
+        assert_eq!(target_preflight["params"], target_invoke["input"]);
+        assert_eq!(source_preflight["request_id"], source_invoke["id"]);
+        assert_eq!(target_preflight["request_id"], target_invoke["id"]);
+        assert_ne!(source_invoke["id"], target_invoke["id"]);
+        assert_eq!(source_preflight["lease_seq"], 42);
+        assert_eq!(source_invoke["lease_seq"], 42);
+        assert_eq!(target_preflight["lease_seq"], 7);
+        assert_eq!(target_invoke["lease_seq"], 7);
+        assert_ne!(
+            source_preflight["capability_token"],
+            target_preflight["capability_token"]
+        );
+        assert_eq!(
+            source_preflight["capability_token"],
+            source_invoke["capability_token"]
+        );
+        assert_eq!(
+            target_preflight["capability_token"],
+            target_invoke["capability_token"]
+        );
+        assert!(source_preflight["holder_proof"].is_null());
+        assert!(source_invoke["holder_proof"].is_null());
+        assert_live_holder_request(&target_preflight, &signing_key);
+        assert_live_holder_request(&target_invoke, &signing_key);
+        assert_eq!(
+            target_preflight["holder_proof"],
+            target_invoke["holder_proof"]
+        );
+    }
+
+    #[test]
+    fn execute_pipe_stops_after_each_failure_without_sending_the_next_stage() {
+        for failure in [
+            "source-denied",
+            "source-error",
+            "missing-path",
+            "wrong-type",
+            "target-denied",
+            "target-error",
+        ] {
+            let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+            let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+            let token = test_capability_token_arg();
+            let source_output = if failure == "wrong-type" {
+                json!({"title": 17})
+            } else {
+                json!({"title": "An issue"})
+            };
+            let provider_error = serde_json::to_value(InvokeResponse::error(
+                RequestId::random(),
+                fcp_core::FcpError::Internal {
+                    message: "provider failure".to_owned(),
+                },
+            ))
+            .expect("provider error should serialize");
+            let mut routes = pipe_mock_catalog(false);
+            routes.push((
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(failure != "source-denied"),
+            ));
+            if failure != "source-denied" {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    if failure == "source-error" {
+                        provider_error.clone()
+                    } else {
+                        mock_invoke_response_json(source_output.clone())
+                    },
+                ));
+            }
+            if failure.starts_with("target-") {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(failure != "target-denied"),
+                ));
+                if failure == "target-error" {
+                    routes.push(("POST /rpc/invoke".to_owned(), provider_error));
+                }
+            }
+            let expected_requests = routes.len();
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipe",
+                "github.search_issues",
+                "slack.post_message",
+                "--input",
+                r#"{"query":"open"}"#,
+                "--map",
+                if failure == "missing-path" {
+                    "missing -> text"
+                } else {
+                    "title -> text"
+                },
+                "--source-capability-token",
+                &token,
+                "--capability-token",
+                &token,
+            ]);
+            server.join().expect("mock host thread should complete");
+            let expected_exit = if failure.ends_with("denied") {
+                CliExitCode::PolicyDenied
+            } else if failure.ends_with("error") {
+                CliExitCode::Connector
+            } else {
+                CliExitCode::Validation
+            };
+            assert_eq!(exit_code, expected_exit.into(), "{failure}: {payload}");
+            assert_ne!(exit_code, CliExitCode::Success.into());
+            assert_eq!(
+                request_log.lock().unwrap().len(),
+                expected_requests,
+                "{failure}"
+            );
+            if !failure.starts_with("source-") {
+                assert_eq!(payload["intermediate"], source_output, "{failure}");
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipe_live_dry_run_reads_source_and_only_preflights_safe_target() {
+        let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+        let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+        let token = test_capability_token_arg();
+        let mut routes = pipe_mock_catalog(false);
+        routes.extend([
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+            (
+                "POST /rpc/invoke".to_owned(),
+                mock_invoke_response_json(json!({"title": "An issue"})),
+            ),
+            (
+                "POST /rpc/preflight".to_owned(),
+                mock_preflight_response_json(true),
+            ),
+        ]);
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+            "--input",
+            r#"{"query":"open"}"#,
+            "--map",
+            "title -> text",
+            "--source-capability-token",
+            &token,
+            "--capability-token",
+            &token,
+            "--dry-run",
+            "--include-intermediate",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(
+            payload["plan"]["preview_input"],
+            json!({"text": "An issue"})
+        );
+        assert_eq!(payload["intermediate"], json!({"title": "An issue"}));
+        assert_eq!(payload["execution"]["target"]["status"], "preflight");
+        assert!(payload.get("result").is_none());
+        assert_eq!(
+            request_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn execute_pipe_checks_auth_and_source_schema_before_any_invoke() {
+        for case in ["missing-source-auth", "invalid-source", "unsafe-dry-run"] {
+            let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+            let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+            let token = test_capability_token_arg();
+            let (host, server, request_log) =
+                spawn_mock_host_sequence_with_body_log(pipe_mock_catalog(case == "unsafe-dry-run"));
+            let mut args = vec![
+                "fwc",
+                "--json",
+                "--host",
+                host.as_str(),
+                "pipe",
+                "github.search_issues",
+                "slack.post_message",
+                "--input",
+                if case == "invalid-source" {
+                    "{}"
+                } else {
+                    r#"{"query":"open"}"#
+                },
+                "--map",
+                "title -> text",
+                "--capability-token",
+                token.as_str(),
+            ];
+            if case != "missing-source-auth" {
+                args.extend(["--source-capability-token", token.as_str()]);
+            }
+            if case == "unsafe-dry-run" {
+                args.push("--dry-run");
+            }
+            let (exit_code, payload) = execute_json(&args);
+            server.join().expect("mock host thread should complete");
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{case}: {payload}"
+            );
+            assert_eq!(request_log.lock().unwrap().len(), 3, "{case}");
+        }
+    }
+
+    #[test]
+    fn execute_pipe_offline_dry_run_and_mapping_validation_do_not_contact_host() {
+        let common = [
+            "fwc",
+            "--json",
+            "--host",
+            "http://127.0.0.1:1",
+            "pipe",
+            "github.search_issues",
+            "slack.post_message",
+        ];
+        let mut offline = common.to_vec();
+        offline.extend(["--map", "title -> text", "--dry-run"]);
+        let (exit_code, payload) = execute_json(&offline);
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["status"], "planned");
+        assert!(payload["plan"]["requires_approval"].is_null());
+
+        let mut invalid = common.to_vec();
+        invalid.extend(["--map", "title -> text, body -> text.child"]);
+        let (exit_code, payload) = execute_json(&invalid);
+        assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
+        assert_eq!(payload["error"]["type"], "invalid-mapping");
+    }
+
     #[test]
     fn execute_pipeline_validate_with_explicit_path() {
         let root = std::env::temp_dir().join(format!(
@@ -44995,6 +47636,319 @@ default = "#general"
         assert_eq!(payload["validation"]["valid"], true);
         assert_eq!(payload["validation"]["execution_order"][0], "fetch");
         assert_eq!(payload["validation"]["execution_order"][1], "notify");
+    }
+
+    fn workflow_auth_pipeline_fixture(directory: &Path) -> PathBuf {
+        let path = directory.join("workflow-auth.toml");
+        fs::write(
+            &path,
+            r#"
+[pipeline]
+name = "workflow-auth"
+
+[[steps]]
+id = "fetch"
+operation = "github.search_issues"
+lease_seq = 41
+input = { query = "first" }
+
+[[steps]]
+id = "again"
+operation = "GitHub.search_issues"
+lease_seq = 42
+depends_on = ["fetch"]
+input = { query = "second" }
+
+[[steps]]
+id = "notify"
+operation = "slack.post_message"
+lease_seq = 7
+depends_on = ["again"]
+input = { text = "{{steps.again.output.title}}" }
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn workflow_auth_mock_catalog() -> Vec<(String, Value)> {
+        let mut routes = pipe_mock_catalog(false);
+        // Two distinct selectors resolve to the same canonical connector.
+        routes.insert(2, routes[1].clone());
+        routes
+    }
+
+    #[test]
+    fn execute_pipeline_binds_every_step_and_preserves_same_connector_defaults() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let fetch = test_workflow_holder_auth(tempdir.path(), "fetch", 0x81);
+        let again = test_workflow_holder_auth(tempdir.path(), "again", 0x82);
+        let notify = test_workflow_holder_auth(tempdir.path(), "notify", 0x83);
+        let notify_token_path = tempdir.path().join("notify-token.cbor");
+        fs::write(
+            &notify_token_path,
+            super::parse_capability_token_str(&notify.0, "notify fixture")
+                .unwrap()
+                .raw()
+                .to_cbor()
+                .unwrap(),
+        )
+        .unwrap();
+
+        for use_default in [false, true] {
+            let mut routes = workflow_auth_mock_catalog();
+            for result in [
+                json!({"title": "first result"}),
+                json!({"title": "second result"}),
+                json!({"delivered": true}),
+            ] {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(result),
+                ));
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipeline".to_owned(),
+                "run".to_owned(),
+                path.display().to_string(),
+            ];
+            if use_default {
+                args.extend([
+                    "--capability-token".to_owned(),
+                    fetch.0.clone(),
+                    "--holder-key-file".to_owned(),
+                    fetch.1.display().to_string(),
+                ]);
+            } else {
+                for (step_id, auth) in [("fetch", &fetch), ("again", &again)] {
+                    args.extend([
+                        "--step-capability-token".to_owned(),
+                        format!("{step_id}={}", auth.0),
+                        "--step-holder-key-file".to_owned(),
+                        format!("{step_id}={}", auth.1.display()),
+                    ]);
+                }
+            }
+            args.extend([
+                "--step-capability-token-file".to_owned(),
+                format!("notify={}", notify_token_path.display()),
+                "--step-holder-key-file".to_owned(),
+                format!("notify={}", notify.1.display()),
+            ]);
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("workflow mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            assert_eq!(payload["execution"]["executed_steps"], 3);
+            assert_eq!(payload["execution"]["outputs"]["notify"]["delivered"], true);
+
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 10);
+            let mut request_ids = std::collections::BTreeSet::new();
+            let selected = [
+                (&fetch, "fcp.github:enterprise:v1", "github.search_issues", 41),
+                (
+                    if use_default { &fetch } else { &again },
+                    "fcp.github:enterprise:v1",
+                    "github.search_issues",
+                    42,
+                ),
+                (&notify, "fcp.slack:team:v1", "slack.post_message", 7),
+            ];
+            for (step_requests, (auth, connector, operation, lease)) in
+                requests[4..].chunks_exact(2).zip(selected)
+            {
+                let preflight: Value = serde_json::from_str(&step_requests[0].1).unwrap();
+                let invoke: Value = serde_json::from_str(&step_requests[1].1).unwrap();
+                assert_workflow_holder_request(&preflight, &auth.0, &auth.2);
+                assert_workflow_holder_request(&invoke, &auth.0, &auth.2);
+                assert_eq!(preflight["connector_id"], connector);
+                assert_eq!(invoke["connector_id"], connector);
+                assert_eq!(preflight["operation"], operation);
+                assert_eq!(invoke["operation"], operation);
+                assert_eq!(preflight["lease_seq"], lease);
+                assert_eq!(invoke["lease_seq"], lease);
+                assert_eq!(preflight["request_id"], invoke["id"]);
+                assert_eq!(preflight["capability_token"], invoke["capability_token"]);
+                assert_eq!(preflight["holder_proof"], invoke["holder_proof"]);
+                assert_eq!(preflight["params"], invoke["input"]);
+                assert!(request_ids.insert(invoke["id"].as_str().unwrap().to_owned()));
+            }
+            let notify_invoke: Value = serde_json::from_str(&requests[9].1).unwrap();
+            assert_eq!(notify_invoke["input"], json!({"text": "second result"}));
+        }
+    }
+
+    #[test]
+    fn execute_pipeline_rejects_invalid_step_credentials_before_any_effect() {
+        let tempdir = TempDir::new().unwrap();
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let fetch = test_workflow_holder_auth(tempdir.path(), "fetch", 0x81);
+        let notify = test_workflow_holder_auth(tempdir.path(), "notify", 0x83);
+        let token_binding = format!("notify={}", notify.0);
+        let key_binding = format!("notify={}", notify.1.display());
+        let secret_marker = "UNRECOGNIZED_SECRET_INPUT";
+        let cases = [
+            ("cross-connector-default", true, vec![]),
+            (
+                "unknown-step",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    format!("{secret_marker}=opaque"),
+                ],
+            ),
+            (
+                "malformed-binding",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    secret_marker.to_owned(),
+                ],
+            ),
+            (
+                "empty-binding",
+                true,
+                vec![
+                    "--step-capability-token-file".to_owned(),
+                    "notify=".to_owned(),
+                ],
+            ),
+            (
+                "duplicate-binding",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                ],
+            ),
+            (
+                "conflicting-sources",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-capability-token-file".to_owned(),
+                    "notify=must-not-be-opened".to_owned(),
+                ],
+            ),
+            (
+                "orphan-holder",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                    "--step-holder-key-file".to_owned(),
+                    format!("fetch={}", fetch.1.display()),
+                ],
+            ),
+            (
+                "default-holder-must-not-be-inherited",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding.clone(),
+                ],
+            ),
+            (
+                "invalid-later-token",
+                true,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    "notify=not-a-token".to_owned(),
+                ],
+            ),
+            (
+                "missing-default",
+                false,
+                vec![
+                    "--step-capability-token".to_owned(),
+                    token_binding,
+                    "--step-holder-key-file".to_owned(),
+                    key_binding,
+                ],
+            ),
+        ];
+        for (case, supply_default, overrides) in cases {
+            let (host, server, request_log) =
+                spawn_mock_host_sequence_with_body_log(workflow_auth_mock_catalog());
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipeline".to_owned(),
+                "run".to_owned(),
+                path.display().to_string(),
+            ];
+            if supply_default {
+                args.extend([
+                    "--capability-token".to_owned(),
+                    fetch.0.clone(),
+                    "--holder-key-file".to_owned(),
+                    fetch.1.display().to_string(),
+                ]);
+            }
+            args.extend(overrides);
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("workflow validation mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Validation.into(), "{case}: {payload}");
+            assert_eq!(
+                payload["error"]["type"],
+                if supply_default {
+                    "invalid-workflow-auth"
+                } else {
+                    "missing-capability-token"
+                },
+                "{case}: {payload}"
+            );
+            assert!(!payload.to_string().contains(secret_marker));
+            assert!(!payload.to_string().contains(&fetch.0));
+            assert!(!payload.to_string().contains(&notify.0));
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), 4, "{case}");
+            assert!(requests.iter().all(|(route, _)| {
+                !route.contains("/rpc/preflight") && !route.contains("/rpc/invoke")
+            }));
+        }
+    }
+
+    #[test]
+    fn workflow_auth_serialization_omits_step_credentials() {
+        let args = super::WorkflowAuthArgs {
+            default_auth: LiveAuthArgs {
+                capability_token: Some("DEFAULT_SECRET".to_owned()),
+                holder_key_file: Some(PathBuf::from("DEFAULT_KEY")),
+                ..LiveAuthArgs::default()
+            },
+            step_capability_token: vec!["notify=STEP_SECRET".to_owned()],
+            step_capability_token_file: vec!["notify=TOKEN_PATH".to_owned()],
+            step_holder_key_file: vec!["notify=HOLDER_PATH".to_owned()],
+        };
+        let encoded = serde_json::to_string(&args).unwrap();
+        for private_value in [
+            "DEFAULT_SECRET",
+            "DEFAULT_KEY",
+            "STEP_SECRET",
+            "TOKEN_PATH",
+            "HOLDER_PATH",
+        ] {
+            assert!(!encoded.contains(private_value));
+        }
     }
 
     #[test]
@@ -45226,6 +48180,7 @@ default = "#general"
                 mock_preflight_response_json(true),
             ),
         ]);
+        let (notify_token, notify_key_path, _) = test_workflow_holder_auth(&root, "notify", 0x91);
         let path_str = path.display().to_string();
         let (exit_code, payload) = execute_json(&[
             "fwc",
@@ -45237,6 +48192,10 @@ default = "#general"
             &path_str,
             "--capability-token",
             &capability_token,
+            "--step-capability-token",
+            &format!("notify={notify_token}"),
+            "--step-holder-key-file",
+            &format!("notify={}", notify_key_path.display()),
             "--param",
             "owner=octocat",
             "--param",
@@ -45561,6 +48520,8 @@ depends_on = ["missing"]
         let tempdir = TempDir::new().expect("recipe holder tempdir");
         let (capability_token, key_path, signing_key) = test_live_holder_auth(tempdir.path());
         let key_path_text = key_path.display().to_string();
+        let (notify_token, notify_key_path, notify_key) =
+            test_workflow_holder_auth(tempdir.path(), "notify", 0x91);
         let github_connector = mock_connector_summary_custom_json(
             "fcp.github:enterprise:v1",
             "GitHub Enterprise",
@@ -45664,6 +48625,10 @@ depends_on = ["missing"]
             &capability_token,
             "--holder-key-file",
             &key_path_text,
+            "--step-capability-token",
+            &format!("notify={notify_token}"),
+            "--step-holder-key-file",
+            &format!("notify={}", notify_key_path.display()),
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -45710,7 +48675,12 @@ depends_on = ["missing"]
         let notify_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
         let fetch_proof = assert_live_holder_request(&fetch_preflight, &signing_key);
         assert_live_holder_request(&fetch_invoke, &signing_key);
-        let notify_proof = assert_live_holder_request(&notify_preflight, &signing_key);
+        let notify_proof =
+            assert_workflow_holder_request(&notify_preflight, &notify_token, &notify_key);
+        assert_ne!(
+            fetch_preflight["capability_token"],
+            notify_preflight["capability_token"]
+        );
         assert_eq!(fetch_preflight["request_id"], fetch_invoke["id"]);
         assert_eq!(
             fetch_preflight["holder_proof"],
@@ -49547,6 +52517,76 @@ depends_on = ["missing"]
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
         assert!(output.ends_with("(answer source: host)\n"));
+    }
+
+    #[test]
+    fn status_connector_mesh_response_satisfies_required_source() {
+        let cid = "fcp.github:enterprise:v1";
+        let (host, server) = spawn_mock_host(
+            StdBTreeMap::from([
+                (
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_json(),
+                ),
+                (
+                    "GET /rpc/health".to_owned(),
+                    json!({
+                        "status": "healthy",
+                        "connectors": {},
+                        "uptime_seconds": 3600,
+                        "active_connections": 2,
+                        "timestamp": "2026-03-12T00:00:00Z",
+                    }),
+                ),
+                (
+                    format!("GET /rpc/connectors/{cid}/status"),
+                    mock_mesh_read_response(json!({
+                        "connector_id": cid,
+                        "desired_state": "enabled",
+                        "observed_state": "running",
+                        "pinned_version": null,
+                        "lifecycle": null,
+                        "config_revision_count": 1,
+                        "last_journal_sequence": 9,
+                        "evaluated_at": "2026-03-12T00:00:00Z",
+                    })),
+                ),
+            ]),
+            3,
+        );
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "status",
+            "github",
+            "--require-source",
+            "mesh",
+        ]);
+        server.join().expect("mock host thread should complete");
+        assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+        assert_eq!(payload["_truth_source"], "mesh");
+        let route = payload["evidence_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|handle| handle["kind"] == "mesh-read")
+            .expect("status carries executor evidence");
+        assert_eq!(route["route"]["served_by"], "executor-peer");
+        assert_eq!(payload["admin"]["connector_id"], cid);
+        assert_eq!(payload["provenance"]["mesh_backed"], true);
+        assert_eq!(
+            payload["provenance"]["transport"],
+            "host-verified-mesh-peer"
+        );
+        assert_eq!(payload["host_health"]["_truth_source"], "host");
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/status.schema.json")).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&payload)
+            .unwrap_or_else(|error| panic!("mesh status violates output schema: {error}"));
     }
 
     #[test]

@@ -76,6 +76,7 @@ mod admission;
 mod directory;
 mod discovery;
 mod inbound;
+mod inventory;
 
 use inbound::InboundReplayWorker;
 
@@ -92,6 +93,10 @@ pub use directory::{
     MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
 };
 use discovery::PeerDiscovery;
+pub use inventory::{
+    MESH_INVENTORY_ROUTE, MESH_INVENTORY_SCHEMA_VERSION, MeshInventoryConnector,
+    MeshInventoryMembershipStatus, MeshInventoryNode, MeshInventoryResponse, MeshInventoryStatus,
+};
 
 /// Env var naming this node's mesh id.
 pub const MESH_NODE_ID_ENV: &str = "FCP_HOST_MESH_NODE_ID";
@@ -115,6 +120,23 @@ const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const ADVERTISEMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
+const CANCELLATION_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCELLATION_FORWARD_LIMITS: MeshForwardLimits = MeshForwardLimits {
+    max_in_flight: 4,
+    max_per_peer: 2,
+    max_request_bytes: 128 * 1024,
+    max_response_bytes: 4 * MAX_REPLY_BYTES,
+};
+
+/// Continuous origin authority for one already admitted cancellation envelope.
+/// The guard carries no cancellation capability; the executor must verify that
+/// separately and recheck this guard immediately before changing an operation.
+#[derive(Debug)]
+pub struct MeshCancellationOrigin {
+    snapshot: PeerSnapshot,
+    request_signing_bytes: Vec<u8>,
+    router_directory: Arc<MeshPeerDirectory>,
+}
 
 /// A peer's continuous authority and confidential endpoint for state transfer.
 ///
@@ -401,6 +423,7 @@ pub struct MeshRouter {
     inbound_worker: Option<InboundReplayWorker>,
     advertisements: PeerDiscovery,
     forwards: ForwardControl,
+    cancellations: ForwardControl,
     client: reqwest::Client,
     membership: Option<DirectoryGuard>,
 }
@@ -416,6 +439,7 @@ impl std::fmt::Debug for MeshRouter {
             .field("local_node", self.directory.local_node())
             .field("peer_count", &self.directory().len())
             .field("forward_limits", &self.forwards.limits())
+            .field("cancellation_limits", &self.cancellations.limits())
             .field("durable_replay", &self.durable_replay.is_some())
             .field("owner_signed_membership", &self.membership.is_some())
             .finish_non_exhaustive()
@@ -446,6 +470,7 @@ impl MeshRouter {
         limits: MeshForwardLimits,
     ) -> HostResult<Self> {
         let forwards = ForwardControl::new(limits)?;
+        let cancellations = ForwardControl::new(CANCELLATION_FORWARD_LIMITS)?;
         let directory = MeshPeerDirectory::from_json(settings.node_id, &settings.peers_json)
             .map_err(|error| HostError::InvalidFilter(error.to_string()))?;
         let empty_directory = MeshPeerDirectory::from_configs(directory.local_node().clone(), &[])
@@ -474,6 +499,7 @@ impl MeshRouter {
             inbound_worker: None,
             advertisements: PeerDiscovery::new(),
             forwards,
+            cancellations,
             client,
             membership: None,
         })
@@ -713,6 +739,59 @@ impl MeshRouter {
     /// invented free capacity.
     pub fn forward_usage(&self) -> HostResult<MeshForwardUsage> {
         self.forwards.snapshot()
+    }
+
+    /// Reserved cancellation capacity, independent of ordinary invoke traffic.
+    ///
+    /// # Errors
+    /// Returns an error if the admission state is poisoned.
+    pub fn cancellation_usage(&self) -> HostResult<MeshForwardUsage> {
+        self.cancellations.snapshot()
+    }
+
+    /// Bind one admitted cancellation to this router and the origin's authority.
+    /// Call only after `accept_inbound_async` has consumed the nonce.
+    ///
+    /// # Errors
+    /// Rejects other methods, expired envelopes, invalid signatures and revoked peers.
+    pub fn cancellation_origin(
+        &self,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<MeshCancellationOrigin, MeshForwardError> {
+        if !matches!(&envelope.body, MeshForwardBody::Cancel { .. }) {
+            return Err(MeshForwardError::Malformed {
+                field: "cancellation_origin",
+                detail: "origin guard requires a cancellation envelope".to_owned(),
+            });
+        }
+        let snapshot = self.trusted_peer(&envelope.origin_node)?;
+        self.finish_inbound_admission(envelope, &snapshot)?;
+        Ok(MeshCancellationOrigin {
+            snapshot,
+            request_signing_bytes: envelope.signing_bytes(),
+            router_directory: Arc::clone(&self.directory),
+        })
+    }
+
+    /// Recheck the exact signed request after asynchronous capability verification.
+    ///
+    /// # Errors
+    /// Rejects a different request or router, expiry, invalid signatures and any
+    /// removal or key/endpoint change in the original origin's continuous authority.
+    pub fn check_cancellation_origin(
+        &self,
+        origin: &MeshCancellationOrigin,
+        envelope: &MeshForwardEnvelope,
+    ) -> Result<(), MeshForwardError> {
+        if !Arc::ptr_eq(&self.directory, &origin.router_directory)
+            || origin.request_signing_bytes != envelope.signing_bytes()
+        {
+            return Err(MeshForwardError::Malformed {
+                field: "cancellation_origin",
+                detail: "cancellation guard does not bind this request and router".to_owned(),
+            });
+        }
+        self.finish_inbound_admission(envelope, &origin.snapshot)
     }
 
     /// This node's id.
@@ -980,7 +1059,15 @@ impl MeshRouter {
                 peer: peer_label.clone(),
                 detail: format!("envelope serialization failed: {error}"),
             })?;
-        self.forwards
+        // Cancellation can still reach an executor while invocation slots are
+        // occupied. Its small, fixed lane keeps identical authentication and
+        // replay rules, and reserves reply headroom before sending.
+        let control = if matches!(&envelope.body, MeshForwardBody::Cancel { .. }) {
+            &self.cancellations
+        } else {
+            &self.forwards
+        };
+        control
             .execute(&peer_label, payload.len(), || {
                 self.forward_transport(peer, payload, &envelope, snapshot)
             })
@@ -1003,11 +1090,17 @@ impl MeshRouter {
                 detail: error.to_string(),
             })?;
         let url = format!("{}{MESH_FORWARD_ROUTE}", peer.endpoint);
-        let response = self
+        let request = self
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload)
+            .body(payload);
+        let request = if matches!(&envelope.body, MeshForwardBody::Cancel { .. }) {
+            request.timeout(CANCELLATION_FORWARD_TIMEOUT)
+        } else {
+            request
+        };
+        let response = request
             .send()
             .await
             .map_err(|error| classify_send_error(&peer_label, &error))?;
@@ -1186,6 +1279,187 @@ mod tests {
                 "{endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn cancellation_origin_guard_binds_exact_request_and_router_authority() {
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let settings = || MeshRoutingSettings {
+            node_id: TailscaleNodeId::new("node-a"),
+            signing_key: local_key.clone(),
+            peers_json: peers_json(&[("node-b", &peer_key)]),
+            forward_timeout: Duration::from_secs(5),
+        };
+        let router = MeshRouter::new(settings()).unwrap();
+        let other_router = MeshRouter::new(settings()).unwrap();
+        let envelope = MeshForwardEnvelope::sign(
+            &peer_key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            unix_now_ms(),
+            MeshForwardBody::Cancel { request_json: "{}".to_owned(), origin_attempt_id: 7 },
+        ).unwrap();
+        router.accept_inbound(&envelope).unwrap();
+        let guard = router.cancellation_origin(&envelope).unwrap();
+        router.check_cancellation_origin(&guard, &envelope).unwrap();
+        assert!(other_router.check_cancellation_origin(&guard, &envelope).is_err());
+        let different_request = MeshForwardEnvelope::sign(
+            &peer_key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            unix_now_ms(),
+            MeshForwardBody::Cancel { request_json: "{}".to_owned(), origin_attempt_id: 8 },
+        ).unwrap();
+        assert!(router.check_cancellation_origin(&guard, &different_request).is_err());
+        let mut forged = envelope.clone();
+        forged.signature = "00".repeat(64);
+        assert!(router.check_cancellation_origin(&guard, &forged).is_err());
+        assert!(router.cancellation_origin(&forged).is_err());
+        let other_method = MeshForwardEnvelope::sign(
+            &peer_key,
+            TailscaleNodeId::new("node-b"),
+            TailscaleNodeId::new("node-a"),
+            unix_now_ms(),
+            MeshForwardBody::Introspect { connector_id: "test".to_owned() },
+        ).unwrap();
+        assert!(router.cancellation_origin(&other_method).is_err());
+    }
+
+    #[test]
+    fn cancellation_keeps_bounded_capacity_under_invoke_saturation() {
+        use std::future::{Future, pending};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::task::{Context, Waker};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let local_key = Ed25519SigningKey::generate();
+        let peer_key = Ed25519SigningKey::generate();
+        let receiver_directory = MeshPeerDirectory::from_json(
+            TailscaleNodeId::new("node-b"),
+            &peers_json(&[("node-a", &local_key)]),
+        ).unwrap();
+        let router = MeshRouter::with_forward_limits(
+            MeshRoutingSettings {
+                node_id: TailscaleNodeId::new("node-a"),
+                signing_key: local_key,
+                peers_json: serde_json::json!([{
+                    "node_id": "node-b",
+                    "endpoint": endpoint,
+                    "public_key_hex": hex::encode(peer_key.verifying_key().to_bytes()),
+                }]).to_string(),
+                forward_timeout: Duration::from_secs(5),
+            },
+            MeshForwardLimits {
+                max_in_flight: 1,
+                max_per_peer: 1,
+                max_request_bytes: 1024,
+                max_response_bytes: MAX_REPLY_BYTES,
+            },
+        ).unwrap();
+        let server = std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < accept_deadline, "cancel never reached peer");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("peer accept failed: {error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains(MESH_FORWARD_ROUTE));
+            let mut content_length = None;
+            let mut header_bytes = line.len();
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                header_bytes += line.len();
+                assert!(header_bytes <= 16 * 1024);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let len = content_length.expect("bounded content-length request");
+            assert!(len <= 128 * 1024);
+            let mut payload = vec![0; len];
+            reader.read_exact(&mut payload).unwrap();
+            let envelope: MeshForwardEnvelope = serde_json::from_slice(&payload).unwrap();
+            envelope.verify(
+                &receiver_directory, unix_now_ms(), DEFAULT_MESH_FORWARD_MAX_SKEW_MS,
+            ).unwrap();
+            assert!(matches!(&envelope.body, MeshForwardBody::Cancel { origin_attempt_id: 7, .. }));
+            let reply = MeshForwardReply::sign(
+                &peer_key, TailscaleNodeId::new("node-b"), &envelope,
+                200, "{\"accepted\":true}".to_owned(),
+            );
+            let body = serde_json::to_vec(&reply).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            ).unwrap();
+            socket.write_all(&body).unwrap();
+        });
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut bulk = Box::pin(router.forwards.execute("node-b", 1, pending));
+        assert!(bulk.as_mut().poll(&mut cx).is_pending());
+        let mut first = Box::pin(router.cancellations.execute("node-b", 1, pending));
+        let mut second = Box::pin(router.cancellations.execute("node-b", 1, pending));
+        let mut third = Box::pin(router.cancellations.execute("node-c", 1, pending));
+        let mut fourth = Box::pin(router.cancellations.execute("node-c", 1, pending));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(third.as_mut().poll(&mut cx).is_pending());
+        assert!(fourth.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(router.cancellation_usage().unwrap().in_flight, 4);
+        let cancel = || MeshForwardBody::Cancel {
+            request_json: "{}".to_owned(), origin_attempt_id: 7,
+        };
+        let target = TailscaleNodeId::new("node-b");
+        let saturated = fcp_async_core::runtime::block_on_sync(
+            router.forward(&target, cancel()),
+        ).unwrap().unwrap_err();
+        assert!(matches!(saturated, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("router_in_flight_limit")));
+        drop(third);
+        drop(fourth);
+        let peer_saturated = fcp_async_core::runtime::block_on_sync(
+            router.forward(&target, cancel()),
+        ).unwrap().unwrap_err();
+        assert!(matches!(peer_saturated, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("peer_in_flight_limit")));
+        drop(first);
+        drop(second);
+
+        let reply = fcp_async_core::runtime::block_on_sync(
+            router.forward(&target, cancel()),
+        ).unwrap().unwrap();
+        assert_eq!(reply.body_json, "{\"accepted\":true}");
+        assert_eq!(router.forward_usage().unwrap().in_flight, 1);
+        assert_eq!(router.cancellation_usage().unwrap(), MeshForwardUsage::default());
+        let oversized = fcp_async_core::runtime::block_on_sync(
+            router.cancellations.execute("node-b", 128 * 1024 + 1, pending),
+        ).unwrap().unwrap_err();
+        assert!(matches!(oversized, MeshForwardFailure::NotDelivered { detail, .. }
+            if detail.contains("request_byte_limit")));
+        drop(bulk);
+        assert_eq!(router.forward_usage().unwrap(), MeshForwardUsage::default());
+        server.join().unwrap();
     }
 
     #[test]
@@ -1582,6 +1856,7 @@ mod tests {
             MeshForwardBody::Invoke {
                 request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                 asserted_principal: Some("test-principal".to_owned()),
+                origin_attempt_id: None,
             },
         ))
         .expect("runtime");

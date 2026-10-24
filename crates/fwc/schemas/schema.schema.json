@@ -47,6 +47,90 @@
     "schema_version": {
       "const": "fcp.fwc.truth-source.v1"
     },
+    "live_read_source": {
+      "type": "string",
+      "enum": ["host-backed", "mesh-backed"]
+    },
+    "read_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "scope", "replication_proven", "responses"],
+      "properties": {
+        "authority": { "const": "selected-host" },
+        "scope": { "$ref": "#/$defs/non_empty_string" },
+        "replication_proven": { "const": false },
+        "responses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "truth_source", "attested"],
+            "properties": {
+              "path": { "$ref": "#/$defs/non_empty_string" },
+              "truth_source": { "$ref": "#/$defs/live_read_source" },
+              "attested": { "type": "boolean" },
+              "route": { "$ref": "#/$defs/mesh_read_route" },
+              "local_connectors": { "$ref": "#/$defs/non_negative_integer" },
+              "mesh_connectors": { "$ref": "#/$defs/non_negative_integer" }
+            },
+            "dependencies": {
+              "local_connectors": ["mesh_connectors"],
+              "mesh_connectors": ["local_connectors"]
+            },
+            "if": { "required": ["route"] },
+            "then": {
+              "properties": {
+                "truth_source": { "const": "mesh-backed" },
+                "attested": { "const": true }
+              }
+            }
+          }
+        }
+      }
+    },
+    "decision_trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "selected_source", "strategy", "reason", "used_fallback", "correlation_id"],
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "outcome", "elapsed", "detail"],
+            "properties": {
+              "source": { "$ref": "#/$defs/live_read_source" },
+              "outcome": { "const": "success" },
+              "elapsed": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["secs", "nanos"],
+                "properties": {
+                  "secs": { "$ref": "#/$defs/non_negative_integer" },
+                  "nanos": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+                }
+              },
+              "detail": { "type": "null" }
+            }
+          }
+        },
+        "selected_source": { "$ref": "#/$defs/live_read_source" },
+        "strategy": { "enum": ["best-available", "prefer-host"] },
+        "reason": { "$ref": "#/$defs/non_empty_string" },
+        "used_fallback": { "const": false },
+        "correlation_id": { "type": "string", "format": "uuid" }
+      }
+    },
+    "live_read_metadata": {
+      "if": { "properties": { "_truth_source": { "enum": ["host", "mesh"] } } },
+      "then": { "required": ["read_provenance", "decision_trace"] },
+      "else": {
+        "not": { "anyOf": [{ "required": ["read_provenance"] }, { "required": ["decision_trace"] }] }
+      }
+    },
     "string_array": {
       "type": "array",
       "items": { "$ref": "#/$defs/non_empty_string" }
@@ -109,6 +193,22 @@
         "source": { "$ref": "#/$defs/non_empty_string" }
       }
     },
+    "mesh_read_route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truth_source", "entry_node", "served_by", "hop_count", "decision"],
+      "properties": {
+        "truth_source": { "const": "mesh-backed" },
+        "entry_node": { "$ref": "#/$defs/non_empty_string" },
+        "served_by": { "$ref": "#/$defs/non_empty_string" },
+        "hop_count": { "const": 1 },
+        "decision": { "$ref": "#/$defs/non_empty_string" },
+        "failed_attempts": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
     "provenance": {
       "type": "object",
       "additionalProperties": true,
@@ -120,7 +220,12 @@
           "enum": ["live_host_introspection", "workspace_manifest"]
         },
         "authoritative": { "type": "boolean" },
-        "caveat": { "$ref": "#/$defs/non_empty_string" }
+        "caveat": { "$ref": "#/$defs/non_empty_string" },
+        "read_routes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/mesh_read_route" }
+        }
       }
     },
     "connector_ref": {
@@ -181,6 +286,11 @@
     "success_base": {
       "type": "object",
       "additionalProperties": false,
+      "if": { "properties": { "source": { "const": "host-admin-api" } } },
+      "then": { "required": ["read_provenance", "decision_trace"] },
+      "else": {
+        "not": { "anyOf": [{ "required": ["read_provenance"] }, { "required": ["decision_trace"] }] }
+      },
       "required": [
         "status",
         "command",
@@ -193,6 +303,8 @@
       "properties": {
         "status": { "const": "ok" },
         "command": { "const": "schema" },
+        "read_provenance": { "$ref": "#/$defs/read_provenance" },
+        "decision_trace": { "$ref": "#/$defs/decision_trace" },
         "source": {
           "type": "string",
           "enum": ["host-admin-api", "workspace-manifests"]
@@ -362,12 +474,15 @@
     "resolution_error": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [{ "$ref": "#/$defs/live_read_metadata" }],
       "required": ["status", "command", "schema_version", "_truth_source", "error"],
       "properties": {
         "status": { "const": "error" },
         "command": { "const": "schema" },
         "schema_version": { "$ref": "#/$defs/schema_version" },
         "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "read_provenance": { "$ref": "#/$defs/read_provenance" },
+        "decision_trace": { "$ref": "#/$defs/decision_trace" },
         "error": {
           "type": "object",
           "additionalProperties": false,
@@ -403,6 +518,7 @@
     "truth_source_unavailable": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [{ "$ref": "#/$defs/live_read_metadata" }],
       "required": [
         "status",
         "command",
@@ -417,6 +533,8 @@
         "command": { "const": "schema" },
         "schema_version": { "$ref": "#/$defs/schema_version" },
         "_truth_source": { "$ref": "#/$defs/truth_source" },
+        "read_provenance": { "$ref": "#/$defs/read_provenance" },
+        "decision_trace": { "$ref": "#/$defs/decision_trace" },
         "error": {
           "type": "object",
           "additionalProperties": false,

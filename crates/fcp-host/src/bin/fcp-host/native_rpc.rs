@@ -22,6 +22,9 @@ use futures_util::future::{Either, select};
 
 use super::{CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest};
 
+#[path = "native_invocation.rs"]
+mod invocation;
+
 const MAX_NATIVE_INVOCATION_LIFETIME: Duration = Duration::from_secs(60);
 const RETIREMENT_GRACE: Duration = Duration::from_secs(2);
 // Physical exit still needs a nonblocking child probe. Ordinary cancellation
@@ -180,6 +183,16 @@ impl NativeRpc {
         self.cancellation.cancel();
     }
 
+    /// Discard a command that its queue owner will never dispatch. Unlike
+    /// cancellation, a failed transport candidate must not stop a logical
+    /// invocation that can still try another worker. Never settle active work.
+    fn reject_queued(&self) {
+        let mut state = self.state.lock().expect("native RPC state lock");
+        if matches!(state.phase, RpcPhase::Queued) {
+            state.phase = RpcPhase::Settled;
+        }
+    }
+
     /// Transfer process custody before clearing the runner's active command.
     /// Child::Drop alone only requests asynchronous reaping, not confirmed exit.
     pub(super) fn retire(&self, mut child: Child) {
@@ -256,47 +269,92 @@ impl Drop for NativeRpcWaiter {
     }
 }
 
-/// The production actor owns one command through response or child retirement.
-pub(super) async fn run_dispatcher(
-    mut runner: ConnectorProcessRunner,
-    mut receiver: mpsc::Receiver<ConnectorRpcRequest>,
-) {
-    while let Some(request) = receiver.recv().await {
-        let rpc = request.rpc;
-        if !rpc.try_begin() {
-            let _ = request.response_tx.send(Err(rpc.stop_error()));
-            continue;
-        }
-        // No await separates selection from publishing the exact active ticket.
-        runner.active_rpc = Some(rpc.clone());
-        let response = {
-            let mut cancelled = pin!(rpc.cancelled());
-            // cancelled() already enforces the ticket's absolute deadline;
-            // wrapping the request in another timeout would duplicate its timer.
-            let mut operation = pin!(runner.request(&request.method, request.params));
-            match select(cancelled.as_mut(), operation.as_mut()).await {
-                Either::Left(_) => Err(rpc.stop_error()),
-                Either::Right((response, _)) => response,
-            }
-        };
-        if response.is_ok() && rpc.try_settle_reply() {
-            // A late waiter drop can affect only the now-settled old ticket.
-            runner.active_rpc = None;
-            let _ = request.response_tx.send(response);
-            continue;
-        }
+/// Own undispatched requests through actor failure, cancellation and shutdown.
+/// Closing admission before draining makes cleanup finite even with concurrent
+/// senders. No child wait or active-ticket settlement belongs to this guard.
+struct NativeRpcQueue(mpsc::Receiver<ConnectorRpcRequest>);
 
-        // Ambiguous IO, expiration and selected cancellation retire the
-        // transport. Keep the Child in the ticket even if the actor is dropped
-        // while waiting for exit or the request receiver has disappeared.
-        if let Some(child) = runner.child.take() {
-            rpc.retire(child);
+impl NativeRpcQueue {
+    async fn recv(&mut self) -> Option<ConnectorRpcRequest> {
+        self.0.recv().await
+    }
+
+    fn close(&mut self) {
+        self.0.close();
+        while let Ok(request) = self.0.try_recv() {
+            request.rpc.reject_queued();
+            let error = if request.rpc.is_cancelled() {
+                request.rpc.stop_error()
+            } else {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "native connector dispatcher stopped before selecting this RPC",
+                )
+            };
+            // Publish settlement before waking a caller. Its next candidate
+            // must not inherit an unsettled ticket for work that never began.
+            let _ = request.response_tx.send(Err(error));
         }
-        runner.active_rpc = None;
-        rpc.wait_for_settlement().await;
-        let error = response.err().unwrap_or_else(|| rpc.stop_error());
-        let _ = request.response_tx.send(Err(error));
-        break;
+    }
+}
+
+impl Drop for NativeRpcQueue {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// The production actor owns one command through response or child retirement.
+pub(super) fn run_dispatcher(
+    mut runner: ConnectorProcessRunner,
+    receiver: mpsc::Receiver<ConnectorRpcRequest>,
+) -> impl Future<Output = ()> {
+    // Construct outside the async block: failed task admission or dropping an
+    // unpolled actor must also close and settle all buffered request custody.
+    let mut receiver = NativeRpcQueue(receiver);
+    async move {
+        while let Some(request) = receiver.recv().await {
+            let rpc = request.rpc;
+            if !rpc.try_begin() {
+                let _ = request.response_tx.send(Err(rpc.stop_error()));
+                continue;
+            }
+            // No await separates selection from publishing the exact active ticket.
+            runner.active_rpc = Some(rpc.clone());
+            let response = {
+                let mut cancelled = pin!(rpc.cancelled());
+                // cancelled() already enforces the ticket's absolute deadline;
+                // wrapping the request in another timeout would duplicate its timer.
+                let mut operation = pin!(runner.request(&request.method, request.params));
+                match select(cancelled.as_mut(), operation.as_mut()).await {
+                    Either::Left(_) => Err(rpc.stop_error()),
+                    Either::Right((response, _)) => response,
+                }
+            };
+            if response.is_ok() && rpc.try_settle_reply() {
+                // A late waiter drop can affect only the now-settled old ticket.
+                runner.active_rpc = None;
+                let _ = request.response_tx.send(response);
+                continue;
+            }
+
+            // This transport cannot serve another request. Reject its backlog
+            // before awaiting child retirement, and unblock senders waiting for
+            // queue capacity so other invocations can choose healthy workers.
+            receiver.close();
+
+            // Ambiguous IO, expiration and selected cancellation retire the
+            // transport. Keep the Child in the ticket even if the actor is dropped
+            // while waiting for exit or the request receiver has disappeared.
+            if let Some(child) = runner.child.take() {
+                rpc.retire(child);
+            }
+            runner.active_rpc = None;
+            rpc.wait_for_settlement().await;
+            let error = response.err().unwrap_or_else(|| rpc.stop_error());
+            let _ = request.response_tx.send(Err(error));
+            break;
+        }
     }
 }
 
@@ -467,32 +525,6 @@ impl NativeInvocationTermination {
             ));
         }
         Ok(())
-    }
-
-    pub(super) async fn invoke<F>(&self, operation: F) -> HostResult<InvokeResponse>
-    where
-        F: Future<Output = HostResult<InvokeResponse>>,
-    {
-        let mut waiter = NativeInvocationWaiter {
-            invocation: self.clone(),
-            returned: false,
-        };
-        let result = {
-            let mut cancelled = pin!(self.cancelled());
-            let mut operation = pin!(operation);
-            match select(cancelled.as_mut(), operation.as_mut()).await {
-                Either::Left(_) => Err(HostError::RegistryError(
-                    "connector invocation cancelled or deadline expired".to_string(),
-                )),
-                Either::Right((result, _)) => result,
-            }
-        };
-        // The losing operation future is dropped before examining its RPCs.
-        // Resilience timeouts may also drop an RPC waiter before actor exit.
-        let settlement = self.ensure_settled().await;
-        waiter.returned = true;
-        settlement?;
-        result
     }
 }
 
@@ -1144,5 +1176,181 @@ mod notification_tests {
             "selected timeout must retire its transport"
         );
         assert!(rpc.is_settled(), "actual child exit is still required");
+    }
+}
+
+#[cfg(test)]
+mod queue_shutdown_tests {
+    use fcp_async_core::channel::oneshot;
+    use std::io::ErrorKind;
+
+    use super::*;
+
+    fn request(
+        rpc: &NativeRpc,
+    ) -> (
+        ConnectorRpcRequest,
+        oneshot::Receiver<std::io::Result<serde_json::Value>>,
+    ) {
+        let (response_tx, response_rx) = oneshot::channel();
+        (
+            ConnectorRpcRequest {
+                method: "queued".to_owned(),
+                params: serde_json::json!({}),
+                response_tx,
+                rpc: rpc.clone(),
+            },
+            response_rx,
+        )
+    }
+
+    #[test]
+    fn close_settles_backlog_without_cancelling_a_retry_or_settling_active_work() {
+        let (sender, receiver) = mpsc::channel(3);
+        let mut queue = NativeRpcQueue(receiver);
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let queued = invocation.register_rpc();
+        let cancelled = NativeRpc::for_io();
+        cancelled.cancel();
+        let expired = NativeRpc::new(Instant::now());
+        let (queued_request, mut queued_response) = request(&queued);
+        let (cancelled_request, mut cancelled_response) = request(&cancelled);
+        let (expired_request, mut expired_response) = request(&expired);
+        sender.try_send(queued_request).unwrap();
+        sender.try_send(cancelled_request).unwrap();
+        sender.try_send(expired_request).unwrap();
+        assert!(!queued.is_settled());
+
+        let active = NativeRpc::for_io();
+        assert!(active.try_begin());
+        active.reject_queued();
+        assert!(!active.is_settled(), "queue rejection cannot release process custody");
+        queue.close();
+        assert!(sender.is_closed());
+        assert!(sender.is_empty());
+        assert!(queued.is_settled() && cancelled.is_settled() && expired.is_settled());
+        assert_eq!(queued_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert_eq!(cancelled_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::Interrupted);
+        assert_eq!(expired_response.try_recv().unwrap().unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(!queued.transport_retired());
+        assert!(!invocation.is_cancel_requested());
+        let retry = invocation.register_rpc();
+        assert!(retry.try_begin(), "a rejected worker must not poison the logical invoke");
+        assert!(retry.try_settle_reply());
+        assert!(active.try_settle_reply());
+        queue.close();
+        assert!(!queued.try_begin());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn closing_full_queue_rejects_a_parked_sender_without_admitting_its_request() {
+        let (sender, receiver) = mpsc::channel(1);
+        let queue = NativeRpcQueue(receiver);
+        let buffered = NativeRpc::for_io();
+        let (buffered_request, buffered_response) = request(&buffered);
+        sender.try_send(buffered_request).unwrap();
+        let waiting = NativeRpc::for_io();
+        let waiter = waiting.waiter();
+        let (waiting_request, waiting_response) = request(&waiting);
+        let mut send = Box::pin(sender.send(waiting_request));
+        assert!(futures_util::poll!(send.as_mut()).is_pending());
+        drop(queue);
+        let failure = fcp_async_core::time::timeout(Duration::from_secs(1), send)
+            .await.unwrap().unwrap_err();
+        assert!(!failure.0.rpc.is_active());
+        drop(failure);
+        drop(waiter);
+        assert!(waiting.is_settled());
+        assert!(waiting_response.await.is_err());
+        assert!(buffered.is_settled());
+        assert_eq!(buffered_response.await.unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert!(sender.is_closed());
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn dropping_an_unpolled_dispatcher_settles_and_replies_to_queued_work() {
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "IFS= read -r request || exit 0; exit 1".to_owned()],
+            &std::collections::BTreeMap::new(),
+        ).await.unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        let rpc = NativeRpc::for_io();
+        let (queued, response) = request(&rpc);
+        sender.try_send(queued).unwrap();
+        let actor = run_dispatcher(runner, receiver);
+        drop(actor);
+        assert!(rpc.is_settled(), "cleanup must not require the first actor poll");
+        assert!(!rpc.transport_retired(), "undispatched work never owned the child");
+        assert!(sender.is_closed());
+        assert_eq!(response.await.unwrap().unwrap_err().kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn retiring_production_actor_rejects_backlog_and_releases_queued_registration() {
+        use fcp_host::{CancellationScope, ConnectorArchetype};
+
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("selected");
+        let environment = std::collections::BTreeMap::from([
+            ("NATIVE_RPC_SELECTED".to_owned(), ready.to_string_lossy().into_owned()),
+        ]);
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_owned(),
+                "IFS= read -r request || exit 1; : > \"$NATIVE_RPC_SELECTED\"; exec sleep 30".to_owned()],
+            &environment,
+        ).await.unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        let actor = fcp_async_core::task::try_spawn(run_dispatcher(runner, receiver)).unwrap();
+        let active = NativeRpc::for_io();
+        let _active_waiter = active.waiter();
+        let (selected, selected_response) = request(&active);
+        sender.send(selected).await.unwrap();
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                fcp_async_core::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("fixture must receive the selected command");
+
+        let controller = Arc::new(CancellationController::new());
+        let invocation = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        let registration = controller.track_operation(
+            "queue-retirement", Some("owner"),
+            CancellationScope::new("native", ConnectorArchetype::RequestResponse)
+                .with_terminator(invocation.terminator()),
+        ).unwrap();
+        invocation.bind_registration(&controller, registration);
+        let queued = invocation.register_rpc();
+        let (queued_request, queued_response) = request(&queued);
+        sender.send(queued_request).await.unwrap();
+        let no_receiver = invocation.register_rpc();
+        let (discarded_request, discarded_response) = request(&no_receiver);
+        sender.send(discarded_request).await.unwrap();
+        drop(discarded_response);
+        assert!(!queued.is_settled());
+        assert!(!no_receiver.is_settled());
+        assert!(active.is_active());
+        active.cancel();
+
+        let failure = fcp_async_core::time::timeout(Duration::from_secs(3), queued_response)
+            .await.unwrap().unwrap().unwrap_err();
+        assert_eq!(failure.kind(), ErrorKind::BrokenPipe);
+        fcp_async_core::time::timeout(Duration::from_secs(5), actor)
+            .await.unwrap().unwrap();
+        assert!(queued.is_settled() && no_receiver.is_settled());
+        assert!(!queued.transport_retired() && !no_receiver.transport_retired());
+        assert!(!invocation.is_cancel_requested());
+        assert!(sender.is_closed());
+        assert!(selected_response.await.unwrap().is_err());
+        assert!(active.transport_retired());
+        assert!(active.is_settled(), "active custody requires observed child exit");
+        drop(NativeInvocationWaiter { invocation, returned: true });
+        controller.track_operation(
+            "queue-retirement", Some("replacement"),
+            CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+        ).expect("undispatched backlog must not strand its operation registration");
     }
 }

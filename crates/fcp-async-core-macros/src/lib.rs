@@ -146,7 +146,11 @@ fn expand_runtime_fn(
 
     sig.asyncness = None;
     let builder = builder_tokens(flavor);
-    let maybe_test_attr = add_test_attr.then(|| quote!(#[test]));
+    // A caller may import our `test` macro, or another attribute with that
+    // name. Emitting bare #[test] would resolve in that caller's scope and
+    // reapply an async attribute to the now-synchronous wrapper. Select the
+    // compiler's test attribute explicitly, independently of caller imports.
+    let maybe_test_attr = add_test_attr.then(|| quote!(#[::core::prelude::v1::test]));
     let runtime_ident = syn::Ident::new("__fcp_async_core_runtime", Span::mixed_site());
 
     Ok(quote! {
@@ -234,7 +238,8 @@ mod tests {
         .expect("expansion should succeed")
         .to_string();
 
-        assert!(expanded.contains("# [test]"));
+        assert!(expanded.contains("# [:: core :: prelude :: v1 :: test]"));
+        assert!(!expanded.contains("# [test]"));
         assert!(expanded.contains("Builder :: new_current_thread"));
         assert!(expanded.contains("runtime . block_on"));
     }
@@ -257,5 +262,64 @@ mod tests {
         assert!(expanded.contains("__fcp_async_core_runtime"));
         assert!(!expanded.contains("let runtime ="));
         assert!(expanded.contains("runtime :: spawn"));
+    }
+
+    #[test]
+    fn test_expansion_preserves_metadata_and_return_type_with_one_builtin_attribute() {
+        for flavor in [Flavor::CurrentThread, Flavor::MultiThread] {
+            let expanded = expand_runtime_fn(
+                quote!(),
+                quote! {
+                    #[should_panic(expected = "sentinel")]
+                    #[allow(unused_variables)]
+                    async fn sample() -> Result<(), std::io::Error> {
+                        Ok(())
+                    }
+                },
+                flavor,
+                true,
+            )
+            .expect("test expansion");
+            let function: ItemFn = syn::parse2(expanded).expect("synchronous test wrapper");
+            assert!(function.sig.asyncness.is_none());
+            assert_eq!(function.attrs.len(), 3);
+            assert!(function.attrs[0].path().is_ident("should_panic"));
+            assert!(function.attrs[1].path().is_ident("allow"));
+            let path = function.attrs[2].path();
+            assert!(
+                path.leading_colon.is_some(),
+                "caller modules must not shadow core"
+            );
+            assert_eq!(
+                path.segments
+                    .iter()
+                    .map(|part| part.ident.to_string())
+                    .collect::<Vec<_>>(),
+                ["core", "prelude", "v1", "test"],
+            );
+            let output = &function.sig.output;
+            assert_eq!(
+                quote!(#output).to_string(),
+                quote!(-> Result<(), std::io::Error>).to_string(),
+            );
+        }
+    }
+
+    #[test]
+    fn main_expansion_does_not_register_a_test() {
+        let expanded = expand_runtime_fn(
+            quote!(),
+            quote! {
+                #[allow(dead_code)]
+                async fn entrypoint() {}
+            },
+            Flavor::MultiThread,
+            false,
+        )
+        .expect("main expansion");
+        let function: ItemFn = syn::parse2(expanded).expect("synchronous entrypoint");
+        assert!(function.sig.asyncness.is_none());
+        assert_eq!(function.attrs.len(), 1);
+        assert!(function.attrs[0].path().is_ident("allow"));
     }
 }

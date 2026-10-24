@@ -15,6 +15,7 @@ use fcp_google_discovery::{DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode, Url, header};
+use sha2::{Digest, Sha256};
 use tracing::{debug, instrument};
 
 use crate::{
@@ -24,6 +25,9 @@ use crate::{
 
 /// Default Google Calendar API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://www.googleapis.com/calendar/v3";
+
+const CREATE_FINGERPRINT_PROPERTY: &str = "fcpCreateFingerprint";
+const CREATE_FINGERPRINT_DOMAIN: &str = "fcp.google-calendar.create-event.v1";
 
 /// Render a redacted auth label suitable for logs/diagnostics.
 #[must_use]
@@ -241,46 +245,79 @@ impl GoogleCalendarClient {
 
     /// Create a new event in a calendar.
     ///
-    /// Ensures a stable client-supplied Google Calendar event `id` (base32hex
-    /// `[0-9a-v]{5,1024}`) is present on the event body before entering the
-    /// retry loop (br-d018i). If a retry after a transient 5xx or dropped
-    /// response receives `409 Conflict` ("The requested identifier already
-    /// exists") because an earlier attempt committed the event, recovers via
-    /// [`Self::get_event`].
+    /// An explicit event ID permits retries with the same frozen payload. A
+    /// duplicate ID is recovered only when the stored private fingerprint matches
+    /// the original request. Without an ID, ambiguous writes are terminal.
     #[instrument(skip(self, event))]
     pub async fn create_event(&self, calendar_id: &str, event: &Event) -> GCalResult<Event> {
+        if let Some(event_id) = event.id.as_deref() {
+            validate_create_event_id(event_id)?;
+        }
         let encoded_cal =
             percent_encoding::utf8_percent_encode(calendar_id, percent_encoding::NON_ALPHANUMERIC);
         let url = format!("{}/calendars/{encoded_cal}/events", self.base_url);
-        let event_id = event
-            .id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map_or_else(
-                || uuid::Uuid::new_v4().simple().to_string(),
-                str::to_string,
-            );
         let mut body = serde_json::to_value(event).map_err(GoogleCalendarError::Json)?;
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("id".to_string(), serde_json::Value::String(event_id.clone()));
-        }
+        let Some(event_id) = event.id.as_deref() else {
+            let created = self.post_json(&url, &body).await?;
+            return validate_created_event(created, None);
+        };
+
+        // Serialize a framed, versioned tuple before adding the marker. The
+        // calendar and original body (including ID) bind the marker to one create.
+        let fingerprint_input =
+            serde_json::to_vec(&(CREATE_FINGERPRINT_DOMAIN, calendar_id, &body))
+                .map_err(GoogleCalendarError::Json)?;
+        let fingerprint = hex::encode(Sha256::digest(&fingerprint_input));
+        body["extendedProperties"] = serde_json::json!({
+            "private": { CREATE_FINGERPRINT_PROPERTY: &fingerprint }
+        });
+
         match self.post_json_replay_safe(&url, &body).await {
-            Ok(created) => Ok(created),
-            Err(GoogleCalendarError::Api { code: 409, .. }) => {
-                self.get_event(calendar_id, &event_id).await
+            Ok(created) => validate_created_event(created, Some(event_id)),
+            Err(conflict @ GoogleCalendarError::Api { code: 409, .. }) => {
+                let encoded_evt = percent_encoding::utf8_percent_encode(
+                    event_id,
+                    percent_encoding::NON_ALPHANUMERIC,
+                );
+                let recovery_url = format!("{url}/{encoded_evt}");
+                // Event intentionally omits provider extension fields; inspect
+                // the raw resource before converting it to the public type.
+                if let Ok(existing) = self.get::<serde_json::Value>(&recovery_url).await {
+                    let matching_request = existing["id"].as_str() == Some(event_id)
+                        && existing["extendedProperties"]["private"][CREATE_FINGERPRINT_PROPERTY]
+                            .as_str()
+                            == Some(fingerprint.as_str());
+                    let active =
+                        matches!(existing["status"].as_str(), Some("confirmed" | "tentative"));
+                    if matching_request && active {
+                        if let Ok(event) = serde_json::from_value(existing) {
+                            return Ok(event);
+                        }
+                    }
+                }
+                Err(conflict)
             }
-            Err(err) => Err(err),
+            Err(
+                error @ (GoogleCalendarError::Json(_)
+                | GoogleCalendarError::Api {
+                    code: 200..=299, ..
+                }),
+            ) => Err(unkeyed_write_error(error)),
+            Err(error) => Err(error),
         }
     }
 
-    /// Update an existing event.
-    #[instrument(skip(self, event))]
+    /// Update only the supplied fields of an existing event.
+    ///
+    /// Calendar's PATCH semantics preserve omitted fields, including attendees,
+    /// recurrence, reminders, and conference data. Supplied arrays replace the
+    /// corresponding array, so an explicit empty array clears it.
+    #[instrument(skip(self, patch))]
     pub async fn update_event(
         &self,
         calendar_id: &str,
         event_id: &str,
-        event: &Event,
+        patch: &serde_json::Value,
     ) -> GCalResult<Event> {
         let encoded_cal =
             percent_encoding::utf8_percent_encode(calendar_id, percent_encoding::NON_ALPHANUMERIC);
@@ -290,8 +327,7 @@ impl GoogleCalendarClient {
             "{}/calendars/{encoded_cal}/events/{encoded_evt}",
             self.base_url
         );
-        let body = serde_json::to_value(event).map_err(GoogleCalendarError::Json)?;
-        self.put_json(&url, &body).await
+        self.patch_json(&url, patch).await
     }
 
     /// Delete an event.
@@ -319,7 +355,8 @@ impl GoogleCalendarClient {
             "{}/calendars/{encoded_cal}/events/quickAdd?text={encoded_text}",
             self.base_url
         );
-        self.post_json(&url, &serde_json::json!({})).await
+        let created = self.post_json(&url, &serde_json::json!({})).await?;
+        validate_created_event(created, None)
     }
 
     // ── FreeBusy operations ──────────────────────────────────────
@@ -405,7 +442,7 @@ impl GoogleCalendarClient {
 
     /// POST with retry.
     ///
-    /// br-kxd3e: fail-closed. A replay of `events.insert` or `events.quickAdd`
+    /// br-kxd3e: fail-closed. A replay of an unkeyed insert or `events.quickAdd`
     /// creates a SECOND calendar event, which also mails a second set of
     /// invitations to the attendees. Read-only POSTs use
     /// [`Self::post_json_replay_safe`].
@@ -416,14 +453,15 @@ impl GoogleCalendarClient {
     ) -> GCalResult<T> {
         let response = self
             .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
-            .await?;
-        decode_json_response(response)
+            .await
+            .map_err(unkeyed_write_error)?;
+        decode_json_response(response).map_err(unkeyed_write_error)
     }
 
     /// POST whose replay cannot duplicate a side effect.
     ///
-    /// `freeBusy` is a query that Google exposes as a POST because the request
-    /// carries a body; it creates nothing.
+    /// `freeBusy` creates nothing. A keyed insert reuses the same provider event
+    /// ID and private request fingerprint on every attempt.
     async fn post_json_replay_safe<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -435,13 +473,13 @@ impl GoogleCalendarClient {
         decode_json_response(response)
     }
 
-    async fn put_json<T: serde::de::DeserializeOwned>(
+    async fn patch_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> GCalResult<T> {
         let response = self
-            .execute_with_retry("PUT", url, Some(body), GoogleResponseMode::Json, true)
+            .execute_with_retry("PATCH", url, Some(body), GoogleResponseMode::Json, true)
             .await?;
         decode_json_response(response)
     }
@@ -567,6 +605,47 @@ impl GoogleCalendarClient {
             .execute(&request)
             .await
             .map_err(map_rest_error)
+    }
+}
+
+fn validate_created_event(event: Event, expected_id: Option<&str>) -> GCalResult<Event> {
+    let actual_id = event.id.as_deref().filter(|id| !id.trim().is_empty());
+    if actual_id.is_none() || expected_id.is_some_and(|expected| actual_id != Some(expected)) {
+        return Err(GoogleCalendarError::AmbiguousWrite { status_code: None });
+    }
+    Ok(event)
+}
+
+fn validate_create_event_id(event_id: &str) -> GCalResult<()> {
+    if !(5..=1024).contains(&event_id.len())
+        || !event_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'v'))
+    {
+        return Err(GoogleCalendarError::InvalidEventId);
+    }
+    Ok(())
+}
+
+/// Do not advertise an outer retry after a write whose provider result is unknown.
+fn unkeyed_write_error(error: GoogleCalendarError) -> GoogleCalendarError {
+    match error {
+        GoogleCalendarError::Http(source)
+            if fcp_sdk::migration::transport_error_reached_service(&source) =>
+        {
+            GoogleCalendarError::AmbiguousWrite {
+                status_code: source.status().map(|status| status.as_u16()),
+            }
+        }
+        GoogleCalendarError::Json(_) => GoogleCalendarError::AmbiguousWrite { status_code: None },
+        GoogleCalendarError::Api { code, .. }
+            if code >= 500 || matches!(code, 0 | 408) || (200..300).contains(&code) =>
+        {
+            GoogleCalendarError::AmbiguousWrite {
+                status_code: u16::try_from(code).ok().filter(|status| *status != 0),
+            }
+        }
+        other => other,
     }
 }
 

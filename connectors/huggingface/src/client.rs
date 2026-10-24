@@ -7,7 +7,9 @@ use tracing::debug;
 use url::Url;
 
 use fcp_sdk::ConnectorRuntime;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, transport_error_reached_service,
+};
 
 use crate::error::{HuggingfaceError, HuggingfaceResult};
 use crate::types::{
@@ -27,14 +29,15 @@ fn sanitize_model_id(value: &str) -> HuggingfaceResult<&str> {
             "model_id must not be empty".into(),
         ));
     }
-    let lower = value.to_ascii_lowercase();
-    if value.contains('\\')
-        || value.contains("..")
-        || lower.contains("%2f")
-        || lower.contains("%5c")
+    if value.contains("..")
+        || value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '\\' | '%' | '?' | '#')
+        })
     {
         return Err(HuggingfaceError::InvalidInput(
-            "model_id contains path traversal characters".into(),
+            "model_id contains URL syntax, whitespace, or path traversal characters".into(),
         ));
     }
     // model_id can contain exactly one `/` for org/model format (e.g. "facebook/bart-large-cnn")
@@ -42,6 +45,14 @@ fn sanitize_model_id(value: &str) -> HuggingfaceResult<&str> {
     if slash_count > 1 {
         return Err(HuggingfaceError::InvalidInput(
             "model_id may contain at most one `/` (org/model format)".into(),
+        ));
+    }
+    if value
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == ".")
+    {
+        return Err(HuggingfaceError::InvalidInput(
+            "model_id must contain non-empty model or org/model path segments".into(),
         ));
     }
     Ok(value)
@@ -61,6 +72,11 @@ fn normalize_api_base_url(value: &str, field: &str) -> HuggingfaceResult<String>
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(HuggingfaceError::InvalidInput(format!(
             "{field} must use http or https"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HuggingfaceError::InvalidInput(format!(
+            "{field} must not contain embedded credentials; use api_token instead"
         )));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -115,6 +131,10 @@ impl HuggingfaceClient {
     ) -> HuggingfaceResult<Self> {
         let client = Client::builder()
             .timeout(timeout)
+            // Redirects are hidden sends below RetryLoop. A 307/308 can
+            // replay billable inference and forward a private prompt to a
+            // different endpoint even if Authorization is stripped.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(HuggingfaceError::Http)?;
 
@@ -357,6 +377,10 @@ fn extract_retry_after_ms(retry_after: Option<Duration>) -> u64 {
 
 /// Handle the Inference API response, which returns JSON directly (no envelope).
 /// The HF Inference API returns 503 with `estimated_time` when the model is loading.
+/// Inference POSTs are not replay-safe: a timeout or generic server error can
+/// arrive after billable work has completed. Preserve that uncertainty in the
+/// returned error as well as the local retry decision, so the host cannot
+/// accidentally retry it at the invoke layer (br-kxd3e).
 async fn handle_inference_response<T: serde::de::DeserializeOwned>(
     req: RequestBuilder,
     attempt: u32,
@@ -364,14 +388,30 @@ async fn handle_inference_response<T: serde::de::DeserializeOwned>(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return AttemptOutcome::Retryable {
-                error: HuggingfaceError::Http(e),
-                retry_after: None,
-            };
+            if transport_error_reached_service(&e) {
+                return AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+                    status: e.status().map(|status| status.as_u16()),
+                });
+            }
+            // A builder error is terminal; only a connect-phase failure is
+            // both transient and provably pre-transmission.
+            let replayable = e.is_connect();
+            return AttemptOutcome::retryable_if_replayable(
+                HuggingfaceError::Http(e),
+                None,
+                replayable,
+            );
         }
     };
 
     let status = resp.status().as_u16();
+
+    if resp.status().is_redirection() {
+        return AttemptOutcome::Terminal(HuggingfaceError::Api {
+            status,
+            message: "redirect refused; configure the intended inference_url explicitly".into(),
+        });
+    }
 
     if status == 429 {
         let retry_after = resp
@@ -400,27 +440,38 @@ async fn handle_inference_response<T: serde::de::DeserializeOwned>(
         )));
     }
 
-    // 503 with estimated_time means the model is loading -- retryable
+    // A valid loading response explicitly says inference has not started.
+    // A generic 503, truncated body, or invalid estimate gives no such proof.
     if status == 503 {
-        let text = resp.text().await.unwrap_or_default();
-        if let Ok(hf_err) = serde_json::from_str::<HfApiError>(&text) {
-            if hf_err.estimated_time.is_some() {
-                let wait = hf_err.estimated_time.map_or(Duration::from_secs(10), |t| {
-                    Duration::from_secs_f64(t.clamp(1.0, 120.0))
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(_) => {
+                return AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+                    status: Some(status),
                 });
+            }
+        };
+        if let Ok(hf_err) = serde_json::from_str::<HfApiError>(&text) {
+            if let Some(estimate) = hf_err
+                .estimated_time
+                .filter(|estimate| estimate.is_finite() && *estimate >= 0.0)
+            {
+                let wait = Duration::from_secs_f64(estimate.clamp(1.0, 120.0));
                 return AttemptOutcome::Retryable {
                     error: HuggingfaceError::ModelLoading(hf_err.error),
                     retry_after: Some(wait),
                 };
             }
         }
-        return AttemptOutcome::Retryable {
-            error: HuggingfaceError::Api {
-                status: 503,
-                message: text,
-            },
-            retry_after: Some(Duration::from_secs(5)),
-        };
+        return AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+            status: Some(status),
+        });
+    }
+
+    if status == 408 || status >= 500 {
+        return AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+            status: Some(status),
+        });
     }
 
     if !resp.status().is_success() {
@@ -429,25 +480,28 @@ async fn handle_inference_response<T: serde::de::DeserializeOwned>(
             status,
             message: text,
         };
-        if status >= 500 {
-            return AttemptOutcome::Retryable {
-                error: err,
-                retry_after: None,
-            };
-        }
         return AttemptOutcome::Terminal(err);
     }
 
     let text = match resp.text().await {
         Ok(t) => t,
-        Err(e) => return AttemptOutcome::Terminal(HuggingfaceError::Http(e)),
+        Err(_) => {
+            return AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+                status: Some(status),
+            });
+        }
     };
 
     match serde_json::from_str::<T>(&text) {
         Ok(v) => AttemptOutcome::Success(v),
-        Err(e) => {
-            debug!(attempt, "Failed to parse inference response: {e}");
-            AttemptOutcome::Terminal(HuggingfaceError::Json(e))
+        Err(_) => {
+            debug!(
+                attempt,
+                "Inference response could not be decoded; replay suppressed"
+            );
+            AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown {
+                status: Some(status),
+            })
         }
     }
 }
@@ -468,6 +522,13 @@ async fn handle_json_response<T: serde::de::DeserializeOwned>(
     };
 
     let status = resp.status().as_u16();
+
+    if resp.status().is_redirection() {
+        return AttemptOutcome::Terminal(HuggingfaceError::Api {
+            status,
+            message: "redirect refused; configure the intended hub_url explicitly".into(),
+        });
+    }
 
     if status == 429 {
         let retry_after = resp
@@ -638,6 +699,111 @@ mod tests {
             sanitize_model_id("mistralai/Mistral-7B-v0.1").unwrap(),
             "mistralai/Mistral-7B-v0.1"
         );
+    }
+
+    #[test]
+    fn sanitize_model_id_rejects_url_component_injection() {
+        for model_id in [
+            ".",
+            "/gpt2",
+            "org/",
+            "org/.",
+            "gpt2?redirect=elsewhere",
+            "org/model#ignored",
+            "%2e%2e",
+            "org/%2E%2e",
+            "org/%252e%252e",
+            "org%255cmodel",
+            " gpt2",
+            "org /model",
+            "org/\tmodel",
+            "gpt2\n",
+            "gpt2\0",
+        ] {
+            assert!(
+                sanitize_model_id(model_id).is_err(),
+                "accepted URL-changing model ID: {model_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_urls_reject_embedded_credentials_without_echoing_them() {
+        for url in [
+            "https://user:private-password@example.test/api",
+            "https://private-user@example.test/api",
+            "https://:private-password@example.test/api",
+        ] {
+            for field in ["inference_url", "hub_url"] {
+                let err = normalize_api_base_url(url, field)
+                    .expect_err("URL credentials must not bypass the explicit auth channel");
+                let message = err.to_string();
+                assert!(message.contains("embedded credentials"));
+                assert!(!message.contains("private-password"));
+                assert!(!message.contains("private-user"));
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inference_builder_failure_is_terminal() {
+        let request = Client::new()
+            .post("http://127.0.0.1:0/models/gpt2")
+            .header("authorization", "invalid\nheader");
+        assert!(matches!(
+            handle_inference_response::<serde_json::Value>(request, 0).await,
+            AttemptOutcome::Terminal(HuggingfaceError::Http(error)) if error.is_builder()
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inference_connect_failure_remains_replayable() {
+        // Port zero cannot be assigned to a listening TCP service; binding
+        // it instead allocates a nonzero ephemeral port. This avoids racing
+        // another test for an ephemeral port that we just closed.
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let request = client.post("http://127.0.0.1:0/models/gpt2");
+        assert!(matches!(
+            handle_inference_response::<serde_json::Value>(request, 0).await,
+            AttemptOutcome::Retryable {
+                error: HuggingfaceError::Http(error),
+                retry_after: None,
+            } if error.is_connect()
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn inference_http_timeout_reports_unknown_outcome() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!([{"generated_text": "already computed"}])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No enclosing execution deadline: exercise the HTTP timeout arm
+        // itself rather than allowing the runtime timeout to win the race.
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let request = client.post(format!("{}/models/gpt2", server.uri()));
+        assert!(matches!(
+            handle_inference_response::<serde_json::Value>(request, 0).await,
+            AttemptOutcome::Terminal(HuggingfaceError::InferenceOutcomeUnknown { status: None })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

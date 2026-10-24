@@ -882,31 +882,39 @@ impl GraphqlClient {
             // Splitting by retry classification keeps each class on its
             // own future without losing dedup for matched-class pairs.
             let dedup_key: DedupKey = (body_bytes.clone(), idempotent);
-            let mut guard = state.inner.lock().await;
-            if let Some(shared) = guard.get(&dedup_key).cloned() {
-                drop(guard);
+            // asupersync's MutexGuard is deliberately !Send. End its
+            // scope before awaiting the shared request so this future
+            // stays spawnable.
+            let (shared, inserted) = {
+                let mut guard = state.inner.lock().await;
+                if let Some(shared) = guard.get(&dedup_key).cloned() {
+                    (shared, false)
+                } else {
+                    let client = self.clone();
+                    let payload = body_bytes;
+                    let future = async move { client.send_with_retry(payload, idempotent).await }
+                        .boxed()
+                        .shared();
+                    guard.insert(dedup_key.clone(), future.clone());
+                    (future, true)
+                }
+            };
+
+            if inserted {
+                // The cleanup guard removes our entry from the dedup map no
+                // matter how we exit this scope: return, cancellation, or
+                // panic. Previously the explicit `remove` after `future.await`
+                // only fired on normal completion, so a cancelled owner
+                // leaked the entry and future duplicates saw a stale cached
+                // Shared<> indefinitely. Only the inserter owns that cleanup;
+                // a hitchhiking caller must not drop the in-flight entry.
+                let _cleanup = DedupGuard {
+                    state: state.clone(),
+                    key: dedup_key,
+                };
                 return shared.await;
             }
-
-            let client = self.clone();
-            let payload = body_bytes;
-            let future = async move { client.send_with_retry(payload, idempotent).await }
-                .boxed()
-                .shared();
-            guard.insert(dedup_key.clone(), future.clone());
-            drop(guard);
-
-            // The cleanup guard removes our entry from the dedup map no
-            // matter how we exit this scope: return, cancellation, or
-            // panic. Previously the explicit `remove` after `future.await`
-            // only fired on normal completion, so a cancelled owner
-            // leaked the entry and future duplicates saw a stale cached
-            // Shared<> indefinitely.
-            let _cleanup = DedupGuard {
-                state: state.clone(),
-                key: dedup_key,
-            };
-            return future.await;
+            return shared.await;
         }
 
         self.send_with_retry(body_bytes, idempotent).await

@@ -629,6 +629,18 @@ impl TestConnector {
             .get("delay_ms")
             .and_then(serde_json::Value::as_u64)
         {
+            // Opt-in subprocess evidence, written only after invoke validation.
+            // Host ingress logs alone cannot prove that this RPC loop is blocked.
+            if let Some(path) = std::env::var_os("FCP_TEST_INVOKE_STARTED_FILE") {
+                let marker = json!({
+                    "pid": std::process::id(),
+                    "request_id": req.id.to_string(),
+                    "delay_ms": delay_ms,
+                });
+                std::fs::write(path, marker.to_string()).map_err(|error| FcpError::Internal {
+                    message: format!("Cannot write invoke-start marker: {error}"),
+                })?;
+            }
             thread::sleep(Duration::from_millis(delay_ms));
         }
 

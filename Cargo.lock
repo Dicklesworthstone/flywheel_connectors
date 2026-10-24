@@ -2663,6 +2663,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 
@@ -3482,6 +3483,7 @@ dependencies = [
  "fcp-chaos",
  "fcp-core",
  "fcp-crypto",
+ "fcp-crypto-hw",
  "fcp-evidence",
  "fcp-host",
  "fcp-kernel",
@@ -5782,6 +5784,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 
@@ -7028,6 +7031,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 
@@ -8676,6 +8680,7 @@ dependencies = [
  "fcp-cbor",
  "fcp-core",
  "fcp-crypto",
+ "fcp-crypto-hw",
  "fcp-evidence",
  "fcp-host",
  "fcp-kernel",

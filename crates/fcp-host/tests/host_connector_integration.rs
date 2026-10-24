@@ -5071,6 +5071,17 @@ async fn fcp_host_binary_batch_route_skips_dependents_after_failure()
     let (mut failing_request, _) =
         build_invoke_request(unknown_connector_id, &capability_signing_key);
     failing_request.input = json!({ "message": "missing" });
+    // A batch member uses the same routing/admission refusal as an ordinary
+    // invoke. Preserve its concrete HTTP status and message without adding
+    // a retry hint or allowing the dependent to run.
+    let direct_refusal = host
+        .client
+        .post(url("/rpc/invoke"))
+        .json(&failing_request)
+        .send()
+        .await?;
+    assert_eq!(direct_refusal.status(), reqwest::StatusCode::FORBIDDEN);
+    let direct_refusal_message = direct_refusal.text().await?;
     let (mut dependent_request, _) =
         build_invoke_request(connector_id.clone(), &capability_signing_key);
     dependent_request.input = json!({ "message": "dependent" });
@@ -5104,13 +5115,13 @@ async fn fcp_host_binary_batch_route_skips_dependents_after_failure()
     assert_eq!(response.results[0].status, OperationResultStatus::Error);
     assert_eq!(response.results[1].status, OperationResultStatus::Skipped);
     assert_eq!(response.results[2].status, OperationResultStatus::Success);
-    assert_eq!(
-        response.results[0]
-            .error
-            .as_ref()
-            .map(|error| error.code.as_str()),
-        Some("PREFLIGHT_DENIED")
-    );
+    let failure = response.results[0]
+        .error
+        .as_ref()
+        .expect("failed member error");
+    assert_eq!(failure.code, "INVOKE_HTTP_403");
+    assert_eq!(failure.message, direct_refusal_message);
+    assert_eq!(failure.retry_after_ms, None);
     assert_eq!(
         response.results[1]
             .error
@@ -5163,10 +5174,9 @@ async fn fcp_host_binary_batch_route_stop_on_first_error_short_circuits_same_tie
         build_invoke_request(connector_id.clone(), &capability_signing_key);
     third_request.input = json!({ "message": "third" });
 
-    // All three operations are independent (one tier); max_parallelism = 1
-    // splits the tier into three sequential chunks. With stop_on_first_error
-    // the failure in the first chunk must short-circuit the REMAINING CHUNKS
-    // OF THE SAME TIER, not just subsequent tiers.
+    // All three operations are ready independently, but max_parallelism = 1
+    // admits only the first. Its failure must stop admission of the remaining
+    // ready operations, not only operations with dependencies.
     let response: BatchInvokeResponse = http_post_json(
         host.client.clone(),
         url("/rpc/batch"),

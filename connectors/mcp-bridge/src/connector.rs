@@ -503,7 +503,9 @@ impl McpBridgeConnector {
     ) -> FcpResult<serde_json::Value> {
         info!("MCP Bridge connector shutting down");
         if let Some(client) = &self.client {
+            // Fence in-flight operations before any network-facing teardown.
             client.shutdown();
+            client.terminate_session().await;
         }
         self.client = None;
         self.config = None;

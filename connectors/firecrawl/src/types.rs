@@ -211,6 +211,10 @@ pub struct CrawlStatusResponse {
     pub credits_used: Option<u32>,
     #[serde(default, rename = "expiresAt")]
     pub expires_at: Option<String>,
+    /// Provider continuation for results not included in this response.
+    /// Retained for active jobs; completed-job reads drain bounded continuations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
     #[serde(default)]
     pub data: Option<Vec<CrawlPageData>>,
     #[serde(default)]
@@ -233,6 +237,21 @@ pub struct CrawlPageData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crawl_continuations_survive_round_trip_instead_of_disappearing() {
+        let value = serde_json::json!({
+            "status": "scraping", "next": "https://api.firecrawl.dev/v2/crawl/job-1?skip=2",
+            "data": [],
+        });
+        let response: CrawlStatusResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap()["next"], value["next"]);
+        let response: CrawlStatusResponse = serde_json::from_value(serde_json::json!({
+            "status": "completed", "next": null,
+        })).unwrap();
+        assert!(response.next.is_none());
+        assert!(serde_json::to_value(response).unwrap().get("next").is_none());
+    }
 
     #[test]
     fn search_request_serializes_minimal() {

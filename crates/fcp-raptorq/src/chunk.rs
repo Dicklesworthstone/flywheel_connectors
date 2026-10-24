@@ -61,88 +61,82 @@ impl ChunkedObjectManifest {
         (manifest, chunks)
     }
 
-    /// Reconstruct the payload from chunks (validates hash).
+    /// Reconstruct the payload after validating geometry and both hash layers.
+    ///
+    /// Every chunk must match its declared position, size and content ID. The
+    /// full-payload hash is checked before allocating the output buffer. For
+    /// bounded-memory output, use [`Self::start_reconstruction`] instead.
     ///
     /// # Errors
     ///
-    /// Returns `ChunkError` if:
-    /// - Wrong number of chunks provided
-    /// - Total length doesn't match
-    /// - BLAKE3 hash verification fails
+    /// Returns `ChunkError` for inconsistent geometry, wrong chunk count or
+    /// length, a mismatched chunk ID, or a mismatched full-payload hash.
     pub fn reconstruct(&self, chunks: &[RawChunk]) -> Result<Vec<u8>, ChunkError> {
-        if chunks.len() != self.chunks.len() {
-            return Err(ChunkError::MissingChunks {
-                expected: self.chunks.len(),
-                got: chunks.len(),
-            });
+        let capacity = self.validate_chunks(chunks)?;
+        let mut hasher = blake3::Hasher::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.verify_chunk(index, chunk)?;
+            hasher.update(&chunk.bytes);
         }
-
-        let actual_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
-        if actual_len != self.total_len {
-            return Err(ChunkError::LengthMismatch {
-                expected: self.total_len,
-                got: actual_len,
-            });
+        if hasher.finalize().as_bytes() != &self.payload_hash {
+            return Err(ChunkError::HashMismatch);
         }
-
-        // Pre-allocate based on verified actual chunks length, not just the manifest claim.
-        // Since we verified actual_len == self.total_len, this is safe from manifest lies,
-        // but we still cap it to avoid OOM from huge valid payloads if system is constrained.
-        // For now, usize limit is the main constraint.
-        let capacity = usize::try_from(actual_len).map_err(|_| ChunkError::LengthMismatch {
-            expected: self.total_len,
-            got: actual_len,
-        })?;
 
         let mut payload = Vec::with_capacity(capacity);
         for chunk in chunks {
             payload.extend_from_slice(&chunk.bytes);
         }
-
-        // Verify hash
-        let actual_hash = blake3::hash(&payload);
-        if actual_hash.as_bytes() != &self.payload_hash {
-            return Err(ChunkError::HashMismatch);
-        }
-
         Ok(payload)
     }
 
     /// Reconstruct the payload from chunks without hash verification.
     ///
     /// Use this only when you've already verified individual chunk hashes.
+    /// Manifest geometry and individual chunk lengths are still checked; this
+    /// method deliberately skips both content-ID and full-payload hashing.
     ///
     /// # Errors
     ///
-    /// Returns `ChunkError` if wrong number of chunks or length mismatch.
+    /// Returns `ChunkError` for invalid geometry, chunk count or chunk length.
     pub fn reconstruct_unchecked(&self, chunks: &[RawChunk]) -> Result<Vec<u8>, ChunkError> {
+        let capacity = self.validate_chunks(chunks)?;
+        let mut payload = Vec::with_capacity(capacity);
+        for chunk in chunks {
+            payload.extend_from_slice(&chunk.bytes);
+        }
+        Ok(payload)
+    }
+
+    // Preserve count/total-length error precedence for existing callers while
+    // rejecting malformed boundaries before allocation in both entry points.
+    fn validate_chunks(&self, chunks: &[RawChunk]) -> Result<usize, ChunkError> {
         if chunks.len() != self.chunks.len() {
             return Err(ChunkError::MissingChunks {
                 expected: self.chunks.len(),
                 got: chunks.len(),
             });
         }
-
-        let actual_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let actual_len = chunks
+            .iter()
+            .try_fold(0_u64, |total, chunk| total.checked_add(chunk.len() as u64))
+            .ok_or(ChunkError::LengthMismatch {
+                expected: self.total_len,
+                got: u64::MAX,
+            })?;
         if actual_len != self.total_len {
             return Err(ChunkError::LengthMismatch {
                 expected: self.total_len,
                 got: actual_len,
             });
         }
-
-        // Safe allocation based on actual chunks provided
-        let capacity = usize::try_from(actual_len).map_err(|_| ChunkError::LengthMismatch {
+        self.validate_layout()?;
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.validate_chunk_length(index, chunk.len())?;
+        }
+        usize::try_from(actual_len).map_err(|_| ChunkError::LengthMismatch {
             expected: self.total_len,
             got: actual_len,
-        })?;
-
-        let mut payload = Vec::with_capacity(capacity);
-        for chunk in chunks {
-            payload.extend_from_slice(&chunk.bytes);
-        }
-
-        Ok(payload)
+        })
     }
 
     /// Number of chunks in the manifest.
@@ -155,7 +149,8 @@ impl ChunkedObjectManifest {
     ///
     /// # Errors
     ///
-    /// Returns `ChunkError::InvalidChunkIndex` if index is out of bounds.
+    /// Returns `ChunkError::InvalidChunkIndex` if index is out of bounds, or
+    /// an error if the manifest's size and chunk count are inconsistent.
     pub fn chunk_size_at(&self, index: usize) -> Result<usize, ChunkError> {
         if index >= self.chunks.len() {
             return Err(ChunkError::InvalidChunkIndex {
@@ -163,32 +158,24 @@ impl ChunkedObjectManifest {
                 count: self.chunks.len(),
             });
         }
+        self.validate_layout()?;
 
-        // `from_payload` asserts `chunk_size > 0`, but `ChunkedObjectManifest`
-        // is `Deserialize`, so a peer can ship `chunk_size: 0`. Reject it
-        // here rather than panicking on `total_len % 0` for the last chunk.
-        if self.chunk_size == 0 {
-            return Err(ChunkError::InvalidChunkSize);
-        }
-
-        // Last chunk may be smaller
-        if index == self.chunks.len() - 1 {
-            let remaining = self.total_len as usize % self.chunk_size as usize;
-            if remaining == 0 {
-                Ok(self.chunk_size as usize)
-            } else {
-                Ok(remaining)
-            }
+        // Compute the remainder before narrowing: total_len can exceed usize
+        // on 32-bit targets even though each individual chunk fits in memory.
+        let remaining = self.total_len % u64::from(self.chunk_size);
+        let size = if index == self.chunks.len() - 1 && remaining != 0 {
+            remaining
         } else {
-            Ok(self.chunk_size as usize)
-        }
+            u64::from(self.chunk_size)
+        };
+        usize::try_from(size).map_err(|_| ChunkError::InvalidChunkSize)
     }
 
-    /// Verify the payload hash matches.
+    /// Verify the payload's declared length and full-payload hash match.
     #[must_use]
     pub fn verify_hash(&self, payload: &[u8]) -> bool {
-        let actual_hash = blake3::hash(payload);
-        actual_hash.as_bytes() == &self.payload_hash
+        u64::try_from(payload.len()).ok() == Some(self.total_len)
+            && blake3::hash(payload).as_bytes() == &self.payload_hash
     }
 }
 

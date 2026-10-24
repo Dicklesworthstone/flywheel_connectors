@@ -37,6 +37,11 @@ pub enum GcpError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// The provider's pagination could not be completed. Static reasons keep
+    /// opaque cursors and provider payloads out of diagnostics.
+    #[error("GCP listing incomplete: {reason}; no partial results were returned")]
+    IncompleteListing { reason: &'static str },
 }
 
 impl GcpError {
@@ -52,7 +57,8 @@ impl GcpError {
             | Self::Async(_)
             | Self::Config(_)
             | Self::ProjectRequired(_)
-            | Self::InvalidInput(_) => false,
+            | Self::InvalidInput(_)
+            | Self::IncompleteListing { .. } => false,
         }
     }
 
@@ -110,6 +116,13 @@ impl GcpError {
                 code: 1005,
                 message: message.clone(),
             },
+            Self::IncompleteListing { .. } => FcpError::External {
+                service: "gcp".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
         }
     }
 }
@@ -141,6 +154,25 @@ impl ConnectorErrorMapping for GcpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_listing_is_not_a_success_or_retryable_host_result() {
+        let error = GcpError::IncompleteListing {
+            reason: "pagination cursor repeated",
+        };
+        assert!(!ConnectorErrorMapping::is_retryable(&error));
+        assert!(ConnectorErrorMapping::retry_after(&error).is_none());
+        assert!(matches!(
+            ConnectorErrorMapping::to_fcp_error(&error),
+            FcpError::External {
+                service,
+                message,
+                retryable: false,
+                retry_after: None,
+                status_code: None,
+            } if service == "gcp" && message.contains("no partial results")
+        ));
+    }
 
     #[test]
     fn rate_limited_is_retryable() {

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use fcp_core::{TailscaleNodeId, ZoneId};
 use fcp_crypto::ed25519::Ed25519SigningKey;
+use fcp_host::{BatchInvokeResponse, BatchStatus, OperationResultStatus};
 use fcp_kernel::{ConnectorId, InvokeResponse, InvokeStatus, InvokeTruthSource};
 use fcp_mesh::invoke_route::{
     MeshForwardBody, MeshForwardEnvelope, MeshForwardReply, advertised_connector_route_subject,
@@ -200,12 +201,26 @@ async fn entry_node_forwards_invoke_to_advertising_peer_and_labels_answer_mesh_b
     );
 
     // Catalog and introspection on the entry node see the peer's connector.
-    let discovery: Value = http_post_json(
-        entry.client.clone(),
-        format!("{}/rpc/discover", entry.base_url),
-        json!({}),
-    )
-    .await?;
+    let discovery_response = entry
+        .client
+        .post(format!("{}/rpc/discover", entry.base_url))
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        discovery_response.headers()["x-fcp-truth-source"],
+        "mesh-backed"
+    );
+    assert_eq!(
+        discovery_response.headers()["x-fcp-truth-local-connectors"],
+        "0"
+    );
+    assert_eq!(
+        discovery_response.headers()["x-fcp-truth-mesh-connectors"],
+        "1"
+    );
+    let discovery: Value = discovery_response.json().await?;
     let listed = discovery["connectors"]
         .as_array()
         .expect("discovery connectors")
@@ -215,11 +230,19 @@ async fn entry_node_forwards_invoke_to_advertising_peer_and_labels_answer_mesh_b
         listed,
         "entry discovery must list the peer connector: {discovery}"
     );
-    let introspection: Value = http_get_json(
-        entry.client.clone(),
-        format!("{}/rpc/introspect/{REMOTE_CONNECTOR}", entry.base_url),
-    )
-    .await?;
+    let introspection_response = entry
+        .client
+        .get(format!(
+            "{}/rpc/introspect/{REMOTE_CONNECTOR}",
+            entry.base_url
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let introspection: Value = introspection_response.json().await?;
+    assert_eq!(introspection["read_route"]["truth_source"], "mesh-backed");
+    assert_eq!(introspection["read_route"]["entry_node"], "node-a");
+    assert_eq!(introspection["read_route"]["served_by"], "node-b");
     assert!(
         introspection["tools"]
             .as_array()
@@ -250,6 +273,130 @@ async fn entry_node_forwards_invoke_to_advertising_peer_and_labels_answer_mesh_b
 }
 
 #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn live_http_batch_forwards_remote_members_and_binds_verified_results()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let _executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Batch Remote",
+            )],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let (mut source, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    source.input = json!({"message": "remote batch value"});
+    let source_id = source.id.clone();
+    let (mut consumer, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    consumer.input = json!({
+        "message": {
+            "$fcp_batch_ref": {"operation": "source", "pointer": "/result/echo/message"}
+        }
+    });
+    let consumer_id = consumer.id.clone();
+
+    // Exercise the alternate public route and reverse submission order: the
+    // dependency determines dispatch order, while results keep caller order.
+    let response: BatchInvokeResponse = http_post_json(
+        entry.client.clone(),
+        format!("{}/rpc/batch-invoke", entry.base_url),
+        json!({
+            "operations": [
+                {"id": "consumer", "request": consumer, "depends_on": ["source"]},
+                {"id": "source", "request": source, "depends_on": []}
+            ],
+            "options": {"max_parallelism": 2, "timeout_ms": 30_000}
+        }),
+    )
+    .await?;
+    assert_eq!(response.status, BatchStatus::Success, "{response:?}");
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (2, 0, 0)
+    );
+    assert_eq!(response.results[0].id, "consumer");
+    assert_eq!(response.results[1].id, "source");
+    for (result, request_id) in response.results.iter().zip([consumer_id, source_id]) {
+        assert_eq!(result.status, OperationResultStatus::Success);
+        let invoke: InvokeResponse = serde_json::from_value(result.output.clone().unwrap())?;
+        assert_eq!(invoke.id, request_id);
+        assert_eq!(invoke.status, InvokeStatus::Ok);
+        assert_eq!(
+            invoke.result.as_ref().unwrap()["echo"]["message"],
+            "remote batch value"
+        );
+        assert_eq!(
+            route_of(&invoke).truth_source,
+            InvokeTruthSource::MeshBacked
+        );
+        assert_eq!(route_of(&invoke).served_by.as_deref(), Some("node-b"));
+    }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn live_http_batch_remote_principal_denial_blocks_dependent_dispatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let _executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(
+                &remote_connector(),
+                "Batch Authority",
+            )],
+        )
+        .await?;
+    let entry = mesh.spawn("node-a", Vec::new()).await?;
+    let (source, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    let (mut consumer, _) = build_invoke_request(remote_connector(), &mesh.capability_key);
+    consumer.input = json!({
+        "message": {
+            "$fcp_batch_ref": {"operation": "source", "pointer": "/result/echo/message"}
+        }
+    });
+    let response: BatchInvokeResponse = entry
+        .client
+        .post(format!("{}/rpc/batch", entry.base_url))
+        .header("X-Principal", "user:other")
+        .json(&json!({
+            "operations": [
+                {"id": "source", "request": source, "depends_on": []},
+                {"id": "consumer", "request": consumer, "depends_on": ["source"]}
+            ],
+            "options": {"max_parallelism": 2, "timeout_ms": 30_000}
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        (response.completed, response.failed, response.skipped),
+        (0, 1, 1)
+    );
+    assert_eq!(response.results[0].status, OperationResultStatus::Error);
+    assert!(response.results[0].output.is_none());
+    let denial = response.results[0].error.as_ref().unwrap();
+    assert!(
+        denial.message.contains("request principal `user:other`"),
+        "{denial:?}"
+    );
+    assert!(denial.retry_after_ms.is_none());
+    assert_eq!(response.results[1].status, OperationResultStatus::Skipped);
+    assert_eq!(
+        response.results[1].error.as_ref().unwrap().code,
+        "DEP_FAILED"
+    );
+    assert!(response.results[1].output.is_none());
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
 async fn remote_connector_inventory_and_status_are_available_without_admin_credentials()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = host_e2e_lock().await;
@@ -269,22 +416,26 @@ async fn remote_connector_inventory_and_status_are_available_without_admin_crede
     // be needed or forwarded to the executor to inspect a remote connector.
     for suffix in ["", "/status"] {
         let path = format!("/rpc/connectors/{REMOTE_CONNECTOR}{suffix}");
-        let direct: Value = executor
+        let direct_response = executor
             .client
             .get(format!("{}{path}", executor.base_url))
+            .header("x-fcp-truth-source", "mesh-backed")
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let forwarded: Value = entry
+            .error_for_status()?;
+        let direct: Value = direct_response.json().await?;
+        assert!(direct.get("read_route").is_none());
+        let forwarded_response = entry
             .client
             .get(format!("{}{path}", entry.base_url))
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let forwarded: Value = forwarded_response.json().await?;
+        assert_eq!(forwarded["read_route"]["truth_source"], "mesh-backed");
+        assert_eq!(forwarded["read_route"]["entry_node"], "node-a");
+        assert_eq!(forwarded["read_route"]["served_by"], "node-b");
+        assert_eq!(forwarded["read_route"]["hop_count"], 1);
         if suffix.is_empty() {
             assert_eq!(forwarded["connector"]["id"], REMOTE_CONNECTOR);
             assert_eq!(forwarded["connector"]["name"], "Remote Inventory");
@@ -320,6 +471,48 @@ async fn remote_connector_inventory_and_status_are_available_without_admin_crede
             .await?;
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     }
+    Ok(())
+}
+
+#[fcp_async_core::runtime::test(flavor = "multi_thread")]
+async fn mesh_discovery_does_not_promote_local_records_to_mesh_truth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = host_e2e_lock().await;
+    let mesh = MeshFixture::new(&["node-a", "node-b"])?;
+    let _executor = mesh
+        .spawn(
+            "node-b",
+            vec![plain_test_connector_config(&remote_connector(), "Remote")],
+        )
+        .await?;
+    let local = ConnectorId::from_static("fcp.test.mesh-local:utility:1.0.0");
+    let entry = mesh
+        .spawn("node-a", vec![plain_test_connector_config(&local, "Local")])
+        .await?;
+
+    let response = entry
+        .client
+        .post(format!("{}/rpc/discover", entry.base_url))
+        .header("x-fcp-truth-source", "mesh-backed")
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(response.headers()["x-fcp-truth-source"], "host-backed");
+    assert_eq!(response.headers()["x-fcp-truth-local-connectors"], "1");
+    assert_eq!(response.headers()["x-fcp-truth-mesh-connectors"], "1");
+    let discovery: Value = response.json().await?;
+    assert_eq!(discovery["connectors"].as_array().unwrap().len(), 2);
+
+    let response = entry
+        .client
+        .get(format!("{}/rpc/introspect/{local}", entry.base_url))
+        .header("x-fcp-truth-source", "mesh-backed")
+        .send()
+        .await?
+        .error_for_status()?;
+    let introspection: Value = response.json().await?;
+    assert!(introspection.get("read_route").is_none());
     Ok(())
 }
 
@@ -486,6 +679,7 @@ async fn peer_forward_endpoint_rejects_forged_misaddressed_and_replayed_envelope
     let body = || MeshForwardBody::Invoke {
         request_json: serde_json::to_string(&request).expect("request json"),
         asserted_principal: None,
+        origin_attempt_id: None,
     };
     let now_ms = u64::try_from(
         std::time::SystemTime::now()

@@ -10,7 +10,7 @@
 //! Based on bead `flywheel_connectors-2653`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use fcp_async_core::process::Child;
@@ -58,6 +58,17 @@ pub const fn default_cancellation_deadline(archetype: ConnectorArchetype) -> Dur
     }
 }
 
+/// Signed origin and invocation generation that admitted a relayed operation.
+/// This binding is retained after completion so an old relay cannot cancel a
+/// newer invocation that reuses the same client operation ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCancellationBinding {
+    /// Authenticated mesh node that originally forwarded the invocation.
+    pub origin_node: String,
+    /// Invocation attempt allocated by that origin before forwarding.
+    pub origin_attempt_id: u64,
+}
+
 /// Deadline policy recorded when a subprocess-backed operation is tracked.
 /// Registrations without a backing subprocess
 /// ([`CancellationController::track_with_owner`]) never expire.
@@ -75,6 +86,8 @@ pub struct CancellationScope {
     /// Optional concrete-runtime terminator. Unsupported runtimes must not
     /// be falsely reported as force-terminated.
     pub terminator: Option<CancellationTerminator>,
+    /// Signed mesh origin and invocation generation, when this is a relay.
+    pub relay: Option<RelayCancellationBinding>,
 }
 
 impl CancellationScope {
@@ -86,6 +99,7 @@ impl CancellationScope {
             archetype,
             deadline_override: None,
             terminator: None,
+            relay: None,
         }
     }
 
@@ -114,6 +128,11 @@ impl CancellationScope {
 }
 
 /// An operation whose cancellation deadline expired without completion.
+///
+/// Retain this handle through the termination attempt, then report its result
+/// with the registration-aware controller methods. Clones share attempt
+/// ownership. If every handle disappears without a recorded result, a later
+/// sweep can retry a supported runtime without resetting its original deadline.
 #[derive(Debug, Clone)]
 pub struct ExpiredCancellation {
     /// Operation that ignored its cancellation past the deadline.
@@ -125,6 +144,9 @@ pub struct ExpiredCancellation {
     /// Captured runtime from the operation, not the current registry entry.
     pub terminator: Option<CancellationTerminator>,
     registration: Arc<()>,
+    // The operation map holds only a Weak reference. Task cancellation, unwind,
+    // or dropping an unpolled attempt therefore cannot strand a dispatch latch.
+    attempt: Arc<()>,
 }
 
 /// Identity of one registration, independent of a reusable client operation ID.
@@ -176,6 +198,9 @@ struct TrackedOperation {
     /// closes br-jdaro, where knowing the client-chosen operation ID
     /// was sufficient to cancel any in-flight operation.
     owner: Option<String>,
+    /// Kept separately from scope so completed tombstones still reject stale
+    /// mesh cancellations after the runtime termination handle is disarmed.
+    relay: Option<RelayCancellationBinding>,
     /// Subprocess-backed deadline policy. `None` for bookkeeping-only
     /// registrations ([`CancellationController::track_with_owner`]),
     /// which never expire and are never force-terminated.
@@ -184,9 +209,20 @@ struct TrackedOperation {
     cancel_requested_at: Option<Instant>,
     /// Original cancellation reason, replayed into the forced audit event.
     cancel_reason: Option<CancelReason>,
-    /// Set once the reaper dispatched a force-terminate for this
-    /// operation, keeping reaped sweeps idempotent.
+    /// Whether an attempt was dispatched. Unsupported targets retain this
+    /// latch; supported targets may retry after all attempt owners disappear.
     forced_cancel_sent: bool,
+    /// Identity and liveness of the current termination attempt, not its runtime.
+    force_attempt: Weak<()>,
+    /// Acknowledged termination is terminal even if its audit history is cleared.
+    forced_cancel_recorded: bool,
+}
+
+impl TrackedOperation {
+    fn owns_expiration(&self, expired: &ExpiredCancellation) -> bool {
+        Arc::ptr_eq(&self.registration, &expired.registration)
+            && Weak::ptr_eq(&self.force_attempt, &Arc::downgrade(&expired.attempt))
+    }
 }
 
 fn disarm_scope(scope: Option<CancellationScope>) {
@@ -251,10 +287,13 @@ impl CancellationController {
                     completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
+                    relay: None,
                     scope: None,
                     cancel_requested_at: None,
                     cancel_reason: None,
                     forced_cancel_sent: false,
+                    force_attempt: Weak::new(),
+                    forced_cancel_recorded: false,
                 },
             )
         };
@@ -287,6 +326,13 @@ impl CancellationController {
         owner: Option<&str>,
         scope: CancellationScope,
     ) -> HostResult<CancellationRegistration> {
+        if scope.relay.as_ref().is_some_and(|relay| {
+            relay.origin_node.trim().is_empty() || relay.origin_attempt_id == 0
+        }) {
+            return Err(HostError::PreflightFailed(
+                "relayed invocation requires a nonempty origin and nonzero attempt ID".to_owned(),
+            ));
+        }
         let registration = CancellationRegistration {
             operation_id: operation_id.to_string(),
             identity: Arc::new(()),
@@ -309,10 +355,13 @@ impl CancellationController {
                     completion_pending: false,
                     cancel_requested: false,
                     owner: owner.map(str::to_string),
+                    relay: scope.relay.clone(),
                     scope: Some(scope),
                     cancel_requested_at: None,
                     cancel_reason: None,
                     forced_cancel_sent: false,
+                    force_attempt: Weak::new(),
+                    forced_cancel_recorded: false,
                 },
             )
         };
@@ -456,6 +505,49 @@ impl CancellationController {
         asserted_principal: Option<&str>,
         now: DateTime<Utc>,
     ) -> HostResult<CancellationResponse> {
+        self.cancel_matching(request, asserted_principal, None, now)
+    }
+
+    /// Cancel only the invocation admitted by this authenticated mesh origin.
+    /// The verified principal, retained origin, and origin attempt must all
+    /// match under the same lock that performs the cancellation transition.
+    /// Completed matching invocations return `TooLate`; a reused operation ID
+    /// never transfers cancellation authority to the new invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::ConnectorNotFound`] when the operation is absent,
+    /// or [`HostError::PreflightFailed`] for missing or mismatched authority.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn cancel_relay(
+        &self,
+        request: &CancellationRequest,
+        verified_principal: &str,
+        relay: &RelayCancellationBinding,
+        now: DateTime<Utc>,
+    ) -> HostResult<CancellationResponse> {
+        if verified_principal.trim().is_empty()
+            || relay.origin_node.trim().is_empty()
+            || relay.origin_attempt_id == 0
+        {
+            return Err(HostError::PreflightFailed(
+                "mesh cancellation requires a verified principal, origin, and attempt ID"
+                    .to_owned(),
+            ));
+        }
+        self.cancel_matching(request, Some(verified_principal), Some(relay), now)
+    }
+
+    fn cancel_matching(
+        &self,
+        request: &CancellationRequest,
+        asserted_principal: Option<&str>,
+        relay: Option<&RelayCancellationBinding>,
+        now: DateTime<Utc>,
+    ) -> HostResult<CancellationResponse> {
         let start = Instant::now();
 
         let outcome = {
@@ -468,6 +560,14 @@ impl CancellationController {
                     )));
                 }
                 Some(op) => {
+                    if let Some(relay) = relay
+                        && (op.owner.is_none() || op.relay.as_ref() != Some(relay))
+                    {
+                        return Err(HostError::PreflightFailed(format!(
+                            "mesh cancellation origin or invocation generation mismatch for operation {}",
+                            request.operation_id
+                        )));
+                    }
                     // br-jdaro: reject mismatched principal BEFORE any
                     // state mutation. If no owner was recorded at track
                     // time, fall through to the legacy permissive path.
@@ -550,12 +650,17 @@ impl CancellationController {
     /// Sweep for operations whose cancellation deadline expired without
     /// completion (`flywheel_connectors-861lx`).
     ///
-    /// Returns each expired operation exactly once (the reaper marks it as
-    /// dispatched), so repeated sweeps never double force-terminate.
-    /// Completed operations and bookkeeping-only registrations (no scope)
-    /// never expire. The tracking entry is deliberately kept: the in-flight
-    /// invoke completes (or errors) on its own when the subprocess dies, and
-    /// no Strict-idempotency intent is released by a forced cancel.
+    /// At most one live attempt is returned for each operation. Retaining any
+    /// clone of its expiration suppresses duplicate dispatch; losing all clones
+    /// without acknowledgement makes a supported runtime eligible on the next
+    /// sweep. Explicit rearming invalidates that attempt before retrying. The
+    /// original cancellation instant and operator deadline never reset.
+    ///
+    /// Unsupported targets are reported once, not retried in a busy loop.
+    /// Completed, acknowledged, and bookkeeping-only registrations never expire.
+    /// Neither losing an attempt nor acknowledging its result releases the
+    /// operation ID or any Strict-idempotency intent. Physical termination must
+    /// still be observed by the caller before it records a forced cancellation.
     ///
     /// # Panics
     ///
@@ -569,7 +674,7 @@ impl CancellationController {
         let mut ops = self.operations.lock().expect("operations lock");
         let mut expired = Vec::new();
         for (operation_id, op) in ops.iter_mut() {
-            if !op.cancel_requested || op.completed || op.forced_cancel_sent {
+            if !op.cancel_requested || op.completed || op.forced_cancel_recorded {
                 continue;
             }
             let Some(requested_at) = op.cancel_requested_at else {
@@ -578,8 +683,15 @@ impl CancellationController {
             let Some(scope) = op.scope.as_ref() else {
                 continue;
             };
+            if op.forced_cancel_sent
+                && (scope.terminator.is_none() || op.force_attempt.strong_count() != 0)
+            {
+                continue;
+            }
             let deadline = scope.effective_deadline();
             if now.saturating_duration_since(requested_at) >= deadline {
+                let attempt = Arc::new(());
+                op.force_attempt = Arc::downgrade(&attempt);
                 op.forced_cancel_sent = true;
                 expired.push(ExpiredCancellation {
                     operation_id: operation_id.clone(),
@@ -587,6 +699,7 @@ impl CancellationController {
                     deadline,
                     terminator: scope.terminator.clone(),
                     registration: Arc::clone(&op.registration),
+                    attempt,
                 });
             }
         }
@@ -600,7 +713,9 @@ impl CancellationController {
     /// [`Self::reap_expired`]. Emits `CancellationAuditEvent` with
     /// `outcome = Cancelled` and `forced = true`, replaying the original
     /// cancellation reason. The tracking entry stays until the regular
-    /// invoke path calls [`Self::complete`].
+    /// invoke path calls [`Self::complete`]. Repeated acknowledgement is inert.
+    /// Production reapers must use [`Self::record_forced_expiration`] to fence
+    /// both reused operation IDs and successive attempts.
     ///
     /// # Panics
     ///
@@ -609,7 +724,10 @@ impl CancellationController {
         self.record_forced_matching(operation_id, None, now);
     }
 
-    /// Record a forced cancellation only for the registration that expired.
+    /// Record a forced cancellation only for the current registration AND
+    /// termination attempt. Returns false for stale or duplicate results.
+    /// A valid result may arrive after the original waiter completed, provided
+    /// its operation ID has not been reused in the meantime.
     ///
     /// # Panics
     ///
@@ -620,13 +738,13 @@ impl CancellationController {
         expired: &ExpiredCancellation,
         now: DateTime<Utc>,
     ) -> bool {
-        self.record_forced_matching(&expired.operation_id, Some(&expired.registration), now)
+        self.record_forced_matching(&expired.operation_id, Some(expired), now)
     }
 
     fn record_forced_matching(
         &self,
         operation_id: &str,
-        identity: Option<&Arc<()>>,
+        expiration: Option<&ExpiredCancellation>,
         now: DateTime<Utc>,
     ) -> bool {
         let (reason, duration_ms) = {
@@ -634,10 +752,13 @@ impl CancellationController {
             let Some(op) = ops.get_mut(operation_id) else {
                 return false;
             };
-            if identity.is_some_and(|identity| !Arc::ptr_eq(identity, &op.registration)) {
+            if op.forced_cancel_recorded
+                || expiration.is_some_and(|expired| !op.owns_expiration(expired))
+            {
                 return false;
             }
             op.forced_cancel_sent = true;
+            op.forced_cancel_recorded = true;
             let duration_ms = op
                 .cancel_requested_at
                 .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX))
@@ -666,9 +787,9 @@ impl CancellationController {
     }
 
     /// Re-arm a failed force-terminate so the next reaper sweep retries
-    /// it (`flywheel_connectors-861lx`). Completed operations are never
-    /// re-armed: once the invoke path reports completion the deadline is
-    /// moot.
+    /// it (`flywheel_connectors-861lx`). Completed operations and acknowledged
+    /// termination results are never re-armed. Production reapers must use
+    /// [`Self::rearm_expiration`] to avoid rearming a newer attempt.
     ///
     /// # Panics
     ///
@@ -677,23 +798,26 @@ impl CancellationController {
         self.rearm_matching(operation_id, None);
     }
 
-    /// Retry only the registration whose termination attempt failed.
+    /// Retry only the current attempt for the registration whose termination
+    /// failed. Late failures cannot displace a newer in-flight attempt.
     ///
     /// # Panics
     ///
     /// Panics if the operations mutex is poisoned.
     pub fn rearm_expiration(&self, expired: &ExpiredCancellation) {
-        self.rearm_matching(&expired.operation_id, Some(&expired.registration));
+        self.rearm_matching(&expired.operation_id, Some(expired));
     }
 
-    fn rearm_matching(&self, operation_id: &str, identity: Option<&Arc<()>>) {
+    fn rearm_matching(&self, operation_id: &str, expiration: Option<&ExpiredCancellation>) {
         let mut ops = self.operations.lock().expect("operations lock");
         if let Some(op) = ops.get_mut(operation_id) {
-            if identity.is_some_and(|identity| !Arc::ptr_eq(identity, &op.registration)) {
+            if expiration.is_some_and(|expired| !op.owns_expiration(expired)) {
                 return;
             }
-            if !op.completed {
+            if !op.completed && !op.forced_cancel_recorded {
                 op.forced_cancel_sent = false;
+                // Invalidate even before the next sweep publishes a new attempt.
+                op.force_attempt = Weak::new();
             }
         }
     }
@@ -1175,6 +1299,139 @@ mod tests {
         assert_eq!(expired.len(), 1);
         controller.remove("removed");
         assert!(!expired[0].terminator.as_ref().unwrap().abort());
+    }
+
+    #[test]
+    fn relay_cancellation_fences_owner_origin_and_reused_operation_ids() {
+        let controller = CancellationController::new();
+        let binding = RelayCancellationBinding {
+            origin_node: "entry-a".to_owned(),
+            origin_attempt_id: 41,
+        };
+        let scope_for = |relay: RelayCancellationBinding| {
+            let mut scope =
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+            scope.relay = Some(relay);
+            scope
+        };
+        let registration = controller
+            .track_operation("relayed", Some("owner"), scope_for(binding.clone()))
+            .unwrap();
+        let request = cancel_request("relayed", CancelReason::UserRequested);
+        let other_origin = RelayCancellationBinding {
+            origin_node: "entry-b".to_owned(),
+            ..binding.clone()
+        };
+        let next = RelayCancellationBinding {
+            origin_attempt_id: 42,
+            ..binding.clone()
+        };
+
+        for (principal, relay) in [
+            ("other", &binding),
+            ("owner", &other_origin),
+            ("owner", &next),
+        ] {
+            assert!(matches!(
+                controller.cancel_relay(&request, principal, relay, fixed_now()),
+                Err(HostError::PreflightFailed(_))
+            ));
+            assert!(!controller.is_cancel_requested("relayed"));
+            assert!(controller.audit_events().is_empty());
+        }
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled
+        );
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Pending
+        );
+        controller.complete_registration(&registration);
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &binding, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::TooLate
+        );
+        assert!(matches!(
+            controller.cancel_relay(&request, "owner", &other_origin, fixed_now()),
+            Err(HostError::PreflightFailed(_))
+        ));
+
+        controller
+            .track_operation("relayed", Some("owner"), scope_for(next.clone()))
+            .unwrap();
+        assert!(matches!(
+            controller.cancel_relay(&request, "owner", &binding, fixed_now()),
+            Err(HostError::PreflightFailed(_))
+        ));
+        assert!(!controller.is_cancel_requested("relayed"));
+        assert_eq!(
+            controller
+                .cancel_relay(&request, "owner", &next, fixed_now())
+                .unwrap()
+                .outcome,
+            CancellationOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn relay_cancellation_rejects_missing_authority_without_changing_local_cancel() {
+        let controller = CancellationController::new();
+        for (origin, attempt) in [("", 1), ("   ", 1), ("entry", 0)] {
+            let mut scope =
+                CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+            scope.relay = Some(RelayCancellationBinding {
+                origin_node: origin.to_owned(),
+                origin_attempt_id: attempt,
+            });
+            assert!(matches!(
+                controller.track_operation("invalid", Some("owner"), scope),
+                Err(HostError::PreflightFailed(_))
+            ));
+        }
+        assert_eq!(controller.tracked_count(), 0);
+
+        let binding = RelayCancellationBinding {
+            origin_node: "entry".to_owned(),
+            origin_attempt_id: 1,
+        };
+        let mut scope =
+            CancellationScope::new("connector", ConnectorArchetype::RequestResponse);
+        scope.relay = Some(binding.clone());
+        controller.track_operation("unowned", None, scope).unwrap();
+        controller.track_with_owner("local", Some("owner"));
+
+        for operation_id in ["unowned", "local"] {
+            let request = cancel_request(operation_id, CancelReason::UserRequested);
+            assert!(matches!(
+                controller.cancel_relay(&request, "owner", &binding, fixed_now()),
+                Err(HostError::PreflightFailed(_))
+            ));
+            assert!(!controller.is_cancel_requested(operation_id));
+        }
+        assert!(controller.audit_events().is_empty());
+        for (operation_id, principal) in [("unowned", None), ("local", Some("owner"))] {
+            assert_eq!(
+                controller
+                    .cancel(
+                        &cancel_request(operation_id, CancelReason::UserRequested),
+                        principal,
+                        fixed_now(),
+                    )
+                    .unwrap()
+                    .outcome,
+                CancellationOutcome::Cancelled
+            );
+        }
     }
 
     fn fixed_now() -> DateTime<Utc> {
@@ -3185,6 +3442,7 @@ mod tests {
         };
         let json = serde_json::to_string(&pr).unwrap();
         let parsed: PartialResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.completed_items, 0);
         assert_eq!(parsed.total_items, Some(0));
     }
 
@@ -3900,5 +4158,216 @@ mod tests {
             !status.success(),
             "SIGKILL-terminated process must not report success"
         );
+    }
+
+    // ── Lost termination attempts: recover ownership, never invent exit ──
+
+    fn cancellable_attempt(
+        controller: &CancellationController,
+        operation_id: &str,
+    ) -> CancellationRegistration {
+        let registration = controller
+            .track_operation(
+                operation_id,
+                None,
+                CancellationScope::new(operation_id, ConnectorArchetype::RequestResponse)
+                    .with_deadline_override_ms(Some(500))
+                    .with_terminator(CancellationTerminator::new(|| {}, || false)),
+            )
+            .unwrap();
+        controller
+            .cancel(
+                &cancel_request(operation_id, CancelReason::UserRequested),
+                None,
+                fixed_now(),
+            )
+            .unwrap();
+        registration
+    }
+
+    #[test]
+    fn lost_attempt_retries_only_after_last_clone_without_resetting_deadline() {
+        let controller = CancellationController::new();
+        let registration = cancellable_attempt(&controller, "lost");
+        let requested_at = controller.operations.lock().unwrap()["lost"]
+            .cancel_requested_at.unwrap();
+        let at_deadline = requested_at + Duration::from_millis(500);
+        assert!(controller.reap_expired(at_deadline - Duration::from_nanos(1)).is_empty());
+        let original = controller.reap_expired(at_deadline).pop().unwrap();
+        let retained = original.clone();
+        let old_attempt = Arc::downgrade(&original.attempt);
+        drop(original);
+        assert!(controller.reap_expired(at_deadline).is_empty());
+        drop(retained);
+        let retry = controller.reap_expired(at_deadline).pop().unwrap();
+        assert!(!Weak::ptr_eq(&old_attempt, &Arc::downgrade(&retry.attempt)));
+        assert!(Arc::ptr_eq(&registration.identity, &retry.registration));
+        assert_eq!(retry.deadline, Duration::from_millis(500));
+        assert_eq!(controller.operations.lock().unwrap()["lost"].cancel_requested_at, Some(requested_at));
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+        assert!(controller.track_operation(
+            "lost", None, CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+        ).is_err(), "losing a reaper is not completion of the invocation");
+    }
+
+    #[test]
+    fn dropping_unpolled_or_pending_attempt_futures_recovers_dispatch() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let controller = CancellationController::new();
+        cancellable_attempt(&controller, "dropped-future");
+        let now = Instant::now() + Duration::from_secs(1);
+        for poll_first in [false, true] {
+            let expired = controller.reap_expired(now).pop().unwrap();
+            let mut work = Box::pin(async move {
+                std::future::pending::<()>().await;
+                drop(expired);
+            });
+            if poll_first {
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(work.as_mut().poll(&mut context).is_pending());
+            }
+            assert!(controller.reap_expired(now).is_empty());
+            drop(work);
+        }
+        assert_eq!(controller.reap_expired(now).len(), 1);
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+    }
+
+    #[test]
+    fn unwinding_attempt_recovers_without_explicit_rearm() {
+        let controller = CancellationController::new();
+        cancellable_attempt(&controller, "unwound");
+        let now = Instant::now() + Duration::from_secs(1);
+        let expired = controller.reap_expired(now).pop().unwrap();
+        let failed = std::thread::spawn(move || {
+            let _owned_attempt = expired;
+            panic!("termination worker failed before reporting its result");
+        });
+        assert!(failed.join().is_err());
+        assert_eq!(controller.reap_expired(now).len(), 1);
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+    }
+
+    #[test]
+    fn stale_attempt_results_cannot_acknowledge_or_rearm_a_newer_attempt() {
+        let controller = CancellationController::new();
+        cancellable_attempt(&controller, "retry-fenced");
+        let now = Instant::now() + Duration::from_secs(1);
+        let old = controller.reap_expired(now).pop().unwrap();
+        controller.rearm_expiration(&old);
+        assert!(!controller.record_forced_expiration(&old, fixed_now()));
+        let current = controller.reap_expired(now).pop().unwrap();
+        assert!(Arc::ptr_eq(&old.registration, &current.registration));
+        assert!(!Arc::ptr_eq(&old.attempt, &current.attempt));
+        controller.rearm_expiration(&old);
+        assert!(controller.reap_expired(now).is_empty());
+        assert!(!controller.record_forced_expiration(&old, fixed_now()));
+        assert!(controller.record_forced_expiration(&current, fixed_now()));
+        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+    }
+
+    #[test]
+    fn concurrent_acknowledgements_emit_one_forced_audit_and_cannot_be_rearmed() {
+        let controller = Arc::new(CancellationController::new());
+        cancellable_attempt(&controller, "ack-once");
+        let now = Instant::now() + Duration::from_secs(1);
+        let expired = controller.reap_expired(now).pop().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers = [(), ()].map(|()| {
+            let controller = Arc::clone(&controller);
+            let barrier = Arc::clone(&barrier);
+            let expired = expired.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                controller.record_forced_expiration(&expired, fixed_now())
+            })
+        });
+        barrier.wait();
+        let results = workers.map(|worker| worker.join().unwrap());
+        assert_eq!(results.into_iter().filter(|recorded| *recorded).count(), 1);
+        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+        controller.rearm_expiration(&expired);
+        controller.rearm_force_terminate("ack-once");
+        controller.record_forced_cancellation("ack-once", fixed_now());
+        assert_eq!(controller.audit_events().iter().filter(|event| event.forced).count(), 1);
+        controller.clear_audit_log();
+        assert!(!controller.record_forced_expiration(&expired, fixed_now()));
+        drop(expired);
+        assert!(controller.reap_expired(now).is_empty());
+        assert!(controller.audit_events().is_empty());
+        assert!(controller.track_operation(
+            "ack-once", None, CancellationScope::new("replacement", ConnectorArchetype::RequestResponse),
+        ).is_err(), "acknowledging termination must not release the operation ID");
+    }
+
+    #[test]
+    fn lost_attempts_recover_independently_while_another_attempt_remains_owned() {
+        let controller = CancellationController::new();
+        for id in ["kept", "lost-a", "lost-b"] {
+            cancellable_attempt(&controller, id);
+        }
+        let now = Instant::now() + Duration::from_secs(1);
+        let mut expired = controller.reap_expired(now);
+        assert_eq!(expired.len(), 3);
+        let retained_index = expired.iter().position(|entry| entry.operation_id == "kept").unwrap();
+        let retained = expired.swap_remove(retained_index);
+        drop(expired);
+        let retries = controller.reap_expired(now);
+        let ids: std::collections::BTreeSet<_> = retries.iter()
+            .map(|entry| entry.operation_id.as_str()).collect();
+        assert_eq!(ids, std::collections::BTreeSet::from(["lost-a", "lost-b"]));
+        assert!(controller.reap_expired(now).is_empty());
+        drop(retained);
+        let recovered = controller.reap_expired(now);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].operation_id, "kept");
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+    }
+
+    #[test]
+    fn lost_attempt_does_not_resurrect_completed_removed_or_replaced_registrations() {
+        let controller = CancellationController::new();
+        let completed = cancellable_attempt(&controller, "completed-attempt");
+        cancellable_attempt(&controller, "removed-attempt");
+        let now = Instant::now() + Duration::from_secs(1);
+        let old = controller.reap_expired(now);
+        controller.complete_registration(&completed);
+        controller.remove("removed-attempt");
+        drop(old);
+        assert!(controller.reap_expired(now).is_empty());
+
+        let replacement = cancellable_attempt(&controller, "completed-attempt");
+        let current = controller.reap_expired(now).pop().unwrap();
+        assert!(Arc::ptr_eq(&current.registration, &replacement.identity));
+        assert!(!Arc::ptr_eq(&current.registration, &completed.identity));
+        controller.complete_registration(&completed);
+        assert!(controller.reap_expired(now).is_empty());
+        drop(current);
+        let retry = controller.reap_expired(now).pop().unwrap();
+        assert!(Arc::ptr_eq(&retry.registration, &replacement.identity));
+    }
+
+    #[test]
+    fn unsupported_target_is_not_automatically_redispatched_after_handle_loss() {
+        let controller = CancellationController::new();
+        controller.track_operation(
+            "unsupported", None,
+            CancellationScope::new("unsupported", ConnectorArchetype::RequestResponse)
+                .with_deadline_override_ms(Some(1)),
+        ).unwrap();
+        controller.cancel(
+            &cancel_request("unsupported", CancelReason::UserRequested), None, fixed_now(),
+        ).unwrap();
+        let now = Instant::now() + Duration::from_secs(1);
+        let expired = controller.reap_expired(now);
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].terminator.is_none());
+        drop(expired);
+        assert!(controller.reap_expired(now + Duration::from_secs(60)).is_empty());
+        assert!(controller.audit_events().iter().all(|event| !event.forced));
+        controller.rearm_force_terminate("unsupported");
+        assert_eq!(controller.reap_expired(now).len(), 1, "explicit legacy retry remains available");
     }
 }

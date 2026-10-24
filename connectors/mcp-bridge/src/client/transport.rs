@@ -6,7 +6,7 @@
 
 use std::future::Future;
 
-use reqwest::Response;
+use reqwest::{Response, header::HeaderValue};
 use serde_json::{Value, json};
 
 use crate::error::{McpBridgeError, McpBridgeResult};
@@ -15,6 +15,27 @@ use crate::types::JsonRpcError;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_MESSAGES: usize = 1024;
+const MAX_RESUME_ID_BYTES: usize = 8 * 1024;
+const MAX_RESUMPTIONS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct StreamLimits {
+    bytes: usize,
+    event_bytes: usize,
+    messages: usize,
+    resumptions: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            bytes: MAX_RESPONSE_BYTES,
+            event_bytes: MAX_EVENT_BYTES,
+            messages: MAX_STREAM_MESSAGES,
+            resumptions: MAX_RESUMPTIONS,
+        }
+    }
+}
 
 /// Deserialization contract failures are terminal, even for read-only methods.
 /// Never include untrusted response bodies, request ids, or credentials here.
@@ -45,13 +66,53 @@ pub(super) async fn read_bounded(mut response: Response, limit: usize) -> McpBri
 /// POST under the originating call's authority and deadline. Only ping is
 /// implemented; unsupported capabilities get -32601, never local side effects.
 pub(super) async fn read_rpc_response<F, Fut>(
-    mut response: Response,
+    response: Response,
     expected_id: u64,
-    mut respond: F,
+    respond: F,
 ) -> McpBridgeResult<Value>
 where
     F: FnMut(Value) -> Fut,
     Fut: Future<Output = McpBridgeResult<()>>,
+{
+    // Initialization has not yet published a managed session. It keeps its
+    // existing single-response behavior rather than inventing resume authority.
+    read_rpc_response_inner(
+        response, expected_id, respond,
+        |_| std::future::ready(Err(invalid_response("resumption is unavailable"))),
+        StreamLimits { resumptions: 0, ..StreamLimits::default() },
+    ).await
+}
+
+/// Resume only the interrupted response stream, never the originating POST.
+/// `resume` must GET the original endpoint under its original session authority.
+/// All streams share the caller's existing deadline and the aggregate bounds.
+pub(super) async fn read_resumable_rpc_response<F, Fut, R, RFut>(
+    response: Response,
+    expected_id: u64,
+    respond: F,
+    resume: R,
+) -> McpBridgeResult<Value>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: Future<Output = McpBridgeResult<()>>,
+    R: FnMut(HeaderValue) -> RFut,
+    RFut: Future<Output = McpBridgeResult<Response>>,
+{
+    read_rpc_response_inner(response, expected_id, respond, resume, StreamLimits::default()).await
+}
+
+async fn read_rpc_response_inner<F, Fut, R, RFut>(
+    mut response: Response,
+    expected_id: u64,
+    mut respond: F,
+    mut resume: R,
+    limits: StreamLimits,
+) -> McpBridgeResult<Value>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: Future<Output = McpBridgeResult<()>>,
+    R: FnMut(HeaderValue) -> RFut,
+    RFut: Future<Output = McpBridgeResult<Response>>,
 {
     let content_type = response
         .headers()
@@ -61,7 +122,7 @@ where
         .map(str::trim)
         .ok_or_else(|| invalid_response("missing Content-Type"))?;
     if content_type.eq_ignore_ascii_case("application/json") {
-        let body = read_bounded(response, MAX_RESPONSE_BYTES).await?;
+        let body = read_bounded(response, limits.bytes).await?;
         return match classify_message(serde_json::from_slice(&body)?, expected_id)? {
             Message::Result(value) => Ok(value),
             Message::Error(error) => Err(error),
@@ -72,32 +133,79 @@ where
         return Err(invalid_response("unsupported Content-Type"));
     }
 
-    let mut decoder = SseDecoder::new(MAX_EVENT_BYTES);
+    let mut decoder = SseDecoder::new(limits.event_bytes);
     let mut received = 0_usize;
     let mut messages = 0_usize;
-    while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(received) {
-            return Err(invalid_response("SSE stream exceeds byte limit"));
-        }
-        received += chunk.len();
-        for &byte in chunk.as_ref() {
-            let Some(data) = decoder.push(byte)? else {
-                continue;
+    let mut checkpoint: Option<String> = None;
+    // At most two entries, irrespective of how many event IDs the server sends.
+    let mut resumed_from = Vec::new();
+    loop {
+        let failure = loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break None,
+                Err(error) => break Some(McpBridgeError::from(error)),
             };
-            messages += 1;
-            if messages > MAX_STREAM_MESSAGES {
-                return Err(invalid_response("too many messages before response"));
+            if chunk.len() > limits.bytes.saturating_sub(received) {
+                return Err(invalid_response("SSE stream exceeds byte limit"));
             }
-            match classify_message(serde_json::from_slice(&data)?, expected_id)? {
-                Message::Result(value) => return Ok(value),
-                Message::Error(error) => return Err(error),
-                Message::Notification => {}
-                Message::Respond(reply) => respond(reply).await?,
+            received += chunk.len();
+            for &byte in chunk.as_ref() {
+                if let Some(data) = decoder.push(byte)? {
+                    messages += 1;
+                    if messages > limits.messages {
+                        return Err(invalid_response("too many messages before response"));
+                    }
+                    match classify_message(serde_json::from_slice(&data)?, expected_id)? {
+                        Message::Result(value) => return Ok(value),
+                        Message::Error(error) => return Err(error),
+                        Message::Notification => {}
+                        Message::Respond(reply) => respond(reply).await?,
+                    }
+                }
+                // Advance only after a complete event block and successful
+                // processing (including any required server-request reply).
+                // Empty IDs explicitly clear the cursor, as required by SSE.
+                if let Some(id) = decoder.checkpoint_id.take() {
+                    checkpoint = if id.is_empty() { None } else { Some(id) };
+                }
             }
+        };
+
+        if limits.resumptions == 0 || checkpoint.is_none() {
+            // Preserve the existing safe-read retry classification before any
+            // GET; a failed resume must never request another operation POST.
+            if resumed_from.is_empty()
+                && let Some(error) = failure
+            {
+                return Err(error);
+            }
+            return Err(invalid_response("SSE ended before the requested response; outcome is unknown"));
         }
+        let id = checkpoint.as_ref().expect("checkpoint presence checked");
+        if resumed_from.len() >= limits.resumptions || resumed_from.contains(id) {
+            return Err(invalid_response("SSE resumption made no progress or exceeded its limit; outcome is unknown"));
+        }
+        let mut header = HeaderValue::from_bytes(id.as_bytes())
+            .map_err(|_| invalid_response("SSE resume cursor is not a valid HTTP header"))?;
+        header.set_sensitive(true);
+        resumed_from.push(id.clone());
+        drop(response);
+        response = resume(header).await.map_err(|_| {
+            invalid_response("SSE resumption failed; original operation outcome is unknown")
+        })?;
+        if response.status() != reqwest::StatusCode::OK
+            || !response.headers().get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(invalid_response("SSE resumption was not accepted; original operation outcome is unknown"));
+        }
+        // Discard a truncated event, never its received bytes. The next stream
+        // begins at the last fully consumed block; all counters remain shared.
+        decoder = SseDecoder::new(limits.event_bytes);
     }
-    // EOF is not an SSE event delimiter and is not a successful null result.
-    Err(invalid_response("SSE ended before the requested response"))
 }
 
 #[derive(Debug)]
@@ -175,6 +283,8 @@ struct SseDecoder {
     first_line: bool,
     skip_lf: bool,
     message_event: bool,
+    pending_id: Option<String>,
+    checkpoint_id: Option<String>,
 }
 
 impl SseDecoder {
@@ -186,6 +296,8 @@ impl SseDecoder {
             first_line: true,
             skip_lf: false,
             message_event: true,
+            pending_id: None,
+            checkpoint_id: None,
         }
     }
 
@@ -218,6 +330,9 @@ impl SseDecoder {
         let line = std::str::from_utf8(line)
             .map_err(|_| invalid_response("SSE contains invalid UTF-8"))?;
         if line.is_empty() {
+            if self.pending_id.is_some() {
+                self.checkpoint_id = self.pending_id.take();
+            }
             let emit = self.message_event && !self.data.is_empty();
             self.message_event = true;
             if emit {
@@ -241,13 +356,21 @@ impl SseDecoder {
                 self.data.push(b'\n');
             }
             "event" => self.message_event = value.is_empty() || value == "message",
-            // id/retry are not replay instructions for a POST. Reissuing a
-            // tools/call after a disconnect could repeat an external effect.
+            "id" if !value.contains('\0') => {
+                if value.len() > MAX_RESUME_ID_BYTES {
+                    return Err(invalid_response("SSE event ID exceeds byte limit"));
+                }
+                self.pending_id = Some(value.to_owned());
+            }
+            // A retry field never authorizes reissuing an operation POST.
             _ => {}
         }
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod resumption_tests;
 
 #[cfg(test)]
 mod tests {

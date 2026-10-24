@@ -323,10 +323,14 @@ impl Refresher {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::{self, Read, Write};
+    use std::sync::atomic::Ordering;
+
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_mesh::invoke_route::MeshPeerConfig;
     use fcp_mesh::peer_manifest::{MESH_PEER_DIRECTORY_SCHEMA, MeshPeerDirectoryPayload};
 
+    use super::super::{DirectoryGuard, MeshRoutingSettings, companion, private_options};
     use super::*;
 
     struct Fixture {
@@ -452,7 +456,9 @@ mod tests {
 
         fn start_file_router(&self) -> crate::mesh_routing::MeshRouter {
             use crate::mesh_routing::{
-                MESH_NODE_ID_ENV, MESH_REPLAY_JOURNAL_ENV, MESH_SIGNING_KEY_FILE_ENV,
+                MESH_DIRECTORY_ID_ENV, MESH_DIRECTORY_OWNER_KEYS_ENV, MESH_DIRECTORY_STATE_ENV,
+                MESH_NODE_ID_ENV, MESH_PEERS_FILE_ENV, MESH_REPLAY_JOURNAL_ENV,
+                MESH_SIGNING_KEY_FILE_ENV,
             };
 
             let key_path = self.dir.path().join("local.key");
@@ -481,6 +487,43 @@ mod tests {
             })
             .unwrap()
             .unwrap()
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mesh_inventory_withholds_expired_or_fenced_membership() {
+        use crate::mesh_routing::{MeshInventoryMembershipStatus, MeshInventoryStatus};
+
+        for failure in ["expired", "source_rejected", "storage_failed"] {
+            let fixture = Fixture::new();
+            let router = fixture.router();
+            match failure {
+                "expired" => {
+                    fixture
+                        .membership
+                        .publication
+                        .write()
+                        .unwrap()
+                        .validity
+                        .expired
+                        .store(true, Ordering::Release);
+                }
+                "source_rejected" => fixture.membership.refuse("signed_source_rejected"),
+                _ => fixture.membership.refuse("checkpoint_storage_failed"),
+            }
+            let inventory = router.inventory(vec![]).await;
+            assert!(inventory.mesh_configured);
+            assert_eq!(
+                inventory.membership_status,
+                MeshInventoryMembershipStatus::Unavailable
+            );
+            assert_eq!(inventory.nodes.len(), 1);
+            assert!(inventory.nodes[0].is_local);
+            assert_eq!(
+                inventory.nodes[0].inventory_status,
+                MeshInventoryStatus::Local
+            );
+            assert_eq!(inventory.nodes[0].node_id.as_deref(), Some("local"));
         }
     }
 
@@ -1150,6 +1193,7 @@ mod tests {
             MeshForwardBody::Invoke {
                 request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                 asserted_principal: None,
+                origin_attempt_id: None,
             },
         ))
         .unwrap();
@@ -1368,6 +1412,7 @@ mod tests {
                 MeshForwardBody::Invoke {
                     request_json: "{\"operation\":\"non_idempotent_write\"}".to_owned(),
                     asserted_principal: None,
+                    origin_attempt_id: None,
                 },
             ))
             .unwrap();

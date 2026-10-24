@@ -64,6 +64,7 @@ impl Fixture {
                 request_json: "{\"operation\":\"test.echo\",\"capability\":\"not-a-real-secret\"}"
                     .to_owned(),
                 asserted_principal: Some("agent:test".to_owned()),
+                origin_attempt_id: None,
             },
         )
         .unwrap()

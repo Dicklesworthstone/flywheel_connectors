@@ -7,8 +7,9 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -16,9 +17,17 @@ use fcp_prelude::ObjectId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[path = "migration_linux/command.rs"]
+mod command;
+#[path = "migration_linux/snapshot.rs"]
+mod snapshot;
+
+pub use command::{CriuCommandError, CriuCommandLimits, CriuCommandStopReason};
+
 const CRIU_DUMP_LOG: &str = "criu-dump.log";
 const CRIU_RESTORE_LOG: &str = "criu-restore.log";
 const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RESTORE_PID_BYTES: u64 = 32;
 
 /// Errors returned by Linux connector migration helpers.
 #[derive(Debug, Error)]
@@ -29,6 +38,13 @@ pub enum LinuxMigrationError {
     /// A caller supplied PID 0, which is not a dumpable process tree.
     #[error("connector pid must be non-zero")]
     InvalidPid,
+    /// A successful CRIU exit did not provide unambiguous root-PID evidence.
+    /// A restored process may already exist; this must not trigger a retry.
+    #[error("criu restore root PID is unconfirmed: {reason}; a process may already exist; reconcile before retrying")]
+    InvalidRestorePid {
+        /// Bounded classification, never untrusted PID-file or log contents.
+        reason: &'static str,
+    },
     /// Snapshot image directories must start empty so stale files cannot mix
     /// with a newly captured process image.
     #[error("checkpoint images directory is not empty: {path:?}")]
@@ -43,6 +59,18 @@ pub enum LinuxMigrationError {
         size_bytes: u64,
         /// Configured maximum.
         max_snapshot_bytes: u64,
+    },
+    /// Image metadata exceeded a structural bound before payload allocation.
+    #[error("checkpoint image tree exceeds its {limit} limit")]
+    SnapshotStructureLimit {
+        /// Fixed classification, not source-directory contents.
+        limit: &'static str,
+    },
+    /// A source image changed during bounded inspection or copying.
+    #[error("checkpoint image tree changed during inspection: {path:?}")]
+    SnapshotChanged {
+        /// Changed entry or tree root.
+        path: PathBuf,
     },
     /// A file descriptor path was outside the caller's migration policy.
     #[error("file descriptor {fd} path is not allowed by migration policy: {path:?}")]
@@ -73,6 +101,15 @@ pub enum LinuxMigrationError {
         status: String,
         /// Captured stderr.
         stderr: String,
+    },
+    /// CRIU setup, resource admission, execution or bounded capture failed.
+    #[error("criu {action}: {source}")]
+    CriuExecution {
+        /// CRIU action, or `configure` when validating local limits.
+        action: &'static str,
+        /// Subprocess-boundary failure, including exact-child reap evidence.
+        #[source]
+        source: CriuCommandError,
     },
     /// Filesystem or process-spawn failure.
     #[error("io error while {context}: {source}")]
@@ -265,7 +302,9 @@ pub struct ConnectorCheckpointManifest {
     pub connector_id: String,
     /// Source process ID.
     pub source_pid: u32,
-    /// Content-addressed identifier for the CRIU image directory contents.
+    /// V2 content address over sorted, length-framed image paths, entry types,
+    /// file lengths and bytes, including empty directories. This is not a
+    /// signature: authenticate this manifest before using it as a restore pin.
     pub snapshot_object_id: ObjectId,
     /// Total snapshot bytes captured under the image directory.
     pub snapshot_size_bytes: u64,
@@ -315,7 +354,9 @@ impl ConnectorRestoreRequest {
 pub struct ConnectorRestoreReport {
     /// Connector ID restored from checkpoint images.
     pub connector_id: String,
-    /// PID parsed from CRIU output when available.
+    /// Root PID read from this attempt's private CRIU `--pidfile`.
+    /// Successful restores always return `Some`; this is not an incarnation
+    /// handle or proof that the process is still alive when later inspected.
     pub restored_pid: Option<u32>,
     /// Restore duration in milliseconds.
     pub restore_duration_ms: u64,
@@ -331,6 +372,7 @@ pub struct CriuConnectorMigrator {
     criu_binary: PathBuf,
     limits: ConnectorMigrationLimits,
     require_linux: bool,
+    command_limits: CriuCommandLimits,
 }
 
 impl Default for CriuConnectorMigrator {
@@ -347,7 +389,27 @@ impl CriuConnectorMigrator {
             criu_binary: criu_binary.into(),
             limits,
             require_linux: true,
+            command_limits: CriuCommandLimits::default(),
         }
+    }
+
+    /// Set independent limits for each CRIU dump/restore command.
+    ///
+    /// Defaults are 60 seconds and 1 MiB of combined stdout/stderr. The
+    /// existing synchronous migration methods must run on a blocking worker,
+    /// not an async executor thread. OS spawn/kill/wait calls cannot be forcibly
+    /// preempted. Only the CRIU child is terminated on interruption; a restored
+    /// process may already exist and must be reconciled before any retry.
+    /// These limits do not bound CRIU's own image files or explicit log files.
+    ///
+    /// # Errors
+    /// Returns an error when the timeout or diagnostic-byte budget is zero.
+    pub fn with_command_limits(mut self, limits: CriuCommandLimits) -> Result<Self, LinuxMigrationError> {
+        limits.validate().map_err(|source| LinuxMigrationError::CriuExecution {
+            action: "configure", source,
+        })?;
+        self.command_limits = limits;
+        Ok(self)
     }
 
     /// Checkpoint a connector subprocess with CRIU.
@@ -382,14 +444,8 @@ impl CriuConnectorMigrator {
 
         let args = dump_args(request);
         let output = self.run_criu("dump", &args)?;
-        let snapshot_size_bytes = directory_size_bytes(&request.images_dir)?;
-        if snapshot_size_bytes > self.limits.max_snapshot_bytes {
-            return Err(LinuxMigrationError::SnapshotTooLarge {
-                size_bytes: snapshot_size_bytes,
-                max_snapshot_bytes: self.limits.max_snapshot_bytes,
-            });
-        }
-        let snapshot_object_id = object_id_for_directory(&request.images_dir)?;
+        let (snapshot_object_id, snapshot_size_bytes) =
+            snapshot::inspect(&request.images_dir, self.limits.max_snapshot_bytes)?;
 
         Ok(ConnectorCheckpointManifest {
             connector_id: request.connector_id.clone(),
@@ -405,10 +461,18 @@ impl CriuConnectorMigrator {
 
     /// Restore a connector subprocess from CRIU images.
     ///
+    /// CRIU exits after restoring the process tree (`--restore-detached`),
+    /// rather than waiting for the restored connector to exit. Root-PID
+    /// evidence comes only from a fresh private `--pidfile`, never stdout or
+    /// a stale file in the image directory. The caller still owns process
+    /// supervision, readiness checks, execution fencing and lease transfer.
+    ///
     /// # Errors
     ///
     /// Returns [`LinuxMigrationError`] if the platform is unsupported, the
-    /// image directory cannot be read, or CRIU restore fails.
+    /// image directory cannot be read, CRIU restore fails, or root-PID
+    /// evidence is missing or invalid. An error after launching restore does
+    /// not prove that no process was created and must not authorize a retry.
     pub fn restore_connector(
         &self,
         request: &ConnectorRestoreRequest,
@@ -418,13 +482,28 @@ impl CriuConnectorMigrator {
             context: "opening checkpoint images directory",
             source,
         })?;
+        let control = tempfile::Builder::new()
+            .prefix("fcp-criu-restore-")
+            .tempdir()
+            .map_err(|source| LinuxMigrationError::Io {
+                context: "creating private CRIU restore control directory",
+                source,
+            })?;
+        // Keep control files outside the content-addressed images. A fresh
+        // private directory also prevents reuse of another attempt's PID.
+        let pid_file = control.path().canonicalize().map_err(|source| {
+            LinuxMigrationError::Io {
+                context: "resolving private CRIU restore control directory",
+                source,
+            }
+        })?.join("root.pid");
         let started_at = Instant::now();
-        let args = restore_args(request);
+        let args = restore_args(request, &pid_file);
         let output = self.run_criu("restore", &args)?;
         let restore_duration_ms =
             u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let restored_pid = parse_restored_pid(&stdout);
+        let restored_pid = Some(read_restored_pid(&pid_file)?);
 
         Ok(ConnectorRestoreReport {
             connector_id: request.connector_id.clone(),
@@ -447,13 +526,8 @@ impl CriuConnectorMigrator {
         action: &'static str,
         args: &[OsString],
     ) -> Result<Output, LinuxMigrationError> {
-        let output = Command::new(&self.criu_binary)
-            .args(args)
-            .output()
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "running criu",
-                source,
-            })?;
+        let output = command::run(&self.criu_binary, args, self.command_limits)
+            .map_err(|source| LinuxMigrationError::CriuExecution { action, source })?;
         if !output.status.success() {
             return Err(LinuxMigrationError::CriuCommandFailed {
                 action,
@@ -470,6 +544,7 @@ impl CriuConnectorMigrator {
             criu_binary: criu_binary.into(),
             limits,
             require_linux: false,
+            command_limits: CriuCommandLimits::default(),
         }
     }
 }
@@ -500,9 +575,12 @@ fn dump_args(request: &ConnectorCheckpointRequest) -> Vec<OsString> {
     args
 }
 
-fn restore_args(request: &ConnectorRestoreRequest) -> Vec<OsString> {
+fn restore_args(request: &ConnectorRestoreRequest, pid_file: &Path) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("restore"),
+        OsString::from("--restore-detached"),
+        OsString::from("--pidfile"),
+        pid_file.as_os_str().to_os_string(),
         OsString::from("--images-dir"),
         request.images_dir.as_os_str().to_os_string(),
         OsString::from("--log-file"),
@@ -546,76 +624,6 @@ fn ensure_empty_directory(path: &Path) -> Result<(), LinuxMigrationError> {
     Ok(())
 }
 
-fn directory_size_bytes(path: &Path) -> Result<u64, LinuxMigrationError> {
-    let mut total = 0_u64;
-    for file in snapshot_files(path)? {
-        let len = fs::metadata(&file)
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "reading checkpoint image metadata",
-                source,
-            })?
-            .len();
-        total = total.saturating_add(len);
-    }
-    Ok(total)
-}
-
-fn object_id_for_directory(path: &Path) -> Result<ObjectId, LinuxMigrationError> {
-    let mut files = snapshot_files(path)?;
-    files.sort();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"FCP-HOST-CRIU-SNAPSHOT-V1");
-    for file in files {
-        let relative = file
-            .strip_prefix(path)
-            .map_err(|_| LinuxMigrationError::UnsupportedSnapshotEntry { path: file.clone() })?;
-        hasher.update(relative.as_os_str().as_encoded_bytes());
-        let bytes = fs::read(&file).map_err(|source| LinuxMigrationError::Io {
-            context: "reading checkpoint image bytes",
-            source,
-        })?;
-        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    Ok(ObjectId::from_unscoped_bytes(hasher.finalize().as_bytes()))
-}
-
-fn snapshot_files(root: &Path) -> Result<Vec<PathBuf>, LinuxMigrationError> {
-    let mut files = Vec::new();
-    collect_snapshot_files(root, &mut files)?;
-    Ok(files)
-}
-
-fn collect_snapshot_files(
-    path: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), LinuxMigrationError> {
-    for entry in fs::read_dir(path).map_err(|source| LinuxMigrationError::Io {
-        context: "reading checkpoint images directory",
-        source,
-    })? {
-        let entry = entry.map_err(|source| LinuxMigrationError::Io {
-            context: "reading checkpoint images directory entry",
-            source,
-        })?;
-        let file_type = entry
-            .file_type()
-            .map_err(|source| LinuxMigrationError::Io {
-                context: "reading checkpoint image file type",
-                source,
-            })?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            collect_snapshot_files(&path, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
-        } else {
-            return Err(LinuxMigrationError::UnsupportedSnapshotEntry { path });
-        }
-    }
-    Ok(())
-}
-
 fn is_safe_relative_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && !path.is_absolute()
@@ -624,10 +632,41 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn parse_restored_pid(stdout: &str) -> Option<u32> {
-    stdout
-        .split(|ch: char| !ch.is_ascii_digit())
-        .find_map(|token| token.parse::<u32>().ok().filter(|pid| *pid != 0))
+fn parse_restored_pid(contents: &str) -> Option<u32> {
+    let pid = contents.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok())
+}
+
+fn read_restored_pid(path: &Path) -> Result<u32, LinuxMigrationError> {
+    let invalid = |reason| LinuxMigrationError::InvalidRestorePid { reason };
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| invalid("PID file is missing or inaccessible"))?;
+    if !metadata.is_file() {
+        return Err(invalid("PID file is not a regular file"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Do not follow a replaced leaf symlink or block opening a FIFO.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| invalid("PID file cannot be opened"))?;
+    let metadata = file.metadata().map_err(|_| invalid("PID file cannot be inspected"))?;
+    if !metadata.is_file() || metadata.len() > MAX_RESTORE_PID_BYTES {
+        return Err(invalid("PID file is not a bounded regular file"));
+    }
+    let mut contents = String::new();
+    file.take(MAX_RESTORE_PID_BYTES + 1).read_to_string(&mut contents)
+        .map_err(|_| invalid("PID file cannot be read as text"))?;
+    if contents.len() as u64 > MAX_RESTORE_PID_BYTES {
+        return Err(invalid("PID file exceeds its byte limit"));
+    }
+    parse_restored_pid(&contents).ok_or_else(|| invalid("PID file must contain one positive pid_t"))
 }
 
 #[cfg(test)]
@@ -685,10 +724,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_restored_pid_extracts_first_nonzero_number() {
-        assert_eq!(parse_restored_pid("restored pid: 4242\n"), Some(4242));
-        assert_eq!(parse_restored_pid("pid=0 pid=9"), Some(9));
-        assert_eq!(parse_restored_pid("no pid"), None);
+    fn parse_restored_pid_requires_one_positive_pid_t() {
+        for valid in ["4242", "4242\n", " 4242\r\n"] {
+            assert_eq!(parse_restored_pid(valid), Some(4242));
+        }
+        for invalid in ["", "0", "+42", "-42", "42 43", "2147483648",
+            "restored pid: 4242\n", "pid=0 pid=9", "42\0", "４２"] {
+            assert_eq!(parse_restored_pid(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn restored_pid_file_must_be_present_regular_bounded_and_well_formed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_restored_pid(&dir.path().join("absent")).is_err());
+        assert!(read_restored_pid(dir.path()).is_err());
+        let path = dir.path().join("root.pid");
+        for invalid in [b"".as_slice(), b"0", b"123 456", b"\xff", &[b'1'; 33]] {
+            fs::write(&path, invalid).unwrap();
+            assert!(matches!(read_restored_pid(&path), Err(LinuxMigrationError::InvalidRestorePid { .. })));
+        }
+        fs::write(&path, b"4321\n").unwrap();
+        assert_eq!(read_restored_pid(&path).unwrap(), 4321);
+    }
+
+    #[test]
+    fn restore_command_requests_detachment_and_an_exact_pidfile() {
+        let mut request = ConnectorRestoreRequest::new("connector", "images with spaces");
+        request.work_dir = Some(PathBuf::from("work dir"));
+        request.tcp_established = true;
+        let args = restore_args(&request, Path::new("private control/root.pid"));
+        assert_eq!(args, ["restore", "--restore-detached", "--pidfile",
+            "private control/root.pid", "--images-dir", "images with spaces",
+            "--log-file", CRIU_RESTORE_LOG, "--work-dir", "work dir",
+            "--shell-job", "--tcp-established"].map(OsString::from));
+        assert!(!dump_args(&ConnectorCheckpointRequest::new("connector", 1, "images"))
+            .contains(&OsString::from("--restore-detached")));
     }
 
     #[test]
@@ -733,6 +804,101 @@ mod tests {
 
         use super::*;
 
+        #[test]
+        fn dump_and_restore_use_the_configured_command_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("blocked-criu.sh");
+            fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(script, ConnectorMigrationLimits::default())
+                .with_command_limits(CriuCommandLimits {
+                    timeout: std::time::Duration::from_millis(100),
+                    max_output_bytes: 1024,
+                }).unwrap();
+            let images = dir.path().join("images");
+            let error = migrator.dump_connector(&ConnectorCheckpointRequest::new("connector", 1234, &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "dump",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::Timeout, child_reaped: true, ..
+                },
+            }));
+            let error = migrator.restore_connector(&ConnectorRestoreRequest::new("connector", &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "restore",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::Timeout, child_reaped: true, ..
+                },
+            }));
+        }
+
+        #[test]
+        fn restore_output_limit_cannot_be_reported_as_success() {
+            let dir = tempfile::tempdir().unwrap();
+            let images = dir.path().join("images");
+            fs::create_dir(&images).unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(
+                fake_criu_script(dir.path(), "unused"), ConnectorMigrationLimits::default(),
+            ).with_command_limits(CriuCommandLimits {
+                timeout: std::time::Duration::from_secs(2), max_output_bytes: 4,
+            }).unwrap();
+            let error = migrator.restore_connector(&ConnectorRestoreRequest::new("connector", &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::CriuExecution {
+                action: "restore",
+                source: CriuCommandError::Interrupted {
+                    reason: CriuCommandStopReason::OutputLimit, child_reaped: true, ..
+                },
+            }));
+        }
+
+        #[test]
+        fn restored_pid_file_never_follows_a_symlink() {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("other-attempt.pid");
+            let link = dir.path().join("root.pid");
+            fs::write(&source, "4321\n").unwrap();
+            std::os::unix::fs::symlink(source, &link).unwrap();
+            assert!(matches!(read_restored_pid(&link), Err(LinuxMigrationError::InvalidRestorePid { .. })));
+        }
+
+        #[test]
+        fn successful_criu_exit_without_pidfile_never_uses_stdout_or_stale_images() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("no-pidfile.sh");
+            fs::write(&script, "#!/bin/sh\necho 'restored pid: 9999'\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let images = dir.path().join("images");
+            fs::create_dir(&images).unwrap();
+            fs::write(images.join("root.pid"), "1111\n").unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(script, ConnectorMigrationLimits::default());
+            let error = migrator.restore_connector(&ConnectorRestoreRequest::new("connector", &images))
+                .unwrap_err();
+            assert!(matches!(error, LinuxMigrationError::InvalidRestorePid { .. }));
+            assert!(error.to_string().contains("reconcile before retrying"));
+            assert_eq!(fs::read_to_string(images.join("root.pid")).unwrap(), "1111\n");
+        }
+
+        #[test]
+        fn restore_control_paths_are_fresh_and_do_not_pollute_snapshot_images() {
+            let dir = tempfile::tempdir().unwrap();
+            let images = dir.path().join("images");
+            fs::create_dir(&images).unwrap();
+            let migrator = CriuConnectorMigrator::for_tests(
+                fake_criu_script(dir.path(), "unused"), ConnectorMigrationLimits::default(),
+            );
+            let request = ConnectorRestoreRequest::new("connector", &images);
+            migrator.restore_connector(&request).unwrap();
+            let first = fs::read_to_string(images.join("args.txt")).unwrap();
+            migrator.restore_connector(&request).unwrap();
+            let second = fs::read_to_string(images.join("args.txt")).unwrap();
+            assert_ne!(first, second, "each attempt needs fresh PID evidence");
+            assert!(!images.join("root.pid").exists());
+            assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+        }
+
         fn fake_criu_script(dir: &Path, payload: &str) -> PathBuf {
             let script = dir.join("fake-criu.sh");
             let body = format!(
@@ -741,9 +907,19 @@ set -eu
 mode="$1"
 shift
 images_dir=""
+pidfile=""
+detached="no"
 args="$*"
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --pidfile)
+      pidfile="$2"
+      shift 2
+      ;;
+    --restore-detached)
+      detached="yes"
+      shift
+      ;;
     --images-dir)
       images_dir="$2"
       shift 2
@@ -762,7 +938,11 @@ if [ "$mode" = "dump" ]; then
   printf "{payload}" > "$images_dir/core.img"
   echo "dump stderr" >&2
 elif [ "$mode" = "restore" ]; then
-  echo "restored pid: 4321"
+  test "$detached" = "yes"
+  test -n "$pidfile"
+  test ! -e "$pidfile"
+  printf '4321\n' > "$pidfile"
+  echo "diagnostic 9999; restored pid is in the pidfile"
   echo "restore stderr" >&2
 else
   echo "unknown mode" >&2

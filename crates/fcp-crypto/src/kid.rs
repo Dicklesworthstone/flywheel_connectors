@@ -102,15 +102,12 @@ impl PartialEq for KeyId {
 
 impl Eq for KeyId {}
 
+// KIDs are public routing identifiers, not secret keys. Collection hashing and
+// ordering use their exact canonical bytes; equality keeps its constant-time
+// implementation. HashMap/BTreeMap lookup itself is not constant-time.
 impl std::hash::Hash for KeyId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl PartialOrd for KeyId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+        std::hash::Hash::hash(&self.0, state);
     }
 }
 
@@ -120,6 +117,11 @@ impl Ord for KeyId {
     }
 }
 
+impl PartialOrd for KeyId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 impl std::fmt::Debug for KeyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "KeyId({})", self.to_hex())
@@ -147,6 +149,105 @@ impl Drop for KeyId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn populated_key_maps_lookup_replace_and_remove_equivalent_ids() {
+        use std::collections::{BTreeMap, HashMap};
+
+        let mut hashed = HashMap::new();
+        let mut ordered = BTreeMap::new();
+        for byte in 0..=u8::MAX {
+            let kid = KeyId::from_bytes([byte; KID_SIZE]);
+            hashed.insert(kid.clone(), byte);
+            ordered.insert(kid, byte);
+        }
+        assert_eq!(hashed.len(), 256);
+        assert_eq!(ordered.len(), 256);
+        for byte in 0..=u8::MAX {
+            let probe = KeyId::from_hex(&hex::encode_upper([byte; KID_SIZE])).unwrap();
+            assert_eq!(hashed.get(&probe), Some(&byte));
+            assert_eq!(ordered.get(&probe), Some(&byte));
+            assert_eq!(hashed.insert(probe.clone(), 0), Some(byte));
+            assert_eq!(ordered.insert(probe.clone(), 0), Some(byte));
+            assert_eq!(hashed.remove(&probe), Some(0));
+            assert_eq!(ordered.remove(&probe), Some(0));
+        }
+        assert!(hashed.is_empty());
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn key_order_matches_canonical_byte_order_in_every_position() {
+        use std::cmp::Ordering;
+
+        let mut keys = vec![KeyId::default()];
+        for position in 0..KID_SIZE {
+            for byte in [1, 0x80, u8::MAX] {
+                let mut bytes = [0; KID_SIZE];
+                bytes[position] = byte;
+                keys.push(KeyId::from_bytes(bytes));
+            }
+        }
+        for left in &keys {
+            for right in &keys {
+                assert_eq!(left.cmp(right), left.as_bytes().cmp(right.as_bytes()));
+                assert_eq!(left.partial_cmp(right), Some(left.cmp(right)));
+                assert_eq!(left.cmp(right) == Ordering::Equal, left == right);
+                assert_eq!(left.cmp(right), right.cmp(left).reverse());
+            }
+        }
+        keys.sort();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(keys.first().unwrap(), &KeyId::default());
+        // The leading byte is most significant, independently of host endian.
+        assert_eq!(keys.last().unwrap().as_bytes(), &[255, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn hash_uses_the_same_bytes_after_clone_hex_and_serde_round_trips() {
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Default)]
+        struct RecordedHash(Vec<u8>);
+        impl Hasher for RecordedHash {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+        }
+
+        let key = KeyId::from_bytes([1, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        let mut expected = RecordedHash::default();
+        key.as_bytes().hash(&mut expected);
+        let json = serde_json::to_string(&key).unwrap();
+        for equivalent in [
+            key.clone(),
+            KeyId::from_hex("0123456789ABCDEF").unwrap(),
+            serde_json::from_str::<KeyId>(&json).unwrap(),
+        ] {
+            let mut actual = RecordedHash::default();
+            equivalent.hash(&mut actual);
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(equivalent, key);
+        }
+    }
+
+    #[test]
+    fn wiping_a_lookup_key_does_not_change_owned_map_keys() {
+        use std::collections::{BTreeMap, HashMap};
+
+        let mut key = KeyId::from_bytes([0xff; KID_SIZE]);
+        let hashed = HashMap::from([(key.clone(), "writer")]);
+        let ordered = BTreeMap::from([(key.clone(), "writer")]);
+        key.zeroize();
+        assert!(!hashed.contains_key(&key));
+        assert!(!ordered.contains_key(&key));
+        let probe = KeyId::from_bytes([0xff; KID_SIZE]);
+        assert_eq!(hashed.get(&probe), Some(&"writer"));
+        assert_eq!(ordered.get(&probe), Some(&"writer"));
+    }
 
     #[test]
     fn kid_derive_deterministic() {

@@ -569,8 +569,11 @@ async fn huggingface_loopback_e2e_jsonl_matrix() {
         .expect_err("slow response should hit timeout");
     let timeout_like = match &timeout_err {
         FcpError::External {
-            service, retryable, ..
-        } => service == "huggingface" && *retryable,
+            service,
+            retryable,
+            message,
+            ..
+        } => service == "huggingface" && !*retryable && message.contains("outcome unknown"),
         FcpError::Internal { message } => {
             message.contains("deadline") || message.contains("timeout")
         }
@@ -592,9 +595,9 @@ async fn huggingface_loopback_e2e_jsonl_matrix() {
         "request_bytes": 112,
         "response_bytes": 0,
         "capability_classification": "model-invoke",
-        "retry_decision": "deadline",
+        "retry_decision": "no-replay-after-timeout",
         "http_status": null,
-        "fcp_error_mapping": "ExternalTimeout",
+        "fcp_error_mapping": "InferenceOutcomeUnknownOrDeadline",
         "artifact_path": "connectors/huggingface/tests/provider_contract.rs",
         "cleanup_result": "not_applicable",
         "skip_reason": null,
@@ -652,4 +655,351 @@ async fn huggingface_loopback_e2e_jsonl_matrix() {
         "skip_reason": null,
         "status": "passed"
     }));
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_server_errors_are_not_replayed() {
+    for operation in [
+        "huggingface.inference.text_generation",
+        "huggingface.inference.summarization",
+    ] {
+        for status in [408, 500, 502, 503, 504] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/models/gpt2"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "error": "private-prompt-reflected-by-upstream"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+            let input = if operation.ends_with("text_generation") {
+                json!({"model_id": "gpt2", "prompt": "hello"})
+            } else {
+                json!({"model_id": "gpt2", "text": "summarize this text"})
+            };
+            let err = connector
+                .handle_invoke(json!({"operation_id": operation, "input": input}))
+                .await
+                .expect_err("ambiguous inference must not be replayed");
+            assert!(matches!(
+                &err,
+                FcpError::External {
+                    status_code: Some(code),
+                    retryable: false,
+                    retry_after: None,
+                    message,
+                    ..
+                } if *code == status && message.contains("outcome unknown")
+            ));
+            assert!(!err.to_string().contains("private-prompt-reflected-by-upstream"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_invalid_loading_estimates_are_not_replayed() {
+    for estimate in [json!(null), json!(-1.0), json!("not-a-duration")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gpt2"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "upstream error",
+                "estimated_time": estimate
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+        let err = connector
+            .handle_invoke(json!({
+                "operation_id": "huggingface.inference.text_generation",
+                "input": {"model_id": "gpt2", "prompt": "hello"}
+            }))
+            .await
+            .expect_err("an invalid estimate is not proof that inference did not run");
+        assert!(matches!(
+            err,
+            FcpError::External {
+                status_code: Some(503),
+                retryable: false,
+                ..
+            }
+        ));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_malformed_success_is_not_replayed() {
+    for body in ["{malformed-json", r#"[{"generated_text":42}]"#] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gpt2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+        let err = connector
+            .handle_invoke(json!({
+                "operation_id": "huggingface.inference.text_generation",
+                "input": {"model_id": "gpt2", "prompt": "hello"}
+            }))
+            .await
+            .expect_err("a malformed response must not repeat completed inference");
+        assert!(matches!(
+            err,
+            FcpError::External {
+                status_code: Some(200),
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_rate_limit_retries_once_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"generated_text": "success after admission"}
+        ])))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+    let result = connector
+        .handle_invoke(json!({
+            "operation_id": "huggingface.inference.text_generation",
+            "input": {"model_id": "gpt2", "prompt": "hello"}
+        }))
+        .await
+        .expect("a refused request is safe to retry");
+    assert_eq!(result["output"][0]["generated_text"], "success after admission");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_loading_retries_once_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": "Model gpt2 is currently loading",
+            "estimated_time": 0.0
+        })))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"generated_text": "success after loading"}
+        ])))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+    let result = connector
+        .handle_invoke(json!({
+            "operation_id": "huggingface.inference.text_generation",
+            "input": {"model_id": "gpt2", "prompt": "hello"}
+        }))
+        .await
+        .expect("a model-loading refusal is safe to retry");
+    assert_eq!(result["output"][0]["generated_text"], "success after loading");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_hub_reads_keep_transient_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "_id": "model-1",
+            "modelId": "gpt2",
+            "pipeline_tag": "text-generation",
+            "tags": [],
+            "downloads": 1,
+            "likes": 1
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+    connector
+        .handle_invoke(json!({
+            "operation_id": "huggingface.models.info",
+            "input": {"model_id": "gpt2"}
+        }))
+        .await
+        .expect("read-only Hub operations should keep retrying transient failures");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_timeout_is_not_replayed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/models/gpt2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!([{"generated_text": "already computed"}])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let connector = configured_loopback_connector_with(&server, 50, 3).await;
+    let err = connector
+        .handle_invoke(json!({
+            "operation_id": "huggingface.inference.text_generation",
+            "input": {"model_id": "gpt2", "prompt": "hello"}
+        }))
+        .await
+        .expect_err("a timed-out inference must not be replayed");
+    match err {
+        FcpError::External {
+            retryable: false,
+            retry_after: None,
+            message,
+            ..
+        } => assert!(message.contains("outcome unknown")),
+        // The enclosing execution deadline can win the race with the HTTP
+        // timeout; it must also terminate the operation without another send.
+        FcpError::Internal { message } => assert!(message.contains("deadline")),
+        other => panic!("expected a non-retryable timeout, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_inference_redirects_do_not_forward_or_replay_prompts() {
+    for status in [301, 302, 303, 307, 308] {
+        let server = MockServer::start().await;
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gpt2"))
+            .respond_with(ResponseTemplate::new(status).insert_header(
+                "location",
+                format!("{}/models/redirected", redirect_target.uri()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+        let err = connector
+            .handle_invoke(json!({
+                "operation_id": "huggingface.inference.text_generation",
+                "input": {"model_id": "gpt2", "prompt": "private-prompt-must-stay-at-origin"}
+            }))
+            .await
+            .expect_err("redirects require an explicit endpoint change");
+        assert!(matches!(
+            err,
+            FcpError::External {
+                status_code: Some(code),
+                retryable: false,
+                ref message,
+                ..
+            } if code == status && message.contains("redirect refused")
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(redirect_target.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_hub_redirects_do_not_escape_the_configured_endpoint() {
+    let server = MockServer::start().await;
+    let redirect_target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models/gpt2"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", redirect_target.uri()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+    let err = connector
+        .handle_invoke(json!({
+            "operation_id": "huggingface.models.info",
+            "input": {"model_id": "gpt2"}
+        }))
+        .await
+        .expect_err("Hub redirects must not bypass endpoint selection");
+    assert!(matches!(
+        err,
+        FcpError::External {
+            status_code: Some(302),
+            retryable: false,
+            ref message,
+            ..
+        } if message.contains("hub_url")
+    ));
+    assert!(redirect_target.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn huggingface_rejects_model_url_injection_before_any_send() {
+    let server = MockServer::start().await;
+    let connector = configured_loopback_connector_with(&server, 5_000, 3).await;
+    for operation in [
+        "huggingface.inference.text_generation",
+        "huggingface.inference.summarization",
+        "huggingface.models.info",
+    ] {
+        for model_id in [
+            "gpt2?admin=true",
+            "gpt2#discarded",
+            "org/%2e%2e",
+            "org/%252e%252e",
+            ".",
+            "/gpt2",
+            "org/",
+            "org/.",
+        ] {
+            let input = match operation {
+                "huggingface.inference.text_generation" => {
+                    json!({"model_id": model_id, "prompt": "hello"})
+                }
+                "huggingface.inference.summarization" => {
+                    json!({"model_id": model_id, "text": "summarize this text"})
+                }
+                _ => json!({"model_id": model_id}),
+            };
+            let err = connector
+                .handle_invoke(json!({"operation_id": operation, "input": input}))
+                .await
+                .expect_err("model IDs must not change URL structure");
+            assert!(matches!(err, FcpError::InvalidRequest { .. }));
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

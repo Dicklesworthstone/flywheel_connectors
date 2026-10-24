@@ -31,6 +31,7 @@ fcp-async-core = { path = "../fcp-async-core" }
 fcp-provider-auth = { path = "../fcp-provider-auth" }
 fcp-cbor = { path = "../fcp-cbor" }
 fcp-crypto = { path = "../fcp-crypto" }
+fcp-raptorq = { path = "../fcp-raptorq" }
 fcp-ratelimit = { path = "../fcp-ratelimit" }
 fcp-store = { path = "../fcp-store" }
 fcp-tailscale = { path = "../fcp-tailscale" }
@@ -57,6 +58,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Error handling
 thiserror = "2"
 
+# Private, per-attempt CRIU control files (also used by the test harness).
+tempfile = "3"
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -81,7 +85,6 @@ x509-parser = "0.18.1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-fcp-raptorq = { path = "../fcp-raptorq" }
 mach2 = "0.4"
 
 [dev-dependencies]
@@ -89,7 +92,6 @@ fcp-testkit = { path = "../fcp-testkit" }
 fcp-crypto-pq = { path = "../fcp-crypto-pq" }
 fcp-browser = { path = "../../connectors/browser", features = ["test-support"] }
 fcp-telegram = { path = "../../connectors/telegram", features = ["test-support"] }
-tempfile = "3"
 rcgen = "0.14.7"
 insta.workspace = true
 criterion.workspace = true
