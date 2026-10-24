@@ -24,6 +24,8 @@ fcp-core = { path = "../../crates/fcp-core" }
 fcp-prelude = { path = "../../crates/fcp-prelude" }
 fcp-async-core = { path = "../../crates/fcp-async-core" }
 fcp-sdk = { path = "../../crates/fcp-sdk" }
+fcp-cbor = { path = "../../crates/fcp-cbor" }
+fcp-crypto = { path = "../../crates/fcp-crypto" }
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -42,5 +44,6 @@ sha1 = "0.10"
 sha2.workspace = true
 subtle.workspace = true
 hex.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]

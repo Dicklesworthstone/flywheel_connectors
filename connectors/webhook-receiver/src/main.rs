@@ -99,7 +99,7 @@ async fn handle_message(
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
+        "invoke" => invoke_message(connector, params).await,
         "simulate" => connector.handle_simulate(params).await,
         "shutdown" => connector.handle_shutdown(params).await,
         _ => Err(fcp_core::FcpError::InvalidRequest {
@@ -136,5 +136,164 @@ async fn handle_message(
             }
             response
         }
+    }
+}
+
+async fn invoke_message(
+    connector: &mut WebhookReceiverConnector,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    let request: fcp_core::InvokeRequest =
+        serde_json::from_value(params.clone()).map_err(|_| fcp_core::FcpError::InvalidRequest {
+            code: 1003,
+            message: "Invalid FCP invoke request".into(),
+        })?;
+    let response = match connector.handle_invoke(params).await {
+        Ok(result) => fcp_core::InvokeResponse::ok(request.id, result),
+        Err(error) => fcp_core::InvokeResponse::error(request.id, error),
+    };
+    serde_json::to_value(response).map_err(|_| fcp_core::FcpError::Internal {
+        message: "Failed to encode FCP invoke response".into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use fcp_core::{
+        CapabilityConstraints, CapabilityId, CapabilityToken, ConnectorId, HandshakeRequest,
+        HandshakeResponse, HealthSnapshot, Introspection, InvokeRequest, InvokeResponse,
+        InvokeStatus, OperationId, RequestId, ZoneId,
+    };
+    use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
+    use serde_json::json;
+
+    #[fcp_async_core::runtime::test]
+    async fn jsonrpc_host_lifecycle_and_invoke_use_canonical_fcp_envelopes() {
+        let mut connector = WebhookReceiverConnector::new();
+        let configured = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "configure", "params": {},
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(configured.get("error").is_none());
+        let key = Ed25519SigningKey::from_bytes(&[17; 32]).unwrap();
+        let handshake = HandshakeRequest {
+            protocol_version: "2.0".into(),
+            zone: ZoneId::work(),
+            zone_dir: None,
+            host_public_key: key.verifying_key().to_bytes(),
+            nonce: [7; 32],
+            capabilities_requested: vec![CapabilityId::from_static("webhook.endpoints.read")],
+            host: None,
+            transport_caps: None,
+            requested_instance_id: None,
+        };
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "handshake", "params": handshake,
+            })
+            .to_string(),
+        )
+        .await;
+        let response: HandshakeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(response.nonce, [7; 32]);
+        let instance = reply["result"]["instance_id"].as_str().unwrap().to_owned();
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "health", "params": {},
+            })
+            .to_string(),
+        )
+        .await;
+        let health: HealthSnapshot = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert!(health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["instance_id"], instance);
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], true);
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "introspect", "params": {},
+            })
+            .to_string(),
+        )
+        .await;
+        let catalog: Introspection = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert!(
+            catalog
+                .operations
+                .iter()
+                .any(|op| op.id.as_str() == "webhook.health")
+        );
+
+        let constraints = CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        };
+        let now = Utc::now();
+        let token = CapabilityTokenBuilder::new()
+            .capability_id("webhook.endpoints.read")
+            .zone_id("z:work")
+            .principal("user:test")
+            .operations(&["webhook.endpoints.list"])
+            .issuer("node:test")
+            .target_instance(&instance)
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(&constraints).unwrap())
+            .unwrap()
+            .sign(&key)
+            .unwrap();
+        let mut request = InvokeRequest {
+            r#type: "invoke".into(),
+            id: RequestId::new("typed-request"),
+            connector_id: ConnectorId::from_static("fcp.webhook-receiver"),
+            operation: OperationId::from_static("webhook.endpoints.list"),
+            zone_id: ZoneId::work(),
+            input: json!({}),
+            capability_token: CapabilityToken::from_raw(token),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("test".into()),
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: vec![],
+        };
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "invoke", "params": request,
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reply["id"], 5);
+        let response: InvokeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(response.id, RequestId::new("typed-request"));
+        assert_eq!(response.status, InvokeStatus::Ok);
+        assert_eq!(response.result.unwrap()["endpoints"], json!([]));
+
+        request.operation = OperationId::from_static("webhook.events.recent");
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc": "2.0", "id": 6, "method": "invoke", "params": request,
+            })
+            .to_string(),
+        )
+        .await;
+        let response: InvokeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(response.status, InvokeStatus::Error);
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
     }
 }

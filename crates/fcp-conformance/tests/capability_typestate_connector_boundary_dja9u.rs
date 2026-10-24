@@ -15,7 +15,8 @@
 //!
 #![allow(clippy::manual_let_else)]
 //!
-//! - 78 connectors `USE_TYPESTATE` (`verify_bound` / `promote_with`_*).
+//! - 79 connectors `USE_TYPESTATE` (`verify_bound` / `promote_with`_* /
+//!   shared `StandaloneSession` bounded admission).
 //! - 0 connectors `USE_LEGACY_VERIFY` (deprecated `verifier.verify(...)`
 //!   alias — the `#[deprecated]` `CapabilityVerifier::verify` entrypoint with
 //!   an ambiguous return type, which discards the structural-verification
@@ -167,6 +168,7 @@ const TYPESTATE_ENFORCED_ALLOWLIST: &[&str] = &[
     "twitter",
     "vercel",
     "wecom",
+    "webhook-receiver",
     "whatsapp",
     "wolfram",
     "youtube",
@@ -220,7 +222,13 @@ fn collect_connector_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn classify(source: &str) -> BoundaryStyle {
-    let uses_typestate = TYPESTATE_MARKERS.iter().any(|m| source.contains(m));
+    // StandaloneSession::admit_bounded returns a non-forgeable admission
+    // witness after verify_bound and signed usage accounting. A construction
+    // alone does not count: the connector must also admit at dispatch.
+    let uses_session_authority =
+        source.contains("StandaloneSession::new(") && source.contains("authority.admit_bounded(");
+    let uses_typestate =
+        uses_session_authority || TYPESTATE_MARKERS.iter().any(|m| source.contains(m));
     let uses_legacy = source.contains(LEGACY_VERIFY_MARKER);
     if uses_typestate {
         BoundaryStyle::UsesTypestate
@@ -229,6 +237,22 @@ fn classify(source: &str) -> BoundaryStyle {
     } else {
         BoundaryStyle::NoVerifier
     }
+}
+
+#[test]
+fn standalone_session_requires_construction_and_admission_for_ratchet() {
+    assert_eq!(
+        classify("StandaloneSession::new(MANIFEST)"),
+        BoundaryStyle::NoVerifier
+    );
+    assert_eq!(
+        classify("authority.admit_bounded(&request, &[], LIMIT)"),
+        BoundaryStyle::NoVerifier
+    );
+    assert_eq!(
+        classify("StandaloneSession::new(MANIFEST); authority.admit_bounded(&request, &[], LIMIT)"),
+        BoundaryStyle::UsesTypestate
+    );
 }
 
 #[test]
@@ -308,7 +332,7 @@ fn dja9u_allowlists_match_pinned_baseline_counts() {
     );
     assert_eq!(
         TYPESTATE_ENFORCED_ALLOWLIST.len(),
-        78,
+        79,
         "TYPESTATE_ENFORCED_ALLOWLIST size drifted; update this assertion \
          to match"
     );

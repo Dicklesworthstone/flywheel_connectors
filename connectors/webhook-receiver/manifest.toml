@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:44c3672e6353ae8b986f31071e45aa68b9ab3681728c23f0ac6ada72f08dbb1c"
+interface_hash = "blake3-256:fcp.interface.v2:9790ee77b413395692d4fda8fd004e6e0bb49b0a4f9d2aa6769e2388c8c8d020"
 
 [connector]
 id = "fcp.webhook-receiver"
@@ -531,6 +531,26 @@ common_mistakes = [
     "Expecting events that failed signature validation to appear in results — they are rejected before storage.",
 ]
 examples = ['{"endpoint_id": "ep_abc123", "limit": 20}']
+related = ["webhook.endpoints.list"]
+
+[provides.operations."webhook.health"]
+description = "Report authenticated connector readiness and ingress diagnostics"
+capability = "webhook.endpoints.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+
+[provides.operations."webhook.health".input_schema]
+type = "object"
+
+[provides.operations."webhook.health".output_schema]
+type = "object"
+
+[provides.operations."webhook.health".ai_hints]
+when_to_use = "Inspect the active webhook receiver and its host-forwarded ingress state."
+common_mistakes = ["A ready receiver does not mean a public HTTP adapter is bound."]
+examples = ['{}']
 related = ["webhook.endpoints.list"]
 
 [event_caps]

@@ -1,7 +1,7 @@
 # Webhook Receiver Connector V3 Contract
 
-> **Status**: runtime contract documented; provider-signature drift documented
-> **Bead**: `flywheel_connectors-4kw5f.12`
+> **Status**: authenticated host-forwarded intake with signed endpoint approvals
+> **Bead**: `flywheel_connectors-yin4m`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
 > **GitHub webhook signature guide**: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
@@ -32,7 +32,7 @@ Important runtime truths the contract preserves:
 - Package and binary name are `fcp-webhook-receiver`.
 - Runtime `BaseConnector` ID is `webhook-receiver`.
 - Manifest and reported connector ID are `fcp.webhook-receiver`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:44c3672e6353ae8b986f31071e45aa68b9ab3681728c23f0ac6ada72f08dbb1c`.
+- The embedded manifest interface hash is validated before session negotiation.
 - Default `public_base_url` is `http://localhost:8080`.
 - Blank or missing `public_base_url` falls back to the default.
 - `public_base_url` policy requires `http` or `https`, a host, and no query or fragment.
@@ -45,13 +45,15 @@ Important runtime truths the contract preserves:
 - `rate_limit_max` defaults to `120` and is capped at `10000`.
 - `in_flight_max` defaults to `8` and is capped at `1024`.
 - `signature_tolerance_seconds` defaults to `300` and is capped at `86400`.
-- Runtime `invoke` uses `operation_id`, not `operation`.
-- Runtime `invoke` checks connector readiness but does not verify `capability_token`.
-- Runtime does not verify approval tokens for endpoint creation, endpoint deletion, or secret rotation.
-- `simulate` only checks whether `operation_id` is present in the local operation inventory.
-- `handle_configure()` stores config and rebases existing endpoint URLs to the new public base URL, but does not clear prior session, handshake, endpoints, events, or ingress state.
-- `handle_handshake()` requires configuration, accepts an optional `session_id`, and returns endpoint/event capability metadata.
-- `health()` reports healthy only after configuration plus session establishment.
+- Runtime `invoke` uses the canonical `InvokeRequest` with `type`, `id`, `connector_id`, `operation`, `zone_id`, `input`, and `capability_token`. An `operation_id`-only request is rejected.
+- Every invoke verifies the signed capability against negotiated capabilities, zone, operation, and the actual instance returned by handshake. Signed call and byte ceilings are charged before dispatch through the SDK's bounded admission path.
+- Endpoint creation, deletion, and secret rotation additionally require a signed execution approval in `approval_tokens`, verified against the separately configured `approval_public_key`.
+- `simulate` consumes a canonical signed `SimulateRequest` and checks authority without charging an invocation. Endpoint mutations report a missing approval because that request type carries no approval evidence.
+- Every configure attempt invalidates prior authority and clears endpoints, signing secrets, events, dedup IDs, and ingress state. Configuration replaces the previous intake namespace; preserve required endpoint configuration outside this process before reconfiguring.
+- Handshake requires a canonical `HandshakeRequest`, accepts protocol `2.0` or `2.0.0`, negotiates only manifest-declared capabilities, rejects forbidden zones, echoes the nonce, and returns a fresh actual `instance_id`. Empty requested capabilities grant no access. Failed handshakes revoke the previous session.
+- Rehandshake within the same zone rotates instance authority. Switching zones requires reconfiguration so prior-zone secrets and payloads cannot cross the boundary.
+- `health()` returns a canonical `HealthSnapshot` with `details.configured`, `details.handshaken`, and `details.instance_id`, enabling the host to prepare an instance-bound session. Ready means local authenticated intake is available; public ingress remains separately reported as unbound.
+- The JSON-RPC transport returns a canonical `InvokeResponse` with the invocation ID inside the outer JSON-RPC response, including typed operation errors.
 - `doctor()` is degraded in the current no-native-listener build because native ingress listener and gateway binding checks fail non-critically.
 - `self_check()` is degraded for local/non-public base URLs and for the current unbound gateway-ingress mode.
 - `handle_shutdown()` clears endpoints, events, dedup IDs, ingress state, config, session, and base lifecycle flags, but request/error counters remain in memory.
@@ -62,17 +64,15 @@ This README documents runtime truth and keeps current drift visible:
 
 - Runtime has no native HTTP listener. Host-forwarded ingress through `webhook.events.ingest` is the only available delivery path.
 - Manifest optional capabilities include `network.dns`, `network.egress`, and `tls.sni`, but runtime opens no outbound sockets and no inbound listener.
-- Manifest marks endpoint creation and secret rotation as policy-approved and endpoint deletion as interactive approval. Runtime operation metadata sets `requires_approval = None`, and invoke checks no approval token.
-- Runtime does not verify capability tokens even though endpoint management and event ingestion mutate in-process state.
+- Manifest and introspection both mark endpoint creation and rotation as policy-approved and deletion as interactive approval. All three require valid signed execution evidence at dispatch.
 - Manifest says endpoint metadata, signing secrets, and deduplication state are stored under singleton-writer state. Runtime stores them in process memory only.
-- `handle_configure()` rebases existing endpoint URLs and preserves prior endpoints/events, which means reconfiguration changes advertised URLs without resetting secrets or dedup state.
 - `doctor()` currently cannot reach `ok` in the no-native-listener build because ingress listener and gateway binding remain deferred.
 - `self_check()` currently cannot reach `ok` unless future gateway binding/native-listener support is added.
 - Endpoint creation and rotation return signing secrets in the response; endpoint listing only returns `signing_secret_configured`.
 - The connector hashes source IPs in recent-event output but stores verified event data in memory until retention eviction or shutdown.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should add bound capability-token verification, add approval-token verification for endpoint mutations, decide whether endpoint/secrets/event state must be durable, separate test-local and production-public readiness signals, align manifest network capabilities with no-native-listener behavior, and add a tracked verification bundle.
+Remaining work includes durable endpoint/secrets/event state, a host HTTP ingress adapter, alignment of manifest network capabilities with the no-native-listener runtime, and a live provider verification bundle.
 
 ## First-Slice Scope
 
@@ -84,19 +84,25 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - provider-specific signature verification for generic HMAC, GitHub, Stripe, Slack, and Twilio styles
 - content-type policy, body-size policy, rate limiting, in-flight limiting, deduplication, and redaction behavior
 - lifecycle, health, doctor, self-check, simulation, introspection, and shutdown behavior
-- runtime/manifest drift around native listener, capability enforcement, approvals, and persistence
+- instance-bound capability verification, signed endpoint approvals, and session invalidation
+- runtime/manifest drift around native listener and persistence
 - deterministic connector tests and direct proof commands
 
 ## Auth And Scope Boundary
 
 - Provider authentication mechanism: endpoint signing secret.
-- Connector management authentication: capability metadata only; runtime does not verify capability tokens.
+- Connector management authentication: SDK `StandaloneSession` on the private host control channel, with signed instance-bound capability verification before every operation. Configure and handshake are trusted host control messages, not a public network authentication API.
 - Runtime capability metadata:
   - `webhook.endpoints.read`
   - `webhook.endpoints.write`
   - `webhook.events.read`
   - `webhook.events.write`
-- Endpoint create, delete, and rotate-secret operations do not verify approval tokens at runtime.
+- Endpoint create, delete, and rotate-secret operations require execution approvals signed by the independent configured approval key. The capability signer is never implicitly an approver.
+- Set `approval_public_key` in connector configuration to the 32 unsigned bytes of the trusted Ed25519 approval public key. Use the public half of the key trusted by the host's `FCP_HOST_APPROVAL_PUBLIC_KEY[_FILE]` setting. This is a public key, not a signing secret. The host does not populate this connector setting automatically.
+- Omitting `approval_public_key` permits authenticated read/ingest operations but denies endpoint mutations. Malformed keys reject configuration and leave prior authority revoked.
+- Approval signatures use the same encoding as the host: Ed25519 over `fcp_cbor::to_canonical_cbor` of the complete approval token with `signature = None`. Approval validity, zone, connector, method pattern, request-object binding, canonical input hash, and JSON Pointer constraints are checked before mutation.
+- Host policy, revocation, holder-proof, lease fencing, and durable idempotency remain host responsibilities. Local admission does not claim a durable receipt or deduplication guarantee.
+- Resource allow/deny constraints bind to the configured endpoint URLs, derived from the requested path or the stored endpoint ID. Collection reads check every endpoint they could disclose; an excluded endpoint denies the whole collection read. Health and empty collections use the configured public base URL as the namespace resource. Caller-supplied alternative resource identifiers never override these targets.
 - The connector does not persist signing secrets, endpoint records, verified events, source IPs, deduplication IDs, headers, payload bodies, request counters, or error counters outside process memory.
 - Webhook payloads can contain public, private, work, credential, or regulated data. Treat live event output according to the provider and endpoint zone.
 
@@ -170,7 +176,7 @@ The current implementation does not include:
 - outbound provider API calls, provider webhook registration, provider secret rotation through remote APIs, or provider-specific subscription discovery
 - arbitrary content-type support, streaming body reads, multipart handling, file upload persistence, or large body storage
 - response customization for providers, webhook delivery sending, retry callback endpoints, or bidirectional webhook workflows
-- capability-token verification, approval-token verification, zone-aware endpoint policy, per-endpoint data retention policy, or secret vault integration
+- per-endpoint zone routing, per-endpoint data retention policy, or secret vault integration
 - long-term audit storage, PII classification, payload redaction beyond selected headers, or encrypted local persistence
 
 These are excluded on purpose:
@@ -184,10 +190,10 @@ These are excluded on purpose:
 `doctor()`, `health()`, `self_check()`, `simulate()`, and `introspect()` are part of the public closeout contract. They surface:
 
 - configured/unconfigured state, session ID, endpoint counts, event counts, ingress state, request counters, and error counters
-- local/public base URL policy and route rebasing behavior
+- local/public base URL policy and clearing of prior state on reconfiguration
 - degraded readiness for local URLs, no native listener, and unbound gateway ingress
 - typed introspection with operations, schemas, capability IDs, risk levels, safety tiers, idempotency, event caps, and ingress metadata
-- simulation allow/deny for known versus unknown operation IDs only
+- authenticated simulation with explicit missing-approval outcomes for endpoint mutations
 - typed provider/FCP error mapping for bad configuration, missing endpoints, duplicate endpoints/events, invalid signatures, stale timestamps, rate limits, in-flight limits, unsupported methods, content-type rejection, body limits, and timeout inputs
 
 The deterministic integration evidence is anchored on connector-local tests covering:
@@ -198,6 +204,10 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - invalid signatures, stale timestamps, missing headers, duplicate events, source allowlists, rate limits, in-flight limits, and body limits
 - recent-event filtering, retention, redacted headers, hashed source IPs, and event ID extraction
 - local/public URL policy and endpoint URL rebasing
+- canonical host handshake, health, introspection, and JSON-RPC invoke envelopes
+- missing/forged tokens, wrong zone/operation/connector/instance, unnegotiated capabilities, signed call exhaustion, and collection resource denials
+- independent signed approvals with expiry, request/input binding, signature, and scope denial checks
+- failed handshake/configuration invalidation and cross-zone state isolation
 
 ## Source Notes
 
@@ -233,6 +243,6 @@ rch exec -- cargo fmt --check
 - Treat this connector as a host-forwarded in-memory webhook receiver, not as a public listener.
 - Use production `https` public base URLs for non-local endpoints.
 - Keep endpoint secrets in a credential manager; endpoint create and rotate responses expose the active secret once.
-- Treat endpoint mutation operations as high-review until capability and approval verification are implemented.
+- Configure an independent approval public key and provide a signed execution approval for endpoint creation, deletion, and secret rotation.
 - Do not rely on `doctor()` or `self_check()` reaching `ok` in the current no-native-listener build.
 - Keep event retention expectations low; events and deduplication IDs are process-memory state.

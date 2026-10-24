@@ -14,7 +14,15 @@
 use serde_json::json;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use fcp_prelude::FcpError;
+use chrono::{Duration, Utc};
+use fcp_crypto::{
+    canonicalize::to_deterministic_cbor, cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey,
+};
+use fcp_prelude::{
+    ApprovalScope, ApprovalToken, CapabilityConstraints, CapabilityId, CapabilityToken,
+    ConnectorId, ExecutionScope, FcpError, FcpResult, HandshakeRequest, HealthSnapshot,
+    InvokeRequest, ObjectId, OperationId, RequestId, SimulateRequest, ZoneId,
+};
 use fcp_webhook_receiver::connector::WebhookReceiverConnector;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -23,28 +31,184 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
 
-async fn setup_connector() -> WebhookReceiverConnector {
-    let mut c = WebhookReceiverConnector::new();
-    c.handle_configure(json!({"public_base_url": "https://hooks.flywheel.test"}))
-        .await
-        .unwrap();
-    c.handle_handshake(json!({"session_id": "test"}))
-        .await
-        .unwrap();
-    c
+/// Provider-contract fixtures use real signed FCP requests. Authority tests below
+/// call `inner` directly so malformed and unsigned requests never get repaired.
+struct SignedConnector {
+    inner: WebhookReceiverConnector,
+    key: Ed25519SigningKey,
+    approval_key: Ed25519SigningKey,
+    instance_id: String,
 }
 
-async fn setup_connector_with_config(config: serde_json::Value) -> WebhookReceiverConnector {
-    let mut c = WebhookReceiverConnector::new();
-    c.handle_configure(config).await.unwrap();
-    c.handle_handshake(json!({"session_id": "test"}))
-        .await
-        .unwrap();
+impl std::ops::Deref for SignedConnector {
+    type Target = WebhookReceiverConnector;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for SignedConnector {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+fn handshake_request(key: &Ed25519SigningKey) -> HandshakeRequest {
+    HandshakeRequest {
+        protocol_version: "2.0".into(),
+        zone: ZoneId::work(),
+        zone_dir: None,
+        host_public_key: key.verifying_key().to_bytes(),
+        nonce: [42; 32],
+        capabilities_requested: [
+            "webhook.endpoints.read",
+            "webhook.endpoints.write",
+            "webhook.events.read",
+            "webhook.events.write",
+        ]
+        .into_iter()
+        .map(CapabilityId::from_static)
+        .collect(),
+        host: None,
+        transport_caps: None,
+        requested_instance_id: None,
+    }
+}
+
+impl SignedConnector {
+    async fn handshake(&mut self) -> serde_json::Value {
+        let response = self
+            .inner
+            .handle_handshake(json!(handshake_request(&self.key)))
+            .await
+            .unwrap();
+        self.instance_id = response["instance_id"].as_str().unwrap().to_owned();
+        response
+    }
+
+    fn request(&self, params: serde_json::Value) -> FcpResult<InvokeRequest> {
+        let operation =
+            params["operation_id"]
+                .as_str()
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Test request requires an operation".into(),
+                })?;
+        let capability = match operation {
+            "webhook.endpoints.create"
+            | "webhook.endpoints.delete"
+            | "webhook.endpoints.rotate_secret" => "webhook.endpoints.write",
+            "webhook.endpoints.list" | "webhook.health" => "webhook.endpoints.read",
+            "webhook.events.recent" => "webhook.events.read",
+            "webhook.events.ingest" => "webhook.events.write",
+            _ => operation,
+        };
+        let constraints = CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        };
+        let now = Utc::now();
+        let raw = CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .zone_id("z:work")
+            .principal("user:webhook-test")
+            .operations(&[operation])
+            .issuer("node:webhook-test")
+            .target_instance(&self.instance_id)
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(&constraints).unwrap())
+            .unwrap()
+            .sign(&self.key)
+            .unwrap();
+        let mut request = InvokeRequest {
+            r#type: "invoke".into(),
+            id: RequestId::random(),
+            connector_id: ConnectorId::from_static("fcp.webhook-receiver"),
+            operation: OperationId::new(operation).unwrap(),
+            zone_id: ZoneId::work(),
+            input: params.get("input").cloned().unwrap_or_else(|| json!({})),
+            capability_token: CapabilityToken::from_raw(raw),
+            holder_proof: None,
+            context: None,
+            idempotency_key: Some("webhook-test".into()),
+            lease_seq: None,
+            deadline_ms: None,
+            correlation_id: None,
+            provenance: None,
+            approval_tokens: vec![],
+        };
+        if matches!(
+            operation,
+            "webhook.endpoints.create"
+                | "webhook.endpoints.delete"
+                | "webhook.endpoints.rotate_secret"
+        ) {
+            let now_ms = u64::try_from(now.timestamp_millis()).unwrap();
+            let input_hash =
+                *blake3::hash(&to_deterministic_cbor(&request.input).unwrap()).as_bytes();
+            let mut approval = ApprovalToken::approved(
+                "test-approval",
+                now_ms - 1000,
+                now_ms + 60_000,
+                "owner:test",
+                ApprovalScope::Execution(ExecutionScope {
+                    connector_id: request.connector_id.to_string(),
+                    method_pattern: operation.into(),
+                    request_object_id: Some(ObjectId::from_unscoped_bytes(request.id.0.as_bytes())),
+                    input_hash: Some(input_hash),
+                    input_constraints: vec![],
+                }),
+                request.zone_id.clone(),
+                None,
+            );
+            approval.signature = Some(
+                self.approval_key
+                    .sign(&fcp_cbor::to_canonical_cbor(&approval).unwrap())
+                    .to_bytes()
+                    .to_vec(),
+            );
+            request.approval_tokens.push(approval);
+        }
+        Ok(request)
+    }
+
+    async fn handle_invoke(&mut self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
+        let request = self.request(params)?;
+        self.inner.handle_invoke(json!(request)).await
+    }
+
+    async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
+        let invoke = self.request(params)?;
+        let request = SimulateRequest::new(
+            invoke.connector_id,
+            invoke.operation,
+            invoke.zone_id,
+            invoke.input,
+            invoke.capability_token,
+        );
+        self.inner.handle_simulate(json!(request)).await
+    }
+}
+
+async fn setup_connector() -> SignedConnector {
+    setup_connector_with_config(json!({"public_base_url": "https://hooks.flywheel.test"})).await
+}
+
+async fn setup_connector_with_config(mut config: serde_json::Value) -> SignedConnector {
+    let mut c = SignedConnector {
+        inner: WebhookReceiverConnector::new(),
+        key: Ed25519SigningKey::from_bytes(&[7; 32]).unwrap(),
+        approval_key: Ed25519SigningKey::from_bytes(&[8; 32]).unwrap(),
+        instance_id: String::new(),
+    };
+    config["approval_public_key"] = json!(c.approval_key.verifying_key().to_bytes());
+    c.inner.handle_configure(config).await.unwrap();
+    c.handshake().await;
     c
 }
 
 async fn create_endpoint(
-    c: &mut WebhookReceiverConnector,
+    c: &mut SignedConnector,
     path: &str,
     provider: &str,
     signing_secret: &str,
@@ -83,7 +247,7 @@ fn unix_seconds() -> i64 {
 }
 
 async fn ingest(
-    c: &mut WebhookReceiverConnector,
+    c: &mut SignedConnector,
     path: &str,
     headers: serde_json::Value,
     body: &str,
@@ -123,7 +287,7 @@ fn assert_external_status(result: Result<serde_json::Value, FcpError>, expected_
 async fn lifecycle_health_unconfigured() {
     let c = WebhookReceiverConnector::new();
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "unconfigured");
+    assert_eq!(h["status"]["state"], "starting");
     assert_eq!(h["configured"], false);
     assert_eq!(h["handshaken"], false);
 }
@@ -133,7 +297,7 @@ async fn lifecycle_configured_not_handshaken() {
     let mut c = WebhookReceiverConnector::new();
     c.handle_configure(json!({})).await.unwrap();
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "degraded");
+    assert_eq!(h["status"]["state"], "degraded");
     assert_eq!(h["configured"], true);
     assert_eq!(h["handshaken"], false);
 }
@@ -142,7 +306,7 @@ async fn lifecycle_configured_not_handshaken() {
 async fn lifecycle_full() {
     let c = setup_connector().await;
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "healthy");
+    assert_eq!(h["status"]["state"], "ready");
     assert_eq!(h["configured"], true);
     assert_eq!(h["handshaken"], true);
     assert_eq!(h["ingress_listener_status"], "deferred");
@@ -167,7 +331,7 @@ async fn lifecycle_shutdown() {
     let mut c = setup_connector().await;
     c.handle_shutdown(json!({})).await.unwrap();
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "unconfigured");
+    assert_eq!(h["status"]["state"], "starting");
 }
 
 #[fcp_async_core::runtime::test]
@@ -243,14 +407,19 @@ async fn lifecycle_handshake_returns_capabilities() {
         .await
         .unwrap();
     let hs = c
-        .handle_handshake(json!({"session_id": "s1"}))
+        .handle_handshake(json!(handshake_request(
+            &Ed25519SigningKey::from_bytes(&[7; 32]).unwrap()
+        )))
         .await
         .unwrap();
     assert_eq!(hs["protocol_version"], "2.0");
     assert_eq!(hs["connector_id"], "fcp.webhook-receiver");
-    let caps = hs["capabilities"].as_array().unwrap();
+    let caps = hs["capabilities_granted"].as_array().unwrap();
     assert_eq!(caps.len(), 4);
-    assert!(caps.iter().any(|cap| cap == "webhook.events.write"));
+    assert!(
+        caps.iter()
+            .any(|cap| cap["capability"] == "webhook.events.write")
+    );
 }
 
 // -- Endpoints Create --
@@ -1064,9 +1233,15 @@ async fn simulate_known_operations() {
             .handle_simulate(json!({"operation_id": op_id}))
             .await
             .unwrap();
-        assert!(
-            result["allowed"].as_bool().unwrap(),
-            "op {op_id} should be allowed"
+        let needs_approval = matches!(
+            op_id,
+            "webhook.endpoints.create"
+                | "webhook.endpoints.rotate_secret"
+                | "webhook.endpoints.delete"
+        );
+        assert_eq!(
+            result["would_succeed"], !needs_approval,
+            "endpoint mutation previews must report the missing signed approval"
         );
     }
 }
@@ -1077,7 +1252,7 @@ async fn simulate_unknown() {
     assert!(
         !c.handle_simulate(json!({"operation_id": "webhook.nope"}))
             .await
-            .unwrap()["allowed"]
+            .unwrap()["would_succeed"]
             .as_bool()
             .unwrap()
     );
@@ -1187,9 +1362,7 @@ async fn shutdown_clears_endpoints() {
 
     // Re-configure and verify empty
     c.handle_configure(json!({})).await.unwrap();
-    c.handle_handshake(json!({"session_id": "s2"}))
-        .await
-        .unwrap();
+    c.handshake().await;
     let list = c
         .handle_invoke(json!({
             "operation_id": "webhook.endpoints.list",
@@ -1286,11 +1459,9 @@ async fn reconfigure_after_shutdown() {
     c.handle_configure(json!({"public_base_url": "https://hooks.flywheel.test"}))
         .await
         .unwrap();
-    c.handle_handshake(json!({"session_id": "new_session"}))
-        .await
-        .unwrap();
+    c.handshake().await;
     let h = c.handle_health().await.unwrap();
-    assert_eq!(h["status"], "healthy");
+    assert_eq!(h["status"]["state"], "ready");
 }
 
 #[fcp_async_core::runtime::test]
@@ -1327,4 +1498,446 @@ async fn self_check_degrades_for_local_test_base_url() {
     let check = c.handle_self_check().await.unwrap();
     assert_eq!(check["status"], "degraded");
     assert_eq!(check["reason_code"], "public_base_url_not_public");
+}
+
+// -- Real session and capability boundary (no fixture request repair) --
+
+fn read_request(c: &SignedConnector) -> InvokeRequest {
+    c.request(json!({"operation_id": "webhook.endpoints.list"}))
+        .unwrap()
+}
+
+fn scoped_token(
+    c: &SignedConnector,
+    zone: &str,
+    operation: &str,
+    instance: Option<&str>,
+) -> CapabilityToken {
+    let now = Utc::now();
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["*".into()],
+        ..Default::default()
+    };
+    let mut builder = CapabilityTokenBuilder::new()
+        .capability_id("webhook.endpoints.read")
+        .zone_id(zone)
+        .principal("user:test")
+        .operations(&[operation])
+        .issuer("node:test")
+        .validity(now, now + Duration::hours(1))
+        .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(&constraints).unwrap())
+        .unwrap();
+    if let Some(instance) = instance {
+        builder = builder.target_instance(instance);
+    }
+    CapabilityToken::from_raw(builder.sign(&c.key).unwrap())
+}
+
+fn resign_approval(c: &SignedConnector, request: &mut InvokeRequest) {
+    let approval = &mut request.approval_tokens[0];
+    approval.signature = None;
+    approval.signature = Some(
+        c.approval_key
+            .sign(&fcp_cbor::to_canonical_cbor(approval).unwrap())
+            .to_bytes()
+            .to_vec(),
+    );
+}
+
+fn constrained_read_token(
+    c: &SignedConnector,
+    constraints: &CapabilityConstraints,
+) -> CapabilityToken {
+    let now = Utc::now();
+    CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id("webhook.endpoints.read")
+            .zone_id("z:work")
+            .principal("user:test")
+            .operations(&["webhook.endpoints.list"])
+            .issuer("node:test")
+            .target_instance(&c.instance_id)
+            .token_id(b"limited-webhook-read")
+            .validity(now, now + Duration::hours(1))
+            .try_constraints_cbor(&fcp_cbor::to_canonical_cbor(constraints).unwrap())
+            .unwrap()
+            .sign(&c.key)
+            .unwrap(),
+    )
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_resource_constraints_cover_empty_and_aggregate_reads() {
+    let mut c = setup_connector().await;
+    let mut request = read_request(&c);
+    request.capability_token = constrained_read_token(
+        &c,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            resource_deny: vec!["*".into()],
+            ..Default::default()
+        },
+    );
+    assert!(c.inner.handle_invoke(json!(request.clone())).await.is_err());
+    let preview = SimulateRequest::new(
+        request.connector_id,
+        request.operation,
+        request.zone_id,
+        request.input,
+        request.capability_token,
+    );
+    assert_eq!(
+        c.inner.handle_simulate(json!(preview)).await.unwrap()["would_succeed"],
+        false
+    );
+
+    let first = create_endpoint(&mut c, "/allowed", "github", "first-secret").await;
+    let second = create_endpoint(&mut c, "/restricted", "github", "second-secret").await;
+    let mut request = read_request(&c);
+    request.capability_token = constrained_read_token(
+        &c,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            resource_deny: vec![second["url"].as_str().unwrap().into()],
+            ..Default::default()
+        },
+    );
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    let mut request = read_request(&c);
+    request.capability_token = constrained_read_token(
+        &c,
+        &CapabilityConstraints {
+            resource_allow: vec![first["url"].as_str().unwrap().into()],
+            ..Default::default()
+        },
+    );
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    let mut request = read_request(&c);
+    request.capability_token = constrained_read_token(
+        &c,
+        &CapabilityConstraints {
+            resource_allow: vec![
+                first["url"].as_str().unwrap().into(),
+                second["url"].as_str().unwrap().into(),
+            ],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        c.inner.handle_invoke(json!(request)).await.unwrap()["endpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_signed_call_allowance_is_enforced_before_dispatch() {
+    let mut c = setup_connector().await;
+    let mut request = read_request(&c);
+    request.capability_token = constrained_read_token(
+        &c,
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            max_calls: Some(1),
+            ..Default::default()
+        },
+    );
+    let preview = SimulateRequest::new(
+        request.connector_id.clone(),
+        request.operation.clone(),
+        request.zone_id.clone(),
+        request.input.clone(),
+        request.capability_token.clone(),
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            c.inner.handle_simulate(json!(preview)).await.unwrap()["would_succeed"],
+            true
+        );
+    }
+    c.inner.handle_invoke(json!(request.clone())).await.unwrap();
+    request.id = RequestId::random();
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    assert_eq!(c.inner.handle_health().await.unwrap()["requests"], 1);
+    assert_eq!(
+        c.inner.handle_simulate(json!(preview)).await.unwrap()["would_succeed"],
+        false
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_typed_health_and_introspection_support_host_preparation() {
+    let mut c = setup_connector().await;
+    let health = c.inner.handle_health().await.unwrap();
+    let typed: HealthSnapshot = serde_json::from_value(health.clone()).unwrap();
+    assert!(typed.is_ready());
+    assert_eq!(health["details"]["configured"], true);
+    assert_eq!(health["details"]["handshaken"], true);
+    assert_eq!(health["details"]["instance_id"], c.instance_id);
+    assert_eq!(health["instance_id"], health["details"]["instance_id"]);
+    let catalog: fcp_prelude::Introspection =
+        serde_json::from_value(c.inner.handle_introspect().await.unwrap()).unwrap();
+    assert_eq!(catalog.operations.len(), 7);
+    let operation = catalog
+        .operations
+        .iter()
+        .find(|op| op.id.as_str() == "webhook.endpoints.delete")
+        .unwrap();
+    assert_eq!(
+        operation.requires_approval,
+        Some(fcp_prelude::ApprovalMode::Interactive)
+    );
+    let request = c
+        .request(json!({"operation_id": "webhook.health"}))
+        .unwrap();
+    let response = c.inner.handle_invoke(json!(request)).await.unwrap();
+    assert_eq!(response["details"]["instance_id"], c.instance_id);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_missing_token_cannot_read_events_or_mutate_endpoints() {
+    let mut c = setup_connector().await;
+    for operation in [
+        "webhook.endpoints.list",
+        "webhook.events.recent",
+        "webhook.endpoints.create",
+    ] {
+        let request = c
+            .request(json!({"operation_id": operation, "input": {"path": "/denied"}}))
+            .unwrap();
+        let mut params = json!(request);
+        params.as_object_mut().unwrap().remove("capability_token");
+        assert!(c.inner.handle_invoke(params).await.is_err());
+    }
+    let health = c.inner.handle_health().await.unwrap();
+    assert_eq!(health["requests"], 0);
+    assert_eq!(health["endpoints"], 0);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_rejects_wrong_zone_operation_connector_and_instance() {
+    let mut c = setup_connector().await;
+    let original = read_request(&c);
+    let mut bad = original.clone();
+    bad.zone_id = ZoneId::private();
+    assert!(c.inner.handle_invoke(json!(bad)).await.is_err());
+    let mut bad = original.clone();
+    bad.operation = OperationId::from_static("webhook.health");
+    assert!(c.inner.handle_invoke(json!(bad)).await.is_err());
+    let mut bad = original.clone();
+    bad.connector_id = ConnectorId::from_static("fcp.other");
+    assert!(c.inner.handle_invoke(json!(bad)).await.is_err());
+    for (zone, instance) in [
+        ("z:private", Some(c.instance_id.as_str())),
+        ("z:work", Some("wrong-instance")),
+        ("z:work", None),
+    ] {
+        let mut bad = original.clone();
+        bad.capability_token = scoped_token(&c, zone, "webhook.endpoints.list", instance);
+        assert!(c.inner.handle_invoke(json!(bad)).await.is_err());
+    }
+    assert!(c.inner.handle_invoke(json!(original)).await.is_ok());
+    assert_eq!(c.inner.handle_health().await.unwrap()["requests"], 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_rejects_other_signer_and_unnegotiated_capabilities() {
+    let mut c = setup_connector().await;
+    let request = read_request(&c);
+    let mut handshake = handshake_request(&Ed25519SigningKey::from_bytes(&[9; 32]).unwrap());
+    let response = c
+        .inner
+        .handle_handshake(json!(handshake.clone()))
+        .await
+        .unwrap();
+    c.instance_id = response["instance_id"].as_str().unwrap().to_owned();
+    let wrong_signer = read_request(&c);
+    assert!(matches!(
+        c.inner.handle_invoke(json!(wrong_signer)).await,
+        Err(FcpError::InvalidSignature)
+    ));
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    handshake.host_public_key = c.key.verifying_key().to_bytes();
+    handshake.capabilities_requested.clear();
+    let response = c.inner.handle_handshake(json!(handshake)).await.unwrap();
+    c.instance_id = response["instance_id"].as_str().unwrap().to_owned();
+    assert_eq!(response["capabilities_granted"], json!([]));
+    let request = read_request(&c);
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_failed_handshake_revokes_prior_session() {
+    let mut c = setup_connector().await;
+    let request = read_request(&c);
+    assert!(
+        c.inner
+            .handle_handshake(json!({"session_id": "untrusted"}))
+            .await
+            .is_err()
+    );
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    assert_eq!(
+        c.inner.handle_health().await.unwrap()["details"]["handshaken"],
+        false
+    );
+    c.handshake().await;
+    let mut handshake = handshake_request(&c.key);
+    handshake.zone = ZoneId::public();
+    assert!(c.inner.handle_handshake(json!(handshake)).await.is_err());
+    assert_eq!(
+        c.inner.handle_health().await.unwrap()["details"]["handshaken"],
+        false
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_rehandshake_rotates_instance_and_rejects_prior_tokens() {
+    let mut c = setup_connector().await;
+    let request = read_request(&c);
+    let previous = c.instance_id.clone();
+    c.handshake().await;
+    assert_ne!(previous, c.instance_id);
+    assert!(c.inner.handle_invoke(json!(request)).await.is_err());
+    let request = read_request(&c);
+    assert!(c.inner.handle_invoke(json!(request)).await.is_ok());
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_reconfiguration_clears_zone_state_and_failed_config_revokes() {
+    let mut c = setup_connector().await;
+    create_endpoint(&mut c, "/private-state", "github", "secret").await;
+    let mut handshake = handshake_request(&c.key);
+    handshake.zone = ZoneId::private();
+    assert!(
+        c.inner
+            .handle_handshake(json!(handshake.clone()))
+            .await
+            .is_err()
+    );
+    assert_eq!(c.inner.handle_health().await.unwrap()["endpoints"], 1);
+    c.inner.handle_configure(json!({})).await.unwrap();
+    assert_eq!(c.inner.handle_health().await.unwrap()["endpoints"], 0);
+    c.inner.handle_handshake(json!(handshake)).await.unwrap();
+    assert!(
+        c.inner
+            .handle_configure(json!({"approval_public_key": [1, 2]}))
+            .await
+            .is_err()
+    );
+    let health = c.inner.handle_health().await.unwrap();
+    assert_eq!(health["details"]["configured"], false);
+    assert_eq!(health["details"]["handshaken"], false);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_endpoint_mutations_require_independent_signed_approvals() {
+    let mut c = setup_connector().await;
+    let created = create_endpoint(&mut c, "/approved", "github", "secret").await;
+    for (operation, input) in [
+        ("webhook.endpoints.create", json!({"path": "/denied"})),
+        (
+            "webhook.endpoints.rotate_secret",
+            json!({"endpoint_id": created["endpoint_id"]}),
+        ),
+        (
+            "webhook.endpoints.delete",
+            json!({"endpoint_id": created["endpoint_id"]}),
+        ),
+    ] {
+        let request = c
+            .request(json!({"operation_id": operation, "input": input}))
+            .unwrap();
+        let mut absent = request.clone();
+        absent.approval_tokens.clear();
+        assert!(c.inner.handle_invoke(json!(absent)).await.is_err());
+        let mut unsigned = request.clone();
+        unsigned.approval_tokens[0].signature = None;
+        assert!(c.inner.handle_invoke(json!(unsigned)).await.is_err());
+        let mut wrong_signer = request;
+        wrong_signer.approval_tokens[0].signature = None;
+        wrong_signer.approval_tokens[0].signature = Some(
+            c.key
+                .sign(&fcp_cbor::to_canonical_cbor(&wrong_signer.approval_tokens[0]).unwrap())
+                .to_bytes()
+                .to_vec(),
+        );
+        assert!(c.inner.handle_invoke(json!(wrong_signer)).await.is_err());
+    }
+    assert_eq!(c.inner.handle_health().await.unwrap()["endpoints"], 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_valid_signatures_do_not_bypass_approval_scope_or_expiry() {
+    let mut c = setup_connector().await;
+    let request = c
+        .request(
+            json!({"operation_id": "webhook.endpoints.create", "input": {"path": "/approved"}}),
+        )
+        .unwrap();
+    let mut altered_input = request.clone();
+    altered_input.input["path"] = json!("/different");
+    assert!(c.inner.handle_invoke(json!(altered_input)).await.is_err());
+    let mut altered_id = request.clone();
+    altered_id.id = RequestId::random();
+    assert!(c.inner.handle_invoke(json!(altered_id)).await.is_err());
+    let mut wrong_zone = request.clone();
+    wrong_zone.approval_tokens[0].zone_id = ZoneId::private();
+    resign_approval(&c, &mut wrong_zone);
+    assert!(c.inner.handle_invoke(json!(wrong_zone)).await.is_err());
+    let mut expired = request.clone();
+    expired.approval_tokens[0].expires_at_ms = 1;
+    resign_approval(&c, &mut expired);
+    assert!(c.inner.handle_invoke(json!(expired)).await.is_err());
+    let mut wrong_op = request.clone();
+    if let ApprovalScope::Execution(scope) = &mut wrong_op.approval_tokens[0].scope {
+        scope.method_pattern = "webhook.endpoints.delete".into();
+    }
+    resign_approval(&c, &mut wrong_op);
+    assert!(c.inner.handle_invoke(json!(wrong_op)).await.is_err());
+    assert_eq!(c.inner.handle_health().await.unwrap()["endpoints"], 0);
+    assert!(c.inner.handle_invoke(json!(request)).await.is_ok());
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_missing_approval_key_allows_reads_but_denies_mutations() {
+    let mut c = setup_connector().await;
+    c.inner.handle_configure(json!({})).await.unwrap();
+    c.handshake().await;
+    let read = read_request(&c);
+    assert!(c.inner.handle_invoke(json!(read)).await.is_ok());
+    let write = c
+        .request(json!({"operation_id": "webhook.endpoints.create", "input": {"path": "/denied"}}))
+        .unwrap();
+    assert!(c.inner.handle_invoke(json!(write)).await.is_err());
+}
+
+#[fcp_async_core::runtime::test]
+async fn authority_simulate_verifies_without_mutation_or_call_charge() {
+    let mut c = setup_connector().await;
+    let request = read_request(&c);
+    let preview = SimulateRequest::new(
+        request.connector_id.clone(),
+        request.operation.clone(),
+        request.zone_id.clone(),
+        request.input.clone(),
+        request.capability_token.clone(),
+    );
+    let result = c
+        .inner
+        .handle_simulate(json!(preview.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result["would_succeed"], true);
+    assert_eq!(c.inner.handle_health().await.unwrap()["requests"], 0);
+    let mut denied = preview;
+    denied.zone_id = ZoneId::private();
+    assert_eq!(
+        c.inner.handle_simulate(json!(denied)).await.unwrap()["would_succeed"],
+        false
+    );
+    c.inner.handle_invoke(json!(request)).await.unwrap();
+    assert_eq!(c.inner.handle_health().await.unwrap()["requests"], 1);
 }

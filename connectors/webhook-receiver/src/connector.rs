@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::IpAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -13,10 +13,17 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Utc};
-use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityId, ConnectorId, FcpError, FcpResult, IdempotencyClass,
-    OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport,
+use fcp_crypto::{
+    canonicalize::to_deterministic_cbor,
+    ed25519::{Ed25519Signature, Ed25519VerifyingKey},
 };
+use fcp_prelude::{
+    AgentHint, ApprovalMode, ApprovalScope, BaseConnector, CapabilityId, ConnectorId, EventCaps,
+    FcpError, FcpResult, HandshakeRequest, HealthSnapshot, HealthState, IdempotencyClass,
+    InvokeRequest, InvokeResponse, ObjectId, OperationId, OperationInfo, RiskLevel, SafetyTier,
+    SelfCheckReport, SimulateRequest, SimulateResponse, ZoneId,
+};
+use fcp_sdk::prelude::{StandaloneInvocation, StandaloneSession};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use reqwest::Url;
@@ -52,6 +59,8 @@ const DEFAULT_IN_FLIGHT_MAX: u64 = 8;
 const MAX_IN_FLIGHT_MAX: u64 = 1024;
 const DEFAULT_SIGNATURE_TOLERANCE_SECONDS: i64 = 300;
 const MAX_SIGNATURE_TOLERANCE_SECONDS: i64 = 24 * 60 * 60;
+const MANIFEST: &str = include_str!("../manifest.toml");
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
@@ -59,6 +68,7 @@ type HmacSha1 = Hmac<Sha1>;
 /// Parsed and validated webhook receiver configuration.
 #[derive(Debug, Clone)]
 struct WebhookReceiverConfig {
+    approval_public_key: Option<Ed25519VerifyingKey>,
     public_base_url: String,
     max_body_bytes: usize,
     body_timeout_ms: u64,
@@ -69,7 +79,17 @@ struct WebhookReceiverConfig {
 }
 
 impl WebhookReceiverConfig {
-    fn from_params(params: &serde_json::Value) -> Self {
+    fn from_params(params: &serde_json::Value) -> FcpResult<Self> {
+        let approval_public_key = params
+            .get("approval_public_key")
+            .map(|value| {
+                let bytes: [u8; 32] = serde_json::from_value(value.clone()).map_err(|_| {
+                    invalid_request("approval_public_key must be a 32-byte Ed25519 public key")
+                })?;
+                Ed25519VerifyingKey::from_bytes(&bytes)
+                    .map_err(|_| invalid_request("approval_public_key is not a valid Ed25519 key"))
+            })
+            .transpose()?;
         let public_base_url = params
             .get("public_base_url")
             .and_then(serde_json::Value::as_str)
@@ -78,7 +98,8 @@ impl WebhookReceiverConfig {
             .unwrap_or(DEFAULT_PUBLIC_BASE_URL)
             .to_string();
 
-        Self {
+        Ok(Self {
+            approval_public_key,
             public_base_url,
             max_body_bytes: optional_usize_param(
                 params,
@@ -120,7 +141,7 @@ impl WebhookReceiverConfig {
                 MAX_SIGNATURE_TOLERANCE_SECONDS,
             )
             .max(1),
-        }
+        })
     }
 
     fn provisioning_readiness(&self, store: &WebhookStore) -> ProvisioningReadiness {
@@ -331,6 +352,9 @@ pub struct WebhookReceiverConnector {
     store: WebhookStore,
     ingress_state: IngressState,
     session_id: Option<String>,
+    authority: Option<StandaloneSession>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
     request_count: AtomicU64,
     error_count: AtomicU64,
 }
@@ -346,6 +370,9 @@ impl WebhookReceiverConnector {
             store: WebhookStore::new(),
             ingress_state: IngressState::default(),
             session_id: None,
+            authority: None,
+            bound_zone: None,
+            started_at: Instant::now(),
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
         }
@@ -367,7 +394,15 @@ impl WebhookReceiverConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let config = WebhookReceiverConfig::from_params(&params);
+        self.invalidate_authority();
+        self.config = None;
+        self.base.set_configured(false);
+        // Endpoint secrets, payloads and deduplication belong to the old zone.
+        // Reconfiguration cannot carry them into a replacement authority.
+        self.store.clear();
+        self.ingress_state = IngressState::default();
+        self.bound_zone = None;
+        let config = WebhookReceiverConfig::from_params(&params)?;
         info!(public_base_url = %config.public_base_url, "Configuring Webhook Receiver connector");
         self.store.set_public_base_url(&config.public_base_url);
         self.config = Some(config);
@@ -388,53 +423,88 @@ impl WebhookReceiverConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
         if self.config.is_none() {
-            return Err(FcpError::InvalidRequest {
-                code: 1004,
-                message: "Connector not configured".into(),
+            return Err(FcpError::NotConfigured);
+        }
+        let request: HandshakeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_request("Invalid FCP handshake request"))?;
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &request.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "webhook.handshake".into(),
+                reason: "Reconfigure before rebinding webhook state to another zone".into(),
             });
         }
-
-        let session_id = params
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-
-        self.session_id = session_id;
+        let zone = request.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST)?;
+        let mut response = authority.handshake(request)?;
+        response.event_caps = Some(EventCaps {
+            streaming: false,
+            replay: true,
+            min_buffer_events: crate::client::MAX_EVENTS_PER_ENDPOINT as u32,
+            requires_ack: false,
+        });
+        let mut result = serde_json::to_value(&response).map_err(|_| FcpError::Internal {
+            message: "Failed to encode handshake response".into(),
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["protocol_version"] = json!("2.0");
+        result["connector_id"] = json!("fcp.webhook-receiver");
+        result["ingress_binding"] = ingress_binding_info();
+        self.session_id = Some(response.session_id.to_string());
+        self.authority = Some(authority);
+        self.bound_zone = Some(zone);
         self.base.set_handshaken(true);
+        Ok(result)
+    }
 
-        Ok(json!({
-            "protocol_version": "2.0",
-            "connector_id": "fcp.webhook-receiver",
-            "connector_version": "0.1.0",
-            "capabilities": [
-                "webhook.endpoints.read",
-                "webhook.endpoints.write",
-                "webhook.events.read",
-                "webhook.events.write"
-            ],
-            "event_caps": webhook_event_caps(),
-            "ingress_binding": ingress_binding_info()
-        }))
+    fn invalidate_authority(&mut self) {
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+        }
+        self.session_id = None;
+        self.base.set_handshaken(false);
     }
 
     /// Handle the `health` method.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
         let configured = self.config.is_some();
-        let handshaken = self.session_id.is_some();
-
+        let handshaken = self
+            .authority
+            .as_ref()
+            .is_some_and(StandaloneSession::is_established);
+        let instance_id = self.authority.as_ref().map(StandaloneSession::instance_id);
         let status = if configured && handshaken {
-            "healthy"
+            HealthState::Ready
         } else if configured {
-            "degraded"
+            HealthState::Degraded {
+                reason: "No negotiated capability authority".into(),
+            }
         } else {
-            "unconfigured"
+            HealthState::Starting
         };
-
-        Ok(json!({
-            "status": status,
+        let snapshot = HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(json!({
+                "configured": configured,
+                "handshaken": handshaken,
+                "instance_id": instance_id,
+            })),
+            rate_limit: None,
+        };
+        let mut result = serde_json::to_value(snapshot).map_err(|_| FcpError::Internal {
+            message: "Failed to encode health snapshot".into(),
+        })?;
+        let diagnostics = json!({
             "configured": configured,
             "handshaken": handshaken,
+            "instance_id": instance_id,
             "requests": self.request_count.load(Ordering::Relaxed),
             "errors": self.error_count.load(Ordering::Relaxed),
             "endpoints": self.store.endpoint_count(),
@@ -446,7 +516,12 @@ impl WebhookReceiverConnector {
             "host_forwarded_ingress_message": HOST_FORWARDED_INGRESS_MESSAGE,
             "gateway_binding_status": GATEWAY_BINDING_STATUS,
             "gateway_binding_message": GATEWAY_BINDING_MESSAGE,
-        }))
+        });
+        if let (Some(result), Some(diagnostics)) = (result.as_object_mut(), diagnostics.as_object())
+        {
+            result.extend(diagnostics.clone());
+        }
+        Ok(result)
     }
 
     /// Handle the `doctor` method.
@@ -615,53 +690,140 @@ impl WebhookReceiverConnector {
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         self.base.check_ready()?;
+        let request: InvokeRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_request("Invalid FCP invoke request"))?;
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(invalid_request(
+                "Invocation requires object input and an unexpired deadline",
+            ));
+        }
+        self.require_execution_approval(&request)?;
+        let authority = self.authority.as_ref().ok_or(FcpError::NotHandshaken)?;
+        let resources = self.resource_uris(request.operation.as_str(), &request.input);
+        // StandaloneSession performs verify_bound, enforces negotiated scope,
+        // and charges signed usage before any endpoint mutation or event read.
+        let witness = authority.admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
+        self.invoke_authorized(request, witness).await
+    }
 
-        let operation = params
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing operation_id".into(),
-            })?;
-
-        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-
+    async fn invoke_authorized(
+        &mut self,
+        request: InvokeRequest,
+        witness: StandaloneInvocation,
+    ) -> FcpResult<Value> {
+        let operation = request.operation.as_str();
+        let input = &request.input;
         self.request_count.fetch_add(1, Ordering::Relaxed);
-
         let result = match operation {
-            "webhook.endpoints.create" => self.invoke_endpoints_create(&input),
-            "webhook.endpoints.rotate_secret" => self.invoke_endpoints_rotate_secret(&input),
-            "webhook.endpoints.delete" => self.invoke_endpoints_delete(&input),
-            "webhook.endpoints.list" => self.invoke_endpoints_list(),
-            "webhook.events.recent" => self.invoke_events_recent(&input),
-            WEBHOOK_EVENTS_INGEST_OPERATION => self.invoke_events_ingest(&input),
-            _ => {
-                return Err(FcpError::InvalidRequest {
-                    code: 1002,
-                    message: format!("Unknown operation: {operation}"),
-                });
-            }
+            "webhook.endpoints.create" => self
+                .invoke_endpoints_create(input)
+                .map_err(|e| e.to_fcp_error()),
+            "webhook.endpoints.rotate_secret" => self
+                .invoke_endpoints_rotate_secret(input)
+                .map_err(|e| e.to_fcp_error()),
+            "webhook.endpoints.delete" => self
+                .invoke_endpoints_delete(input)
+                .map_err(|e| e.to_fcp_error()),
+            "webhook.endpoints.list" => self.invoke_endpoints_list().map_err(|e| e.to_fcp_error()),
+            "webhook.events.recent" => self
+                .invoke_events_recent(input)
+                .map_err(|e| e.to_fcp_error()),
+            WEBHOOK_EVENTS_INGEST_OPERATION => self
+                .invoke_events_ingest(input)
+                .map_err(|e| e.to_fcp_error()),
+            "webhook.health" => self.handle_health().await,
+            _ => Err(invalid_request("Unknown webhook operation")),
         };
-
-        result.map_err(|e| {
+        if result.is_err() {
             self.error_count.fetch_add(1, Ordering::Relaxed);
-            e.to_fcp_error()
-        })
+        }
+        // Settle the complete canonical response, including an error, before
+        // releasing provider data. Failed/oversized outcomes keep their charge.
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id, value.clone()),
+            Err(error) => InvokeResponse::error(request.id, error.clone()),
+        };
+        witness.finish_response(&response)?;
+        result
     }
 
     /// Handle the `simulate` method.
     pub async fn handle_simulate(&self, params: serde_json::Value) -> FcpResult<serde_json::Value> {
-        let operation = params
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        self.base.check_ready()?;
+        let request: SimulateRequest = serde_json::from_value(params)
+            .map_err(|_| invalid_request("Invalid FCP simulate request"))?;
+        if request.r#type != "simulate" || request.id.0.is_empty() || !request.input.is_object() {
+            return Err(invalid_request("Invalid simulation type, ID or input"));
+        }
+        let authority = self.authority.as_ref().ok_or(FcpError::NotHandshaken)?;
+        let resources = self.resource_uris(request.operation.as_str(), &request.input);
+        let checked = authority.authorize(
+            &request.connector_id, &request.zone_id, &request.operation,
+            request.capability_token, &resources,
+        ).and_then(|_| {
+            if requires_execution_approval(request.operation.as_str()) {
+                Err(FcpError::CapabilityDenied {
+                    capability: request.operation.to_string(),
+                    reason: "Execution requires a signed approval; simulate carries no approval evidence".into(),
+                })
+            } else {
+                Ok(())
+            }
+        });
+        let response = match checked {
+            Ok(()) => SimulateResponse::allowed(request.id),
+            Err(error) => {
+                SimulateResponse::denied(request.id, error.to_string(), error.error_code())
+            }
+        };
+        serde_json::to_value(response).map_err(|_| FcpError::Internal {
+            message: "Failed to encode simulation response".into(),
+        })
+    }
 
-        let allowed = operations_info().iter().any(|o| o.id.as_ref() == operation);
-
-        Ok(json!({
-            "allowed": allowed,
-            "reason": if allowed { "Operation supported" } else { "Unknown operation" },
-        }))
+    /// Bind resource constraints to the actual endpoints being touched. A list
+    /// checks every endpoint it can disclose, so a denied endpoint cannot leak
+    /// through a collection read. Empty collections and health use the intake
+    /// namespace URL; an empty URI list must never bypass a signed deny rule.
+    fn resource_uris(&self, operation: &str, input: &Value) -> Vec<String> {
+        let namespace = self.store.public_base_url().trim_end_matches('/');
+        if matches!(
+            operation,
+            "webhook.endpoints.create" | WEBHOOK_EVENTS_INGEST_OPERATION
+        ) && let Some(path) = input.get("path").and_then(Value::as_str)
+        {
+            return vec![format!("{namespace}{}", path.trim())];
+        }
+        if matches!(
+            operation,
+            "webhook.endpoints.delete"
+                | "webhook.endpoints.rotate_secret"
+                | "webhook.events.recent"
+        ) && let Some(id) = input.get("endpoint_id").and_then(Value::as_str)
+        {
+            return vec![
+                self.store
+                    .get_endpoint(id)
+                    .map_or_else(|_| namespace.to_owned(), |endpoint| endpoint.url.clone()),
+            ];
+        }
+        if matches!(
+            operation,
+            "webhook.endpoints.list" | "webhook.events.recent"
+        ) {
+            let mut resources = self
+                .store
+                .list_endpoints()
+                .into_iter()
+                .map(|endpoint| endpoint.url)
+                .collect::<Vec<_>>();
+            if !resources.is_empty() {
+                resources.sort();
+                resources.dedup();
+                return resources;
+            }
+        }
+        vec![namespace.to_owned()]
     }
 
     /// Handle the `shutdown` method.
@@ -670,13 +832,71 @@ impl WebhookReceiverConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Webhook Receiver connector shutting down");
+        self.invalidate_authority();
         self.store.clear();
         self.ingress_state = IngressState::default();
         self.config = None;
         self.base.set_configured(false);
         self.base.set_handshaken(false);
         self.session_id = None;
+        self.bound_zone = None;
         Ok(json!({}))
+    }
+
+    /// Verify independent approval authority before changing endpoint secrets
+    /// or deleting retained events. The capability signer is never trusted as
+    /// an approval signer implicitly; the host configures the public key.
+    fn require_execution_approval(&self, request: &InvokeRequest) -> FcpResult<()> {
+        if !requires_execution_approval(request.operation.as_str()) {
+            return Ok(());
+        }
+        let denied = || FcpError::CapabilityDenied {
+            capability: request.operation.to_string(),
+            reason: "Endpoint mutation requires a valid signed execution approval for this request"
+                .into(),
+        };
+        let key = self
+            .config
+            .as_ref()
+            .and_then(|config| config.approval_public_key.as_ref())
+            .ok_or_else(denied)?;
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).map_err(|_| denied())?;
+        let input_bytes = to_deterministic_cbor(&request.input).map_err(|_| denied())?;
+        let input_hash = *blake3::hash(&input_bytes).as_bytes();
+        let request_object_id = ObjectId::from_unscoped_bytes(request.id.0.as_bytes());
+        for approval in &request.approval_tokens {
+            if !approval.is_valid(now_ms) || approval.zone_id != request.zone_id {
+                continue;
+            }
+            let ApprovalScope::Execution(scope) = &approval.scope else {
+                continue;
+            };
+            if scope.connector_id != request.connector_id.as_str()
+                || !approval_operation_matches(&scope.method_pattern, request.operation.as_str())
+                || scope
+                    .request_object_id
+                    .is_some_and(|id| id != request_object_id)
+                || scope.input_hash.is_some_and(|hash| hash != input_hash)
+                || !scope.input_constraints.iter().all(|constraint| {
+                    request.input.pointer(&constraint.pointer) == Some(&constraint.expected)
+                })
+            {
+                continue;
+            }
+            let Some(signature) = approval.signature.as_deref() else {
+                continue;
+            };
+            let Ok(signature) = Ed25519Signature::try_from_slice(signature) else {
+                continue;
+            };
+            let mut unsigned = approval.clone();
+            unsigned.signature = None;
+            let bytes = fcp_cbor::to_canonical_cbor(&unsigned).map_err(|_| denied())?;
+            if key.verify(&bytes, &signature).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(denied())
     }
 
     // -- Operation implementations --
@@ -1745,6 +1965,30 @@ fn redacted_hash(value: &str) -> String {
     hex::encode(&digest[..16])
 }
 
+fn invalid_request(message: &str) -> FcpError {
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: message.into(),
+    }
+}
+
+fn requires_execution_approval(operation: &str) -> bool {
+    matches!(
+        operation,
+        "webhook.endpoints.create" | "webhook.endpoints.delete" | "webhook.endpoints.rotate_secret"
+    )
+}
+
+fn approval_operation_matches(pattern: &str, operation: &str) -> bool {
+    pattern == "*"
+        || pattern == operation
+        || pattern.strip_suffix(".*").is_some_and(|prefix| {
+            operation
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+}
+
 fn webhook_event_caps() -> serde_json::Value {
     json!({
         "streaming": false,
@@ -1882,7 +2126,11 @@ fn op_info(
         risk_level,
         description: None,
         rate_limit: None,
-        requires_approval: None,
+        requires_approval: Some(match id {
+            "webhook.endpoints.delete" => ApprovalMode::Interactive,
+            "webhook.endpoints.create" | "webhook.endpoints.rotate_secret" => ApprovalMode::Policy,
+            _ => ApprovalMode::None,
+        }),
         safety_tier,
         idempotency,
         ai_hints,
@@ -2128,6 +2376,22 @@ fn operations_info() -> Vec<OperationInfo> {
                 ],
             },
         ),
+        op_info(
+            "webhook.health",
+            "Report authenticated connector readiness and ingress diagnostics",
+            json!({"type": "object"}),
+            json!({"type": "object"}),
+            "webhook.endpoints.read",
+            RiskLevel::Low,
+            SafetyTier::Safe,
+            IdempotencyClass::Strict,
+            AgentHint {
+                when_to_use: "Inspect the active webhook receiver and its host-forwarded ingress state.".into(),
+                common_mistakes: vec!["A ready receiver does not mean a public HTTP adapter is bound.".into()],
+                examples: vec!["{}".into()],
+                related: vec![CapabilityId::from_static("webhook.endpoints.list")],
+            },
+        ),
     ]
 }
 
@@ -2160,9 +2424,9 @@ mod tests {
     }
 
     #[test]
-    fn operations_info_has_6_operations() {
+    fn operations_info_has_7_operations() {
         let ops = operations_info();
-        assert_eq!(ops.len(), 6);
+        assert_eq!(ops.len(), 7);
     }
 
     #[test]
