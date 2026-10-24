@@ -5,6 +5,8 @@
 //! HPKE during a V4 cutover are tracked as deferred acknowledgers so the
 //! owner can re-send an X-Wing wrap when they advertise a V4 key.
 
+use std::collections::HashSet;
+
 use fcp_core::{
     NodeId, NodeSignature, TailscaleNodeId, WrappedKey, WrappedZoneKeyV4, ZoneId, ZoneKemAlgorithm,
     ZoneKey, ZoneKeyManifest, wrap_zone_key,
@@ -131,7 +133,8 @@ pub enum ZoneKeyRotationAckRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZoneKeyRotationPhase {
-    /// All recipients received X-Wing wraps.
+    /// Every recipient received the selected wrap without a deferred V4
+    /// acknowledgement (including explicitly requested HPKE-only issuance).
     Complete,
     /// At least one recipient got an HPKE fallback wrap and must
     /// acknowledge after publishing V4 key material.
@@ -166,6 +169,16 @@ impl ZoneKeyRotationCutover {
 /// Zone-key rotation construction or receiver-policy failure.
 #[derive(Debug, Error)]
 pub enum ZoneKeyRotationError {
+    /// Recipient descriptors must name each node exactly once, so conflicting
+    /// keys or capability advertisements cannot silently overwrite one another.
+    #[error("zone-key rotation lists peer {peer} more than once")]
+    DuplicateRecipient {
+        /// Duplicate recipient node.
+        peer: String,
+    },
+    /// The manifest contains ambiguous recipient wraps.
+    #[error("invalid zone-key rotation manifest: {0}")]
+    InvalidManifest(#[from] fcp_core::ZoneKeyError),
     /// Policy requires X-Wing, but this recipient cannot receive it.
     #[error(
         "peer {peer} cannot receive X-Wing zone-key wrap while policy requires PQ KEM: {reason:?}"
@@ -213,13 +226,23 @@ pub enum ZoneKeyRotationError {
 
 /// Build a mixed V3/V4 zone-key manifest for a peer-driven cutover.
 ///
-/// The returned manifest is deliberately not re-signed; callers must run the
+/// `recipients` is the complete authorized recipient set for this issuance,
+/// not a list of incremental updates. Both zone-key wrap lists are rebuilt
+/// from that set; removed peers receive no retained zone-key or object-ID-key
+/// wrap, and upgrading a peer to X-Wing removes its legacy HPKE wrap. Object-ID
+/// key wraps for retained recipients are preserved unchanged: callers must
+/// supply valid object-ID wraps when adding recipients or rotating that key.
+///
+/// The caller supplies the new manifest metadata, including key IDs, validity
+/// window, and predecessor. This helper does not generate keys or change that
+/// metadata. It clears the inherited signature; callers must run the
 /// owner-signing flow after this helper fills in the recipient wraps.
 ///
 /// # Errors
 ///
 /// Returns [`ZoneKeyRotationError`] when policy requires X-Wing but a
-/// recipient can only receive HPKE, or when HPKE/X-Wing wrapping fails.
+/// recipient can only receive HPKE, recipients are duplicated, the template
+/// manifest has ambiguous wraps, or HPKE/X-Wing wrapping fails.
 pub fn build_zone_key_rotation_cutover<K>(
     mut manifest: ZoneKeyManifest,
     zone_key: &ZoneKey,
@@ -230,6 +253,27 @@ pub fn build_zone_key_rotation_cutover<K>(
 where
     K: XWingKem,
 {
+    manifest.validate_no_recipient_split_view()?;
+    let mut recipient_ids = HashSet::with_capacity(recipients.len());
+    for recipient in recipients {
+        if !recipient_ids.insert(recipient.node_id.clone()) {
+            return Err(ZoneKeyRotationError::DuplicateRecipient {
+                peer: recipient.node_id.as_str().to_string(),
+            });
+        }
+        // Validate the complete policy before doing any sealing work.
+        choose_kem(recipient, policy)?;
+    }
+
+    // A membership-change or revocation rotation is a replacement issuance.
+    // Upserting into inherited lists would preserve removed peers and leave
+    // an HPKE/X-Wing split view when an existing peer upgrades to V4.
+    manifest.wrapped_keys.clear();
+    manifest.wrapped_keys_v4.clear();
+    manifest
+        .wrapped_object_id_keys
+        .retain(|entry| recipient_ids.contains(&entry.recipient));
+    manifest.signature.signature = [0_u8; 64];
     manifest.kem = ZoneKemAlgorithm::HpkeX25519;
     let mut acknowledgements = Vec::with_capacity(recipients.len());
 
@@ -244,7 +288,7 @@ where
                     recipient,
                     zone_key,
                 )?;
-                upsert_xwing_wrap(&mut manifest, recipient.node_id.clone(), sealed);
+                append_xwing_wrap(&mut manifest, recipient.node_id.clone(), sealed);
                 manifest.kem = ZoneKemAlgorithm::XWing;
                 acknowledgements.push(ZoneKeyRotationAckRequirement::Immediate {
                     peer: recipient.node_id.clone(),
@@ -259,7 +303,7 @@ where
                     manifest.valid_from,
                     zone_key,
                 )?;
-                upsert_hpke_wrap(&mut manifest, wrapped);
+                append_hpke_wrap(&mut manifest, wrapped);
                 if let Some(reason) = deferred_reason {
                     acknowledgements.push(ZoneKeyRotationAckRequirement::Deferred {
                         peer: recipient.node_id.clone(),
@@ -284,6 +328,7 @@ where
         ZoneKeyRotationPhase::Complete
     };
 
+    manifest.validate_no_recipient_split_view()?;
     Ok(ZoneKeyRotationCutover {
         manifest,
         phase,
@@ -296,13 +341,16 @@ where
 /// # Errors
 ///
 /// Returns [`ZoneKeyRotationError::MissingRecipientWrap`] when the manifest
-/// does not include this peer, and [`ZoneKeyRotationError::KemTooWeak`] when
-/// `policy.require_pq_kem` rejects a non-X-Wing wrap.
+/// does not include this peer, [`ZoneKeyRotationError::KemTooWeak`] when
+/// `policy.require_pq_kem` rejects a non-X-Wing wrap, or
+/// [`ZoneKeyRotationError::InvalidManifest`] for duplicate or split-view wraps.
+/// This policy check does not replace owner-signature or freshness validation.
 pub fn enforce_incoming_zone_key_policy(
     manifest: &ZoneKeyManifest,
     recipient: &TailscaleNodeId,
     policy: ProtocolVersionPolicy,
 ) -> Result<WrappedKey, ZoneKeyRotationError> {
+    manifest.validate_no_recipient_split_view()?;
     let wrapped = manifest
         .resolved_wrapped_key_for(recipient)
         .ok_or_else(|| ZoneKeyRotationError::MissingRecipientWrap {
@@ -443,52 +491,29 @@ where
         })
 }
 
-fn upsert_hpke_wrap(manifest: &mut ZoneKeyManifest, wrapped: fcp_core::WrappedZoneKey) {
-    manifest
-        .wrapped_keys
-        .retain(|entry| entry.recipient != wrapped.recipient);
-    manifest.wrapped_keys.push(wrapped.clone());
-    upsert_wrapped_key_v4(
-        &mut manifest.wrapped_keys_v4,
-        WrappedZoneKeyV4 {
-            recipient: wrapped.recipient,
-            issued_at: wrapped.issued_at,
-            sealed: WrappedKey::from_hpke(wrapped.sealed),
-        },
-    );
+fn append_hpke_wrap(manifest: &mut ZoneKeyManifest, wrapped: fcp_core::WrappedZoneKey) {
+    manifest.wrapped_keys_v4.push(wrapped.to_v4());
+    manifest.wrapped_keys.push(wrapped);
 }
 
-fn upsert_xwing_wrap(
+fn append_xwing_wrap(
     manifest: &mut ZoneKeyManifest,
     recipient: TailscaleNodeId,
     sealed: fcp_crypto::XWingSealedBox,
 ) {
-    upsert_wrapped_key_v4(
-        &mut manifest.wrapped_keys_v4,
-        WrappedZoneKeyV4 {
-            recipient,
-            issued_at: manifest.valid_from,
-            sealed: WrappedKey::from_xwing(sealed),
-        },
-    );
-}
-
-fn upsert_wrapped_key_v4(entries: &mut Vec<WrappedZoneKeyV4>, entry: WrappedZoneKeyV4) {
-    if let Some(existing) = entries
-        .iter_mut()
-        .find(|existing| existing.recipient == entry.recipient)
-    {
-        *existing = entry;
-    } else {
-        entries.push(entry);
-    }
+    manifest.wrapped_keys_v4.push(WrappedZoneKeyV4 {
+        recipient,
+        issued_at: manifest.valid_from,
+        sealed: WrappedKey::from_xwing(sealed),
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fcp_core::{
-        NodeId, ObjectHeader, ObjectIdKeyId, Provenance, ZONE_KEY_LEN, ZoneKeyAlgorithm, ZoneKeyId,
+        NodeId, ObjectHeader, ObjectIdKey, ObjectIdKeyId, Provenance, ZONE_KEY_LEN,
+        ZoneKeyAlgorithm, ZoneKeyId, ZoneKeyRing, wrap_object_id_key,
     };
     use fcp_crypto::{
         Ed25519Signature, Ed25519SigningKey, X25519SecretKey, XWingProvider, XWingSecretKey,
@@ -537,11 +562,19 @@ mod tests {
     }
 
     fn v3_recipient(name: &str) -> ZoneKeyRecipient {
-        ZoneKeyRecipient::new(
-            TailscaleNodeId::new(name),
-            hpke_public_key(),
-            None,
-            PeerProtocolCapabilities::v3_only(),
+        v3_recipient_with_secret(name).0
+    }
+
+    fn v3_recipient_with_secret(name: &str) -> (ZoneKeyRecipient, X25519SecretKey) {
+        let secret = X25519SecretKey::generate();
+        (
+            ZoneKeyRecipient::new(
+                TailscaleNodeId::new(name),
+                secret.public_key(),
+                None,
+                PeerProtocolCapabilities::v3_only(),
+            ),
+            secret,
         )
     }
 
@@ -732,5 +765,204 @@ mod tests {
 
         assert_ne!(signed_payload, tampered_payload);
         assert!(verifying_key.verify(&tampered_payload, &signature).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn zone_key_rotation_v4_reissues_exact_membership_and_upgrades_existing_peer() {
+        let xwing = XWingProvider::new();
+        let zone_id = ZoneId::work();
+        let (upgrading, upgrading_secret) = v3_recipient_with_secret("upgrading-peer");
+        let (retained, retained_secret) = v3_recipient_with_secret("retained-v3-peer");
+        let removed_v3 = v3_recipient("removed-v3-peer");
+        let removed_v4 = v4_recipient("removed-v4-peer", &xwing);
+        let initial_recipients = [
+            upgrading.clone(),
+            retained.clone(),
+            removed_v3.clone(),
+            removed_v4.clone(),
+        ];
+        let object_id_key = ObjectIdKey::from_bytes([0xCC; ZONE_KEY_LEN]);
+        let mut initial = test_manifest(zone_id.clone(), 1_700_000_400);
+        for recipient in &initial_recipients {
+            initial.wrapped_object_id_keys.push(
+                wrap_object_id_key(
+                    &recipient.hpke_public_key,
+                    &zone_id,
+                    &recipient.node_id,
+                    initial.valid_from,
+                    &object_id_key,
+                )
+                .expect("initial object-ID wrap"),
+            );
+        }
+        let initial = build_zone_key_rotation_cutover(
+            initial,
+            &test_zone_key(),
+            &initial_recipients,
+            ProtocolVersionPolicy::migration_default(),
+            &xwing,
+        )
+        .expect("initial mixed issuance")
+        .manifest;
+
+        let (upgrading_public, upgrading_xwing_secret) = xwing.generate().expect("new X-Wing key");
+        let mut upgraded = upgrading.clone();
+        upgraded.xwing_public_key = Some(upgrading_public);
+        upgraded.protocol_capabilities = PeerProtocolCapabilities::v3_v4();
+        let next_zone_key = ZoneKey::from_bytes([0xB5; ZONE_KEY_LEN]);
+        let mut next = initial.clone();
+        next.zone_key_id = ZoneKeyId::from_bytes([0x66; 8]);
+        next.prev_zone_key_id = Some(initial.zone_key_id);
+        next.valid_from += 10;
+        next.header.created_at = next.valid_from;
+        next.signature.signature = [0xA1; 64];
+        let next = build_zone_key_rotation_cutover(
+            next,
+            &next_zone_key,
+            &[upgraded.clone(), retained.clone()],
+            ProtocolVersionPolicy::migration_default(),
+            &xwing,
+        )
+        .expect("membership-change rotation")
+        .manifest;
+
+        next.validate_no_recipient_split_view()
+            .expect("upgraded recipient must have no legacy HPKE split view");
+        assert_eq!(next.wrapped_keys.len(), 1);
+        assert_eq!(next.wrapped_keys[0].recipient, retained.node_id);
+        assert_eq!(next.wrapped_keys_v4.len(), 2);
+        assert_eq!(next.wrapped_object_id_keys.len(), 2);
+        assert_eq!(next.prev_zone_key_id, Some(initial.zone_key_id));
+        assert_eq!(next.object_id_key_id, initial.object_id_key_id);
+        assert_eq!(next.signature.signature, [0_u8; 64]);
+        for removed in [&removed_v3, &removed_v4] {
+            assert!(next.wrapped_key_for(&removed.node_id).is_none());
+            assert!(next.wrapped_key_v4_for(&removed.node_id).is_none());
+            assert!(next.wrapped_object_id_key_for(&removed.node_id).is_none());
+            assert!(matches!(
+                enforce_incoming_zone_key_policy(
+                    &next,
+                    &removed.node_id,
+                    ProtocolVersionPolicy::migration_default(),
+                ),
+                Err(ZoneKeyRotationError::MissingRecipientWrap { .. })
+            ));
+        }
+        let mut upgraded_ring = ZoneKeyRing::new(zone_id.clone());
+        upgraded_ring
+            .apply_manifest_v4(
+                &next,
+                &upgraded.node_id,
+                &upgrading_secret,
+                &upgrading_xwing_secret,
+                &xwing,
+            )
+            .expect("upgraded recipient applies the actual rotation");
+        assert_eq!(upgraded_ring.active_zone_key(), Some(&next_zone_key));
+        assert_eq!(upgraded_ring.active_object_id_key(), Some(&object_id_key));
+        assert_eq!(upgraded_ring.active_zone_key_id, Some(next.zone_key_id));
+        let mut retained_ring = ZoneKeyRing::new(zone_id);
+        retained_ring
+            .apply_manifest(&next, &retained.node_id, &retained_secret)
+            .expect("retained V3 recipient still applies the rotation");
+        assert_eq!(retained_ring.active_zone_key(), Some(&next_zone_key));
+        assert_eq!(retained_ring.active_object_id_key(), Some(&object_id_key));
+        assert_eq!(initial.wrapped_keys_v4.len(), 4);
+    }
+
+    #[test]
+    fn zone_key_rotation_v4_rejects_conflicting_recipient_descriptors() {
+        let xwing = XWingProvider::new();
+        let recipient = v3_recipient("duplicate-peer");
+        let conflicting = v4_recipient("duplicate-peer", &xwing);
+        let error = build_zone_key_rotation_cutover(
+            test_manifest(ZoneId::work(), 1_700_000_500),
+            &test_zone_key(),
+            &[recipient, conflicting],
+            ProtocolVersionPolicy::migration_default(),
+            &xwing,
+        )
+        .expect_err("the last descriptor must not silently select a different KEM or key");
+        assert!(matches!(
+            error,
+            ZoneKeyRotationError::DuplicateRecipient { .. }
+        ));
+    }
+
+    #[test]
+    fn zone_key_rotation_v4_refuses_split_view_before_receiver_policy_or_reissue() {
+        let xwing = XWingProvider::new();
+        let recipient = v4_recipient("split-view-peer", &xwing);
+        let mut manifest = build_zone_key_rotation_cutover(
+            test_manifest(ZoneId::work(), 1_700_000_600),
+            &test_zone_key(),
+            std::slice::from_ref(&recipient),
+            ProtocolVersionPolicy::require_xwing(),
+            &xwing,
+        )
+        .expect("X-Wing issuance")
+        .manifest;
+        manifest.wrapped_keys.push(
+            wrap_zone_key(
+                &recipient.hpke_public_key,
+                &manifest.zone_id,
+                &recipient.node_id,
+                manifest.valid_from,
+                &ZoneKey::from_bytes([0xFF; ZONE_KEY_LEN]),
+            )
+            .expect("conflicting legacy wrap"),
+        );
+
+        let error = enforce_incoming_zone_key_policy(
+            &manifest,
+            &recipient.node_id,
+            ProtocolVersionPolicy::require_xwing(),
+        )
+        .expect_err("an X-Wing selection must not hide a conflicting V3 view");
+        assert!(matches!(
+            error,
+            ZoneKeyRotationError::InvalidManifest(
+                fcp_core::ZoneKeyError::InconsistentRecipientWraps { .. }
+            )
+        ));
+        assert!(matches!(
+            build_zone_key_rotation_cutover(
+                manifest,
+                &test_zone_key(),
+                &[recipient],
+                ProtocolVersionPolicy::migration_default(),
+                &xwing,
+            ),
+            Err(ZoneKeyRotationError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn zone_key_rotation_v4_receiver_rejects_duplicate_wraps_before_resolution() {
+        let xwing = XWingProvider::new();
+        let recipient = v3_recipient("duplicate-wrap-peer");
+        let mut manifest = build_zone_key_rotation_cutover(
+            test_manifest(ZoneId::work(), 1_700_000_700),
+            &test_zone_key(),
+            std::slice::from_ref(&recipient),
+            ProtocolVersionPolicy::migration_default(),
+            &xwing,
+        )
+        .expect("HPKE issuance")
+        .manifest;
+        manifest
+            .wrapped_keys_v4
+            .push(manifest.wrapped_keys_v4[0].clone());
+        assert!(matches!(
+            enforce_incoming_zone_key_policy(
+                &manifest,
+                &recipient.node_id,
+                ProtocolVersionPolicy::migration_default(),
+            ),
+            Err(ZoneKeyRotationError::InvalidManifest(
+                fcp_core::ZoneKeyError::DuplicateRecipientInManifest { .. }
+            ))
+        ));
     }
 }

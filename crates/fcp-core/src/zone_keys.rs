@@ -1110,6 +1110,10 @@ impl ZoneKeyRing {
     /// [`ZoneKeyManifest::add_xwing_wrap`] entries require
     /// [`Self::apply_manifest_v4`] for those recipients.
     ///
+    /// Both the zone key and object-ID key must unwrap successfully before
+    /// either is installed or activated. Any error leaves the entire ring
+    /// unchanged, including retained keys whose IDs the manifest reuses.
+    ///
     /// # Errors
     /// Returns [`ZoneKeyError`] if the manifest is for a different
     /// zone, fails the split-view / duplicate-recipient guard, the
@@ -1164,6 +1168,8 @@ impl ZoneKeyRing {
     /// not promote it to V4. A V4-only zone-key manifest whose
     /// `wrapped_object_id_keys` list is empty for this recipient
     /// fails with [`ZoneKeyError::MissingWrappedObjectIdKey`].
+    /// As with [`Self::apply_manifest`], a failure leaves all stored and
+    /// active keys unchanged.
     ///
     /// # Errors
     /// Returns [`ZoneKeyError`] for any of the same conditions as
@@ -1211,8 +1217,8 @@ impl ZoneKeyRing {
     }
 
     /// Common tail of [`Self::apply_manifest`] and
-    /// [`Self::apply_manifest_v4`]: install the unwrapped zone key
-    /// and unwrap the V3 `ObjectIdKey` for the same recipient.
+    /// [`Self::apply_manifest_v4`]: finish unwrapping both keys before
+    /// committing the new key pair and its active IDs together.
     fn finalize_apply(
         &mut self,
         manifest: &ZoneKeyManifest,
@@ -1220,9 +1226,6 @@ impl ZoneKeyRing {
         node_secret: &X25519SecretKey,
         zone_key: ZoneKey,
     ) -> ZoneKeyResult<()> {
-        self.insert_zone_key(manifest.zone_key_id, zone_key);
-        self.active_zone_key_id = Some(manifest.zone_key_id);
-
         let wrapped_object_id = manifest.wrapped_object_id_key_for(node_id).ok_or_else(|| {
             ZoneKeyError::MissingWrappedObjectIdKey {
                 node_id: node_id.as_str().to_string(),
@@ -1230,7 +1233,13 @@ impl ZoneKeyRing {
         })?;
         let object_id_key =
             unwrap_object_id_key(node_secret, &manifest.zone_id, wrapped_object_id)?;
+
+        // No fallible validation or cryptography may follow the first write:
+        // a failed object-ID unwrap must not leave a half-applied rotation or
+        // overwrite a retained zone key under an existing ID.
+        self.insert_zone_key(manifest.zone_key_id, zone_key);
         self.insert_object_id_key(manifest.object_id_key_id, object_id_key);
+        self.active_zone_key_id = Some(manifest.zone_key_id);
         self.active_object_id_key_id = Some(manifest.object_id_key_id);
 
         Ok(())
@@ -1606,6 +1615,152 @@ mod tests {
         );
         assert_eq!(ring.active_zone_key(), Some(&zone_key));
         assert_eq!(ring.active_object_id_key(), Some(&object_id_key));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_object_id_failure_preserves_entire_key_ring(use_xwing: bool) {
+        let zone_id = ZoneId::work();
+        let node_id = TailscaleNodeId::new("atomic-rotation-recipient");
+        let secret = X25519SecretKey::generate();
+        let public = secret.public_key();
+        let xwing = XWingProvider::new();
+        let (xwing_public, xwing_secret) = xwing.generate().expect("X-Wing key pair");
+        let old_zone_id = ZoneKeyId::from_bytes([0x10; 8]);
+        let old_object_id = ObjectIdKeyId::from_bytes([0x20; 8]);
+        let old_zone_key = random_zone_key();
+        let old_object_key = random_object_id_key();
+        let new_zone_key = random_zone_key();
+        let new_object_key = random_object_id_key();
+        let issued_at = 1_700_000_800;
+        let mut ring = ZoneKeyRing::new(zone_id.clone());
+        ring.insert_zone_key(old_zone_id, old_zone_key);
+        ring.insert_object_id_key(old_object_id, old_object_key);
+        assert!(ring.set_active_zone_key(old_zone_id));
+        assert!(ring.set_active_object_id_key(old_object_id));
+        let original = ring.clone();
+        let mut manifest = ZoneKeyManifest {
+            header: test_header(&zone_id),
+            zone_id: zone_id.clone(),
+            zone_key_id: ZoneKeyId::from_bytes([0x11; 8]),
+            object_id_key_id: ObjectIdKeyId::from_bytes([0x21; 8]),
+            algorithm: ZoneKeyAlgorithm::ChaCha20Poly1305,
+            valid_from: issued_at,
+            valid_until: None,
+            prev_zone_key_id: Some(old_zone_id),
+            wrapped_keys: Vec::new(),
+            wrapped_object_id_keys: vec![
+                wrap_object_id_key(&public, &zone_id, &node_id, issued_at, &new_object_key)
+                    .expect("object-ID wrap"),
+            ],
+            rekey_policy: None,
+            signature: test_signature(),
+            kem: ZoneKemAlgorithm::HpkeX25519,
+            wrapped_keys_v4: Vec::new(),
+        };
+        if use_xwing {
+            let aad =
+                Fcp4Aad::for_zone_key(zone_id.as_bytes(), node_id.as_str().as_bytes(), issued_at)
+                    .encode()
+                    .expect("X-Wing AAD");
+            let sealed = xwing
+                .seal(&xwing_public, new_zone_key.as_bytes(), &aad)
+                .expect("X-Wing zone-key wrap");
+            manifest.kem = ZoneKemAlgorithm::XWing;
+            manifest.add_xwing_wrap(node_id.clone(), issued_at, sealed);
+        } else {
+            manifest.wrapped_keys.push(
+                wrap_zone_key(&public, &zone_id, &node_id, issued_at, &new_zone_key)
+                    .expect("HPKE zone-key wrap"),
+            );
+        }
+        let apply = |ring: &mut ZoneKeyRing, candidate: &ZoneKeyManifest| {
+            if use_xwing {
+                ring.apply_manifest_v4(candidate, &node_id, &secret, &xwing_secret, &xwing)
+            } else {
+                ring.apply_manifest(candidate, &node_id, &secret)
+            }
+        };
+
+        for reuse_existing_ids in [false, true] {
+            for failure in [
+                "missing",
+                "corrupted",
+                "wrong_key",
+                "wrong_aad",
+                "short_key",
+            ] {
+                let mut invalid = manifest.clone();
+                if reuse_existing_ids {
+                    invalid.zone_key_id = old_zone_id;
+                    invalid.object_id_key_id = old_object_id;
+                }
+                match failure {
+                    "missing" => invalid.wrapped_object_id_keys.clear(),
+                    "corrupted" => {
+                        invalid.wrapped_object_id_keys[0].sealed.ciphertext[0] ^= 1;
+                    }
+                    "wrong_key" => {
+                        invalid.wrapped_object_id_keys[0] = wrap_object_id_key(
+                            &X25519SecretKey::generate().public_key(),
+                            &zone_id,
+                            &node_id,
+                            issued_at,
+                            &new_object_key,
+                        )
+                        .expect("wrap for another key");
+                    }
+                    "wrong_aad" => invalid.wrapped_object_id_keys[0].issued_at += 1,
+                    "short_key" => {
+                        let aad = Fcp2Aad::for_objectid_key(
+                            zone_id.as_bytes(),
+                            node_id.as_str().as_bytes(),
+                            issued_at,
+                        );
+                        invalid.wrapped_object_id_keys[0].sealed =
+                            hpke_seal(&public, &[0xAA; ZONE_KEY_LEN - 1], &aad)
+                                .expect("well-authenticated payload with invalid key length");
+                    }
+                    _ => unreachable!("fixed failure cases"),
+                }
+                let error = apply(&mut ring, &invalid).expect_err(failure);
+                match failure {
+                    "missing" => assert!(matches!(
+                        error,
+                        ZoneKeyError::MissingWrappedObjectIdKey { .. }
+                    )),
+                    "short_key" => assert!(matches!(error, ZoneKeyError::InvalidKeyLength { .. })),
+                    _ => assert!(matches!(error, ZoneKeyError::Crypto(_))),
+                }
+                assert_eq!(ring.zone_keys, original.zone_keys, "{failure}");
+                assert_eq!(ring.object_id_keys, original.object_id_keys, "{failure}");
+                assert_eq!(
+                    ring.active_zone_key_id, original.active_zone_key_id,
+                    "{failure}"
+                );
+                assert_eq!(
+                    ring.active_object_id_key_id, original.active_object_id_key_id,
+                    "{failure}"
+                );
+            }
+        }
+
+        apply(&mut ring, &manifest).expect("a complete rotation still succeeds after failures");
+        assert_eq!(ring.active_zone_key(), Some(&new_zone_key));
+        assert_eq!(ring.active_object_id_key(), Some(&new_object_key));
+        assert_eq!(ring.zone_key(&old_zone_id), Some(&old_zone_key));
+        assert_eq!(ring.object_id_key(&old_object_id), Some(&old_object_key));
+        assert_eq!(ring.zone_keys.len(), 2);
+        assert_eq!(ring.object_id_keys.len(), 2);
+    }
+
+    #[test]
+    fn apply_manifest_object_id_failure_is_atomic() {
+        assert_object_id_failure_preserves_entire_key_ring(false);
+    }
+
+    #[test]
+    fn apply_manifest_v4_object_id_failure_is_atomic() {
+        assert_object_id_failure_preserves_entire_key_ring(true);
     }
 
     /// br-f69kn regression: pre-fix, `ZoneKeyRing::apply_manifest`
