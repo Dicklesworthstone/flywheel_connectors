@@ -4368,7 +4368,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Context(args) => context_dispatch(args)?,
         Commands::Mesh(args) => mesh_dispatch(args, cli.host.as_deref())?,
         Commands::Connector(args) => connector_dispatch(args, cli.host.as_deref())?,
-        Commands::Task(args) => task_dispatch(args)?,
+        Commands::Task(args) => task_dispatch(args, cli.host.as_deref())?,
         Commands::Session(args) => session_dispatch(args)?,
         Commands::Agent(args) => agent_dispatch(args)?,
         Commands::AgentBootstrap(args) => agent_bootstrap_dispatch(args)?,
@@ -4377,7 +4377,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Explain(args) => {
             intent_explain_dispatch(&args.request(intent::IntentMode::Explain))?
         }
-        Commands::Do(args) => intent_do_dispatch(args)?,
+        Commands::Do(args) => intent_do_dispatch(args, cli.host.as_deref())?,
         Commands::List(args) => list_dispatch(args, cli.host.as_deref())?,
         Commands::Zones(args) => zones_dispatch(args)?,
         Commands::Search(args) => search_dispatch(args, cli.host.as_deref())?,
@@ -29171,7 +29171,8 @@ fn finish_pipeline_dispatch(
     if let Some(failure) = &execution.failure {
         // Preserve request-inspection guidance and uncertainty classification,
         // while retaining the run namespace and all completed step evidence.
-        if let (Some(target), Some(source)) = (payload.as_object_mut(), failure.payload.as_object()) {
+        if let (Some(target), Some(source)) = (payload.as_object_mut(), failure.payload.as_object())
+        {
             target.extend(source.clone());
         }
     } else if execution.exit_code.is_success() {
@@ -31885,17 +31886,17 @@ fn discovery_error(
     }
 }
 
-fn task_dispatch(args: &TaskArgs) -> Result<DispatchOutcome> {
+fn task_dispatch(args: &TaskArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     match &args.command {
         TaskCommand::Create(args) => task_create_dispatch(args),
         TaskCommand::Show(args) => task_show_dispatch(args),
         TaskCommand::List(args) => task_list_dispatch(args),
-        TaskCommand::Resolve(args) => task_resolve_dispatch(args),
+        TaskCommand::Resolve(args) => task_resolve_dispatch(args, explicit_host),
         TaskCommand::Ask(args) => task_ask_dispatch(args),
-        TaskCommand::Advance(args) => task_advance_dispatch(args),
+        TaskCommand::Advance(args) => task_advance_dispatch(args, explicit_host),
         TaskCommand::Bind(args) => task_bind_dispatch(args),
         TaskCommand::Approve(args) => task_approve_dispatch(args),
-        TaskCommand::Run(args) => task_run_dispatch(args),
+        TaskCommand::Run(args) => task_run_dispatch(args, explicit_host),
     }
 }
 
@@ -31963,7 +31964,10 @@ fn task_list_dispatch(args: &TaskListArgs) -> Result<DispatchOutcome> {
     })
 }
 
-fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
+fn task_resolve_dispatch(
+    args: &TaskResolveArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
     let Some(mut task) = store.refresh(&args.task_id)? else {
         return Ok(missing_task_dispatch(&args.task_id));
@@ -31979,6 +31983,7 @@ fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
     let mut safe_step_count = 0usize;
     let mut changed_any = false;
     let mut pass_summaries = Vec::new();
+    let mut failed_execution = None;
     let stop_reason = loop {
         if pass_count > 0 && workflow::ready_for_execution(&task) {
             break "ready";
@@ -31993,29 +31998,52 @@ fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
         };
         let patch_changes = workflow::resolution_patch_would_change(&task, &patch);
         let (pass_safe_step_count, safe_execution) = if can_materialize_resolution_steps(&task) {
-            materialize_safe_resolution_steps(&task, &bindings)?
+            materialize_safe_resolution_steps(&task, &bindings, explicit_host)
         } else {
             (
                 0,
-                json!({
-                    "status": "skipped",
-                    "reason": "Resolution did not materialize primitive commands because the connector choice is still ambiguous.",
-                    "safe_step_count": 0,
-                }),
+                DispatchOutcome {
+                    payload: json!({
+                        "status": "skipped",
+                        "reason": "Resolution did not materialize primitive commands because the connector choice is still ambiguous.",
+                        "safe_step_count": 0,
+                    }),
+                    exit_code: CliExitCode::Success,
+                },
             )
         };
         safe_step_count += pass_safe_step_count;
 
-        let Some(applied) = store.append_resolution(
-            &args.task_id,
+        let applied = match task_receipt_or_failure(
+            store.append_resolution(
+                &args.task_id,
+                "resolve",
+                mode,
+                pass_count,
+                safe_step_count,
+                patch,
+            ),
+            &task,
             "resolve",
-            mode,
-            pass_count,
-            safe_step_count,
-            patch,
-        )?
-        else {
-            return Ok(missing_task_dispatch(&args.task_id));
+            &safe_execution,
+        ) {
+            Ok(applied) => applied,
+            Err(mut failure) => {
+                pass_summaries.push(json!({
+                    "pass": pass_count,
+                    "receipt": null,
+                    "safe_execution": safe_execution.payload,
+                }));
+                failure.payload["resolution"] = json!({
+                    "mode": mode,
+                    "pass_count": pass_count,
+                    "safe_step_count": safe_step_count,
+                    "changed": changed_any,
+                    "stop_reason": "persistence-error",
+                    "passes": pass_summaries,
+                });
+                return Ok(failure);
+            }
         };
 
         changed_any |= applied.receipt.changed;
@@ -32023,8 +32051,13 @@ fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
         pass_summaries.push(json!({
             "pass": pass_count,
             "receipt": resolution_receipt_summary(&applied.receipt),
-            "safe_execution": safe_execution,
+            "safe_execution": safe_execution.payload,
         }));
+
+        if !safe_execution.exit_code.is_success() {
+            failed_execution = Some(safe_execution);
+            break "primitive-error";
+        }
 
         if workflow::ready_for_execution(&task) {
             break "ready";
@@ -32049,7 +32082,7 @@ fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "task");
     let mut payload = json!({
-        "status": task.capsule_status,
+        "status": if failed_execution.is_some() { "error" } else { task.capsule_status.as_str() },
         "command": "task",
         "subcommand": "resolve",
         "message": resolve_message(stop_reason, until_ready),
@@ -32066,10 +32099,13 @@ fn task_resolve_dispatch(args: &TaskResolveArgs) -> Result<DispatchOutcome> {
         "state_root": store.root_dir().display().to_string(),
     });
     envelope.inject_into(&mut payload);
-    Ok(DispatchOutcome {
-        payload,
-        exit_code: CliExitCode::Success,
-    })
+    let exit_code = if let Some(execution) = &failed_execution {
+        attach_compiled_execution_failure(&mut payload, execution);
+        execution.exit_code
+    } else {
+        CliExitCode::Success
+    };
+    Ok(DispatchOutcome { payload, exit_code })
 }
 
 fn task_ask_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
@@ -32185,7 +32221,10 @@ fn task_approve_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
     })
 }
 
-fn task_advance_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
+fn task_advance_dispatch(
+    args: &TaskIdArgs,
+    explicit_host: Option<&str>,
+) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
     let Some(task) = store.refresh(&args.task_id)? else {
         return Ok(missing_task_dispatch(&args.task_id));
@@ -32205,15 +32244,21 @@ fn task_advance_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
 
     let approve = !task.has_side_effects();
     let bindings = workflow::effective_bindings(&task);
-    let execution = materialize_compiled_steps(&task.compiled, approve, Some(&bindings))?;
-    let Some(task) = store.append_execution(
-        &args.task_id,
+    let execution =
+        materialize_compiled_steps(&task.compiled, approve, Some(&bindings), explicit_host);
+    let task = match task_receipt_or_failure(
+        store.append_execution(
+            &args.task_id,
+            "advance",
+            if approve { "approve" } else { "simulate" },
+            execution.payload.clone(),
+        ),
+        &task,
         "advance",
-        if approve { "approve" } else { "simulate" },
-        execution.clone(),
-    )?
-    else {
-        return Ok(missing_task_dispatch(&args.task_id));
+        &execution,
+    ) {
+        Ok(task) => task,
+        Err(failure) => return Ok(failure),
     };
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "task");
@@ -32221,22 +32266,25 @@ fn task_advance_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
         "status": task.capsule_status,
         "command": "task",
         "subcommand": "advance",
-        "message": if approve {
+        "message": if !execution.exit_code.is_success() {
+            "The workflow capsule stopped on a failed primitive. Its completed steps and failure are retained."
+        } else if approve {
             "Advanced the workflow capsule by executing its current non-side-effecting plan."
         } else {
             "Advanced the workflow capsule by materializing its next safe simulation step."
         },
-        "execution": execution,
+        "execution": execution.payload,
         "task": task_payload_view(&task),
     });
     envelope.inject_into(&mut payload);
+    attach_compiled_execution_failure(&mut payload, &execution);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: execution.exit_code,
     })
 }
 
-fn task_run_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
+fn task_run_dispatch(args: &TaskIdArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     let store = workflow::TaskStore::discover()?;
     let Some(task) = store.refresh(&args.task_id)? else {
         return Ok(missing_task_dispatch(&args.task_id));
@@ -32284,20 +32332,29 @@ fn task_run_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
     }
 
     let bindings = workflow::effective_bindings(&task);
-    let execution =
-        materialize_compiled_steps(&task.compiled, task.approval.workflow, Some(&bindings))?;
-    let Some(task) = store.append_execution(
-        &args.task_id,
+    let execution = materialize_compiled_steps(
+        &task.compiled,
+        task.approval.workflow,
+        Some(&bindings),
+        explicit_host,
+    );
+    let task = match task_receipt_or_failure(
+        store.append_execution(
+            &args.task_id,
+            "run",
+            if task.approval.workflow {
+                "approve"
+            } else {
+                "simulate"
+            },
+            execution.payload.clone(),
+        ),
+        &task,
         "run",
-        if task.approval.workflow {
-            "approve"
-        } else {
-            "simulate"
-        },
-        execution.clone(),
-    )?
-    else {
-        return Ok(missing_task_dispatch(&args.task_id));
+        &execution,
+    ) {
+        Ok(task) => task,
+        Err(failure) => return Ok(failure),
     };
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "task");
@@ -32305,18 +32362,72 @@ fn task_run_dispatch(args: &TaskIdArgs) -> Result<DispatchOutcome> {
         "status": task.capsule_status,
         "command": "task",
         "subcommand": "run",
-        "message": if task.approval.workflow {
+        "message": if !execution.exit_code.is_success() {
+            "The workflow capsule stopped on a failed primitive. Its completed steps and failure are retained."
+        } else if task.approval.workflow {
             "Ran the approved workflow capsule and surfaced the live result of each primitive step."
         } else {
             "Ran the workflow capsule in non-side-effecting mode."
         },
-        "execution": execution,
+        "execution": execution.payload,
         "task": task_payload_view(&task),
     });
     envelope.inject_into(&mut payload);
+    attach_compiled_execution_failure(&mut payload, &execution);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: execution.exit_code,
+    })
+}
+
+fn task_receipt_or_failure<T>(
+    result: Result<Option<T>>,
+    task: &workflow::WorkflowTask,
+    subcommand: &str,
+    execution: &DispatchOutcome,
+) -> std::result::Result<T, DispatchOutcome> {
+    let reason = match result {
+        Ok(Some(receipt)) => return Ok(receipt),
+        Ok(None) => "task-missing",
+        Err(_) => "task-store-error",
+    };
+    let persistence_error = json!({
+        "type": "task-receipt-not-persisted",
+        "reason": reason,
+        "message": "The primitive results could not be saved to the task. Preserve this execution report and inspect completed effects before repeating any step.",
+        "recoverable": false,
+    });
+    let mut payload = json!({
+        "status": "error",
+        "command": "task",
+        "subcommand": subcommand,
+        "message": "The workflow reached primitive execution, but its local receipt was not persisted. This response retains the execution evidence.",
+        "error": persistence_error,
+        "persistence_error": persistence_error,
+        "receipt_persisted": false,
+        "task_snapshot": "before-receipt",
+        "task": task_payload_view(task),
+        "execution": execution.payload,
+        "automatic_retry_allowed": false,
+    });
+    let mut envelope = CommandEnvelope::new(CommandAvailability::Unavailable, "task");
+    envelope.explanation =
+        "The local workflow receipt could not be persisted after primitive execution.".to_owned();
+    envelope.recoverable = false;
+    envelope.next_actions = vec![
+        "Preserve this execution report before repairing the local task store.".to_owned(),
+        "Inspect completed or unknown effects before deciding which steps can be repeated."
+            .to_owned(),
+    ];
+    envelope.inject_into(&mut payload);
+    attach_compiled_execution_failure(&mut payload, execution);
+    Err(DispatchOutcome {
+        payload,
+        exit_code: if execution.exit_code.is_success() {
+            CliExitCode::Internal
+        } else {
+            execution.exit_code
+        },
     })
 }
 
@@ -32409,7 +32520,7 @@ fn intent_explain_dispatch(request: &intent::IntentRequest) -> Result<DispatchOu
     })
 }
 
-fn intent_do_dispatch(args: &DoIntentArgs) -> Result<DispatchOutcome> {
+fn intent_do_dispatch(args: &DoIntentArgs, explicit_host: Option<&str>) -> Result<DispatchOutcome> {
     let compiled = intent::compile(&args.request());
 
     if compiled.status != "ready" {
@@ -32438,14 +32549,16 @@ fn intent_do_dispatch(args: &DoIntentArgs) -> Result<DispatchOutcome> {
     }
 
     let approve = args.approve;
-    let execution = materialize_compiled_steps(&compiled, approve, None)?;
+    let execution = materialize_compiled_steps(&compiled, approve, None, explicit_host);
     let defaulted_to_simulation = !args.simulate && !args.approve;
 
     let envelope = CommandEnvelope::new(CommandAvailability::OfflineArtifact, "do");
     let mut payload = json!({
-        "status": if approve { "materialized" } else { "simulated" },
+        "status": execution.payload["status"],
         "command": "do",
-        "message": if approve {
+        "message": if !execution.exit_code.is_success() {
+            "The workflow stopped on a failed primitive. Its completed steps and failure are retained."
+        } else if approve {
             "Materialized the full primitive workflow in approval mode and surfaced the live result of each primitive step."
         } else {
             "Materialized the safe prefix of the primitive workflow and stopped before the first side-effecting step."
@@ -32456,12 +32569,13 @@ fn intent_do_dispatch(args: &DoIntentArgs) -> Result<DispatchOutcome> {
             "defaulted": defaulted_to_simulation,
         },
         "workflow": serde_json::to_value(compiled)?,
-        "execution": execution,
+        "execution": execution.payload,
     });
     envelope.inject_into(&mut payload);
+    attach_compiled_execution_failure(&mut payload, &execution);
     Ok(DispatchOutcome {
         payload,
-        exit_code: CliExitCode::Success,
+        exit_code: execution.exit_code,
     })
 }
 
@@ -32472,7 +32586,8 @@ fn can_materialize_resolution_steps(task: &workflow::WorkflowTask) -> bool {
 fn materialize_safe_resolution_steps(
     task: &workflow::WorkflowTask,
     bindings: &BTreeMap<String, String>,
-) -> Result<(usize, Value)> {
+    explicit_host: Option<&str>,
+) -> (usize, DispatchOutcome) {
     let steps = task
         .compiled
         .steps
@@ -32482,21 +32597,24 @@ fn materialize_safe_resolution_steps(
         .collect::<Vec<_>>();
 
     if steps.is_empty() {
-        return Ok((
+        return (
             0,
-            json!({
-                "status": "no-safe-steps",
-                "safe_step_count": 0,
-                "executed_steps": [],
-            }),
-        ));
+            DispatchOutcome {
+                payload: json!({
+                    "status": "no-safe-steps",
+                    "safe_step_count": 0,
+                    "executed_steps": [],
+                }),
+                exit_code: CliExitCode::Success,
+            },
+        );
     }
 
     let mut compiled = task.compiled.clone();
     compiled.steps = steps;
     let safe_step_count = compiled.steps.len();
-    let execution = materialize_compiled_steps(&compiled, true, Some(bindings))?;
-    Ok((safe_step_count, execution))
+    let execution = materialize_compiled_steps(&compiled, true, Some(bindings), explicit_host);
+    (safe_step_count, execution)
 }
 
 fn is_resolution_safe_step(step: &intent::CompiledStep) -> bool {
@@ -32555,6 +32673,9 @@ fn resolve_message(stop_reason: &str, until_ready: bool) -> &'static str {
         "iteration-cap" => {
             "Stopped after multiple resolution passes to avoid looping without any new durable resolution progress."
         }
+        "primitive-error" => {
+            "Resolution stopped because a primitive failed. Local draft bindings were retained; inspect the execution failure before continuing."
+        }
         _ => "Ran a safe resolution pass for the current workflow capsule.",
     }
 }
@@ -32563,13 +32684,17 @@ fn materialize_compiled_steps(
     compiled: &intent::CompiledIntent,
     approve: bool,
     bindings: Option<&BTreeMap<String, String>>,
-) -> Result<Value> {
+    explicit_host: Option<&str>,
+) -> DispatchOutcome {
     let mut executed_steps = Vec::new();
     let mut withheld_steps = Vec::new();
     let mut stopped_before_side_effect = false;
 
     for step in &compiled.steps {
-        let (resolved_argv, resolved_command_line) = resolve_step_argv(step, bindings);
+        let (mut resolved_argv, _) = resolve_step_argv(step, bindings);
+        let parsed = parse_compiled_step_cli(&mut resolved_argv, explicit_host);
+        let recorded_argv = redact_sensitive_args(&resolved_argv);
+        let resolved_command_line = intent::shell_join(&recorded_argv);
         if !approve && (stopped_before_side_effect || step.side_effecting) {
             let reason = if step.side_effecting {
                 "Simulation mode stops before the first side-effecting primitive."
@@ -32583,7 +32708,7 @@ fn materialize_compiled_steps(
                 "purpose": step.purpose,
                 "command": step.command,
                 "command_line": resolved_command_line,
-                "argv": resolved_argv,
+                "argv": recorded_argv,
                 "approval_required": step.approval_required,
                 "side_effecting": step.side_effecting,
                 "notes": step.notes,
@@ -32593,47 +32718,130 @@ fn materialize_compiled_steps(
             continue;
         }
 
-        let parsed = Cli::try_parse_from(&resolved_argv).map_err(|error| {
-            anyhow::anyhow!("failed to parse compiled primitive `{resolved_command_line}`: {error}")
-        })?;
-        let primitive = dispatch(&parsed)?;
-        let primitive_succeeded = primitive.exit_code == CliExitCode::Success;
-        let primitive_payload = primitive.payload;
+        let primitive = match parsed {
+            Ok(parsed) => dispatch(&parsed)
+                .unwrap_or_else(|error| internal_error_dispatch(&resolved_argv, &error)),
+            Err(error) => parse_failure_dispatch(&resolved_argv, &error),
+        };
+        let primitive_succeeded = primitive.exit_code.is_success();
+        let withhold_argument_echo = invocation_cmd::withhold_argument_echo(&primitive.payload)
+            || connector_state_pull_cmd::withhold_argument_echo(&primitive.payload);
 
         executed_steps.push(json!({
             "ordinal": step.ordinal,
             "phase": step.phase,
             "purpose": step.purpose,
             "command": step.command,
-            "command_line": resolved_command_line,
-            "argv": resolved_argv,
+            "command_line": if withhold_argument_echo { Value::Null } else { json!(resolved_command_line) },
+            "argv": if withhold_argument_echo { Value::Null } else { json!(recorded_argv) },
+            "argument_echo_withheld": withhold_argument_echo,
             "approval_required": step.approval_required,
             "side_effecting": step.side_effecting,
             "notes": step.notes,
             "status": if primitive_succeeded { "executed" } else { "failed" },
-            "result": primitive_payload,
+            "exit_code": primitive.exit_code.as_u8(),
+            "result": primitive.payload,
         }));
 
         if !primitive_succeeded {
-            return Ok(json!({
-                "status": "stopped-on-primitive-error",
-                "executed_steps": executed_steps,
-                "withheld_steps": withheld_steps,
-                "executed_count": executed_steps.len(),
-                "withheld_count": withheld_steps.len(),
-                "stopped_before_side_effect": stopped_before_side_effect,
-            }));
+            return DispatchOutcome {
+                payload: json!({
+                    "status": "stopped-on-primitive-error",
+                    "exit_code": primitive.exit_code.as_u8(),
+                    "executed_steps": executed_steps,
+                    "withheld_steps": withheld_steps,
+                    "executed_count": executed_steps.len(),
+                    "withheld_count": withheld_steps.len(),
+                    "stopped_before_side_effect": stopped_before_side_effect,
+                    "automatic_retry_allowed": false,
+                }),
+                exit_code: primitive.exit_code,
+            };
         }
     }
 
-    Ok(json!({
-        "status": if approve { "materialized" } else { "simulated" },
-        "executed_steps": executed_steps,
-        "withheld_steps": withheld_steps,
-        "executed_count": executed_steps.len(),
-        "withheld_count": withheld_steps.len(),
-        "stopped_before_side_effect": stopped_before_side_effect,
-    }))
+    DispatchOutcome {
+        payload: json!({
+            "status": if approve { "materialized" } else { "simulated" },
+            "exit_code": CliExitCode::Success.as_u8(),
+            "executed_steps": executed_steps,
+            "withheld_steps": withheld_steps,
+            "executed_count": executed_steps.len(),
+            "withheld_count": withheld_steps.len(),
+            "stopped_before_side_effect": stopped_before_side_effect,
+        }),
+        exit_code: CliExitCode::Success,
+    }
+}
+
+fn parse_compiled_step_cli(
+    argv: &mut Vec<String>,
+    explicit_host: Option<&str>,
+) -> std::result::Result<Cli, clap::Error> {
+    let mut parsed = Cli::try_parse_from(&*argv)?;
+    if parsed.host.is_none()
+        && let Some(host) = explicit_host
+    {
+        parsed.host = Some(host.to_owned());
+        argv.splice(1..1, ["--host".to_owned(), host.to_owned()]);
+    }
+    Ok(parsed)
+}
+
+fn attach_compiled_execution_failure(payload: &mut Value, execution: &DispatchOutcome) {
+    if execution.exit_code.is_success() {
+        return;
+    }
+
+    let failed_step = execution.payload["executed_steps"]
+        .as_array()
+        .and_then(|steps| steps.last());
+    let failure = failed_step.and_then(|step| step.get("result"));
+    payload["error"] = failure
+        .and_then(|result| result.get("error"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "type": "workflow-primitive-failed",
+                "message": "A primitive failed; inspect the retained execution steps before continuing.",
+                "recoverable": false,
+            })
+        });
+    payload["failed_step"] = failed_step.map_or(Value::Null, |step| {
+        json!({
+            "ordinal": step["ordinal"],
+            "command": step["command"],
+            "exit_code": execution.exit_code.as_u8(),
+        })
+    });
+    payload["automatic_retry_allowed"] = Value::Bool(false);
+
+    if let Some(failure) = failure {
+        for field in [
+            "request_id",
+            "request",
+            "inspection",
+            "outcome",
+            "source_outcome_known",
+            "host",
+            "schema_version",
+            "_truth_source",
+            "next_actions",
+            "caveats",
+        ] {
+            if let Some(value) = failure.get(field) {
+                payload[field] = value.clone();
+            }
+        }
+        if let Some(availability) = failure
+            .get("availability")
+            .filter(|value| value.is_object())
+        {
+            let mut availability = availability.clone();
+            availability["command"] = payload["command"].clone();
+            payload["availability"] = availability;
+        }
+    }
 }
 
 fn resolve_step_argv(
@@ -39703,8 +39911,9 @@ deny_ptrace = true
         let resolved_payload: Value =
             serde_json::from_str(&resolved.text).expect("json output should parse cleanly");
 
-        assert_eq!(resolved.exit_code, CliExitCode::Success.into());
-        assert_eq!(resolved_payload["resolution"]["stop_reason"], "ready");
+        assert_eq!(resolved.exit_code, CliExitCode::Transport.into());
+        assert_eq!(resolved_payload["resolution"]["stop_reason"], "primitive-error");
+        assert_eq!(resolved_payload["error"]["type"], "missing-host-endpoint");
         assert_eq!(
             resolved_payload["task"]["resolution"]["draft_bindings"]["payload_json"],
             "{\"title\":\"FWC: add workflow macros\"}"
@@ -39793,8 +40002,10 @@ deny_ptrace = true
         let resolved_payload: Value =
             serde_json::from_str(&resolved.text).expect("json output should parse cleanly");
 
-        assert_eq!(resolved.exit_code, CliExitCode::Success.into());
-        assert_eq!(resolved_payload["status"], "needs-answer");
+        assert_eq!(resolved.exit_code, CliExitCode::Transport.into());
+        assert_eq!(resolved_payload["status"], "error");
+        assert_eq!(resolved_payload["task"]["capsule_status"], "needs-answer");
+        assert_eq!(resolved_payload["resolution"]["stop_reason"], "primitive-error");
         assert_eq!(
             resolved_payload["task"]["resolution"]["draft_bindings"]["payload_json"],
             "{\"content\":\"Summary\"}"
@@ -40089,7 +40300,7 @@ deny_ptrace = true
         let advanced_payload: Value =
             serde_json::from_str(&advanced.text).expect("json output should parse cleanly");
 
-        assert_eq!(advanced.exit_code, CliExitCode::Success.into());
+        assert_eq!(advanced.exit_code, CliExitCode::Transport.into());
         assert_eq!(advanced_payload["status"], "unavailable");
         assert_eq!(
             advanced_payload["execution"]["status"],
@@ -40137,24 +40348,309 @@ deny_ptrace = true
         let payload: Value =
             serde_json::from_str(&outcome.text).expect("json output should parse cleanly");
 
-        assert_eq!(outcome.exit_code, CliExitCode::Success.into());
-        assert_eq!(payload["status"], "simulated");
-        assert_eq!(payload["availability"]["availability"], "offline-artifact");
+        assert_eq!(outcome.exit_code, CliExitCode::Transport.into());
+        assert_eq!(payload["status"], "stopped-on-primitive-error");
+        assert_eq!(payload["error"]["type"], "missing-host-endpoint");
+        assert_eq!(payload["availability"]["availability"], "unavailable");
         assert_eq!(payload["availability"]["command"], "do");
         assert_eq!(payload["availability"]["authoritative"], false);
-        assert!(
-            payload["availability"]["next_actions"]
-                .as_array()
-                .is_some_and(|actions| actions
-                    .iter()
-                    .all(|action| !action.as_str().unwrap_or_default().contains("--host")))
-        );
+        assert_eq!(payload["automatic_retry_allowed"], false);
         assert_eq!(payload["execution_mode"]["defaulted"], true);
         assert_eq!(payload["execution"]["status"], "stopped-on-primitive-error");
         // The first inspect step fails (no live host), so execution truthfully stops
         // rather than continuing with potentially invalid state.
         assert!(payload["execution"]["executed_count"].as_u64().unwrap() >= 1);
         assert_eq!(payload["execution"]["withheld_count"], 0);
+    }
+
+    fn compiled_workflow_test_plan(commands: &[&[&str]]) -> super::intent::CompiledIntent {
+        let mut compiled = super::intent::compile(&super::intent::IntentRequest {
+            intent: "search GitHub issues for auth".to_owned(),
+            connector_override: None,
+            zone_override: None,
+            mode: super::intent::IntentMode::DoSimulate,
+            host_url: None,
+        });
+        compiled.steps = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let argv = command
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect::<Vec<_>>();
+                super::intent::CompiledStep {
+                    ordinal: index + 1,
+                    phase: "inspect".to_owned(),
+                    purpose: "Verify compiled workflow dispatch.".to_owned(),
+                    command: argv[1].clone(),
+                    command_line: super::intent::shell_join(&argv),
+                    argv,
+                    side_effecting: false,
+                    approval_required: false,
+                    notes: Vec::new(),
+                }
+            })
+            .collect();
+        compiled
+    }
+
+    #[test]
+    fn compiled_step_host_inheritance_preserves_explicit_overrides() {
+        let inherited = "http://127.0.0.1:17700";
+        let inner = "http://127.0.0.1:17701";
+        for (args, expected_host) in [
+            (vec!["fwc", "list"], inherited),
+            (vec!["fwc", "--host", inner, "list"], inner),
+            (vec!["fwc", "list", "--host", inner], inner),
+            (vec!["fwc", "list", "--host=http://127.0.0.1:17701"], inner),
+        ] {
+            let original = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+            let mut argv = original.clone();
+            let parsed = super::parse_compiled_step_cli(&mut argv, Some(inherited)).unwrap();
+            assert_eq!(parsed.host.as_deref(), Some(expected_host));
+            let reparsed = Cli::try_parse_from(&argv).unwrap();
+            assert_eq!(reparsed.host, parsed.host);
+            if expected_host == inner {
+                assert_eq!(argv, original, "explicit step host must remain unchanged");
+            } else {
+                assert_eq!(&argv[1..3], &["--host", inherited]);
+            }
+        }
+
+        let mut argv = vec!["fwc".to_owned(), "list".to_owned()];
+        let parsed = super::parse_compiled_step_cli(&mut argv, None).unwrap();
+        assert!(parsed.host.is_none());
+        assert_eq!(argv, ["fwc", "list"]);
+    }
+
+    #[test]
+    fn compiled_workflow_keeps_selected_host_through_nested_dispatch() {
+        let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            ),
+            (
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_with_connectors(Vec::new()),
+            ),
+        ]);
+        let (inner_host, inner_server) = spawn_mock_host(
+            StdBTreeMap::from([(
+                "POST /rpc/discover".to_owned(),
+                mock_discovery_response_json(),
+            )]),
+            1,
+        );
+        let compiled = compiled_workflow_test_plan(&[
+            &["fwc", "list"],
+            &["fwc", "list", "--host", &inner_host],
+            &["fwc", "do", "search GitHub issues for auth"],
+            &["fwc", "guide"],
+        ]);
+        let outcome = super::materialize_compiled_steps(&compiled, true, None, Some(&host));
+
+        server
+            .join()
+            .expect("selected host must receive both inherited requests");
+        inner_server
+            .join()
+            .expect("explicit step host must receive its own request");
+        assert_eq!(request_log.lock().unwrap().len(), 2);
+        assert_eq!(outcome.exit_code, CliExitCode::Validation);
+        assert_eq!(outcome.payload["status"], "stopped-on-primitive-error");
+        assert_eq!(outcome.payload["executed_count"], 3);
+        assert_eq!(
+            outcome.payload["executed_steps"][0]["result"]["_truth_source"],
+            "host"
+        );
+        assert_eq!(outcome.payload["executed_steps"][0]["argv"][2], host);
+        assert_eq!(outcome.payload["executed_steps"][1]["argv"][3], inner_host);
+        assert_eq!(outcome.payload["executed_steps"][1]["exit_code"], 0);
+        let nested = &outcome.payload["executed_steps"][2]["result"];
+        assert_eq!(nested["error"]["type"], "connector-not-found");
+        assert_eq!(nested["execution"]["executed_steps"][0]["argv"][2], host);
+        assert_eq!(
+            nested["execution"]["exit_code"],
+            CliExitCode::Validation.as_u8()
+        );
+        assert_eq!(nested["automatic_retry_allowed"], false);
+    }
+
+    #[test]
+    fn compiled_workflow_retains_completed_steps_on_parse_and_dispatch_failure() {
+        for (failed_argv, expected_exit, error_type) in [
+            (
+                vec!["fwc", "show", "github", "--unknown-workflow-flag"],
+                CliExitCode::Parse,
+                "unknown-argument",
+            ),
+            (
+                vec!["fwc", "list", "--host", "ftp://invalid.example"],
+                CliExitCode::Internal,
+                "internal-error",
+            ),
+        ] {
+            let compiled = compiled_workflow_test_plan(&[
+                &["fwc", "guide"],
+                &failed_argv,
+                &["fwc", "guide", "list"],
+            ]);
+            let outcome = super::materialize_compiled_steps(&compiled, true, None, None);
+            assert_eq!(outcome.exit_code, expected_exit);
+            assert_eq!(outcome.payload["executed_count"], 2);
+            assert_eq!(outcome.payload["executed_steps"][0]["status"], "executed");
+            assert_eq!(outcome.payload["executed_steps"][1]["status"], "failed");
+            assert_eq!(
+                outcome.payload["executed_steps"][1]["result"]["error"]["type"],
+                error_type
+            );
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+        }
+    }
+
+    #[test]
+    fn execute_compiled_workflow_wrappers_use_selected_host_and_propagate_failure() {
+        let intent = "search GitHub issues for auth";
+        for subcommand in ["do", "resolve", "advance", "run"] {
+            let (host, server) = spawn_mock_host(
+                StdBTreeMap::from([(
+                    "POST /rpc/discover".to_owned(),
+                    mock_discovery_response_with_connectors(Vec::new()),
+                )]),
+                1,
+            );
+            let task_id = if subcommand == "do" {
+                String::new()
+            } else {
+                let (exit, created) = execute_json(&["fwc", "--json", "task", intent]);
+                assert_eq!(exit, CliExitCode::Success.into());
+                created["task"]["id"].as_str().unwrap().to_owned()
+            };
+            let mut args = vec!["fwc", "--json", "--host", &host];
+            if subcommand == "do" {
+                args.extend(["do", intent]);
+            } else {
+                args.extend(["task", subcommand, &task_id]);
+            }
+            let (exit_code, payload) = execute_json(&args);
+            server
+                .join()
+                .expect("wrapper must contact its selected host");
+
+            assert_eq!(
+                exit_code,
+                CliExitCode::Validation.into(),
+                "{subcommand}: {payload}"
+            );
+            assert_eq!(payload["error"]["type"], "connector-not-found");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            let execution = if subcommand == "resolve" {
+                assert_eq!(payload["resolution"]["stop_reason"], "primitive-error");
+                assert_eq!(payload["resolution"]["pass_count"], 1);
+                &payload["resolution"]["passes"][0]["safe_execution"]
+            } else {
+                &payload["execution"]
+            };
+            assert_eq!(execution["executed_count"], 1);
+            assert_eq!(execution["executed_steps"][0]["argv"][2], host);
+            assert_eq!(execution["exit_code"], CliExitCode::Validation.as_u8());
+        }
+    }
+
+    #[test]
+    fn task_receipt_failure_keeps_completed_and_unknown_effect_evidence() {
+        let temp = TempDir::new().unwrap();
+        let store = super::workflow::TaskStore::at_path(temp.path().join("working"));
+        let task = store
+            .create(super::workflow::WorkflowRequest {
+                intent: "search GitHub issues for auth".to_owned(),
+                connector_override: None,
+                zone_override: None,
+            })
+            .unwrap();
+        let blocked_root = temp.path().join("blocked");
+        std::fs::write(&blocked_root, "a file cannot contain the task directory").unwrap();
+        let broken_store = super::workflow::TaskStore::at_path(blocked_root);
+        let missing_store = super::workflow::TaskStore::at_path(temp.path().join("missing"));
+
+        let completed = json!({
+            "ordinal": 1,
+            "command": "invoke",
+            "status": "executed",
+            "exit_code": 0,
+            "result": { "output": { "created_record_id": "already-created-42" } },
+        });
+        let inspection = json!({
+            "operation_id": "req_unknown_attempt",
+            "host_endpoint": "http://127.0.0.1:17700",
+            "command": "fwc invocation req_unknown_attempt --host http://127.0.0.1:17700 --json",
+        });
+        for execution in [
+            super::DispatchOutcome {
+                payload: json!({
+                    "status": "materialized",
+                    "executed_count": 1,
+                    "executed_steps": [completed],
+                }),
+                exit_code: CliExitCode::Success,
+            },
+            super::DispatchOutcome {
+                payload: json!({
+                    "status": "stopped-on-primitive-error",
+                    "executed_count": 2,
+                    "executed_steps": [completed, {
+                        "ordinal": 2,
+                        "command": "invoke",
+                        "status": "failed",
+                        "exit_code": CliExitCode::Transport.as_u8(),
+                        "result": {
+                            "error": { "type": "invoke-outcome-unknown", "recoverable": false },
+                            "request_id": "req_unknown_attempt",
+                            "inspection": inspection,
+                            "outcome": "outcome_unknown",
+                            "source_outcome_known": false,
+                            "automatic_retry_allowed": false,
+                        },
+                    }],
+                }),
+                exit_code: CliExitCode::Transport,
+            },
+        ] {
+            for (failed_store, reason) in [
+                (&broken_store, "task-store-error"),
+                (&missing_store, "task-missing"),
+            ] {
+                let persisted = failed_store.append_execution(
+                    &task.id,
+                    "run",
+                    "approve",
+                    execution.payload.clone(),
+                );
+                let failure = super::task_receipt_or_failure(persisted, &task, "run", &execution)
+                    .expect_err("missing or broken storage must preserve the execution report");
+                assert_eq!(failure.payload["execution"], execution.payload);
+                assert_eq!(failure.payload["receipt_persisted"], false);
+                assert_eq!(failure.payload["task_snapshot"], "before-receipt");
+                assert_eq!(failure.payload["task"]["id"], task.id);
+                assert_eq!(failure.payload["persistence_error"]["reason"], reason);
+                assert_eq!(failure.payload["automatic_retry_allowed"], false);
+                if execution.exit_code.is_success() {
+                    assert_eq!(failure.exit_code, CliExitCode::Internal);
+                    assert_eq!(
+                        failure.payload["error"]["type"],
+                        "task-receipt-not-persisted"
+                    );
+                } else {
+                    assert_eq!(failure.exit_code, CliExitCode::Transport);
+                    assert_eq!(failure.payload["error"]["type"], "invoke-outcome-unknown");
+                    assert_eq!(failure.payload["request_id"], "req_unknown_attempt");
+                    assert_eq!(failure.payload["inspection"], inspection);
+                    assert_eq!(failure.payload["source_outcome_known"], false);
+                }
+            }
+        }
     }
 
     #[test]
@@ -48028,8 +48524,14 @@ input = { text = "{{steps.again.output.title}}" }
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(binding(original).scope_digest, binding(changed).scope_digest);
-        assert_ne!(binding(original).effect_digest, binding(changed).effect_digest);
+        assert_eq!(
+            binding(original).scope_digest,
+            binding(changed).scope_digest
+        );
+        assert_ne!(
+            binding(original).effect_digest,
+            binding(changed).effect_digest
+        );
     }
 
     #[test]
@@ -48094,7 +48596,10 @@ input = { text = "{{steps.again.output.title}}" }
             if failed_phase == "invoke" {
                 assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
                 assert_eq!(payload["outcome"], "outcome_unknown");
-                assert_eq!(payload["execution"]["steps"][1]["status"], "outcome_unknown");
+                assert_eq!(
+                    payload["execution"]["steps"][1]["status"],
+                    "outcome_unknown"
+                );
                 assert_eq!(payload["execution"]["steps"][1]["invoke_attempted"], true);
                 let failed_request: Value = serde_json::from_str(&requests[7].1).unwrap();
                 assert_eq!(payload["request_id"], failed_request["id"]);
@@ -48111,10 +48616,20 @@ input = { text = "{{steps.again.output.title}}" }
     #[test]
     fn workflow_run_namespace_validation_applies_to_pipeline_and_recipe() {
         for command in ["pipeline", "recipe"] {
-            for key in ["".to_owned(), " \t".to_owned(), "a\nb".to_owned(), "x".repeat(129)] {
+            for key in [
+                "".to_owned(),
+                " \t".to_owned(),
+                "a\nb".to_owned(),
+                "x".repeat(129),
+            ] {
                 assert!(
                     Cli::try_parse_from([
-                        "fwc", command, "run", "example", "--idempotency-key", &key
+                        "fwc",
+                        command,
+                        "run",
+                        "example",
+                        "--idempotency-key",
+                        &key
                     ])
                     .is_err(),
                     "{command} must reject invalid run namespaces before contacting a host"
@@ -48122,7 +48637,12 @@ input = { text = "{{steps.again.output.title}}" }
             }
             assert!(
                 Cli::try_parse_from([
-                    "fwc", command, "run", "example", "--idempotency-key", &"x".repeat(128)
+                    "fwc",
+                    command,
+                    "run",
+                    "example",
+                    "--idempotency-key",
+                    &"x".repeat(128)
                 ])
                 .is_ok()
             );
@@ -57426,7 +57946,7 @@ require_attestation_types = ["in-toto"]"#,
         let (resolve_exit, resolve_payload) = execute_json(&[
             "fwc", "--json", "task", "resolve", &task_id, "--until", "ready",
         ]);
-        assert_eq!(resolve_exit, CliExitCode::Success.into());
+        assert_eq!(resolve_exit, CliExitCode::Transport.into());
         assert_eq!(resolve_payload["command"], "task");
         assert_eq!(resolve_payload["subcommand"], "resolve");
         assert!(
