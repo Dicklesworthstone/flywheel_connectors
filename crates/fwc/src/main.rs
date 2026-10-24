@@ -3183,6 +3183,11 @@ struct RecipeRunArgs {
     #[arg(long)]
     zone: Option<String>,
 
+    /// Run namespace for intentional retries; independent runs get a fresh key by default.
+    /// Reusing a key preserves step identity but does not authorize replay of uncertain effects.
+    #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
+    idempotency_key: Option<String>,
+
     #[command(flatten)]
     auth: WorkflowAuthArgs,
 }
@@ -3236,6 +3241,11 @@ struct PipelineRunArgs {
     /// Execute each step in this zone.
     #[arg(long)]
     zone: Option<String>,
+
+    /// Run namespace for intentional retries; independent runs get a fresh key by default.
+    /// Reusing a key preserves step identity but does not authorize replay of uncertain effects.
+    #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
+    idempotency_key: Option<String>,
 
     #[command(flatten)]
     auth: WorkflowAuthArgs,
@@ -29057,6 +29067,7 @@ impl PipelinePlanMode {
 
 #[derive(Debug)]
 struct LivePipelineExecutionResult {
+    run_key: String,
     status: &'static str,
     exit_code: CliExitCode,
     executed_steps: usize,
@@ -29067,6 +29078,109 @@ struct LivePipelineExecutionResult {
     error_steps: usize,
     step_results: Vec<Value>,
     outputs: BTreeMap<String, Value>,
+    failure: Option<DispatchOutcome>,
+}
+
+fn parse_workflow_idempotency_key(value: &str) -> std::result::Result<String, String> {
+    if value.trim().is_empty()
+        || value.len() > fcp_core::MAX_IDEMPOTENCY_KEY_LEN
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "a workflow idempotency key must be nonempty, contain no control characters, and fit within {} bytes",
+            fcp_core::MAX_IDEMPOTENCY_KEY_LEN
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+/// Keep the retry namespace independent of the effect payload. The host binds
+/// the resulting key to its verified principal and effect digest, so changed
+/// input cannot turn an explicitly repeated run into an unrelated operation.
+fn workflow_step_identity(
+    command: &str,
+    plan_name: &str,
+    mode: PipelinePlanMode,
+    run_key: &str,
+    step_id: &str,
+    connector_id: &str,
+    operation: &str,
+    zone: &str,
+    input: &Value,
+) -> Result<(RequestId, Option<String>)> {
+    let step_scope = to_deterministic_cbor(&json!([
+        "fwc-workflow-step-v1",
+        command,
+        plan_name,
+        mode.subcommand(),
+        run_key,
+        step_id,
+    ]))?;
+    let step_key = format!("workflow_{}", blake3::hash(&step_scope).to_hex());
+    let request_scope = to_deterministic_cbor(&json!([
+        "fwc-workflow-request-v1",
+        &step_key,
+        connector_id,
+        operation,
+        zone,
+        input,
+    ]))?;
+    let request_digest = blake3::hash(&request_scope).to_hex().to_string();
+    Ok((
+        RequestId::new(format!("req_{}", &request_digest[..32])),
+        (mode == PipelinePlanMode::Run).then_some(step_key),
+    ))
+}
+
+fn pipeline_execution_failure(
+    command: &str,
+    step_id: &str,
+    phase: &str,
+    error_type: &str,
+    message: &str,
+    exit_code: CliExitCode,
+) -> DispatchOutcome {
+    let mut payload = json!({
+        "status": "error",
+        "command": command,
+        "phase": phase,
+        "failed_step": step_id,
+        "automatic_retry_allowed": false,
+        "message": message,
+        "error": {
+            "type": error_type,
+            "message": message,
+            "recoverable": false,
+        },
+        "next_actions": [
+            "Inspect the retained step outcomes before deciding which operations may be repeated.",
+            "An idempotency key preserves identity; it does not prove that repeating completed effects is safe.",
+        ],
+    });
+    let mut envelope = CommandEnvelope::new(CommandAvailability::Unknown, command);
+    envelope.recoverable = false;
+    envelope.inject_into(&mut payload);
+    DispatchOutcome { payload, exit_code }
+}
+
+fn finish_pipeline_dispatch(
+    mut payload: Value,
+    execution: &LivePipelineExecutionResult,
+    command: &str,
+) -> DispatchOutcome {
+    if let Some(failure) = &execution.failure {
+        // Preserve request-inspection guidance and uncertainty classification,
+        // while retaining the run namespace and all completed step evidence.
+        if let (Some(target), Some(source)) = (payload.as_object_mut(), failure.payload.as_object()) {
+            target.extend(source.clone());
+        }
+    } else if execution.exit_code.is_success() {
+        CommandEnvelope::new(CommandAvailability::LiveRuntime, command).inject_into(&mut payload);
+    }
+    DispatchOutcome {
+        payload,
+        exit_code: execution.exit_code,
+    }
 }
 
 fn pipeline_execution_context(
@@ -29428,13 +29542,14 @@ fn live_pipeline_operation_metadata(
 
 #[allow(clippy::too_many_lines)]
 fn execute_live_pipeline_plan(
-    _command: &str,
+    command: &str,
     plan: &pipe::PipelinePlan,
     operations: &BTreeMap<String, ResolvedHostOperation>,
     mode: PipelinePlanMode,
     host: &ResolvedHostConfig,
     zone: &str,
     auth_by_step: &BTreeMap<String, ResolvedLiveAuth>,
+    requested_run_key: Option<&str>,
 ) -> Result<LivePipelineExecutionResult> {
     for step in &plan.steps {
         anyhow::ensure!(
@@ -29458,6 +29573,9 @@ fn execute_live_pipeline_plan(
     let mut blocked_steps = 0usize;
     let mut denied_steps = 0usize;
     let mut error_steps = 0usize;
+    let run_key = requested_run_key.map_or_else(|| RequestId::random().to_string(), str::to_owned);
+    let mut failure = None;
+    let mut stopped_after = None::<String>;
 
     for step_id in &plan.execution_order {
         let step = steps_by_id.get(step_id.as_str()).ok_or_else(|| {
@@ -29469,6 +29587,20 @@ fn execute_live_pipeline_plan(
         let auth = auth_by_step.get(step_id).ok_or_else(|| {
             anyhow::anyhow!("pipeline step `{step_id}` is missing resolved credentials")
         })?;
+
+        if let Some(failed_step) = &stopped_after {
+            blocked_steps += 1;
+            step_statuses.insert(step.id.clone(), "blocked");
+            step_results.push(json!({
+                "id": &step.id,
+                "operation": &step.operation,
+                "status": "blocked",
+                "reason": "execution-stopped",
+                "blocked_by": [failed_step],
+                "attempted": false,
+            }));
+            continue;
+        }
 
         let dependency_failures = step
             .depends_on
@@ -29528,10 +29660,33 @@ fn execute_live_pipeline_plan(
         }
 
         let context = pipeline_execution_context(&plan.params, &step_outputs);
-        let condition_evaluation = if let Some(condition) = &step.condition {
-            Some(pipeline_evaluate_condition(condition, &context)?)
-        } else {
-            None
+        let condition_evaluation = match step
+            .condition
+            .as_ref()
+            .map(|condition| pipeline_evaluate_condition(condition, &context))
+            .transpose()
+        {
+            Ok(evaluation) => evaluation,
+            Err(_) => {
+                error_steps += 1;
+                stopped_after = Some(step.id.clone());
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "error",
+                    "reason": "invalid-condition",
+                    "attempted": false,
+                }));
+                failure = Some(pipeline_execution_failure(
+                    command,
+                    &step.id,
+                    "input-authoring",
+                    "pipeline-condition-failed",
+                    "A step condition could not be evaluated. Earlier step outcomes are retained; later steps were not attempted.",
+                    CliExitCode::Validation,
+                ));
+                continue;
+            }
         };
         if condition_evaluation == Some(false) {
             skipped_steps += 1;
@@ -29555,7 +29710,29 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let rendered_input = pipeline_render_value(&step.input, &context)?;
+        let rendered_input = match pipeline_render_value(&step.input, &context) {
+            Ok(input) => input,
+            Err(_) => {
+                error_steps += 1;
+                stopped_after = Some(step.id.clone());
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "error",
+                    "reason": "input-rendering-failed",
+                    "attempted": false,
+                }));
+                failure = Some(pipeline_execution_failure(
+                    command,
+                    &step.id,
+                    "input-authoring",
+                    "pipeline-input-rendering-failed",
+                    "A step input could not be rendered. Earlier step outcomes are retained; later steps were not attempted.",
+                    CliExitCode::Validation,
+                ));
+                continue;
+            }
+        };
         let (valid, validation_errors) =
             validate_payload_against_schema(&rendered_input, &resolved.operation.input_schema);
         if !valid {
@@ -29587,44 +29764,92 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let request_id = derive_live_request_id(
+        let prepared_request = workflow_step_identity(
+            command,
+            &plan.name,
+            mode,
+            &run_key,
+            &step.id,
             resolved.connector.summary.id.as_str(),
             &resolved.operation.name,
             zone,
             &rendered_input,
-            None,
-            Some(step.id.as_str()),
-        )?;
-        let idempotency_key = (mode == PipelinePlanMode::Run).then(|| request_id.to_string());
-        let connector_id: ConnectorId =
-            resolved
-                .connector
-                .summary
-                .id
-                .as_str()
-                .parse()
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "host connector id `{}` is not canonical: {error}",
-                        resolved.connector.summary.id
-                    )
-                })?;
-        let zone_id: ZoneId = zone
-            .parse()
-            .map_err(|error| anyhow::anyhow!("`{zone}` is not a valid FCP zone: {error}"))?;
+        )
+        .and_then(|(request_id, idempotency_key)| {
+            build_live_invoke_request(
+                resolved.connector.summary.id.as_str(),
+                &resolved.operation.name,
+                zone,
+                rendered_input.clone(),
+                request_id,
+                auth,
+                idempotency_key,
+                step.lease_seq,
+                None,
+            )
+        });
+        let invoke_request = match prepared_request {
+            Ok(request) => request,
+            Err(_) => {
+                error_steps += 1;
+                stopped_after = Some(step.id.clone());
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "error",
+                    "reason": "request-preparation-failed",
+                    "attempted": false,
+                }));
+                failure = Some(pipeline_execution_failure(
+                    command,
+                    &step.id,
+                    "input-authoring",
+                    "pipeline-request-preparation-failed",
+                    "A step request could not be prepared. Earlier step outcomes are retained; later steps were not attempted.",
+                    CliExitCode::Validation,
+                ));
+                continue;
+            }
+        };
+        let request_id = &invoke_request.id;
+        let idempotency_key = &invoke_request.idempotency_key;
         let preflight_request = HostPreflightRequest {
-            holder_proof: auth.holder_proof_for(&request_id, &resolved.operation.name)?,
+            holder_proof: invoke_request.holder_proof.clone(),
             request_id: request_id.clone(),
-            connector_id: connector_id.clone(),
+            connector_id: invoke_request.connector_id.clone(),
             operation: resolved.operation.name.clone(),
             params: Some(rendered_input.clone()),
             principal: auth.principal_hint.clone(),
-            zone_id: Some(zone_id.clone()),
+            zone_id: Some(invoke_request.zone_id.clone()),
             lease_seq: step.lease_seq,
             capability_token: Some(auth.capability_token.clone()),
             approval_tokens: auth.approval_tokens.clone(),
         };
-        let preflight = client.preflight(&preflight_request)?;
+        let preflight = match client.preflight(&preflight_request) {
+            Ok(response) => response,
+            Err(_) => {
+                error_steps += 1;
+                stopped_after = Some(step.id.clone());
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "error",
+                    "reason": "preflight-unavailable",
+                    "request_id": request_id.to_string(),
+                    "idempotency_key": idempotency_key,
+                    "invoke_attempted": false,
+                }));
+                failure = Some(pipeline_execution_failure(
+                    command,
+                    &step.id,
+                    "preflight",
+                    "pipeline-preflight-unavailable",
+                    "The host did not return a usable preflight response. This step was not invoked; earlier step outcomes are retained and later steps were not attempted.",
+                    CliExitCode::Transport,
+                ));
+                continue;
+            }
+        };
         let preflight_value = serde_json::to_value(&preflight)?;
 
         if !preflight.allowed {
@@ -29719,19 +29944,42 @@ fn execute_live_pipeline_plan(
             continue;
         }
 
-        let invoke_request = build_live_invoke_request(
-            resolved.connector.summary.id.as_str(),
-            &resolved.operation.name,
-            zone,
-            rendered_input.clone(),
-            request_id.clone(),
-            &auth,
-            idempotency_key.clone(),
-            step.lease_seq,
-            None,
-        )?;
         let started_at = std::time::Instant::now();
-        let response = client.invoke(&invoke_request)?;
+        let response = match client.invoke(&invoke_request) {
+            Ok(response) => response,
+            Err(error) => {
+                error_steps += 1;
+                stopped_after = Some(step.id.clone());
+                let mut unknown = error
+                    .downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>()
+                    .map_or_else(
+                        || {
+                            invocation_cmd::InvokeOutcomeUnknown::from_request(
+                                &invoke_request,
+                                &host.endpoint,
+                                &error,
+                            )
+                            .dispatch(command)
+                        },
+                        |unknown| unknown.dispatch(command),
+                    );
+                unknown.payload["failed_step"] = json!(&step.id);
+                step_results.push(json!({
+                    "id": &step.id,
+                    "operation": &step.operation,
+                    "status": "outcome_unknown",
+                    "reason": "invoke-outcome-unknown",
+                    "request_id": request_id.to_string(),
+                    "idempotency_key": idempotency_key,
+                    "preflight": preflight_value,
+                    "invoke_attempted": true,
+                    "automatic_retry_allowed": false,
+                    "inspection": &unknown.payload["inspection"],
+                }));
+                failure = Some(unknown);
+                continue;
+            }
+        };
         let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let response_value = serde_json::to_value(&response)?;
         let history_status = match response.status {
@@ -29829,7 +30077,9 @@ fn execute_live_pipeline_plan(
     } else {
         "ok"
     };
-    let exit_code = if error_steps > 0 {
+    let exit_code = if let Some(failure) = &failure {
+        failure.exit_code
+    } else if error_steps > 0 {
         CliExitCode::Connector
     } else if denied_steps > 0 {
         CliExitCode::PolicyDenied
@@ -29838,6 +30088,7 @@ fn execute_live_pipeline_plan(
     };
 
     Ok(LivePipelineExecutionResult {
+        run_key,
         status,
         exit_code,
         executed_steps,
@@ -29848,6 +30099,7 @@ fn execute_live_pipeline_plan(
         error_steps,
         step_results,
         outputs: step_outputs,
+        failure,
     })
 }
 
@@ -30125,6 +30377,7 @@ fn recipe_run_dispatch(
         &host,
         &zone,
         &auth,
+        args.idempotency_key.as_deref(),
     )?;
 
     let message = match mode {
@@ -30150,8 +30403,7 @@ fn recipe_run_dispatch(
         PipelinePlanMode::Estimate => unreachable!("handled above"),
     };
 
-    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "recipe");
-    let mut payload = json!({
+    let payload = json!({
         "status": execution.status,
         "command": "recipe",
         "subcommand": mode.subcommand(),
@@ -30164,6 +30416,7 @@ fn recipe_run_dispatch(
         "plan": serde_json::to_value(&plan)?,
         "execution": {
             "mode": mode.subcommand(),
+            "idempotency_key": execution.run_key,
             "executed_steps": execution.executed_steps,
             "preflight_only_steps": execution.preflight_only_steps,
             "skipped_steps": execution.skipped_steps,
@@ -30179,11 +30432,7 @@ fn recipe_run_dispatch(
             format!("fwc status --host {}", host.endpoint),
         ],
     });
-    let exit_code = execution.exit_code;
-    if exit_code.is_success() {
-        envelope.inject_into(&mut payload);
-    }
-    Ok(DispatchOutcome { payload, exit_code })
+    Ok(finish_pipeline_dispatch(payload, &execution, "recipe"))
 }
 
 #[allow(dead_code)]
@@ -30659,6 +30908,7 @@ fn pipeline_run_dispatch(
         &host,
         &zone,
         &auth,
+        args.idempotency_key.as_deref(),
     )?;
     let message = match mode {
         PipelinePlanMode::Run => format!(
@@ -30683,8 +30933,7 @@ fn pipeline_run_dispatch(
         PipelinePlanMode::Estimate => unreachable!("handled above"),
     };
 
-    let envelope = CommandEnvelope::new(CommandAvailability::LiveRuntime, "pipeline");
-    let mut payload = json!({
+    let payload = json!({
         "status": execution.status,
         "command": "pipeline",
         "subcommand": subcommand,
@@ -30696,6 +30945,7 @@ fn pipeline_run_dispatch(
         "plan": serde_json::to_value(&plan)?,
         "execution": {
             "mode": subcommand,
+            "idempotency_key": execution.run_key,
             "executed_steps": execution.executed_steps,
             "preflight_only_steps": execution.preflight_only_steps,
             "skipped_steps": execution.skipped_steps,
@@ -30711,11 +30961,7 @@ fn pipeline_run_dispatch(
             format!("fwc status --host {}", host.endpoint),
         ],
     });
-    let exit_code = execution.exit_code;
-    if exit_code.is_success() {
-        envelope.inject_into(&mut payload);
-    }
-    Ok(DispatchOutcome { payload, exit_code })
+    Ok(finish_pipeline_dispatch(payload, &execution, "pipeline"))
 }
 
 #[allow(dead_code)]
@@ -47676,6 +47922,211 @@ input = { text = "{{steps.again.output.title}}" }
         // Two distinct selectors resolve to the same canonical connector.
         routes.insert(2, routes[1].clone());
         routes
+    }
+
+    #[test]
+    fn execute_pipeline_run_identity_separates_new_work_from_explicit_retries() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let token = test_capability_token_arg();
+        let mut runs = Vec::new();
+        for (mode, run_key, title) in [
+            ("run", None, "same result"),
+            ("run", None, "same result"),
+            ("run", Some("review-run-1"), "same result"),
+            ("run", Some("review-run-1"), "same result"),
+            ("run", Some("review-run-1"), "changed result"),
+            ("dry-run", Some("review-run-1"), "same result"),
+        ] {
+            let mut routes = workflow_auth_mock_catalog();
+            for (index, result) in [
+                json!({"title": "first result"}),
+                json!({"title": title}),
+                json!({"delivered": true}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+                if mode == "run" || index < 2 {
+                    routes.push((
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(result),
+                    ));
+                }
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipeline".to_owned(),
+                mode.to_owned(),
+                path.display().to_string(),
+                "--capability-token".to_owned(),
+                token.clone(),
+                "--step-capability-token".to_owned(),
+                format!("notify={token}"),
+            ];
+            if let Some(run_key) = run_key {
+                args.extend(["--idempotency-key".to_owned(), run_key.to_owned()]);
+            }
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("workflow mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            let reported_key = payload["execution"]["idempotency_key"]
+                .as_str()
+                .expect("every execution reports its namespace")
+                .to_owned();
+            if let Some(run_key) = run_key {
+                assert_eq!(reported_key, run_key);
+            }
+            let requests = request_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .map(|(_, body)| serde_json::from_str::<super::InvokeRequest>(body).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), if mode == "run" { 3 } else { 2 });
+            runs.push((reported_key, requests));
+        }
+
+        assert_ne!(runs[0].0, runs[1].0);
+        for index in 0..3 {
+            assert_ne!(runs[0].1[index].id, runs[1].1[index].id);
+            assert_ne!(
+                runs[0].1[index].idempotency_key,
+                runs[1].1[index].idempotency_key
+            );
+            assert_eq!(runs[2].1[index].id, runs[3].1[index].id);
+            assert_eq!(
+                runs[2].1[index].idempotency_key,
+                runs[3].1[index].idempotency_key
+            );
+            runs[2].1[index].validate_idempotency_key().unwrap();
+        }
+        assert_ne!(runs[2].1[0].idempotency_key, runs[2].1[1].idempotency_key);
+        for index in 0..2 {
+            assert_ne!(runs[2].1[index].id, runs[5].1[index].id);
+            assert!(runs[5].1[index].idempotency_key.is_none());
+        }
+
+        let original = &runs[2].1[2];
+        let changed = &runs[4].1[2];
+        assert_ne!(original.input, changed.input);
+        assert_ne!(original.id, changed.id);
+        assert_eq!(original.idempotency_key, changed.idempotency_key);
+        let binding = |request| {
+            fcp_host::InvocationIdempotency::from_request(request, "workflow-test-principal")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(binding(original).scope_digest, binding(changed).scope_digest);
+        assert_ne!(binding(original).effect_digest, binding(changed).effect_digest);
+    }
+
+    #[test]
+    fn execute_pipeline_retains_completed_effects_when_later_transport_fails() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let path = workflow_auth_pipeline_fixture(tempdir.path());
+        let token = test_capability_token_arg();
+        for failed_phase in ["preflight", "invoke"] {
+            let mut routes = workflow_auth_mock_catalog();
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"title": "completed first step"})),
+                ),
+            ]);
+            if failed_phase == "invoke" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+            }
+            routes.push((
+                format!("POST /rpc/{failed_phase}"),
+                json!({"invalid_response": "private-reflected-diagnostic"}),
+            ));
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipeline",
+                "run",
+                &path.display().to_string(),
+                "--capability-token",
+                &token,
+                "--step-capability-token",
+                &format!("notify={token}"),
+            ]);
+            server.join().expect("workflow mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Transport.into(), "{payload}");
+            assert_eq!(payload["failed_step"], "again");
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["execution"]["executed_steps"], 1);
+            assert_eq!(payload["execution"]["error_steps"], 1);
+            assert_eq!(payload["execution"]["blocked_steps"], 1);
+            assert!(payload["execution"]["idempotency_key"].is_string());
+            assert_eq!(
+                payload["execution"]["outputs"]["fetch"]["title"],
+                "completed first step"
+            );
+            assert_eq!(payload["execution"]["steps"][0]["status"], "ok");
+            assert_eq!(payload["execution"]["steps"][2]["status"], "blocked");
+            assert_eq!(payload["execution"]["steps"][2]["attempted"], false);
+            assert!(!payload.to_string().contains("private-reflected-diagnostic"));
+            let requests = request_log.lock().unwrap();
+            if failed_phase == "invoke" {
+                assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert_eq!(payload["execution"]["steps"][1]["status"], "outcome_unknown");
+                assert_eq!(payload["execution"]["steps"][1]["invoke_attempted"], true);
+                let failed_request: Value = serde_json::from_str(&requests[7].1).unwrap();
+                assert_eq!(payload["request_id"], failed_request["id"]);
+                assert_eq!(payload["inspection"]["operation_id"], failed_request["id"]);
+                assert_eq!(requests.len(), 8);
+            } else {
+                assert_eq!(payload["error"]["type"], "pipeline-preflight-unavailable");
+                assert_eq!(payload["execution"]["steps"][1]["invoke_attempted"], false);
+                assert_eq!(requests.len(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_run_namespace_validation_applies_to_pipeline_and_recipe() {
+        for command in ["pipeline", "recipe"] {
+            for key in ["".to_owned(), " \t".to_owned(), "a\nb".to_owned(), "x".repeat(129)] {
+                assert!(
+                    Cli::try_parse_from([
+                        "fwc", command, "run", "example", "--idempotency-key", &key
+                    ])
+                    .is_err(),
+                    "{command} must reject invalid run namespaces before contacting a host"
+                );
+            }
+            assert!(
+                Cli::try_parse_from([
+                    "fwc", command, "run", "example", "--idempotency-key", &"x".repeat(128)
+                ])
+                .is_ok()
+            );
+        }
     }
 
     #[test]
