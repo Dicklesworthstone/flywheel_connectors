@@ -2822,6 +2822,18 @@ impl CapabilityVerifier {
             }
         }
 
+        // Omitting target resources cannot prove that a signed deny list was
+        // respected. This applies even with resource_allow = ["*"]: that
+        // wildcard does not cancel explicit denials. Fail closed at the shared
+        // verifier boundary until the caller supplies the actual resource URIs.
+        if !constraints.resource_deny.is_empty() && resource_uris.is_empty() {
+            return Err(FcpError::ResourceNotAllowed {
+                resource:
+                    "<none>: token declares resource_deny but caller provided no resource URIs"
+                        .into(),
+            });
+        }
+
         // Check deny list
         for uri in resource_uris {
             if constraints
@@ -3822,6 +3834,143 @@ mod tests {
         verifier
             .verify(token, &cap, &op, &[])
             .expect("pure wildcard resource_allow should still accept empty resource_uris");
+    }
+
+    fn signed_resource_constraints_token(
+        signing_key: &Ed25519SigningKey,
+        instance: &InstanceId,
+        constraints: &CapabilityConstraints,
+    ) -> CapabilityToken {
+        let now = Utc::now();
+        let encoded = fcp_cbor::to_canonical_cbor(constraints).expect("constraint CBOR");
+        CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id("cap.resources")
+                .zone_id("z:work")
+                .principal("user:resource-test")
+                .operations(&["op.resources"])
+                .issuer("node:resource-test")
+                .target_instance(instance.as_str())
+                .validity(now, now + Duration::hours(1))
+                .try_constraints_cbor(&encoded)
+                .expect("valid constraints")
+                .sign(signing_key)
+                .expect("signed capability"),
+        )
+    }
+
+    #[test]
+    fn verify_resource_deny_requires_actual_resource_uris() {
+        let signing_key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let bound = CapabilityVerifier::new(
+            signing_key.verifying_key().to_bytes(),
+            ZoneId::work(),
+            instance.clone(),
+        );
+        let gateway = CapabilityVerifier::without_instance_binding(
+            signing_key.verifying_key().to_bytes(),
+            ZoneId::work(),
+        );
+        let capability = CapabilityId::new("cap.resources").unwrap();
+        let operation = OperationId::new("op.resources").unwrap();
+        for allow in [Vec::new(), vec!["*".to_owned()]] {
+            for deny in ["*", "notion://page/private/*"] {
+                let token = signed_resource_constraints_token(
+                    &signing_key,
+                    &instance,
+                    &CapabilityConstraints {
+                        resource_allow: allow.clone(),
+                        resource_deny: vec![deny.to_owned()],
+                        ..Default::default()
+                    },
+                );
+                assert!(matches!(
+                    bound.verify_bound(token.clone(), &capability, &operation, &[]),
+                    Err(FcpError::ResourceNotAllowed { resource })
+                        if resource.contains("resource_deny")
+                ));
+                assert!(matches!(
+                    gateway.verify_unbound(token, &capability, &operation, &[]),
+                    Err(FcpError::ResourceNotAllowed { resource })
+                        if resource.contains("resource_deny")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn verify_resource_deny_checks_every_supplied_uri() {
+        let signing_key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let verifier = CapabilityVerifier::new(
+            signing_key.verifying_key().to_bytes(),
+            ZoneId::work(),
+            instance.clone(),
+        );
+        let capability = CapabilityId::new("cap.resources").unwrap();
+        let operation = OperationId::new("op.resources").unwrap();
+        let token = signed_resource_constraints_token(
+            &signing_key,
+            &instance,
+            &CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                resource_deny: vec!["notion://page/private/*".into()],
+                ..Default::default()
+            },
+        );
+        let allowed = "notion://page/public/1".to_owned();
+        let denied = "notion://page/private/2".to_owned();
+        verifier
+            .verify_bound(
+                token.clone(),
+                &capability,
+                &operation,
+                std::slice::from_ref(&allowed),
+            )
+            .expect("known resource outside the denied scope");
+        for resources in [
+            vec![allowed.clone(), denied.clone()],
+            vec![denied.clone(), allowed],
+            vec![denied.clone()],
+        ] {
+            assert!(matches!(
+                verifier.verify_bound(token.clone(), &capability, &operation, &resources),
+                Err(FcpError::ResourceNotAllowed { resource }) if resource == denied
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_resource_deny_absent_preserves_wildcard_and_default_deny() {
+        let signing_key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let verifier = CapabilityVerifier::new(
+            signing_key.verifying_key().to_bytes(),
+            ZoneId::work(),
+            instance.clone(),
+        );
+        for (allow, permitted) in [(Vec::new(), false), (vec!["*".to_owned()], true)] {
+            let token = signed_resource_constraints_token(
+                &signing_key,
+                &instance,
+                &CapabilityConstraints {
+                    resource_allow: allow,
+                    ..Default::default()
+                },
+            );
+            let result = verifier.verify_bound(
+                token,
+                &CapabilityId::new("cap.resources").unwrap(),
+                &OperationId::new("op.resources").unwrap(),
+                &[],
+            );
+            if permitted {
+                result.expect("an explicit wildcard without denials needs no resource URI");
+            } else {
+                assert!(matches!(result, Err(FcpError::CapabilityDenied { .. })));
+            }
+        }
     }
 
     #[test]
