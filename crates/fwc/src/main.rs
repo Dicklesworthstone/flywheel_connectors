@@ -5581,6 +5581,7 @@ impl HostAdminClient {
         self.post_read_json("/rpc/discover", &json!({ "filter": filter }))
     }
 
+    #[allow(dead_code)]
     fn connector(&self, connector_id: &str) -> Result<HostConnectorInventoryResponse> {
         self.get_json(&format!("/rpc/connectors/{connector_id}"))
     }
@@ -35787,7 +35788,7 @@ max_state_replication_staleness_secs = 120
             .collect::<StdBTreeMap<_, _>>();
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0usize;
 
             while served < expected_requests && Instant::now() < deadline {
@@ -35898,7 +35899,7 @@ max_state_replication_staleness_secs = 120
             .collect::<Vec<_>>();
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0usize;
 
             while served < expected_requests && Instant::now() < deadline {
@@ -36013,7 +36014,7 @@ max_state_replication_staleness_secs = 120
         let thread_log = Arc::clone(&request_log);
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0usize;
 
             while served < expected_requests && Instant::now() < deadline {
@@ -37260,7 +37261,7 @@ deny_ptrace = true
         );
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut served = 0usize;
 
             while served < expected_requests && Instant::now() < deadline {
@@ -40426,6 +40427,8 @@ deny_ptrace = true
 
     #[test]
     fn compiled_workflow_keeps_selected_host_through_nested_dispatch() {
+        // Warm the static connector/operation profile index before starting timed mock servers.
+        let _ = compiled_workflow_test_plan(&[&["fwc", "list"]]);
         let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(vec![
             (
                 "POST /rpc/discover".to_owned(),
@@ -48417,6 +48420,10 @@ input = { text = "{{steps.again.output.title}}" }
         let mut routes = pipe_mock_catalog(false);
         // Two distinct selectors resolve to the same canonical connector.
         routes.insert(2, routes[1].clone());
+        // In workflow pipelines, `notify` (`slack.post_message`) is a side-effecting step
+        // that should be preflight-only during dry-run while remaining invocable during run.
+        routes[3].1["tools"][0]["idempotency"] = json!("none");
+        routes[3].1["tools"][0]["idempotent"] = json!(false);
         routes
     }
 

@@ -227,11 +227,7 @@ pub struct MeshDispatchRequest {
 impl MeshDispatchRequest {
     /// Construct a new mesh dispatch request.
     #[must_use]
-    pub fn new(
-        connector_id: impl Into<String>,
-        operation: OperationInfo,
-        payload: Value,
-    ) -> Self {
+    pub fn new(connector_id: impl Into<String>, operation: OperationInfo, payload: Value) -> Self {
         Self {
             connector_id: connector_id.into(),
             operation,
@@ -437,8 +433,10 @@ impl MeshInvokeTransport {
                     std::thread::sleep(overhead);
                 }
 
-                let selected_peers: Vec<String> =
-                    quorum_set.iter().map(|entry| entry.peer_id.clone()).collect();
+                let selected_peers: Vec<String> = quorum_set
+                    .iter()
+                    .map(|entry| entry.peer_id.clone())
+                    .collect();
                 let response = json!({
                     "status": "ok",
                     "mode": "quorum",
@@ -529,13 +527,15 @@ impl MeshInvokeTransport {
 
 #[cfg(test)]
 mod tests {
-    use fcp_core::{
-        AgentHint, CapabilityId, IdempotencyClass, OperationId, RiskLevel, SafetyTier,
-    };
+    use fcp_core::{AgentHint, CapabilityId, IdempotencyClass, OperationId, RiskLevel, SafetyTier};
 
     use super::*;
 
-    fn sample_op(id: &str, safety_tier: SafetyTier, idempotency: IdempotencyClass) -> OperationInfo {
+    fn sample_op(
+        id: &str,
+        safety_tier: SafetyTier,
+        idempotency: IdempotencyClass,
+    ) -> OperationInfo {
         OperationInfo {
             id: OperationId::new(id).expect("valid op id"),
             summary: format!("Summary for {id}"),
@@ -569,9 +569,13 @@ mod tests {
 
     #[test]
     fn iconfluent_dispatch_skips_quorum_and_uses_single_peer() {
-        let transport = MeshInvokeTransport::new(five_peer_table(), 3)
-            .with_force_quorum_override(Some(false));
-        let op = sample_op("stripe.list_charges", SafetyTier::Safe, IdempotencyClass::Strict);
+        let transport =
+            MeshInvokeTransport::new(five_peer_table(), 3).with_force_quorum_override(Some(false));
+        let op = sample_op(
+            "stripe.list_charges",
+            SafetyTier::Safe,
+            IdempotencyClass::Strict,
+        );
         let req = MeshDispatchRequest::new("stripe", op, json!({}));
         let outcome = transport.dispatch(&req).expect("dispatch succeeds");
 
@@ -585,9 +589,13 @@ mod tests {
 
     #[test]
     fn requires_quorum_dispatch_contacts_threshold_peers() {
-        let transport = MeshInvokeTransport::new(five_peer_table(), 3)
-            .with_force_quorum_override(Some(false));
-        let op = sample_op("stripe.create_charge", SafetyTier::Risky, IdempotencyClass::Strict);
+        let transport =
+            MeshInvokeTransport::new(five_peer_table(), 3).with_force_quorum_override(Some(false));
+        let op = sample_op(
+            "stripe.create_charge",
+            SafetyTier::Risky,
+            IdempotencyClass::Strict,
+        );
         let req = MeshDispatchRequest::new("stripe", op, json!({"amount": 1000}));
         let outcome = transport.dispatch(&req).expect("dispatch succeeds");
 
@@ -607,8 +615,8 @@ mod tests {
 
     #[test]
     fn requires_fencing_routes_to_hrw_holder_and_enforces_epoch() {
-        let transport = MeshInvokeTransport::new(five_peer_table(), 3)
-            .with_force_quorum_override(Some(false));
+        let transport =
+            MeshInvokeTransport::new(five_peer_table(), 3).with_force_quorum_override(Some(false));
         let op = sample_op(
             "stripe.refund_charge",
             SafetyTier::Dangerous,
@@ -645,7 +653,11 @@ mod tests {
     fn force_quorum_override_forces_iconfluent_ops_into_quorum_round() {
         let transport =
             MeshInvokeTransport::new(five_peer_table(), 3).with_force_quorum_override(Some(true));
-        let op = sample_op("stripe.get_charge", SafetyTier::Safe, IdempotencyClass::Strict);
+        let op = sample_op(
+            "stripe.get_charge",
+            SafetyTier::Safe,
+            IdempotencyClass::Strict,
+        );
         let req = MeshDispatchRequest::new("stripe", op, json!({"id": "ch_123"}));
         let outcome = transport.dispatch(&req).expect("dispatch succeeds");
 

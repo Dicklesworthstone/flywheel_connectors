@@ -1190,7 +1190,9 @@ async fn fixture_e2e_jsonl_exercises_connector_boundary() {
         u64::try_from(timeout_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let timeout_error_text = timeout_error.to_string();
     assert!(
-        timeout_error_text.contains("timed out") || timeout_error_text.contains("timeout"),
+        timeout_error_text.contains("timed out")
+            || timeout_error_text.contains("timeout")
+            || timeout_error_text.contains("deadline exceeded"),
         "unexpected timeout mapping: {timeout_error_text}"
     );
 

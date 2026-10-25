@@ -24,8 +24,8 @@ use fcp_core::{
     AuditEvent, AuditHead, CorrelationId, Decision, DecisionReceipt, EVENT_AUDIT_FORK_DETECTED,
     EVENT_CAPABILITY_INVOKE, EVENT_DECLASSIFICATION_GRANTED, EVENT_ELEVATION_GRANTED,
     EVENT_REVOCATION_ISSUED, EVENT_SECRET_ACCESS, EVENT_SECURITY_VIOLATION, EVENT_ZONE_TRANSITION,
-    EpochId, NodeId, NodeSignature, ObjectHeader, ObjectId, PrincipalId, Provenance, SignatureSet,
-    TraceContext, ZoneCheckpoint, ZoneId,
+    EpochId, NodeId, NodeSignature, ObjectEncryptionKind, ObjectHeader, ObjectId, PrincipalId,
+    Provenance, SignatureSet, TraceContext, ZoneCheckpoint, ZoneId,
 };
 use semver::Version;
 use uuid::Uuid;
@@ -118,7 +118,7 @@ fn test_zone() -> ZoneId {
 
 fn test_header(kind: &str) -> ObjectHeader {
     ObjectHeader {
-        encryption_kind: Default::default(),
+        encryption_kind: ObjectEncryptionKind::default(),
         schema: SchemaId::new("fcp.audit", kind, Version::new(1, 0, 0)),
         zone_id: test_zone(),
         created_at: 1_700_000_000,

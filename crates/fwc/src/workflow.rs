@@ -223,12 +223,14 @@ impl TaskStore {
 
     pub fn load(&self, task_id: &str) -> Result<Option<WorkflowTask>> {
         let path = self.task_path(task_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read workflow capsule `{task_id}`"))?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read workflow capsule `{task_id}`"));
+            }
+        };
         let mut task: WorkflowTask = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse workflow capsule `{task_id}`"))?;
         recompute_task(&mut task, false);

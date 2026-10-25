@@ -567,8 +567,9 @@ impl MeshForwardBody {
                 connector_id,
                 zone_id,
             } => connector_id.len().saturating_add(zone_id.len()),
-            Self::Cancel { request_json, .. }
-            | Self::ConnectorStateExport { request_json } => request_json.len(),
+            Self::Cancel { request_json, .. } | Self::ConnectorStateExport { request_json } => {
+                request_json.len()
+            }
         }
     }
 

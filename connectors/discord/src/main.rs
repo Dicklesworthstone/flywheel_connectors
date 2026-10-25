@@ -4,6 +4,7 @@
 //! Uses the Discord Gateway (WebSocket) for real-time events and REST API for operations.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(dead_code)] // Connector API types/methods wired incrementally
 #![allow(
     clippy::cast_possible_truncation,

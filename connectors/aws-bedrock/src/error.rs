@@ -149,7 +149,7 @@ impl ConnectorErrorMapping for BedrockError {
     fn from_async_error(error: AsyncError) -> Self {
         match error {
             AsyncError::Timeout { timeout_ms } => {
-                Self::Async(format!("request deadline exceeded after {timeout_ms}ms"))
+                Self::Async(format!("request timeout: deadline exceeded after {timeout_ms}ms"))
             }
             AsyncError::Cancelled => Self::Async("operation cancelled".into()),
             other => Self::Async(other.to_string()),

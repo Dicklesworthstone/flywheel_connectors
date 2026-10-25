@@ -1,6 +1,7 @@
 //! FCP AWS Bedrock connector entrypoint.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
 use std::io::{BufRead, Write};

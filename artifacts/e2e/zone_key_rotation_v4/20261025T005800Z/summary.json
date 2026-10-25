@@ -1,0 +1,6 @@
+{
+  "status": "passed",
+  "run_id": "20261025T005800Z",
+  "record_count": 7,
+  "jsonl_path": "/data/projects/flywheel_connectors/artifacts/e2e/zone_key_rotation_v4/20261025T005800Z/zone_key_rotation_cutover_e2e.jsonl"
+}

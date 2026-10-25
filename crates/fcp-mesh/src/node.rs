@@ -66,6 +66,10 @@ use crate::symbol_request::{
     SymbolResponse, SymbolResponseBuilder, TargetedRepairEngine, TransferKey, ValidatedRequest,
 };
 use crate::transport::{RankedPath, TransportPath, TransportSelector};
+use crate::zone_key_rotation::{
+    ProtocolVersionPolicy, ZoneKeyRecipient, ZoneKeyRotationCutover, ZoneKeyRotationError,
+    build_zone_key_rotation_cutover, zone_key_manifest_owner_payload,
+};
 
 const DEFAULT_LEASE_PUBLICATION_REQUIRED_QUORUM_SIGNATURES: usize = 2;
 
@@ -313,6 +317,10 @@ pub enum MeshNodeError {
     /// Canonical object serialization failed.
     #[error("canonical serialization error: {0}")]
     Serialization(#[from] fcp_cbor::SerializationError),
+
+    /// Zone-key rotation cutover or receiver-policy error.
+    #[error("zone-key rotation error: {0}")]
+    ZoneKeyRotation(#[from] ZoneKeyRotationError),
 }
 
 /// Enforcement errors for control-plane requests.
@@ -1675,6 +1683,103 @@ impl MeshNode {
             now_ms,
         );
         Ok(object_id)
+    }
+
+    /// Build, owner-sign, store, and announce a zone-key manifest (initial issuance,
+    /// membership-change rekey, or post-revocation rotation) using the V3/V4
+    /// [`build_zone_key_rotation_cutover`] path.
+    ///
+    /// # Errors
+    /// Returns [`MeshNodeError`] if per-recipient KEM selection/sealing, owner-payload
+    /// canonicalization, object-ID derivation, or local object storage fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_zone_key_rotation<K>(
+        &mut self,
+        manifest_template: fcp_core::ZoneKeyManifest,
+        zone_key: &ZoneKey,
+        recipients: &[ZoneKeyRecipient],
+        policy: ProtocolVersionPolicy,
+        xwing: &K,
+        owner_signing_key: &fcp_crypto::Ed25519SigningKey,
+        object_id_key: &ObjectIdKey,
+        now_ms: u64,
+    ) -> Result<(ObjectId, ZoneKeyRotationCutover), MeshNodeError>
+    where
+        K: fcp_crypto::XWingKem,
+    {
+        let mut cutover = build_zone_key_rotation_cutover(
+            manifest_template,
+            zone_key,
+            recipients,
+            policy,
+            xwing,
+        )?;
+        let owner_payload = zone_key_manifest_owner_payload(&cutover.manifest)?;
+        let signature = owner_signing_key.sign(&owner_payload);
+        cutover.manifest.signature = fcp_core::NodeSignature::new(
+            fcp_core::NodeId::new(cutover.manifest.signature.node_id.as_str()),
+            signature.to_bytes(),
+            cutover.manifest.valid_from,
+        );
+
+        let body =
+            CanonicalSerializer::serialize(&cutover.manifest, &cutover.manifest.header.schema)?;
+        let object_id = StoredObject::derive_id(&cutover.manifest.header, &body, object_id_key)?;
+        let stored = StoredObject {
+            object_id,
+            header: cutover.manifest.header.clone(),
+            body,
+            storage: StorageMeta {
+                retention: EvictionPolicy::Pinned,
+            },
+        };
+
+        match self.object_store.put(stored).await {
+            Ok(()) | Err(fcp_store::ObjectStoreError::AlreadyExists(_)) => {}
+            Err(err) => return Err(MeshNodeError::ObjectStore(err)),
+        }
+        self.announce_object(
+            &cutover.manifest.header.zone_id,
+            &object_id,
+            ObjectAdmissionClass::Admitted,
+            now_ms,
+        );
+        Ok((object_id, cutover))
+    }
+
+    /// Publish an initial zone-key manifest for the authorized recipient roster.
+    ///
+    /// Selecting `WrappedKey` variants per recipient (`HpkeX25519` vs `XWing`) is
+    /// delegated to [`Self::publish_zone_key_rotation`].
+    ///
+    /// # Errors
+    /// Returns [`MeshNodeError`] if manifest construction, signing, or storage fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_initial_zone_key<K>(
+        &mut self,
+        manifest_template: fcp_core::ZoneKeyManifest,
+        zone_key: &ZoneKey,
+        recipients: &[ZoneKeyRecipient],
+        policy: ProtocolVersionPolicy,
+        xwing: &K,
+        owner_signing_key: &fcp_crypto::Ed25519SigningKey,
+        object_id_key: &ObjectIdKey,
+        now_ms: u64,
+    ) -> Result<(ObjectId, ZoneKeyRotationCutover), MeshNodeError>
+    where
+        K: fcp_crypto::XWingKem,
+    {
+        self.publish_zone_key_rotation(
+            manifest_template,
+            zone_key,
+            recipients,
+            policy,
+            xwing,
+            owner_signing_key,
+            object_id_key,
+            now_ms,
+        )
+        .await
     }
 
     /// Announce a symbol for gossip (admitted objects only).

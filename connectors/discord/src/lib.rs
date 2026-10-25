@@ -11,6 +11,7 @@
 //! Based on clawdbot's Discord integration patterns.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(dead_code)] // Connector API types/methods wired incrementally

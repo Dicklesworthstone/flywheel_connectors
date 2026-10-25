@@ -135,6 +135,8 @@ artifacts/e2e/*
 !artifacts/e2e/zone_isolation_full_e2e/
 artifacts/e2e/zone_isolation_full_e2e/*
 !artifacts/e2e/zone_isolation_full_e2e/*.jsonl
+!artifacts/e2e/zone_key_rotation_v4/
+!artifacts/e2e/zone_key_rotation_v4/**
 !artifacts/proofs/
 artifacts/proofs/*
 !artifacts/proofs/kyopb_review_packet/

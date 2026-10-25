@@ -18,6 +18,7 @@ chrono.workspace = true
 constant_time_eq = "0.4"
 fcp-core = { path = "../fcp-core" }
 fcp-cbor = { path = "../fcp-cbor" }
+fcp-evidence = { path = "../fcp-evidence" }
 fcp-prelude = { path = "../fcp-prelude" }
 fcp-crypto = { path = "../fcp-crypto" }
 fcp-policy = { path = "../fcp-policy" }

@@ -306,6 +306,7 @@ pub fn build_replay_payload_from_paths(
 /// # Errors
 ///
 /// Returns [`CapabilityReplayError`] when reconstruction or rendering fails.
+#[allow(dead_code)]
 pub fn build_replay_payload_from_entries(
     token: &str,
     since_seconds: u64,

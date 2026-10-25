@@ -57,7 +57,7 @@ impl DiscoveryBudget {
         message: &str,
     ) -> McpBridgeResult<()> {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(amount).filter(|next| *next <= limit)
             })
             .map(|_| ())

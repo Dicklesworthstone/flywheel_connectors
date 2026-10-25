@@ -1,6 +1,7 @@
 //! FCP Qdrant Connector - Main entrypoint
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 #![allow(dead_code)]
 #![allow(
     clippy::cast_possible_truncation,
