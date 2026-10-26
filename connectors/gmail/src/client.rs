@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fcp_google_discovery::auth::{GoogleAuthSourceKind, GoogleMaterializedAuth};
@@ -78,6 +78,10 @@ impl GmailClient {
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
             .user_agent("fcp-gmail/0.1.0")
+            // Replays and authenticated redirects must not bypass the SDK's
+            // per-operation decision, especially for sending or creating mail.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(GmailError::Http)?;
 
@@ -226,7 +230,9 @@ impl GmailClient {
     pub async fn send_message(&self, raw_message: &str) -> GmailResult<GmailMessage> {
         let url = format!("{}/users/me/messages/send", self.base_url);
         let body = serde_json::json!({ "raw": raw_message });
-        self.post_json(&url, &body).await
+        let message: GmailMessage = self.post_json(&url, &body).await?;
+        require_effect_identity(&message.id)?;
+        Ok(message)
     }
 
     /// Modify message labels (add/remove).
@@ -293,7 +299,9 @@ impl GmailClient {
     pub async fn create_draft(&self, raw_message: &str) -> GmailResult<GmailDraft> {
         let url = format!("{}/users/me/drafts", self.base_url);
         let body = serde_json::json!({ "message": { "raw": raw_message } });
-        self.post_json(&url, &body).await
+        let draft: GmailDraft = self.post_json(&url, &body).await?;
+        require_effect_identity(&draft.id)?;
+        Ok(draft)
     }
 
     /// Send a draft.
@@ -301,7 +309,9 @@ impl GmailClient {
     pub async fn send_draft(&self, draft_id: &str) -> GmailResult<GmailMessage> {
         let url = format!("{}/users/me/drafts/send", self.base_url);
         let body = serde_json::json!({ "id": draft_id });
-        self.post_json(&url, &body).await
+        let message: GmailMessage = self.post_json(&url, &body).await?;
+        require_effect_identity(&message.id)?;
+        Ok(message)
     }
 
     // ── Internal HTTP helpers ────────────────────────────────────
@@ -350,7 +360,8 @@ impl GmailClient {
         let response = self
             .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
             .await?;
-        decode_json_response(response)
+        let status_code = Some(response.status_code);
+        decode_json_response(response).map_err(|_| GmailError::OutcomeUnknown { status_code })
     }
 
     /// POST whose replay cannot duplicate a side effect.
@@ -387,15 +398,37 @@ impl GmailClient {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
+        let unsettled = AtomicBool::new(false);
+        let pending_effect = &unsettled;
 
-        RetryLoop::execute(&ctx, &policy, |attempt| async move {
+        let result = RetryLoop::execute(&ctx, &policy, |attempt| async move {
             let redacted_url = redact_url(url);
             debug!(url = %redacted_url, method = http_method, attempt, "request");
 
-            match self
+            // The context may drop an attempt while awaiting I/O. A cancelled
+            // waiter does not prove that a send or draft creation was undone.
+            // Set this only once the attempt is actually polled, not while its
+            // factory is being constructed or while waiting in safe backoff.
+            pending_effect.store(!replay_safe, Ordering::Relaxed);
+            let response = self
                 .execute_once(http_method, url, body, response_mode)
-                .await
+                .await;
+            let response = response.map_err(|error| {
+                if replay_safe {
+                    error
+                } else {
+                    error.after_non_idempotent_attempt()
+                }
+            });
+            if response
+                .as_ref()
+                .is_err_and(|error| !matches!(error, GmailError::OutcomeUnknown { .. }))
             {
+                pending_effect.store(false, Ordering::Relaxed);
+            }
+            // Keep a successful effect unsettled until the context delivers its
+            // result: a deadline race must not turn it into a safe retry either.
+            match response {
                 Ok(response) => AttemptOutcome::Success(response),
                 Err(error) if error.is_retryable() => {
                     // A rate limit was refused WITHOUT sending anything, so it
@@ -408,7 +441,14 @@ impl GmailClient {
                 Err(error) => AttemptOutcome::Terminal(error),
             }
         })
-        .await
+        .await;
+        result.map_err(|error| {
+            if !replay_safe && unsettled.load(Ordering::Relaxed) {
+                error.after_non_idempotent_attempt()
+            } else {
+                error
+            }
+        })
     }
 
     async fn execute_once(
@@ -418,9 +458,9 @@ impl GmailClient {
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
     ) -> GmailResult<GoogleExecuteResponse> {
-        let parsed_url = Url::parse(raw_url).map_err(|error| GmailError::Api {
+        let parsed_url = Url::parse(raw_url).map_err(|_| GmailError::Api {
             code: 400,
-            message: format!("invalid request url `{raw_url}`: {error}"),
+            message: "invalid Gmail request URL".to_owned(),
         })?;
 
         let mut parameters: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -486,6 +526,14 @@ impl GmailClient {
     }
 }
 
+fn require_effect_identity(id: &str) -> GmailResult<()> {
+    if id.trim().is_empty() {
+        Err(GmailError::OutcomeUnknown { status_code: None })
+    } else {
+        Ok(())
+    }
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     response: GoogleExecuteResponse,
 ) -> GmailResult<T> {
@@ -506,9 +554,11 @@ fn map_rest_error(error: GoogleRestError) -> GmailError {
         GoogleRestError::Http { source } => GmailError::Http(source),
         GoogleRestError::JsonDecode { source } => GmailError::Json(source),
         GoogleRestError::Api { error, .. } => map_google_api_error(error),
-        other => GmailError::Api {
-            code: 500,
-            message: other.to_string(),
+        // The remaining executor errors are local metadata/body validation;
+        // they occur before send and are not transient provider failures.
+        _ => GmailError::Api {
+            code: 400,
+            message: "Gmail request failed local validation".to_owned(),
         },
     }
 }
@@ -592,7 +642,271 @@ fn redact_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
     use super::*;
+
+    const EFFECT_PATHS: [&str; 3] = [
+        "/users/me/messages/send",
+        "/users/me/drafts",
+        "/users/me/drafts/send",
+    ];
+
+    fn test_client(server: &MockServer) -> GmailClient {
+        let mut client = GmailClient::new("fixture-private-token")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(2, 1, 2);
+        client.retry_config.jitter_enabled = false;
+        client
+    }
+
+    async fn run_effect(client: &GmailClient, index: usize) -> GmailResult<String> {
+        match index {
+            0 => client.send_message("fixture-private-message").await.map(|message| message.id),
+            1 => client.create_draft("fixture-private-message").await.map(|draft| draft.id),
+            2 => client.send_draft("fixture-draft").await.map(|message| message.id),
+            _ => unreachable!("unknown test operation"),
+        }
+    }
+
+    fn assert_unknown(error: &GmailError) {
+        assert!(matches!(error, GmailError::OutcomeUnknown { .. }), "{error:?}");
+        assert!(!error.is_retryable());
+        assert!(!error.replay_is_safe());
+        assert!(error.retry_after().is_none());
+        assert!(matches!(error.to_fcp_error(), fcp_prelude::FcpError::External {
+            retryable: false, retry_after: None, ..
+        }));
+        let diagnostic = format!("{error:?} {error} {:?}", error.to_fcp_error());
+        assert!(!diagnostic.contains("fixture-private"));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn ambiguous_send_and_creation_failures_cannot_be_replayed_by_callers() {
+        for (index, endpoint) in EFFECT_PATHS.iter().enumerate() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path(*endpoint))
+                .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": {"code": 503, "message": "fixture-private-provider-response"}
+                })))
+                .expect(1).mount(&server).await;
+            let error = run_effect(&test_client(&server), index).await.unwrap_err();
+            assert_unknown(&error);
+            assert!(matches!(error, GmailError::OutcomeUnknown { status_code: Some(503) }));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalid_successes_are_unknown_not_internal_errors_or_empty_receipts() {
+        for (index, endpoint) in EFFECT_PATHS.iter().enumerate() {
+            for body in ["", "{", "{}", "null", r#"{"id":""}"#, r#"{"id":"   "}"#] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST")).and(path(*endpoint))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                    .expect(1).mount(&server).await;
+                assert_unknown(&run_effect(&test_client(&server), index).await.unwrap_err());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn rate_limit_refusals_can_recover_for_all_effectful_endpoints() {
+        for (index, endpoint) in EFFECT_PATHS.iter().enumerate() {
+            let server = MockServer::start().await;
+            let attempts = AtomicU64::new(0);
+            Mock::given(method("POST")).and(path(*endpoint))
+                .respond_with(move |_: &wiremock::Request| {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(429).insert_header("Retry-After", "0")
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"accepted"}))
+                    }
+                })
+                .expect(2).mount(&server).await;
+            assert_eq!(run_effect(&test_client(&server), index).await.unwrap(), "accepted");
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn replay_safe_reads_and_state_updates_keep_transient_recovery() {
+        for (index, verb, endpoint) in [
+            (0, "GET", "/users/me/messages/known"),
+            (1, "POST", "/users/me/messages/known/modify"),
+            (2, "POST", "/users/me/messages/known/trash"),
+        ] {
+            let server = MockServer::start().await;
+            let attempts = AtomicU64::new(0);
+            Mock::given(method(verb)).and(path(endpoint))
+                .respond_with(move |_: &wiremock::Request| {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(503)
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"known"}))
+                    }
+                })
+                .expect(2).mount(&server).await;
+            let client = test_client(&server);
+            let message = match index {
+                0 => client.get_message("known").await,
+                1 => client.modify_message("known", &[], &[]).await,
+                _ => client.trash_message("known").await,
+            }.unwrap();
+            assert_eq!(message.id, "known");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn mutation_redirects_never_forward_credentials_or_message_bodies() {
+        for status in [301, 302, 303, 307, 308] {
+            let server = MockServer::start().await;
+            // Same-origin redirects matter too: reqwest would otherwise retain
+            // credentials on them even when it strips them across origins.
+            Mock::given(path("/capture"))
+                .respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+            Mock::given(method("POST")).and(path(EFFECT_PATHS[0]))
+                .respond_with(ResponseTemplate::new(status)
+                    .insert_header("Location", format!("{}/capture", server.uri())))
+                .expect(1).mount(&server).await;
+            let error = test_client(&server).send_message("fixture-private-message").await.unwrap_err();
+            assert_unknown(&error);
+            assert!(matches!(error, GmailError::OutcomeUnknown { status_code: Some(code) } if code == status));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn shutdown_during_an_accepted_send_preserves_outcome_uncertainty() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+        let cancel = client.runtime.clone();
+        Mock::given(method("POST")).and(path(EFFECT_PATHS[0]))
+            .respond_with(move |_: &wiremock::Request| {
+                cancel.shutdown();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"accepted"}))
+                    .set_delay(Duration::from_secs(2))
+            })
+            .expect(1).mount(&server).await;
+        assert_unknown(&client.send_message("fixture-private-message").await.unwrap_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn truncated_success_body_is_not_exposed_as_retryable_transport_failure() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{Shutdown, TcpListener};
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("POST /users/me/messages/send "));
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" { break; }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+            }
+            assert!(length > 0 && length < 1024);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            assert!(String::from_utf8(body).unwrap().contains("fixture-private-message"));
+            // The request was fully consumed; only its success response is lost.
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"").unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+        });
+        let client = GmailClient::new("fixture-private-token").unwrap()
+            .with_base_url(endpoint).with_retry_config(2, 1, 2);
+        let result = client.send_message("fixture-private-message").await;
+        worker.join().unwrap();
+        assert_unknown(&result.unwrap_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn a_cancelled_context_never_starts_a_send() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+        client.shutdown();
+        let error = client.send_message("fixture-private-message").await.unwrap_err();
+        assert!(!matches!(error, GmailError::OutcomeUnknown { .. }));
+        assert!(!error.is_retryable());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn deadline_during_send_is_unknown_but_expiry_in_refusal_backoff_is_not() {
+        for refused in [false, true] {
+            let server = MockServer::start().await;
+            let response = if refused {
+                ResponseTemplate::new(429).insert_header("Retry-After", "60")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"accepted"}))
+                    .set_delay(Duration::from_secs(3))
+            };
+            Mock::given(method("POST")).and(path(EFFECT_PATHS[0]))
+                .respond_with(response).expect(1).mount(&server).await;
+            let mut client = test_client(&server);
+            // Keep the policy ceiling above the context budget so Retry-After
+            // is not clamped into a fast second attempt by this test's client.
+            client.retry_config.max_delay_ms = 60_000;
+            client.runtime = ConnectorRuntime::new(
+                ConnectorRuntimeConfig::default().with_request_timeout(Duration::from_secs(1)),
+            );
+            let error = client.send_message("fixture-private-message").await.unwrap_err();
+            if refused {
+                assert!(matches!(error, GmailError::RateLimited { .. }), "{error:?}");
+            } else {
+                assert_unknown(&error);
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_request_validation_never_looks_like_an_ambiguous_provider_failure() {
+        let server = MockServer::start().await;
+        let client = test_client(&server).with_base_url("not-a-url-fixture-private");
+        let error = client.send_message("fixture-private-message").await.unwrap_err();
+        assert!(matches!(error, GmailError::Api { code: 400, .. }));
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("fixture-private"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let error = map_rest_error(GoogleRestError::UnknownSchemaReference {
+            schema: "fixture-private-schema".to_owned(),
+        });
+        assert!(matches!(error, GmailError::Api { code: 400, .. }));
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("fixture-private"));
+    }
 
     #[test]
     fn sanitize_path_segment_rejects_traversal() {

@@ -22,6 +22,11 @@ pub enum GmailError {
     #[error("Gmail API error: {message} (code: {code})")]
     Api { code: u32, message: String },
 
+    /// A send or creation may have completed; automatic replay is unsafe.
+    /// Deliberately carries no response body, request URL, or credential.
+    #[error("Gmail operation outcome is unknown; reconcile mailbox state before retrying")]
+    OutcomeUnknown { status_code: Option<u16> },
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
@@ -44,6 +49,30 @@ pub enum GmailError {
 }
 
 impl GmailError {
+    /// Preserve uncertainty after a non-idempotent attempt at the public error
+    /// boundary, not just inside the retry loop. Only definite refusals and
+    /// failures known to precede transmission retain their ordinary mapping.
+    pub(crate) fn after_non_idempotent_attempt(self) -> Self {
+        match self {
+            Self::Http(error)
+                if fcp_sdk::migration::transport_error_reached_service(&error) =>
+            {
+                Self::OutcomeUnknown {
+                    status_code: error.status().map(|status| status.as_u16()),
+                }
+            }
+            Self::Json(_) => Self::OutcomeUnknown { status_code: None },
+            Self::Api { code, .. } if !(400..=499).contains(&code) || code == 408 => {
+                Self::OutcomeUnknown {
+                    status_code: u16::try_from(code)
+                        .ok()
+                        .filter(|code| (100..=599).contains(code)),
+                }
+            }
+            error => error,
+        }
+    }
+
     /// Check if this error is retryable.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
@@ -88,6 +117,13 @@ impl GmailError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::OutcomeUnknown { status_code } => FcpError::External {
+                service: "gmail".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
+            },
             Self::Http(e) => FcpError::External {
                 service: "gmail".into(),
                 message: e.to_string(),
@@ -181,6 +217,55 @@ impl ConnectorErrorMapping for GmailError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_effects_stay_non_retryable_across_the_fcp_boundary() {
+        for code in [0, 200, 204, 301, 307, 308, 408, 500, 502, 503, 504, 599] {
+            let error = GmailError::Api {
+                code,
+                message: "private-provider-response".to_owned(),
+            }
+            .after_non_idempotent_attempt();
+            assert!(matches!(error, GmailError::OutcomeUnknown { .. }));
+            assert!(!error.is_retryable());
+            assert!(!error.replay_is_safe());
+            assert!(error.retry_after().is_none());
+            let FcpError::External { retryable, retry_after, message, status_code, .. } =
+                error.to_fcp_error()
+            else {
+                panic!("uncertain effects must remain explicit external errors");
+            };
+            assert!(!retryable);
+            assert!(retry_after.is_none());
+            assert!(message.contains("outcome is unknown"));
+            assert!(!message.contains("private-provider-response"));
+            assert_eq!(status_code, if code == 0 { None } else { Some(u16::try_from(code).unwrap()) });
+        }
+    }
+
+    #[test]
+    fn definite_refusals_keep_their_existing_error_contract() {
+        for code in [400, 401, 403, 404, 409, 422, 429] {
+            let error = GmailError::Api { code, message: "refused".into() }
+                .after_non_idempotent_attempt();
+            assert!(matches!(error, GmailError::Api { code: actual, .. } if actual == code));
+            assert_eq!(error.is_retryable(), code == 429);
+            assert_eq!(error.replay_is_safe(), code == 429);
+        }
+        let limited = GmailError::RateLimited { retry_after_secs: 7 }
+            .after_non_idempotent_attempt();
+        assert_eq!(limited.retry_after(), Some(Duration::from_secs(7)));
+        assert!(matches!(limited.to_fcp_error(), FcpError::RateLimited { retry_after_ms: 7000, .. }));
+    }
+
+    #[test]
+    fn malformed_effect_response_drops_decoder_details() {
+        let source = serde_json::from_str::<u64>("\"private-response\"").unwrap_err();
+        let error = GmailError::Json(source).after_non_idempotent_attempt();
+        assert!(matches!(error, GmailError::OutcomeUnknown { status_code: None }));
+        assert!(!format!("{error:?} {error}").contains("private-response"));
+        assert!(matches!(error.to_fcp_error(), FcpError::External { retryable: false, .. }));
+    }
 
     // ---- is_retryable ----
 
