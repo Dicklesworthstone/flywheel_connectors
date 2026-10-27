@@ -37,6 +37,7 @@ const MAX_UPLOAD_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 /// Google Drive API v3 client.
 pub struct DriveClient {
     executor: GoogleRestExecutor,
+    upload_executor: GoogleRestExecutor,
     auth: GoogleMaterializedAuth,
     base_url: String,
     runtime: ConnectorRuntime,
@@ -61,6 +62,14 @@ impl DriveClient {
         headers.insert(header::ACCEPT, "application/json".parse().unwrap());
 
         let client = Client::builder()
+            .default_headers(headers.clone())
+            .timeout(Duration::from_secs(30))
+            .user_agent("fcp-google-drive/0.1.0")
+            .build()
+            .map_err(DriveError::Http)?;
+        // Upload redirects can replay a file-creation request. Keep this policy
+        // isolated from ordinary media downloads, which may follow redirects.
+        let upload_client = Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
@@ -70,6 +79,7 @@ impl DriveClient {
 
         Ok(Self {
             executor: GoogleRestExecutor::new().with_client(client),
+            upload_executor: GoogleRestExecutor::new().with_client(upload_client),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             runtime: ConnectorRuntime::new(
@@ -442,7 +452,7 @@ impl DriveClient {
         request.auth = Some(&self.auth);
 
         if upload.is_some() {
-            self.executor
+            self.upload_executor
                 .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
                 .await
                 .map_err(map_rest_error)
@@ -881,8 +891,26 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn upload_does_not_follow_provider_redirects() {
+    async fn upload_does_not_follow_redirects_while_downloads_still_do() {
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/download-file"))
+            .and(query_param("alt", "media"))
+            .and(header("authorization", "Bearer upload-test-token"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/media/download-file", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/media/download-file"))
+            .and(header("authorization", "Bearer upload-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("redirected download"))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/upload/drive/v3/files"))
             .respond_with(
@@ -897,15 +925,19 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
+        let client = upload_client(&server);
+        assert_eq!(
+            client.download_file("download-file").await.unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(b"redirected download"),
+        );
         assert!(matches!(
-            upload_client(&server)
-                .upload_file("x", "text/plain", None, "eA==")
-                .await,
+            client.upload_file("x", "text/plain", None, "eA==").await,
             Err(DriveError::Api {
                 status_code: 307,
                 ..
             }),
         ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[test]
