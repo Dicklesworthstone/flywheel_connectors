@@ -89,6 +89,7 @@ async fn gmail_introspect_has_required_operations() {
     // Core Gmail operations that must survive migration.
     let required = [
         "gmail.get_message",
+        "gmail.get_attachment",
         "gmail.list_messages",
         "gmail.send_message",
         "gmail.modify_message",

@@ -53,6 +53,14 @@ pub struct MessagePartBody {
     pub data: Option<String>,
 }
 
+/// Retrieved attachment bytes, encoded with Gmail's URL-safe base64 alphabet.
+/// Both fields are required; an absent body must not become a fabricated empty file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmailAttachment {
+    pub size: u64,
+    pub data: String,
+}
+
 /// Gmail header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Header {

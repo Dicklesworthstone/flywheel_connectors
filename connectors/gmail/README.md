@@ -6,6 +6,7 @@
 > **Verification script**: `scripts/e2e/gmail_connector_verification.sh`
 > **Gmail REST upstream**: https://developers.google.com/workspace/gmail/api/reference/rest
 > **Messages upstream**: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages
+> **Attachment reads upstream**: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages.attachments/get
 > **Messages send upstream**: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send
 > **History upstream**: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list
 > **Threads upstream**: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.threads
@@ -14,7 +15,7 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.gmail`. The connector exposes the Gmail API surface implemented in this crate: messages, mailbox listing, history sync, labels, threads, drafts, and sending.
+This document fixes the operator-facing contract for `fcp.gmail`. The connector exposes the Gmail API surface implemented in this crate: messages, attachment retrieval, mailbox listing, history sync, labels, threads, drafts, and sending.
 
 The connector is intentionally a bounded mailbox bridge. It is not a Google Workspace admin connector, contact connector, Calendar connector, watch-channel manager, mailbox backup system, or general MIME processing toolkit.
 
@@ -24,6 +25,7 @@ The current crate exposes these operations:
 
 - `gmail.send_message`
 - `gmail.get_message`
+- `gmail.get_attachment`
 - `gmail.list_messages`
 - `gmail.sync_history`
 - `gmail.modify_message`
@@ -39,8 +41,7 @@ Important runtime truths the contract preserves:
 - Package and binary name are `fcp-gmail`.
 - Runtime `BaseConnector` ID is `gmail`.
 - Manifest connector ID is `fcp.gmail`.
-- Configuration uses shared Google auth selection at the top level: direct bearer token, `credential_id`, or `oauth_refresh`.
-- Direct bearer-token mode returns `configured`.
+- The connector configure boundary accepts a secretless `credential_id`; raw bearer tokens and OAuth refresh secrets are rejected there. The low-level client and shared auth substrate retain bearer/OAuth support for host materialization and internal tests.
 - `credential_id` mode is secretless and returns `configured_pending_token_materialization`.
 - `oauth_refresh` mode can materialize granted scopes and lets `doctor()`/`self_check()` detect scope-limited operation coverage.
 - Configuration accepts either explicit `required_scopes` or `scope_triggers`; both together are rejected.
@@ -52,6 +53,8 @@ Important runtime truths the contract preserves:
 - The client uses the shared retry loop with `max_retries = 3`, `initial_delay_ms = 1000`, and `max_delay_ms = 60000`.
 - The client retries retryable Google REST errors; 401 and 403 map to Unauthorized, and 429 maps to RateLimited with retry guidance.
 - Message IDs, thread IDs, and draft IDs used in URL path segments are validated to reject empty strings, slashes, backslashes, traversal, and encoded slash/backslash variants.
+- Attachment reads validate and percent-encode both IDs as individual URL path segments; message IDs are limited to 128 bytes and attachment IDs to 4096 bytes.
+- `gmail.get_attachment` checks canonical URL-safe base64 and decoded size, with a caller-controlled `max_bytes` ceiling up to 16 MiB. Malformed or oversized replies never return partial file contents.
 - Runtime handshake installs a `CapabilityVerifier`.
 - `invoke` requires `operation`, `input`, and `capability_token`; it validates input, computes resource URIs, and verifies a bound capability token before provider execution.
 - `simulate` validates operation inventory, input shape, configured state, handshaken state, and bound capability token before returning an allowed result.
@@ -95,7 +98,7 @@ The current Gmail README slice documents the existing runtime surface:
 - Allowed target zone: `z:private`.
 - Forbidden zones: `z:public` and `z:work`.
 - Runtime capability surface:
-  - `gmail.read` gates message reads, message listing, thread reads, and label listing.
+  - `gmail.read` gates message and attachment reads, message listing, thread reads, and label listing.
   - `gmail.history.read` gates restart-safe mailbox history sync.
   - `gmail.write` gates label modification and draft read/create.
   - `gmail.send` gates sending new messages and sending drafts.
@@ -115,7 +118,7 @@ The current Gmail README slice documents the existing runtime surface:
 - Runtime request timeout: `30 seconds`.
 - Manifest connect timeout is `10000 ms` for Gmail operations.
 - Manifest total timeout is `30000 ms` for most operations and `60000 ms` for list/history operations.
-- Manifest maximum response bytes range from `1048576` to `10485760`.
+- Manifest maximum response bytes range from `1048576` to `22435160`. The attachment allowance includes base64 expansion of 16 MiB plus 64 KiB of JSON envelope overhead; a smaller requested `max_bytes` also lowers its streaming response bound.
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `120000 ms` wall-clock timeout, read-only `/usr` and `/lib`, writable `$CONNECTOR_STATE`, no exec, and no ptrace.
 - The connector does not open inbound sockets.
 - The connector does not implement Gmail watch channels, Pub/Sub, replay streaming, or webhook ingress.
@@ -124,7 +127,7 @@ The current Gmail README slice documents the existing runtime surface:
 
 | Capability | Purpose |
 |-----------|---------|
-| `gmail.read` | Read messages, list messages, read threads, and list labels visible to the authenticated mailbox principal. |
+| `gmail.read` | Read messages and attachments, list messages, read threads, and list labels visible to the authenticated mailbox principal. |
 | `gmail.history.read` | Incrementally fetch mailbox history while preserving cursor fencing. |
 | `gmail.write` | Modify message labels and read/create drafts. |
 | `gmail.send` | Send new messages and send saved drafts. |
@@ -138,6 +141,7 @@ The current Gmail README slice documents the existing runtime surface:
 |-----------|----------------|------------|------------|-----------|-------------|-----------|
 | `gmail.send_message` | `POST /gmail/v1/users/me/messages/send` | `gmail.send` | `Dangerous` | `High` | `None` | Sends a new email from raw MIME or structured fields. |
 | `gmail.get_message` | `GET /gmail/v1/users/me/messages/{message_id}` | `gmail.read` | `Safe` | `Low` | `Strict` | Reads one Gmail message by message ID. |
+| `gmail.get_attachment` | `GET /gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}` | `gmail.read` | `Safe` | `Low` | `Strict` | Retrieves a separate MIME body with validated base64url data and a decoded-byte limit. |
 | `gmail.list_messages` | `GET /gmail/v1/users/me/messages?q={query}&maxResults={max_results}&pageToken={page_token}` | `gmail.read` | `Safe` | `Low` | `Strict` | Lists or searches message IDs visible to the mailbox principal. |
 | `gmail.sync_history` | `GET /gmail/v1/users/me/history?startHistoryId={history_id}` | `gmail.history.read` | `Safe` | `Low` | `Strict` | Fetches history pages and persists a fenced cursor. |
 | `gmail.modify_message` | `POST /gmail/v1/users/me/messages/{message_id}/modify` | `gmail.write` | `Risky` | `Medium` | `BestEffort` | Adds or removes label IDs on one message. |
@@ -156,6 +160,7 @@ Runtime capability-token verification binds operations to these resource URI sha
 |-----------|--------------|
 | `gmail.send_message` | `gmail:messages:send` |
 | `gmail.get_message` | `gmail:message:{message_id}` |
+| `gmail.get_attachment` | `gmail:message:{percent_encoded_message_id}:attachment:{percent_encoded_attachment_id}` |
 | `gmail.modify_message` | `gmail:message:{message_id}` |
 | `gmail.trash_message` | `gmail:message:{message_id}` |
 | `gmail.list_messages` | `gmail:messages` |
@@ -166,12 +171,28 @@ Runtime capability-token verification binds operations to these resource URI sha
 | `gmail.send_draft` | `gmail:draft:{draft_id}` |
 | `gmail.create_draft` | `gmail:drafts:create` |
 
+## Attachment Retrieval
+
+Read a message with `gmail.get_message` or `gmail.get_thread`, then inspect its MIME parts. A part with `body.attachmentId` has a separate body that can be fetched with `gmail.get_attachment`. Pass the containing message ID and that exact attachment ID; a MIME `partId` or filename is not an attachment ID. Parts whose bytes are already in `body.data` do not need a separate fetch.
+
+```json
+{
+  "message_id": "18d1234abc567890",
+  "attachment_id": "ANGjdJ-example",
+  "max_bytes": 1048576
+}
+```
+
+The result is `{"attachment":{"size":5,"data":"SGVsbG8"}}`: `size` counts decoded bytes, and `data` uses Gmail's URL-safe base64 alphabet, with or without canonical padding. Decode it to recover the original binary bytes. Both response fields are required and the declared size must match the decoded contents. A zero-byte attachment is valid; `max_bytes: 0` permits only an empty attachment. The default and hard decoded limit is `16777216` bytes (16 MiB).
+
+The provider requires `gmail.readonly`, `gmail.modify`, or `https://mail.google.com/`; metadata-only scope cannot retrieve attachment contents. Capability authorization binds both IDs, so a grant for one attachment cannot read another attachment or another message. The client sends an authenticated GET with no request body, refuses redirects, and retries only safe read failures. Response bounds apply while reading the network body, before JSON/base64 decoding, including oversized error responses. Attachment validation errors contain no provider payload.
+
 ## Explicit Non-Goals
 
 The current implementation does not include:
 
 - Gmail watch channels, Pub/Sub setup, webhook ingress, replay streams, or mailbox event fanout
-- attachments download/upload, MIME tree normalization, inline image extraction, or message body rendering
+- attachment upload, separate attachment downloads above 16 MiB, MIME tree normalization, inline image extraction, or message body rendering
 - label create/update/delete, thread modify/trash, message untrash, message delete, batch modify, batch delete, import, insert, or SMTP-like sending
 - filters, settings, delegates, forwarding addresses, vacation settings, send-as aliases, signatures, or profile management
 - multi-mailbox delegation, domain-wide delegation provisioning, service account setup, Admin SDK integration, Contacts/People API integration, or Calendar integration
@@ -181,7 +202,7 @@ These are excluded on purpose:
 
 - Gmail contains private user data and live sends are side-effecting.
 - History sync needs explicit singleton-writer fencing before broader replay semantics are added.
-- Attachments and MIME rendering need separate media redaction and size-limit contracts.
+- Attachment reads have an explicit size/encoding contract; MIME rendering and attachment upload still need their own media contracts.
 
 ## Readiness And Verification Surface
 
@@ -201,6 +222,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - local non-mock loopback acceptance for production `handle_invoke()` paths across `gmail.list_labels`, `gmail.get_message`, and `gmail.send_message`
 - lifecycle, configuration, base URL policy, loopback allowance, introspection, simulation, doctor, self-check, and shutdown behavior
 - message get/list/send/modify/trash, thread get, label list, draft get/create/send, and history sync through deterministic HTTP fixtures
+- attachment HTTP fixtures cover exact binary contents, required response fields, base64url and size validation, encoded IDs, bounded bodies, provider refusals, safe read retries, redirect refusal, and message/attachment-specific capability authority
 - cursor persistence and resumed history sync with `lease_seq` fencing
 - invoke rejection for unknown operation, missing token, missing input, wrong capability, and pre-provider capability verification
 - provider 401, 403, 404, 429, 500 classes and FCP error mapping
@@ -258,6 +280,7 @@ The verifier writes proof-governor artifacts under `${OUT_ROOT}/proof`. Only `ac
 - If `gmail.sync_history` conflicts, inspect `lease_seq`, `lease_object_id`, and the persisted cursor state before retrying.
 - If `gmail.list_messages` filters do not behave as expected, use runtime `query` syntax rather than manifest-only `label_ids`.
 - If provider returns 403, treat it as an auth/scope/permission failure rather than a retryable transport error.
+- If an attachment read exceeds `max_bytes`, raise the caller limit only if appropriate, up to 16 MiB; larger attachments require another retrieval path. Missing or malformed attachment fields are errors, never fabricated empty files.
 
 **Rerun commands**:
 

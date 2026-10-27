@@ -604,6 +604,42 @@ impl GmailConnector {
                     },
                 ),
                 op_info(
+                    "gmail.get_attachment",
+                    "Read a message attachment with a decoded-byte limit",
+                    json!({
+                        "type": "object",
+                        "required": ["message_id", "attachment_id"],
+                        "properties": {
+                            "message_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                            "attachment_id": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                            "max_bytes": { "type": "integer", "minimum": 0, "maximum": 16777216, "default": 16777216 }
+                        }
+                    }),
+                    json!({
+                        "type": "object", "required": ["attachment"],
+                        "properties": {
+                            "attachment": {
+                                "type": "object", "required": ["size", "data"],
+                                "properties": {
+                                    "size": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+                                    "data": { "type": "string", "maxLength": 22369624, "description": "URL-safe base64 attachment bytes; size is the decoded byte count." }
+                                }
+                            }
+                        }
+                    }),
+                    "gmail.read",
+                    RiskLevel::Low,
+                    SafetyTier::Safe,
+                    IdempotencyClass::Strict,
+                    None,
+                    AgentHint {
+                        when_to_use: "Read the separate body referenced by a MIME part's attachmentId from gmail.get_message or gmail.get_thread.".into(),
+                        common_mistakes: vec!["Use attachmentId, not the MIME partId or filename".into(), "Decode data with URL-safe base64; attachment size is checked against max_bytes".into()],
+                        examples: vec![r#"{"message_id":"18d1234abc567890","attachment_id":"ANGjdJ-example","max_bytes":1048576}"#.into()],
+                        related: vec![CapabilityId::from_static("gmail.get_message"), CapabilityId::from_static("gmail.get_thread")],
+                    },
+                ),
+                op_info(
                     "gmail.list_messages",
                     "List email messages with optional search query",
                     json!({
@@ -1019,6 +1055,7 @@ impl GmailConnector {
         match operation {
             "gmail.send_message" => self.invoke_send_message(input).await,
             "gmail.get_message" => self.invoke_get_message(input).await,
+            "gmail.get_attachment" => self.invoke_get_attachment(input).await,
             "gmail.list_messages" => self.invoke_list_messages(input).await,
             "gmail.sync_history" => self.invoke_sync_history(input).await,
             "gmail.modify_message" => self.invoke_modify_message(input).await,
@@ -1061,6 +1098,19 @@ impl GmailConnector {
             .map_err(|e: GmailError| e.to_fcp_error())?;
 
         Ok(json!({ "message": message }))
+    }
+
+    async fn invoke_get_attachment(
+        &self,
+        input: serde_json::Value,
+    ) -> FcpResult<serde_json::Value> {
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let (message_id, attachment_id, max_bytes) = parse_attachment_input(&input)?;
+        let attachment = client
+            .get_attachment(message_id, attachment_id, max_bytes)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+        Ok(json!({ "attachment": attachment }))
     }
 
     async fn invoke_list_messages(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -1609,7 +1659,7 @@ fn parse_history_types(input: &serde_json::Value) -> FcpResult<Option<Vec<String
 fn required_capability_for_operation(operation: &str) -> Option<&'static str> {
     match operation {
         "gmail.send_message" | "gmail.send_draft" => Some("gmail.send"),
-        "gmail.get_message" | "gmail.list_messages" | "gmail.get_thread" | "gmail.list_labels" => {
+        "gmail.get_message" | "gmail.get_attachment" | "gmail.list_messages" | "gmail.get_thread" | "gmail.list_labels" => {
             Some("gmail.read")
         }
         "gmail.sync_history" => Some("gmail.history.read"),
@@ -1637,6 +1687,7 @@ fn validate_gmail_input(operation: &str, input: &serde_json::Value) -> FcpResult
             }
         }
         "gmail.get_message" | "gmail.trash_message" => require_str(input, "message_id").map(|_| ()),
+        "gmail.get_attachment" => parse_attachment_input(input).map(|_| ()),
         "gmail.list_messages" => {
             validate_optional_string_field(input, "query")?;
             validate_optional_u32_field(input, "max_results")?;
@@ -1669,6 +1720,17 @@ fn validate_gmail_input(operation: &str, input: &serde_json::Value) -> FcpResult
 fn gmail_resource_uris(operation: &str, input: &serde_json::Value) -> Vec<String> {
     match operation {
         "gmail.send_message" => vec!["gmail:messages:send".into()],
+        "gmail.get_attachment" => match (
+            input.get("message_id").and_then(serde_json::Value::as_str),
+            input.get("attachment_id").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(message), Some(attachment)) => vec![format!(
+                "gmail:message:{}:attachment:{}",
+                crate::client::encode_attachment_identifier(message),
+                crate::client::encode_attachment_identifier(attachment),
+            )],
+            _ => Vec::new(),
+        },
         "gmail.get_message" | "gmail.modify_message" | "gmail.trash_message" => input
             .get("message_id")
             .and_then(|value| value.as_str())
@@ -1690,6 +1752,29 @@ fn gmail_resource_uris(operation: &str, input: &serde_json::Value) -> Vec<String
         "gmail.create_draft" => vec!["gmail:drafts:create".into()],
         _ => Vec::new(),
     }
+}
+
+fn parse_attachment_input(input: &serde_json::Value) -> FcpResult<(&str, &str, usize)> {
+    let message_id = require_str(input, "message_id")?;
+    let attachment_id = require_str(input, "attachment_id")?;
+    let max_bytes = match input.get("max_bytes") {
+        None => crate::client::MAX_ATTACHMENT_BYTES,
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value <= crate::client::MAX_ATTACHMENT_BYTES)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "max_bytes must be an integer between 0 and 16777216".into(),
+            })?,
+    };
+    crate::client::validate_attachment_request(message_id, attachment_id, max_bytes).map_err(
+        |error| FcpError::InvalidRequest {
+            code: 1003,
+            message: error.to_string(),
+        },
+    )?;
+    Ok((message_id, attachment_id, max_bytes))
 }
 
 fn validate_optional_string_field(input: &serde_json::Value, field: &str) -> FcpResult<()> {
@@ -1757,6 +1842,14 @@ fn granted_scopes_are_authoritative(config: &GmailConfig) -> bool {
 fn missing_scope_limited_operations(config: &GmailConfig) -> Vec<&'static str> {
     let granted: BTreeSet<&str> = config.granted_scopes.iter().map(String::as_str).collect();
     [
+        (
+            "gmail.get_attachment",
+            &[
+                "https://mail.google.com/",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.modify",
+            ][..],
+        ),
         (
             "gmail.send_message",
             &[
@@ -2227,6 +2320,93 @@ mod tests {
             .await
             .unwrap();
         (connector, signing_key)
+    }
+
+    #[test]
+    fn attachment_input_budget_and_resource_identity_are_strict() {
+        let input = json!({"message_id": "message:one", "attachment_id": "part?one#two"});
+        assert_eq!(
+            parse_attachment_input(&input).unwrap(),
+            (
+                "message:one",
+                "part?one#two",
+                crate::client::MAX_ATTACHMENT_BYTES
+            )
+        );
+        assert_eq!(
+            gmail_resource_uris("gmail.get_attachment", &input),
+            ["gmail:message:message%3Aone:attachment:part%3Fone%23two"]
+        );
+        for invalid in [
+            json!(-1),
+            json!(1.5),
+            json!(null),
+            json!(true),
+            json!(16777217),
+            json!("1"),
+        ] {
+            let mut invalid_input = input.clone();
+            invalid_input["max_bytes"] = invalid;
+            assert!(matches!(
+                parse_attachment_input(&invalid_input),
+                Err(FcpError::InvalidRequest { code: 1003, .. })
+            ));
+        }
+        for limit in [0, 1, crate::client::MAX_ATTACHMENT_BYTES] {
+            let mut bounded = input.clone();
+            bounded["max_bytes"] = json!(limit);
+            assert_eq!(parse_attachment_input(&bounded).unwrap().2, limit);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_simulation_validates_input_and_operation_authority() {
+        let (connector, signing_key) = handshaken_connector().await;
+        let valid = json!({"message_id":"m1", "attachment_id":"a1", "max_bytes":1});
+        for input in [
+            json!({"message_id":"m1"}),
+            json!({"message_id":"m1", "attachment_id":"../other"}),
+            json!({"message_id":"m1", "attachment_id":"a1", "max_bytes":-1}),
+        ] {
+            let token = generate_valid_token(&signing_key, &connector, "gmail.get_attachment");
+            let response = connector
+                .handle_simulate(simulate_request("gmail.get_attachment", input, token))
+                .await
+                .unwrap();
+            assert!(!parse_simulate_response(response).would_succeed);
+        }
+        let wrong = generate_valid_token(&signing_key, &connector, "gmail.get_message");
+        let denied = connector
+            .handle_simulate(simulate_request(
+                "gmail.get_attachment",
+                valid.clone(),
+                wrong,
+            ))
+            .await
+            .unwrap();
+        assert!(!parse_simulate_response(denied).would_succeed);
+        let token = generate_valid_token(&signing_key, &connector, "gmail.get_attachment");
+        let allowed = connector
+            .handle_simulate(simulate_request("gmail.get_attachment", valid, token))
+            .await
+            .unwrap();
+        assert!(parse_simulate_response(allowed).would_succeed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_scope_diagnostics_require_content_read_access() {
+        let mut connector = configured_connector().await;
+        let config = connector.config.as_mut().unwrap();
+        for scope in [
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.modify",
+        ] {
+            config.granted_scopes = vec![scope.into()];
+            assert!(!missing_scope_limited_operations(config).contains(&"gmail.get_attachment"));
+        }
+        config.granted_scopes = vec!["https://www.googleapis.com/auth/gmail.metadata".into()];
+        assert!(missing_scope_limited_operations(config).contains(&"gmail.get_attachment"));
     }
 
     // ── GoogleMaterializedAuth label ─────────────────────────────────
@@ -2974,7 +3154,7 @@ mod tests {
         let connector = GmailConnector::new();
         let result = connector.handle_introspect().await.unwrap();
         let ops = result["operations"].as_array().unwrap();
-        assert_eq!(ops.len(), 11);
+        assert_eq!(ops.len(), 12);
     }
 
     // ── Risk levels ────────────────────────────────────────────────
@@ -3005,6 +3185,7 @@ mod tests {
 
         let read_ops = [
             "gmail.get_message",
+            "gmail.get_attachment",
             "gmail.list_messages",
             "gmail.get_thread",
             "gmail.list_labels",
@@ -3796,6 +3977,7 @@ mod tests {
 
         assert!(op_ids.contains(&"gmail.send_message"));
         assert!(op_ids.contains(&"gmail.get_message"));
+        assert!(op_ids.contains(&"gmail.get_attachment"));
         assert!(op_ids.contains(&"gmail.list_messages"));
         assert!(op_ids.contains(&"gmail.modify_message"));
         assert!(op_ids.contains(&"gmail.trash_message"));
@@ -3805,7 +3987,7 @@ mod tests {
         assert!(op_ids.contains(&"gmail.get_draft"));
         assert!(op_ids.contains(&"gmail.create_draft"));
         assert!(op_ids.contains(&"gmail.send_draft"));
-        assert_eq!(ops.len(), 11);
+        assert_eq!(ops.len(), 12);
     }
 
     #[test]

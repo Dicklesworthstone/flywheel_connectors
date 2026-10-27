@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use fcp_google_discovery::auth::{GoogleAuthSourceKind, GoogleMaterializedAuth};
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
@@ -23,13 +24,16 @@ use tracing::{debug, instrument};
 use crate::{
     error::{GmailError, GmailResult},
     types::{
-        GmailDraft, GmailLabel, GmailMessage, GmailThread, HistoryListResponse, LabelsListResponse,
-        MessagesListResponse,
+        GmailAttachment, GmailDraft, GmailLabel, GmailMessage, GmailThread, HistoryListResponse,
+        LabelsListResponse, MessagesListResponse,
     },
 };
 
 /// Default Gmail API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
+/// Decoded attachment ceiling, leaving room for base64 in native host responses.
+pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+const ATTACHMENT_RESPONSE_OVERHEAD: usize = 64 * 1024;
 
 /// Gmail API client with retry logic and rate limit awareness.
 ///
@@ -175,6 +179,42 @@ impl GmailClient {
         self.get(&url).await
     }
 
+    /// Retrieve the separate body identified by a message MIME part's attachmentId.
+    /// The response is checked against the caller's decoded-byte budget and size.
+    pub async fn get_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+        max_bytes: usize,
+    ) -> GmailResult<GmailAttachment> {
+        validate_attachment_request(message_id, attachment_id, max_bytes)?;
+        let url = format!(
+            "{}/users/me/messages/{}/attachments/{}",
+            self.base_url,
+            encode_attachment_identifier(message_id),
+            encode_attachment_identifier(attachment_id),
+        );
+        let response_limit = max_bytes.div_ceil(3) * 4 + ATTACHMENT_RESPONSE_OVERHEAD;
+        let response = self
+            .execute_with_retry(
+                "GET",
+                &url,
+                None,
+                GoogleResponseMode::Json,
+                true,
+                Some(response_limit),
+            )
+            .await
+            .map_err(|error| match error {
+                GmailError::Json(_) => invalid_attachment("response is not valid attachment JSON"),
+                other => other,
+            })?;
+        let attachment: GmailAttachment = decode_json_response(response)
+            .map_err(|_| invalid_attachment("response must contain size and data fields"))?;
+        validate_attachment_response(&attachment, max_bytes)?;
+        Ok(attachment)
+    }
+
     /// List messages, optionally filtered by query.
     #[instrument(skip(self))]
     pub async fn list_messages(
@@ -318,7 +358,7 @@ impl GmailClient {
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> GmailResult<T> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true, None)
             .await?;
         decode_json_response(response)
     }
@@ -358,7 +398,7 @@ impl GmailClient {
         body: &serde_json::Value,
     ) -> GmailResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false, None)
             .await?;
         let status_code = Some(response.status_code);
         decode_json_response(response).map_err(|_| GmailError::OutcomeUnknown { status_code })
@@ -376,7 +416,7 @@ impl GmailClient {
         body: &serde_json::Value,
     ) -> GmailResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, true)
+            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, true, None)
             .await?;
         decode_json_response(response)
     }
@@ -394,6 +434,7 @@ impl GmailClient {
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
         replay_safe: bool,
+        max_response_bytes: Option<usize>,
     ) -> GmailResult<GoogleExecuteResponse> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
@@ -411,7 +452,7 @@ impl GmailClient {
             // factory is being constructed or while waiting in safe backoff.
             pending_effect.store(!replay_safe, Ordering::Relaxed);
             let response = self
-                .execute_once(http_method, url, body, response_mode)
+                .execute_once(http_method, url, body, response_mode, max_response_bytes)
                 .await;
             let response = response.map_err(|error| {
                 if replay_safe {
@@ -457,6 +498,7 @@ impl GmailClient {
         raw_url: &str,
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
+        max_response_bytes: Option<usize>,
     ) -> GmailResult<GoogleExecuteResponse> {
         let parsed_url = Url::parse(raw_url).map_err(|_| GmailError::Api {
             code: 400,
@@ -519,11 +561,75 @@ impl GmailClient {
         request.response_mode = response_mode;
         request.auth = Some(&self.auth);
 
-        self.executor
-            .execute(&request)
-            .await
-            .map_err(map_rest_error)
+        match max_response_bytes {
+            Some(limit) => self.executor.execute_bounded(&request, limit).await,
+            None => self.executor.execute(&request).await,
+        }
+        .map_err(map_rest_error)
     }
+}
+
+pub(crate) fn validate_attachment_request(
+    message_id: &str,
+    attachment_id: &str,
+    max_bytes: usize,
+) -> GmailResult<()> {
+    for (field, value, limit) in [
+        ("message_id", message_id, 128),
+        ("attachment_id", attachment_id, 4096),
+    ] {
+        sanitize_path_segment(value, field)?;
+        if value == "."
+            || value.len() > limit
+            || value
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(GmailError::Api {
+                code: 400,
+                message: format!(
+                    "{field} must fit {limit} bytes and contain no whitespace or controls"
+                ),
+            });
+        }
+    }
+    if max_bytes > MAX_ATTACHMENT_BYTES {
+        return Err(GmailError::Api {
+            code: 400,
+            message: "max_bytes must be between 0 and 16777216".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_attachment_identifier(value: &str) -> String {
+    const SEGMENT: &percent_encoding::AsciiSet =
+        &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_');
+    percent_encoding::utf8_percent_encode(value, SEGMENT).to_string()
+}
+
+fn invalid_attachment(message: &str) -> GmailError {
+    GmailError::InvalidAttachment {
+        message: message.into(),
+    }
+}
+
+fn validate_attachment_response(attachment: &GmailAttachment, max_bytes: usize) -> GmailResult<()> {
+    if attachment.size > max_bytes as u64 || attachment.data.len() > max_bytes.div_ceil(3) * 4 {
+        return Err(invalid_attachment(
+            "attachment exceeds the decoded-byte limit",
+        ));
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&attachment.data)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&attachment.data))
+        .map_err(|_| invalid_attachment("data must be canonical URL-safe base64"))?;
+    if decoded.len() > max_bytes || decoded.len() as u64 != attachment.size {
+        return Err(invalid_attachment(
+            "size does not match decoded attachment bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn require_effect_identity(id: &str) -> GmailResult<()> {
@@ -551,6 +657,7 @@ fn decode_json_response<T: serde::de::DeserializeOwned>(
 
 fn map_rest_error(error: GoogleRestError) -> GmailError {
     match error {
+        GoogleRestError::ResponseTooLarge { limit } => GmailError::ResponseTooLarge { limit },
         GoogleRestError::Http { source } => GmailError::Http(source),
         GoogleRestError::JsonDecode { source } => GmailError::Json(source),
         GoogleRestError::Api { error, .. } => map_google_api_error(error),
@@ -662,6 +769,245 @@ mod tests {
             .with_retry_config(2, 1, 2);
         client.retry_config.jitter_enabled = false;
         client
+    }
+
+    #[test]
+    fn attachment_bytes_accept_canonical_base64url_and_exact_sizes() {
+        for bytes in [
+            b"".as_slice(),
+            b"\0\xff\xfe\xfb",
+            b"attachment text\r\n",
+            b"{\"data\":true}",
+        ] {
+            for encoding in [
+                base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                base64::engine::general_purpose::URL_SAFE,
+            ] {
+                let attachment = GmailAttachment {
+                    size: bytes.len() as u64,
+                    data: encoding.encode(bytes),
+                };
+                validate_attachment_response(&attachment, bytes.len()).unwrap();
+                if !bytes.is_empty() {
+                    assert!(validate_attachment_response(&attachment, bytes.len() - 1).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_bytes_reject_malformed_data_and_untrusted_sizes() {
+        for (size, data) in [
+            (0, "YQ"),
+            (2, "YQ"),
+            (1, "Zh=="),
+            (1, "Zg="),
+            (1, "Zg==="),
+            (3, "+/8="),
+            (1, "Zg\n"),
+            (1, "!"),
+            (u64::MAX, ""),
+        ] {
+            let error = validate_attachment_response(
+                &GmailAttachment {
+                    size,
+                    data: data.into(),
+                },
+                MAX_ATTACHMENT_BYTES,
+            )
+            .unwrap_err();
+            assert!(matches!(error, GmailError::InvalidAttachment { .. }));
+            assert!(!error.is_retryable());
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"size":0}),
+            serde_json::json!({"data":""}),
+            serde_json::json!({"size":-1,"data":""}),
+            serde_json::json!({"size":0,"data":null}),
+        ] {
+            assert!(serde_json::from_value::<GmailAttachment>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn attachment_identifiers_are_bounded_and_encode_as_single_segments() {
+        validate_attachment_request("m1", "ANGjdJ_opaque-id", MAX_ATTACHMENT_BYTES).unwrap();
+        validate_attachment_request("m1", "a1", 0).unwrap();
+        for invalid in [
+            "", " ", ".", "../other", "a/b", "a\\b", "a%2Fb", "a%5cb", "a\nb", "a b",
+        ] {
+            assert!(validate_attachment_request(invalid, "a1", 1).is_err());
+            assert!(validate_attachment_request("m1", invalid, 1).is_err());
+        }
+        assert!(validate_attachment_request(&"m".repeat(129), "a1", 1).is_err());
+        assert!(validate_attachment_request("m1", &"a".repeat(4097), 1).is_err());
+        assert!(validate_attachment_request("m1", "a1", MAX_ATTACHMENT_BYTES + 1).is_err());
+        assert_eq!(encode_attachment_identifier("m:one?x#z"), "m%3Aone%3Fx%23z");
+        assert_eq!(encode_attachment_identifier("a_-+=%"), "a_-%2B%3D%25");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_get_preserves_bytes_and_sends_only_encoded_ids() {
+        let server = MockServer::start().await;
+        let bytes = b"\0\xff\xfe\xfbattachment\r\n";
+        let data = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "size": bytes.len(), "data": data
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let attachment = test_client(&server)
+            .get_attachment("m:one", "a?one#two", bytes.len())
+            .await
+            .unwrap();
+        assert_eq!(attachment.size, bytes.len() as u64);
+        assert_eq!(attachment.data, data);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].url.path(),
+            "/users/me/messages/m%3Aone/attachments/a%3Fone%23two"
+        );
+        assert!(requests[0].url.query_pairs().next().is_none());
+        assert!(requests[0].body.is_empty());
+        assert_eq!(
+            requests[0].headers["authorization"],
+            "Bearer fixture-private-token"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_get_rejects_invalid_successes_without_retry_or_payload_echo() {
+        for body in [
+            "",
+            "{",
+            "null",
+            "{}",
+            r#"{"size":0}"#,
+            r#"{"data":""}"#,
+            r#"{"size":1,"data":"fixture-private-content"}"#,
+            r#"{"size":2,"data":"YQ"}"#,
+            r#"{"size":16777217,"data":""}"#,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = test_client(&server)
+                .get_attachment("m1", "a1", MAX_ATTACHMENT_BYTES)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GmailError::InvalidAttachment { .. }));
+            assert!(!error.is_retryable());
+            assert!(
+                !format!("{error:?} {error} {:?}", error.to_fcp_error())
+                    .contains("fixture-private")
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_get_bounds_the_network_envelope_before_decoding() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(" ".repeat(ATTACHMENT_RESPONSE_OVERHEAD + 5)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = test_client(&server)
+            .get_attachment("m1", "a1", 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GmailError::ResponseTooLarge { limit } if limit == ATTACHMENT_RESPONSE_OVERHEAD + 4)
+        );
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_prelude::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_get_handles_provider_refusals_and_retries_safe_reads() {
+        for status in [401, 403, 404] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": {"code": status, "message": "fixture provider refusal"}
+                    })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = test_client(&server)
+                .get_attachment("m1", "a1", 1)
+                .await
+                .unwrap_err();
+            if status == 404 {
+                assert!(matches!(error, GmailError::Api { code: 404, .. }));
+            } else {
+                assert!(matches!(error, GmailError::Unauthorized));
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"size":0,"data":""})),
+            )
+            .with_priority(10)
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            test_client(&server)
+                .get_attachment("m1", "a1", 0)
+                .await
+                .unwrap()
+                .size,
+            0
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, requests[1].url);
+        assert!(requests.iter().all(|request| request.body.is_empty()));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn attachment_get_does_not_forward_credentials_on_redirects() {
+        for status in [307, 308] {
+            let server = MockServer::start().await;
+            let sink = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status).insert_header("Location", sink.uri()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(
+                test_client(&server)
+                    .get_attachment("m1", "a1", 1)
+                    .await
+                    .is_err()
+            );
+            assert!(sink.received_requests().await.unwrap().is_empty());
+        }
     }
 
     async fn run_effect(client: &GmailClient, index: usize) -> GmailResult<String> {

@@ -20,6 +20,12 @@ async fn gmail_schema_operation_and_error_contracts_are_advertised() {
                 output_fields: &["message"],
             },
             OperationContract {
+                id: "gmail.get_attachment",
+                capability: "gmail.read",
+                required_input_fields: &["message_id", "attachment_id"],
+                output_fields: &["attachment"],
+            },
+            OperationContract {
                 id: "gmail.sync_history",
                 capability: "gmail.history.read",
                 required_input_fields: &["lease_seq"],

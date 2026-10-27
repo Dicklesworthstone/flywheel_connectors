@@ -703,6 +703,89 @@ async fn invoke_get_message_through_connector() {
     assert_eq!(result["message"]["threadId"], "thread42");
 }
 
+#[fcp_async_core::runtime::test]
+async fn attachment_invoke_is_bound_to_both_ids_and_host_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/me/messages/m1/attachments/a1"))
+        .and(header(FCP_CREDENTIAL_ID_HEADER, TEST_CREDENTIAL_ID))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"size":2,"data":"-_8"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = GmailConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let signing_key = setup_handshake(&mut connector, &["gmail.get_attachment"]).await;
+    let operation = "gmail.get_attachment";
+    let input = json!({"message_id":"m1", "attachment_id":"a1", "max_bytes":2});
+    let make_token = |capability: &str, granted_operation: &str, resource: &str, instance: &str| {
+        let constraints = CapabilityConstraints {
+            resource_allow: vec![resource.into()],
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id(capability)
+                .zone_id("z:work")
+                .principal("user:test")
+                .operations(&[granted_operation])
+                .issuer("node:test")
+                .target_instance(instance)
+                .validity(now, now + Duration::hours(1))
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(&signing_key)
+                .unwrap(),
+        )
+    };
+    let instance = connector.instance_id().as_str();
+    for (capability, granted_operation, resource, target) in [
+        ("gmail.send", operation, "*", instance),
+        ("gmail.read", "gmail.get_message", "*", instance),
+        (
+            "gmail.read",
+            operation,
+            "gmail:message:other:attachment:a1",
+            instance,
+        ),
+        (
+            "gmail.read",
+            operation,
+            "gmail:message:m1:attachment:other",
+            instance,
+        ),
+        ("gmail.read", operation, "*", "wrong-attachment-instance"),
+    ] {
+        let token = make_token(capability, granted_operation, resource, target);
+        let result = connector
+            .handle_invoke(json!({"operation":operation, "input":input, "capability_token":token}))
+            .await;
+        assert!(
+            result.is_err(),
+            "authority mismatch must be rejected before egress"
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let token = make_token(
+        "gmail.read",
+        operation,
+        "gmail:message:m1:attachment:a1",
+        instance,
+    );
+    let result = connector
+        .handle_invoke(json!({"operation":operation, "input":input, "capability_token":token}))
+        .await
+        .unwrap();
+    assert_eq!(result, json!({"attachment":{"size":2,"data":"-_8"}}));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].body.is_empty());
+    assert!(!requests[0].headers.contains_key("authorization"));
+}
+
 /// Invoke `gmail.send_message` through the connector with structured fields.
 #[fcp_async_core::runtime::test]
 async fn invoke_send_message_accepts_structured_fields() {

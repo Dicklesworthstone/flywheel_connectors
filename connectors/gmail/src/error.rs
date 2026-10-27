@@ -9,8 +9,7 @@ use thiserror::Error;
 
 /// Gmail-specific errors.
 #[derive(Error, Debug)]
-pub enum GmailError {
-    /// HTTP request failed
+pub enum GmailError {    /// HTTP request failed
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -26,6 +25,14 @@ pub enum GmailError {
     /// Deliberately carries no response body, request URL, or credential.
     #[error("Gmail operation outcome is unknown; reconcile mailbox state before retrying")]
     OutcomeUnknown { status_code: Option<u16> },
+
+    /// A bounded read exceeded its response envelope allowance.
+    #[error("Gmail response exceeds the {limit}-byte response limit")]
+    ResponseTooLarge { limit: usize },
+
+    /// Attachment metadata or encoding cannot establish valid file contents.
+    #[error("Invalid Gmail attachment response: {message}")]
+    InvalidAttachment { message: String },
 
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_secs}s")]
@@ -117,6 +124,13 @@ impl GmailError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::ResponseTooLarge { .. } | Self::InvalidAttachment { .. } => FcpError::External {
+                service: "gmail".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
             Self::OutcomeUnknown { status_code } => FcpError::External {
                 service: "gmail".into(),
                 message: self.to_string(),

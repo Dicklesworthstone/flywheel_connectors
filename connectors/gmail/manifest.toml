@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:5fd0fb8f2869c930f3ec6bc4fd77ad9bfd7a190653ed7e65f656fe66d3a4c5a9"
+interface_hash = "blake3-256:fcp.interface.v2:7f4ef7a7b43dc780b07c3ea681e3c4de89d1b5b6631dc5d7ea5ca586289acb58"
 
 [connector]
 id = "fcp.gmail"
@@ -133,6 +133,70 @@ when_to_use = "Read a specific email by ID."
 common_mistakes = ["Using a thread ID instead of a message ID — they are different identifiers in Gmail", "Not requesting the full format — the default metadata-only response omits the message body"]
 examples = ['{"message_id": "abc123"}']
 related = ["gmail.list_messages", "gmail.search_messages"]
+
+# ────────────────────────────────────────────────────────────────
+
+[provides.operations."gmail.get_attachment"]
+description = "Read a message attachment with a decoded-byte limit"
+capability = "gmail.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+revocation_freshness = "safe"
+
+[provides.operations."gmail.get_attachment".input_schema]
+required = ["message_id", "attachment_id"]
+type = "object"
+[provides.operations."gmail.get_attachment".input_schema.properties.message_id]
+type = "string"
+minLength = 1
+maxLength = 128
+[provides.operations."gmail.get_attachment".input_schema.properties.attachment_id]
+type = "string"
+minLength = 1
+maxLength = 4096
+[provides.operations."gmail.get_attachment".input_schema.properties.max_bytes]
+type = "integer"
+minimum = 0
+maximum = 16777216
+default = 16777216
+
+[provides.operations."gmail.get_attachment".output_schema]
+required = ["attachment"]
+type = "object"
+[provides.operations."gmail.get_attachment".output_schema.properties.attachment]
+type = "object"
+required = ["size", "data"]
+[provides.operations."gmail.get_attachment".output_schema.properties.attachment.properties.size]
+type = "integer"
+minimum = 0
+maximum = 16777216
+[provides.operations."gmail.get_attachment".output_schema.properties.attachment.properties.data]
+type = "string"
+maxLength = 22369624
+description = "URL-safe base64 attachment bytes; size is the decoded byte count."
+
+[provides.operations."gmail.get_attachment".network_constraints]
+host_allow = ["gmail.googleapis.com", "www.googleapis.com"]
+port_allow = [443]
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 22435160
+
+[provides.operations."gmail.get_attachment".ai_hints]
+when_to_use = "Read the separate body referenced by a MIME part's attachmentId from gmail.get_message or gmail.get_thread."
+common_mistakes = ["Use attachmentId, not the MIME partId or filename", "Decode data with URL-safe base64; attachment size is checked against max_bytes"]
+examples = ['{"message_id":"18d1234abc567890","attachment_id":"ANGjdJ-example","max_bytes":1048576}']
+related = ["gmail.get_message", "gmail.get_thread"]
 
 # ────────────────────────────────────────────────────────────────
 
@@ -624,6 +688,7 @@ scope = "instance"
 [rate_limits.operation_pools]
 "gmail.send_message" = ["gmail.send"]
 "gmail.get_message" = ["gmail.read"]
+"gmail.get_attachment" = ["gmail.read"]
 "gmail.list_messages" = ["gmail.read"]
 "gmail.sync_history" = ["gmail.history.read"]
 "gmail.modify_message" = ["gmail.write"]
