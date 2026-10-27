@@ -639,7 +639,29 @@ impl TelegramNativeSubscription {
             });
         }
         self.verify_authority()?;
-        if event.topic != self.topic {
+        if self.topic == "telegram.update" {
+            if !matches!(
+                event.topic.as_str(),
+                "telegram.message.new"
+                    | "telegram.message.edited"
+                    | "telegram.channel_post.new"
+                    | "telegram.channel_post.edited"
+                    | "telegram.callback_query"
+            ) {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Unsupported Telegram aggregate source topic".into(),
+                });
+            }
+            // One provider cursor covers every supported update kind. Keep
+            // the normalized payload and its metadata stable for replay while
+            // routing all kinds through the explicitly authorized aggregate.
+            event.data.payload = json!({
+                "source_topic": event.topic,
+                "event": event.data.payload,
+            });
+            event.topic.clone_from(&self.topic);
+        } else if event.topic != self.topic {
             return Ok(false);
         }
         event.data.zone_id = self.verifier.zone_id.clone();
@@ -1612,6 +1634,27 @@ impl TelegramConnector {
         })
     }
 
+    fn update_event_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source_topic", "event"],
+            "properties": {
+                "source_topic": {
+                    "type": "string",
+                    "enum": [
+                        "telegram.message.new",
+                        "telegram.message.edited",
+                        "telegram.channel_post.new",
+                        "telegram.channel_post.edited",
+                        "telegram.callback_query"
+                    ]
+                },
+                "event": { "type": "object" }
+            }
+        })
+    }
+
     fn input_schema_for(operation: &str) -> Option<serde_json::Value> {
         match operation {
             "telegram.send_message" => Some(Self::send_message_input_schema()),
@@ -1973,6 +2016,11 @@ impl TelegramConnector {
         let introspection = Introspection {
             operations: Self::operations_info(),
             events: vec![
+                EventInfo {
+                    topic: "telegram.update".into(),
+                    schema: Self::update_event_schema(),
+                    requires_ack: true,
+                },
                 EventInfo {
                     topic: "telegram.message.new".into(),
                     schema: Self::message_event_schema(),
@@ -3001,7 +3049,8 @@ impl TelegramConnector {
             || !matches!(
                 request.topics.first().map(String::as_str),
                 Some(
-                    "telegram.message.new"
+                    "telegram.update"
+                        | "telegram.message.new"
                         | "telegram.message.edited"
                         | "telegram.channel_post.new"
                         | "telegram.channel_post.edited"
@@ -3816,6 +3865,11 @@ impl FcpConnector for TelegramConnector {
                 ),
             ],
             events: vec![
+                EventInfo {
+                    topic: "telegram.update".into(),
+                    schema: Self::update_event_schema(),
+                    requires_ack: true,
+                },
                 EventInfo {
                     topic: "telegram.message.new".into(),
                     schema: Self::message_event_schema(),
@@ -5803,6 +5857,11 @@ mod tests {
             false,
         ))
         .unwrap();
+        let mut aggregate_with_narrow_grant = base.clone();
+        aggregate_with_narrow_grant["topics"] = json!(["telegram.update"]);
+        aggregate_with_narrow_grant["capability_token"] =
+            serde_json::to_value(scoped_token("telegram:events:telegram.message.new", false))
+                .unwrap();
         let mut expired = base.clone();
         expired["capability_token"] =
             serde_json::to_value(scoped_token("telegram:events:telegram.message.new", true))
@@ -5823,6 +5882,7 @@ mod tests {
             wrong_instance,
             wrong_signature,
             wrong_resource,
+            aggregate_with_narrow_grant,
             expired,
             wildcard,
             multiple,
@@ -5971,6 +6031,162 @@ mod tests {
         })
         .await
         .expect("ACK must commit the cursor before the next provider poll");
+        connector.handle_shutdown(json!({})).await.unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_aggregate_acknowledges_every_kind_before_checkpoint_and_replays_stably() {
+        let server = TestTelegramServer::start();
+        let message = json!({
+            "message_id": 55, "date": 1700000000, "message_thread_id": 19,
+            "from": {"id": 7, "is_bot": false, "first_name": "Test", "username": "tester"},
+            "chat": {"id": -99, "type": "supergroup", "title": "Forum"},
+            "text": "all supported update kinds need acknowledgements",
+        });
+        let updates: Vec<Value> = [
+            ("message", message.clone()),
+            ("edited_message", message.clone()),
+            ("channel_post", message.clone()),
+            ("edited_channel_post", message.clone()),
+            (
+                "callback_query",
+                json!({
+                    "id": "callback-1", "from": message["from"], "message": message,
+                    "chat_instance": "forum-instance", "data": "button-pressed",
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, payload))| {
+            let mut update = json!({"update_id": 1000 + index});
+            update[kind] = payload;
+            update
+        })
+        .collect();
+        for _ in 0..2 {
+            server.respond(TestTelegramRoute::new(
+                "POST",
+                token_path("getUpdates"),
+                json!({"ok": true, "result": updates}),
+            ));
+        }
+        let mut connector = TelegramConnector::new();
+        let transport = install_native_test_transport(&mut connector);
+        transport.acknowledge.store(false, Ordering::SeqCst);
+        connector
+            .handle_configure(json!({
+                "credential": test_bot_credential(), "base_url": server.uri(), "poll_timeout": 1,
+                "inbound_policy": {"mode": "open"},
+            }))
+            .await
+            .unwrap();
+        let zone_dir = unique_zone_dir("native-aggregate-ack-replay");
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        write_json_file_atomic(
+            &cursor_path,
+            &TelegramPollingCursorState {
+                version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+                bot_id: Some(TEST_BOT_ID.into()),
+                offset: Some(1000),
+                last_poll_count: 0,
+                updated_at: current_unix_timestamp_secs(),
+            },
+        )
+        .unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0", "zone": "z:work", "zone_dir": zone_dir,
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32], "capabilities_requested": ["telegram.read"],
+            }))
+            .await
+            .unwrap();
+        let request = json!({
+            "type": "subscribe", "id": "aggregate", "stream_id": "aggregate-stream",
+            "topics": ["telegram.update"], "window_size": 1,
+            "capability_token": generate_valid_token(&signing_key, "telegram.subscribe", &connector.instance_id()),
+        });
+
+        for attempt in 0..2 {
+            let response = connector.handle_subscribe(request.clone()).await.unwrap();
+            assert_eq!(
+                response["result"]["confirmed_topics"],
+                json!(["telegram.update"])
+            );
+            for (index, update) in updates.iter().enumerate() {
+                let frame_index = attempt * updates.len() + index;
+                fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+                    while transport.frames.lock().unwrap().len() <= frame_index {
+                        fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("every supported update kind must reach the consumer");
+                let frame = transport.frames.lock().unwrap()[frame_index].clone();
+                let event = &frame["params"]["event"];
+                let update: Update = serde_json::from_value(update.clone()).unwrap();
+                let mut source =
+                    update_to_event(&update, &connector.base.id, &connector.instance_id()).unwrap();
+                source.data.zone_id = ZoneId::work();
+                source.data.payload =
+                    json!({"source_topic": source.topic, "event": source.data.payload});
+                assert_eq!(event["topic"], "telegram.update");
+                assert_eq!(event["seq"], source.seq);
+                assert_eq!(event["cursor"], update.update_id.to_string());
+                assert_eq!(event["requires_ack"], true);
+                assert_eq!(event["data"], serde_json::to_value(source.data).unwrap());
+                assert_eq!(
+                    read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                        .unwrap()
+                        .unwrap()
+                        .offset,
+                    Some(1000)
+                );
+                assert_eq!(
+                    server
+                        .requests()
+                        .iter()
+                        .filter(|request| request.path == token_path("getUpdates"))
+                        .count(),
+                    attempt + 1
+                );
+                if attempt == 0 && index == updates.len() - 1 {
+                    // A callback cannot disappear behind ACKs for the four
+                    // message kinds sharing the same provider checkpoint.
+                    transport.stream.close();
+                    fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+                        while !connector.poll_task.as_ref().unwrap().is_finished() {
+                            fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    transport
+                        .stream
+                        .acknowledge(json!({
+                            "stream_id": "aggregate-stream",
+                            "ack": EventAck::new("telegram.update", vec![source.seq])
+                                .with_cursors(vec![update.update_id.to_string()]),
+                        }))
+                        .unwrap();
+                }
+            }
+        }
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                .unwrap()
+                .unwrap()
+                .offset
+                != Some(1005)
+            {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all five ACKs must durably advance the provider checkpoint");
         connector.handle_shutdown(json!({})).await.unwrap();
     }
 
@@ -7696,8 +7912,9 @@ mod tests {
         let result = connector.handle_introspect().await.unwrap();
         let events = result["events"].as_array().unwrap();
 
-        assert_eq!(events.len(), 5, "Expected 5 events");
+        assert_eq!(events.len(), 6, "Expected 6 events");
         let topics: Vec<&str> = events.iter().filter_map(|e| e["topic"].as_str()).collect();
+        assert!(topics.contains(&"telegram.update"));
         assert!(topics.contains(&"telegram.message.new"));
         assert!(topics.contains(&"telegram.message.edited"));
         assert!(topics.contains(&"telegram.callback_query"));

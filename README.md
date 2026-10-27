@@ -968,7 +968,7 @@ are rejected by these routes.
 For Telegram, prepare the actual instance through the protected
 `POST /rpc/admin/connectors/{connector_id}/session` route, then have the trusted
 issuer sign `telegram.read` / `telegram.subscribe` for that instance and a resource
-such as `telegram:events:telegram.message.new`. The signing library supports
+such as `telegram:events:telegram.update` for the complete supported feed. The signing library supports
 `CapabilityTokenBuilder::target_instance`; the host library's
 `issue_capability_token` also accepts `CapabilityIssuanceRequest.instance_id`.
 The HTTP host only needs the verification key. An open body looks like:
@@ -979,7 +979,7 @@ The HTTP host only needs the verification key. An open body looks like:
     "request_id": "consumer-subscription-001",
     "connector_id": "fcp.telegram",
     "zone_id": "z:work",
-    "topic": "telegram.message.new",
+    "topic": "telegram.update",
     "capability_token": "<base64 signed COSE token>"
   },
   "window_size": 1
@@ -995,7 +995,7 @@ delivery, send the same `auth` and `stream_id` to `/ack` with:
 {
   "ack": {
     "type": "ack",
-    "topic": "telegram.message.new",
+    "topic": "telegram.update",
     "seqs": [12345],
     "cursors": ["12345"]
   }
@@ -1015,8 +1015,14 @@ configuration selects `polling` (default) or `webhook`; webhook mode requires a
 configured secret and does not start `getUpdates`. The producer currently uses
 one credit, even if a larger window is negotiated. An unacknowledged delivery
 times out after 60 seconds without advancing the checkpoint; reopen the same
-stream to recover after the poller drains. Each stream selects one exact topic;
-other provider update topics are filtered deliberately.
+stream to recover after the poller drains. Each stream selects one exact topic.
+The aggregate `telegram.update` topic includes all five supported update kinds:
+new and edited messages, new and edited channel posts, and callback queries.
+Its payload retains the original topic in `source_topic` and the normalized
+payload in `event`. It requires its own exact resource grant; a capability for
+`telegram.message.new` cannot open the aggregate feed. The five narrow topics
+remain available and deliberately filter other update kinds. Provider-side
+`allowed_updates` configuration and inbound policy still apply.
 
 This provides local durable custody and at-least-once consumer delivery. Consumers
 must make their own processing idempotent across a crash between side effects and

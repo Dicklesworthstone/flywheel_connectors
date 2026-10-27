@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:9b1303577a96da88569e671a4c1cd92c2f072226226babd95a1f7463508cbcc7"
+interface_hash = "blake3-256:fcp.interface.v2:7c0e4da3553e48d30c16a72778598bce3712ea793920992486eb44ea5889d9d0"
 
 [connector]
 id = "fcp.telegram"
@@ -766,6 +766,33 @@ common_mistakes = [
 ]
 
 # --- Events ---
+
+[provides.events."telegram.update"]
+description = "Acknowledged feed of all supported message, channel-post, and callback updates"
+streaming = true
+replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.update"
+
+[provides.events."telegram.update".schema]
+type = "object"
+additionalProperties = false
+required = ["source_topic", "event"]
+
+[provides.events."telegram.update".schema.properties.source_topic]
+type = "string"
+enum = [
+    "telegram.message.new",
+    "telegram.message.edited",
+    "telegram.channel_post.new",
+    "telegram.channel_post.edited",
+    "telegram.callback_query",
+]
+
+[provides.events."telegram.update".schema.properties.event]
+type = "object"
 
 [provides.events."telegram.message.new"]
 description = "New message received"

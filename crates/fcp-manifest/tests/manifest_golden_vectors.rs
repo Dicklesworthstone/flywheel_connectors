@@ -4077,7 +4077,37 @@ fn telegram_manifest_parses_as_valid_toml_with_expected_structure() {
     );
     let validated = ConnectorManifest::parse_str(&raw)
         .expect("Telegram manifest must carry its actual interface hash");
-    assert_eq!(validated.provides.events.len(), 5);
+    assert_eq!(
+        validated
+            .provides
+            .events
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "telegram.callback_query",
+            "telegram.channel_post.edited",
+            "telegram.channel_post.new",
+            "telegram.message.edited",
+            "telegram.message.new",
+            "telegram.update",
+        ]
+    );
+    let aggregate_schema = validated.provides.events["telegram.update"]
+        .schema
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        aggregate_schema["required"],
+        serde_json::json!(["source_topic", "event"])
+    );
+    assert_eq!(
+        aggregate_schema["properties"]["source_topic"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
     for (topic, event) in &validated.provides.events {
         assert!(event.requires_ack);
         assert_eq!(event.capability.as_deref(), Some("telegram.read"));

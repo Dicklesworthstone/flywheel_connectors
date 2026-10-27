@@ -353,10 +353,19 @@ fn generate_token_for_capability(
     cap: &str,
     op: &str,
 ) -> fcp_core::CapabilityToken {
+    generate_token_for_resource(signing_key, cap, op, "*")
+}
+
+fn generate_token_for_resource(
+    signing_key: &Ed25519SigningKey,
+    cap: &str,
+    op: &str,
+    resource: &str,
+) -> fcp_core::CapabilityToken {
     let now = Utc::now();
     // C3.4: tokens MUST include constraints (default-deny)
     let constraints = CapabilityConstraints {
-        resource_allow: vec!["*".into()],
+        resource_allow: vec![resource.into()],
         ..Default::default()
     };
     let mut cbor = Vec::new();
@@ -3534,6 +3543,49 @@ async fn subscribe_returns_only_an_authorized_exact_topic() {
     connector.handle_shutdown(json!({})).await.unwrap();
 }
 
+#[fcp_async_core::test]
+async fn aggregate_subscribe_requires_its_own_resource_grant() {
+    let _ctx = AsyncTestContext::for_scenario("telegram.lifecycle.aggregate_scope");
+    let mut connector = TelegramConnector::new();
+    let stream = fcp_sdk::prelude::JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(
+        std::io::sink(),
+    ));
+    connector.attach_event_stream(stream.clone()).unwrap();
+    let (mock_server, signing_key) = full_setup(&mut connector, &["telegram.subscribe"]).await;
+    let mut request = json!({
+        "type": "subscribe", "id": "aggregate", "stream_id": "integration-aggregate",
+        "topics": ["telegram.update"], "window_size": 1,
+        "capability_token": generate_token_for_resource(
+            &signing_key, "telegram.read", "telegram.subscribe", "telegram:events:telegram.message.new"
+        ),
+    });
+    assert!(connector.handle_subscribe(request.clone()).await.is_err());
+    assert!(!stream.is_open());
+    assert!(
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| { request.url.path() != token_path("getUpdates") })
+    );
+
+    request["capability_token"] = serde_json::to_value(generate_token_for_resource(
+        &signing_key,
+        "telegram.read",
+        "telegram.subscribe",
+        "telegram:events:telegram.update",
+    ))
+    .unwrap();
+    let response = connector.handle_subscribe(request).await.unwrap();
+    assert_eq!(
+        response["result"]["confirmed_topics"],
+        json!(["telegram.update"])
+    );
+    assert_eq!(response["result"]["replay_supported"], false);
+    connector.handle_shutdown(json!({})).await.unwrap();
+}
+
 // ============================================================================
 // Introspect edge case: verify schema fields
 // ============================================================================
@@ -3569,10 +3621,18 @@ async fn introspect_operations_have_schemas() {
     // Verify events are listed
     let events = result["events"].as_array().expect("events array");
     assert!(
-        events.len() >= 5,
-        "Expected at least 5 event types, got {}",
+        events.len() == 6,
+        "Expected 6 event types, got {}",
         events.len()
     );
+    let aggregate = events
+        .iter()
+        .find(|event| event["topic"] == "telegram.update")
+        .unwrap();
+    assert_eq!(aggregate["requires_ack"], true);
+    let manifest = parsed_manifest();
+    let schema = &manifest["provides"]["events"]["telegram.update"]["schema"];
+    assert_eq!(aggregate["schema"], serde_json::to_value(schema).unwrap());
 }
 
 #[fcp_async_core::test]

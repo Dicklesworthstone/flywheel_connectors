@@ -100,30 +100,46 @@ Input and event handling:
 - Polling persists `telegram_poll_cursor.json` and `telegram_poll_lease.json` under `zone_dir`.
 - Polling uses a singleton-writer lease so a second live instance with the same zone state cannot poll concurrently.
 - Webhook ingestion uses a bounded in-memory duplicate cache keyed by Telegram `update_id`.
-- Event topics are `telegram.message.new`, `telegram.message.edited`, `telegram.channel_post.new`, `telegram.channel_post.edited`, and `telegram.callback_query`.
+- `telegram.update` delivers all five supported update kinds in one acknowledged feed. Individual topics remain available as `telegram.message.new`, `telegram.message.edited`, `telegram.channel_post.new`, `telegram.channel_post.edited`, and `telegram.callback_query`.
 
 ## Native Consumer Delivery
 
 The native executable continuously emits bounded event notifications on stdout while its independent input reader handles `ack` and `stream_close` controls. Ordinary RPC responses and event notifications share one complete-frame writer. A webhook invocation can therefore wait for a downstream acknowledgement without preventing the host from sending that acknowledgement.
 
-A native `subscribe` request carries the normal `SubscribeRequest` fields plus a host-issued `stream_id`:
+A native `subscribe` request carries the normal `SubscribeRequest` fields plus a host-issued `stream_id`. Use `telegram.update` to receive every supported kind sharing the bot's provider cursor:
 
 ```json
 {
   "type": "subscribe",
   "id": "subscribe-request-1",
   "stream_id": "host-issued-stream-id",
-  "topics": ["telegram.message.new"],
+  "topics": ["telegram.update"],
   "window_size": 1,
   "capability_token": "<serialized capability token>"
 }
 ```
 
-The token must bind the current connector instance and handshake zone, grant `telegram.read` and the control operation `telegram.subscribe`, and authorize the exact resource `telegram:events:telegram.message.new`. The connector verifies that authority when opening the stream and again before every delivery. While waiting for an ACK it also rechecks authority and renews the polling lease. Wildcards, unknown topics, multiple topics, replay cursors, unsupported batching/rate options, and windows outside `1..=64` are rejected. The sender conservatively uses one outstanding event even when the caller offers a larger window.
+The token must bind the current connector instance and handshake zone, grant `telegram.read` and the control operation `telegram.subscribe`, and authorize the resource `telegram:events:telegram.update`. A grant limited to an individual topic, such as `telegram:events:telegram.message.new`, cannot open the aggregate feed. The connector verifies that authority when opening the stream and again before every delivery. While waiting for an ACK it also rechecks authority and renews the polling lease. Topic wildcards, unknown topics, multiple topics, replay cursors, unsupported batching/rate options, and windows outside `1..=64` are rejected. The sender conservatively uses one outstanding event even when the caller offers a larger window.
+
+An aggregate event has outer topic `telegram.update` and this payload shape:
+
+```json
+{
+  "source_topic": "telegram.callback_query",
+  "event": {
+    "id": "callback-123",
+    "from": { "id": 7, "is_bot": false, "first_name": "Example" },
+    "data": "button-pressed",
+    "chat_instance": "chat-instance"
+  }
+}
+```
+
+`event` contains the unchanged normalized payload of the source topic. The envelope retains its principal, trust, resource URIs, thread information, and correlation metadata. `source_topic` is one of the five individual topics listed above. Messages, edits, channel posts, and callback queries all consume the same stream's acknowledgement credit, so a callback cannot be skipped when a message is acknowledged. This feed covers the update kinds currently implemented by the connector; it does not enable unimplemented Telegram update kinds.
 
 Notifications have the shape `{"jsonrpc":"2.0","method":"event","params":{"stream_id":"…","event":{…}}}` with no RPC ID. Each event contains the handshake zone, `requires_ack: true`, and the Telegram `update_id` as both its sequence and decimal cursor. The complete notification, including its newline, is limited to 256 KiB. A matching no-ID `ack` control identifies the stream, exact topic, sequence, and cursor. Merely reading stdout or polling the host's consumer endpoint does not acknowledge an update.
 
-For polling, a batch reaches cursor persistence only after all selected events have received the host's durable consumer ACK. The connector then synchronizes the cursor file before issuing the next `getUpdates` request with a later offset. Inbound-policy denials and events outside the selected exact topic are intentionally filtered. A failed handoff, closed stream, expired authority, oversized event, or 60-second ACK timeout leaves the provider checkpoint at the previous replay-safe position. Closing the stream or shutting down the process releases pending waits as failures. A later authorized subscription can reopen the same stream and resume from the durable cursor; replays are deduplicated by the host using the stable event cursor.
+For polling, a batch reaches cursor persistence only after all selected events have received the host's durable consumer ACK. The connector then synchronizes the cursor file before issuing the next `getUpdates` request with a later offset. Inbound-policy denials remain filtered. Subscribing to an individual topic intentionally filters other kinds before advancing the shared provider cursor; use `telegram.update` when those kinds must also be delivered. Switching to the aggregate later cannot recover updates already consumed under a narrower subscription. A failed handoff, closed stream, expired authority, oversized event, or 60-second ACK timeout leaves the provider checkpoint at the previous replay-safe position. Closing the stream or shutting down the process releases pending waits as failures. A later authorized subscription can reopen the same stream and resume from the durable cursor; replays are deduplicated by the host using the stable event cursor and unchanged aggregate payload.
 
 For webhooks, use `receive_mode: "webhook"`. The ingest operation returns an accepted delivery only after the consumer ACK and records the update in its bounded local deduplication cache at that point. A failed delivery remains retryable. The host retains durable pending events and acknowledgement records across its restart; the connector's local webhook cache remains in memory. A retry may therefore cross the native pipe again, with the host suppressing already acknowledged cursor identities. This is at-least-once delivery: consumer side effects need their own durable deduplication when a consumer crashes after applying an effect but before acknowledging it.
 
@@ -245,7 +261,7 @@ The current implementation does not include:
 - Message edit/delete/pin operations
 - Downloading file bytes
 - Uploading local files by multipart form data
-- Event replay or explicit event acknowledgement
+- Arbitrary historical event replay
 - Local Bot API server production mode
 - Approval-token enforcement for send operations
 
