@@ -11,13 +11,14 @@ use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use serde_json::Value;
 use tracing::{debug, instrument};
+use url::Url;
 
 use crate::{
     error::{SlackError, SlackResult},
     types::{
-        AuthTestData, AuthTestInfo, ChannelListData, FileUploadData, HistoryData, Message,
-        PostMessageData, SearchData, SlackApiResponse, SocketModeOpenData, TopicSetData,
-        UserInfoData,
+        AuthTestData, AuthTestInfo, ChannelListData, CompleteUploadData, ExternalUploadData,
+        FileUploadData, HistoryData, Message, PostMessageData, SearchData, SlackApiResponse,
+        SocketModeOpenData, TopicSetData, UserInfoData,
     },
 };
 
@@ -25,6 +26,9 @@ use crate::{
 const DEFAULT_BASE_URL: &str = "https://slack.com/api";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const FCP_CREDENTIAL_ID_HEADER: &str = "X-FCP-Credential-ID";
+const MAX_API_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 content accepted by the buffered file-upload operation.
+pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Authentication mode for Slack Web API calls.
 #[derive(Clone)]
@@ -64,6 +68,7 @@ impl SlackAuth {
 /// Slack Web API client with retry logic and rate limit awareness.
 pub struct SlackClient {
     client: HttpClient,
+    upload_client: HttpClient,
     auth: SlackAuth,
     base_url: String,
     runtime: ConnectorRuntime,
@@ -95,6 +100,13 @@ impl SlackClient {
         Ok(Self {
             client: HttpClientBuilder::new()
                 .user_agent("fcp-slack/0.1.0")
+                .build(),
+            upload_client: HttpClientBuilder::new()
+                .user_agent("fcp-slack/0.1.0")
+                .no_redirects()
+                .no_cookie_store()
+                .no_retries()
+                .max_body_size(MAX_API_RESPONSE_BYTES)
                 .build(),
             auth,
             base_url: DEFAULT_BASE_URL.into(),
@@ -394,7 +406,12 @@ impl SlackClient {
 
     // ── File operations ──────────────────────────────────────────
 
-    /// Upload a file to channels.
+    /// Upload a file through Slack's external-upload protocol.
+    ///
+    /// Only the reservation and completion calls receive API credentials. The
+    /// returned upload capability receives the exact UTF-8 content bytes and no
+    /// authorization or credential-reference header. Completion failures that
+    /// may have committed the file are surfaced as non-retryable uncertainty.
     #[instrument(skip(self, content))]
     pub async fn upload_file(
         &self,
@@ -403,17 +420,114 @@ impl SlackClient {
         filename: Option<&str>,
         thread_ts: Option<&str>,
     ) -> SlackResult<crate::types::SlackFile> {
-        let mut body = serde_json::json!({
-            "channels": channels,
-            "content": content,
-            "filename": filename.unwrap_or("upload.txt"),
-        });
-        if let Some(thread_ts) = thread_ts {
-            body["thread_ts"] = serde_json::Value::String(thread_ts.to_string());
+        validate_upload_input(channels, content, filename, thread_ts)?;
+        let filename = filename.unwrap_or("upload.txt");
+        let reservation: SlackApiResponse<ExternalUploadData> = self
+            .post_json(
+                "files.getUploadURLExternal",
+                &serde_json::json!({
+                    "filename": filename,
+                    "length": content.len(),
+                }),
+            )
+            .await?;
+        Self::check_response(&reservation)?;
+        let reservation = Self::expect_data(reservation.data, "files.getUploadURLExternal")?;
+        if !valid_file_id(&reservation.file_id) {
+            return Err(SlackError::Api {
+                error: "files.getUploadURLExternal returned an invalid file ID".into(),
+                code: None,
+                ok: true,
+            });
         }
-        let resp: SlackApiResponse<FileUploadData> = self.post_json("files.upload", &body).await?;
-        Self::check_response(&resp)?;
-        Ok(Self::expect_data(resp.data, "files.upload")?.file)
+        let upload_url = validate_upload_url(&reservation.upload_url, &self.base_url)?;
+        self.send_upload_bytes(&upload_url, content.as_bytes())
+            .await?;
+
+        let normalized_channels = channels.split(',').map(str::trim).collect::<Vec<_>>();
+        let mut completion = serde_json::json!({
+            "files": [{"id": reservation.file_id, "title": filename}],
+        });
+        if normalized_channels.len() == 1 && !normalized_channels[0].starts_with('U') {
+            completion["channel_id"] = serde_json::json!(normalized_channels[0]);
+        } else {
+            completion["channels"] = serde_json::json!(normalized_channels.join(","));
+        }
+        if let Some(thread_ts) = thread_ts {
+            completion["thread_ts"] = serde_json::Value::String(thread_ts.to_string());
+        }
+        let result = self
+            .complete_upload(&completion, &reservation.file_id)
+            .await;
+        result.map_err(|error| match &error {
+            SlackError::Http {
+                reached_service: true,
+                status_code,
+                ..
+            } => SlackError::UploadOutcomeUnknown {
+                file_id: reservation.file_id,
+                status_code: *status_code,
+            },
+            SlackError::Json(_) => SlackError::UploadOutcomeUnknown {
+                file_id: reservation.file_id,
+                status_code: None,
+            },
+            SlackError::Api { ok, .. } if *ok || error.is_retryable() => {
+                SlackError::UploadOutcomeUnknown {
+                    file_id: reservation.file_id,
+                    status_code: None,
+                }
+            }
+            _ => error,
+        })
+    }
+
+    async fn complete_upload(
+        &self,
+        body: &Value,
+        file_id: &str,
+    ) -> SlackResult<crate::types::SlackFile> {
+        let response: SlackApiResponse<CompleteUploadData> =
+            self.post_json("files.completeUploadExternal", body).await?;
+        Self::check_response(&response)?;
+        let mut data = Self::expect_data(response.data, "files.completeUploadExternal")?;
+        if data.files.len() != 1 || data.files[0].id != file_id {
+            return Err(SlackError::UploadOutcomeUnknown {
+                file_id: file_id.to_owned(),
+                status_code: None,
+            });
+        }
+        Ok(data.files.remove(0))
+    }
+
+    async fn send_upload_bytes(&self, upload_url: &Url, bytes: &[u8]) -> SlackResult<()> {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        let cx = fcp_async_core::compatibility_cx();
+        let response = time::timeout(
+            self.request_timeout,
+            self.upload_client.request(
+                &cx,
+                Method::Post,
+                upload_url.as_str(),
+                vec![("Content-Type".into(), "application/octet-stream".into())],
+                bytes.to_vec(),
+            ),
+        )
+        .await
+        // Transport errors may include the capability URL. Never expose them.
+        .map_err(|_| SlackError::http("Slack file transfer timed out or was cancelled"))?
+        .map_err(|_| SlackError::http("Slack file transfer failed before completion"))?;
+        if response.status != 200 {
+            return Err(SlackError::Http {
+                message: "Slack file transfer was refused before completion".into(),
+                status_code: Some(response.status),
+                is_timeout: false,
+                // No completion request has been made, so restarting the
+                // upload cannot duplicate a shared file.
+                reached_service: false,
+            });
+        }
+        Ok(())
     }
 
     /// Download a file by ID (returns the file info with download URL).
@@ -512,6 +626,10 @@ impl SlackClient {
         let ctx = self.runtime.request_context();
         let policy = self.retry_config.to_retry_policy();
         let replay_safe = post_replay_is_safe(method);
+        let client = match method {
+            "files.getUploadURLExternal" | "files.completeUploadExternal" => &self.upload_client,
+            _ => &self.client,
+        };
 
         RetryLoop::execute(&ctx, &policy, |attempt| {
             let url = &url;
@@ -521,7 +639,10 @@ impl SlackClient {
                     Ok(b) => b,
                     Err(e) => return AttemptOutcome::Terminal(SlackError::Json(e)),
                 };
-                match self.send_request(Method::Post, url, body_bytes).await {
+                match self
+                    .send_request_with_client(client, Method::Post, url, body_bytes)
+                    .await
+                {
                     Ok(resp) => {
                         // A 429 was refused WITHOUT being performed, so it
                         // stays retryable regardless of `replay_safe`.
@@ -532,6 +653,19 @@ impl SlackClient {
                                 },
                                 retry_after: retry_result,
                             };
+                        }
+                        if !(200..300).contains(&resp.status) {
+                            let error = SlackError::Http {
+                                message: format!("Slack API returned HTTP {}", resp.status),
+                                status_code: Some(resp.status),
+                                is_timeout: false,
+                                reached_service: true,
+                            };
+                            return AttemptOutcome::retryable_if_replayable(
+                                error,
+                                None,
+                                replay_safe && resp.status >= 500,
+                            );
                         }
                         match resp.json::<T>() {
                             Ok(data) => AttemptOutcome::Success(data),
@@ -606,6 +740,17 @@ impl SlackClient {
         url: &str,
         body: Vec<u8>,
     ) -> SlackResult<HttpResponse> {
+        self.send_request_with_client(&self.client, method, url, body)
+            .await
+    }
+
+    async fn send_request_with_client(
+        &self,
+        client: &HttpClient,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+    ) -> SlackResult<HttpResponse> {
         let mut headers = vec![("Accept".to_string(), JSON_CONTENT_TYPE.to_string())];
         match &self.auth {
             SlackAuth::Token(token) => {
@@ -628,7 +773,7 @@ impl SlackClient {
         let cx = fcp_async_core::compatibility_cx();
         match time::timeout(
             self.request_timeout,
-            self.client.request(&cx, method, url, headers, body),
+            client.request(&cx, method, url, headers, body),
         )
         .await
         {
@@ -637,6 +782,114 @@ impl SlackClient {
             Err(error) => Err(SlackError::from_async_error(error, self.request_timeout)),
         }
     }
+}
+
+/// Validate buffered upload arguments before reservation or channel coordination.
+pub(crate) fn validate_upload_input(
+    channels: &str,
+    content: &str,
+    filename: Option<&str>,
+    thread_ts: Option<&str>,
+) -> SlackResult<()> {
+    let invalid = |message: &str| SlackError::InvalidUpload {
+        message: message.into(),
+    };
+    if content.len() > MAX_UPLOAD_BYTES {
+        return Err(invalid(
+            "resolved_content exceeds the 16 MiB UTF-8 upload limit",
+        ));
+    }
+    let channel_ids = channels.split(',').map(str::trim).collect::<Vec<_>>();
+    if channel_ids.len() > 100
+        || channel_ids.iter().any(|channel| {
+            channel.len() < 2
+                || channel.len() > 64
+                || !matches!(channel.as_bytes()[0], b'C' | b'D' | b'G' | b'U')
+                || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+    {
+        return Err(invalid(
+            "channels must contain 1 to 100 comma-separated Slack channel or user IDs",
+        ));
+    }
+    if thread_ts.is_some() && channel_ids.len() != 1 {
+        return Err(invalid(
+            "slack.upload_file thread_ts requires exactly one channel",
+        ));
+    }
+    if thread_ts.is_some() && channel_ids[0].starts_with('U') {
+        return Err(invalid(
+            "thread_ts requires a channel or conversation ID with a C, D, or G prefix",
+        ));
+    }
+    if let Some(thread_ts) = thread_ts {
+        let valid = thread_ts
+            .split_once('.')
+            .is_some_and(|(seconds, fraction)| {
+                !seconds.is_empty()
+                    && !fraction.is_empty()
+                    && seconds.bytes().all(|byte| byte.is_ascii_digit())
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        if !valid {
+            return Err(invalid(
+                "thread_ts must be a Slack timestamp formatted as digits.digits",
+            ));
+        }
+    }
+    if let Some(filename) = filename
+        && (filename.trim().is_empty()
+            || filename.len() > 255
+            || filename.chars().any(char::is_control))
+    {
+        return Err(invalid(
+            "filename must be nonempty, at most 255 bytes, and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_file_id(file_id: &str) -> bool {
+    file_id.starts_with('F')
+        && (2..=64).contains(&file_id.len())
+        && file_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn validate_upload_url(raw_url: &str, api_base_url: &str) -> SlackResult<Url> {
+    let invalid = || SlackError::Api {
+        error: "files.getUploadURLExternal returned an untrusted upload URL".into(),
+        code: None,
+        ok: true,
+    };
+    if raw_url.len() > 8192 {
+        return Err(invalid());
+    }
+    let url = Url::parse(raw_url).map_err(|_| invalid())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !url.path().starts_with("/upload/")
+    {
+        return Err(invalid());
+    }
+    let trusted_slack = url.scheme() == "https"
+        && url.host_str() == Some("files.slack.com")
+        && url.port_or_known_default() == Some(443);
+    // Explicit loopback API fixtures may serve their own upload endpoint, but
+    // never authorize a different host/port or a local URL returned by Slack.
+    let fixture_origin = Url::parse(api_base_url).ok().is_some_and(|base| {
+        base.scheme() == "http"
+            && match base.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            }
+            && base.origin() == url.origin()
+    });
+    if !trusted_slack && !fixture_origin {
+        return Err(invalid());
+    }
+    Ok(url)
 }
 
 /// Whether replaying a POST to this Slack Web API method cannot duplicate a
@@ -667,7 +920,8 @@ fn post_replay_is_safe(method: &str) -> bool {
     )
     // Deliberately absent, because a replay IS observable:
     //   chat.postMessage       — a duplicate message in the channel
-    //   files.upload           — a duplicate file
+    //   files.getUploadURLExternal — creates a new upload reservation
+    //   files.completeUploadExternal — only callable once for that file
     //   conversations.setTopic — Slack posts a `channel_topic` event into the
     //                            channel for each successful call
 }
@@ -681,7 +935,72 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 
 #[cfg(test)]
 mod tests {
-    use super::post_replay_is_safe;
+    use super::{
+        MAX_UPLOAD_BYTES, post_replay_is_safe, validate_upload_input, validate_upload_url,
+    };
+
+    #[test]
+    fn upload_urls_require_slack_https_without_credentials_or_redirect_targets() {
+        assert!(
+            validate_upload_url(
+                "https://files.slack.com/upload/v1/opaque?signature=secret",
+                "https://slack.com/api",
+            )
+            .is_ok()
+        );
+        for candidate in [
+            "http://files.slack.com/upload/v1/token",
+            "https://files.slack.com.evil.example/upload/v1/token",
+            "https://evil.example/upload/v1/token",
+            "https://files.slack.com:8443/upload/v1/token",
+            "https://user:secret@files.slack.com/upload/v1/token",
+            "https://files.slack.com/upload/v1/token#secret",
+            "https://files.slack.com/api/auth.test",
+            "http://127.0.0.1:9000/upload/v1/token",
+            "http://169.254.169.254/upload/v1/token",
+            "file:///upload/v1/token",
+        ] {
+            let error = validate_upload_url(candidate, "https://slack.com/api").unwrap_err();
+            assert!(!error.to_string().contains(candidate));
+        }
+    }
+
+    #[test]
+    fn upload_fixture_urls_are_limited_to_the_explicit_api_origin() {
+        let base = "http://127.0.0.1:9000/api";
+        assert!(validate_upload_url("http://127.0.0.1:9000/upload/v1/token", base).is_ok());
+        assert!(validate_upload_url("http://127.0.0.1:9001/upload/v1/token", base).is_err());
+        assert!(validate_upload_url("http://localhost:9000/upload/v1/token", base).is_err());
+        assert!(validate_upload_url("http://127.0.0.2:9000/upload/v1/token", base).is_err());
+    }
+
+    #[test]
+    fn upload_user_destinations_cannot_anchor_a_thread() {
+        assert!(validate_upload_input("U0123", "hello", None, None).is_ok());
+        assert!(validate_upload_input("U0123", "hello", None, Some("123.456")).is_err());
+        for conversation in ["C0123", "D0123", "G0123"] {
+            assert!(validate_upload_input(conversation, "hello", None, Some("123.456")).is_ok());
+        }
+    }
+
+    #[test]
+    fn upload_validation_rejects_invalid_or_unbounded_inputs() {
+        assert!(
+            validate_upload_input("C0123, G4567", "hello 🌍", Some("report.txt"), None).is_ok()
+        );
+        assert!(validate_upload_input("C0123", "", None, Some("123.456")).is_ok());
+        for channels in ["", "  ", ",", "C0123,", "#general", "C0123,invalid"] {
+            assert!(validate_upload_input(channels, "data", None, None).is_err());
+        }
+        assert!(validate_upload_input("C0123,G4567", "data", None, Some("123.456")).is_err());
+        assert!(validate_upload_input("C0123", "data", None, Some("123.bad")).is_err());
+        assert!(validate_upload_input("C0123", "data", Some("bad\r\nname"), None).is_err());
+        assert!(validate_upload_input("C0123", "data", Some("  "), None).is_err());
+        let oversized = "x".repeat(MAX_UPLOAD_BYTES + 1);
+        assert!(validate_upload_input("C0123", &oversized, None, None).is_err());
+        let too_many_channels = vec!["C0123"; 101].join(",");
+        assert!(validate_upload_input(&too_many_channels, "data", None, None).is_err());
+    }
 
     /// br-kxd3e: replaying these cannot duplicate a side effect.
     #[test]
@@ -703,7 +1022,12 @@ mod tests {
     /// would duplicate. Each of these is a real POST call site in this client.
     #[test]
     fn mutating_post_methods_are_not_replayable() {
-        for method in ["chat.postMessage", "files.upload", "conversations.setTopic"] {
+        for method in [
+            "chat.postMessage",
+            "files.getUploadURLExternal",
+            "files.completeUploadExternal",
+            "conversations.setTopic",
+        ] {
             assert!(
                 !post_replay_is_safe(method),
                 "replaying {method} produces a user-visible duplicate"

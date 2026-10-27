@@ -749,10 +749,10 @@ impl SlackConnector {
                         "type": "object",
                         "required": ["channels", "content_object_id", "resolved_content"],
                         "properties": {
-                            "channels": { "type": "string", "description": "Comma-separated channel IDs" },
+                            "channels": { "type": "string", "description": "1 to 100 comma-separated Slack channel or user IDs" },
                             "content_object_id": { "type": "string", "description": "Source mesh object reference (hex ObjectId)" },
-                            "resolved_content": { "type": "string", "description": "Host-materialized content bytes for content_object_id" },
-                            "filename": { "type": "string", "description": "Filename to display" },
+                            "resolved_content": { "type": "string", "description": "Host-materialized UTF-8 content for content_object_id, at most 16 MiB when encoded" },
+                            "filename": { "type": "string", "description": "Filename to display, at most 255 UTF-8 bytes; defaults to upload.txt" },
                             "thread_ts": { "type": "string", "description": "Optional parent thread timestamp for a single-channel threaded upload" }
                         }
                     }),
@@ -1834,6 +1834,8 @@ impl SlackConnector {
         let content = require_str(&input, "resolved_content")?;
         let filename = input.get("filename").and_then(|v| v.as_str());
         let thread_ts = optional_slack_thread_ts(&input, "thread_ts")?;
+        crate::client::validate_upload_input(channels, content, filename, thread_ts)
+            .map_err(|error| error.to_fcp_error())?;
         let coordination = if let Some(thread_ts) = thread_ts {
             let channel = require_single_threaded_upload_channel(channels)?;
             let coordination = self
@@ -3361,12 +3363,17 @@ fn validate_simulate_input(operation: &str, input: &serde_json::Value) -> FcpRes
             require_str(input, "user")?;
         }
         "slack.upload_file" => {
-            require_str(input, "channels")?;
+            let channels = require_str(input, "channels")?;
             require_object_id_str(input, "content_object_id")?;
-            require_str(input, "resolved_content")?;
-            if optional_slack_thread_ts(input, "thread_ts")?.is_some() {
-                require_single_threaded_upload_channel(require_str(input, "channels")?)?;
-            }
+            let content = require_str(input, "resolved_content")?;
+            let thread_ts = optional_slack_thread_ts(input, "thread_ts")?;
+            crate::client::validate_upload_input(
+                channels,
+                content,
+                input.get("filename").and_then(Value::as_str),
+                thread_ts,
+            )
+            .map_err(|error| error.to_fcp_error())?;
         }
         "slack.download_file" => {
             require_str(input, "file_id")?;

@@ -175,6 +175,21 @@ pub struct FileUploadData {
     pub file: SlackFile,
 }
 
+/// Upload reservation returned by `files.getUploadURLExternal`.
+///
+/// The URL is a bearer capability and must never be logged or returned to callers.
+#[derive(Deserialize)]
+pub struct ExternalUploadData {
+    pub upload_url: String,
+    pub file_id: String,
+}
+
+/// Files finalized by `files.completeUploadExternal`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompleteUploadData {
+    pub files: Vec<SlackFile>,
+}
+
 /// Topic set response data.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TopicSetData {

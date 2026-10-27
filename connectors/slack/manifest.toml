@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:465bcd3768e237219ee05f9bfeb616589fd0ba695399a70fdb3c27f85de231ff"
+interface_hash = "blake3-256:fcp.interface.v2:8f5e27c4a82b8cdda0bd53f0df3c6577ddbb765f800c14c20546d37b870657d1"
 
 [connector]
 id = "fcp.slack"
@@ -478,12 +478,18 @@ required = ["channels", "content_object_id", "resolved_content"]
 type = "object"
 [provides.operations."slack.upload_file".input_schema.properties.channels]
 type = "string"
+description = "1 to 100 comma-separated Slack channel or user IDs"
 [provides.operations."slack.upload_file".input_schema.properties.content_object_id]
 type = "string"
 [provides.operations."slack.upload_file".input_schema.properties.resolved_content]
 type = "string"
+description = "Host-materialized UTF-8 content, at most 16 MiB when encoded"
 [provides.operations."slack.upload_file".input_schema.properties.filename]
 type = "string"
+description = "Display filename, at most 255 UTF-8 bytes; defaults to upload.txt"
+[provides.operations."slack.upload_file".input_schema.properties.thread_ts]
+type = "string"
+description = "Optional parent thread timestamp; requires exactly one channel"
 
 [provides.operations."slack.upload_file".output_schema]
 required = ["file", "file_object_id", "source_object_id"]
@@ -510,7 +516,7 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 60000
 max_response_bytes = 1048576
@@ -518,7 +524,7 @@ max_response_bytes = 1048576
 [provides.operations."slack.upload_file".ai_hints]
 when_to_use = "Upload a file to a Slack channel."
 common_mistakes = ["Using channel name instead of channel ID"]
-examples = ['{"channels": "C01234567", "content": "log output...", "filename": "output.txt"}']
+examples = ['{"channels": "C01234567", "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "resolved_content": "log output...", "filename": "output.txt"}']
 related = ["slack.post_message"]
 
 # ────────────────────────────────────────────────────────────────

@@ -37,6 +37,19 @@ pub enum SlackError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Invalid upload input, rejected before any provider request.
+    #[error("Invalid Slack upload: {message}")]
+    InvalidUpload { message: String },
+
+    /// Slack may have finalized the upload; repeating the operation can duplicate it.
+    #[error(
+        "Slack upload completion outcome is unknown for file {file_id}; inspect this file before resubmitting"
+    )]
+    UploadOutcomeUnknown {
+        file_id: String,
+        status_code: Option<u16>,
+    },
+
     /// Slack API returned an error
     #[error("Slack API error: {error} (code: {code:?})")]
     Api {
@@ -232,6 +245,17 @@ impl SlackError {
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),
+            },
+            Self::InvalidUpload { message } => FcpError::InvalidRequest {
+                code: 1003,
+                message: message.clone(),
+            },
+            Self::UploadOutcomeUnknown { status_code, .. } => FcpError::External {
+                service: "slack".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
             },
         }
     }

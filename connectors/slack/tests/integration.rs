@@ -512,6 +512,48 @@ impl StructuredHttpResponse {
     }
 }
 
+fn external_upload_reservation(
+    request: &StructuredHttpRequest,
+    file_id: &str,
+) -> StructuredHttpResponse {
+    StructuredHttpResponse::json(
+        200,
+        &json!({
+            "ok": true,
+            "file_id": file_id,
+            "upload_url": format!("http://{}/upload/v1/fixture", request.headers["host"]),
+        }),
+    )
+}
+
+async fn mount_external_upload(server: &MockServer, file: serde_json::Value) {
+    Mock::given(method("POST"))
+        .and(path("/files.getUploadURLExternal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "file_id": file["id"],
+            "upload_url": format!("{}/upload/v1/fixture", server.uri()),
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/upload/v1/fixture"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/files.completeUploadExternal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "files": [file],
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
 struct StructuredFakeHttpServer {
     base_url: String,
     requests: Arc<Mutex<Vec<StructuredHttpRequest>>>,
@@ -1717,21 +1759,18 @@ async fn upload_file_happy_path() {
     let _ctx = AsyncTestContext::for_scenario("slack.upload_file.happy_path");
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/files.upload"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true,
-            "file": {
-                "id": "F01234567",
-                "name": "output.log",
-                "title": "output.log",
-                "mimetype": "text/plain",
-                "filetype": "text",
-                "size": 42
-            }
-        })))
-        .mount(&mock_server)
-        .await;
+    mount_external_upload(
+        &mock_server,
+        json!({
+                    "id": "F01234567",
+                    "name": "output.log",
+                    "title": "output.log",
+                    "mimetype": "text/plain",
+                    "filetype": "text",
+                    "size": 42
+        }),
+    )
+    .await;
 
     let mut connector = SlackConnector::new();
     let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
@@ -1763,31 +1802,56 @@ async fn upload_file_happy_path() {
         64,
         "file_object_id should be a hex ObjectId"
     );
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let reservation: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(reservation, json!({"filename": "output.log", "length": 13}));
+    assert_eq!(requests[1].body, b"log data here");
+    assert!(!requests[1].headers.contains_key("authorization"));
+    assert!(!requests[1].headers.contains_key("x-fcp-credential-id"));
+    let completion: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(
+        completion,
+        json!({
+            "files": [{"id": "F01234567", "title": "output.log"}],
+            "channel_id": "C01234567",
+        })
+    );
 }
 
 #[fcp_async_core::runtime::test]
 async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
     let _ctx = AsyncTestContext::for_scenario("slack.upload_file.coordination.deny_duplicate");
-    let fake_server = StructuredFakeHttpServer::spawn(1, |_idx, request| {
+    let fake_server = StructuredFakeHttpServer::spawn(3, |idx, request| {
         assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/files.upload");
+        if idx == 0 {
+            assert_eq!(request.path, "/files.getUploadURLExternal");
+            return external_upload_reservation(request, "F01234567");
+        }
+        if idx == 1 {
+            assert_eq!(request.path, "/upload/v1/fixture");
+            assert_eq!(request.body, b"agent A upload");
+            assert!(!request.headers.contains_key("authorization"));
+            return StructuredHttpResponse::json(200, &json!({}));
+        }
+        assert_eq!(request.path, "/files.completeUploadExternal");
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("slack upload body json");
-        assert_eq!(body["channels"], "C01234567");
+        assert_eq!(body["channel_id"], "C01234567");
         assert_eq!(body["thread_ts"], "1234567890.123456");
-        assert_eq!(body["content"], "agent A upload");
+        assert_eq!(body["files"][0]["id"], "F01234567");
         StructuredHttpResponse::json(
             200,
             &json!({
                 "ok": true,
-                "file": {
+                "files": [{
                     "id": "F01234567",
                     "name": "output.log",
                     "title": "output.log",
                     "mimetype": "text/plain",
                     "filetype": "text",
                     "size": 42
-                }
+                }]
             }),
         )
     });
@@ -1853,7 +1917,7 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
             ref message
         } if message == "thread_owned_by_peer:agent:a"
     ));
-    assert_eq!(fake_server.requests().len(), 1);
+    assert_eq!(fake_server.requests().len(), 3);
 }
 
 #[fcp_async_core::runtime::test]
@@ -1895,14 +1959,22 @@ async fn upload_file_rejects_invalid_thread_ts_before_coordination_or_http() {
 #[fcp_async_core::runtime::test]
 async fn upload_file_slack_api_failure_returns_no_coordination_success() {
     let _ctx = AsyncTestContext::for_scenario("slack.upload_file.coordination.slack_failure");
-    let fake_server = StructuredFakeHttpServer::spawn(1, |_idx, request| {
+    let fake_server = StructuredFakeHttpServer::spawn(3, |idx, request| {
         assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/files.upload");
+        if idx == 0 {
+            assert_eq!(request.path, "/files.getUploadURLExternal");
+            return external_upload_reservation(request, "F01234567");
+        }
+        if idx == 1 {
+            assert_eq!(request.path, "/upload/v1/fixture");
+            assert_eq!(request.body, b"will fail");
+            return StructuredHttpResponse::json(200, &json!({}));
+        }
+        assert_eq!(request.path, "/files.completeUploadExternal");
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("slack upload body json");
-        assert_eq!(body["channels"], "C01234567");
+        assert_eq!(body["channel_id"], "C01234567");
         assert_eq!(body["thread_ts"], "1234567890.123456");
-        assert_eq!(body["content"], "will fail");
         StructuredHttpResponse::json(
             200,
             &json!({
@@ -1939,7 +2011,235 @@ async fn upload_file_slack_api_failure_returns_no_coordination_success() {
         .expect_err("Slack API failure should not return send_executed evidence");
 
     assert!(matches!(error, fcp_core::FcpError::ResourceNotFound { .. }));
-    assert_eq!(fake_server.requests().len(), 1);
+    assert_eq!(fake_server.requests().len(), 3);
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_sends_utf8_bytes_without_token_or_credential_reference() {
+    use fcp_slack::client::SlackAuth;
+    for auth in [
+        SlackAuth::Token("xoxb-upload-secret".into()),
+        SlackAuth::CredentialId(fcp_core::CredentialId::new()),
+    ] {
+        let server = StructuredFakeHttpServer::spawn(3, |idx, request| match idx {
+            0 => {
+                assert_eq!(request.path, "/files.getUploadURLExternal");
+                assert!(
+                    request.headers.contains_key("authorization")
+                        || request.headers.contains_key("x-fcp-credential-id")
+                );
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["length"], "hello 🌍\n".len());
+                assert_eq!(body["filename"], "upload.txt");
+                external_upload_reservation(request, "FUPLOAD1")
+            }
+            1 => {
+                assert_eq!(request.path, "/upload/v1/fixture");
+                assert_eq!(request.body, "hello 🌍\n".as_bytes());
+                assert_eq!(request.headers["content-type"], "application/octet-stream");
+                assert!(!request.headers.contains_key("authorization"));
+                assert!(!request.headers.contains_key("x-fcp-credential-id"));
+                StructuredHttpResponse::json(200, &json!({}))
+            }
+            _ => {
+                assert_eq!(request.path, "/files.completeUploadExternal");
+                assert!(
+                    request.headers.contains_key("authorization")
+                        || request.headers.contains_key("x-fcp-credential-id")
+                );
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["channels"], "C0123,G4567");
+                assert!(body.get("channel_id").is_none());
+                assert_eq!(body["files"][0]["id"], "FUPLOAD1");
+                StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true, "files": [{"id": "FUPLOAD1", "title": "upload.txt"}],
+                    }),
+                )
+            }
+        });
+        let client = SlackClient::new_with_auth(auth)
+            .unwrap()
+            .with_base_url(server.url());
+        let file = client
+            .upload_file(" C0123, G4567 ", "hello 🌍\n", None, None)
+            .await
+            .unwrap();
+        assert_eq!(file.id, "FUPLOAD1");
+        assert_eq!(server.requests().len(), 3);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_single_user_uses_the_user_capable_channels_field() {
+    let server = MockServer::start().await;
+    mount_external_upload(&server, json!({"id": "FUPLOAD1"})).await;
+    let client = SlackClient::new("token")
+        .unwrap()
+        .with_base_url(server.uri());
+    let file = client
+        .upload_file("U0123", "hello", None, None)
+        .await
+        .unwrap();
+    assert_eq!(file.id, "FUPLOAD1");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let completion: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(completion["channels"], "U0123");
+    assert!(completion.get("channel_id").is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn upload_response_limit_does_not_reduce_channel_history_capacity() {
+    let message_size = 1024 * 1024 + 1;
+    let server = StructuredFakeHttpServer::spawn(1, move |_idx, request| {
+        assert!(request.path.starts_with("/conversations.history?"));
+        StructuredHttpResponse::json(
+            200,
+            &json!({
+                "ok": true,
+                "messages": [{"ts": "123.456", "text": "x".repeat(message_size)}],
+                "has_more": false,
+            }),
+        )
+    });
+    let client = SlackClient::new("token")
+        .unwrap()
+        .with_base_url(server.url());
+    let messages = client.get_channel_history("C0123", Some(1)).await.unwrap();
+    assert_eq!(messages[0].text.len(), message_size);
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_rejects_untrusted_reservation_before_sending_content() {
+    let server = StructuredFakeHttpServer::spawn(1, |_idx, _request| {
+        StructuredHttpResponse::json(
+            200,
+            &json!({
+                "ok": true, "file_id": "FUPLOAD1",
+                "upload_url": "http://169.254.169.254/upload/v1/secret-capability",
+            }),
+        )
+    });
+    let client = SlackClient::new("token")
+        .unwrap()
+        .with_base_url(server.url());
+    let error = client
+        .upload_file("C0123", "private content", None, None)
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("169.254"));
+    assert!(!error.to_string().contains("secret-capability"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_refuses_redirects_and_failed_transfers_without_finalizing() {
+    for status in [302, 500] {
+        let server = StructuredFakeHttpServer::spawn(2, move |idx, request| {
+            if idx == 0 {
+                return external_upload_reservation(request, "FUPLOAD1");
+            }
+            assert_eq!(request.path, "/upload/v1/fixture");
+            StructuredHttpResponse {
+                status,
+                headers: vec![(
+                    "location".into(),
+                    format!("http://{}/must-not-follow", request.headers["host"]),
+                )],
+                body: b"secret provider response".to_vec(),
+            }
+        });
+        let client = SlackClient::new("token")
+            .unwrap()
+            .with_base_url(server.url());
+        let error = client
+            .upload_file("C0123", "content", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, fcp_slack::error::SlackError::Http { status_code: Some(code), .. } if code == status)
+        );
+        assert!(!error.to_string().contains("secret provider response"));
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_uncertain_completion_is_not_retried_or_reported_as_success() {
+    let completions = [
+        StructuredHttpResponse::json(500, &json!({"ok": false, "error": "internal_error"})),
+        StructuredHttpResponse::json(200, &json!({"ok": false, "error": "internal_error"})),
+        StructuredHttpResponse::json(200, &json!({"ok": true})),
+        StructuredHttpResponse::json(200, &json!({"ok": true, "files": []})),
+        StructuredHttpResponse::json(200, &json!({"ok": true, "files": [{"id": "FWRONG"}]})),
+        StructuredHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: b"not json".to_vec(),
+        },
+    ];
+    for completion in completions {
+        let server = StructuredFakeHttpServer::spawn(3, move |idx, request| match idx {
+            0 => external_upload_reservation(request, "FUPLOAD1"),
+            1 => StructuredHttpResponse::json(200, &json!({})),
+            _ => completion.clone(),
+        });
+        let client = SlackClient::new("token")
+            .unwrap()
+            .with_base_url(server.url())
+            .with_retry_config(3, 1, 1);
+        let error = client
+            .upload_file("C0123", "content", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, fcp_slack::error::SlackError::UploadOutcomeUnknown { file_id, .. } if file_id == "FUPLOAD1")
+        );
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_core::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(!error.is_retryable());
+        assert_eq!(server.requests().len(), 3);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn external_upload_rate_limit_retries_only_completion_with_the_same_file_id() {
+    let server = StructuredFakeHttpServer::spawn(4, |idx, request| match idx {
+        0 => external_upload_reservation(request, "FUPLOAD1"),
+        1 => StructuredHttpResponse::json(200, &json!({})),
+        2 => StructuredHttpResponse {
+            status: 429,
+            headers: vec![("retry-after".into(), "0".into())],
+            body: vec![],
+        },
+        _ => StructuredHttpResponse::json(
+            200,
+            &json!({
+                "ok": true, "files": [{"id": "FUPLOAD1"}],
+            }),
+        ),
+    });
+    let client = SlackClient::new("token")
+        .unwrap()
+        .with_base_url(server.url())
+        .with_retry_config(3, 1, 1);
+    let file = client
+        .upload_file("C0123", "content", None, None)
+        .await
+        .unwrap();
+    assert_eq!(file.id, "FUPLOAD1");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].path, "/files.completeUploadExternal");
+    assert_eq!(requests[3].path, requests[2].path);
+    assert_eq!(requests[3].body, requests[2].body);
 }
 
 #[fcp_async_core::runtime::test]
@@ -2150,21 +2450,18 @@ async fn upload_file_emits_receipt() {
     let _ctx = AsyncTestContext::for_scenario("slack.receipt.upload_file");
     let mock_server = MockServer::start().await;
 
-    Mock::given(method("POST"))
-        .and(path("/files.upload"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true,
-            "file": {
-                "id": "F09876543",
-                "name": "data.csv",
-                "title": "data.csv",
-                "mimetype": "text/csv",
-                "filetype": "csv",
-                "size": 100
-            }
-        })))
-        .mount(&mock_server)
-        .await;
+    mount_external_upload(
+        &mock_server,
+        json!({
+                    "id": "F09876543",
+                    "name": "data.csv",
+                    "title": "data.csv",
+                    "mimetype": "text/csv",
+                    "filetype": "csv",
+                    "size": 100
+        }),
+    )
+    .await;
 
     let mut connector = SlackConnector::new();
     let key = setup_handshake(&mut connector, &["slack.files.write"]).await;

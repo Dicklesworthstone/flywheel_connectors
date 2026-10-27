@@ -78,13 +78,13 @@ This README documents runtime truth and keeps current drift visible:
 - Manifest marks `slack.post_message`, `slack.reply_thread`, `slack.update_progress_draft`, `slack.upload_file`, and `slack.set_channel_topic` as policy-approved operations. Runtime `OperationInfo` sets `requires_approval = None`, and invoke checks no approval token.
 - Doctor/self-check required scopes are only `channels:read`, `channels:history`, `chat:write`, and `users:read`; they do not prove file upload/download, reactions, topic updates, search, or Socket Mode app-token readiness.
 - Runtime `download_file` returns redacted Slack file metadata and a deterministic content object ID, but it does not download or persist file bytes.
-- Runtime `upload_file` sends host-materialized `resolved_content` through legacy `files.upload` JSON handling and redacts returned file URLs.
+- Runtime `upload_file` reserves a file with `files.getUploadURLExternal`, sends the UTF-8 bytes of host-materialized `resolved_content` to the returned upload URL, then finalizes the same file ID with `files.completeUploadExternal`. Returned file URLs remain redacted.
 - Runtime `handle_subscribe()` starts Socket Mode only after client and verifier exist, but subscribe itself does not verify a subscribe capability token.
 - Manifest state model is singleton-writer. Runtime keeps token, Socket Mode state, progress drafts, monitor policy, subscriptions, and verifier/session state in process memory.
 - Manifest rate-limit pools are documented intent; runtime relies on Slack 429 handling and the client retry loop, not connector-local pool enforcement.
 - The dedicated tracked verification script is `scripts/e2e/slack_connector_verification.sh`, which writes loopback and live-smoke JSONL evidence under `/tmp/fcp-slack-e2e/<run-id>/` by default.
 
-A follow-up parity bead should align runtime bound-token capability IDs with manifest capability IDs, add approval-token verification for policy-approved mutations, decide whether shutdown/reconfigure should clear verifier/session state, expand doctor/self-check scope readiness, and document or replace legacy `files.upload`.
+A follow-up parity bead should align runtime bound-token capability IDs with manifest capability IDs, add approval-token verification for policy-approved mutations, decide whether shutdown/reconfigure should clear verifier/session state, and expand doctor/self-check scope readiness.
 
 ## First-Slice Scope
 
@@ -154,10 +154,22 @@ The current Slack README slice documents the existing runtime surface:
 | `slack.list_channels` | `conversations.list` | `slack.list_channels` | `slack.read` | `Safe` | `Low` | `Strict` | optional `types` |
 | `slack.get_user_info` | `users.info` | `slack.get_user_info` | `slack.read` | `Safe` | `Low` | `Strict` | `user` |
 | `slack.handle_events_api` | Host/fcp-webhook verified Events API payload | `slack.read` | `slack.read` | `Safe` | `Medium` | `BestEffort` | `payload`, `signature_result="verified"` |
-| `slack.upload_file` | `files.upload` | `slack.files.write` | `slack.files.write` | `Risky` | `Medium` | `None` | `channels`, `content_object_id`, `resolved_content` |
+| `slack.upload_file` | `files.getUploadURLExternal` → raw upload → `files.completeUploadExternal` | `slack.files.write` | `slack.files.write` | `Risky` | `Medium` | `None` | `channels`, `content_object_id`, `resolved_content` |
 | `slack.download_file` | `files.info` metadata | `slack.files.read` | `slack.files.read` | `Safe` | `Low` | `Strict` | `file_id` |
 | `slack.add_reaction` | `reactions.add` | `slack.add_reaction` | `slack.write` | `Safe` | `Low` | `BestEffort` | `channel`, `timestamp`, `name` |
 | `slack.set_channel_topic` | `conversations.setTopic` | `slack.set_channel_topic` | `slack.write` | `Risky` | `Medium` | `BestEffort` | `channel`, `topic` |
+
+### File Upload Contract
+
+Uploads use Slack's current [external-upload workflow](https://docs.slack.dev/messaging/working-with-files/). Both reservation and completion require a token with `files:write`, supplied either directly or through the host's credential reference. The deprecated `files.upload` endpoint is no longer called.
+
+- `resolved_content` is UTF-8 text with a maximum encoded size of 16 MiB; the reservation length is the byte count, including multi-byte characters. `filename` defaults to `upload.txt` and is limited to 255 UTF-8 bytes without control characters.
+- `channels` accepts 1 to 100 comma-separated channel or user IDs. A single conversation uses `channel_id`; user destinations and multiple destinations use `channels` on completion. A `thread_ts` requires exactly one conversation ID (`C`, `D`, or `G` prefix) and retains the existing thread-ownership check before any upload request.
+- The returned upload URL must use HTTPS on `files.slack.com:443` under `/upload/`, without embedded credentials or a fragment. Explicit loopback API fixtures may return an upload URL on their own exact origin. The upload sends raw bytes without the Slack bearer token or `X-FCP-Credential-ID` header; redirects and cookie persistence are disabled.
+- Each HTTP attempt is bounded by the configured request timeout, and upload response bodies are capped at 1 MiB using a dedicated HTTP client. Other Slack operations retain their existing response capacity. The upload URL and raw transfer-error bodies are never returned to callers.
+- Completion is attempted only after an HTTP 200 transfer response. Slack 429 refusals retry the same completion request and file ID; they do not reserve or upload a second file. A timeout, 5xx, transient Slack error, or malformed/mismatched completion response reports a **non-retryable unknown outcome** containing the file ID for reconciliation. Inspect that file in Slack before manually resubmitting; the connector emits no success receipt for an uncertain completion.
+
+The completion contract follows [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/): finalization can be called only once. This operation does not promise idempotency across independent invocations or process restarts.
 
 ## Explicit Non-Goals
 
