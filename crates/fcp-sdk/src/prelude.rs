@@ -142,7 +142,7 @@ pub use crate::{RetryDecision, RetryPolicy};
 
 /// Shared standalone JSONL framing implementation.
 mod jsonl;
-pub use jsonl::{JsonlConfig, serve_jsonl};
+pub use jsonl::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
 
 /// Instance-bound authority for standalone connector control channels.
 mod standalone;

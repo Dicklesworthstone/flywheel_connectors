@@ -28,6 +28,7 @@ use std::io::{BufRead, Write};
 
 use anyhow::Result;
 use fcp_async_core::runtime::Builder;
+use fcp_sdk::prelude::dispatch_raw_invoke;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_google_drive::connector::DriveConnector;
@@ -90,7 +91,7 @@ async fn handle_message(connector: &mut DriveConnector, message: &str) -> serde_
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
+        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
         "simulate" => connector.handle_simulate(params).await,
         "shutdown" => connector.handle_shutdown(params).await,
         _ => Err(fcp_core::FcpError::InvalidRequest {
@@ -127,5 +128,78 @@ async fn handle_message(connector: &mut DriveConnector, message: &str) -> serde_
             }
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn invoke_requires_an_inner_string_id_before_dispatch() {
+        let mut connector = DriveConnector::new();
+        for inner_id in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(7)),
+            Some(serde_json::json!({"nested": "id"})),
+        ] {
+            let mut params = serde_json::json!({
+                "operation": "drive.list_files",
+                "input": {}
+            });
+            if let Some(inner_id) = inner_id {
+                params["id"] = inner_id;
+            }
+            let response = handle_message(
+                &mut connector,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "transport:invalid",
+                    "method": "invoke",
+                    "params": params
+                })
+                .to_string(),
+            )
+            .await;
+
+            assert_eq!(response["id"], "transport:invalid");
+            assert_eq!(response["error"]["code"], "FCP-1003");
+            assert_eq!(
+                response["error"]["message"],
+                "Invalid request: invoke params.id must be a string"
+            );
+            assert!(response.get("result").is_none());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invoke_preserves_handler_errors_and_the_outer_id() {
+        let mut connector = DriveConnector::new();
+        let params = serde_json::json!({
+            "id": "invocation:error",
+            "operation": "drive.list_files",
+            "input": {}
+        });
+        let expected = connector
+            .handle_invoke(params.clone())
+            .await
+            .expect_err("unconfigured invocation must fail")
+            .to_response();
+        let response = handle_message(
+            &mut connector,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "transport:error",
+                "method": "invoke",
+                "params": params
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(response["id"], "transport:error");
+        assert_eq!(response["error"], serde_json::to_value(expected).unwrap());
+        assert!(response.get("result").is_none());
     }
 }

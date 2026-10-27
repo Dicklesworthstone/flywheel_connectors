@@ -21,7 +21,43 @@ use std::io::{self, BufRead, Read, Write};
 
 use serde_json::{Value, json};
 
-use crate::{FcpError, FcpResult};
+use crate::{FcpError, FcpResult, InvokeResponse, RequestId};
+
+/// Dispatch one raw operation handler and encode its canonical invoke response.
+///
+/// Use this explicitly for handlers returning an operation's output value.
+/// Typed handlers already returning an [`InvokeResponse`] must not use it.
+/// Provider output is always nested as result data, even when it contains keys
+/// such as `type`, `id`, `status`, or `error`.
+///
+/// The inner invocation ID is required before dispatch and is independent of
+/// the outer JSON-RPC correlation ID. Only that identifier is copied;
+/// ownership of the original params, including large inputs, passes to the
+/// handler. The adapter never retries a handler or interprets its output shape.
+///
+/// # Errors
+///
+/// Missing or non-string invocation IDs fail before the handler runs. Handler
+/// errors propagate unchanged: a reported failure can still represent an
+/// uncertain external side effect and must not become a successful RPC result.
+pub async fn dispatch_raw_invoke<F, Fut>(params: Value, invoke: F) -> FcpResult<Value>
+where
+    F: FnOnce(Value) -> Fut,
+    Fut: std::future::Future<Output = FcpResult<Value>>,
+{
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .map(RequestId::new)
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "invoke params.id must be a string".into(),
+        })?;
+    let output = invoke(params).await?;
+    serde_json::to_value(InvokeResponse::ok(id, output)).map_err(|error| FcpError::Internal {
+        message: format!("Failed to serialize invoke response: {error}"),
+    })
+}
 
 /// Resource limits for the standalone JSONL request stream.
 #[derive(Debug, Clone, Copy)]
@@ -204,12 +240,239 @@ mod tests {
 
     use super::*;
 
+    fn run_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("ready test handler unexpectedly yielded"),
+        }
+    }
+
     fn responses(bytes: &[u8]) -> Vec<Value> {
         bytes
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).expect("JSON response"))
             .collect()
+    }
+
+    #[test]
+    fn raw_invoke_preserves_opaque_payloads_and_inner_string_identifiers() {
+        let payloads = [
+            Value::Null,
+            json!(true),
+            json!(42),
+            json!("provider text"),
+            json!([1, {"nested": true}]),
+            json!({"ordinary": "operation output"}),
+            json!({
+                "type": "response",
+                "id": "provider-identifier",
+                "status": "error",
+                "error": {"code": "provider-data"},
+                "result": {"opaque": true},
+            }),
+        ];
+        // RequestId deliberately prescribes no string format. Preserve it
+        // exactly instead of adding transport-specific trimming or length rules.
+        for id in ["operation-42", "", "  opaque/π identifier  "] {
+            for payload in &payloads {
+                let params = json!({
+                    "id": id,
+                    "operation": "test.raw",
+                    "input": {"original": [1, 2, 3]},
+                    "capability_token": "opaque-test-token",
+                });
+                let expected_params = params.clone();
+                let mut calls = 0;
+                let value = run_ready(dispatch_raw_invoke(params, |actual| {
+                    calls += 1;
+                    assert_eq!(actual, expected_params);
+                    std::future::ready(Ok(payload.clone()))
+                }))
+                .unwrap();
+                let response: InvokeResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(calls, 1);
+                assert_eq!(response.r#type, "response");
+                assert_eq!(response.id, RequestId::new(id));
+                assert_eq!(response.status, crate::InvokeStatus::Ok);
+                assert_eq!(response.result.as_ref(), Some(payload));
+                assert!(response.error.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_invoke_rejects_missing_or_non_string_id_before_dispatch() {
+        for params in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"id": null}),
+            json!({"id": 7}),
+            json!({"id": true}),
+            json!({"id": []}),
+            json!({"id": {"private": "must-not-echo"}}),
+        ] {
+            let mut calls = 0;
+            let error = run_ready(dispatch_raw_invoke(params, |_| {
+                calls += 1;
+                std::future::ready(Ok(Value::Null))
+            }))
+            .unwrap_err();
+            assert_eq!(calls, 0);
+            assert!(matches!(error, FcpError::InvalidRequest { code: 1003, .. }));
+            assert!(!error.to_string().contains("must-not-echo"));
+        }
+    }
+
+    #[test]
+    fn raw_invoke_preserves_handler_errors_without_retry_or_envelope_conversion() {
+        for error in [
+            FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "event consumer is unavailable".into(),
+            },
+            FcpError::External {
+                service: "test-mutation".into(),
+                message: "provider outcome is unknown; reconcile before retry".into(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
+        ] {
+            let expected = serde_json::to_value(&error).unwrap();
+            let expected_retryable = error.is_retryable();
+            let mut calls = 0;
+            let actual = run_ready(dispatch_raw_invoke(json!({"id": "operation-7"}), |_| {
+                calls += 1;
+                std::future::ready(Err(error))
+            }))
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(serde_json::to_value(&actual).unwrap(), expected);
+            assert_eq!(actual.is_retryable(), expected_retryable);
+        }
+    }
+
+    #[test]
+    fn jsonl_raw_invoke_keeps_outer_inner_and_provider_identifiers_separate() {
+        let input = [
+            json!({
+                "jsonrpc": "2.0", "id": 91, "method": "invoke",
+                "params": {"id": "operation-7", "operation": "test.raw", "input": null}
+            }),
+            json!({"jsonrpc": "2.0", "id": "health-rpc", "method": "health"}),
+        ]
+        .map(|request| request.to_string())
+        .join("\n");
+        let payload = json!({
+            "id": "provider-id", "type": "response",
+            "status": "error", "result": {"preserve": true},
+        });
+        let mut output = Vec::new();
+        let mut invocation_calls = 0;
+        serve_jsonl(
+            Cursor::new(input.as_bytes()),
+            &mut output,
+            JsonlConfig::default(),
+            |method, params| match method {
+                "invoke" => run_ready(dispatch_raw_invoke(params, |_| {
+                    invocation_calls += 1;
+                    std::future::ready(Ok(payload.clone()))
+                })),
+                "health" => Ok(json!({"status": "healthy"})),
+                _ => panic!("unexpected test method"),
+            },
+        )
+        .unwrap();
+        let replies = responses(&output);
+        assert_eq!(invocation_calls, 1);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["id"], 91);
+        let response: InvokeResponse =
+            serde_json::from_value(replies[0]["result"].clone()).unwrap();
+        assert_eq!(response.id, RequestId::new("operation-7"));
+        assert_eq!(response.status, crate::InvokeStatus::Ok);
+        assert_eq!(response.result, Some(payload));
+        assert_eq!(
+            replies[1],
+            json!({
+                "jsonrpc": "2.0", "id": "health-rpc",
+                "result": {"status": "healthy"},
+            })
+        );
+    }
+
+    #[test]
+    fn jsonl_raw_invoke_keeps_uncertain_handler_failure_as_an_rpc_error() {
+        let input = concat!(
+            "{\"method\":\"invoke\",\"id\":\"outer-1\",\"params\":{\"id\":\"inner-1\"}}\n",
+            "{\"method\":\"health\",\"id\":\"outer-2\"}\n",
+        );
+        let failure = FcpError::External {
+            service: "test-mutation".into(),
+            message: "provider outcome is unknown; do not retry automatically".into(),
+            status_code: None,
+            retryable: false,
+            retry_after: None,
+        };
+        let expected_error = serde_json::to_value(failure.to_response()).unwrap();
+        let mut failure = Some(failure);
+        let mut calls = 0;
+        let mut output = Vec::new();
+        serve_jsonl(
+            Cursor::new(input.as_bytes()),
+            &mut output,
+            JsonlConfig::default(),
+            |method, params| {
+                if method == "health" {
+                    return Ok(json!("healthy"));
+                }
+                run_ready(dispatch_raw_invoke(params, |_| {
+                    calls += 1;
+                    std::future::ready(Err(failure.take().expect("handler must run only once")))
+                }))
+            },
+        )
+        .unwrap();
+        let replies = responses(&output);
+        assert_eq!(calls, 1);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["id"], "outer-1");
+        assert_eq!(replies[0]["error"], expected_error);
+        assert!(replies[0].get("result").is_none());
+        assert_eq!(replies[1]["result"], "healthy");
+    }
+
+    #[test]
+    fn jsonl_raw_invoke_never_replays_after_failed_response_flush() {
+        let first = "{\"method\":\"invoke\",\"id\":1,\"params\":{\"id\":\"operation-1\"}}\n";
+        let input = format!(
+            "{first}{{\"method\":\"invoke\",\"id\":2,\"params\":{{\"id\":\"operation-2\"}}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut writer = RecordingWriter {
+            fail_flush: true,
+            ..RecordingWriter::default()
+        };
+        let mut calls = 0;
+        let error = serve_jsonl(
+            &mut reader,
+            &mut writer,
+            JsonlConfig::default(),
+            |_, params| {
+                run_ready(dispatch_raw_invoke(params, |_| {
+                    calls += 1;
+                    std::future::ready(Ok(json!({"effect": "completed"})))
+                }))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(calls, 1);
+        assert_eq!(reader.position(), first.len() as u64);
     }
 
     #[test]

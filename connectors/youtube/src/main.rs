@@ -100,7 +100,10 @@ async fn handle_message(connector: &mut YouTubeConnector, message: &str) -> serd
         "doctor" => connector.handle_doctor().await,
         "self_check" => connector.handle_self_check().await,
         "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
+        "invoke" => {
+            fcp_sdk::prelude::dispatch_raw_invoke(params, |params| connector.handle_invoke(params))
+                .await
+        }
         "simulate" => connector.handle_simulate(params).await,
         "shutdown" => connector.handle_shutdown(params).await,
         _ => Err(fcp_core::FcpError::InvalidRequest {
@@ -137,5 +140,45 @@ async fn handle_message(connector: &mut YouTubeConnector, message: &str) -> serd
             }
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[fcp_async_core::runtime::test]
+    async fn invoke_requires_an_inner_id_and_preserves_handler_errors() {
+        let mut connector = YouTubeConnector::new();
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"id": null}),
+            serde_json::json!({"id": 7}),
+            serde_json::json!({"id": ["request"]}),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": "transport-7", "method": "invoke", "params": params
+            });
+            let response = handle_message(&mut connector, &request.to_string()).await;
+            assert_eq!(response["id"], "transport-7");
+            assert!(response.get("result").is_none());
+            assert_eq!(response["error"]["code"], "FCP-1003");
+            assert_eq!(
+                response["error"]["message"],
+                "Invalid request: invoke params.id must be a string"
+            );
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "invoke", "params": {"id": "invoke-7"}
+        });
+        let response = handle_message(&mut connector, &request.to_string()).await;
+        assert_eq!(response["id"], 7);
+        assert!(response.get("result").is_none());
+        assert_eq!(response["error"]["code"], "FCP-1003");
+        assert_eq!(
+            response["error"]["message"],
+            "Invalid request: Missing operation"
+        );
     }
 }

@@ -803,7 +803,11 @@ pub struct InvokeResponse {
     pub status: InvokeStatus,
 
     /// Result data (present when status is Ok)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_invoke_result",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<serde_json::Value>,
 
     /// Error details (present when status is Error)
@@ -845,6 +849,17 @@ pub struct InvokeResponse {
     /// Response metadata (timing, cache hints).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_metadata: Option<ResponseMetadata>,
+}
+
+// An explicit JSON null is a valid operation result. Deserialize the value
+// itself so it stays distinct from an absent result field (handled by default).
+fn deserialize_present_invoke_result<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl InvokeResponse {
@@ -2766,6 +2781,44 @@ mod tests {
 
         let mismatched = HolderProof::signable_bytes(&request_id, &operation_id, b"other-jti");
         assert!(verifying_key.verify(&mismatched, &proof_sig).is_err());
+    }
+
+    #[test]
+    fn invoke_response_preserves_explicit_null_result() {
+        let response = InvokeResponse::ok(RequestId::new("req-null"), serde_json::Value::Null);
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded.get("result"), Some(&serde_json::Value::Null));
+        let decoded: InvokeResponse = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.result, Some(serde_json::Value::Null));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn invoke_response_keeps_absent_result_absent() {
+        let response = InvokeResponse::error(RequestId::new("req-error"), FcpError::NotConfigured);
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert!(encoded.get("result").is_none());
+        let decoded: InvokeResponse = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.result.is_none());
+        assert!(matches!(decoded.error, Some(FcpError::NotConfigured)));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn invoke_response_preserves_non_null_json_results() {
+        for result in [
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!("text"),
+            serde_json::json!([null, 7]),
+            serde_json::json!({"id": "provider-id", "result": null}),
+        ] {
+            let response = InvokeResponse::ok(RequestId::new("req-value"), result.clone());
+            let encoded = serde_json::to_value(&response).unwrap();
+            let decoded: InvokeResponse = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(decoded.result, Some(result));
+            assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        }
     }
 
     #[test]
