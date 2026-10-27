@@ -8,6 +8,7 @@
 > **YouTube OAuth upstream**: https://developers.google.com/youtube/v3/guides/authentication
 > **YouTube quota upstream**: https://developers.google.com/youtube/v3/determine_quota_cost
 > **YouTube search upstream**: https://developers.google.com/youtube/v3/docs/search/list
+> **YouTube caption upload upstream**: https://developers.google.com/youtube/v3/docs/captions/insert
 
 ## Purpose
 
@@ -48,7 +49,7 @@ Important runtime truths the contract preserves:
 - Direct API-key mode appends `key` as a query parameter.
 - Shared Google auth mode uses the shared Google executor and may be bearer-token backed or secretless `credential_id` backed.
 - `credential_id` mode performs no local live provider check; `self_check()` degrades with `credential_injection_required` until the host egress proxy injects credentials.
-- Runtime HTTP and request-context timeouts are `30 seconds` for ordinary requests and `600 seconds` for bounded video uploads.
+- Runtime request-context budgets are `30 seconds` for ordinary requests, `120 seconds` for caption uploads, and `600 seconds` for bounded video uploads. Host invocation deadlines can impose a shorter budget.
 - Runtime retry policy uses `max_retries = 2`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 - Runtime handshake advertises no streaming and no replay.
@@ -64,7 +65,8 @@ This README documents runtime truth and keeps current drift visible:
 
 - `youtube.upload_video` sends real `multipart/related` metadata and decoded video bytes to `/upload/youtube/v3/videos` on the configured origin. It supports files up to 16 MiB in one request; resumable sessions and larger-file streaming are not implemented.
 - Manifest allows `youtubeanalytics.googleapis.com` for `youtube.get_analytics`, but runtime currently aggregates channel/video statistics from Data API calls instead of using the full YouTube Analytics API.
-- `youtube.upload_video` rejects API-key mode locally during invoke and simulate. Comment and caption writes still rely on the provider to reject insufficient credentials. All three write operations require user-authorized OAuth in real YouTube operation.
+- `youtube.upload_caption` sends real `multipart/related` metadata and UTF-8 caption file bytes to `/upload/youtube/v3/captions`, with a 5 MiB file limit. It creates a new track; replacing an existing track and auto-synchronizing untimed transcripts are outside this operation.
+- Both upload operations reject API-key mode locally during invoke and simulate. Comment writes still rely on the provider to reject insufficient credentials. All three write operations require user-authorized OAuth in real YouTube operation.
 - Runtime approval metadata marks write operations as dangerous/interactive in the manifest and introspection, but connector-local invoke enforcement is capability-token based rather than an approval workflow.
 - There is no tracked connector verification shell script yet.
 - `youtube.get_transcript` uses official caption list/download paths and SRT normalization. It does not scrape watch pages, use unofficial transcript endpoints, or bypass YouTube Data API auth/quota behavior.
@@ -114,8 +116,8 @@ The current YouTube README slice documents the existing runtime surface:
   - `POST /commentThreads`
   - `GET /captions`
   - `GET /captions/{caption_id}`
-  - `POST /captions`
-  - `POST /videos?uploadType=multipart&part=snippet,status`
+  - `POST /upload/youtube/v3/captions?uploadType=multipart&part=snippet`
+  - `POST /upload/youtube/v3/videos?uploadType=multipart&part=snippet,status`
 - Runtime URL construction percent-encodes query and path inputs where implemented.
 - Runtime video URL parsing accepts standard YouTube watch, mobile, shorts, embed, live, and youtu.be shapes and extracts an 11-character video ID.
 - Transcript normalization enforces `max_bytes` and `max_segments` bounds and parses SRT-style timestamp blocks.
@@ -146,9 +148,23 @@ The current YouTube README slice documents the existing runtime surface:
 | `youtube.get_captions` | `GET /captions?videoId=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `video_id`. |
 | `youtube.get_caption_transcript` | `GET /captions/{caption_id}?tfmt=...` | `youtube.read` | `Safe` | `Low` | `Strict` | `caption_id`; optional `format` (`srt`, `vtt`, `ttml`). |
 | `youtube.get_transcript` | `GET /captions` plus `GET /captions/{caption_id}` and local normalization | `youtube.read` | `Safe` | `Low` | `Strict` | One of `video_id` or `video_url`; optional language and bounds. |
-| `youtube.upload_caption` | `POST /captions` | `youtube.write` | `Dangerous` | `High` | `None` | `video_id`, `language`, `transcript`; optional `name`. |
+| `youtube.upload_caption` | `POST /upload/youtube/v3/captions?uploadType=multipart&part=snippet` | `youtube.write` | `Dangerous` | `High` | `None` | `video_id`, `language`, `transcript`; optional `name`. OAuth required; at most 5 MiB of UTF-8 caption file bytes. |
 | `youtube.get_analytics` | `GET /channels`, `GET /playlistItems`, `GET /videos` summary chain | `youtube.read` | `Safe` | `Low` | `Strict` | `channel_id`; optional `max_videos`. |
 | `youtube.upload_video` | `POST /upload/youtube/v3/videos?uploadType=multipart&part=snippet,status` | `youtube.write` | `Dangerous` | `High` | `None` | `title`, `description`, `video_data_base64`; optional `privacy`, `tags`, `category_id`. OAuth required; at most 16 MiB decoded. |
+
+### Caption Upload Contract
+
+The connector uses the single-request multipart form of [`captions.insert`](https://developers.google.com/youtube/v3/docs/captions/insert). The existing `transcript` field carries the exact UTF-8 contents of a supported timed caption file, such as SRT or WebVTT. Metadata is sent as the first MIME part and the original caption bytes as `application/octet-stream` in the second. Unicode, a UTF-8 byte order mark, and line endings are preserved. The connector does not send transcript text inside a JSON resource or attempt to align untimed speech; YouTube has [deprecated the API's `sync` parameter](https://developers.google.com/youtube/v3/docs/captions).
+
+- `transcript` must be nonblank and at most 5 MiB of UTF-8 bytes. This buffered connector limit is lower than the provider's 100 MB limit. Google validates the caption file format and timestamps.
+- `video_id` must contain 1 to 128 ASCII letters, digits, hyphens, or underscores. `language` is a BCP-47 tag; the connector accepts up to 255 ASCII bytes in nonempty subtags and Google validates supported languages. `name` defaults to `Uploaded transcript` and is limited to 150 Unicode characters. An explicitly empty string name is preserved. Optional fields with the wrong JSON type are rejected during invoke and simulate.
+- Configure a user-authorized OAuth access token or host credential reference with `https://www.googleapis.com/auth/youtube.force-ssl` or `https://www.googleapis.com/auth/youtubepartner`. The `youtube.upload` scope used for video uploads alone does not authorize caption insertion. API-key mode is rejected before media allocation or HTTP, and bound `youtube.write` capability checks still apply.
+- The request sets `snippet.videoId`, `snippet.language`, `snippet.name`, and `snippet.isDraft=false`. This submits a new track with draft mode disabled; it does not replace an existing track. A provider `409 captionExists` remains a non-retryable conflict. No existing track is deleted or overwritten to resolve it.
+- Caption uploads have a two-minute connector request budget, a ten-second connection timeout, a 5 MiB response limit, and no redirects. A shorter host deadline remains effective. Ordinary reads keep their existing transport configuration.
+- Only explicit 429 refusals and connection failures proven to precede transmission can be retried automatically. Cancellation, timeouts after dispatch, 5xx responses, oversized responses, or malformed success bodies yield a **non-retryable unknown outcome**. Use `youtube.get_captions` on the target video and inspect the language/name before resubmitting.
+- Success preserves the existing `{ "caption": ... }` shape and returns the created track's real ID and metadata. A missing identity, mismatched target video, or missing processing status is treated as uncertain completion. The provider's `syncing`, `serving`, or `failed` status describes processing; a created track is not necessarily ready to display. A supplied `failureReason` is retained when processing fails.
+
+`tests/integration.rs` exercises the real multipart path and exact UTF-8 body with bearer and credential-reference auth, local validation, invoke/simulate refusals, provider conflicts, processing failures, safe rate-limit retry, cancellation, redirects, and uncertain completion.
 
 ### Video Upload Contract
 
@@ -205,7 +221,7 @@ These are excluded on purpose:
 
 The deterministic integration evidence is anchored on connector-local tests covering:
 
-- search, video, channel, playlist, comments, captions, transcript, caption upload, and upload-like fixture paths
+- search, video, channel, playlist, comments, captions, transcript, and real multipart caption/video upload wire contracts
 - provider 401, 403, 404, 429, transport, retryable, and input-validation behavior
 - default-deny capability tokens, wrong capability rejection, missing constraints, resource URI derivation, simulation, unknown operation rejection, and lifecycle handlers
 - transcript parsing, video URL parsing, max segment/byte bounds, credential-reference degradation, doctor, health, self-check, introspection, and shutdown behavior
@@ -213,7 +229,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 ## Source Notes
 
 - `connectors/youtube/src/connector.rs` defines configuration parsing, service selector validation, lifecycle handlers, diagnostics, introspection, simulation, input validation, transcript normalization, resource URI binding, bound capability-token verification, and invoke dispatch.
-- `connectors/youtube/src/client.rs` defines YouTube Data API request construction, API-key and shared-Google auth behavior, retry dispatch, timeout configuration, transcript download, caption upload, real bounded multipart video upload, and provider error mapping.
+- `connectors/youtube/src/client.rs` defines YouTube Data API request construction, API-key and shared-Google auth behavior, retry dispatch, timeout configuration, transcript download, bounded multipart caption/video uploads, and provider error mapping.
 - `connectors/youtube/src/types.rs` defines YouTube response/resource shapes, captions, transcript output, analytics summary, and upload result types.
 - `connectors/youtube/src/error.rs` defines connector error classes and FCP error conversion.
 - `connectors/youtube/manifest.toml` defines the operation catalog, network constraints, sandbox boundary, zone policy, and state claim.
@@ -272,7 +288,7 @@ Common remediation:
 - If write operations fail with authorization errors in API-key mode, switch to OAuth/shared Google credentials with scopes appropriate for the operation.
 - If search or caption operations start returning quota errors, reduce pagination/search fanout and inspect the Google Cloud quota dashboard.
 - If transcript operations return not found or empty output, confirm the video has a downloadable caption track and that the auth mode is allowed to download it.
-- If upload behavior matters, verify the live upload protocol in a dedicated follow-up before relying on the current mock-oriented upload path.
+- If an upload reports an unknown outcome, inspect the authenticated channel or the video's caption tracks before resubmitting. The wire contracts have deterministic fixture coverage; validate credentials, ownership, and provider processing in a disposable channel before live operational use.
 
 Rerun commands:
 

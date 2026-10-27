@@ -15,15 +15,22 @@
 use chrono::{Duration, Utc};
 use fcp_crypto::cose::CapabilityTokenBuilder;
 use fcp_crypto::ed25519::Ed25519SigningKey;
-use fcp_prelude::CapabilityConstraints;
+use fcp_google_discovery::auth::{GoogleAuthSourceKind, GoogleMaterializedAuth};
+use fcp_prelude::{
+    CapabilityConstraints, ConnectorId, OperationId, SimulateRequest, SimulateResponse,
+};
 use fcp_testkit::AsyncTestContext;
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path, path_regex},
+    matchers::{method, path, path_regex, query_param},
 };
 
-use fcp_youtube::connector::YouTubeConnector;
+use fcp_youtube::{
+    client::{YouTubeAuth, YouTubeClient},
+    connector::YouTubeConnector,
+    error::YouTubeError,
+};
 
 // ============================================================================
 // Helpers
@@ -38,6 +45,15 @@ fn generate_valid_token(
         "youtube.post_comment" | "youtube.upload_caption" => "youtube.write",
         _ => "youtube.read",
     };
+    generate_token_for_capability(signing_key, connector, op, cap)
+}
+
+fn generate_token_for_capability(
+    signing_key: &Ed25519SigningKey,
+    connector: &YouTubeConnector,
+    op: &str,
+    cap: &str,
+) -> fcp_core::CapabilityToken {
     let now = Utc::now();
     // C3.4: tokens MUST include constraints (default-deny)
     let constraints = CapabilityConstraints {
@@ -88,6 +104,42 @@ async fn setup_configure(connector: &mut YouTubeConnector, base_url: &str) {
         .await
         .expect("configure should succeed");
 }
+
+async fn setup_caption_upload(connector: &mut YouTubeConnector, base_url: &str) {
+    connector
+        .handle_configure(json!({
+            "access_token": "fixture-caption-token",
+            "base_url": base_url,
+        }))
+        .await
+        .expect("OAuth upload configuration should succeed");
+}
+
+fn caption_upload_client(server: &MockServer) -> YouTubeClient {
+    YouTubeClient::new_with_auth(YouTubeAuth::GoogleShared(
+        GoogleMaterializedAuth::BearerToken {
+            access_token: "fixture-caption-token".into(),
+            source: GoogleAuthSourceKind::AccessToken,
+            granted_scopes: Vec::new(),
+            quota_project_id: None,
+        },
+    ))
+    .unwrap()
+    .with_base_url(&format!("{}/youtube/v3", server.uri()))
+}
+
+fn caption_upload_response() -> serde_json::Value {
+    json!({
+        "kind": "youtube#caption", "etag": "etag-1", "id": "cap-new-1",
+        "snippet": {
+            "videoId": "dQw4w9WgXcQ", "language": "en", "trackKind": "standard",
+            "name": "Uploaded transcript", "isDraft": false, "status": "syncing",
+        },
+    })
+}
+
+const CAPTION_FILE: &str =
+    "\u{feff}1\r\n00:00:00,000 --> 00:00:01,000\r\nHello 雪 <b>caption</b>\r\n\r\n";
 
 // ============================================================================
 // Happy-path operation tests
@@ -751,44 +803,399 @@ async fn get_transcript_rejects_oversized_transcript() {
 #[fcp_async_core::runtime::test]
 async fn upload_caption_happy_path() {
     let _ctx = AsyncTestContext::for_scenario("youtube.upload_caption.happy_path");
-    let mock_server = MockServer::start().await;
+    for credential_mode in [false, true] {
+        let server = MockServer::start().await;
+        let prefix = if credential_mode {
+            "/fixture/youtube/v3"
+        } else {
+            "/youtube/v3"
+        };
+        let name = if credential_mode {
+            "Uploaded transcript"
+        } else {
+            "English 雪"
+        };
+        let mut response = caption_upload_response();
+        response["snippet"]["name"] = json!(name);
+        response["snippet"]["language"] = json!("en-US");
+        Mock::given(method("POST"))
+            .and(path(format!("/upload{prefix}/captions")))
+            .and(query_param("part", "snippet"))
+            .and(query_param("uploadType", "multipart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let credential_id = fcp_core::CredentialId::new();
+        let mut config = json!({"base_url": format!("{}{prefix}", server.uri())});
+        if credential_mode {
+            config["credential_id"] = json!(credential_id.to_string());
+        } else {
+            config["access_token"] = json!("fixture-caption-token");
+        }
+        let mut connector = YouTubeConnector::new();
+        connector.handle_configure(config).await.unwrap();
+        let key = setup_handshake(&mut connector, &["youtube.read", "youtube.write"]).await;
+        let mut input = json!({
+            "video_id": "dQw4w9WgXcQ", "language": "en-US", "transcript": CAPTION_FILE,
+        });
+        if !credential_mode {
+            input["name"] = json!(name);
+        }
+        let denied = connector.handle_invoke(json!({
+            "operation": "youtube.upload_caption", "input": input,
+            "capability_token": generate_token_for_capability(&key, &connector, "youtube.upload_caption", "youtube.read"),
+        })).await.unwrap_err();
+        assert!(matches!(
+            denied,
+            fcp_core::FcpError::OperationNotGranted { .. }
+                | fcp_core::FcpError::CapabilityDenied { .. }
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let result = connector.handle_invoke(json!({
+            "operation": "youtube.upload_caption", "input": input,
+            "capability_token": generate_valid_token(&key, &connector, "youtube.upload_caption"),
+        })).await.expect("upload_caption invoke should succeed");
+        assert_eq!(result["caption"]["id"], "cap-new-1");
+        assert_eq!(result["caption"]["snippet"]["status"], "syncing");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            !request
+                .url
+                .query_pairs()
+                .any(|(key, _)| key == "key" || key == "sync")
+        );
+        assert_eq!(
+            request
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key == "uploadType")
+                .count(),
+            1
+        );
+        if credential_mode {
+            assert_eq!(
+                request.headers["x-fcp-credential-id"].to_str().unwrap(),
+                credential_id.to_string()
+            );
+            assert!(!request.headers.contains_key("authorization"));
+        } else {
+            assert_eq!(
+                request.headers["authorization"].to_str().unwrap(),
+                "Bearer fixture-caption-token"
+            );
+            assert!(!request.headers.contains_key("x-fcp-credential-id"));
+        }
+        assert_eq!(
+            request.headers["content-length"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            request.body.len()
+        );
+        let boundary = request.headers["content-type"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("multipart/related; boundary=")
+            .unwrap();
+        let metadata_header =
+            format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+        let media_header =
+            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n");
+        let closing = format!("\r\n--{boundary}--\r\n");
+        assert!(request.body.starts_with(metadata_header.as_bytes()));
+        assert!(request.body.ends_with(closing.as_bytes()));
+        let media_start = request
+            .body
+            .windows(media_header.len())
+            .position(|part| part == media_header.as_bytes())
+            .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&request.body[metadata_header.len()..media_start]).unwrap();
+        assert_eq!(
+            metadata,
+            json!({"snippet":{
+                "videoId":"dQw4w9WgXcQ", "language":"en-US", "name":name, "isDraft":false,
+            }})
+        );
+        assert_eq!(
+            &request.body[media_start + media_header.len()..request.body.len() - closing.len()],
+            CAPTION_FILE.as_bytes()
+        );
+    }
+}
 
-    Mock::given(method("POST"))
-        .and(path_regex("/captions.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "kind": "youtube#caption",
-            "etag": "etag-1",
-            "id": "cap-new-1",
-            "snippet": {
-                "videoId": "dQw4w9WgXcQ",
-                "language": "en",
-                "trackKind": "standard",
-                "name": "English"
-            }
-        })))
-        .mount(&mock_server)
-        .await;
-
+#[fcp_async_core::runtime::test]
+async fn caption_upload_validation_and_api_key_denials_do_not_contact_google() {
+    let server = MockServer::start().await;
     let mut connector = YouTubeConnector::new();
-    setup_configure(&mut connector, &mock_server.uri()).await;
-    let signing_key = setup_handshake(&mut connector, &["youtube.upload_caption"]).await;
-    let capability = generate_valid_token(&signing_key, &connector, "youtube.upload_caption");
-
-    let result = connector
+    setup_caption_upload(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.write"]).await;
+    let base = json!({"video_id":"dQw4w9WgXcQ", "language":"en", "transcript":CAPTION_FILE});
+    for (field, value) in [
+        ("video_id", json!("../video")),
+        ("video_id", json!("")),
+        ("language", json!("en_US")),
+        ("language", json!("en--US")),
+        ("transcript", json!(" \r\n")),
+        ("transcript", json!(false)),
+        ("name", json!(false)),
+        ("name", serde_json::Value::Null),
+        ("name", json!("雪".repeat(151))),
+    ] {
+        let mut input = base.clone();
+        input[field] = value;
+        let error = connector
+            .handle_invoke(json!({
+                "operation":"youtube.upload_caption", "input":input,
+                "capability_token":generate_valid_token(&key, &connector, "youtube.upload_caption"),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, fcp_core::FcpError::InvalidRequest { .. }),
+            "{field}: {error:?}"
+        );
+        let request = SimulateRequest::new(
+            ConnectorId::from_static("youtube"),
+            OperationId::from_static("youtube.upload_caption"),
+            fcp_core::ZoneId::work(),
+            input,
+            generate_valid_token(&key, &connector, "youtube.upload_caption"),
+        );
+        let response: SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(serde_json::to_value(request).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!response.would_succeed);
+        assert_eq!(response.denial_code, Some(error.error_code()));
+    }
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["youtube.write"]).await;
+    let error = connector
         .handle_invoke(json!({
-            "operation": "youtube.upload_caption",
-            "input": {
-                "video_id": "dQw4w9WgXcQ",
-                "language": "en",
-                "transcript": "Hello transcript",
-                "name": "English"
-            },
-            "capability_token": capability
+            "operation":"youtube.upload_caption", "input":base,
+            "capability_token":generate_valid_token(&key, &connector, "youtube.upload_caption"),
         }))
         .await
-        .expect("upload_caption invoke should succeed");
+        .unwrap_err();
+    assert!(matches!(error, fcp_core::FcpError::Unauthorized { .. }));
+    assert!(error.to_string().contains("youtube.force-ssl"));
+    assert!(!error.to_string().contains("test-api-key-xyz"));
+    let request = SimulateRequest::new(
+        ConnectorId::from_static("youtube"),
+        OperationId::from_static("youtube.upload_caption"),
+        fcp_core::ZoneId::work(),
+        base,
+        generate_valid_token(&key, &connector, "youtube.upload_caption"),
+    );
+    let response: SimulateResponse = serde_json::from_value(
+        connector
+            .handle_simulate(serde_json::to_value(request).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!response.would_succeed);
+    assert_eq!(response.denial_code, Some(error.error_code()));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
 
-    assert_eq!(result["caption"]["id"], "cap-new-1");
+#[fcp_async_core::runtime::test]
+async fn caption_upload_unknown_completion_is_nonretryable() {
+    let mut blank_id = caption_upload_response();
+    blank_id["id"] = json!(" ");
+    let mut empty_id = caption_upload_response();
+    empty_id["id"] = json!("");
+    let mut wrong_video = caption_upload_response();
+    wrong_video["snippet"]["videoId"] = json!("another_video");
+    let mut missing_status = caption_upload_response();
+    missing_status["snippet"]
+        .as_object_mut()
+        .unwrap()
+        .remove("status");
+    let responses = [
+        ResponseTemplate::new(503)
+            .set_body_json(json!({"error":{"code":503,"message":"unavailable"}})),
+        ResponseTemplate::new(200).set_body_json(json!({})),
+        ResponseTemplate::new(200).set_body_json(blank_id),
+        ResponseTemplate::new(200).set_body_json(empty_id),
+        ResponseTemplate::new(200).set_body_json(wrong_video),
+        ResponseTemplate::new(200).set_body_json(missing_status),
+        ResponseTemplate::new(200).set_body_string("not JSON"),
+        ResponseTemplate::new(204),
+        ResponseTemplate::new(200).set_body_string("x".repeat(5 * 1024 * 1024 + 1)),
+    ];
+    for response in responses {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/youtube/v3/captions"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = caption_upload_client(&server)
+            .with_retry_config(2)
+            .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, YouTubeError::CaptionUploadOutcomeUnknown { .. }),
+            "{error:?}"
+        );
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            error.to_fcp_error(),
+            fcp_core::FcpError::External {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("youtube.get_captions"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn caption_upload_provider_rejections_are_distinct_from_unknown_outcomes() {
+    for (status, reason) in [(400, "invalidMetadata"), (409, "captionExists")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/youtube/v3/captions"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "error":{"code":status,"message":reason,"errors":[{"reason":reason}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = caption_upload_client(&server)
+            .with_retry_config(2)
+            .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, YouTubeError::Api { status_code:Some(code), message } if *code == status && message.contains(reason))
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn caption_upload_returns_created_track_processing_failure() {
+    let server = MockServer::start().await;
+    let mut response = caption_upload_response();
+    response["snippet"]["status"] = json!("failed");
+    response["snippet"]["failureReason"] = json!("unsupportedFormat");
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let caption = caption_upload_client(&server)
+        .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+        .await
+        .unwrap();
+    assert_eq!(caption.id, "cap-new-1");
+    let snippet = caption.snippet.unwrap();
+    assert_eq!(snippet.status.as_deref(), Some("failed"));
+    assert_eq!(snippet.failure_reason.as_deref(), Some("unsupportedFormat"));
+    assert_eq!(
+        serde_json::to_value(snippet).unwrap()["failureReason"],
+        "unsupportedFormat"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn caption_upload_retries_only_explicit_rate_limits_with_identical_media() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"error":{"code":429,"message":"rate limited"}})),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(caption_upload_response()))
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let caption = caption_upload_client(&server)
+        .with_retry_config(1)
+        .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+        .await
+        .unwrap();
+    assert_eq!(caption.id, "cap-new-1");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url, requests[1].url);
+    assert_eq!(requests[0].body, requests[1].body);
+}
+
+#[fcp_async_core::runtime::test]
+async fn caption_upload_cancellation_after_dispatch_does_not_replay() {
+    let server = MockServer::start().await;
+    let client = std::sync::Arc::new(caption_upload_client(&server).with_retry_config(2));
+    let client_on_request = std::sync::Arc::clone(&client);
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(move |_request: &wiremock::Request| {
+            client_on_request.shutdown();
+            ResponseTemplate::new(200)
+                .set_body_json(caption_upload_response())
+                .set_delay(std::time::Duration::from_secs(1))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client
+        .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        YouTubeError::CaptionUploadOutcomeUnknown { .. }
+    ));
+    assert!(!error.is_retryable());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn caption_upload_does_not_redirect_credentials_or_content() {
+    let server = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload/youtube/v3/captions"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/stolen", target.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        caption_upload_client(&server)
+            .upload_caption("dQw4w9WgXcQ", "en", CAPTION_FILE, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert!(target.received_requests().await.unwrap().is_empty());
 }
 
 // ============================================================================
@@ -1217,7 +1624,7 @@ async fn upload_caption_missing_transcript_fails() {
     let mock_server = MockServer::start().await;
 
     let mut connector = YouTubeConnector::new();
-    setup_configure(&mut connector, &mock_server.uri()).await;
+    setup_caption_upload(&mut connector, &mock_server.uri()).await;
     let signing_key = setup_handshake(&mut connector, &["youtube.upload_caption"]).await;
     let capability = generate_valid_token(&signing_key, &connector, "youtube.upload_caption");
 

@@ -838,19 +838,20 @@ impl YouTubeConnector {
                 ),
                 op_info(
                     "youtube.upload_caption",
-                    "Upload a caption/transcript track for a video",
+                    "Upload a UTF-8 timed caption file as a new video caption track (OAuth required, up to 5 MiB)",
                     json!({
                         "type": "object",
                         "required": ["video_id", "language", "transcript"],
                         "properties": {
-                            "video_id": { "type": "string" },
-                            "language": { "type": "string" },
-                            "transcript": { "type": "string" },
-                            "name": { "type": "string" }
+                            "video_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+                            "language": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*$" },
+                            "transcript": { "type": "string", "minLength": 1, "maxLength": 5242880, "description": "UTF-8 contents of a supported timed caption file, such as SRT or WebVTT; at most 5 MiB of bytes. No automatic synchronization." },
+                            "name": { "type": "string", "maxLength": 150, "default": "Uploaded transcript" }
                         }
                     }),
                     json!({
                         "type": "object",
+                        "required": ["caption"],
                         "properties": {
                             "caption": { "type": "object" }
                         }
@@ -860,14 +861,19 @@ impl YouTubeConnector {
                     SafetyTier::Dangerous,
                     IdempotencyClass::None,
                     AgentHint {
-                        when_to_use: "Publish or replace caption text for a video.".into(),
+                        when_to_use: "Create a new timed caption track on a video with user-authorized OAuth.".into(),
                         common_mistakes: vec![
                             "Caption upload is a dangerous side-effect and must be approved".into(),
+                            "Use youtube.force-ssl or youtubepartner scope; youtube.upload alone does not authorize captions".into(),
+                            "Supply a timed caption file, not an untimed transcript; this operation inserts a new track and does not replace one".into(),
                         ],
                         examples: vec![
-                            r#"{"video_id":"dQw4w9WgXcQ","language":"en","transcript":"..."}"#.into(),
+                            r#"{"video_id":"dQw4w9WgXcQ","language":"en","transcript":"1\n00:00:00,000 --> 00:00:01,000\nHello\n","name":"English"}"#.into(),
                         ],
-                        related: vec![CapabilityId::from_static("youtube.get_caption_transcript")],
+                        related: vec![
+                            CapabilityId::from_static("youtube.get_caption_transcript"),
+                            CapabilityId::from_static("youtube.get_captions"),
+                        ],
                     },
                 ),
                 op_info(
@@ -983,15 +989,20 @@ impl YouTubeConnector {
             }
         };
 
-        if req.operation.as_str() == "youtube.upload_video"
-            && let Some(client) = &self.client
-            && let Err(error) = client.require_video_upload_auth()
-        {
-            let error = error.to_fcp_error();
-            let response = SimulateResponse::denied(req.id, error.to_string(), error.error_code());
-            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
-                message: format!("Failed to serialize response: {e}"),
-            });
+        if let Some(client) = &self.client {
+            let auth_check = match req.operation.as_str() {
+                "youtube.upload_video" => client.require_video_upload_auth(),
+                "youtube.upload_caption" => client.require_caption_upload_auth(),
+                _ => Ok(()),
+            };
+            if let Err(error) = auth_check {
+                let error = error.to_fcp_error();
+                let response =
+                    SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+                return serde_json::to_value(response).map_err(|e| FcpError::Internal {
+                    message: format!("Failed to serialize response: {e}"),
+                });
+            }
         }
 
         if let Err(error) = validate_youtube_input(req.operation.as_str(), &req.input) {
@@ -1425,13 +1436,18 @@ impl YouTubeConnector {
         input: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
-        let video_id = require_str(&input, "video_id")?;
-        let language = require_str(&input, "language")?;
-        let transcript = require_str(&input, "transcript")?;
-        let name = input.get("name").and_then(|v| v.as_str());
+        client
+            .require_caption_upload_auth()
+            .map_err(|error| error.to_fcp_error())?;
+        let upload = parse_caption_upload_input(&input)?;
 
         let caption = client
-            .upload_caption(video_id, language, transcript, name)
+            .upload_caption(
+                upload.video_id,
+                upload.language,
+                upload.transcript,
+                upload.name,
+            )
             .await
             .map_err(|e: YouTubeError| e.to_fcp_error())?;
 
@@ -1973,6 +1989,29 @@ fn youtube_capability_for_operation(operation: &str) -> FcpResult<CapabilityId> 
     }
 }
 
+struct CaptionUploadInput<'a> {
+    video_id: &'a str,
+    language: &'a str,
+    transcript: &'a str,
+    name: Option<&'a str>,
+}
+
+fn parse_caption_upload_input(input: &serde_json::Value) -> FcpResult<CaptionUploadInput<'_>> {
+    let name = match input.get("name") {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Field name must be a string".into(),
+        })?),
+    };
+    Ok(CaptionUploadInput {
+        video_id: require_str(input, "video_id")?,
+        language: require_str(input, "language")?,
+        transcript: require_str(input, "transcript")?,
+        name,
+    })
+}
+
 struct VideoUploadInput<'a> {
     title: &'a str,
     description: &'a str,
@@ -2060,9 +2099,14 @@ fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResu
             parse_transcript_request(input)?;
         }
         "youtube.upload_caption" => {
-            require_str(input, "video_id")?;
-            require_str(input, "language")?;
-            require_str(input, "transcript")?;
+            let upload = parse_caption_upload_input(input)?;
+            crate::client::prepare_caption_upload(
+                upload.video_id,
+                upload.language,
+                upload.transcript,
+                upload.name,
+            )
+            .map_err(|error| error.to_fcp_error())?;
         }
         "youtube.upload_video" => {
             let upload = parse_video_upload_input(input)?;
@@ -2694,6 +2738,7 @@ mod tests {
                 is_draft: None,
                 is_auto_synced: None,
                 status: status.map(str::to_string),
+                failure_reason: None,
             }),
         }
     }

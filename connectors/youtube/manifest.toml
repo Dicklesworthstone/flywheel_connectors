@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:a0d2a4d710a9f0e06f608ff7c4fb6e8333f2038a22e5da30a1e9200127208db5"
+interface_hash = "blake3-256:fcp.interface.v2:0f1660224c325988a81d99b0f312361caa7210334a3cab83561010dba0f258b2"
 
 [connector]
 id = "fcp.youtube"
@@ -570,7 +570,7 @@ related = ["youtube.get_captions", "youtube.get_caption_transcript"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."youtube.upload_caption"]
-description = "Upload a caption/transcript track for a video"
+description = "Upload a UTF-8 timed caption file as a new video caption track (OAuth required, up to 5 MiB)"
 capability = "youtube.write"
 risk_level = "high"
 safety_tier = "dangerous"
@@ -582,12 +582,23 @@ required = ["video_id", "language", "transcript"]
 type = "object"
 [provides.operations."youtube.upload_caption".input_schema.properties.video_id]
 type = "string"
+minLength = 1
+maxLength = 128
+pattern = "^[A-Za-z0-9_-]+$"
 [provides.operations."youtube.upload_caption".input_schema.properties.language]
 type = "string"
+minLength = 1
+maxLength = 255
+pattern = "^[A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*$"
 [provides.operations."youtube.upload_caption".input_schema.properties.transcript]
 type = "string"
+minLength = 1
+maxLength = 5242880
+description = "UTF-8 contents of a supported timed caption file, such as SRT or WebVTT; at most 5 MiB of bytes. No automatic synchronization."
 [provides.operations."youtube.upload_caption".input_schema.properties.name]
 type = "string"
+maxLength = 150
+default = "Uploaded transcript"
 
 [provides.operations."youtube.upload_caption".output_schema]
 required = ["caption"]
@@ -611,9 +622,9 @@ total_timeout_ms = 120000
 max_response_bytes = 5242880
 
 [provides.operations."youtube.upload_caption".ai_hints]
-when_to_use = "Publish caption text to YouTube for a specific video."
-common_mistakes = ["Caption uploads are dangerous side effects and require approval"]
-examples = ['{"video_id": "dQw4w9WgXcQ", "language": "en", "transcript": "..."}']
+when_to_use = "Create a new timed caption track on a video with user-authorized OAuth."
+common_mistakes = ["Caption uploads are dangerous side effects and require approval", "Use youtube.force-ssl or youtubepartner scope; youtube.upload alone does not authorize captions", "Supply a timed caption file, not an untimed transcript; this operation inserts a new track and does not replace one"]
+examples = ['{"video_id": "dQw4w9WgXcQ", "language": "en", "transcript": "1\n00:00:00,000 --> 00:00:01,000\nHello\n", "name": "English"}']
 related = ["youtube.get_caption_transcript", "youtube.get_captions"]
 
 # ────────────────────────────────────────────────────────────────

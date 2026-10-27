@@ -389,6 +389,9 @@ pub struct CaptionSnippet {
     pub is_draft: Option<bool>,
     pub is_auto_synced: Option<bool>,
     pub status: Option<String>,
+    /// Provider processing failure, when the track exists but is not usable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 /// Caption list response.

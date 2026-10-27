@@ -30,9 +30,14 @@ pub const DEFAULT_BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 const PAGE_CURSOR_PARAM_PREFIX: &str = concat!("&page", "Token", "=");
 /// Maximum decoded video size for the buffered, single-request upload surface.
 pub const MAX_VIDEO_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum UTF-8 caption file size for the buffered upload surface.
+pub const MAX_CAPTION_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
 const MAX_UPLOAD_METADATA_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const CAPTION_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CAPTION_UPLOAD_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_CAPTION_UPLOAD_NAME: &str = "Uploaded transcript";
 
 /// Authentication mode for the YouTube API.
 #[derive(Clone)]
@@ -522,7 +527,16 @@ impl YouTubeClient {
             tags.as_deref(),
             category_id,
         )?;
-        let response = self.execute_video_upload(upload).await?;
+        let response = self
+            .execute_media_upload(
+                "videos",
+                "snippet,status",
+                upload,
+                MAX_VIDEO_UPLOAD_BYTES,
+                MAX_UPLOAD_RESPONSE_BYTES,
+                UPLOAD_TIMEOUT,
+            )
+            .await?;
         let GoogleResponseBody::Json(value) = response.body else {
             return Err(YouTubeError::UploadOutcomeUnknown {
                 status_code: Some(response.status_code),
@@ -569,17 +583,33 @@ impl YouTubeClient {
         Ok(())
     }
 
-    async fn execute_video_upload(
+    /// Caption insertion requires an OAuth scope distinct from video upload.
+    pub(crate) fn require_caption_upload_auth(&self) -> YouTubeResult<()> {
+        if matches!(self.auth, YouTubeAuth::ApiKey(_)) {
+            return Err(YouTubeError::Forbidden {
+                message: "Caption uploads require user-authorized OAuth with youtube.force-ssl or youtubepartner scope; configure a Google access token or credential reference instead of an API key".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn execute_media_upload(
         &self,
+        resource: &str,
+        part: &str,
         upload: GoogleUploadPayload,
+        max_upload_bytes: usize,
+        max_response_bytes: usize,
+        timeout: Duration,
     ) -> YouTubeResult<GoogleExecuteResponse> {
         let base = Url::parse(&self.base_url).map_err(|_| YouTubeError::InvalidUpload {
             message: "invalid upload base URL".into(),
         })?;
-        let upload_path = format!("upload{}/videos", base.path().trim_end_matches('/'));
+        let upload_path = format!("upload{}/{resource}", base.path().trim_end_matches('/'));
+        let method_id = format!("youtube.{resource}.insert");
         let method = DiscoveryMethod {
-            key: "youtube.videos.insert".into(),
-            id: "youtube.videos.insert".into(),
+            key: method_id.clone(),
+            id: method_id,
             http_method: "POST".into(),
             path: upload_path.clone(),
             flat_path: None,
@@ -604,7 +634,7 @@ impl YouTubeClient {
             supports_media_upload: true,
             media_upload: Some(DiscoveryMediaUpload {
                 accept: vec!["application/octet-stream".into()],
-                max_size: Some(MAX_VIDEO_UPLOAD_BYTES.to_string()),
+                max_size: Some(max_upload_bytes.to_string()),
                 simple_path: Some(upload_path),
                 resumable_path: None,
             }),
@@ -612,17 +642,17 @@ impl YouTubeClient {
         let schemas = BTreeMap::new();
         let base_url = format!("{}/", base.origin().ascii_serialization());
         let mut request = GoogleExecuteRequest::new(&method, &schemas, &base_url);
-        request.parameters = BTreeMap::from([("part".into(), vec!["snippet,status".into()])]);
+        request.parameters = BTreeMap::from([("part".into(), vec![part.into()])]);
         request.upload = Some(upload);
         request.response_mode = GoogleResponseMode::Json;
         self.apply_shared_auth(&mut request);
 
-        let ctx = self.runtime.request_context_with_timeout(UPLOAD_TIMEOUT);
+        let ctx = self.runtime.request_context_with_timeout(timeout);
         let policy = self.retry_config.to_retry_policy();
         RetryLoop::execute(&ctx, &policy, |_attempt| async {
             match self
                 .upload_executor
-                .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
+                .execute_bounded(&request, max_response_bytes)
                 .await
                 .map_err(map_upload_rest_error)
             {
@@ -639,7 +669,7 @@ impl YouTubeClient {
         .map_err(upload_outcome_error)
     }
 
-    /// Upload a caption/transcript track for a video.
+    /// Upload a UTF-8 timed caption file as a new track for a video.
     pub async fn upload_caption(
         &self,
         video_id: &str,
@@ -647,21 +677,48 @@ impl YouTubeClient {
         transcript: &str,
         name: Option<&str>,
     ) -> YouTubeResult<CaptionTrack> {
-        let base = format!("{}/captions?part=snippet", self.base_url);
-        let url = self.url_with_key(&base);
-
-        let body = serde_json::json!({
-            "snippet": {
-                "videoId": video_id,
-                "language": language,
-                "name": name.unwrap_or("Uploaded transcript"),
-                "trackKind": "standard",
-                "isDraft": false
-            },
-            "transcript": transcript
+        self.require_caption_upload_auth()?;
+        let upload = prepare_caption_upload(video_id, language, transcript, name)?;
+        let response = self
+            .execute_media_upload(
+                "captions",
+                "snippet",
+                upload,
+                MAX_CAPTION_UPLOAD_BYTES,
+                MAX_CAPTION_UPLOAD_RESPONSE_BYTES,
+                CAPTION_UPLOAD_TIMEOUT,
+            )
+            .await
+            .map_err(caption_upload_outcome_error)?;
+        let status_code = response.status_code;
+        let caption: CaptionTrack =
+            decode_json_response(response).map_err(caption_upload_outcome_error)?;
+        let snippet_matches = caption.snippet.as_ref().is_some_and(|snippet| {
+            snippet.video_id.as_deref() == Some(video_id)
+                && snippet
+                    .language
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(language))
+                && snippet.name.as_deref() == Some(name.unwrap_or(DEFAULT_CAPTION_UPLOAD_NAME))
+                && snippet
+                    .status
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
         });
-
-        self.post_json(&url, &body).await
+        if caption.kind != "youtube#caption"
+            || caption.id.is_empty()
+            || caption.id.len() > 1024
+            || caption
+                .id
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            || !snippet_matches
+        {
+            return Err(YouTubeError::CaptionUploadOutcomeUnknown {
+                status_code: Some(status_code),
+            });
+        }
+        Ok(caption)
     }
 
     // ── Internal HTTP helpers ────────────────────────────────────
@@ -816,6 +873,68 @@ impl YouTubeClient {
     }
 }
 
+/// Validate caption metadata and retain the supplied UTF-8 file bytes unchanged.
+pub(crate) fn prepare_caption_upload(
+    video_id: &str,
+    language: &str,
+    transcript: &str,
+    name: Option<&str>,
+) -> YouTubeResult<GoogleUploadPayload> {
+    let invalid = |message: &str| YouTubeError::InvalidUpload {
+        message: message.into(),
+    };
+    if video_id.is_empty()
+        || video_id.len() > 128
+        || !video_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(invalid(
+            "video_id must contain 1 to 128 ASCII letters, digits, hyphens, or underscores",
+        ));
+    }
+    let mut subtags = language.split('-');
+    let primary = subtags.next().unwrap_or_default();
+    if language.len() > 255
+        || primary.is_empty()
+        || primary.len() > 8
+        || !primary.bytes().all(|byte| byte.is_ascii_alphabetic())
+        || subtags.any(|subtag| {
+            subtag.is_empty()
+                || subtag.len() > 8
+                || !subtag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+    {
+        return Err(invalid(
+            "language must be a BCP-47 tag with ASCII subtags, at most 255 bytes",
+        ));
+    }
+    let name = name.unwrap_or(DEFAULT_CAPTION_UPLOAD_NAME);
+    if name.len() > 600 || name.chars().count() > 150 {
+        return Err(invalid(
+            "name exceeds the 150-character caption track limit",
+        ));
+    }
+    if transcript.len() > MAX_CAPTION_UPLOAD_BYTES || transcript.trim().is_empty() {
+        return Err(invalid(
+            "transcript must contain a nonempty UTF-8 caption file of at most 5 MiB",
+        ));
+    }
+    let metadata = serde_json::json!({
+        "snippet": {
+            "videoId": video_id,
+            "language": language,
+            "name": name,
+            "isDraft": false,
+        },
+    });
+    Ok(GoogleUploadPayload::multipart(
+        "application/octet-stream",
+        transcript.as_bytes().to_vec(),
+        metadata,
+    ))
+}
+
 /// Validate the buffered upload contract and decode media before any HTTP request.
 pub(crate) fn prepare_video_upload(
     title: &str,
@@ -926,6 +1045,15 @@ fn upload_outcome_error(error: YouTubeError) -> YouTubeError {
     }
 }
 
+fn caption_upload_outcome_error(error: YouTubeError) -> YouTubeError {
+    match upload_outcome_error(error) {
+        YouTubeError::UploadOutcomeUnknown { status_code } => {
+            YouTubeError::CaptionUploadOutcomeUnknown { status_code }
+        }
+        other => other,
+    }
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     response: GoogleExecuteResponse,
 ) -> YouTubeResult<T> {
@@ -1024,6 +1152,50 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_upload_preserves_utf8_media_and_only_writable_metadata() {
+        let transcript = "\u{feff}1\r\n00:00:00,000 --> 00:00:01,000\r\nHello 雪\r\n";
+        let upload = prepare_caption_upload("dQw4w9WgXcQ", "zh-Hant-TW", transcript, None).unwrap();
+        assert_eq!(upload.bytes, transcript.as_bytes());
+        assert_eq!(upload.content_type, "application/octet-stream");
+        assert_eq!(
+            upload.metadata.unwrap(),
+            serde_json::json!({
+                "snippet": {
+                    "videoId": "dQw4w9WgXcQ", "language": "zh-Hant-TW",
+                    "name": "Uploaded transcript", "isDraft": false,
+                },
+            })
+        );
+        assert!(prepare_caption_upload("video_12345", "en", transcript, Some("")).is_ok());
+    }
+
+    #[test]
+    fn caption_upload_validation_bounds_utf8_bytes_and_name_characters() {
+        let transcript = "é".repeat(MAX_CAPTION_UPLOAD_BYTES / 2);
+        let name = "雪".repeat(150);
+        let upload = prepare_caption_upload("dQw4w9WgXcQ", "en", &transcript, Some(&name)).unwrap();
+        assert_eq!(upload.bytes.len(), MAX_CAPTION_UPLOAD_BYTES);
+        let oversized = format!("{transcript}x");
+        assert!(prepare_caption_upload("dQw4w9WgXcQ", "en", &oversized, None).is_err());
+        assert!(
+            prepare_caption_upload("dQw4w9WgXcQ", "en", "caption", Some(&"雪".repeat(151)))
+                .is_err()
+        );
+        for transcript in ["", " \r\n\t"] {
+            assert!(prepare_caption_upload("dQw4w9WgXcQ", "en", transcript, None).is_err());
+        }
+        for video_id in ["", "../video", "video?key=secret", "video name"] {
+            assert!(prepare_caption_upload(video_id, "en", "caption", None).is_err());
+        }
+        for language in ["", "en_US", "en--US", "en-", "é", "en\r\nX-Test: x"] {
+            assert!(prepare_caption_upload("dQw4w9WgXcQ", language, "caption", None).is_err());
+        }
+        assert!(
+            prepare_caption_upload("dQw4w9WgXcQ", &"en-US".repeat(52), "caption", None).is_err()
+        );
+    }
 
     #[test]
     fn video_upload_validation_decodes_only_canonical_nonempty_base64() {

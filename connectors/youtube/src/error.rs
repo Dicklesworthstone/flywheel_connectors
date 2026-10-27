@@ -43,6 +43,12 @@ pub enum YouTubeError {
     )]
     UploadOutcomeUnknown { status_code: Option<u16> },
 
+    /// A caption track may exist even though its creation could not be confirmed.
+    #[error(
+        "YouTube caption upload outcome is unknown; inspect the video's caption tracks with youtube.get_captions before resubmitting to avoid duplicate tracks"
+    )]
+    CaptionUploadOutcomeUnknown { status_code: Option<u16> },
+
     /// YouTube API returned an error
     #[error("YouTube API error: {message} (status {status_code:?})")]
     Api {
@@ -85,6 +91,10 @@ impl std::fmt::Debug for YouTubeError {
                 .finish(),
             Self::UploadOutcomeUnknown { status_code } => f
                 .debug_struct("UploadOutcomeUnknown")
+                .field("status_code", status_code)
+                .finish(),
+            Self::CaptionUploadOutcomeUnknown { status_code } => f
+                .debug_struct("CaptionUploadOutcomeUnknown")
                 .field("status_code", status_code)
                 .finish(),
             Self::Api {
@@ -219,7 +229,8 @@ impl YouTubeError {
                 code: 1003,
                 message: message.clone(),
             },
-            Self::UploadOutcomeUnknown { status_code } => FcpError::External {
+            Self::UploadOutcomeUnknown { status_code }
+            | Self::CaptionUploadOutcomeUnknown { status_code } => FcpError::External {
                 service: "youtube".into(),
                 message: self.to_string(),
                 status_code: *status_code,
