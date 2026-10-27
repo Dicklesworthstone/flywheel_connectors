@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:48cd0f73bcac37702d254ee03f4882564a95e5c05505611775fb23d6a1c52203"
+interface_hash = "blake3-256:fcp.interface.v2:a0d2a4d710a9f0e06f608ff7c4fb6e8333f2038a22e5da30a1e9200127208db5"
 
 [connector]
 id = "fcp.youtube"
@@ -664,7 +664,7 @@ related = ["youtube.get_channel", "youtube.list_videos"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."youtube.upload_video"]
-description = "Upload a video to the authenticated channel with title, description, and optional metadata"
+description = "Upload at most 16 MiB of video to the authenticated channel using OAuth and multipart/related"
 capability = "youtube.write"
 risk_level = "high"
 safety_tier = "dangerous"
@@ -676,24 +676,40 @@ required = ["title", "description", "video_data_base64"]
 type = "object"
 [provides.operations."youtube.upload_video".input_schema.properties.title]
 type = "string"
+minLength = 1
+maxLength = 100
 [provides.operations."youtube.upload_video".input_schema.properties.description]
 type = "string"
+description = "Video description, at most 5000 UTF-8 bytes"
 [provides.operations."youtube.upload_video".input_schema.properties.video_data_base64]
 type = "string"
+minLength = 4
+maxLength = 22369624
+description = "Canonical standard padded base64 for 1 byte to 16 MiB of video data"
 [provides.operations."youtube.upload_video".input_schema.properties.privacy]
 type = "string"
+enum = ["private", "unlisted", "public"]
 [provides.operations."youtube.upload_video".input_schema.properties.tags]
 type = "array"
+maxItems = 100
 [provides.operations."youtube.upload_video".input_schema.properties.tags.items]
 type = "string"
+minLength = 1
 [provides.operations."youtube.upload_video".input_schema.properties.category_id]
 type = "string"
+pattern = "^[0-9]{1,64}$"
 
 [provides.operations."youtube.upload_video".output_schema]
-required = ["video"]
+required = ["videoId", "title", "privacyStatus", "uploadStatus"]
 type = "object"
-[provides.operations."youtube.upload_video".output_schema.properties.video]
-type = "object"
+[provides.operations."youtube.upload_video".output_schema.properties.videoId]
+type = "string"
+[provides.operations."youtube.upload_video".output_schema.properties.title]
+type = "string"
+[provides.operations."youtube.upload_video".output_schema.properties.privacyStatus]
+type = "string"
+[provides.operations."youtube.upload_video".output_schema.properties.uploadStatus]
+type = "string"
 
 [provides.operations."youtube.upload_video".network_constraints]
 host_allow = ["www.googleapis.com", "upload.googleapis.com"]
@@ -712,7 +728,7 @@ max_response_bytes = 10485760
 
 [provides.operations."youtube.upload_video".ai_hints]
 when_to_use = "Publish a new video to the authenticated YouTube channel."
-common_mistakes = ["Video uploads are dangerous side effects and require interactive approval", "video_data_base64 is the raw video bytes base64-encoded; verify size against total_timeout_ms"]
+common_mistakes = ["Video uploads require user-authorized OAuth and interactive approval", "video_data_base64 must decode to 1 byte through 16 MiB", "Inspect the channel before resubmitting an unknown upload outcome"]
 examples = ['{"title": "Launch demo", "description": "Demo video", "video_data_base64": "<base64 mp4>", "privacy": "private"}']
 related = ["youtube.get_video", "youtube.get_analytics"]
 
@@ -724,7 +740,7 @@ related = ["youtube.get_video", "youtube.get_analytics"]
 profile = "strict"
 memory_mb = 256
 cpu_percent = 50
-wall_clock_timeout_ms = 120000
+wall_clock_timeout_ms = 660000
 fs_readonly_paths = ["/usr", "/lib"]
 fs_writable_paths = ["$CONNECTOR_STATE"]
 deny_exec = true

@@ -5,12 +5,13 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use base64::Engine as _;
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
-    GoogleResponseMode, GoogleRestError, GoogleRestExecutor,
+    GoogleResponseMode, GoogleRestError, GoogleRestExecutor, GoogleUploadPayload,
 };
-use fcp_google_discovery::{DiscoveryMethod, DiscoveryParameter};
+use fcp_google_discovery::{DiscoveryMediaUpload, DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode, Url, header};
@@ -27,6 +28,11 @@ use crate::{
 /// Default YouTube Data API v3 base URL.
 pub const DEFAULT_BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 const PAGE_CURSOR_PARAM_PREFIX: &str = concat!("&page", "Token", "=");
+/// Maximum decoded video size for the buffered, single-request upload surface.
+pub const MAX_VIDEO_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UPLOAD_METADATA_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Authentication mode for the YouTube API.
 #[derive(Clone)]
@@ -75,6 +81,7 @@ impl fmt::Debug for YouTubeAuth {
 /// YouTube Data API v3 client.
 pub struct YouTubeClient {
     executor: GoogleRestExecutor,
+    upload_executor: GoogleRestExecutor,
     auth: YouTubeAuth,
     base_url: String,
     max_retries: u32,
@@ -94,15 +101,25 @@ impl YouTubeClient {
         headers.insert(header::ACCEPT, "application/json".parse().unwrap());
 
         let http = Client::builder()
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .user_agent("fcp-youtube/0.1.0")
             .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(YouTubeError::Http)?;
+
+        let upload_http = Client::builder()
+            .default_headers(headers)
+            .user_agent("fcp-youtube/0.1.0")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(UPLOAD_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(YouTubeError::Http)?;
 
         let request_timeout = Duration::from_secs(30);
         Ok(Self {
             executor: GoogleRestExecutor::new().with_client(http),
+            upload_executor: GoogleRestExecutor::new().with_client(upload_http),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: 2,
@@ -483,10 +500,10 @@ impl YouTubeClient {
         })
     }
 
-    /// Upload a video via the YouTube Data API v3 resumable upload protocol.
+    /// Upload a bounded video as metadata and raw bytes in multipart/related.
     ///
-    /// Accepts video content as base64-encoded data. For real production use,
-    /// the upload would be chunked; here we send the full content in one request.
+    /// Requires user-authorized OAuth, including host-injected credentials.
+    /// This buffered operation does not create a resumable upload session.
     pub async fn upload_video(
         &self,
         title: &str,
@@ -496,71 +513,130 @@ impl YouTubeClient {
         tags: Option<Vec<String>>,
         category_id: Option<&str>,
     ) -> YouTubeResult<crate::types::VideoUploadResult> {
-        let base = format!(
-            "{}/videos?uploadType=multipart&part=snippet,status",
-            self.base_url,
-        );
-        let url = self.url_with_key(&base);
-
-        let metadata = serde_json::json!({
-            "snippet": {
-                "title": title,
-                "description": description,
-                "tags": tags.unwrap_or_default(),
-                "categoryId": category_id.unwrap_or("22"),
-            },
-            "status": {
-                "privacyStatus": privacy,
-                "selfDeclaredMadeForKids": false
-            }
-        });
-
-        // For the mock/test path, we send metadata as JSON body.
-        // Real YouTube API would use multipart with the binary video data.
-        let body = serde_json::json!({
-            "metadata": metadata,
-            "media_body_base64": video_data_base64
-        });
-
-        let response = self
-            .execute_with_retry("POST", &url, Some(&body), GoogleResponseMode::Json, false)
-            .await?;
-
-        // Parse the video resource from the response.
+        self.require_video_upload_auth()?;
+        let upload = prepare_video_upload(
+            title,
+            description,
+            privacy,
+            video_data_base64,
+            tags.as_deref(),
+            category_id,
+        )?;
+        let response = self.execute_video_upload(upload).await?;
         let GoogleResponseBody::Json(value) = response.body else {
-            return Err(YouTubeError::Api {
-                message: "expected JSON response from upload".into(),
+            return Err(YouTubeError::UploadOutcomeUnknown {
                 status_code: Some(response.status_code),
             });
         };
-
-        let video_id = value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let resp_title = value
-            .pointer("/snippet/title")
-            .and_then(|v| v.as_str())
-            .unwrap_or(title)
-            .to_string();
-        let resp_privacy = value
-            .pointer("/status/privacyStatus")
-            .and_then(|v| v.as_str())
-            .unwrap_or(privacy)
-            .to_string();
-        let upload_status = value
-            .pointer("/status/uploadStatus")
-            .and_then(|v| v.as_str())
-            .unwrap_or("uploaded")
-            .to_string();
+        let required_string = |pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(YouTubeError::UploadOutcomeUnknown {
+                    status_code: Some(response.status_code),
+                })
+        };
+        let video_id = required_string("/id")?;
+        if video_id.len() > 128
+            || !video_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(YouTubeError::UploadOutcomeUnknown {
+                status_code: Some(response.status_code),
+            });
+        }
+        let resp_title = required_string("/snippet/title")?;
+        let resp_privacy = required_string("/status/privacyStatus")?;
+        let upload_status = required_string("/status/uploadStatus")?;
 
         Ok(crate::types::VideoUploadResult {
-            video_id,
-            title: resp_title,
-            privacy_status: resp_privacy,
-            upload_status,
+            video_id: video_id.to_owned(),
+            title: resp_title.to_owned(),
+            privacy_status: resp_privacy.to_owned(),
+            upload_status: upload_status.to_owned(),
         })
+    }
+
+    /// Reject API-key uploads before allocating a media body or contacting Google.
+    pub(crate) fn require_video_upload_auth(&self) -> YouTubeResult<()> {
+        if matches!(self.auth, YouTubeAuth::ApiKey(_)) {
+            return Err(YouTubeError::Forbidden {
+                message: "Video uploads require user-authorized OAuth; configure a Google access token or credential reference instead of an API key".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn execute_video_upload(
+        &self,
+        upload: GoogleUploadPayload,
+    ) -> YouTubeResult<GoogleExecuteResponse> {
+        let base = Url::parse(&self.base_url).map_err(|_| YouTubeError::InvalidUpload {
+            message: "invalid upload base URL".into(),
+        })?;
+        let upload_path = format!("upload{}/videos", base.path().trim_end_matches('/'));
+        let method = DiscoveryMethod {
+            key: "youtube.videos.insert".into(),
+            id: "youtube.videos.insert".into(),
+            http_method: "POST".into(),
+            path: upload_path.clone(),
+            flat_path: None,
+            canonical_path: upload_path.clone(),
+            resource_path: Vec::new(),
+            description: None,
+            scopes: Vec::new(),
+            request_ref: None,
+            response_ref: None,
+            parameters: BTreeMap::from([(
+                "part".into(),
+                DiscoveryParameter {
+                    location: Some("query".into()),
+                    required: true,
+                    repeated: false,
+                    type_name: Some("string".into()),
+                    format: None,
+                    description: None,
+                },
+            )]),
+            supports_media_download: false,
+            supports_media_upload: true,
+            media_upload: Some(DiscoveryMediaUpload {
+                accept: vec!["application/octet-stream".into()],
+                max_size: Some(MAX_VIDEO_UPLOAD_BYTES.to_string()),
+                simple_path: Some(upload_path),
+                resumable_path: None,
+            }),
+        };
+        let schemas = BTreeMap::new();
+        let base_url = format!("{}/", base.origin().ascii_serialization());
+        let mut request = GoogleExecuteRequest::new(&method, &schemas, &base_url);
+        request.parameters = BTreeMap::from([("part".into(), vec!["snippet,status".into()])]);
+        request.upload = Some(upload);
+        request.response_mode = GoogleResponseMode::Json;
+        self.apply_shared_auth(&mut request);
+
+        let ctx = self.runtime.request_context_with_timeout(UPLOAD_TIMEOUT);
+        let policy = self.retry_config.to_retry_policy();
+        RetryLoop::execute(&ctx, &policy, |_attempt| async {
+            match self
+                .upload_executor
+                .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
+                .await
+                .map_err(map_upload_rest_error)
+            {
+                Ok(response) => AttemptOutcome::Success(response),
+                Err(error) if error.is_retryable() => {
+                    let replayable = error.replay_is_safe();
+                    let retry_after = error.retry_after();
+                    AttemptOutcome::retryable_if_replayable(error, retry_after, replayable)
+                }
+                Err(error) => AttemptOutcome::Terminal(error),
+            }
+        })
+        .await
+        .map_err(upload_outcome_error)
     }
 
     /// Upload a caption/transcript track for a video.
@@ -740,6 +816,116 @@ impl YouTubeClient {
     }
 }
 
+/// Validate the buffered upload contract and decode media before any HTTP request.
+pub(crate) fn prepare_video_upload(
+    title: &str,
+    description: &str,
+    privacy: &str,
+    video_data_base64: &str,
+    tags: Option<&[String]>,
+    category_id: Option<&str>,
+) -> YouTubeResult<GoogleUploadPayload> {
+    let invalid = |message: &str| YouTubeError::InvalidUpload {
+        message: message.into(),
+    };
+    if title.trim().is_empty() || title.len() > 400 || title.chars().count() > 100 {
+        return Err(invalid("title must contain 1 to 100 characters"));
+    }
+    if description.len() > 5000 {
+        return Err(invalid("description exceeds the 5000-byte limit"));
+    }
+    if !matches!(privacy, "private" | "unlisted" | "public") {
+        return Err(invalid("privacy must be private, unlisted, or public"));
+    }
+    let category_id = category_id.unwrap_or("22");
+    if category_id.is_empty()
+        || category_id.len() > 64
+        || !category_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid("category_id must contain 1 to 64 decimal digits"));
+    }
+    let tags = tags.unwrap_or_default();
+    if tags.len() > 100 || tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(invalid("tags must contain at most 100 nonempty strings"));
+    }
+    let metadata_bytes = tags.iter().fold(
+        title
+            .len()
+            .saturating_add(description.len())
+            .saturating_add(category_id.len()),
+        |total, tag| total.saturating_add(tag.len()),
+    );
+    if metadata_bytes > MAX_UPLOAD_METADATA_BYTES {
+        return Err(invalid("upload metadata exceeds the 64 KiB limit"));
+    }
+    let metadata = serde_json::json!({
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "categoryId": category_id,
+        },
+        "status": {
+            "privacyStatus": privacy,
+        },
+    });
+    if metadata.to_string().len() > MAX_UPLOAD_METADATA_BYTES {
+        return Err(invalid(
+            "serialized upload metadata exceeds the 64 KiB limit",
+        ));
+    }
+    if video_data_base64.len() > MAX_VIDEO_UPLOAD_BYTES.div_ceil(3) * 4 {
+        return Err(invalid(
+            "video_data_base64 exceeds the 16 MiB decoded limit",
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(video_data_base64)
+        .map_err(|_| invalid("video_data_base64 must be canonical standard padded base64"))?;
+    if bytes.is_empty() || bytes.len() > MAX_VIDEO_UPLOAD_BYTES {
+        return Err(invalid(
+            "video must contain 1 byte to 16 MiB of decoded data",
+        ));
+    }
+    Ok(GoogleUploadPayload::multipart(
+        "application/octet-stream",
+        bytes,
+        metadata,
+    ))
+}
+
+fn map_upload_rest_error(error: GoogleRestError) -> YouTubeError {
+    match error {
+        GoogleRestError::ResponseTooLarge { .. } => {
+            YouTubeError::UploadOutcomeUnknown { status_code: None }
+        }
+        other => map_rest_error(other),
+    }
+}
+
+fn upload_outcome_error(error: YouTubeError) -> YouTubeError {
+    match &error {
+        YouTubeError::Http(source)
+            if fcp_sdk::migration::transport_error_reached_service(source) =>
+        {
+            YouTubeError::UploadOutcomeUnknown {
+                status_code: source.status().map(|status| status.as_u16()),
+            }
+        }
+        YouTubeError::Json(_) => YouTubeError::UploadOutcomeUnknown { status_code: None },
+        YouTubeError::Api { status_code, .. }
+            if status_code.is_none_or(|status| {
+                status == 0 || (200..300).contains(&status) || status == 408 || status >= 500
+            }) =>
+        {
+            YouTubeError::UploadOutcomeUnknown {
+                status_code: *status_code,
+            }
+        }
+        _ => error,
+    }
+}
+
 fn decode_json_response<T: serde::de::DeserializeOwned>(
     response: GoogleExecuteResponse,
 ) -> YouTubeResult<T> {
@@ -838,6 +1024,55 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_upload_validation_decodes_only_canonical_nonempty_base64() {
+        let upload = prepare_video_upload("Title", "", "private", "AP8=", None, None).unwrap();
+        assert_eq!(upload.bytes, [0, 255]);
+        assert_eq!(upload.content_type, "application/octet-stream");
+        let metadata = upload.metadata.unwrap();
+        assert_eq!(metadata["snippet"]["categoryId"], "22");
+        assert!(metadata["status"].get("selfDeclaredMadeForKids").is_none());
+        for encoded in ["", "not base64", "AA", "AB==", "_w==", "AA==\n"] {
+            assert!(
+                matches!(
+                    prepare_video_upload("Title", "", "private", encoded, None, None),
+                    Err(YouTubeError::InvalidUpload { .. })
+                ),
+                "accepted {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_upload_validation_enforces_decoded_and_serialized_bounds() {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(vec![0_u8; MAX_VIDEO_UPLOAD_BYTES]);
+        assert_eq!(
+            prepare_video_upload("Title", "", "private", &encoded, None, None)
+                .unwrap()
+                .bytes
+                .len(),
+            MAX_VIDEO_UPLOAD_BYTES
+        );
+        let oversized =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0_u8; MAX_VIDEO_UPLOAD_BYTES + 1]);
+        assert!(prepare_video_upload("Title", "", "private", &oversized, None, None).is_err());
+        let escaping_tags = vec!["\0".repeat(11_000)];
+        assert!(
+            prepare_video_upload("Title", "", "private", "AA==", Some(&escaping_tags), None)
+                .is_err()
+        );
+        assert!(prepare_video_upload(" ", "", "private", "AA==", None, None).is_err());
+        assert!(prepare_video_upload(&"x".repeat(101), "", "private", "AA==", None, None).is_err());
+        assert!(
+            prepare_video_upload("Title", &"é".repeat(2501), "private", "AA==", None, None)
+                .is_err()
+        );
+        assert!(prepare_video_upload("Title", "", "friends", "AA==", None, None).is_err());
+        assert!(prepare_video_upload("Title", "", "private", "AA==", None, Some("22x")).is_err());
+    }
 
     #[test]
     fn redact_key_hides_secret_and_preserves_other_parameters() {

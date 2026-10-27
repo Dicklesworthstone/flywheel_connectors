@@ -33,6 +33,16 @@ pub enum YouTubeError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Invalid buffered upload input, rejected before any provider request.
+    #[error("Invalid YouTube upload: {message}")]
+    InvalidUpload { message: String },
+
+    /// YouTube may have created the video; blindly retrying can duplicate it.
+    #[error(
+        "YouTube upload outcome is unknown; inspect the authenticated channel before resubmitting to avoid duplicate videos"
+    )]
+    UploadOutcomeUnknown { status_code: Option<u16> },
+
     /// YouTube API returned an error
     #[error("YouTube API error: {message} (status {status_code:?})")]
     Api {
@@ -69,6 +79,14 @@ impl std::fmt::Debug for YouTubeError {
                 .field(&redacted_http_error(error))
                 .finish(),
             Self::Json(error) => f.debug_tuple("Json").field(error).finish(),
+            Self::InvalidUpload { message } => f
+                .debug_struct("InvalidUpload")
+                .field("message", message)
+                .finish(),
+            Self::UploadOutcomeUnknown { status_code } => f
+                .debug_struct("UploadOutcomeUnknown")
+                .field("status_code", status_code)
+                .finish(),
             Self::Api {
                 message,
                 status_code,
@@ -196,6 +214,17 @@ impl YouTubeError {
             },
             Self::Json(e) => FcpError::Internal {
                 message: format!("JSON error: {e}"),
+            },
+            Self::InvalidUpload { message } => FcpError::InvalidRequest {
+                code: 1003,
+                message: message.clone(),
+            },
+            Self::UploadOutcomeUnknown { status_code } => FcpError::External {
+                service: "youtube".into(),
+                message: self.to_string(),
+                status_code: *status_code,
+                retryable: false,
+                retry_after: None,
             },
         }
     }

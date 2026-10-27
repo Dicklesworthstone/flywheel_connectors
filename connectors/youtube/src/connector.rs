@@ -912,21 +912,22 @@ impl YouTubeConnector {
                 ),
                 op_info(
                     "youtube.upload_video",
-                    "Upload a video to YouTube",
+                    "Upload a video of at most 16 MiB to YouTube using OAuth",
                     json!({
                         "type": "object",
                         "required": ["title", "description", "video_data_base64"],
                         "properties": {
-                            "title": { "type": "string" },
-                            "description": { "type": "string" },
+                            "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+                            "description": { "type": "string", "description": "Video description, at most 5000 UTF-8 bytes" },
                             "privacy": { "type": "string", "enum": ["private", "unlisted", "public"] },
-                            "video_data_base64": { "type": "string", "description": "Base64-encoded video file data" },
-                            "tags": { "type": "array", "items": { "type": "string" } },
-                            "category_id": { "type": "string" }
+                            "video_data_base64": { "type": "string", "minLength": 4, "maxLength": 22369624, "description": "Canonical standard padded base64 for 1 byte to 16 MiB of video data" },
+                            "tags": { "type": "array", "maxItems": 100, "items": { "type": "string", "minLength": 1 } },
+                            "category_id": { "type": "string", "pattern": "^[0-9]{1,64}$" }
                         }
                     }),
                     json!({
                         "type": "object",
+                        "required": ["videoId", "title", "privacyStatus", "uploadStatus"],
                         "properties": {
                             "videoId": { "type": "string" },
                             "title": { "type": "string" },
@@ -941,7 +942,8 @@ impl YouTubeConnector {
                     AgentHint {
                         when_to_use: "Upload a video to YouTube. Defaults to private visibility.".into(),
                         common_mistakes: vec![
-                            "Video uploads are expensive (1600 quota units) and cannot be undone easily".into(),
+                            "Video uploads require user-authorized OAuth and at most 16 MiB of decoded data".into(),
+                            "An unknown upload outcome requires channel reconciliation before resubmitting".into(),
                             "Always upload as private first, then change visibility after review".into(),
                         ],
                         examples: vec![
@@ -980,6 +982,17 @@ impl YouTubeConnector {
                 });
             }
         };
+
+        if req.operation.as_str() == "youtube.upload_video"
+            && let Some(client) = &self.client
+            && let Err(error) = client.require_video_upload_auth()
+        {
+            let error = error.to_fcp_error();
+            let response = SimulateResponse::denied(req.id, error.to_string(), error.error_code());
+            return serde_json::to_value(response).map_err(|e| FcpError::Internal {
+                message: format!("Failed to serialize response: {e}"),
+            });
+        }
 
         if let Err(error) = validate_youtube_input(req.operation.as_str(), &req.input) {
             let response = SimulateResponse::denied(req.id, error.to_string(), error.error_code());
@@ -1447,22 +1460,20 @@ impl YouTubeConnector {
 
     async fn invoke_upload_video(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
-        let title = require_str(&input, "title")?;
-        let description = require_str(&input, "description")?;
-        let privacy = input
-            .get("privacy")
-            .and_then(|v| v.as_str())
-            .unwrap_or("private");
-        let video_data = require_str(&input, "video_data_base64")?;
-        let tags: Option<Vec<String>> = input.get("tags").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        });
-        let category_id = input.get("category_id").and_then(|v| v.as_str());
+        client
+            .require_video_upload_auth()
+            .map_err(|error| error.to_fcp_error())?;
+        let upload = parse_video_upload_input(&input)?;
 
         let result = client
-            .upload_video(title, description, privacy, video_data, tags, category_id)
+            .upload_video(
+                upload.title,
+                upload.description,
+                upload.privacy,
+                upload.video_data,
+                upload.tags,
+                upload.category_id,
+            )
             .await
             .map_err(|e: YouTubeError| e.to_fcp_error())?;
 
@@ -1962,6 +1973,65 @@ fn youtube_capability_for_operation(operation: &str) -> FcpResult<CapabilityId> 
     }
 }
 
+struct VideoUploadInput<'a> {
+    title: &'a str,
+    description: &'a str,
+    privacy: &'a str,
+    video_data: &'a str,
+    tags: Option<Vec<String>>,
+    category_id: Option<&'a str>,
+}
+
+fn parse_video_upload_input(input: &serde_json::Value) -> FcpResult<VideoUploadInput<'_>> {
+    let optional_string = |field: &str| match input.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: format!("Field {field} must be a string"),
+            }),
+    };
+    let tags = match input.get("tags") {
+        None => None,
+        Some(value) => {
+            let values = value
+                .as_array()
+                .filter(|values| values.len() <= 100)
+                .ok_or_else(|| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "tags must be an array of at most 100 strings".into(),
+                })?;
+            Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|tag| tag.len() <= 64 * 1024)
+                            .map(str::to_owned)
+                            .ok_or_else(|| FcpError::InvalidRequest {
+                                code: 1003,
+                                message:
+                                    "Each tag must be a string within the 64 KiB metadata limit"
+                                        .into(),
+                            })
+                    })
+                    .collect::<FcpResult<Vec<_>>>()?,
+            )
+        }
+    };
+    Ok(VideoUploadInput {
+        title: require_str(input, "title")?,
+        description: require_str(input, "description")?,
+        privacy: optional_string("privacy")?.unwrap_or("private"),
+        video_data: require_str(input, "video_data_base64")?,
+        tags,
+        category_id: optional_string("category_id")?,
+    })
+}
+
 fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
     match operation {
         "youtube.search" => {
@@ -1995,9 +2065,16 @@ fn validate_youtube_input(operation: &str, input: &serde_json::Value) -> FcpResu
             require_str(input, "transcript")?;
         }
         "youtube.upload_video" => {
-            require_str(input, "title")?;
-            require_str(input, "description")?;
-            require_str(input, "video_data_base64")?;
+            let upload = parse_video_upload_input(input)?;
+            crate::client::prepare_video_upload(
+                upload.title,
+                upload.description,
+                upload.privacy,
+                upload.video_data,
+                upload.tags.as_deref(),
+                upload.category_id,
+            )
+            .map_err(|error| error.to_fcp_error())?;
         }
         _ => {
             return Err(FcpError::OperationNotGranted {

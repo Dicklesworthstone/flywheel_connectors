@@ -1111,7 +1111,11 @@ pub fn validate_upload_content_type(content_type: &str) -> Result<(), GoogleRest
         return Err(invalid());
     }
     let parsed = content_type.parse::<mime::Mime>().map_err(|_| invalid())?;
-    if parsed.type_() == mime::STAR || parsed.subtype() == mime::STAR {
+    if parsed.type_() == mime::STAR
+        || parsed.subtype() == mime::STAR
+        || parsed.type_().as_str().is_empty()
+        || parsed.subtype().as_str().is_empty()
+    {
         return Err(invalid());
     }
     Ok(())
