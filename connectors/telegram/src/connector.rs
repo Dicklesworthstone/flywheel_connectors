@@ -203,14 +203,26 @@ fn split_telegram_text_chunks(text: &str, max_utf16_units: usize) -> Vec<String>
 }
 
 fn write_json_file_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
 
     let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    fs::write(&tmp_path, payload)?;
+    let mut tmp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    std::io::Write::write_all(&mut tmp_file, &payload)?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
     fs::rename(&tmp_path, path)?;
+    // A successful rename alone does not make the checkpoint durable after
+    // power loss. A directory-sync error is an uncertain commit, so propagate it.
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -306,6 +318,16 @@ impl PollingCursor for TelegramPollingCursor {
         if let Some(path) = &self.state_path
             && let Some(state) = read_json_file_if_exists::<TelegramPollingCursorState>(path)?
         {
+            if state.version > TELEGRAM_POLLING_CURSOR_STATE_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unsupported Telegram polling cursor version {}",
+                        state.version
+                    ),
+                )
+                .into());
+            }
             if let Some(expected_bot_id) = self.bot_id.as_deref() {
                 let state_bot_id = state.bot_id.as_deref().filter(|value| !value.is_empty());
                 if state_bot_id != Some(expected_bot_id) {
@@ -315,13 +337,17 @@ impl PollingCursor for TelegramPollingCursor {
                 }
             }
 
-            self.offset = state.offset.filter(|offset| {
-                let valid = is_valid_telegram_update_id(*offset);
-                if !valid {
-                    warn!(offset, "Ignoring invalid persisted Telegram polling offset");
-                }
-                valid
-            });
+            if state
+                .offset
+                .is_some_and(|offset| !is_valid_telegram_update_id(offset))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid negative Telegram polling cursor offset",
+                )
+                .into());
+            }
+            self.offset = state.offset;
             self.last_poll_count = self.offset.map_or(0, |_| state.last_poll_count);
         }
         Ok(())
@@ -2957,21 +2983,23 @@ impl TelegramConnector {
                                 );
                                 continue;
                             }
-                            cursor.advance_if_newer(update.update_id);
-
                             if let Some(event) = authorized_update_to_event(
                                 &update,
                                 &connector_id,
                                 &instance_id,
                                 &config.inbound_policy,
                             ) {
-                                base.record_event();
                                 if event_tx.send(Ok(event)).is_err() {
                                     info!("Event receiver dropped, closing polling loop");
                                     let _ = shutdown_tx.send(true);
-                                    break;
+                                    // Returning an error rolls the batch cursor
+                                    // back. A dropped event must not be persisted
+                                    // or acknowledged by a later getUpdates call.
+                                    return Err("Telegram polling event receiver dropped".into());
                                 }
+                                base.record_event();
                             }
+                            cursor.advance_if_newer(update.update_id);
                         }
                         Ok(())
                     },
@@ -5166,6 +5194,149 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn test_polling_preserves_cursor_when_event_receiver_is_missing() {
+        let server = TestTelegramServer::start();
+        server.respond(TestTelegramRoute::new(
+            "POST",
+            token_path("getUpdates"),
+            json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1000,
+                    "message": {
+                        "message_id": 55,
+                        "from": {"id": 7, "is_bot": false, "first_name": "Test"},
+                        "chat": {"id": 99, "type": "private", "first_name": "Test"},
+                        "date": 1700000000,
+                        "text": "must remain replayable"
+                    }
+                }]
+            }),
+        ));
+        let mut connector = TelegramConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential": test_bot_credential(),
+                "base_url": server.uri(),
+                "poll_timeout": 1,
+                "inbound_policy": {"mode": "allowlist", "allowed_user_ids": [7]}
+            }))
+            .await
+            .expect("configure should succeed");
+
+        let zone_dir = unique_zone_dir("polling-missing-receiver");
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        write_json_file_atomic(
+            &cursor_path,
+            &TelegramPollingCursorState {
+                version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+                bot_id: Some(TEST_BOT_ID.to_string()),
+                offset: Some(1000),
+                last_poll_count: 0,
+                updated_at: current_unix_timestamp_secs(),
+            },
+        )
+        .expect("seed the last committed cursor");
+
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0",
+                "zone": "z:work",
+                "zone_dir": zone_dir,
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["telegram.read"]
+            }))
+            .await
+            .expect("handshake should start polling");
+
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while *connector.poll_running.read().await {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("polling must stop when its event receiver is missing");
+        connector
+            .handle_shutdown(json!({}))
+            .await
+            .expect("shutdown should succeed");
+
+        let checkpoint = read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+            .expect("checkpoint should be readable")
+            .expect("checkpoint should exist");
+        assert_eq!(checkpoint.offset, Some(1000));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == token_path("getUpdates"))
+                .count(),
+            1,
+            "failed delivery must not trigger a later provider acknowledgement"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn test_polling_does_not_overwrite_an_unreadable_checkpoint() {
+        let server = TestTelegramServer::start();
+        let mut connector = TelegramConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential": test_bot_credential(),
+                "base_url": server.uri(),
+                "poll_timeout": 1,
+                "inbound_policy": {"mode": "allowlist", "allowed_user_ids": [7]}
+            }))
+            .await
+            .expect("configure should succeed");
+
+        let zone_dir = unique_zone_dir("polling-unreadable-checkpoint");
+        fs::create_dir_all(&zone_dir).expect("create checkpoint directory");
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        let corrupt_checkpoint = b"{\"offset\":1000,";
+        fs::write(&cursor_path, corrupt_checkpoint).expect("write incomplete checkpoint");
+
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0",
+                "zone": "z:work",
+                "zone_dir": zone_dir,
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["telegram.read"]
+            }))
+            .await
+            .expect("handshake should start the polling task");
+
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while *connector.poll_running.read().await {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an unreadable checkpoint must stop polling");
+        connector
+            .handle_shutdown(json!({}))
+            .await
+            .expect("shutdown should succeed");
+
+        assert_eq!(
+            fs::read(&cursor_path).expect("read checkpoint"),
+            corrupt_checkpoint
+        );
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.path != token_path("getUpdates")),
+            "restoration uncertainty must prevent all provider polls"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn test_loopback_polling_routes_root_and_topic_dm_events() {
         let loopback = LoopbackTelegramServer::start();
         let mut connector = TelegramConnector::new();
@@ -7244,9 +7415,58 @@ mod tests {
         write_json_file_atomic(&cursor_path, &state).unwrap();
 
         let mut cursor = TelegramPollingCursor::new(Some(cursor_path), None);
-        cursor.restore().unwrap();
-        assert_eq!(cursor.offset(), None);
-        assert_eq!(cursor.last_poll_count(), 0);
+        cursor.set_offset(42);
+        cursor.record_poll(Instant::now(), 3);
+        let error = cursor
+            .restore()
+            .expect_err("negative checkpoint offset must fail closed");
+        assert!(error.to_string().contains("negative"));
+        assert_eq!(cursor.offset(), Some(42));
+        assert_eq!(cursor.last_poll_count(), 3);
+    }
+
+    #[test]
+    fn test_polling_cursor_restore_rejects_future_version() {
+        let cursor_path =
+            PathBuf::from(unique_zone_dir("cursor-future-version")).join(TELEGRAM_POLL_CURSOR_FILE);
+        let state = TelegramPollingCursorState {
+            version: TELEGRAM_POLLING_CURSOR_STATE_VERSION + 1,
+            bot_id: Some(TEST_BOT_ID.into()),
+            offset: Some(1000),
+            last_poll_count: 1,
+            updated_at: 1700000000,
+        };
+        write_json_file_atomic(&cursor_path, &state).expect("write future checkpoint");
+        let mut cursor = TelegramPollingCursor::new(Some(cursor_path), Some(TEST_BOT_ID.into()));
+        cursor.set_offset(42);
+        let error = cursor
+            .restore()
+            .expect_err("unsupported checkpoint version must fail closed");
+        assert!(error.to_string().contains("version"));
+        assert_eq!(cursor.offset(), Some(42));
+    }
+
+    #[test]
+    fn test_polling_cursor_restore_accepts_compatible_historical_versions() {
+        let cursor_path = PathBuf::from(unique_zone_dir("cursor-historical-version"))
+            .join(TELEGRAM_POLL_CURSOR_FILE);
+        for version in 0..=TELEGRAM_POLLING_CURSOR_STATE_VERSION {
+            let state = TelegramPollingCursorState {
+                version,
+                bot_id: Some(TEST_BOT_ID.into()),
+                offset: Some(42),
+                last_poll_count: 3,
+                updated_at: 1700000000,
+            };
+            write_json_file_atomic(&cursor_path, &state).expect("write compatible checkpoint");
+            let mut cursor =
+                TelegramPollingCursor::new(Some(cursor_path.clone()), Some(TEST_BOT_ID.into()));
+            cursor
+                .restore()
+                .expect("compatible checkpoint should restore");
+            assert_eq!(cursor.offset(), Some(42));
+            assert_eq!(cursor.last_poll_count(), 3);
+        }
     }
 
     // ─── is_telegram_or_local_base_url edge cases ──────────────────

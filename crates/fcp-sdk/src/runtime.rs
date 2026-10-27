@@ -851,8 +851,9 @@ impl StreamingSession for InMemoryStreamingSession {
 /// Cursor state for polling connectors (e.g., getUpdates-style APIs).
 ///
 /// Connectors implement this trait to track the current offset/sequence
-/// and persist it across restarts. This enables exactly-once processing
-/// of updates via offset deduplication.
+/// and persist it across restarts. Durable cursor advancement prevents later
+/// polls from acknowledging progress before the checkpoint is committed.
+/// Processing must tolerate replay if a batch or its checkpoint fails.
 pub trait PollingCursor: Send + Sync {
     /// Get the current cursor offset (e.g., Telegram `update_id`).
     ///
@@ -2625,7 +2626,7 @@ pub struct PollingSupervisorStats {
 /// - Exponential backoff on recoverable errors
 /// - Rate-limit aware backoff (respects Retry-After hints)
 /// - Health state transitions based on success/failure patterns
-/// - Cursor persistence hooks for exactly-once semantics
+/// - Durable cursor commit barriers before acknowledging further provider progress
 ///
 /// # Example
 ///
@@ -2660,6 +2661,7 @@ pub struct PollingSupervisor<C: PollingCursor> {
     cursor: C,
     health: HealthTracker,
     stats: PollingSupervisorStats,
+    cursor_state_error: Option<String>,
 }
 
 impl<C: PollingCursor> PollingSupervisor<C> {
@@ -2670,6 +2672,7 @@ impl<C: PollingCursor> PollingSupervisor<C> {
             cursor,
             health: HealthTracker::new(),
             stats: PollingSupervisorStats::default(),
+            cursor_state_error: None,
         }
     }
 
@@ -2696,6 +2699,28 @@ impl<C: PollingCursor> PollingSupervisor<C> {
     /// Get the supervisor configuration.
     pub const fn config(&self) -> &SupervisorConfig {
         &self.config
+    }
+
+    fn cursor_state_failure(
+        &mut self,
+        action: &'static str,
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> SupervisorOutcome {
+        let message = format!(
+            "Polling cursor {action} failed; durable progress must be reconciled before restarting: {error}"
+        );
+        tracing::error!(error = %error, action, "Stopping polling after cursor state failure");
+        self.health.transition(HealthTransition::ToUnhealthy {
+            reason: message.clone(),
+        });
+        self.cursor_state_error = Some(message.clone());
+        SupervisorOutcome::FatalError { message }
+    }
+
+    fn persist_cursor(&mut self) -> Result<(), SupervisorOutcome> {
+        self.cursor
+            .persist()
+            .map_err(|error| self.cursor_state_failure("persistence", error))
     }
 
     /// Compute the next backoff delay, respecting rate-limit hints.
@@ -2739,6 +2764,19 @@ impl<C: PollingCursor> PollingSupervisor<C> {
     /// # Returns
     ///
     /// Returns the outcome of the supervisor run.
+    ///
+    /// Processing may advance the in-memory cursor, but no subsequent poll is
+    /// issued until that batch's cursor has been persisted. A restore or
+    /// persistence failure is terminal, including during shutdown. The same
+    /// supervisor cannot be restarted after a state failure: reconcile durable
+    /// state and construct a fresh cursor/supervisor. Persistence may have
+    /// partially succeeded, so neither processing nor checkpointing is retried
+    /// automatically after that error.
+    ///
+    /// `process_fn` must return success only after a replay-safe handoff of the
+    /// complete batch. If processing fails, the offset is rolled back and the
+    /// batch may be delivered again; cursor persistence alone does not make
+    /// downstream side effects exactly once.
     #[allow(clippy::too_many_lines)]
     pub async fn run<T, F, Fut, P>(
         &mut self,
@@ -2755,9 +2793,15 @@ impl<C: PollingCursor> PollingSupervisor<C> {
         let poll_interval = Duration::from_millis(poll_interval_ms);
         let mut consecutive_failures: u32 = 0;
 
-        // Restore cursor state if available
-        if let Err(e) = self.cursor.restore() {
-            tracing::warn!(error = %e, "Failed to restore cursor state, starting fresh");
+        if let Some(message) = &self.cursor_state_error {
+            return SupervisorOutcome::FatalError {
+                message: message.clone(),
+            };
+        }
+        // An unreadable checkpoint is not an absent checkpoint. Starting from
+        // a fresh or uncommitted in-memory offset can lose or duplicate work.
+        if let Err(error) = self.cursor.restore() {
+            return self.cursor_state_failure("restoration", error);
         }
 
         // Remain in `Starting` until the first successful poll proves the
@@ -2770,8 +2814,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
             if *shutdown.borrow() {
                 tracing::info!("Polling supervisor received shutdown signal");
                 // Persist cursor before shutdown
-                if let Err(e) = self.cursor.persist() {
-                    tracing::error!(error = %e, "Failed to persist cursor on shutdown");
+                if let Err(outcome) = self.persist_cursor() {
+                    return outcome;
                 }
                 return SupervisorOutcome::Shutdown;
             }
@@ -2818,8 +2862,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                                 max = self.config.max_consecutive_failures,
                                 "Maximum consecutive failures reached"
                             );
-                            if let Err(e) = self.cursor.persist() {
-                                tracing::error!(error = %e, "Failed to persist cursor");
+                            if let Err(outcome) = self.persist_cursor() {
+                                return outcome;
                             }
                             return SupervisorOutcome::MaxFailuresReached {
                                 failures: consecutive_failures,
@@ -2840,12 +2884,21 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                             .await
                             .is_err()
                         {
-                            if let Err(e) = self.cursor.persist() {
-                                tracing::error!(error = %e, "Failed to persist cursor on shutdown");
+                            if let Err(outcome) = self.persist_cursor() {
+                                return outcome;
                             }
                             return SupervisorOutcome::Shutdown;
                         }
                         continue;
+                    }
+
+                    // This is the commit barrier: a later poll may acknowledge
+                    // the advanced offset at the provider. Do not report the
+                    // batch as successful or poll again if its checkpoint fails.
+                    if item_count > 0
+                        && let Err(outcome) = self.persist_cursor()
+                    {
+                        return outcome;
                     }
 
                     self.stats.successful_polls += 1;
@@ -2854,12 +2907,6 @@ impl<C: PollingCursor> PollingSupervisor<C> {
 
                     self.health.record_success();
                     self.health.evaluate(&self.config);
-
-                    if item_count > 0
-                        && let Err(e) = self.cursor.persist()
-                    {
-                        tracing::warn!(error = %e, "Failed to persist cursor");
-                    }
 
                     tracing::debug!(
                         items = item_count,
@@ -2872,8 +2919,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                         .await
                         .is_err()
                     {
-                        if let Err(e) = self.cursor.persist() {
-                            tracing::error!(error = %e, "Failed to persist cursor on shutdown");
+                        if let Err(outcome) = self.persist_cursor() {
+                            return outcome;
                         }
                         return SupervisorOutcome::Shutdown;
                     }
@@ -2905,8 +2952,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                             max = self.config.max_consecutive_failures,
                             "Maximum consecutive failures reached"
                         );
-                        if let Err(e) = self.cursor.persist() {
-                            tracing::error!(error = %e, "Failed to persist cursor");
+                        if let Err(outcome) = self.persist_cursor() {
+                            return outcome;
                         }
                         return SupervisorOutcome::MaxFailuresReached {
                             failures: consecutive_failures,
@@ -2929,8 +2976,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                         .await
                         .is_err()
                     {
-                        if let Err(e) = self.cursor.persist() {
-                            tracing::error!(error = %e, "Failed to persist cursor on shutdown");
+                        if let Err(outcome) = self.persist_cursor() {
+                            return outcome;
                         }
                         return SupervisorOutcome::Shutdown;
                     }
@@ -2942,8 +2989,8 @@ impl<C: PollingCursor> PollingSupervisor<C> {
                     self.health.transition(HealthTransition::ToUnhealthy {
                         reason: message.clone(),
                     });
-                    if let Err(e) = self.cursor.persist() {
-                        tracing::error!(error = %e, "Failed to persist cursor");
+                    if let Err(outcome) = self.persist_cursor() {
+                        return outcome;
                     }
                     return SupervisorOutcome::FatalError { message };
                 }
@@ -6598,6 +6645,291 @@ deny_ptrace = true
             assert_eq!(supervisor.stats().items_processed, 3);
             assert_eq!(supervisor.cursor().offset(), Some(31));
         });
+    }
+
+    #[derive(Debug, Default)]
+    struct FaultyPollingCheckpoint {
+        committed_offset: Option<i64>,
+        restore_calls: usize,
+        persist_calls: usize,
+        fail_restore: bool,
+        fail_persist: bool,
+        write_before_failure: bool,
+    }
+
+    #[derive(Debug)]
+    struct FaultInjectingPollingCursor {
+        inner: InMemoryPollingCursor,
+        checkpoint: Arc<Mutex<FaultyPollingCheckpoint>>,
+    }
+
+    impl FaultInjectingPollingCursor {
+        fn new(checkpoint: Arc<Mutex<FaultyPollingCheckpoint>>) -> Self {
+            Self {
+                inner: InMemoryPollingCursor::new(),
+                checkpoint,
+            }
+        }
+    }
+
+    impl PollingCursor for FaultInjectingPollingCursor {
+        fn offset(&self) -> Option<i64> {
+            self.inner.offset()
+        }
+
+        fn set_offset(&mut self, offset: i64) {
+            self.inner.set_offset(offset);
+        }
+
+        fn clear_offset(&mut self) {
+            self.inner.clear_offset();
+        }
+
+        fn last_poll_at(&self) -> Option<Instant> {
+            self.inner.last_poll_at()
+        }
+
+        fn record_poll(&mut self, at: Instant, updates_received: usize) {
+            self.inner.record_poll(at, updates_received);
+        }
+
+        fn last_poll_count(&self) -> usize {
+            self.inner.last_poll_count()
+        }
+
+        fn persist(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut checkpoint = self.checkpoint.lock().expect("checkpoint lock");
+            checkpoint.persist_calls += 1;
+            if !checkpoint.fail_persist || checkpoint.write_before_failure {
+                checkpoint.committed_offset = self.offset();
+            }
+            if checkpoint.fail_persist {
+                return Err(io::Error::other("checkpoint write failed").into());
+            }
+            Ok(())
+        }
+
+        fn restore(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut checkpoint = self.checkpoint.lock().expect("checkpoint lock");
+            checkpoint.restore_calls += 1;
+            if checkpoint.fail_restore {
+                return Err(io::Error::other("checkpoint read failed").into());
+            }
+            let offset = checkpoint.committed_offset;
+            drop(checkpoint);
+            match offset {
+                Some(offset) => self.inner.set_offset(offset),
+                None => self.inner.clear_offset(),
+            }
+            Ok(())
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_refuses_to_poll_after_cursor_restore_failure() {
+        let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+            committed_offset: Some(40),
+            fail_restore: true,
+            ..Default::default()
+        }));
+        let cursor = FaultInjectingPollingCursor::new(Arc::clone(&checkpoint));
+        let mut supervisor = PollingSupervisor::new(SupervisorConfig::default(), cursor);
+        let poll_count = AtomicUsize::new(0);
+        let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+
+        for _ in 0..2 {
+            let outcome = supervisor
+                .run(
+                    shutdown_rx.clone(),
+                    1,
+                    |_| {
+                        poll_count.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(PollResult::<i64>::fatal("unexpected poll"))
+                    },
+                    |_, _| panic!("an unreadable checkpoint must prevent processing"),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message }
+                    if message.contains("restoration") && message.contains("checkpoint read failed")
+            ));
+            checkpoint.lock().expect("checkpoint lock").fail_restore = false;
+        }
+
+        assert_eq!(poll_count.load(Ordering::SeqCst), 0);
+        assert_eq!(supervisor.stats().total_polls, 0);
+        assert!(supervisor.health().is_unhealthy());
+        let checkpoint = checkpoint.lock().expect("checkpoint lock");
+        assert_eq!(checkpoint.restore_calls, 1);
+        assert_eq!(checkpoint.persist_calls, 0);
+        assert_eq!(checkpoint.committed_offset, Some(40));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_stops_before_acknowledging_an_uncertain_checkpoint() {
+        for write_before_failure in [false, true] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+                committed_offset: Some(40),
+                fail_persist: true,
+                write_before_failure,
+                ..Default::default()
+            }));
+            let cursor = FaultInjectingPollingCursor::new(Arc::clone(&checkpoint));
+            let mut supervisor = PollingSupervisor::new(SupervisorConfig::default(), cursor);
+            let poll_count = AtomicUsize::new(0);
+            let mut process_count = 0;
+            let (_shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+
+            let outcome = supervisor
+                .run(
+                    shutdown_rx.clone(),
+                    1,
+                    |offset| {
+                        let attempt = poll_count.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(if attempt == 0 {
+                            assert_eq!(offset, Some(40));
+                            PollResult::success(vec![41])
+                        } else {
+                            PollResult::fatal("poll acknowledged an uncommitted cursor")
+                        })
+                    },
+                    |items, cursor| {
+                        process_count += 1;
+                        cursor.advance_if_newer(items[0]);
+                        Ok(())
+                    },
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message }
+                    if message.contains("persistence") && message.contains("checkpoint write failed")
+            ));
+            assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+            assert_eq!(process_count, 1);
+            assert_eq!(supervisor.cursor().offset(), Some(42));
+            assert_eq!(supervisor.stats().successful_polls, 0);
+            assert_eq!(supervisor.stats().items_processed, 0);
+            assert!(supervisor.health().is_unhealthy());
+
+            // A failed save may already have replaced the durable checkpoint.
+            // Do not roll it back, retry delivery, or reuse uncommitted memory.
+            {
+                let mut checkpoint = checkpoint.lock().expect("checkpoint lock");
+                assert_eq!(checkpoint.restore_calls, 1);
+                assert_eq!(checkpoint.persist_calls, 1);
+                assert_eq!(
+                    checkpoint.committed_offset,
+                    Some(if write_before_failure { 42 } else { 40 })
+                );
+                checkpoint.fail_persist = false;
+            }
+            let outcome = supervisor
+                .run(
+                    shutdown_rx,
+                    1,
+                    |_| {
+                        poll_count.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(PollResult::<i64>::fatal("unsafe restart"))
+                    },
+                    |_, _| panic!("a failed checkpoint must prevent another run"),
+                )
+                .await;
+            assert!(matches!(outcome, SupervisorOutcome::FatalError { .. }));
+            assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+            let checkpoint = checkpoint.lock().expect("checkpoint lock");
+            assert_eq!(checkpoint.restore_calls, 1);
+            assert_eq!(checkpoint.persist_calls, 1);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_commits_each_batch_before_next_offset() {
+        let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+            committed_offset: Some(40),
+            ..Default::default()
+        }));
+        let cursor = FaultInjectingPollingCursor::new(Arc::clone(&checkpoint));
+        let mut supervisor = PollingSupervisor::new(SupervisorConfig::default(), cursor);
+        let poll_count = AtomicUsize::new(0);
+        let (shutdown_tx, shutdown_rx) = fcp_async_core::channel::watch::channel(false);
+
+        let outcome = supervisor
+            .run(
+                shutdown_rx,
+                1,
+                |offset| {
+                    let checkpoint = checkpoint.lock().expect("checkpoint lock");
+                    assert_eq!(offset, checkpoint.committed_offset);
+                    let attempt = poll_count.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(if attempt == 0 {
+                        assert_eq!(offset, Some(40));
+                        assert_eq!(checkpoint.persist_calls, 0);
+                        PollResult::success(vec![41])
+                    } else {
+                        assert_eq!(attempt, 1);
+                        assert_eq!(offset, Some(42));
+                        assert_eq!(checkpoint.persist_calls, 1);
+                        shutdown_tx.send(true).expect("shutdown receiver alive");
+                        PollResult::empty()
+                    })
+                },
+                |items, cursor| {
+                    cursor.advance_if_newer(items[0]);
+                    Ok(())
+                },
+            )
+            .await;
+
+        assert!(matches!(outcome, SupervisorOutcome::Shutdown));
+        assert_eq!(poll_count.load(Ordering::SeqCst), 2);
+        assert_eq!(supervisor.stats().successful_polls, 2);
+        assert_eq!(supervisor.stats().items_processed, 1);
+        let checkpoint = checkpoint.lock().expect("checkpoint lock");
+        assert_eq!(checkpoint.committed_offset, Some(42));
+        // One commit for the nonempty batch, one final save on shutdown.
+        assert_eq!(checkpoint.persist_calls, 2);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn polling_supervisor_reports_failed_shutdown_checkpoint() {
+        for already_shutting_down in [false, true] {
+            let checkpoint = Arc::new(Mutex::new(FaultyPollingCheckpoint {
+                committed_offset: Some(40),
+                fail_persist: true,
+                ..Default::default()
+            }));
+            let cursor = FaultInjectingPollingCursor::new(Arc::clone(&checkpoint));
+            let mut supervisor = PollingSupervisor::new(SupervisorConfig::default(), cursor);
+            let (shutdown_tx, shutdown_rx) =
+                fcp_async_core::channel::watch::channel(already_shutting_down);
+
+            let outcome = supervisor
+                .run(
+                    shutdown_rx,
+                    1,
+                    |_| {
+                        shutdown_tx.send(true).expect("shutdown receiver alive");
+                        std::future::ready(PollResult::<i64>::empty())
+                    },
+                    |_, _| panic!("an empty poll must not call the processor"),
+                )
+                .await;
+
+            assert!(matches!(
+                outcome,
+                SupervisorOutcome::FatalError { message } if message.contains("persistence")
+            ));
+            assert!(supervisor.health().is_unhealthy());
+            assert_eq!(
+                supervisor.stats().total_polls,
+                u64::from(!already_shutting_down)
+            );
+            let checkpoint = checkpoint.lock().expect("checkpoint lock");
+            assert_eq!(checkpoint.persist_calls, 1);
+            assert_eq!(checkpoint.committed_offset, Some(40));
+        }
     }
 
     #[derive(Debug, Default)]
