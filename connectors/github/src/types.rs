@@ -155,7 +155,96 @@ pub struct FileContent {
     pub content: Option<String>,
     #[serde(default)]
     pub encoding: Option<String>,
-    pub html_url: String,
+    #[serde(default)]
+    pub html_url: Option<String>,
+    /// Symlink target, when GitHub returns the link rather than its contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The origin of a submodule, including submodules hosted outside GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodule_git_url: Option<String>,
+}
+
+/// The contents endpoint returns an object for a file, symlink or submodule,
+/// and an array for a directory. Preserve those provider shapes in FCP output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RepositoryContent {
+    Entry(FileContent),
+    Directory(Vec<FileContent>),
+}
+
+/// Explicit page selection. One invocation makes one bounded provider request;
+/// callers can continue with the returned `next_page` and the same `per_page`.
+#[derive(Debug, Clone, Copy)]
+pub struct PageRequest {
+    pub page: u32,
+    pub per_page: u32,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            per_page: 100,
+        }
+    }
+}
+
+impl PageRequest {
+    /// Reject invalid page sizes and offsets outside GitHub's search window.
+    ///
+    /// # Errors
+    /// Returns a validation error before any request is sent.
+    pub fn validate(self, search: bool) -> crate::error::GitHubResult<Self> {
+        if self.page == 0 || !(1..=100).contains(&self.per_page) {
+            return Err(crate::error::GitHubError::ValidationError {
+                message: "page must be positive and per_page must be between 1 and 100".into(),
+            });
+        }
+        if search && u64::from(self.page - 1) * u64::from(self.per_page) >= 1_000 {
+            return Err(crate::error::GitHubError::ValidationError {
+                message: "GitHub search exposes only the first 1000 results; narrow the query"
+                    .into(),
+            });
+        }
+        Ok(self)
+    }
+
+    /// Describe continuation without fetching more pages or hiding the provider
+    /// total. An incomplete search remains separately visible in its response.
+    #[must_use]
+    pub fn metadata(self, total_count: u64, returned: usize, search: bool) -> Pagination {
+        let accessible_total_count = if search {
+            total_count.min(1_000)
+        } else {
+            total_count
+        };
+        let page_end = u64::from(self.page) * u64::from(self.per_page);
+        Pagination {
+            page: self.page,
+            per_page: self.per_page,
+            returned,
+            next_page: (page_end < accessible_total_count)
+                .then(|| self.page.checked_add(1))
+                .flatten(),
+            accessible_total_count,
+            result_limit: search.then_some(1_000),
+            result_limit_exceeded: search && total_count > 1_000,
+        }
+    }
+}
+
+/// Bounded continuation metadata for searches and workflow inventories.
+#[derive(Debug, Clone, Serialize)]
+pub struct Pagination {
+    pub page: u32,
+    pub per_page: u32,
+    pub returned: usize,
+    pub next_page: Option<u32>,
+    pub accessible_total_count: u64,
+    pub result_limit: Option<u32>,
+    pub result_limit_exceeded: bool,
 }
 
 /// Search results wrapper.
@@ -1127,7 +1216,9 @@ mod tests {
             content_type: "file".into(),
             content: Some("base64data".into()),
             encoding: Some("base64".into()),
-            html_url: "https://github.com/org/repo/blob/main/src/lib.rs".into(),
+            html_url: Some("https://github.com/org/repo/blob/main/src/lib.rs".into()),
+            target: None,
+            submodule_git_url: None,
         };
         let cloned = fc.clone();
         assert_eq!(cloned.name, "lib.rs");
@@ -1145,7 +1236,9 @@ mod tests {
             content_type: "file".into(),
             content: Some("SGVsbG8gV29ybGQ=".into()),
             encoding: Some("base64".into()),
-            html_url: "https://github.com/org/repo/blob/main/README.md".into(),
+            html_url: Some("https://github.com/org/repo/blob/main/README.md".into()),
+            target: None,
+            submodule_git_url: None,
         };
         let serialized = serde_json::to_string(&fc).unwrap();
         let back: FileContent = serde_json::from_str(&serialized).unwrap();

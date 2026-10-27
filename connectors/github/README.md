@@ -149,6 +149,61 @@ The current GitHub README slice documents the existing runtime surface:
 | `github.search_code` | `GET /search/code?q={query}` | `github.read` | `Safe` | `Low` | `Strict` | Searches code using GitHub search syntax. |
 | `github.process_webhook` | local only, no provider egress | `github.process_webhook` | `Safe` | `Low` | `Strict` | Converts a host-verified webhook payload into a typed event object. |
 
+## Pagination, Repository Refs, And Workflow Inputs
+
+`github.search_issues`, `github.search_repos`, `github.search_code`, and
+`github.list_workflows` return one provider page per invocation. All four accept
+`page` (a positive integer, default `1`) and `per_page` (an integer from `1` to
+`100`, default `100`). For example, the input for a second issue-search page is:
+
+```json
+{"query": "repo:octocat/hello-world is:issue", "page": 2, "per_page": 100}
+```
+
+The response preserves the provider's `total_count` and item collection and adds
+`pagination` with `page`, `per_page`, `returned`, `next_page`,
+`accessible_total_count`, `result_limit`, and `result_limit_exceeded`. Continue
+with `next_page`, keeping the query and page size unchanged; `null` means there
+is no next page within the accessible result window. Pagination reflects the
+provider's reported count, so concurrent repository changes can alter subsequent
+pages.
+
+GitHub search exposes at most the first `1000` matches for a query. Search
+responses report `result_limit: 1000`, cap `accessible_total_count` at `1000`, and
+set `result_limit_exceeded` when more matches exist. Narrow the query to retrieve
+additional matches. The provider's `incomplete_results` flag is also returned;
+`false` is required before treating a search as complete. Requests whose page
+starts beyond the search window fail locally. Workflow inventories have no
+search-result cap and report `result_limit: null`.
+
+`github.get_file_content` accepts an optional nonempty `ref` containing a branch,
+tag, or commit SHA. Omit it to use the repository's default branch. An empty
+`path` lists the repository root:
+
+```json
+{"owner": "octocat", "repo": "hello-world", "path": "", "ref": "main"}
+```
+
+The response's `content` is an object for a single file and an array for a
+directory, including an empty array for an empty directory. File contents retain
+GitHub's encoding metadata; symlink targets and submodule URLs are preserved when
+provided, and `html_url` may be `null` for external submodules. GitHub limits a
+directory response to `1000` entries; the Contents API does not paginate those
+entries.
+
+`github.trigger_workflow` accepts a workflow ID or YAML filename, the required
+`ref`, and an optional `inputs` object with at most `25` properties. Input values
+are forwarded without coercion and must satisfy the workflow's declared inputs:
+
+```json
+{"owner": "octocat", "repo": "hello-world", "workflow_id": "deploy.yml", "ref": "main", "inputs": {"environment": "staging", "dry_run": true}}
+```
+
+Successful dispatch responses, including GitHub's empty `204 No Content`, return
+`{"triggered": true}`. Dispatch is non-idempotent: the connector does not replay
+an ambiguous provider failure or a transport failure after submission. Inspect
+the repository's workflow runs before deciding whether to dispatch again.
+
 ## Resource URIs
 
 Runtime capability-token verification binds operations to these resource URI shapes:

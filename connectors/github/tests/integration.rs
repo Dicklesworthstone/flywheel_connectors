@@ -23,7 +23,7 @@ use fcp_testkit::AsyncTestContext;
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{header, method, path},
+    matchers::{body_json, header, method, path, query_param},
 };
 
 use fcp_github::client::GitHubClient;
@@ -530,7 +530,7 @@ async fn trigger_workflow_happy_path() {
         .and(path(
             "/repos/octocat/hello-world/actions/workflows/ci.yml/dispatches",
         ))
-        .respond_with(ResponseTemplate::new(202))
+        .respond_with(ResponseTemplate::new(204))
         .mount(&mock_server)
         .await;
 
@@ -554,6 +554,66 @@ async fn trigger_workflow_happy_path() {
         .expect("trigger_workflow should succeed");
 
     assert!(result["triggered"].as_bool().unwrap());
+}
+
+#[fcp_async_core::test]
+async fn workflow_dispatch_preserves_inputs_and_accepts_success_without_replay() {
+    for status in [200, 202, 204] {
+        let server = MockServer::start().await;
+        let inputs = json!({ "environment": "staging", "dry_run": true, "count": 3 });
+        Mock::given(method("POST"))
+            .and(path(
+                "/repos/octocat/hello-world/actions/workflows/ci.yml/dispatches",
+            ))
+            .and(body_json(
+                json!({ "ref": "release/next", "inputs": inputs }),
+            ))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = GitHubConnector::new();
+        setup_configure(&mut connector, &server.uri()).await;
+        let key = setup_handshake(&mut connector, &["github.trigger_workflow"]).await;
+        let token = generate_valid_bound_token(&key, &connector, "github.trigger_workflow");
+        let result = connector
+            .handle_invoke(json!({
+                "operation": "github.trigger_workflow",
+                "input": { "owner": "octocat", "repo": "hello-world", "workflow_id": "ci.yml",
+                    "ref": "release/next", "inputs": inputs },
+                "capability_token": token
+            }))
+            .await
+            .expect("a successful dispatch must not become an error while decoding an empty body");
+        assert_eq!(result["triggered"], true);
+        server.verify().await;
+    }
+}
+
+#[fcp_async_core::test]
+async fn workflow_dispatch_does_not_replay_ambiguous_provider_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/repos/octocat/hello-world/actions/workflows/ci.yml/dispatches",
+        ))
+        .respond_with(
+            ResponseTemplate::new(502).set_body_json(github_error_response("upstream failure")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = GitHubClient::new("test-token")
+        .unwrap()
+        .with_base_url(server.uri())
+        .with_retry_config(3, 1, 1);
+    assert!(
+        client
+            .trigger_workflow("octocat", "hello-world", "ci.yml", "main", None)
+            .await
+            .is_err()
+    );
+    server.verify().await;
 }
 
 // ============================================================================
@@ -601,6 +661,299 @@ async fn get_file_content_happy_path() {
 
     assert_eq!(result["content"]["name"], "README.md");
     assert_eq!(result["content"]["encoding"], "base64");
+}
+
+#[fcp_async_core::test]
+async fn repository_content_lists_root_and_directory_at_explicit_ref() {
+    let server = MockServer::start().await;
+    let git_ref = "feature/a &b#c";
+    let entries = json!([
+        { "name": "src", "path": "src", "sha": "abc", "size": 0, "type": "dir",
+            "html_url": "https://github.com/octocat/hello-world/tree/main/src" },
+        { "name": "vendor", "path": "vendor", "sha": "def", "size": 0, "type": "file",
+            "html_url": null, "submodule_git_url": "https://example.org/vendor.git" }
+    ]);
+    for (requested_path, response) in [("", entries.clone()), ("empty", json!([]))] {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/octocat/hello-world/contents/{requested_path}"
+            )))
+            .and(query_param("ref", git_ref))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["github.get_file_content"]).await;
+    for requested_path in ["", "empty"] {
+        let token = generate_valid_bound_token(&key, &connector, "github.get_file_content");
+        let result = connector.handle_invoke(json!({
+            "operation": "github.get_file_content",
+            "input": { "owner": "octocat", "repo": "hello-world", "path": requested_path, "ref": git_ref },
+            "capability_token": token
+        })).await.expect("directory arrays must deserialize, including an empty root path");
+        let items = result["content"]
+            .as_array()
+            .expect("directory response stays an array");
+        if requested_path.is_empty() {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0]["type"], "dir");
+            assert!(items[1]["html_url"].is_null());
+            assert_eq!(
+                items[1]["submodule_git_url"],
+                "https://example.org/vendor.git"
+            );
+        } else {
+            assert!(items.is_empty());
+        }
+    }
+    server.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn searches_expose_bounded_continuation_and_incomplete_results() {
+    let server = MockServer::start().await;
+    let query = "repo:octocat/hello-world bug &feature";
+    let operations = [
+        ("github.search_issues", "/search/issues"),
+        ("github.search_repos", "/search/repositories"),
+        ("github.search_code", "/search/code"),
+    ];
+    for (_, endpoint) in operations {
+        for page in [2, 3] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .and(query_param("q", query))
+                .and(query_param("page", page.to_string()))
+                .and(query_param("per_page", "2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "total_count": 5, "incomplete_results": page == 2, "items": []
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+    }
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &operations.map(|(op, _)| op)).await;
+    for (operation, _) in operations {
+        for page in [2, 3] {
+            let token = generate_valid_bound_token(&key, &connector, operation);
+            let result = connector
+                .handle_invoke(json!({
+                    "operation": operation,
+                    "input": { "query": query, "page": page, "per_page": 2 },
+                    "capability_token": token
+                }))
+                .await
+                .expect("each invocation should retrieve the selected provider page");
+            assert_eq!(result["total_count"], 5);
+            assert_eq!(result["incomplete_results"], page == 2);
+            assert_eq!(result["pagination"]["page"], page);
+            assert_eq!(result["pagination"]["per_page"], 2);
+            assert_eq!(
+                result["pagination"]["next_page"],
+                if page == 2 { json!(3) } else { json!(null) }
+            );
+            assert_eq!(result["pagination"]["accessible_total_count"], 5);
+        }
+    }
+    server.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn search_result_limit_is_explicit_without_hiding_provider_total() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .and(query_param("page", "10"))
+        .and(query_param("per_page", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1200, "incomplete_results": false,
+            "items": [github_issue_response(1000, "Last accessible issue", "open")]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["github.search_issues"]).await;
+    let token = generate_valid_bound_token(&key, &connector, "github.search_issues");
+    let result = connector
+        .handle_invoke(json!({
+            "operation": "github.search_issues", "input": { "query": "bug", "page": 10 },
+            "capability_token": token
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result["total_count"], 1200);
+    assert_eq!(result["items"][0]["number"], 1000);
+    assert_eq!(result["pagination"]["returned"], 1);
+    assert_eq!(result["pagination"]["accessible_total_count"], 1000);
+    assert_eq!(result["pagination"]["result_limit"], 1000);
+    assert_eq!(result["pagination"]["result_limit_exceeded"], true);
+    assert!(result["pagination"]["next_page"].is_null());
+    server.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn workflow_inventory_continues_past_search_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/hello-world/actions/workflows"))
+        .and(query_param("page", "11"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "total_count": 1101, "workflows": [] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["github.list_workflows"]).await;
+    let token = generate_valid_bound_token(&key, &connector, "github.list_workflows");
+    let result = connector.handle_invoke(json!({
+        "operation": "github.list_workflows", "input": { "owner": "octocat", "repo": "hello-world", "page": 11 },
+        "capability_token": token
+    })).await.unwrap();
+    assert_eq!(result["pagination"]["next_page"], 12);
+    assert_eq!(result["pagination"]["accessible_total_count"], 1101);
+    assert!(result["pagination"]["result_limit"].is_null());
+    assert_eq!(result["pagination"]["result_limit_exceeded"], false);
+    server.verify().await;
+}
+
+#[fcp_async_core::test]
+async fn invalid_pagination_fails_before_network_or_simulation() {
+    let server = MockServer::start().await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let operations = [
+        "github.search_issues",
+        "github.search_repos",
+        "github.search_code",
+        "github.list_workflows",
+    ];
+    let key = setup_handshake(&mut connector, &operations).await;
+    for operation in operations {
+        for invalid in [
+            json!({ "page": 0 }),
+            json!({ "page": -1 }),
+            json!({ "page": "2" }),
+            json!({ "page": null }),
+            json!({ "page": 4_294_967_296_u64 }),
+            json!({ "per_page": 0 }),
+            json!({ "per_page": 101 }),
+            json!({ "per_page": 1.5 }),
+        ] {
+            let mut input = json!({ "owner": "octocat", "repo": "hello-world", "query": "test" });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            let token = generate_valid_bound_token(&key, &connector, operation);
+            let simulation = connector
+                .handle_simulate(json!({
+                    "type": "simulate", "id": "invalid-page", "connector_id": "github",
+                    "operation": operation, "zone_id": "z:work", "input": input,
+                    "capability_token": token, "estimate_cost": false, "check_availability": false
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                simulation["would_succeed"], false,
+                "simulation must reject {input}"
+            );
+            let error = connector
+                .handle_invoke(json!({
+                    "operation": operation, "input": input, "capability_token": token
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, fcp_core::FcpError::InvalidRequest { .. }),
+                "{operation}: {error}"
+            );
+        }
+        if operation != "github.list_workflows" {
+            let token = generate_valid_bound_token(&key, &connector, operation);
+            let error = connector.handle_invoke(json!({
+                "operation": operation, "input": { "query": "test", "page": 11 }, "capability_token": token
+            })).await.unwrap_err();
+            assert!(matches!(error, fcp_core::FcpError::InvalidRequest { .. }));
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn content_ref_and_workflow_inputs_reject_invalid_shapes_before_network() {
+    let server = MockServer::start().await;
+    let mut connector = GitHubConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(
+        &mut connector,
+        &["github.get_file_content", "github.trigger_workflow"],
+    )
+    .await;
+    for git_ref in [json!(null), json!(4), json!(""), json!("  ")] {
+        let token = generate_valid_bound_token(&key, &connector, "github.get_file_content");
+        let error = connector.handle_invoke(json!({
+            "operation": "github.get_file_content",
+            "input": { "owner": "octocat", "repo": "hello-world", "path": "README.md", "ref": git_ref },
+            "capability_token": token
+        })).await.unwrap_err();
+        assert!(matches!(error, fcp_core::FcpError::InvalidRequest { .. }));
+    }
+    let too_many: serde_json::Map<String, serde_json::Value> = (0..26)
+        .map(|index| (format!("input{index}"), json!("value")))
+        .collect();
+    for inputs in [json!(null), json!([]), json!("a=b"), json!(too_many)] {
+        let token = generate_valid_bound_token(&key, &connector, "github.trigger_workflow");
+        let error = connector.handle_invoke(json!({
+            "operation": "github.trigger_workflow",
+            "input": { "owner": "octocat", "repo": "hello-world", "workflow_id": "ci.yml", "ref": "main", "inputs": inputs },
+            "capability_token": token
+        })).await.unwrap_err();
+        assert!(matches!(error, fcp_core::FcpError::InvalidRequest { .. }));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::test]
+async fn pagination_and_content_schemas_match_manifest_and_introspection() {
+    let manifest =
+        fcp_manifest::ConnectorManifest::parse_str_unchecked(include_str!("../manifest.toml"))
+            .unwrap();
+    let introspection = GitHubConnector::new().handle_introspect().await.unwrap();
+    for operation in [
+        "github.search_issues",
+        "github.search_repos",
+        "github.search_code",
+        "github.list_workflows",
+        "github.get_file_content",
+    ] {
+        let runtime = introspection["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == operation)
+            .unwrap();
+        let declared = &manifest.provides.operations[operation];
+        assert_eq!(
+            runtime["input_schema"], declared.input_schema,
+            "input schema for {operation}"
+        );
+        assert_eq!(
+            runtime["output_schema"], declared.output_schema,
+            "output schema for {operation}"
+        );
+    }
 }
 
 /// Search code.

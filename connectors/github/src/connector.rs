@@ -25,7 +25,9 @@ use tracing::{info, instrument};
 
 use crate::client::{DEFAULT_BASE_URL, GitHubAuth, GitHubClient};
 use crate::error::GitHubError;
-use crate::types::{CreateIssueRequest, CreatePullRequestRequest, MergePullRequestRequest};
+use crate::types::{
+    CreateIssueRequest, CreatePullRequestRequest, MergePullRequestRequest, PageRequest,
+};
 
 const GITHUB_DEFAULT_OAUTH_SCOPES: &[&str] = &["repo", "read:user"];
 const WEBHOOK_DELIVERY_CACHE_LIMIT: usize = 1024;
@@ -578,18 +580,8 @@ impl GitHubConnector {
                 op_info(
                     "github.search_issues",
                     "Search issues and pull requests",
-                    json!({
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": { "query": { "type": "string" } }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "items": { "type": "array" },
-                            "total_count": { "type": "integer" }
-                        }
-                    }),
+                    search_input_schema(),
+                    paginated_output_schema("items", true),
                     "github.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -712,18 +704,8 @@ impl GitHubConnector {
                 op_info(
                     "github.search_repos",
                     "Search repositories",
-                    json!({
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": { "query": { "type": "string" } }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "items": { "type": "array" },
-                            "total_count": { "type": "integer" }
-                        }
-                    }),
+                    search_input_schema(),
+                    paginated_output_schema("items", true),
                     "github.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -743,16 +725,12 @@ impl GitHubConnector {
                         "required": ["owner", "repo"],
                         "properties": {
                             "owner": { "type": "string" },
-                            "repo": { "type": "string" }
+                            "repo": { "type": "string" },
+                            "page": { "type": "integer", "minimum": 1, "default": 1 },
+                            "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "default": 100 }
                         }
                     }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "workflows": { "type": "array" },
-                            "total_count": { "type": "integer" }
-                        }
-                    }),
+                    paginated_output_schema("workflows", false),
                     "github.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -774,7 +752,8 @@ impl GitHubConnector {
                             "owner": { "type": "string" },
                             "repo": { "type": "string" },
                             "workflow_id": { "type": "string" },
-                            "ref": { "type": "string" }
+                            "ref": { "type": "string" },
+                            "inputs": { "type": "object", "maxProperties": 25 }
                         }
                     }),
                     json!({ "type": "object", "properties": { "triggered": { "type": "boolean" } } }),
@@ -784,7 +763,7 @@ impl GitHubConnector {
                     IdempotencyClass::None,
                     AgentHint {
                         when_to_use: "Manually trigger a GitHub Actions workflow.".into(),
-                        common_mistakes: vec!["Using workflow file name instead of ID".into()],
+                        common_mistakes: vec!["Omitting required workflow inputs; workflow_id accepts either the numeric ID or file name".into()],
                         examples: vec![
                             r#"{"owner": "octocat", "repo": "hello-world", "workflow_id": "ci.yml", "ref": "main"}"#.into(),
                         ],
@@ -800,16 +779,17 @@ impl GitHubConnector {
                         "properties": {
                             "owner": { "type": "string" },
                             "repo": { "type": "string" },
-                            "path": { "type": "string" }
+                            "path": { "type": "string", "description": "File or directory path; use an empty string for the repository root" },
+                            "ref": { "type": "string", "minLength": 1 }
                         }
                     }),
-                    json!({ "type": "object", "properties": { "content": { "type": "object" } } }),
+                    json!({ "type": "object", "required": ["content"], "properties": { "content": { "type": ["object", "array"] } } }),
                     "github.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
                     IdempotencyClass::Strict,
                     AgentHint {
-                        when_to_use: "Read file content from a repository.".into(),
+                        when_to_use: "Read a file or list a directory at a branch, tag or commit; directory listings are limited by GitHub to 1000 entries.".into(),
                         common_mistakes: vec!["Not specifying a ref for a specific branch".into()],
                         examples: vec![
                             r#"{"owner": "octocat", "repo": "hello-world", "path": "README.md"}"#.into(),
@@ -820,18 +800,8 @@ impl GitHubConnector {
                 op_info(
                     "github.search_code",
                     "Search code across repositories",
-                    json!({
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": { "query": { "type": "string" } }
-                    }),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "items": { "type": "array" },
-                            "total_count": { "type": "integer" }
-                        }
-                    }),
+                    search_input_schema(),
+                    paginated_output_schema("items", true),
                     "github.read",
                     RiskLevel::Low,
                     SafetyTier::Safe,
@@ -1110,15 +1080,18 @@ impl GitHubConnector {
     async fn invoke_search_issues(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let query = require_str(&input, "query")?;
+        let pagination = page_request(&input, true)?;
 
         let results = client
-            .search_issues(query)
+            .search_issues(query, pagination)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
         Ok(json!({
+            "pagination": pagination.metadata(results.total_count, results.items.len(), true),
             "items": results.items,
-            "total_count": results.total_count
+            "total_count": results.total_count,
+            "incomplete_results": results.incomplete_results
         }))
     }
 
@@ -1215,15 +1188,18 @@ impl GitHubConnector {
     async fn invoke_search_repos(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let query = require_str(&input, "query")?;
+        let pagination = page_request(&input, true)?;
 
         let results = client
-            .search_repos(query)
+            .search_repos(query, pagination)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
         Ok(json!({
+            "pagination": pagination.metadata(results.total_count, results.items.len(), true),
             "items": results.items,
-            "total_count": results.total_count
+            "total_count": results.total_count,
+            "incomplete_results": results.incomplete_results
         }))
     }
 
@@ -1234,13 +1210,15 @@ impl GitHubConnector {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let owner = require_str(&input, "owner")?;
         let repo = require_str(&input, "repo")?;
+        let pagination = page_request(&input, false)?;
 
         let result = client
-            .list_workflows(owner, repo)
+            .list_workflows(owner, repo, pagination)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
         Ok(json!({
+            "pagination": pagination.metadata(u64::from(result.total_count), result.workflows.len(), false),
             "workflows": result.workflows,
             "total_count": result.total_count
         }))
@@ -1255,9 +1233,10 @@ impl GitHubConnector {
         let repo = require_str(&input, "repo")?;
         let workflow_id = require_str(&input, "workflow_id")?;
         let git_ref = require_str(&input, "ref")?;
+        let inputs = workflow_inputs(&input)?;
 
         client
-            .trigger_workflow(owner, repo, workflow_id, git_ref)
+            .trigger_workflow(owner, repo, workflow_id, git_ref, inputs)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
@@ -1272,9 +1251,10 @@ impl GitHubConnector {
         let owner = require_str(&input, "owner")?;
         let repo = require_str(&input, "repo")?;
         let path = require_str(&input, "path")?;
+        let git_ref = optional_content_ref(&input)?;
 
         let content = client
-            .get_file_content(owner, repo, path)
+            .get_file_content(owner, repo, path, git_ref)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
@@ -1284,15 +1264,18 @@ impl GitHubConnector {
     async fn invoke_search_code(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let query = require_str(&input, "query")?;
+        let pagination = page_request(&input, true)?;
 
         let results = client
-            .search_code(query)
+            .search_code(query, pagination)
             .await
             .map_err(|e: GitHubError| e.to_fcp_error())?;
 
         Ok(json!({
+            "pagination": pagination.metadata(results.total_count, results.items.len(), true),
             "items": results.items,
-            "total_count": results.total_count
+            "total_count": results.total_count,
+            "incomplete_results": results.incomplete_results
         }))
     }
 
@@ -1527,6 +1510,100 @@ fn require_u32(input: &serde_json::Value, field: &str) -> FcpResult<u32> {
         })
 }
 
+fn page_request(input: &serde_json::Value, search: bool) -> FcpResult<PageRequest> {
+    let defaults = PageRequest::default();
+    let pagination = PageRequest {
+        page: if input.get("page").is_some() {
+            require_u32(input, "page")?
+        } else {
+            defaults.page
+        },
+        per_page: if input.get("per_page").is_some() {
+            require_u32(input, "per_page")?
+        } else {
+            defaults.per_page
+        },
+    };
+    pagination
+        .validate(search)
+        .map_err(|error| error.to_fcp_error())
+}
+
+fn optional_content_ref(input: &serde_json::Value) -> FcpResult<Option<&str>> {
+    let Some(value) = input.get("ref") else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "ref must be a non-empty string when supplied".into(),
+        })
+}
+
+fn workflow_inputs(
+    input: &serde_json::Value,
+) -> FcpResult<Option<&serde_json::Map<String, serde_json::Value>>> {
+    let Some(value) = input.get("inputs") else {
+        return Ok(None);
+    };
+    value
+        .as_object()
+        .filter(|inputs| inputs.len() <= 25)
+        .map(Some)
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "inputs must be an object with at most 25 properties".into(),
+        })
+}
+
+fn search_input_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": { "type": "string" },
+            "page": { "type": "integer", "minimum": 1, "default": 1,
+                "description": "Page within GitHub's first 1000 search results; continue with pagination.next_page" },
+            "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "default": 100 }
+        }
+    })
+}
+
+fn paginated_output_schema(items: &str, search: bool) -> serde_json::Value {
+    let mut required = vec![items, "total_count", "pagination"];
+    if search {
+        required.push("incomplete_results");
+    }
+    let mut schema = json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            (items): { "type": "array" },
+            "total_count": { "type": "integer" },
+            "pagination": {
+                "type": "object",
+                "required": ["page", "per_page", "returned", "next_page", "accessible_total_count", "result_limit", "result_limit_exceeded"],
+                "properties": {
+                    "page": { "type": "integer", "minimum": 1 },
+                    "per_page": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "returned": { "type": "integer", "minimum": 0 },
+                    "next_page": { "type": ["integer", "null"] },
+                    "accessible_total_count": { "type": "integer", "minimum": 0 },
+                    "result_limit": { "type": ["integer", "null"] },
+                    "result_limit_exceeded": { "type": "boolean" }
+                }
+            }
+        }
+    });
+    if search {
+        schema["properties"]["incomplete_results"] = json!({ "type": "boolean" });
+    }
+    schema
+}
+
 fn github_capability_for_operation(operation: &str) -> FcpResult<CapabilityId> {
     match operation {
         "github.create_issue" | "github.create_pull_request" => {
@@ -1564,6 +1641,7 @@ fn validate_github_input(operation: &str, input: &serde_json::Value) -> FcpResul
         }
         "github.search_issues" | "github.search_repos" | "github.search_code" => {
             require_str(input, "query")?;
+            page_request(input, true)?;
         }
         "github.create_pull_request" => {
             require_str(input, "owner")?;
@@ -1577,20 +1655,27 @@ fn validate_github_input(operation: &str, input: &serde_json::Value) -> FcpResul
             require_str(input, "repo")?;
             require_u32(input, "pull_number")?;
         }
-        "github.get_repo" | "github.list_workflows" => {
+        "github.get_repo" => {
             require_str(input, "owner")?;
             require_str(input, "repo")?;
+        }
+        "github.list_workflows" => {
+            require_str(input, "owner")?;
+            require_str(input, "repo")?;
+            page_request(input, false)?;
         }
         "github.trigger_workflow" => {
             require_str(input, "owner")?;
             require_str(input, "repo")?;
             require_str(input, "workflow_id")?;
             require_str(input, "ref")?;
+            workflow_inputs(input)?;
         }
         "github.get_file_content" => {
             require_str(input, "owner")?;
             require_str(input, "repo")?;
             require_str(input, "path")?;
+            optional_content_ref(input)?;
         }
         "github.process_webhook" => {
             let signature_validated = input

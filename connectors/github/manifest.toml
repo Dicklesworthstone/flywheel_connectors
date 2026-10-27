@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:707670b5736a6e474f8e19a4d881775919d0187130b5bd1951d82229aed55fcd"
+interface_hash = "blake3-256:fcp.interface.v2:773c695a1b67edf39acc62386e4ee29c8029aea2f3f9e0c08aa38b24256d62a7"
 
 [connector]
 id = "fcp.github"
@@ -153,14 +153,30 @@ required = ["query"]
 type = "object"
 [provides.operations."github.search_issues".input_schema.properties.query]
 type = "string"
+[provides.operations."github.search_issues".input_schema.properties.page]
+type = "integer"
+minimum = 1
+default = 1
+description = "Page within GitHub's first 1000 search results; continue with pagination.next_page"
+[provides.operations."github.search_issues".input_schema.properties.per_page]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 100
 
 [provides.operations."github.search_issues".output_schema]
-required = ["items", "total_count"]
+required = ["items", "total_count", "pagination", "incomplete_results"]
 type = "object"
 [provides.operations."github.search_issues".output_schema.properties.items]
 type = "array"
 [provides.operations."github.search_issues".output_schema.properties.total_count]
 type = "integer"
+[provides.operations."github.search_issues".output_schema.properties.incomplete_results]
+type = "boolean"
+[provides.operations."github.search_issues".output_schema.properties.pagination]
+type = "object"
+required = ["page", "per_page", "returned", "next_page", "accessible_total_count", "result_limit", "result_limit_exceeded"]
+properties = { page = { type = "integer", minimum = 1 }, per_page = { type = "integer", minimum = 1, maximum = 100 }, returned = { type = "integer", minimum = 0 }, next_page = { type = ["integer", "null"] }, accessible_total_count = { type = "integer", minimum = 0 }, result_limit = { type = ["integer", "null"] }, result_limit_exceeded = { type = "boolean" } }
 
 [provides.operations."github.search_issues".network_constraints]
 host_allow = ["api.github.com"]
@@ -395,14 +411,30 @@ required = ["query"]
 type = "object"
 [provides.operations."github.search_repos".input_schema.properties.query]
 type = "string"
+[provides.operations."github.search_repos".input_schema.properties.page]
+type = "integer"
+minimum = 1
+default = 1
+description = "Page within GitHub's first 1000 search results; continue with pagination.next_page"
+[provides.operations."github.search_repos".input_schema.properties.per_page]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 100
 
 [provides.operations."github.search_repos".output_schema]
-required = ["items", "total_count"]
+required = ["items", "total_count", "pagination", "incomplete_results"]
 type = "object"
 [provides.operations."github.search_repos".output_schema.properties.items]
 type = "array"
 [provides.operations."github.search_repos".output_schema.properties.total_count]
 type = "integer"
+[provides.operations."github.search_repos".output_schema.properties.incomplete_results]
+type = "boolean"
+[provides.operations."github.search_repos".output_schema.properties.pagination]
+type = "object"
+required = ["page", "per_page", "returned", "next_page", "accessible_total_count", "result_limit", "result_limit_exceeded"]
+properties = { page = { type = "integer", minimum = 1 }, per_page = { type = "integer", minimum = 1, maximum = 100 }, returned = { type = "integer", minimum = 0 }, next_page = { type = ["integer", "null"] }, accessible_total_count = { type = "integer", minimum = 0 }, result_limit = { type = ["integer", "null"] }, result_limit_exceeded = { type = "boolean" } }
 
 [provides.operations."github.search_repos".network_constraints]
 host_allow = ["api.github.com"]
@@ -443,14 +475,27 @@ type = "object"
 type = "string"
 [provides.operations."github.list_workflows".input_schema.properties.repo]
 type = "string"
+[provides.operations."github.list_workflows".input_schema.properties.page]
+type = "integer"
+minimum = 1
+default = 1
+[provides.operations."github.list_workflows".input_schema.properties.per_page]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 100
 
 [provides.operations."github.list_workflows".output_schema]
-required = ["workflows", "total_count"]
+required = ["workflows", "total_count", "pagination"]
 type = "object"
 [provides.operations."github.list_workflows".output_schema.properties.workflows]
 type = "array"
 [provides.operations."github.list_workflows".output_schema.properties.total_count]
 type = "integer"
+[provides.operations."github.list_workflows".output_schema.properties.pagination]
+type = "object"
+required = ["page", "per_page", "returned", "next_page", "accessible_total_count", "result_limit", "result_limit_exceeded"]
+properties = { page = { type = "integer", minimum = 1 }, per_page = { type = "integer", minimum = 1, maximum = 100 }, returned = { type = "integer", minimum = 0 }, next_page = { type = ["integer", "null"] }, accessible_total_count = { type = "integer", minimum = 0 }, result_limit = { type = ["integer", "null"] }, result_limit_exceeded = { type = "boolean" } }
 
 [provides.operations."github.list_workflows".network_constraints]
 host_allow = ["api.github.com"]
@@ -495,6 +540,9 @@ type = "string"
 type = "string"
 [provides.operations."github.trigger_workflow".input_schema.properties.ref]
 type = "string"
+[provides.operations."github.trigger_workflow".input_schema.properties.inputs]
+type = "object"
+maxProperties = 25
 
 [provides.operations."github.trigger_workflow".output_schema]
 required = ["triggered"]
@@ -519,7 +567,7 @@ max_response_bytes = 1048576
 
 [provides.operations."github.trigger_workflow".ai_hints]
 when_to_use = "Manually trigger a GitHub Actions workflow."
-common_mistakes = ["Using workflow file name instead of ID"]
+common_mistakes = ["Omitting required workflow inputs; workflow_id accepts either the numeric ID or file name"]
 examples = ['{"owner": "octocat", "repo": "hello-world", "workflow_id": "ci.yml", "ref": "main"}']
 related = ["github.list_workflows"]
 
@@ -543,12 +591,16 @@ type = "string"
 type = "string"
 [provides.operations."github.get_file_content".input_schema.properties.path]
 type = "string"
+description = "File or directory path; use an empty string for the repository root"
+[provides.operations."github.get_file_content".input_schema.properties.ref]
+type = "string"
+minLength = 1
 
 [provides.operations."github.get_file_content".output_schema]
 required = ["content"]
 type = "object"
 [provides.operations."github.get_file_content".output_schema.properties.content]
-type = "object"
+type = ["object", "array"]
 
 [provides.operations."github.get_file_content".network_constraints]
 host_allow = ["api.github.com"]
@@ -566,7 +618,7 @@ total_timeout_ms = 30000
 max_response_bytes = 10485760
 
 [provides.operations."github.get_file_content".ai_hints]
-when_to_use = "Read file content from a repository."
+when_to_use = "Read a file or list a directory at a branch, tag or commit; directory listings are limited by GitHub to 1000 entries."
 common_mistakes = ["Not specifying a ref for a specific branch or commit"]
 examples = ['{"owner": "octocat", "repo": "hello-world", "path": "README.md"}']
 related = ["github.get_repo", "github.search_code"]
@@ -587,14 +639,30 @@ required = ["query"]
 type = "object"
 [provides.operations."github.search_code".input_schema.properties.query]
 type = "string"
+[provides.operations."github.search_code".input_schema.properties.page]
+type = "integer"
+minimum = 1
+default = 1
+description = "Page within GitHub's first 1000 search results; continue with pagination.next_page"
+[provides.operations."github.search_code".input_schema.properties.per_page]
+type = "integer"
+minimum = 1
+maximum = 100
+default = 100
 
 [provides.operations."github.search_code".output_schema]
-required = ["items", "total_count"]
+required = ["items", "total_count", "pagination", "incomplete_results"]
 type = "object"
 [provides.operations."github.search_code".output_schema.properties.items]
 type = "array"
 [provides.operations."github.search_code".output_schema.properties.total_count]
 type = "integer"
+[provides.operations."github.search_code".output_schema.properties.incomplete_results]
+type = "boolean"
+[provides.operations."github.search_code".output_schema.properties.pagination]
+type = "object"
+required = ["page", "per_page", "returned", "next_page", "accessible_total_count", "result_limit", "result_limit_exceeded"]
+properties = { page = { type = "integer", minimum = 1 }, per_page = { type = "integer", minimum = 1, maximum = 100 }, returned = { type = "integer", minimum = 0 }, next_page = { type = ["integer", "null"] }, accessible_total_count = { type = "integer", minimum = 0 }, result_limit = { type = ["integer", "null"] }, result_limit_exceeded = { type = "boolean" } }
 
 [provides.operations."github.search_code".network_constraints]
 host_allow = ["api.github.com"]

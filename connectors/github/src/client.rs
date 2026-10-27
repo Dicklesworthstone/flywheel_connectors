@@ -16,9 +16,9 @@ use tracing::{debug, instrument};
 use crate::{
     error::{GitHubError, GitHubResult},
     types::{
-        ApiErrorResponse, CodeSearchItem, CreateIssueRequest, CreatePullRequestRequest,
-        FileContent, Issue, MergePullRequestRequest, MergeResult, PullRequest, Repository,
-        SearchResults, WorkflowsResponse,
+        ApiErrorResponse, CodeSearchItem, CreateIssueRequest, CreatePullRequestRequest, Issue,
+        MergePullRequestRequest, MergeResult, PageRequest, PullRequest, Repository,
+        RepositoryContent, SearchResults, WorkflowsResponse,
     },
 };
 
@@ -243,9 +243,17 @@ impl GitHubClient {
     /// # Errors
     /// Returns [`GitHubError`] if the API request fails.
     #[instrument(skip(self))]
-    pub async fn search_issues(&self, query: &str) -> GitHubResult<SearchResults<Issue>> {
+    pub async fn search_issues(
+        &self,
+        query: &str,
+        pagination: PageRequest,
+    ) -> GitHubResult<SearchResults<Issue>> {
+        let PageRequest { page, per_page } = pagination.validate(true)?;
         let encoded = urlencoding::encode(query);
-        self.get(&format!("/search/issues?q={encoded}")).await
+        self.get(&format!(
+            "/search/issues?q={encoded}&page={page}&per_page={per_page}"
+        ))
+        .await
     }
 
     // ── Pull Request operations ───────────────────────────────────
@@ -323,9 +331,17 @@ impl GitHubClient {
     /// # Errors
     /// Returns [`GitHubError`] if the API request fails.
     #[instrument(skip(self))]
-    pub async fn search_repos(&self, query: &str) -> GitHubResult<SearchResults<Repository>> {
+    pub async fn search_repos(
+        &self,
+        query: &str,
+        pagination: PageRequest,
+    ) -> GitHubResult<SearchResults<Repository>> {
+        let PageRequest { page, per_page } = pagination.validate(true)?;
         let encoded = urlencoding::encode(query);
-        self.get(&format!("/search/repositories?q={encoded}")).await
+        self.get(&format!(
+            "/search/repositories?q={encoded}&page={page}&per_page={per_page}"
+        ))
+        .await
     }
 
     // ── Actions operations ────────────────────────────────────────
@@ -335,30 +351,47 @@ impl GitHubClient {
     /// # Errors
     /// Returns [`GitHubError`] if the API request fails or owner/repo are invalid.
     #[instrument(skip(self))]
-    pub async fn list_workflows(&self, owner: &str, repo: &str) -> GitHubResult<WorkflowsResponse> {
+    pub async fn list_workflows(
+        &self,
+        owner: &str,
+        repo: &str,
+        pagination: PageRequest,
+    ) -> GitHubResult<WorkflowsResponse> {
         validate_owner_repo(owner, "owner")?;
         validate_owner_repo(repo, "repo")?;
-        self.get(&format!("/repos/{owner}/{repo}/actions/workflows"))
-            .await
+        let PageRequest { page, per_page } = pagination.validate(false)?;
+        self.get(&format!(
+            "/repos/{owner}/{repo}/actions/workflows?page={page}&per_page={per_page}"
+        ))
+        .await
     }
 
     /// Trigger a workflow dispatch event.
     ///
     /// # Errors
     /// Returns [`GitHubError`] if the API request fails or owner/repo are invalid.
-    #[instrument(skip(self))]
+    #[instrument(skip(self, inputs))]
     pub async fn trigger_workflow(
         &self,
         owner: &str,
         repo: &str,
         workflow_id: &str,
         git_ref: &str,
+        inputs: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> GitHubResult<()> {
         validate_owner_repo(owner, "owner")?;
         validate_owner_repo(repo, "repo")?;
         let encoded_workflow_id =
             utf8_percent_encode(workflow_id, PATH_SEGMENT_ENCODE_SET).to_string();
-        let body = serde_json::json!({ "ref": git_ref });
+        let mut body = serde_json::json!({ "ref": git_ref });
+        if let Some(inputs) = inputs {
+            if inputs.len() > 25 {
+                return Err(GitHubError::ValidationError {
+                    message: "workflow inputs must contain at most 25 properties".into(),
+                });
+            }
+            body["inputs"] = serde_json::Value::Object(inputs.clone());
+        }
         let url = format!(
             "{}/repos/{owner}/{repo}/actions/workflows/{encoded_workflow_id}/dispatches",
             self.base_url
@@ -384,7 +417,14 @@ impl GitHubClient {
                 {
                     Ok(response) => {
                         let status = response.status();
-                        if status == StatusCode::ACCEPTED {
+                        // The versioned API returns 204 without a body. GitHub
+                        // can also return 200 with run details. Both prove the
+                        // dispatch was accepted: do not parse an empty body as
+                        // an error or retry a successfully created workflow run.
+                        if matches!(
+                            status,
+                            StatusCode::OK | StatusCode::ACCEPTED | StatusCode::NO_CONTENT
+                        ) {
                             return AttemptOutcome::Success(());
                         }
                         let retry_after_secs = response
@@ -438,12 +478,17 @@ impl GitHubClient {
         owner: &str,
         repo: &str,
         path: &str,
-    ) -> GitHubResult<FileContent> {
+        git_ref: Option<&str>,
+    ) -> GitHubResult<RepositoryContent> {
         validate_owner_repo(owner, "owner")?;
         validate_owner_repo(repo, "repo")?;
         let encoded_path = encode_path(path);
-        self.get(&format!("/repos/{owner}/{repo}/contents/{encoded_path}"))
-            .await
+        let mut endpoint = format!("/repos/{owner}/{repo}/contents/{encoded_path}");
+        if let Some(git_ref) = git_ref {
+            endpoint.push_str("?ref=");
+            endpoint.push_str(&urlencoding::encode(git_ref));
+        }
+        self.get(&endpoint).await
     }
 
     // ── Code Search ───────────────────────────────────────────────
@@ -453,9 +498,17 @@ impl GitHubClient {
     /// # Errors
     /// Returns [`GitHubError`] if the API request fails.
     #[instrument(skip(self))]
-    pub async fn search_code(&self, query: &str) -> GitHubResult<SearchResults<CodeSearchItem>> {
+    pub async fn search_code(
+        &self,
+        query: &str,
+        pagination: PageRequest,
+    ) -> GitHubResult<SearchResults<CodeSearchItem>> {
+        let PageRequest { page, per_page } = pagination.validate(true)?;
         let encoded = urlencoding::encode(query);
-        self.get(&format!("/search/code?q={encoded}")).await
+        self.get(&format!(
+            "/search/code?q={encoded}&page={page}&per_page={per_page}"
+        ))
+        .await
     }
 
     // ── HTTP primitives ───────────────────────────────────────────
@@ -1154,7 +1207,10 @@ mod tests {
             .with_base_url(server.uri());
 
         let results = client
-            .search_issues("is:open is:issue repo:octocat/hello-world")
+            .search_issues(
+                "is:open is:issue repo:octocat/hello-world",
+                PageRequest::default(),
+            )
             .await
             .unwrap();
         server.finish();
