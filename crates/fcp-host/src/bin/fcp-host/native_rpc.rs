@@ -325,7 +325,14 @@ pub(super) fn run_dispatcher(
                 let mut cancelled = pin!(rpc.cancelled());
                 // cancelled() already enforces the ticket's absolute deadline;
                 // wrapping the request in another timeout would duplicate its timer.
-                let mut operation = pin!(runner.request(&request.method, request.params));
+                // The ticket already includes queueing and session work in
+                // its absolute invocation budget. A fresh 10-second default
+                // here would terminate valid longer-running invocations.
+                let mut operation = pin!(runner.request_with_timeout(
+                    &request.method,
+                    request.params,
+                    rpc.remaining(),
+                ));
                 match select(cancelled.as_mut(), operation.as_mut()).await {
                     Either::Left(_) => Err(rpc.stop_error()),
                     Either::Right((response, _)) => response,
@@ -417,15 +424,27 @@ impl NativeInvocationTermination {
         CancellationTerminator::new(move || stop.cancel(), move || finished.is_finished())
     }
 
-    /// Registration and the invocation stop latch share this lock so a
-    /// cancellation between introspect and handshake cannot be lost.
+    /// Keep existing control-ticket tests on the lifecycle registration path.
+    #[cfg(test)]
     #[must_use]
     pub(super) fn register_rpc(&self) -> NativeRpc {
-        let rpc = NativeRpc::new(
+        self.register_rpc_for_method("introspect")
+    }
+
+    /// Invocation RPCs share the original absolute deadline, including time
+    /// already spent in the queue and session preparation. Lifecycle calls
+    /// additionally retain their shorter IO cap. Registration and the stop
+    /// latch share a lock so cancellation cannot miss a newly created ticket.
+    #[must_use]
+    pub(super) fn register_rpc_for_method(&self, method: &str) -> NativeRpc {
+        let deadline = if matches!(method, "invoke" | "simulate") {
+            self.state.deadline
+        } else {
             self.state
                 .deadline
-                .min(deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT)),
-        );
+                .min(deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT))
+        };
+        let rpc = NativeRpc::new(deadline);
         let mut commands = self.state.commands.lock().expect("native invocation lock");
         let cancel = commands.stop_requested
             || self.state.waiter_finished.load(Ordering::SeqCst)
@@ -562,6 +581,53 @@ impl Drop for NativeInvocationWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_registration_preserves_invocation_deadline_and_lifecycle_cap() {
+        let started_at = Instant::now();
+        let deadline = invocation_deadline(started_at, Some(120_000));
+        assert_eq!(
+            deadline,
+            deadline_after(started_at, Duration::from_secs(60))
+        );
+        let invocation = NativeInvocationTermination::new(deadline);
+        for method in ["invoke", "simulate"] {
+            let rpc = invocation.register_rpc_for_method(method);
+            assert_eq!(rpc.deadline, deadline, "{method} lost the admitted budget");
+            assert!(rpc.try_begin());
+            assert!(rpc.try_settle_reply());
+        }
+        for method in [
+            "configure",
+            "introspect",
+            "handshake",
+            "health",
+            "self_check",
+            "shutdown",
+        ] {
+            let rpc = invocation.register_rpc_for_method(method);
+            assert!(
+                rpc.deadline < deadline,
+                "{method} must keep the lifecycle cap"
+            );
+            assert!(rpc.deadline <= deadline_after(Instant::now(), CONNECTOR_RPC_IO_TIMEOUT));
+        }
+
+        let short_deadline = deadline_after(Instant::now(), Duration::from_secs(2));
+        let short = NativeInvocationTermination::new(short_deadline);
+        for method in ["invoke", "simulate", "handshake"] {
+            assert_eq!(
+                short.register_rpc_for_method(method).deadline,
+                short_deadline
+            );
+        }
+        invocation.cancel();
+        for method in ["invoke", "simulate", "handshake"] {
+            let rpc = invocation.register_rpc_for_method(method);
+            assert!(rpc.is_settled());
+            assert!(!rpc.try_begin());
+        }
+    }
 
     #[test]
     fn abandoned_queued_ticket_cannot_be_selected_or_affect_another_command() {
@@ -1129,6 +1195,60 @@ mod notification_tests {
         );
         assert!(!invocation.state.cancellation.is_cancelled());
         assert!(!rpc.try_begin());
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn production_dispatcher_honors_longer_invocation_budget() {
+        use fcp_async_core::channel::oneshot;
+        use std::collections::BTreeMap;
+
+        let script = r#"
+IFS= read -r request || exit 1
+sleep 11
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:0","result":{"completed":true}}'
+while IFS= read -r request; do :; done
+"#;
+        let runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        let actor = fcp_async_core::task::try_spawn(run_dispatcher(runner, receiver)).unwrap();
+        // Use the same registration path as rpc_with_termination; a manually
+        // constructed ticket would miss an accidental lifecycle cap here.
+        let invocation = NativeInvocationTermination::new(deadline_after(
+            Instant::now(),
+            Duration::from_secs(15),
+        ));
+        let rpc = invocation.register_rpc_for_method("invoke");
+        let _waiter = rpc.waiter();
+        let (response_tx, response_rx) = oneshot::channel();
+        sender
+            .send(ConnectorRpcRequest {
+                method: "invoke".to_string(),
+                params: serde_json::json!({"operation":"long.running"}),
+                response_tx,
+                rpc: rpc.clone(),
+            })
+            .await
+            .unwrap();
+        let response = fcp_async_core::time::timeout(Duration::from_secs(17), response_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("an 11-second operation fits the admitted 15-second deadline");
+        assert_eq!(response["result"]["completed"], true);
+        assert!(!rpc.transport_retired());
+        assert!(rpc.is_settled());
+        drop(sender);
+        fcp_async_core::time::timeout(Duration::from_secs(3), actor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(unix)]

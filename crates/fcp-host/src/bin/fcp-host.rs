@@ -35,7 +35,9 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use fcp_async_core::channel::{mpsc, oneshot};
 use fcp_async_core::hyper_bridge::{HyperExecutor, HyperIo};
-use fcp_async_core::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use fcp_async_core::io::{
+    AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use fcp_async_core::net::TcpListener;
 #[cfg(unix)]
 use fcp_async_core::net::UnixListener;
@@ -171,6 +173,8 @@ mod http_batch;
 mod invoke_jobs;
 #[path = "fcp-host/mesh_cancel.rs"]
 mod mesh_cancel;
+#[path = "fcp-host/native_framing.rs"]
+mod native_framing;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
 #[path = "fcp-host/session.rs"]
@@ -189,6 +193,10 @@ const CONNECTOR_STATE_CANONICAL_OBJECTS_DIR: &str = "objects";
 const CONNECTOR_STATE_CANONICAL_SYMBOLS_DIR: &str = "symbols";
 const HYBRID_OWNER_EVIDENCE_TAG: &str = "fcp.hybrid_owner.evidence_cbor";
 const LOCAL_PLACEMENT_OPERATION: &str = "fcp.host.placement/launch";
+/// Local invocation envelopes include base64 media and capability evidence.
+/// Keep a hard HTTP bound while allowing a 16 MiB payload plus its encoding.
+/// Mesh forwarding and connector/provider limits are enforced independently.
+const LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const HYBRID_OWNER_CONTEXT_FILE_ENV: &str = "FCP_HOST_HYBRID_OWNER_CONTEXT_FILE";
 const BLUEBUBBLES_INGRESS_ROUTE: &str = "/bluebubbles-webhook";
 const BLUEBUBBLES_INGRESS_OPERATION: &str = "imessage.ingest_webhook_request";
@@ -587,9 +595,14 @@ impl SubprocessConnector {
             )));
         }
 
-        let runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
+        // Pin response budgets from host-owned policy before starting the
+        // subprocess. Connector-supplied request fields cannot raise them.
+        let response_limits =
+            native_rpc_response_limits(&config, &load_manifest_operation_constraints(&config)?);
+        let mut runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
             .await
             .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
+        runner.response_limits = response_limits;
         let state_root = configured_connector_state_root(&config);
         let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
@@ -651,8 +664,9 @@ impl SubprocessConnector {
         params: serde_json::Value,
         termination: Option<&NativeInvocationTermination>,
     ) -> HostResult<serde_json::Value> {
-        let rpc =
-            termination.map_or_else(NativeRpc::for_io, NativeInvocationTermination::register_rpc);
+        let rpc = termination.map_or_else(NativeRpc::for_io, |invocation| {
+            invocation.register_rpc_for_method(method)
+        });
         let _waiter = rpc.waiter();
         if rpc.is_cancelled() {
             return Err(HostError::RegistryError(
@@ -2214,6 +2228,20 @@ fn load_manifest_operation_constraints(
         &manifest,
         path.to_string(),
     ))
+}
+
+fn native_rpc_response_limits(
+    config: &ConnectorConfig,
+    manifest: &ManifestOperationConstraintCatalog,
+) -> native_framing::NativeResponseLimits {
+    let mut limits = native_framing::NativeResponseLimits::default();
+    for (operation, constraints) in &manifest.network_constraints {
+        limits.restrict_operation(operation, constraints.max_response_bytes);
+    }
+    for (operation, constraints) in &config.operation_network_constraints {
+        limits.restrict_operation(operation, constraints.max_response_bytes);
+    }
+    limits
 }
 
 fn validate_production_prewarm_policy(config: &ConnectorConfig) -> HostResult<()> {
@@ -4397,6 +4425,7 @@ struct ConnectorProcessRunner {
     poisoned: bool,
     epoch: u64,
     next_request_seq: u64,
+    response_limits: native_framing::NativeResponseLimits,
 }
 
 impl Drop for ConnectorProcessRunner {
@@ -4424,15 +4453,14 @@ const CONNECTOR_RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Single-sourced so the warm-pool retention classifier and the constructor can
 /// never drift apart. See [`warm_entry_survives_error`].
 const CONNECTOR_JSON_RPC_ERROR_PREFIX: &str = "connector error: ";
-const CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES: usize = 64 * 1024;
+#[cfg(test)]
+const CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES: usize = native_framing::CONTROL_RESPONSE_BYTES;
 const CONNECTOR_RPC_MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 
 /// Threshold above which `rpc_in_handshaken_zone` emits a warn-level
 /// log when releasing the per-connector handshaken-zone Mutex
-/// (br-utiw3). Set to ~3× the worst-case lock-hold time given two
-/// `CONNECTOR_RPC_IO_TIMEOUT` awaits inside the critical section, so
-/// the warn only fires on genuinely pathological contention or a
-/// hung connector — not on a normal slow-path handshake.
+/// (br-utiw3). Long invocations can legitimately exceed this threshold;
+/// their caller's absolute deadline still bounds the critical section.
 const HANDSHAKEN_ZONE_LOCK_HOLD_WARN_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// RAII observability guard for the per-connector handshaken-zone
@@ -4442,8 +4470,8 @@ const HANDSHAKEN_ZONE_LOCK_HOLD_WARN_THRESHOLD: Duration = Duration::from_secs(3
 /// (handshake RPC + first invoke/simulate RPC) by intentional design —
 /// it keeps the handshake and first real call as one critical section
 /// so a cross-zone caller cannot re-handshake the connector between
-/// them. Both awaits are bounded by `CONNECTOR_RPC_IO_TIMEOUT`, so the
-/// worst-case hold time is ~2× that timeout.
+/// them. Control RPCs use `CONNECTOR_RPC_IO_TIMEOUT`; invocation RPCs
+/// share the caller's absolute deadline across preparation and execution.
 ///
 /// This guard records the lock acquisition time and emits a warn-level
 /// structured log when dropped if the hold exceeded
@@ -4572,6 +4600,7 @@ impl ConnectorProcessRunner {
             poisoned: false,
             epoch: 0,
             next_request_seq: 0,
+            response_limits: native_framing::NativeResponseLimits::default(),
         })
     }
     fn next_request_id(&mut self) -> String {
@@ -4597,46 +4626,51 @@ impl ConnectorProcessRunner {
         Ok(())
     }
 
-    async fn read_json(&mut self, io_timeout: Duration) -> std::io::Result<serde_json::Value> {
-        let mut line = Vec::with_capacity(1024);
-        let bytes = fcp_async_core::time::timeout(io_timeout, async {
-            loop {
-                if line.len() > CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES {
-                    return Ok(line.len());
+    async fn read_json(
+        &mut self,
+        io_timeout: Duration,
+        response_limit: usize,
+    ) -> std::io::Result<serde_json::Value> {
+        let mut frame = native_framing::ResponseFrame::new(response_limit);
+        fcp_async_core::time::timeout(
+            io_timeout,
+            std::future::poll_fn(|cx| {
+                // Bound work per poll as well as total storage. Large, already
+                // buffered responses must yield to the absolute-deadline waiter.
+                const BYTES_PER_POLL: usize = 64 * 1024;
+                let mut scanned = 0;
+                loop {
+                    let chunk =
+                        std::task::ready!(std::pin::Pin::new(&mut self.stdout).poll_fill_buf(cx))?;
+                    if chunk.is_empty() {
+                        return std::task::Poll::Ready(Ok::<(), std::io::Error>(()));
+                    }
+                    let available = chunk.len().min(BYTES_PER_POLL - scanned);
+                    let (consumed, complete) =
+                        frame.append(&chunk[..available]).map_err(|error| {
+                            connector_transport_desynchronized_error(error.to_string())
+                        })?;
+                    std::pin::Pin::new(&mut self.stdout).consume(consumed);
+                    if complete {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    scanned += consumed;
+                    if scanned == BYTES_PER_POLL {
+                        cx.waker().wake_by_ref();
+                        return std::task::Poll::Pending;
+                    }
                 }
-                match self.stdout.read_u8().await {
-                    Ok(byte) => {
-                        line.push(byte);
-                        if byte == b'\n' {
-                            return Ok(line.len());
-                        }
-                    }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::UnexpectedEof && line.is_empty() =>
-                    {
-                        return Ok(0);
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        return Ok(line.len());
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        })
+            }),
+        )
         .await
         .map_err(|_| connector_io_timeout_error("stdout read", io_timeout))??;
-        if bytes == 0 {
+        if frame.bytes().is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "connector closed stdout",
             ));
         }
-        if line.len() > CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES {
-            return Err(connector_transport_desynchronized_error(format!(
-                "stdout frame exceeded {CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES} bytes"
-            )));
-        }
-        let line = std::str::from_utf8(&line)
+        let line = std::str::from_utf8(frame.bytes())
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         serde_json::from_str::<serde_json::Value>(line.trim())
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
@@ -4669,6 +4703,7 @@ impl ConnectorProcessRunner {
         }
     }
 
+    #[cfg(test)]
     async fn request(
         &mut self,
         method: &str,
@@ -4689,6 +4724,10 @@ impl ConnectorProcessRunner {
         }
 
         let request_epoch = self.epoch;
+        let response_limit = self.response_limits.for_request(
+            method,
+            params.get("operation").and_then(serde_json::Value::as_str),
+        );
         let expected_id = self.next_request_id();
         let request = json!({
             "jsonrpc": "2.0",
@@ -4710,7 +4749,7 @@ impl ConnectorProcessRunner {
                 return Err(connector_io_timeout_error("stdout read", io_timeout));
             }
 
-            let response = match self.read_json(remaining).await {
+            let response = match self.read_json(remaining, response_limit).await {
                 Ok(response) => response,
                 Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
                     self.epoch = self.epoch.saturating_add(1);
@@ -8103,6 +8142,18 @@ fn invoke_audit_unavailable(phase: &'static str, error: fcp_audit::AuditError) -
     ))
 }
 
+/// Apply the larger media envelope budget only to the three local invocation
+/// surfaces. Administrative, webhook, and mesh routes retain their own limits.
+fn local_invocation_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/rpc/invoke", post(invoke_handler))
+        .route("/rpc/preflight", post(preflight_handler))
+        .route("/rpc/simulate", post(simulate_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES,
+        ))
+}
+
 async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     let bind_target = resolve_bind_target()?;
     let capability_verifying_key = resolve_verifying_key(
@@ -8442,7 +8493,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         // TODO(review) marker and ungated GET: see bead
         // flywheel_connectors-qeapt.
         .route("/rpc/introspect/{connector_id}", get(introspect_handler))
-        .route("/rpc/invoke", post(invoke_handler))
+        .merge(local_invocation_routes())
         .route("/rpc/egress/http", post(host_egress_http_handler))
         .route("/rpc/egress/tcp", post(host_egress_tcp_handler))
         // /rpc/cancel and /rpc/operations/cancel moved into
@@ -8453,8 +8504,6 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         .route("/rpc/cancel-self", post(cancel_self_handler))
         .route("/rpc/batch", post(batch_invoke_handler))
         .route("/rpc/batch-invoke", post(batch_invoke_handler))
-        .route("/rpc/preflight", post(preflight_handler))
-        .route("/rpc/simulate", post(simulate_handler))
         .route("/rpc/mesh/cutover-gates", get(mesh_cutover_gates_handler))
         // Peer-facing mesh routes. They are authenticated by the peer
         // directory's Ed25519 keys (signed envelopes / signed
@@ -11660,18 +11709,16 @@ async fn preflight_handler(
                 }
             }
             let forwarded = match serde_json::to_string(&request) {
-                Ok(request_json) => {
-                    mesh_forward_query::<PreflightResponse>(
-                        &router,
-                        decision,
-                        fcp_mesh::invoke_route::MeshForwardBody::Preflight {
-                            request_json,
-                            asserted_principal: asserted_principal.clone(),
-                        },
-                    )
-                    .await
-                    .map(|response| response.response)
-                }
+                Ok(request_json) => mesh_forward_query::<PreflightResponse>(
+                    &router,
+                    decision,
+                    fcp_mesh::invoke_route::MeshForwardBody::Preflight {
+                        request_json,
+                        asserted_principal: asserted_principal.clone(),
+                    },
+                )
+                .await
+                .map(|response| response.response),
                 Err(error) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("preflight request could not be encoded for mesh forwarding: {error}"),
@@ -14469,9 +14516,10 @@ async fn route_invoke_with_deadline(
         .await;
     }
     constrain_invoke_deadline(&mut request, deadline);
-    let mut response = invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
-        .await
-        .map_err(map_host_error)?;
+    let mut response =
+        invoke_jobs::execute(state, request, asserted_principal, Some(deadline), None)
+            .await
+            .map_err(map_host_error)?;
     stamp_invoke_route(
         &mut response,
         InvokeRouteProvenance::host_backed(
@@ -15615,11 +15663,12 @@ async fn mesh_forward_handler(
                 format!("forwarded invoke request is not a valid InvokeRequest: {error}"),
             ))),
         },
-        MeshForwardBody::Cancel { request_json, origin_attempt_id } => {
-            mesh_reply_body(
-                mesh_cancel::execute(&state, &envelope, request_json, *origin_attempt_id).await,
-            )
-        }
+        MeshForwardBody::Cancel {
+            request_json,
+            origin_attempt_id,
+        } => mesh_reply_body(
+            mesh_cancel::execute(&state, &envelope, request_json, *origin_attempt_id).await,
+        ),
         MeshForwardBody::Preflight {
             request_json,
             asserted_principal,
@@ -17050,6 +17099,44 @@ deny_ptrace = true
         assert_eq!(op_a.port_allow, vec![443]);
         assert_eq!(op_b.host_allow, vec!["api-b.example"]);
         assert_eq!(op_b.port_allow, vec![8443]);
+    }
+
+    #[test]
+    fn native_response_limits_use_both_manifest_and_managed_operation_policy() {
+        let mut catalog = ManifestOperationConstraintCatalog::from_manifest(
+            &two_operation_network_manifest(),
+            "inline-test-manifest".to_string(),
+        );
+        catalog
+            .network_constraints
+            .get_mut("op.a")
+            .unwrap()
+            .max_response_bytes = 128 * 1024;
+        let mut config = dispatcher_test_config("fcp.test:network:1.0.0");
+        let mut managed =
+            runtime_network_test_constraints("api-a.example", ManagedPortConstraint::Static(443));
+        managed.max_response_bytes = 64 * 1024;
+        config
+            .operation_network_constraints
+            .insert("op.a".into(), managed.clone());
+        managed.max_response_bytes = 256 * 1024;
+        config
+            .operation_network_constraints
+            .insert("op.managed".into(), managed);
+        let limits = native_rpc_response_limits(&config, &catalog);
+        assert_eq!(limits.for_request("invoke", Some("op.a")), 7 * 64 * 1024);
+        assert_eq!(
+            limits.for_request("invoke", Some("op.managed")),
+            6 * 256 * 1024 + native_framing::CONTROL_RESPONSE_BYTES
+        );
+        assert_eq!(
+            limits.for_request("invoke", Some("op.b")),
+            native_framing::MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            limits.for_request("invoke", Some("op.unknown")),
+            native_framing::CONTROL_RESPONSE_BYTES
+        );
     }
 
     #[test]
@@ -29218,6 +29305,110 @@ deny_ptrace = true
 
     #[cfg(unix)]
     #[fcp_async_core::runtime::test]
+    async fn connector_process_runner_preserves_large_download_and_search_results() {
+        let script = r#"
+i=0
+while IFS= read -r _line; do
+  printf '{"jsonrpc":"2.0","id":"0:%s","result":' "$i"
+  case "$i" in
+    0)
+      printf '{"content_base64":"'
+      head -c 262144 /dev/zero | tr '\000' A
+      printf '"}'
+      ;;
+    1)
+      printf '{"items":['
+      j=0
+      while [ "$j" -lt 2000 ]; do
+        if [ "$j" -gt 0 ]; then printf ','; fi
+        printf '{"number":%s,"title":"search result preserving every item"}' "$j"
+        j=$((j + 1))
+      done
+      printf ']}'
+      ;;
+    *) printf '{"healthy":true}' ;;
+  esac
+  printf '}\n'
+  i=$((i + 1))
+done
+"#;
+        let mut runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("spawn large-response connector");
+        let mut config = dispatcher_test_config("fcp.test:large-response:1.0.0");
+        for operation in ["files.download", "issues.search"] {
+            config.operation_network_constraints.insert(
+                operation.to_string(),
+                runtime_network_test_constraints("api.example", ManagedPortConstraint::Static(443)),
+            );
+        }
+        runner.response_limits =
+            native_rpc_response_limits(&config, &ManifestOperationConstraintCatalog::default());
+        let download = runner
+            .request("invoke", json!({"operation":"files.download"}))
+            .await
+            .expect("declared download larger than 64 KiB must reach caller");
+        let encoded = download["result"]["content_base64"].as_str().unwrap();
+        assert_eq!(encoded.len(), 262144);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(bytes, vec![0_u8; 196608]);
+        let search = runner
+            .request("invoke", json!({"operation":"issues.search"}))
+            .await
+            .expect("large search results must not poison the connector");
+        let items = search["result"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2000);
+        assert_eq!(items[1999]["number"], 1999);
+        let health = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(health["result"]["healthy"], true);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn connector_process_runner_accepts_exact_limit_without_consuming_next_frame() {
+        let prefix = r#"{"jsonrpc":"2.0","id":"0:0","result":{"value":""#;
+        let suffix = "\"}}\n";
+        let payload_bytes = CONNECTOR_RPC_MAX_STDOUT_LINE_BYTES - prefix.len() - suffix.len();
+        let environment = BTreeMap::from([
+            ("FRAMING_PREFIX".to_string(), prefix.to_string()),
+            ("FRAMING_SUFFIX".to_string(), suffix.to_string()),
+            (
+                "FRAMING_PAYLOAD_BYTES".to_string(),
+                payload_bytes.to_string(),
+            ),
+        ]);
+        let script = r#"
+IFS= read -r _line || exit 1
+printf '%s' "$FRAMING_PREFIX"
+head -c "$FRAMING_PAYLOAD_BYTES" /dev/zero | tr '\000' A
+printf '%s' "$FRAMING_SUFFIX"
+printf '%s\n' '{"jsonrpc":"2.0","id":"0:1","result":{"next":true}}'
+while IFS= read -r _line; do :; done
+"#;
+        let mut runner = ConnectorProcessRunner::spawn(
+            "/bin/sh",
+            &["-c".to_string(), script.to_string()],
+            &environment,
+        )
+        .await
+        .unwrap();
+        let first = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(
+            first["result"]["value"].as_str().unwrap().len(),
+            payload_bytes
+        );
+        let second = runner.request("health", json!({})).await.unwrap();
+        assert_eq!(second["result"]["next"], true);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
     async fn connector_process_runner_rejects_mismatched_response_id_and_poisoned_transport() {
         let script = r#"while IFS= read -r _line; do printf '%s\n' '{"jsonrpc":"2.0","id":"stale","result":{"status":"wrong"}}'; done"#;
         let args = vec!["-c".to_string(), script.to_string()];
@@ -33559,6 +33750,151 @@ done"#;
             String::from_utf8_lossy(&bytes)
         );
         serde_json::from_slice(&bytes).map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn local_media_envelopes_reach_all_admission_handlers_without_bypassing_authority() {
+        const CONNECTOR: &str = "fcp.test.media-envelope:utility:1.0.0";
+        const OPERATION: &str = "test.echo";
+        const CAPABILITY: &str = "cap.test.echo";
+        let signing_key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let invokes = Arc::new(AtomicU64::new(0));
+        let state = invoke_token_bucket_state(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            &signing_key,
+            Arc::clone(&invokes),
+            false,
+        );
+        let app = local_invocation_routes().with_state(Arc::clone(&state));
+        let mut invoke = invoke_token_bucket_request(
+            CONNECTOR,
+            OPERATION,
+            CAPABILITY,
+            ZoneId::work(),
+            &signing_key,
+        );
+        // Larger than Axum's 2 MiB default: this previously failed extraction
+        // before any connector or capability check could run.
+        invoke.input = json!({ "message": "A".repeat(3 * 1024 * 1024) });
+        let preflight = HostPreflightRequest {
+            request_id: invoke.id.clone(),
+            connector_id: invoke.connector_id.clone(),
+            operation: OPERATION.to_string(),
+            params: Some(invoke.input.clone()),
+            principal: Some("user:test".to_string()),
+            zone_id: Some(invoke.zone_id.clone()),
+            capability_token: Some(invoke.capability_token.clone()),
+            holder_proof: None,
+            approval_tokens: Vec::new(),
+            lease_seq: None,
+        };
+        let simulation = HostSimulateRequest {
+            request_id: invoke.id.to_string(),
+            connector_id: CONNECTOR.to_string(),
+            operation: OPERATION.to_string(),
+            input: Some(invoke.input.clone()),
+            zone_id: Some(invoke.zone_id.to_string()),
+            principal: Some("user:test".to_string()),
+            capability_token: Some(invoke.capability_token.clone()),
+            holder_proof: None,
+            approval_tokens: Vec::new(),
+            lease_seq: None,
+            estimate_cost: false,
+            check_availability: false,
+            deadline_ms: 5_000,
+        };
+        let preflight_response = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/preflight",
+            serde_json::to_value(preflight).unwrap(),
+            &[],
+        )
+        .await
+        .unwrap();
+        let preflight_body = response_body_json_ok(preflight_response, "large preflight")
+            .await
+            .unwrap();
+        assert_eq!(preflight_body["allowed"], true);
+        let simulation_response = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/simulate",
+            serde_json::to_value(simulation).unwrap(),
+            &[],
+        )
+        .await
+        .unwrap();
+        let simulation_body = response_body_json_ok(simulation_response, "large simulation")
+            .await
+            .unwrap();
+        assert_eq!(simulation_body["would_succeed"], true);
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+
+        let invocation_body = serde_json::to_value(&invoke).unwrap();
+        let denied = send_json_request(
+            app.clone(),
+            axum::http::Method::POST,
+            "/rpc/invoke",
+            invocation_body.clone(),
+            &[("x-principal", "user:other")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(invokes.load(Ordering::SeqCst), 0);
+
+        let response = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/invoke",
+            invocation_body,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(invokes.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_media_http_limit_rejects_unbounded_streams_before_dispatch() {
+        let state = cancel_route_test_state();
+        let app = local_invocation_routes().with_state(state);
+        for path in ["/rpc/invoke", "/rpc/preflight", "/rpc/simulate"] {
+            // No Content-Length: the body must remain bounded while streaming.
+            // Shared Bytes chunks avoid allocating a second oversized fixture.
+            let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+            let chunks = (0..=LOCAL_INVOCATION_HTTP_BODY_LIMIT_BYTES / chunk.len())
+                .map(move |_| Ok::<Bytes, std::io::Error>(chunk.clone()));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn local_media_http_limit_does_not_expand_other_route_budgets() {
+        let app = local_invocation_routes()
+            .route("/rpc/discover", post(discover_handler))
+            .with_state(cancel_route_test_state());
+        let response = send_json_request(
+            app,
+            axum::http::Method::POST,
+            "/rpc/discover",
+            json!({ "extra": "A".repeat(3 * 1024 * 1024) }),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     struct HostOAuthLoopbackExpectedRequest {
