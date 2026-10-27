@@ -313,7 +313,19 @@ pub(super) fn run_dispatcher(
     // unpolled actor must also close and settle all buffered request custody.
     let mut receiver = NativeRpcQueue(receiver);
     async move {
-        while let Some(request) = receiver.recv().await {
+        loop {
+            let request = {
+                let failed = pin!(runner.event_transport.failed());
+                let next = pin!(receiver.recv());
+                match select(failed, next).await {
+                    Either::Left(_) => None,
+                    Either::Right((request, _)) => request,
+                }
+            };
+            let Some(request) = request else {
+                receiver.close();
+                break;
+            };
             let rpc = request.rpc;
             if !rpc.try_begin() {
                 let _ = request.response_tx.send(Err(rpc.stop_error()));

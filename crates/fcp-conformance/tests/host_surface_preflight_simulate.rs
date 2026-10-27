@@ -859,6 +859,7 @@ async fn issue_live_capability_token(
                 connector_id: connector_id.to_string(),
                 capability_id: capability_id.to_string(),
                 zone_id: zone_id.to_string(),
+                instance_id: None,
                 principal_id: principal.to_string(),
                 operations: vec![operation.to_string()],
                 ttl_secs: 3_600,

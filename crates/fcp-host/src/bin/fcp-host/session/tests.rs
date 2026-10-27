@@ -273,6 +273,7 @@ fn dispatcher() -> Dispatcher {
     let connector = SubprocessConnector {
         summary,
         runner_tx,
+        event_transport: None,
         _runner_task: runner_task,
         resilience,
         capability_verifying_key: Some([1; PUBLIC_KEY_SIZE]),

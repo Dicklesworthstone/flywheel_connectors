@@ -36,12 +36,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use fcp_async_core::channel::{mpsc, oneshot};
 use fcp_async_core::hyper_bridge::{HyperExecutor, HyperIo};
 use fcp_async_core::io::{
-    AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use fcp_async_core::net::TcpListener;
 #[cfg(unix)]
 use fcp_async_core::net::UnixListener;
-use fcp_async_core::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use fcp_async_core::process::{Child, Command, Stdio};
 use fcp_async_core::sync::{Mutex, RwLock};
 use fcp_async_core::task::{self, JoinHandle};
 use fcp_crypto::{
@@ -175,8 +175,12 @@ mod invoke_jobs;
 mod mesh_cancel;
 #[path = "fcp-host/native_framing.rs"]
 mod native_framing;
+#[path = "fcp-host/native_events.rs"]
+mod native_events;
 #[path = "fcp-host/native_rpc.rs"]
 mod native_rpc;
+#[path = "fcp-host/native_stream.rs"]
+mod native_stream;
 #[path = "fcp-host/session.rs"]
 mod session;
 
@@ -387,6 +391,7 @@ fn connector_summary_from_config(config: &ConnectorConfig) -> HostResult<Connect
 struct SubprocessConnector {
     summary: ConnectorSummary,
     runner_tx: mpsc::Sender<ConnectorRpcRequest>,
+    event_transport: Option<native_stream::NativeEventTransport>,
     _runner_task: JoinHandle<()>,
     resilience: Arc<ResilienceLayer>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
@@ -603,6 +608,7 @@ impl SubprocessConnector {
             .await
             .map_err(|err| HostError::Internal(format!("spawn failed: {err}")))?;
         runner.response_limits = response_limits;
+        let event_transport = runner.event_transport.clone();
         let state_root = configured_connector_state_root(&config);
         let (runner_tx, runner_rx) =
             mpsc::channel::<ConnectorRpcRequest>(CONNECTOR_RPC_QUEUE_CAPACITY);
@@ -614,6 +620,7 @@ impl SubprocessConnector {
         let connector = Self {
             summary,
             runner_tx,
+            event_transport: Some(event_transport),
             _runner_task: runner_task,
             resilience,
             capability_verifying_key,
@@ -2177,6 +2184,7 @@ struct ManifestOperationConstraintCatalog {
     source: Option<String>,
     declared_operations: HashSet<String>,
     network_constraints: HashMap<String, NetworkConstraints>,
+    event_authorities: BTreeMap<String, fcp_manifest::EventSection>,
 }
 
 impl ManifestOperationConstraintCatalog {
@@ -2202,6 +2210,7 @@ impl ManifestOperationConstraintCatalog {
             source: Some(source.into()),
             declared_operations,
             network_constraints,
+            event_authorities: manifest.provides.events.clone(),
         }
     }
 }
@@ -4419,8 +4428,9 @@ fn connector_config_declares_singleton_writer(config: &ConnectorConfig) -> bool 
 struct ConnectorProcessRunner {
     child: Option<Child>,
     active_rpc: Option<NativeRpc>,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    event_transport: native_stream::NativeEventTransport,
+    responses: mpsc::Receiver<std::io::Result<native_stream::NativeReply>>,
+    _stdout_task: JoinHandle<()>,
     _stderr_task: JoinHandle<()>,
     poisoned: bool,
     epoch: u64,
@@ -4430,6 +4440,10 @@ struct ConnectorProcessRunner {
 
 impl Drop for ConnectorProcessRunner {
     fn drop(&mut self) {
+        self.event_transport.fail(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "native subprocess transport owner stopped",
+        ));
         if let Some(rpc) = self.active_rpc.take()
             && let Some(child) = self.child.take()
         {
@@ -4591,11 +4605,15 @@ impl ConnectorProcessRunner {
             std::io::Error::other(format!("connector stderr task admission failed: {error}"))
         })?;
 
+        let event_transport = native_stream::NativeEventTransport::new(stdin);
+        let (responses, stdout_task) = event_transport.spawn_reader(stdout)?;
+
         Ok(Self {
             child: Some(child),
             active_rpc: None,
-            stdin,
-            stdout: BufReader::new(stdout),
+            event_transport,
+            responses,
+            _stdout_task: stdout_task,
             _stderr_task: stderr_task,
             poisoned: false,
             epoch: 0,
@@ -4614,16 +4632,7 @@ impl ConnectorProcessRunner {
         value: &serde_json::Value,
         io_timeout: Duration,
     ) -> std::io::Result<()> {
-        let line = serde_json::to_string(value)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        fcp_async_core::time::timeout(io_timeout, async {
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await
-        })
-        .await
-        .map_err(|_| connector_io_timeout_error("stdin write", io_timeout))??;
-        Ok(())
+        self.event_transport.write_json(value, io_timeout).await
     }
 
     async fn read_json(
@@ -4631,49 +4640,26 @@ impl ConnectorProcessRunner {
         io_timeout: Duration,
         response_limit: usize,
     ) -> std::io::Result<serde_json::Value> {
-        let mut frame = native_framing::ResponseFrame::new(response_limit);
-        fcp_async_core::time::timeout(
-            io_timeout,
-            std::future::poll_fn(|cx| {
-                // Bound work per poll as well as total storage. Large, already
-                // buffered responses must yield to the absolute-deadline waiter.
-                const BYTES_PER_POLL: usize = 64 * 1024;
-                let mut scanned = 0;
-                loop {
-                    let chunk =
-                        std::task::ready!(std::pin::Pin::new(&mut self.stdout).poll_fill_buf(cx))?;
-                    if chunk.is_empty() {
-                        return std::task::Poll::Ready(Ok::<(), std::io::Error>(()));
-                    }
-                    let available = chunk.len().min(BYTES_PER_POLL - scanned);
-                    let (consumed, complete) =
-                        frame.append(&chunk[..available]).map_err(|error| {
-                            connector_transport_desynchronized_error(error.to_string())
-                        })?;
-                    std::pin::Pin::new(&mut self.stdout).consume(consumed);
-                    if complete {
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    scanned += consumed;
-                    if scanned == BYTES_PER_POLL {
-                        cx.waker().wake_by_ref();
-                        return std::task::Poll::Pending;
-                    }
+        let response = fcp_async_core::time::timeout(io_timeout, async {
+            // Prefer a completed reply over EOF observed immediately after it.
+            let response = pin!(self.responses.recv());
+            let failed = pin!(self.event_transport.failed());
+            match futures_util::future::select(response, failed).await {
+                futures_util::future::Either::Left((Some(response), _)) => response,
+                futures_util::future::Either::Left((None, _))
+                | futures_util::future::Either::Right(_) => {
+                    Err(self.event_transport.failure_error())
                 }
-            }),
-        )
+            }
+        })
         .await
         .map_err(|_| connector_io_timeout_error("stdout read", io_timeout))??;
-        if frame.bytes().is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connector closed stdout",
-            ));
+        if response.frame_bytes > response_limit {
+            return Err(connector_transport_desynchronized_error(format!(
+                "stdout frame exceeded {response_limit} bytes"
+            )));
         }
-        let line = std::str::from_utf8(frame.bytes())
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        serde_json::from_str::<serde_json::Value>(line.trim())
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        Ok(response.value)
     }
 
     fn validate_response_id(
@@ -4728,6 +4714,7 @@ impl ConnectorProcessRunner {
             method,
             params.get("operation").and_then(serde_json::Value::as_str),
         );
+        let _response_budget = self.event_transport.response_budget(response_limit);
         let expected_id = self.next_request_id();
         let request = json!({
             "jsonrpc": "2.0",
@@ -8185,6 +8172,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
     // lifecycle admissions. A second host must fail before touching live work.
     let (lifecycle, invoke_audit) =
         open_host_invocation_stores(HostAdminStateStore::persistence_path_from_env()?)?;
+    let event_journal = native_events::open_journal()?;
     let lifecycle = Arc::new(lifecycle);
     let invoke_audit = Arc::new(invoke_audit);
     let registry = Arc::new(
@@ -8494,6 +8482,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         // flywheel_connectors-qeapt.
         .route("/rpc/introspect/{connector_id}", get(introspect_handler))
         .merge(local_invocation_routes())
+        .merge(native_events::routes(Arc::clone(&state), event_journal))
         .route("/rpc/egress/http", post(host_egress_http_handler))
         .route("/rpc/egress/tcp", post(host_egress_tcp_handler))
         // /rpc/cancel and /rpc/operations/cancel moved into
@@ -17215,7 +17204,7 @@ deny_ptrace = true
         config
     }
 
-    fn dispatcher_test_connector(
+    pub(super) fn dispatcher_test_connector(
         connector_id: &'static str,
         runner_tx: mpsc::Sender<ConnectorRpcRequest>,
         runner_task: JoinHandle<()>,
@@ -17237,6 +17226,7 @@ deny_ptrace = true
             runner_tx,
             _runner_task: runner_task,
             resilience: Arc::new(ResilienceLayer::default()),
+            event_transport: None,
             capability_verifying_key: None,
             state_root: None,
             handshaken_zone: futures_util::lock::Mutex::new(None),
@@ -17252,7 +17242,7 @@ deny_ptrace = true
         })
     }
 
-    fn dispatcher_registry_with_connector(
+    pub(super) fn dispatcher_registry_with_connector(
         connector_id: &'static str,
         connector: Arc<SubprocessConnector>,
         config: ConnectorConfig,
@@ -17299,7 +17289,7 @@ deny_ptrace = true
         })
     }
 
-    fn dispatcher_app_state(
+    pub(super) fn dispatcher_app_state(
         registry: Arc<SubprocessRegistry>,
         lifecycle: Arc<HostAdminStateStore>,
         capability_verifying_key: Option<Ed25519VerifyingKey>,
@@ -17385,7 +17375,7 @@ deny_ptrace = true
         }
     }
 
-    fn dispatcher_test_config(connector_id: &'static str) -> ConnectorConfig {
+    pub(super) fn dispatcher_test_config(connector_id: &'static str) -> ConnectorConfig {
         ConnectorConfig {
             cancellation_deadline_ms: None,
             id: connector_id.to_string(),
@@ -18652,6 +18642,7 @@ deny_ptrace = true
                     connector_id: connector_id.to_string(),
                     capability_id: capability_id.to_string(),
                     zone_id: zone_id.to_string(),
+                    instance_id: None,
                     principal_id: "user:test".to_string(),
                     operations: vec![operation_id.to_string()],
                     ttl_secs: 3600,
@@ -18671,7 +18662,7 @@ deny_ptrace = true
             .expect("register test capability issuer");
     }
 
-    fn test_capability_token(
+    pub(super) fn test_capability_token(
         signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
         capability_id: &str,
         operation_id: &str,
@@ -18695,7 +18686,7 @@ deny_ptrace = true
         )
     }
 
-    fn test_capability_token_for_instance(
+    pub(super) fn test_capability_token_for_instance(
         signing_key: &fcp_crypto::ed25519::Ed25519SigningKey,
         capability_id: &str,
         operation_id: &str,
@@ -21422,6 +21413,7 @@ deny_ptrace = true
                     connector_id: connector_id.to_string(),
                     capability_id: "cap.test.echo".to_string(),
                     zone_id: ZoneId::work().to_string(),
+                    instance_id: None,
                     principal_id: "user:test".to_string(),
                     operations: vec!["test.echo".to_string()],
                     ttl_secs: 3600,
@@ -28278,6 +28270,7 @@ deny_ptrace = true
                     connector_id: connector_id.to_string(),
                     capability_id: "cap.test.echo".to_string(),
                     zone_id: ZoneId::work().to_string(),
+                    instance_id: None,
                     principal_id: "user:test".to_string(),
                     operations: vec!["test.echo".to_string()],
                     ttl_secs: 3600,
@@ -28379,6 +28372,7 @@ deny_ptrace = true
                     connector_id: connector_id.to_string(),
                     capability_id: "cap.test.echo".to_string(),
                     zone_id: ZoneId::work().to_string(),
+                    instance_id: None,
                     principal_id: "user:test".to_string(),
                     operations: vec!["test.echo".to_string()],
                     ttl_secs: 3600,
@@ -29606,6 +29600,7 @@ done"#
         let connector = SubprocessConnector {
             summary,
             runner_tx,
+            event_transport: None,
             _runner_task: runner_task,
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: None,
@@ -31473,6 +31468,7 @@ done"#;
                 last_health_check: None,
             },
             runner_tx,
+            event_transport: None,
             _runner_task: runner_task,
             resilience: Arc::new(ResilienceLayer::default()),
             capability_verifying_key: Some(signing_key.verifying_key().to_bytes()),
@@ -33426,6 +33422,7 @@ done"#;
                     connector_id: connector_id.to_string(),
                     capability_id: capability_id.to_string(),
                     zone_id: ZoneId::work().to_string(),
+                    instance_id: None,
                     principal_id: principal_id.to_string(),
                     operations,
                     ttl_secs: 3600,

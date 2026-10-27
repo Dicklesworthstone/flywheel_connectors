@@ -929,6 +929,106 @@ Reconnecting ──(max retries)────> Unhealthy
 
 `StreamHealthTracker` drives transitions and produces `StreamHealthSnapshot` structs with `last_heartbeat_ms_ago`, `last_ack_ms_ago`, `reconnect_count`, `messages_received`, and `uptime_ms`. The tracker maps to `fcp_core::ConnectorHealth` for external reporting.
 
+### Native event consumers and durable acknowledgements
+
+The native host continuously reads connector stdout, separating event notifications
+from RPC replies even when no RPC is pending. An authorized consumer can open an
+exact topic, poll retained deliveries, and acknowledge them through these routes:
+
+| Route | Behavior |
+|-------|----------|
+| `POST /rpc/streams/open` | Verify authority, attach a dedicated native process, and subscribe with a bounded credit window. |
+| `POST /rpc/streams/poll` | Return pending events without removing them or granting producer credit. |
+| `POST /rpc/streams/ack` | Durably record the consumer's exact sequence/cursor acknowledgement, then notify the producer. |
+| `POST /rpc/streams/close` | Stop new admission while retaining unacknowledged deliveries for the same authorized consumer. |
+
+Configure `FCP_HOST_EVENT_JOURNAL_FILE`, or configure the persistent lifecycle
+store; its sibling `<lifecycle-path>.events.json` is then used automatically.
+Consumer routes refuse to operate without durable storage. The journal holds an
+exclusive writer lock and synchronizes each transition before exposing a delivery
+or releasing credit. A failed or uncertain write fences the journal until recovery.
+
+The connector inventory must name a validated `manifest_path`, admit the exact
+zone, and allow the manifest's subscription control operation. Each event declares
+`capability`, `subscribe_operation`, `resource_uri`, `streaming = true`, and
+`requires_ack = true`. These authority declarations participate in the interface
+hash. Runtime egress restrictions continue to apply; subscriptions cannot bypass
+strict native egress enforcement. Warm-pool and WASI instances do not expose this
+native consumer surface.
+
+Every request includes an `auth` object containing `request_id`, `connector_id`,
+`zone_id`, `topic`, and `capability_token`. The token is a signed COSE byte array or
+its standard base64 encoding. Its subject must own the retained stream, and its
+grants must match the manifest's capability, subscription operation, exact topic
+resource, zone, and authorized connector instance. The host rechecks revocation
+and zone policy on every request. Stream IDs and asserted principal headers do
+not authorize access. Holder-bound tokens require a separate proof transport and
+are rejected by these routes.
+
+For Telegram, prepare the actual instance through the protected
+`POST /rpc/admin/connectors/{connector_id}/session` route, then have the trusted
+issuer sign `telegram.read` / `telegram.subscribe` for that instance and a resource
+such as `telegram:events:telegram.message.new`. The signing library supports
+`CapabilityTokenBuilder::target_instance`; the host library's
+`issue_capability_token` also accepts `CapabilityIssuanceRequest.instance_id`.
+The HTTP host only needs the verification key. An open body looks like:
+
+```json
+{
+  "auth": {
+    "request_id": "consumer-subscription-001",
+    "connector_id": "fcp.telegram",
+    "zone_id": "z:work",
+    "topic": "telegram.message.new",
+    "capability_token": "<base64 signed COSE token>"
+  },
+  "window_size": 1
+}
+```
+
+Retain the returned `stream.stream_id`. The same verified owner, scope, and open
+request ID derive the same stream ID, so a lost open response can be retried.
+Poll with the same `auth`, `stream_id`, and `limit` (1–64). After processing a
+delivery, send the same `auth` and `stream_id` to `/ack` with:
+
+```json
+{
+  "ack": {
+    "type": "ack",
+    "topic": "telegram.message.new",
+    "seqs": [12345],
+    "cursors": ["12345"]
+  }
+}
+```
+
+Only pairs returned by polling can be acknowledged. Repeated polls redeliver
+unacknowledged events, and repeated acknowledgements are idempotent. If
+`upstream_notified` is false, the consumer decision is still durable; retry its
+original acknowledgement or resume the same stream after restoring the native
+process. On consumer reconnect, poll and acknowledge retained work before waiting
+for a subscription renewal that may be queued behind an invocation awaiting ACK.
+
+Telegram starts polling only after an authorized subscription and waits for the
+consumer ACK before advancing its durable provider cursor. Its `receive_mode`
+configuration selects `polling` (default) or `webhook`; webhook mode requires a
+configured secret and does not start `getUpdates`. The producer currently uses
+one credit, even if a larger window is negotiated. An unacknowledged delivery
+times out after 60 seconds without advancing the checkpoint; reopen the same
+stream to recover after the poller drains. Each stream selects one exact topic;
+other provider update topics are filtered deliberately.
+
+This provides local durable custody and at-least-once consumer delivery. Consumers
+must make their own processing idempotent across a crash between side effects and
+ACK. Telegram still advertises no historical replay. Pending events and exact
+receipts survive host restarts, but this journal is not mesh-replicated storage.
+Limits are 256 KiB per native event frame, 64 outstanding events per stream,
+16 MiB pending payloads, 64 retained streams, 16,384 exact cursor receipts per
+stream, and a 32 MiB snapshot. Exhaustion fails closed; receipts are not silently
+evicted. Closed streams retain their evidence and cannot be reopened. Changing to
+a new logical stream on the same dedicated process requires an explicit connector
+restart after closing and draining the old stream.
+
 ---
 
 ## Provider Auth and Credential Pooling
@@ -1780,6 +1880,7 @@ Proof anchors for deployment claims:
 | `FCP_HOST_BIND` | `fcp-host` listen address (also used by `fwc` as a third fallback for endpoint resolution) | `127.0.0.1:8787` |
 | `FCP_HOST_CONNECTORS_FILE` | Live connector inventory file mutated by `fcp-host` | None |
 | `FCP_HOST_LIFECYCLE_STATE_FILE` | Local admin-state snapshot for `fcp-host` | None |
+| `FCP_HOST_EVENT_JOURNAL_FILE` | Durable native event deliveries and consumer ACK receipts | `<lifecycle-path>.events.json` when lifecycle persistence is configured; otherwise native consumer delivery is unavailable |
 | `FCP_CONFIG_DIR` | FCP configuration directory; also resolves `HOME` / `USERPROFILE` as fallbacks | `~/.fcp` |
 | `FCP_CONNECTOR_STATE` | Connector state directory | `$FCP_CONFIG_DIR/state` |
 | `RUST_LOG` | Standard Rust logging filter | `info` |

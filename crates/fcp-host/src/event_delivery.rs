@@ -105,7 +105,9 @@ pub enum NativeEventAdmission {
 #[serde(deny_unknown_fields)]
 struct PendingEvent {
     event: EventEnvelope,
-    native_seq: u64,
+    // None until this cursor has been observed from the authorized instance.
+    // Old snapshots encode a number, which deserializes as Some(number).
+    native_seq: Option<u64>,
     digest: String,
     bytes: usize,
     delivered: bool,
@@ -116,7 +118,7 @@ struct PendingEvent {
 struct AcknowledgedEvent {
     cursor: String,
     delivery_seq: u64,
-    native_seq: u64,
+    native_seq: Option<u64>,
     digest: String,
 }
 
@@ -266,7 +268,19 @@ impl NativeEventJournal {
                 // The host must verify the capability against the newly
                 // observed instance before replacing this admission. Retained
                 // payloads keep their original provenance and delivery IDs.
-                record.instance_id = instance_id;
+                if record.instance_id != instance_id {
+                    // Native sequence numbers belong to the subprocess, not
+                    // the durable stream. An ACK before provider replay still
+                    // commits custody but must not target its predecessor's
+                    // sequence in a fresh process.
+                    for pending in &mut record.pending {
+                        pending.native_seq = None;
+                    }
+                    for receipt in record.acknowledged.values_mut() {
+                        receipt.native_seq = None;
+                    }
+                    record.instance_id = instance_id;
+                }
                 return Ok(stream_view(stream_id, record, self.path.is_some()));
             }
             if snapshot.streams.len() >= NATIVE_EVENT_MAX_STREAMS {
@@ -343,7 +357,7 @@ impl NativeEventJournal {
             }
             if let Some(receipt) = record.acknowledged.get_mut(&event.cursor) {
                 check_digest(&receipt.digest, &digest)?;
-                receipt.native_seq = event.seq;
+                receipt.native_seq = Some(event.seq);
                 return Ok(NativeEventAdmission::AlreadyAcknowledged(
                     EventAck::new(&record.binding.topic, vec![event.seq])
                         .with_cursors(vec![event.cursor.clone()]),
@@ -355,7 +369,7 @@ impl NativeEventJournal {
                 .find(|pending| pending.event.cursor == event.cursor)
             {
                 check_digest(&pending.digest, &digest)?;
-                pending.native_seq = event.seq;
+                pending.native_seq = Some(event.seq);
                 return Ok(NativeEventAdmission::DuplicatePending);
             }
             if record.pending.len() >= record.window_size as usize {
@@ -370,7 +384,7 @@ impl NativeEventJournal {
                 return Err(unavailable("event journal pending byte limit reached"));
             }
             record.pending.push_back(PendingEvent {
-                native_seq: event.seq,
+                native_seq: Some(event.seq),
                 event,
                 digest,
                 bytes,
@@ -420,11 +434,14 @@ impl NativeEventJournal {
         })
     }
 
-    /// Commit consumer acknowledgement and return the current native identity.
+    /// Commit consumer acknowledgement and return observed current native identities.
     ///
     /// The caller may relay the returned acknowledgement only after this
     /// method succeeds. Duplicate consumer acknowledgements are idempotent;
     /// the connector must likewise release credit once per exact identity.
+    /// After an instance changes, pairs that have not replayed from the new
+    /// process are omitted. Their custody still commits; a subsequent replay
+    /// returns `AlreadyAcknowledged` with its freshly observed native identity.
     ///
     /// # Errors
     /// Rejects mismatched authority, undelivered/unknown events, partial cursor
@@ -447,6 +464,7 @@ impl NativeEventJournal {
                 ));
             }
             let mut native_seqs = Vec::with_capacity(ack.seqs.len());
+            let mut native_cursors = Vec::with_capacity(ack.cursors.len());
             for (&sequence, cursor) in ack.seqs.iter().zip(&ack.cursors) {
                 if let Some(receipt) = record.acknowledged.get(cursor) {
                     if receipt.delivery_seq != sequence {
@@ -454,7 +472,10 @@ impl NativeEventJournal {
                             "acknowledgement sequence/cursor pair does not match",
                         ));
                     }
-                    native_seqs.push(receipt.native_seq);
+                    if let Some(native_seq) = receipt.native_seq {
+                        native_seqs.push(native_seq);
+                        native_cursors.push(cursor.clone());
+                    }
                     continue;
                 }
                 let position = record
@@ -471,7 +492,10 @@ impl NativeEventJournal {
                 let pending = record.pending.remove(position).ok_or_else(|| {
                     unavailable("event custody changed while committing acknowledgement")
                 })?;
-                native_seqs.push(pending.native_seq);
+                if let Some(native_seq) = pending.native_seq {
+                    native_seqs.push(native_seq);
+                    native_cursors.push(cursor.clone());
+                }
                 record.acknowledged.insert(
                     cursor.clone(),
                     AcknowledgedEvent {
@@ -482,7 +506,7 @@ impl NativeEventJournal {
                     },
                 );
             }
-            Ok(EventAck::new(&record.binding.topic, native_seqs).with_cursors(ack.cursors.clone()))
+            Ok(EventAck::new(&record.binding.topic, native_seqs).with_cursors(native_cursors))
         })
     }
 
@@ -1112,6 +1136,74 @@ mod tests {
     }
 
     #[test]
+    fn instance_reattachment_never_relays_unobserved_predecessor_sequences() {
+        let journal = NativeEventJournal::memory();
+        register(&journal, 2);
+        ingest(&journal, event(41)).unwrap();
+        ingest(&journal, event(42)).unwrap();
+        journal
+            .poll("stream-1", &binding(), &instance_id(), 2)
+            .unwrap();
+        journal
+            .acknowledge("stream-1", &binding(), &instance_id(), &ack(41))
+            .unwrap();
+        ingest(&journal, event(43)).unwrap();
+        journal
+            .poll("stream-1", &binding(), &instance_id(), 2)
+            .unwrap();
+
+        let replacement = InstanceId::new();
+        journal
+            .register("stream-1", binding(), 2, replacement.clone())
+            .unwrap();
+        // An old receipt is still a committed consumer decision, but it
+        // carries no credit identity for the replacement subprocess yet.
+        let unmapped = journal
+            .acknowledge("stream-1", &binding(), &replacement, &ack(41))
+            .unwrap();
+        assert!(unmapped.seqs.is_empty());
+        assert!(unmapped.cursors.is_empty());
+
+        let mut replay = event(42);
+        replay.seq = 7;
+        replay.data.instance_id = replacement.clone();
+        assert!(matches!(
+            ingest(&journal, replay).unwrap(),
+            NativeEventAdmission::DuplicatePending
+        ));
+        let batch = EventAck::new(binding().topic, vec![41, 42, 43]).with_cursors(vec![
+            "update:41".to_owned(),
+            "update:42".to_owned(),
+            "update:43".to_owned(),
+        ]);
+        let mapped = journal
+            .acknowledge("stream-1", &binding(), &replacement, &batch)
+            .unwrap();
+        assert_eq!(mapped.seqs, vec![7]);
+        assert_eq!(mapped.cursors, vec!["update:42"]);
+        assert_eq!(journal.describe("stream-1").unwrap().pending_events, 0);
+        assert_eq!(journal.describe("stream-1").unwrap().acknowledged_events, 3);
+
+        for (original_seq, native_seq) in [(41, 8), (43, 9)] {
+            let mut replay = event(original_seq);
+            replay.seq = native_seq;
+            replay.data.instance_id = replacement.clone();
+            match ingest(&journal, replay).unwrap() {
+                NativeEventAdmission::AlreadyAcknowledged(ack) => {
+                    assert_eq!(ack.seqs, vec![native_seq]);
+                    assert_eq!(ack.cursors, vec![format!("update:{original_seq}")]);
+                }
+                other => panic!("committed event must not redeliver: {other:?}"),
+            }
+        }
+        let all_mapped = journal
+            .acknowledge("stream-1", &binding(), &replacement, &batch)
+            .unwrap();
+        assert_eq!(all_mapped.seqs, vec![8, 7, 9]);
+        assert_eq!(all_mapped.cursors, batch.cursors);
+    }
+
+    #[test]
     fn cursor_conflicts_fail_closed_before_and_after_acknowledgement() {
         let journal = NativeEventJournal::memory();
         register(&journal, 1);
@@ -1312,7 +1404,7 @@ mod tests {
                     AcknowledgedEvent {
                         cursor,
                         delivery_seq: seq as u64,
-                        native_seq: seq as u64,
+                        native_seq: Some(seq as u64),
                         digest: "a".repeat(64),
                     },
                 );
@@ -1382,9 +1474,11 @@ mod tests {
             serde_json::to_value(original.events).unwrap(),
             serde_json::to_value(replay.events).unwrap()
         );
-        journal
+        let unmapped = journal
             .acknowledge("stream-1", &binding(), &replacement_instance, &ack(42))
             .unwrap();
+        assert!(unmapped.seqs.is_empty());
+        assert!(unmapped.cursors.is_empty());
         drop(journal); // Consumer may not have received the acknowledgement response.
 
         let journal = NativeEventJournal::open(path).unwrap();
@@ -1395,6 +1489,13 @@ mod tests {
         journal
             .register("stream-1", binding(), 1, replacement_instance.clone())
             .unwrap();
+        assert!(
+            journal
+                .acknowledge("stream-1", &binding(), &replacement_instance, &ack(42))
+                .unwrap()
+                .seqs
+                .is_empty()
+        );
         assert!(
             journal
                 .poll("stream-1", &binding(), &replacement_instance, 1)

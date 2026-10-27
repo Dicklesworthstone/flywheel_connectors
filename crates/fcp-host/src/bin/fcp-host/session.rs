@@ -17,7 +17,7 @@ pub(super) struct PrepareSessionRequest {
 pub(super) struct PreparedSession {
     connector_id: ConnectorId,
     zone_id: ZoneId,
-    instance_id: InstanceId,
+    pub(super) instance_id: InstanceId,
     protocol_version: &'static str,
 }
 
@@ -120,7 +120,7 @@ fn require_zone(allowed: &[String], zone: &ZoneId) -> Result<(), HttpFailure> {
 
 /// Accept only the typed, ready health of the actual negotiated process,
 /// not an instance ID supplied by an API caller or guessed by the host.
-fn prepared_from_health(
+pub(super) fn prepared_from_health(
     connector_id: ConnectorId,
     zone_id: ZoneId,
     value: Value,

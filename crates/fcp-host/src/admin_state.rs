@@ -20,7 +20,7 @@ use fcp_kernel::{
 pub use fcp_mesh::planner::SimulateResourceAvailability;
 use fcp_prelude::{
     ApprovalToken, CapabilityConstraints, CapabilityGrant, CapabilityId, CapabilityToken,
-    CredentialId, ObjectPlacementPolicy, OperationId,
+    CredentialId, InstanceId, ObjectPlacementPolicy, OperationId,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -1106,6 +1106,13 @@ pub struct CapabilityIssuanceRequest {
     pub capability_id: String,
     /// Zone within which the token is valid.
     pub zone_id: String,
+    /// Running connector instance to which the token is bound.
+    ///
+    /// Native event streams and other bound-verifier paths require this
+    /// claim. Obtain the instance from the connector's prepared session;
+    /// restarting the connector requires issuing a token for its new instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<InstanceId>,
     /// Principal receiving the capability.
     pub principal_id: String,
     /// Allowed operations. Empty means all operations under the connector.
@@ -4432,6 +4439,10 @@ impl HostAdminStateStore {
 
         if let Some(nbf) = not_before {
             claims = claims.not_before(nbf);
+        }
+
+        if let Some(instance_id) = request.instance_id.as_ref() {
+            claims = claims.target_instance(instance_id.as_str());
         }
 
         if !request.operations.is_empty() {
@@ -8711,6 +8722,7 @@ mod tests {
             connector_id: "github:saas:1.0.0".to_string(),
             capability_id: "github.repo".to_string(),
             zone_id: "z:work".to_string(),
+            instance_id: None,
             principal_id: "agent:test-agent".to_string(),
             operations: vec!["list_repos".to_string(), "create_issue".to_string()],
             ttl_secs: 3600,
@@ -8772,7 +8784,7 @@ mod tests {
 
         let verified = verifier
             .verify_unbound(
-                token,
+                token.clone(),
                 &CapabilityId::new("github.repo").unwrap(),
                 &OperationId::new("list_repos").unwrap(),
                 &[],
@@ -8780,6 +8792,66 @@ mod tests {
             .expect("host-issued token must satisfy live core verifier");
 
         assert_eq!(verified.claims().get_capability_id(), Some("github.repo"));
+
+        let bound = fcp_core::CapabilityVerifier::new(
+            key.verifying_key().to_bytes(),
+            fcp_core::ZoneId::work(),
+            InstanceId::new(),
+        );
+        assert!(matches!(
+            bound.verify_bound(
+                token,
+                &CapabilityId::new("github.repo").unwrap(),
+                &OperationId::new("list_repos").unwrap(),
+                &[],
+            ),
+            Err(fcp_core::FcpError::MissingField { field }) if field.contains("instance_id")
+        ));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn instance_bound_issued_token_only_verifies_for_requested_instance() {
+        let store = HostAdminStateStore::new();
+        let key = test_signing_key();
+        let instance = InstanceId::new();
+        let mut request = basic_issuance_request();
+        request.instance_id = Some(instance.clone());
+        let response = store.issue_capability_token(&request, &key).await.unwrap();
+        let token_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            response.token_cbor_b64.expect("non-dry-run token"),
+        )
+        .unwrap();
+        let token = CapabilityToken::from_raw(CoseToken::from_cbor(&token_bytes).unwrap());
+        let capability = CapabilityId::new("github.repo").unwrap();
+        let operation = OperationId::new("list_repos").unwrap();
+
+        let verified = fcp_core::CapabilityVerifier::new(
+            key.verifying_key().to_bytes(),
+            fcp_core::ZoneId::work(),
+            instance.clone(),
+        )
+        .verify_bound(token.clone(), &capability, &operation, &[])
+        .expect("host-issued token must be bound to the requested instance");
+        assert_eq!(
+            verified
+                .claims()
+                .get(fcp_crypto::cose::fcp2_claims::INSTANCE_ID)
+                .and_then(ciborium::Value::as_text),
+            Some(instance.as_str())
+        );
+
+        let mismatched = fcp_core::CapabilityVerifier::new(
+            key.verifying_key().to_bytes(),
+            fcp_core::ZoneId::work(),
+            InstanceId::new(),
+        )
+        .verify_bound(token, &capability, &operation, &[]);
+        assert!(matches!(
+            mismatched,
+            Err(fcp_core::FcpError::ZoneViolation { message, .. })
+                if message.contains("instance mismatch")
+        ));
     }
 
     #[fcp_async_core::runtime::test]
@@ -9451,6 +9523,26 @@ mod tests {
         assert_eq!(parsed.ttl_secs, 3600);
         assert!(!parsed.dry_run);
         assert_eq!(parsed.max_delegation_depth, 0);
+        assert!(parsed.instance_id.is_none());
+        assert!(
+            serde_json::to_value(&parsed)
+                .unwrap()
+                .get("instance_id")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capability_issuance_request_validates_and_preserves_instance_binding() {
+        let mut request = basic_issuance_request();
+        let instance = InstanceId::new();
+        request.instance_id = Some(instance.clone());
+        let mut json = serde_json::to_value(&request).unwrap();
+        let decoded: CapabilityIssuanceRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded.instance_id, Some(instance));
+
+        json["instance_id"] = serde_json::json!("instance with whitespace");
+        assert!(serde_json::from_value::<CapabilityIssuanceRequest>(json).is_err());
     }
 
     // ── Simulate RPC tests ─────────────────────────────────────────────────
@@ -10102,6 +10194,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned(), "write".to_owned()],
             ttl_secs: 3600,
@@ -10150,6 +10243,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 3600,
@@ -10201,6 +10295,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 3600,
@@ -10246,6 +10341,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 3600,
@@ -10303,6 +10399,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 3600,
@@ -10346,6 +10443,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 60,
@@ -10406,6 +10504,7 @@ mod tests {
             connector_id: "test:saas:1.0.0".to_owned(),
             capability_id: "test.read".to_owned(),
             zone_id: "zone-test".to_owned(),
+            instance_id: None,
             principal_id: "agent-1".to_owned(),
             operations: vec!["read".to_owned()],
             ttl_secs: 3600,
