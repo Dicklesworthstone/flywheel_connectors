@@ -88,7 +88,7 @@ fn validate_drive_base_url(raw: &str) -> FcpResult<String> {
 
 fn drive_capability_for_operation(operation: &str) -> FcpResult<CapabilityId> {
     match operation {
-        "drive.list_files" | "drive.get_file" | "drive.download_file" => {
+        "drive.list_files" | "drive.get_file" | "drive.download_file" | "drive.export_file" => {
             Ok(CapabilityId::from_static("drive.read"))
         }
         "drive.create_folder" | "drive.upload_file" | "drive.trash_file" | "drive.share_file" => {
@@ -103,8 +103,19 @@ fn drive_capability_for_operation(operation: &str) -> FcpResult<CapabilityId> {
 fn validate_drive_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
     match operation {
         "drive.list_files" => {}
-        "drive.get_file" | "drive.download_file" | "drive.trash_file" => {
+        "drive.get_file" | "drive.trash_file" => {
             require_str(input, "file_id")?;
+        }
+        "drive.download_file" => {
+            crate::client::validate_media_file_id(require_str(input, "file_id")?)
+                .map_err(|error| error.to_fcp_error())?;
+        }
+        "drive.export_file" => {
+            crate::client::validate_export_input(
+                require_str(input, "file_id")?,
+                require_str(input, "mime_type")?,
+            )
+            .map_err(|error| error.to_fcp_error())?;
         }
         "drive.create_folder" => {
             require_str(input, "name")?;
@@ -147,7 +158,11 @@ fn drive_resource_uris_for_operation(
 ) -> FcpResult<Vec<String>> {
     match operation {
         "drive.list_files" => Ok(vec!["drive://files".into()]),
-        "drive.get_file" | "drive.download_file" | "drive.trash_file" | "drive.share_file" => {
+        "drive.get_file"
+        | "drive.download_file"
+        | "drive.export_file"
+        | "drive.trash_file"
+        | "drive.share_file" => {
             let file_id = require_str(input, "file_id")?;
             Ok(vec![format!("drive://files/{file_id}")])
         }
@@ -175,6 +190,7 @@ const OPERATION_ORDER: &[&str] = &[
     "drive.list_files",
     "drive.get_file",
     "drive.download_file",
+    "drive.export_file",
     "drive.create_folder",
     "drive.upload_file",
     "drive.trash_file",
@@ -569,6 +585,7 @@ impl DriveConnector {
             "drive.list_files" => self.invoke_list_files(input).await,
             "drive.get_file" => self.invoke_get_file(input).await,
             "drive.download_file" => self.invoke_download_file(input).await,
+            "drive.export_file" => self.invoke_export_file(input).await,
             "drive.create_folder" => self.invoke_create_folder(input).await,
             "drive.upload_file" => self.invoke_upload_file(input).await,
             "drive.trash_file" => self.invoke_trash_file(input).await,
@@ -622,6 +639,22 @@ impl DriveConnector {
 
         Ok(json!({
             "file_id": file_id,
+            "content_base64": content
+        }))
+    }
+
+    async fn invoke_export_file(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let file_id = require_str(&input, "file_id")?;
+        let mime_type = require_str(&input, "mime_type")?;
+        let content = client
+            .export_file(file_id, mime_type)
+            .await
+            .map_err(|error| error.to_fcp_error())?;
+
+        Ok(json!({
+            "file_id": file_id,
+            "mime_type": mime_type,
             "content_base64": content
         }))
     }
@@ -796,8 +829,19 @@ mod tests {
         instance_id: &str,
         operation: &'static str,
     ) -> CapabilityToken {
+        build_capability_with_resources(signing_key, instance_id, operation, &["*"])
+    }
+
+    fn build_capability_with_resources(
+        signing_key: &Ed25519SigningKey,
+        instance_id: &str,
+        operation: &'static str,
+        resources: &[&str],
+    ) -> CapabilityToken {
         let capability = match operation {
-            "drive.list_files" | "drive.get_file" | "drive.download_file" => "drive.read",
+            "drive.list_files" | "drive.get_file" | "drive.download_file" | "drive.export_file" => {
+                "drive.read"
+            }
             "drive.create_folder"
             | "drive.upload_file"
             | "drive.trash_file"
@@ -805,7 +849,7 @@ mod tests {
             _ => "drive.read",
         };
         let constraints = CapabilityConstraints {
-            resource_allow: vec!["*".into()],
+            resource_allow: resources.iter().map(ToString::to_string).collect(),
             ..Default::default()
         };
         let mut constraints_cbor = Vec::new();
@@ -868,6 +912,166 @@ mod tests {
             }))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn export_input_validation_and_manifest_formats_agree() {
+        let manifest = ConnectorManifest::parse_str(MANIFEST_TOML).unwrap();
+        let export = &manifest.provides.operations["drive.export_file"];
+        let formats = export.input_schema["properties"]["mime_type"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(formats.len(), crate::client::EXPORT_MIME_TYPES.len());
+        for format in formats {
+            let mime_type = format.as_str().unwrap();
+            assert!(crate::client::EXPORT_MIME_TYPES.contains(&mime_type));
+            validate_drive_input(
+                "drive.export_file",
+                &json!({"file_id":"document-id", "mime_type":mime_type}),
+            )
+            .unwrap();
+        }
+        for input in [
+            json!({}),
+            json!({"file_id":"document-id"}),
+            json!({"file_id":42, "mime_type":"application/pdf"}),
+            json!({"file_id":"document-id", "mime_type":42}),
+            json!({"file_id":"document-id", "mime_type":null}),
+            json!({"file_id":"document-id", "mime_type":"video/mp4"}),
+            json!({"file_id":"../other", "mime_type":"application/pdf"}),
+        ] {
+            assert!(matches!(
+                validate_drive_input("drive.export_file", &input),
+                Err(FcpError::InvalidRequest { .. })
+            ));
+        }
+        assert_eq!(
+            drive_resource_uris_for_operation("drive.export_file", &json!({"file_id":"doc"}))
+                .unwrap(),
+            vec!["drive://files/doc"],
+        );
+        assert_eq!(
+            export
+                .network_constraints
+                .as_ref()
+                .unwrap()
+                .max_response_bytes,
+            crate::client::MAX_EXPORT_BYTES as u64,
+        );
+        assert_eq!(
+            manifest.provides.operations["drive.download_file"]
+                .network_constraints
+                .as_ref()
+                .unwrap()
+                .max_response_bytes,
+            crate::client::MAX_DOWNLOAD_BYTES as u64,
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn export_invocation_and_simulation_enforce_operation_and_file_authority() {
+        use base64::Engine as _;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path, query_param},
+        };
+
+        let server = MockServer::start().await;
+        let media = b"%PDF-1.7\r\n\0\xff\x80";
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/native-doc/export"))
+            .and(query_param("mimeType", "application/pdf"))
+            .and(query_param("alt", "media"))
+            .and(header("authorization", "Bearer export-wire-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = DriveConnector::new();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(bearer_config_with_base_url(
+                "export-wire-token",
+                format!("{}/drive/v3", server.uri()),
+            ))
+            .await
+            .unwrap();
+        connector
+            .handle_handshake(json!({
+                "protocol_version":"2.0", "zone":"z:work",
+                "host_public_key":signing_key.verifying_key().to_bytes(),
+                "capabilities_requested":["drive.read"], "nonce":vec![7_u8; 32]
+            }))
+            .await
+            .unwrap();
+        let input = json!({"file_id":"native-doc", "mime_type":"application/pdf"});
+        for token in [
+            build_capability(&signing_key, connector.instance_id(), "drive.get_file"),
+            build_capability_with_resources(
+                &signing_key,
+                connector.instance_id(),
+                "drive.export_file",
+                &["drive://files/other-doc"],
+            ),
+            build_capability(&signing_key, "another-instance", "drive.export_file"),
+        ] {
+            let simulation = SimulateRequest::new(
+                ConnectorId::from_static("google-drive"),
+                OperationId::from_static("drive.export_file"),
+                fcp_core::ZoneId::work(),
+                input.clone(),
+                token.clone(),
+            );
+            let result = connector
+                .handle_simulate(serde_json::to_value(simulation).unwrap())
+                .await
+                .unwrap();
+            assert!(!parse_simulate_response(result).would_succeed);
+            assert!(
+                connector
+                    .handle_invoke(json!({
+                        "operation":"drive.export_file", "input":input,
+                        "capability_token":token
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        let token = build_capability_with_resources(
+            &signing_key,
+            connector.instance_id(),
+            "drive.export_file",
+            &["drive://files/native-doc"],
+        );
+        let simulation = SimulateRequest::new(
+            ConnectorId::from_static("google-drive"),
+            OperationId::from_static("drive.export_file"),
+            fcp_core::ZoneId::work(),
+            input.clone(),
+            token.clone(),
+        );
+        let result = connector
+            .handle_simulate(serde_json::to_value(simulation).unwrap())
+            .await
+            .unwrap();
+        assert!(parse_simulate_response(result).would_succeed);
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let result = connector
+            .handle_invoke(json!({
+                "operation":"drive.export_file", "input":input,
+                "capability_token":token
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["file_id"], "native-doc");
+        assert_eq!(result["mime_type"], "application/pdf");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(result["content_base64"].as_str().unwrap())
+                .unwrap(),
+            media,
+        );
     }
 
     #[fcp_async_core::runtime::test]

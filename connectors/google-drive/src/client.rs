@@ -31,6 +31,28 @@ pub const DEFAULT_BASE_URL: &str = "https://www.googleapis.com/drive/v3";
 
 /// Maximum decoded file size for this buffered upload operation.
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Buffered blob downloads leave room for base64 in the native host response.
+pub const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Local export limit in bytes; Drive documents a 10 MB export ceiling.
+pub const MAX_EXPORT_BYTES: usize = 10_000_000;
+/// Export formats supported for Google Docs, Sheets, and Slides.
+pub(crate) const EXPORT_MIME_TYPES: &[&str] = &[
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.oasis.opendocument.text",
+    "application/rtf",
+    "application/pdf",
+    "text/plain",
+    "text/html",
+    "application/zip",
+    "application/epub+zip",
+    "text/markdown",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "text/csv",
+    "text/tab-separated-values",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.presentation",
+];
 const MAX_MULTIPART_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
 const RESUMABLE_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_RESUMABLE_RECOVERIES: u32 = 3;
@@ -372,22 +394,60 @@ impl DriveClient {
             .map_err(|_| DriveError::UploadOutcomeUnknown)
     }
 
-    /// Download a file's content as bytes (returned as base64).
+    /// Download up to 16 MiB of blob content as standard padded base64.
+    ///
+    /// Google-native Docs, Sheets, and Slides require [`Self::export_file`].
     pub async fn download_file(&self, file_id: &str) -> DriveResult<String> {
-        let file_id = sanitize_path_segment(file_id, "file_id")?;
+        validate_media_file_id(file_id)?;
         let url = format!(
             "{}/files/{}?alt=media",
             self.base_url,
             urlencoding::encode(file_id),
         );
-        let response = self
-            .execute_with_retry("GET", &url, None, GoogleResponseMode::Binary, true, None)
-            .await?;
-        match response.body {
-            GoogleResponseBody::Binary(bytes) => Ok(base64_encode(&bytes)),
-            GoogleResponseBody::Json(value) => Ok(value.to_string()),
-            GoogleResponseBody::Empty => Ok(String::new()),
-        }
+        self.get_media(&url, MAX_DOWNLOAD_BYTES).await
+    }
+
+    /// Export a Google Workspace document to a supported format as base64.
+    ///
+    /// The format must be compatible with the source document; Drive validates
+    /// that pairing. CSV and TSV exports contain only the first sheet.
+    pub async fn export_file(&self, file_id: &str, mime_type: &str) -> DriveResult<String> {
+        validate_export_input(file_id, mime_type)?;
+        let url = format!(
+            "{}/files/{}/export?mimeType={}",
+            self.base_url,
+            urlencoding::encode(file_id),
+            urlencoding::encode(mime_type),
+        );
+        self.get_media(&url, MAX_EXPORT_BYTES).await
+    }
+
+    async fn get_media(&self, url: &str, max_response_bytes: usize) -> DriveResult<String> {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        let ctx = self.runtime.request_context();
+        let policy = self.retry_config.to_retry_policy();
+        let response = RetryLoop::execute(&ctx, &policy, |_| async {
+            match self
+                .execute_once(
+                    "GET",
+                    url,
+                    None,
+                    GoogleResponseMode::Binary,
+                    None,
+                    Some(max_response_bytes),
+                )
+                .await
+            {
+                Ok(response) => AttemptOutcome::Success(response),
+                Err(error) if error.is_retryable() => {
+                    let retry_after = error.retry_after();
+                    AttemptOutcome::retryable_if_replayable(error, retry_after, true)
+                }
+                Err(error) => AttemptOutcome::Terminal(error),
+            }
+        })
+        .await?;
+        encode_media_response(response)
     }
 
     /// Trash a file (move to trash).
@@ -503,7 +563,7 @@ impl DriveClient {
             debug!(attempt, method = http_method, "drive request");
 
             match self
-                .execute_once(http_method, url, body, response_mode, upload)
+                .execute_once(http_method, url, body, response_mode, upload, None)
                 .await
             {
                 Ok(response) => AttemptOutcome::Success(response),
@@ -528,6 +588,7 @@ impl DriveClient {
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
         upload: Option<&GoogleUploadPayload>,
+        max_response_bytes: Option<usize>,
     ) -> DriveResult<GoogleExecuteResponse> {
         let parsed_url = Url::parse(raw_url).map_err(|error| DriveError::Api {
             status_code: 400,
@@ -595,18 +656,72 @@ impl DriveClient {
         request.upload = upload.cloned();
         request.response_mode = response_mode;
         request.auth = Some(&self.auth);
+        if matches!(response_mode, GoogleResponseMode::Binary) {
+            request.extra_headers.push(("accept".into(), "*/*".into()));
+        }
 
         if upload.is_some() {
             self.upload_executor
                 .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
                 .await
                 .map_err(map_rest_error)
+        } else if let Some(limit) = max_response_bytes {
+            self.executor
+                .execute_bounded(&request, limit)
+                .await
+                .map_err(|error| match error {
+                    GoogleRestError::ResponseTooLarge { limit } => {
+                        DriveError::ResponseTooLarge { limit }
+                    }
+                    other => map_rest_error(other),
+                })
         } else {
             self.executor
                 .execute(&request)
                 .await
                 .map_err(map_rest_error)
         }
+    }
+}
+
+/// Validate media identifiers before both simulation and provider execution.
+pub(crate) fn validate_media_file_id(file_id: &str) -> DriveResult<()> {
+    if file_id.len() > 1024
+        || file_id
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || file_id.contains('%')
+        || sanitize_path_segment(file_id, "file_id").is_err()
+    {
+        return Err(DriveError::InvalidInput {
+            message: "file_id must be a nonempty safe path segment of at most 1024 bytes".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate the explicit export format without fetching file metadata.
+pub(crate) fn validate_export_input(file_id: &str, mime_type: &str) -> DriveResult<()> {
+    validate_media_file_id(file_id)?;
+    if !EXPORT_MIME_TYPES.contains(&mime_type) {
+        return Err(DriveError::InvalidInput {
+            message: "mime_type must be a supported Google Docs, Sheets, or Slides export format"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn encode_media_response(response: GoogleExecuteResponse) -> DriveResult<String> {
+    match response.body {
+        GoogleResponseBody::Binary(bytes) => Ok(base64_encode(&bytes)),
+        GoogleResponseBody::Empty => Ok(String::new()),
+        // A structured JSON value cannot preserve the original media bytes.
+        // Never return unencoded JSON in a field promising base64 content.
+        GoogleResponseBody::Json(_) => Err(DriveError::Api {
+            status_code: 502,
+            message: "Drive media response did not preserve its original bytes".into(),
+        }),
     }
 }
 
@@ -953,6 +1068,233 @@ mod tests {
         client.retry_config.max_delay_ms = 1;
         client.retry_config.jitter_enabled = false;
         client
+    }
+
+    #[test]
+    fn export_validation_accepts_declared_formats_and_rejects_unsafe_inputs() {
+        for mime_type in EXPORT_MIME_TYPES {
+            validate_export_input("document-123_ABC", mime_type).unwrap();
+        }
+        for mime_type in [
+            "",
+            "application/octet-stream",
+            "video/mp4",
+            "image/png",
+            "text/plain; charset=utf-8",
+            "TEXT/PLAIN",
+            "text/plain\r\nX-Injected: yes",
+            "text/plain&alt=json",
+        ] {
+            assert!(matches!(
+                validate_export_input("document-id", mime_type),
+                Err(DriveError::InvalidInput { .. })
+            ));
+        }
+        for file_id in [
+            "",
+            " ",
+            "../file",
+            "a/b",
+            "a\\b",
+            "a?x=y",
+            "a#fragment",
+            "a%2fb",
+            "a%41b",
+            "a\r\nb",
+            " a",
+            "a b",
+        ] {
+            assert!(validate_export_input(file_id, "application/pdf").is_err());
+            assert!(validate_media_file_id(file_id).is_err());
+        }
+        assert!(validate_media_file_id(&"a".repeat(1024)).is_ok());
+        assert!(validate_media_file_id(&"a".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn media_response_never_returns_unencoded_or_reconstructed_json() {
+        let response = |body| GoogleExecuteResponse {
+            status_code: 200,
+            headers: Vec::new(),
+            body,
+            next_page_token: None,
+        };
+        let bytes = b"{ \"looks_like_json\": true }\r\n\0\xff";
+        assert_eq!(
+            encode_media_response(response(GoogleResponseBody::Binary(bytes.to_vec()))).unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        );
+        assert_eq!(
+            encode_media_response(response(GoogleResponseBody::Empty)).unwrap(),
+            "",
+        );
+        assert!(
+            encode_media_response(response(GoogleResponseBody::Json(serde_json::json!({
+                "unexpected": "structured media"
+            }))))
+            .is_err()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn export_preserves_text_csv_pdf_and_office_bytes_with_authorized_requests() {
+        let server = MockServer::start().await;
+        let client = upload_client(&server);
+        let fixtures: [(&str, &str, &[u8]); 5] = [
+            ("doc", "text/plain", b"{ \"title\": \"A\" }\r\n"),
+            ("sheet", "text/csv", b"name,value\r\n\"caf\xc3\xa9\",42\r\n"),
+            ("slides", "application/pdf", b"%PDF-1.7\r\n\0\xff\x80"),
+            (
+                "office",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                b"PK\x03\x04\0\xff\x80",
+            ),
+            ("empty", "text/markdown", b""),
+        ];
+        for (file_id, mime_type, bytes) in fixtures {
+            Mock::given(method("GET"))
+                .and(path(format!("/drive/v3/files/{file_id}/export")))
+                .and(query_param("mimeType", mime_type))
+                .and(query_param("alt", "media"))
+                .and(header("authorization", "Bearer upload-test-token"))
+                .and(header("accept", "*/*"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", mime_type)
+                        .set_body_bytes(bytes),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let encoded = client.export_file(file_id, mime_type).await.unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap(),
+                bytes,
+            );
+        }
+        for request in server.received_requests().await.unwrap() {
+            assert!(request.body.is_empty());
+            assert_eq!(request.url.query_pairs().count(), 2);
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn export_validates_before_network_and_preserves_provider_errors() {
+        let server = MockServer::start().await;
+        let client = upload_client(&server);
+        for (file_id, mime_type) in [
+            ("../private", "application/pdf"),
+            ("valid", "application/pdf&mimeType=text/plain"),
+            ("valid", "video/mp4"),
+        ] {
+            assert!(client.export_file(file_id, mime_type).await.is_err());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        for (file_id, status) in [("unsupported", 400), ("forbidden", 403), ("missing", 404)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/drive/v3/files/{file_id}/export")))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": { "code": status, "message": "export not available" }
+                    })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = client
+                .export_file(file_id, "application/pdf")
+                .await
+                .unwrap_err();
+            assert!(!error.is_retryable());
+            match status {
+                400 => assert!(matches!(
+                    error,
+                    DriveError::Api {
+                        status_code: 400,
+                        ..
+                    }
+                )),
+                403 => assert!(matches!(error, DriveError::Forbidden { .. })),
+                404 => assert!(matches!(error, DriveError::FileNotFound { .. })),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn media_reads_reject_oversized_success_and_error_bodies_without_retry() {
+        let server = MockServer::start().await;
+        let client = upload_client(&server);
+        for (file_id, limit, export, status) in [
+            ("large-export", MAX_EXPORT_BYTES, true, 200),
+            ("large-blob", MAX_DOWNLOAD_BYTES, false, 200),
+            ("large-error", MAX_EXPORT_BYTES, true, 503),
+        ] {
+            let endpoint = if export {
+                format!("/drive/v3/files/{file_id}/export")
+            } else {
+                format!("/drive/v3/files/{file_id}")
+            };
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(vec![0; limit + 1]))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = if export {
+                client.export_file(file_id, "application/pdf").await
+            } else {
+                client.download_file(file_id).await
+            };
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, DriveError::ResponseTooLarge { limit: actual } if actual == limit)
+            );
+            assert!(!error.is_retryable());
+            assert!(!error.to_string().contains("upload"));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn media_reads_enforce_streamed_limit_without_content_length() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0u8; 1];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+                assert!(headers.len() < 8192);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n1\r\nx\r\n0\r\n\r\n").unwrap();
+        });
+        let client = DriveClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
+            access_token: "media-token".into(),
+            source: GoogleAuthSourceKind::AccessToken,
+            granted_scopes: Vec::new(),
+            quota_project_id: None,
+        })
+        .unwrap();
+        let result = client
+            .get_media(
+                &format!("http://{address}/drive/v3/files/chunked?alt=media"),
+                32,
+            )
+            .await;
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(DriveError::ResponseTooLarge { limit: 32 })
+        ));
     }
 
     fn large_upload_media() -> Vec<u8> {

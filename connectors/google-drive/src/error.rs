@@ -20,9 +20,13 @@ pub enum DriveError {
     #[error("Drive API error ({status_code}): {message}")]
     Api { status_code: u16, message: String },
 
-    /// Invalid upload input rejected before contacting Drive.
+    /// Invalid operation input rejected before contacting Drive.
     #[error("Invalid Drive input: {message}")]
     InvalidInput { message: String },
+
+    /// Buffered media exceeded the operation's declared response limit.
+    #[error("Drive media response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
 
     /// Drive may have created the uploaded file but no usable response arrived.
     #[error(
@@ -92,7 +96,7 @@ impl DriveError {
                 code: 1003,
                 message: message.clone(),
             },
-            Self::UploadOutcomeUnknown => FcpError::External {
+            Self::UploadOutcomeUnknown | Self::ResponseTooLarge { .. } => FcpError::External {
                 service: "google_drive".into(),
                 message: self.to_string(),
                 status_code: None,
@@ -235,6 +239,21 @@ mod tests {
             }
             .is_retryable()
         );
+    }
+
+    #[test]
+    fn oversized_media_is_a_nonretryable_read_error() {
+        let error = DriveError::ResponseTooLarge { limit: 10_000_000 };
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("upload"));
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::External {
+                retryable: false,
+                status_code: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:bbf59bb6799f6839c708703784936ed5fca4798b4cd2b3681844eec00476bf8a"
+interface_hash = "blake3-256:fcp.interface.v2:1d29bdf372010595caf71f22df56cc9f752e1046ffad792f068ba4a7d0f9e93c"
 
 [connector]
 id = "fcp.google_drive"
@@ -123,14 +123,14 @@ max_response_bytes = 1048576
 
 [provides.operations."drive.get_file".ai_hints]
 when_to_use = "Get metadata for a specific file or folder by its Drive file ID."
-common_mistakes = ["This returns metadata only — use drive.download_file to fetch binary content"]
+common_mistakes = ["This returns metadata only — use drive.download_file for blob bytes or drive.export_file for Google Docs, Sheets, and Slides"]
 examples = ["{\"file_id\": \"1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2wtIs\"}"]
-related = ["drive.list_files", "drive.download_file"]
+related = ["drive.list_files", "drive.download_file", "drive.export_file"]
 
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."drive.download_file"]
-description = "Download a file's content and return it as base64"
+description = "Download up to 16 MiB of blob file content as standard padded base64"
 capability = "drive.read"
 risk_level = "low"
 safety_tier = "safe"
@@ -143,6 +143,8 @@ required = ["file_id"]
 type = "object"
 [provides.operations."drive.download_file".input_schema.properties.file_id]
 type = "string"
+minLength = 1
+maxLength = 1024
 
 [provides.operations."drive.download_file".output_schema]
 required = ["file_id", "content_base64"]
@@ -151,6 +153,8 @@ type = "object"
 type = "string"
 [provides.operations."drive.download_file".output_schema.properties.content_base64]
 type = "string"
+maxLength = 22369624
+description = "Standard padded base64 preserving the exact downloaded bytes; empty for an empty file"
 
 [provides.operations."drive.download_file".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -164,14 +168,70 @@ require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
 connect_timeout_ms = 10000
-total_timeout_ms = 120000
-max_response_bytes = 52428800
+total_timeout_ms = 30000
+max_response_bytes = 16777216
 
 [provides.operations."drive.download_file".ai_hints]
-when_to_use = "Download the binary content of a Drive file as base64."
-common_mistakes = ["Google Docs/Sheets/Slides cannot be downloaded directly — they must be exported via their own export APIs first"]
+when_to_use = "Download up to 16 MiB of blob content such as a PDF, image, or uploaded Office file."
+common_mistakes = ["Use drive.export_file for Google-native Docs, Sheets, and Slides", "Larger blobs are rejected before returning a partial result", "Full-size base64 results require the local host/native transport; the mesh reply cap still applies"]
 examples = ["{\"file_id\": \"1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2wtIs\"}"]
-related = ["drive.get_file"]
+related = ["drive.get_file", "drive.export_file"]
+
+# ────────────────────────────────────────────────────────────────
+
+[provides.operations."drive.export_file"]
+description = "Export a Google Doc, Sheet, or Slide presentation to a supported format as base64, up to 10,000,000 bytes"
+capability = "drive.read"
+risk_level = "low"
+safety_tier = "safe"
+requires_approval = "none"
+idempotency = "strict"
+revocation_freshness = "safe"
+
+[provides.operations."drive.export_file".input_schema]
+required = ["file_id", "mime_type"]
+type = "object"
+[provides.operations."drive.export_file".input_schema.properties.file_id]
+type = "string"
+minLength = 1
+maxLength = 1024
+[provides.operations."drive.export_file".input_schema.properties.mime_type]
+type = "string"
+enum = ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.oasis.opendocument.text", "application/rtf", "application/pdf", "text/plain", "text/html", "application/zip", "application/epub+zip", "text/markdown", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.oasis.opendocument.spreadsheet", "text/csv", "text/tab-separated-values", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "application/vnd.oasis.opendocument.presentation"]
+description = "Requested export format; it must be compatible with the source file. CSV and TSV include only the first sheet."
+
+[provides.operations."drive.export_file".output_schema]
+required = ["file_id", "mime_type", "content_base64"]
+type = "object"
+[provides.operations."drive.export_file".output_schema.properties.file_id]
+type = "string"
+[provides.operations."drive.export_file".output_schema.properties.mime_type]
+type = "string"
+[provides.operations."drive.export_file".output_schema.properties.content_base64]
+type = "string"
+maxLength = 13333336
+description = "Standard padded base64 preserving the exact exported bytes; empty for an empty export"
+
+[provides.operations."drive.export_file".network_constraints]
+host_allow = ["www.googleapis.com"]
+port_allow = [443]
+deny_localhost = true
+deny_private_ranges = true
+deny_tailnet_ranges = true
+require_sni = true
+deny_ip_literals = true
+require_host_canonicalization = true
+dns_max_ips = 16
+max_redirects = 0
+connect_timeout_ms = 10000
+total_timeout_ms = 30000
+max_response_bytes = 10000000
+
+[provides.operations."drive.export_file".ai_hints]
+when_to_use = "Read or save native Google Docs, Sheets, and Slides as text, PDF, Office, or another declared export format."
+common_mistakes = ["The format must match the source: DOCX for Docs, XLSX/CSV for Sheets, PPTX for Slides; PDF works for all three", "CSV and TSV contain only the first sheet; use XLSX or ODS to retain all sheets", "Exports above 10,000,000 bytes are unsupported", "Use drive.download_file for uploaded blobs; Google Vids export is not supported", "The operation exports the current document, not a revision-pinned snapshot"]
+examples = ["{\"file_id\":\"document-id\",\"mime_type\":\"text/markdown\"}", "{\"file_id\":\"spreadsheet-id\",\"mime_type\":\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"}", "{\"file_id\":\"presentation-id\",\"mime_type\":\"application/pdf\"}"]
+related = ["drive.list_files", "drive.get_file", "drive.download_file"]
 
 # ────────────────────────────────────────────────────────────────
 
@@ -405,6 +465,7 @@ scope = "instance"
 "drive.list_files" = ["drive.read"]
 "drive.get_file" = ["drive.read"]
 "drive.download_file" = ["drive.read"]
+"drive.export_file" = ["drive.read"]
 "drive.create_folder" = ["drive.write"]
 "drive.upload_file" = ["drive.write"]
 "drive.trash_file" = ["drive.write"]

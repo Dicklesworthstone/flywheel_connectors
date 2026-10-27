@@ -7,6 +7,8 @@
 > **Drive files upstream**: https://developers.google.com/drive/api/reference/rest/v3/files
 > **Drive files list upstream**: https://developers.google.com/drive/api/reference/rest/v3/files/list
 > **Drive files get upstream**: https://developers.google.com/drive/api/reference/rest/v3/files/get
+> **Drive export upstream**: https://developers.google.com/workspace/drive/api/reference/rest/v3/files/export
+> **Export formats upstream**: https://developers.google.com/workspace/drive/api/guides/ref-export-formats
 > **Drive files create upstream**: https://developers.google.com/drive/api/reference/rest/v3/files/create
 > **Drive files update upstream**: https://developers.google.com/drive/api/reference/rest/v3/files/update
 > **Drive permissions create upstream**: https://developers.google.com/drive/api/reference/rest/v3/permissions/create
@@ -14,9 +16,9 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.google_drive`. The connector exposes the Google Drive API surface implemented in this crate: file listing, metadata lookup, content download, folder creation, file upload, trashing, and user permission creation.
+This document fixes the operator-facing contract for `fcp.google_drive`. The connector exposes file listing, metadata lookup, blob download, native Docs/Sheets/Slides export, folder creation, file upload, trashing, and user permission creation.
 
-The connector is intentionally a bounded Drive bridge. Its upload sessions recover interruptions within one call; it does not persist an upload across calls or process restarts. Workspace administration, document export, sync, permission auditing, and shared-drive administration remain outside its scope.
+The connector is intentionally a bounded Drive bridge. Its upload sessions recover interruptions within one call; it does not persist an upload across calls or process restarts. Workspace administration, sync, permission auditing, and shared-drive administration remain outside its scope.
 
 ## Current Runtime Snapshot
 
@@ -25,6 +27,7 @@ The current crate exposes these operations:
 - `drive.list_files`
 - `drive.get_file`
 - `drive.download_file`
+- `drive.export_file`
 - `drive.create_folder`
 - `drive.upload_file`
 - `drive.trash_file`
@@ -45,7 +48,9 @@ Important runtime truths the contract preserves:
 - File IDs are inserted into URL path segments only after local path-segment validation and URL encoding.
 - Path-segment validation rejects empty strings, slashes, backslashes, `..`, query strings, fragments, encoded slash/backslash/query/fragment markers, and literal percent characters.
 - `drive.list_files` URL-encodes `query` and `page_token`, and forwards `max_results` as `pageSize` without clamping it in the client.
-- `drive.download_file` requests `alt=media` and returns `content_base64`; if the executor returns JSON instead of binary, the current runtime returns the JSON value as a string.
+- `drive.download_file` requests `alt=media` and returns the exact blob bytes as standard padded `content_base64`, with a 16 MiB response limit.
+- `drive.export_file` requests `/files/{file_id}/export?mimeType=...&alt=media` and returns `file_id`, `mime_type`, and standard padded `content_base64`. Its local response limit is 10,000,000 bytes; Google documents a 10 MB export ceiling.
+- Both media reads enforce their limit on declared Content-Length and during streaming, including provider error bodies. Oversize reads fail without returning partial data or retrying. Empty content returns an empty base64 string; JSON-looking bytes remain unchanged. File IDs and export MIME types are validated during both simulation and invocation.
 - `drive.upload_file` accepts canonical standard padded base64 through 16 MiB of decoded bytes, including an empty string for an empty file. Files through 5 MiB use `multipart/related` at `/upload/drive/v3/files?uploadType=multipart`, with JSON metadata followed by exact binary media. Larger files initiate a resumable session and send 1 MiB chunks through the same shared executor.
 - Upload metadata is limited to 64 KiB after JSON serialization. The MIME type must be concrete and cannot contain header control characters. Upload responses, including error bodies, are bounded to 5 MiB while being read.
 - Multipart uploads retry only confirmed rate-limit refusals and transport failures known not to have reached the service. Resumable uploads use the provider's acknowledged byte ranges; after an uncertain request or server error they probe the same session before sending any remaining bytes. A completed status probe returns the existing file. Recovery is bounded to three retries and 64 session requests, and never creates a replacement session.
@@ -68,13 +73,12 @@ This README documents the runtime truth and keeps current drift visible:
 - Runtime introspection derives operation descriptions, schemas, capability, risk, safety, idempotency, approval mode, rate limits, and AI hints from `manifest.toml`.
 - Manifest optional capabilities include `media.download` and `media.upload`, but operation metadata and capability verification use only `drive.read` and `drive.write`.
 - Manifest marks `drive.create_folder` as policy approval and `drive.upload_file`, `drive.trash_file`, and `drive.share_file` as interactive approval. Runtime introspection now exposes that approval intent, but `invoke` and `simulate` verify bound capability tokens only and do not verify approval tokens.
-- Runtime `drive.download_file` can return a JSON string in `content_base64` if the executor gives the client a JSON response body.
 - Runtime introspection says `max_results` has a maximum of 1000, but runtime input validation and client dispatch do not clamp the value.
 - Runtime `handle_shutdown` calls client shutdown but does not clear client, verifier, session, configured flags, or handshaken flags.
 - `self_check()` reports `DEFAULT_BASE_URL` in details even when a loopback or custom base URL was configured.
 - The dedicated tracked verification shell script is `scripts/e2e/google_drive_connector_verification.sh`.
 
-A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, fix download response semantics, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
+A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
 
 ## First-Slice Scope
 
@@ -82,7 +86,7 @@ The current Google Drive README slice documents the existing runtime surface:
 
 - Google bearer-token, credential-reference, and OAuth refresh auth selection
 - Drive API base URL policy and loopback test allowance
-- file list/get/download, folder create, file upload, file trash, and user share operations
+- file list/get/download/export, folder create, file upload, file trash, and user share operations
 - bound capability-token verification during both `invoke` and `simulate`
 - provider error mapping, retry behavior, redaction posture, doctor behavior, and health behavior
 - lifecycle, doctor, health, self-check, introspection, simulation, invoke, and shutdown surfaces
@@ -97,7 +101,7 @@ The current Google Drive README slice documents the existing runtime surface:
 - Allowed target zones: `z:private` and `z:work`.
 - Forbidden zone: `z:public`.
 - Runtime capability surface:
-  - `drive.read` gates file listing, metadata lookup, and file download.
+  - `drive.read` gates file listing, metadata lookup, blob download, and native-document export.
   - `drive.write` gates folder creation, file upload, trashing, and sharing.
 - Manifest capability surface also lists `media.download` and `media.upload`, but current runtime checks only `drive.read` and `drive.write`.
 - The connector does not persist file metadata, file content, permission records, access tokens, credential IDs, provider payloads, or provider error bodies beyond process memory.
@@ -107,15 +111,15 @@ The current Google Drive README slice documents the existing runtime surface:
 
 - Production host: `www.googleapis.com`.
 - Production API prefix: `/drive/v3`; media upload prefix: `/upload/drive/v3`.
-- The HTTP client does not follow redirects, including redirects on media uploads.
+- The ordinary read client retains its redirect behavior for downloads and exports. The dedicated upload client never follows redirects.
 - Production port: `443`.
 - TLS and SNI are required by the manifest for live traffic.
 - Manifest network policy denies localhost, private ranges, tailnet ranges, and IP literals for live operations.
 - Runtime loopback base URLs are test-only.
 - Runtime request timeout: `30 seconds`.
 - Manifest network constraints use `10_000 ms` or `15_000 ms` connect timeout depending on operation.
-- Manifest total timeout ranges from `30_000 ms` to `600_000 ms`, with the longest window reserved for upload.
-- Manifest maximum response bytes range from `1_048_576` to `52_428_800` depending on operation size.
+- Manifest total timeout ranges from `30_000 ms` to `60_000 ms`, with the longest window reserved for upload.
+- Manifest maximum response bytes range from `1_048_576` to `16_777_216` depending on operation size.
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `600_000 ms` wall-clock timeout, no exec, and no ptrace.
 - The connector does not open inbound sockets.
 - The connector does not implement streaming events or replay.
@@ -135,11 +139,26 @@ The current Google Drive README slice documents the existing runtime surface:
 |-----------|----------------|------------|------------|-----------|-------------|-----------|
 | `drive.list_files` | `GET /drive/v3/files?fields=...` | `drive.read` | `Safe` | `Low` | `Strict` | Lists Drive files and folders visible to the authenticated principal. |
 | `drive.get_file` | `GET /drive/v3/files/{file_id}?fields=...` | `drive.read` | `Safe` | `Low` | `Strict` | Reads metadata for one Drive file or folder. |
-| `drive.download_file` | `GET /drive/v3/files/{file_id}?alt=media` | `drive.read` | `Safe` | `Low` | `Strict` | Downloads file content and returns it as `content_base64` when the executor returns binary. |
+| `drive.download_file` | `GET /drive/v3/files/{file_id}?alt=media` | `drive.read` | `Safe` | `Low` | `Strict` | Downloads at most 16 MiB of blob bytes as standard padded base64. |
+| `drive.export_file` | `GET /drive/v3/files/{file_id}/export?mimeType=...&alt=media` | `drive.read` | `Safe` | `Low` | `Strict` | Exports a native document in a compatible declared format, up to 10,000,000 bytes, as standard padded base64. |
 | `drive.create_folder` | `POST /drive/v3/files?fields=id,name,mimeType,parents` | `drive.write` | `Risky` | `Medium` | `None` | Creates a new folder, optionally under a parent folder. |
 | `drive.upload_file` | `POST /upload/drive/v3/files`, then session `PUT` requests when resumable | `drive.write` | `Dangerous` | `High` | `None` | Creates a file from at most 16 MiB of decoded base64 input. Uses multipart through 5 MiB and bounded resumable recovery for larger files. |
 | `drive.trash_file` | `PATCH /drive/v3/files/{file_id}?fields=id,name,trashed` | `drive.write` | `Dangerous` | `High` | `Strict` | Moves a file or folder to trash. |
 | `drive.share_file` | `POST /drive/v3/files/{file_id}/permissions` | `drive.write` | `Dangerous` | `Critical` | `None` | Grants another user access to a file or folder. |
+
+## Native Document Export
+
+Use `drive.get_file` to inspect the source MIME type, then call `drive.export_file` with its file ID and a compatible target MIME type. The connector accepts these formats; Drive determines whether the requested format is valid for the source document and account.
+
+| Source | Accepted target MIME types |
+|--------|----------------------------|
+| Google Docs | `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/vnd.oasis.opendocument.text`, `application/rtf`, `application/pdf`, `text/plain`, `text/html`, `application/zip`, `application/epub+zip`, `text/markdown` |
+| Google Sheets | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `application/vnd.oasis.opendocument.spreadsheet`, `application/pdf`, `application/zip`, `text/csv`, `text/tab-separated-values` |
+| Google Slides | `application/vnd.openxmlformats-officedocument.presentationml.presentation`, `application/vnd.oasis.opendocument.presentation`, `application/pdf`, `text/plain` |
+
+For example, `{"file_id":"document-id","mime_type":"text/markdown"}` exports a Doc as Markdown; use `application/pdf` for a PDF or the spreadsheet MIME type above for an XLSX workbook. CSV and TSV contain only the first sheet; XLSX or ODS preserves multiple sheets. MIME parameters, unsupported types, and wrong input types are rejected locally. Google Vids and revision-specific exports are outside this operation.
+
+The export limit is exactly 10,000,000 decoded bytes, producing at most 13,333,336 base64 characters. Blob download permits 16,777,216 bytes, producing at most 22,369,624 characters. These buffered operations reject larger responses rather than truncate them. Full-size blob results require the local host/native transport; the mesh reply limit remains 16 MiB. Exports return the current document, so repeated reads can differ after edits.
 
 ## Resource URIs
 
@@ -150,6 +169,7 @@ Runtime capability-token verification binds operations to these resource URI sha
 | `drive.list_files` | `drive://files` |
 | `drive.get_file` | `drive://files/{file_id}` |
 | `drive.download_file` | `drive://files/{file_id}` |
+| `drive.export_file` | `drive://files/{file_id}` |
 | `drive.trash_file` | `drive://files/{file_id}` |
 | `drive.share_file` | `drive://files/{file_id}` |
 | `drive.create_folder` | `drive://folders/{parent_id_or_root}/children` |
@@ -159,7 +179,7 @@ Runtime capability-token verification binds operations to these resource URI sha
 
 The current implementation does not include:
 
-- Google Docs, Sheets, or Slides export before download
+- exports above 10,000,000 bytes, blob downloads above 16 MiB, Google Vids downloads, and revision-specific export
 - uploads above 16 MiB, durable upload sessions across calls or restarts, progress events, or checksum verification
 - permission listing, permission deletion, link-sharing policy management, domain sharing, ownership transfer, shared-drive administration, or ACL audit
 - file copy, move, rename, patch, labels, revisions, comments, shortcuts, change feeds, watch channels, or hard delete
@@ -169,7 +189,7 @@ The current implementation does not include:
 These are excluded on purpose:
 
 - Drive contents and permission records are high-sensitivity user data.
-- Upload, export, and shared-drive behavior need separate idempotency and proof contracts.
+- Durable upload and shared-drive behavior need separate idempotency and proof contracts.
 - Permission changes are sensitive enough to keep narrowly documented and explicitly confirmed before live use.
 
 ## Readiness And Verification Surface
@@ -255,7 +275,7 @@ The verification surface captures:
 
 - If configuration fails, provide exactly one Google auth source at the top level.
 - If live checks fail with a credential reference, materialize host credentials before invoking provider operations.
-- If `drive.download_file` fails on Google-native documents, export through the appropriate Google API first; this connector does not implement export.
+- Use `drive.export_file` for Google-native documents and `drive.download_file` for blobs. An incompatible source/target format is a provider error. For an oversize result, reduce the source or select a smaller export format; these operations do not return partial content.
 - If `drive.upload_file` reports an unknown outcome, inspect the destination folder for the new file before retrying. The connector does not replay uploads that may already have committed. Invalid base64, MIME types, empty names/parent IDs, and size-limit failures are rejected locally.
 - If list pagination behaves unexpectedly, validate `max_results`, `query`, and `page_token` against Drive API syntax and provider limits.
 - If provider returns 403, treat it as an auth/permission failure rather than a retryable transport error.
