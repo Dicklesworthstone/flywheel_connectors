@@ -46,6 +46,20 @@ struct InterfaceDescriptorV2<'a> {
     state: EffectiveStateModel<'a>,
     capabilities: InterfaceCapabilitiesDescriptor<'a>,
     operations: Vec<InterfaceOperationDescriptor<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    event_authorities: Vec<InterfaceEventAuthorityDescriptor<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct InterfaceEventAuthorityDescriptor<'a> {
+    id: &'a str,
+    topic: &'a str,
+    capability: &'a str,
+    subscribe_operation: &'a str,
+    resource_uri: &'a str,
+    streaming: bool,
+    replay: bool,
+    requires_ack: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +248,33 @@ impl ConnectorManifest {
             }
         }
 
+        for (event_id, event) in &self.provides.events {
+            let Some(capability) = event.capability.as_deref() else {
+                continue;
+            };
+            lint_capability_id_no_network_addressing(
+                capability,
+                "provides.events.*.capability",
+            )?;
+            if forbidden_capabilities.contains(capability) {
+                return Err(ManifestError::Invalid {
+                    field: "provides.events.*.capability",
+                    message: format!(
+                        "event `{event_id}` references forbidden capability `{capability}`"
+                    ),
+                });
+            }
+            if !declared_capabilities.contains(capability) {
+                return Err(ManifestError::Invalid {
+                    field: "provides.events.*.capability",
+                    message: format!(
+                        "event `{event_id}` capability `{capability}` must appear in \
+                         capabilities.required or capabilities.optional"
+                    ),
+                });
+            }
+        }
+
         // NORMATIVE: interface_hash must be well-formed and match computed value.
         let expected = self.compute_interface_hash()?;
         if self.manifest.interface_hash != expected {
@@ -403,6 +444,28 @@ impl ConnectorManifest {
             .collect();
         operations.sort_unstable_by(|a, b| a.id.cmp(b.id));
 
+        let mut event_authorities = Vec::new();
+        for (id, event) in &self.provides.events {
+            event.validate()?;
+            if let (Some(capability), Some(subscribe_operation), Some(resource_uri)) = (
+                event.capability.as_deref(),
+                event.subscribe_operation.as_deref(),
+                event.resource_uri.as_deref(),
+            ) {
+                event_authorities.push(InterfaceEventAuthorityDescriptor {
+                    id,
+                    topic: event.topic.as_deref().unwrap_or(id),
+                    capability,
+                    subscribe_operation,
+                    resource_uri,
+                    streaming: event.streaming,
+                    replay: event.replay,
+                    requires_ack: event.requires_ack,
+                });
+            }
+        }
+        event_authorities.sort_unstable_by(|a, b| a.id.cmp(b.id));
+
         let descriptor = InterfaceDescriptorV2 {
             connector_id: self.connector.id.as_str(),
             archetypes,
@@ -413,6 +476,7 @@ impl ConnectorManifest {
                 forbidden,
             },
             operations,
+            event_authorities,
         };
 
         let canonical = fcp_cbor::to_canonical_cbor(&descriptor)?;
@@ -1734,6 +1798,16 @@ pub struct EventSection {
     /// Whether the event requires explicit acknowledgement.
     #[serde(default)]
     pub requires_ack: bool,
+    /// Capability required to open, read, acknowledge, or close a native stream.
+    /// The complete authority triple is required for host consumer delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Control operation checked by the capability verifier (not an invoke alias).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe_operation: Option<String>,
+    /// Exact resource bound to this event topic by the host and connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_uri: Option<String>,
     /// Optional schema for the event payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
@@ -1754,6 +1828,41 @@ impl EventSection {
                 field: "provides.events.*.topic",
                 message: "must not be empty when present".into(),
             });
+        }
+        match (
+            self.capability.as_deref(),
+            self.subscribe_operation.as_deref(),
+            self.resource_uri.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(capability), Some(operation), Some(resource)) => {
+                validate_canonical_id(capability)?;
+                validate_canonical_id(operation)?;
+                if resource.is_empty()
+                    || resource.len() > 2048
+                    || resource.chars().any(char::is_whitespace)
+                    || resource.chars().any(char::is_control)
+                    || resource.contains('*')
+                    || !resource.contains(':')
+                {
+                    return Err(ManifestError::Invalid {
+                        field: "provides.events.*.resource_uri",
+                        message: "must be an exact, bounded resource URI without wildcards".into(),
+                    });
+                }
+                if !self.streaming || !self.requires_ack {
+                    return Err(ManifestError::Invalid {
+                        field: "provides.events.*",
+                        message: "native consumer authority requires streaming and explicit acknowledgements".into(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ManifestError::Invalid {
+                    field: "provides.events.*",
+                    message: "capability, subscribe_operation, and resource_uri must be declared together".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -4916,6 +5025,9 @@ deny_ptrace = true
             replay: false,
             topic: Some("t".into()),
             requires_ack: true,
+            capability: None,
+            subscribe_operation: None,
+            resource_uri: None,
             schema: Some(json!({"type": "string"})),
         };
         let json = serde_json::to_string(&section).unwrap();
@@ -4933,6 +5045,122 @@ deny_ptrace = true
         }))
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    fn native_event_section() -> EventSection {
+        serde_json::from_value(json!({
+            "description": "Acknowledged messages",
+            "streaming": true,
+            "requires_ack": true,
+            "capability": "test.read",
+            "subscribe_operation": "test.subscribe",
+            "resource_uri": "test:events:message"
+        }))
+        .expect("event authority")
+    }
+
+    #[test]
+    fn native_event_authority_requires_complete_exact_scope() {
+        let valid = native_event_section();
+        valid.validate().expect("complete authority");
+        let mut incomplete = valid.clone();
+        incomplete.capability = None;
+        assert!(incomplete.validate().is_err());
+        incomplete = valid.clone();
+        incomplete.subscribe_operation = None;
+        assert!(incomplete.validate().is_err());
+        incomplete = valid.clone();
+        incomplete.resource_uri = None;
+        assert!(incomplete.validate().is_err());
+        for resource in ["", "test:events:*", "test:events:bad\n", "not-a-uri"] {
+            let mut invalid = valid.clone();
+            invalid.resource_uri = Some(resource.to_owned());
+            assert!(invalid.validate().is_err(), "{resource:?}");
+        }
+        let mut no_ack = valid.clone();
+        no_ack.requires_ack = false;
+        assert!(no_ack.validate().is_err());
+        let mut no_stream = valid;
+        no_stream.streaming = false;
+        assert!(no_stream.validate().is_err());
+    }
+
+    #[test]
+    fn native_event_authority_requires_a_declared_non_forbidden_capability() {
+        let raw = test_manifest_toml(
+            "blake3-256:fcp.interface.v2:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let mut manifest = ConnectorManifest::parse_str_unchecked(&raw).unwrap();
+        manifest
+            .provides
+            .events
+            .insert("test.message".into(), native_event_section());
+        manifest.manifest.interface_hash = manifest.compute_interface_hash().unwrap();
+        let error = manifest.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestError::Invalid {
+                field: "provides.events.*.capability",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("must appear"));
+
+        let capability = CapabilityId::new("test.read").unwrap();
+        manifest.capabilities.optional.push(capability.clone());
+        manifest.manifest.interface_hash = manifest.compute_interface_hash().unwrap();
+        manifest.validate().expect("declared event authority");
+
+        manifest.capabilities.optional.retain(|id| id != &capability);
+        manifest.capabilities.forbidden.push(capability);
+        manifest.manifest.interface_hash = manifest.compute_interface_hash().unwrap();
+        let error = manifest.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestError::Invalid {
+                field: "provides.events.*.capability",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("forbidden capability"));
+    }
+
+    #[test]
+    fn native_event_authority_is_bound_into_interface_hash() {
+        let raw = test_manifest_toml(
+            "blake3-256:fcp.interface.v2:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let mut manifest: ConnectorManifest = toml::from_str(&raw).expect("manifest");
+        let no_authority = manifest.compute_interface_hash().expect("baseline hash");
+        manifest
+            .provides
+            .events
+            .insert("test.message".into(), native_event_section());
+        let original = manifest.compute_interface_hash().expect("event hash");
+        assert_ne!(no_authority, original);
+        for field in [
+            "capability",
+            "subscribe_operation",
+            "resource_uri",
+            "topic",
+            "replay",
+        ] {
+            let mut changed = manifest.clone();
+            let event = changed.provides.events.get_mut("test.message").unwrap();
+            match field {
+                "capability" => event.capability = Some("test.admin".into()),
+                "subscribe_operation" => event.subscribe_operation = Some("test.other".into()),
+                "resource_uri" => event.resource_uri = Some("test:events:other".into()),
+                "topic" => event.topic = Some("test.other".into()),
+                "replay" => event.replay = true,
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                original,
+                changed.compute_interface_hash().unwrap(),
+                "{field}"
+            );
+        }
     }
 
     // ── EventCapsSection validation ────────────────────────────────────
@@ -7099,6 +7327,9 @@ deny_ptrace = true
             replay: false,
             topic: Some("topic".into()),
             requires_ack: true,
+            capability: None,
+            subscribe_operation: None,
+            resource_uri: None,
             schema: Some(json!({"type": "object"})),
         };
         let cloned = section.clone();
