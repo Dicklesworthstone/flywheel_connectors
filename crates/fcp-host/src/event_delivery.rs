@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HostError, HostResult};
 
-/// Maximum number of retained logical streams, including closed streams.
+#[path = "event_delivery/sqlite.rs"]
+mod sqlite;
+
+/// Maximum open or undrained durable streams; ephemeral journals retain at most
+/// this many stream records in total.
 pub const NATIVE_EVENT_MAX_STREAMS: usize = 64;
 /// Maximum outstanding events negotiated for one logical stream.
 pub const NATIVE_EVENT_MAX_WINDOW: u32 = 64;
@@ -25,13 +29,16 @@ pub const NATIVE_EVENT_MAX_WINDOW: u32 = 64;
 pub const NATIVE_EVENT_MAX_BYTES: usize = 256 * 1024;
 /// Maximum serialized event payload bytes retained across all streams.
 pub const NATIVE_EVENT_MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum persisted snapshot size, including acknowledgement receipts.
+/// Maximum legacy or ephemeral snapshot size, including acknowledgement receipts.
 pub const NATIVE_EVENT_MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum exact cursor receipts retained by one logical stream.
+/// Default disk budget for the durable exact cursor index, excluding its rollback
+/// sidecar. Operators can increase it without discarding receipts.
+pub const NATIVE_EVENT_DEFAULT_MAX_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Maximum exact cursor receipts retained by one ephemeral logical stream.
 ///
 /// Receipts are never silently evicted: exhaustion stops ingestion until the
-/// stream is explicitly retired. This bounds the supported deduplication
-/// horizon without treating an unknown old cursor as safely acknowledged.
+/// stream is explicitly retired. Durable journals instead retain exact receipts
+/// in their disk index until the configured database byte budget is reached.
 pub const NATIVE_EVENT_MAX_RECEIPTS: usize = 16_384;
 
 const SNAPSHOT_VERSION: u32 = 1;
@@ -151,6 +158,7 @@ impl Default for JournalSnapshot {
 
 struct JournalState {
     snapshot: JournalSnapshot,
+    sqlite: Option<sqlite::SqliteJournal>,
     persistence_failed: bool,
 }
 
@@ -172,6 +180,7 @@ impl NativeEventJournal {
         Self {
             state: Mutex::new(JournalState {
                 snapshot: JournalSnapshot::default(),
+                sqlite: None,
                 persistence_failed: false,
             }),
             path: None,
@@ -185,48 +194,39 @@ impl NativeEventJournal {
     /// Fails on an occupied writer lock, invalid/oversized persisted state,
     /// symlinks, or an unsupported durable filesystem platform.
     pub fn open(path: PathBuf) -> HostResult<Self> {
+        Self::open_with_max_database_bytes(path, NATIVE_EVENT_DEFAULT_MAX_DATABASE_BYTES)
+    }
+
+    /// Open a durable journal with a database disk budget. Raising the budget
+    /// allows a full journal to resume without forgetting acknowledged cursors.
+    /// The rollback sidecar has a separate 64 MiB retention limit.
+    ///
+    /// # Errors
+    /// Rejects budgets below 1 MiB, above SQLite's supported page range, or
+    /// smaller than an existing database, in addition to the errors from `open`.
+    pub fn open_with_max_database_bytes(path: PathBuf, max_bytes: u64) -> HostResult<Self> {
         if !cfg!(unix) {
             return Err(unavailable(
                 "durable event delivery requires directory synchronization",
             ));
         }
+        sqlite::validate_database_budget(max_bytes)?;
         let parent = parent_directory(&path);
         create_private_directories(parent)?;
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
-        let writer_lock = open_private_file(Path::new(&lock_path), true)?;
+        let (writer_lock, created_lock) = open_writer_lock(Path::new(&lock_path))?;
         writer_lock
             .try_lock()
             .map_err(|_| unavailable("event journal already has a writer"))?;
-        let snapshot = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(invalid("event journal must be a regular file"));
-                }
-                let file = open_private_file(&path, false)?;
-                let mut bytes = Vec::new();
-                file.take((NATIVE_EVENT_MAX_SNAPSHOT_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| unavailable("event journal could not be read"))?;
-                if bytes.len() > NATIVE_EVENT_MAX_SNAPSHOT_BYTES {
-                    return Err(invalid("event journal exceeds its snapshot byte limit"));
-                }
-                let snapshot: JournalSnapshot = serde_json::from_slice(&bytes)
-                    .map_err(|_| invalid("event journal has invalid persisted data"))?;
-                validate_snapshot(&snapshot)?;
-                snapshot
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                JournalSnapshot::default()
-            }
-            Err(_) => return Err(unavailable("event journal could not be inspected")),
-        };
-        // Re-synchronize a valid recovered snapshot before trusting decisions
-        // whose previous writer may have lost the result of its final sync.
-        persist_snapshot(&path, &snapshot)?;
+        // A lost marker must not make a previously used journal look new.
+        // Pass this decision to the actual marker read to avoid a check/read
+        // race. Interrupted first initialization is also fenced for recovery.
+        let sqlite = sqlite::SqliteJournal::open(&path, max_bytes, created_lock)?;
         Ok(Self {
             state: Mutex::new(JournalState {
-                snapshot,
+                snapshot: JournalSnapshot::default(),
+                sqlite: Some(sqlite),
                 persistence_failed: false,
             }),
             path: Some(path),
@@ -255,6 +255,11 @@ impl NativeEventJournal {
         validate_identifier(instance_id.as_str(), "connector instance identifier")?;
         if !(1..=NATIVE_EVENT_MAX_WINDOW).contains(&window_size) {
             return Err(invalid("event window must be between 1 and 64"));
+        }
+        if self.path.is_some() {
+            return self.with_sqlite(|sqlite| {
+                sqlite.register(stream_id, binding, window_size, instance_id)
+            });
         }
         self.mutate(|snapshot| {
             if let Some(record) = snapshot.streams.get_mut(stream_id) {
@@ -317,6 +322,9 @@ impl NativeEventJournal {
     /// # Errors
     /// Fails if the stream is absent or persistence is fenced.
     pub fn describe(&self, stream_id: &str) -> HostResult<NativeEventStream> {
+        if self.path.is_some() {
+            return self.with_sqlite(|sqlite| sqlite.describe(stream_id));
+        }
         let state = self.lock()?;
         let record = stream_record(&state.snapshot, stream_id)?;
         Ok(stream_view(stream_id, record, self.path.is_some()))
@@ -340,6 +348,11 @@ impl NativeEventJournal {
     ) -> HostResult<NativeEventAdmission> {
         let bytes = validate_event(&event)?;
         let digest = event_digest(&event)?;
+        if self.path.is_some() {
+            return self.with_sqlite(|sqlite| {
+                sqlite.ingest(stream_id, connector_id, zone_id, event, bytes, &digest)
+            });
+        }
         self.mutate(|snapshot| {
             let pending_bytes = snapshot_pending_bytes(snapshot)?;
             let record = stream_record_mut(snapshot, stream_id)?;
@@ -411,6 +424,10 @@ impl NativeEventJournal {
         if limit == 0 || limit > NATIVE_EVENT_MAX_WINDOW as usize {
             return Err(invalid("event poll limit must be between 1 and 64"));
         }
+        if self.path.is_some() {
+            return self
+                .with_sqlite(|sqlite| sqlite.poll(stream_id, binding, expected_instance, limit));
+        }
         self.mutate(|snapshot| {
             let record = stream_record_mut(snapshot, stream_id)?;
             check_binding(record, binding)?;
@@ -454,6 +471,11 @@ impl NativeEventJournal {
         ack: &EventAck,
     ) -> HostResult<EventAck> {
         validate_ack(ack)?;
+        if self.path.is_some() {
+            return self.with_sqlite(|sqlite| {
+                sqlite.acknowledge(stream_id, binding, expected_instance, ack)
+            });
+        }
         self.mutate(|snapshot| {
             let record = stream_record_mut(snapshot, stream_id)?;
             check_binding(record, binding)?;
@@ -520,6 +542,9 @@ impl NativeEventJournal {
         binding: &NativeEventBinding,
         expected_instance: &InstanceId,
     ) -> HostResult<NativeEventStream> {
+        if self.path.is_some() {
+            return self.with_sqlite(|sqlite| sqlite.close(stream_id, binding, expected_instance));
+        }
         self.mutate(|snapshot| {
             let record = stream_record_mut(snapshot, stream_id)?;
             check_binding(record, binding)?;
@@ -562,6 +587,27 @@ impl NativeEventJournal {
         }
         state.snapshot = next;
         Ok(result)
+    }
+
+    fn with_sqlite<T>(
+        &self,
+        operation: impl FnOnce(&mut sqlite::SqliteJournal) -> sqlite::SqlResult<T>,
+    ) -> HostResult<T> {
+        let mut state = self.lock()?;
+        let backend = state
+            .sqlite
+            .as_mut()
+            .ok_or_else(|| unavailable("event journal backend is absent"))?;
+        match operation(backend) {
+            Ok(result) => Ok(result),
+            Err(sqlite::Failure::Rejected(error)) => Err(error),
+            Err(sqlite::Failure::Storage) => {
+                state.persistence_failed = true;
+                Err(unavailable(
+                    "event journal storage failed; reopen before authorizing upstream acknowledgement",
+                ))
+            }
+        }
     }
 }
 
@@ -862,9 +908,41 @@ fn open_private_file(path: &Path, create: bool) -> HostResult<File> {
     {
         return Err(invalid("event journal path must be a regular file"));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file
+            .metadata()
+            .map_err(|_| unavailable("event journal file cannot be inspected"))?;
+        if metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(invalid(
+                "event journal files must be private and have one link",
+            ));
+        }
+    }
     Ok(file)
 }
 
+fn open_writer_lock(path: &Path) -> HostResult<(File, bool)> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    match options.open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok((open_private_file(path, false)?, false))
+        }
+        Err(_) => Err(unavailable("event journal writer lock cannot be created")),
+    }
+}
+
+#[cfg(test)]
 fn persist_snapshot(path: &Path, snapshot: &JournalSnapshot) -> HostResult<()> {
     persist_bytes(path, &snapshot_bytes(snapshot)?)
 }
@@ -920,7 +998,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    fn binding() -> NativeEventBinding {
+    pub(super) fn binding() -> NativeEventBinding {
         NativeEventBinding {
             principal: "agent:consumer".to_owned(),
             connector_id: ConnectorId::from_static("fcp.telegram:messaging:1.0.0"),
@@ -929,11 +1007,11 @@ mod tests {
         }
     }
 
-    fn instance_id() -> InstanceId {
+    pub(super) fn instance_id() -> InstanceId {
         "inst_native_delivery_fixture".parse().unwrap()
     }
 
-    fn event(sequence: u64) -> EventEnvelope {
+    pub(super) fn event(sequence: u64) -> EventEnvelope {
         let binding = binding();
         EventEnvelope::new(
             &binding.topic,
@@ -955,13 +1033,13 @@ mod tests {
         .requiring_ack()
     }
 
-    fn register(journal: &NativeEventJournal, window: u32) {
+    pub(super) fn register(journal: &NativeEventJournal, window: u32) {
         journal
             .register("stream-1", binding(), window, instance_id())
             .unwrap();
     }
 
-    fn ingest(
+    pub(super) fn ingest(
         journal: &NativeEventJournal,
         event: EventEnvelope,
     ) -> HostResult<NativeEventAdmission> {
@@ -969,7 +1047,7 @@ mod tests {
         journal.ingest("stream-1", &binding.connector_id, &binding.zone_id, event)
     }
 
-    fn ack(sequence: u64) -> EventAck {
+    pub(super) fn ack(sequence: u64) -> EventAck {
         EventAck::new(binding().topic, vec![sequence])
             .with_cursors(vec![format!("update:{sequence}")])
     }
@@ -1584,9 +1662,10 @@ mod tests {
     fn corrupted_or_future_snapshot_is_rejected_without_rewriting_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.json");
-        let journal = NativeEventJournal::open(path.clone()).unwrap();
+        let journal = NativeEventJournal::memory();
         register(&journal, 1);
         ingest(&journal, event(1)).unwrap();
+        persist_snapshot(&path, &journal.lock().unwrap().snapshot).unwrap();
         drop(journal);
         let mut malformed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

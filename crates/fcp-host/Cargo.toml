@@ -61,6 +61,9 @@ thiserror = "2"
 # Private, per-attempt CRIU control files (also used by the test harness).
 tempfile = "3"
 
+# Exact, transactional native event receipts and bounded pending custody.
+rusqlite = { version = "0.39.0", features = ["bundled", "limits"] }
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

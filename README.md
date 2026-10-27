@@ -948,6 +948,18 @@ Consumer routes refuse to operate without durable storage. The journal holds an
 exclusive writer lock and synchronizes each transition before exposing a delivery
 or releasing credit. A failed or uncertain write fences the journal until recovery.
 
+The configured journal path is a small version-two marker naming a private SQLite
+database in the same directory. Existing version-one JSON journals migrate
+automatically: the new database is committed and synchronized before the marker
+replaces the JSON snapshot. Pending deliveries, exact cursor receipts, and closed
+stream identities survive migration. A missing or mismatched database, unsafe
+storage file, or missing marker for an existing writer lock fails closed. This
+also means an interrupted first initialization may require restoring or
+reconciling its files before reopening; the host will not silently start empty.
+Back up the marker, its named database, and any rollback sidecar as a consistent
+set with the host stopped. Failed migrations can leave uniquely named,
+non-authoritative staging databases; the host never reuses or deletes them.
+
 The connector inventory must name a validated `manifest_path`, admit the exact
 zone, and allow the manifest's subscription control operation. Each event declares
 `capability`, `subscribe_operation`, `resource_uri`, `streaming = true`, and
@@ -1029,10 +1041,17 @@ must make their own processing idempotent across a crash between side effects an
 ACK. Telegram still advertises no historical replay. Pending events and exact
 receipts survive host restarts, but this journal is not mesh-replicated storage.
 Limits are 256 KiB per native event frame, 64 outstanding events per stream,
-16 MiB pending payloads, 64 retained streams, 16,384 exact cursor receipts per
-stream, and a 32 MiB snapshot. Exhaustion fails closed; receipts are not silently
-evicted. Closed streams retain their evidence and cannot be reopened. Changing to
-a new logical stream on the same dedicated process requires an explicit connector
+16 MiB pending payloads, and 64 open or undrained streams. Closed, drained streams
+release active capacity while retaining permanent tombstones and receipts; their
+IDs cannot be reopened. The durable SQLite cursor index has no lifetime receipt
+count limit. It uses a 1 GiB database budget by default; set
+`FCP_HOST_EVENT_JOURNAL_MAX_BYTES` to an unsigned byte count to change it
+(minimum 1 MiB). Exhaustion fails closed without silently evicting receipts.
+Increase the budget and reopen the host to recover a full database while retaining
+its history. The SQLite rollback sidecar has a separate 64 MiB retention limit
+and can grow larger during a transaction. The 16,384-receipt and 32 MiB snapshot
+limits apply only to the ephemeral backend and legacy JSON format. Changing to a
+new logical stream on the same dedicated process requires an explicit connector
 restart after closing and draining the old stream.
 
 ---
@@ -1887,6 +1906,7 @@ Proof anchors for deployment claims:
 | `FCP_HOST_CONNECTORS_FILE` | Live connector inventory file mutated by `fcp-host` | None |
 | `FCP_HOST_LIFECYCLE_STATE_FILE` | Local admin-state snapshot for `fcp-host` | None |
 | `FCP_HOST_EVENT_JOURNAL_FILE` | Durable native event deliveries and consumer ACK receipts | `<lifecycle-path>.events.json` when lifecycle persistence is configured; otherwise native consumer delivery is unavailable |
+| `FCP_HOST_EVENT_JOURNAL_MAX_BYTES` | Maximum SQLite event database bytes; excludes the rollback sidecar, retains exact receipts, and fails closed when full | `1073741824` (1 GiB; minimum 1 MiB) |
 | `FCP_CONFIG_DIR` | FCP configuration directory; also resolves `HOME` / `USERPROFILE` as fallbacks | `~/.fcp` |
 | `FCP_CONNECTOR_STATE` | Connector state directory | `$FCP_CONFIG_DIR/state` |
 | `RUST_LOG` | Standard Rust logging filter | `info` |

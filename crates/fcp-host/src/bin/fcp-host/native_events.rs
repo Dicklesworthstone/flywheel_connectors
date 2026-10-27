@@ -10,6 +10,7 @@ use fcp_core::{CapabilityId, EventAck, SubscribeResponse};
 use fcp_host::{NativeEventAdmission, NativeEventBinding, NativeEventJournal};
 
 const JOURNAL_ENV: &str = "FCP_HOST_EVENT_JOURNAL_FILE";
+const JOURNAL_MAX_BYTES_ENV: &str = "FCP_HOST_EVENT_JOURNAL_MAX_BYTES";
 const REQUEST_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -123,8 +124,21 @@ pub(super) fn open_journal() -> HostResult<Option<Arc<NativeEventJournal>>> {
             PathBuf::from(name)
         })
     };
-    path.map(|path| NativeEventJournal::open(path).map(Arc::new))
-        .transpose()
+    let max_database_bytes = read_optional_trimmed_env_string(JOURNAL_MAX_BYTES_ENV)?
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                invalid("FCP_HOST_EVENT_JOURNAL_MAX_BYTES must be an unsigned byte count")
+            })
+        })
+        .transpose()?;
+    path.map(|path| {
+        match max_database_bytes {
+            Some(bytes) => NativeEventJournal::open_with_max_database_bytes(path, bytes),
+            None => NativeEventJournal::open(path),
+        }
+        .map(Arc::new)
+    })
+    .transpose()
 }
 
 pub(super) fn routes(
