@@ -486,6 +486,58 @@ impl GoogleRestExecutor {
             .await
     }
 
+    /// Send one chunk or status probe to a validated resumable-upload session.
+    ///
+    /// The caller must validate the session URI against its provider origin and
+    /// use an executor configured with redirects disabled. The URI and query
+    /// are preserved exactly; no `uploadType` parameter or retry is added.
+    /// `308 Resume Incomplete` is returned with its headers for reconciliation.
+    ///
+    /// # Errors
+    /// Returns bounded transport/API errors, with session URLs removed from
+    /// transport diagnostics. An error never establishes whether bytes committed.
+    pub async fn execute_resumable_put(
+        &self,
+        session_url: &reqwest::Url,
+        auth: &GoogleMaterializedAuth,
+        content_range: &str,
+        body: Vec<u8>,
+        max_response_bytes: usize,
+        timeout: std::time::Duration,
+    ) -> Result<GoogleExecuteResponse, GoogleRestError> {
+        let mut builder = self
+            .client
+            .put(session_url.clone())
+            .header(reqwest::header::CONTENT_RANGE, content_range)
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
+            .body(body)
+            .timeout(timeout);
+        let mut headers = Vec::new();
+        auth.apply_headers(&mut headers);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|source| GoogleRestError::Http {
+                source: source.without_url(),
+            })?;
+        Self::read_response(
+            response,
+            GoogleResponseMode::Json,
+            Some(max_response_bytes),
+            true,
+        )
+        .await
+        .map_err(|error| match error {
+            GoogleRestError::Http { source } => GoogleRestError::Http {
+                source: source.without_url(),
+            },
+            other => other,
+        })
+    }
+
     async fn execute_with_limit(
         &self,
         request: &GoogleExecuteRequest<'_>,
@@ -521,10 +573,19 @@ impl GoogleRestExecutor {
 
         builder = apply_payload(builder, &method, request, validation_body.as_ref())?;
 
-        let mut response = builder
+        let response = builder
             .send()
             .await
             .map_err(|source| GoogleRestError::Http { source })?;
+        Self::read_response(response, request.response_mode, max_response_bytes, false).await
+    }
+
+    async fn read_response(
+        mut response: reqwest::Response,
+        response_mode: GoogleResponseMode,
+        max_response_bytes: Option<usize>,
+        accept_resume_incomplete: bool,
+    ) -> Result<GoogleExecuteResponse, GoogleRestError> {
         let status = response.status();
         let content_type = response
             .headers()
@@ -558,7 +619,8 @@ impl GoogleRestExecutor {
                 .map_err(|source| GoogleRestError::Http { source })?
         };
 
-        if !status.is_success() {
+        let resume_incomplete = accept_resume_incomplete && status.as_u16() == 308;
+        if !status.is_success() && !resume_incomplete {
             let mut error = parse_google_api_error(status, &bytes);
             error.retry_after_ms = parse_retry_after_header(&headers);
             return Err(GoogleRestError::Api {
@@ -568,7 +630,11 @@ impl GoogleRestExecutor {
             });
         }
 
-        let body = decode_response_body(&bytes, content_type.as_deref(), request.response_mode)?;
+        let body = if resume_incomplete {
+            GoogleResponseBody::Empty
+        } else {
+            decode_response_body(&bytes, content_type.as_deref(), response_mode)?
+        };
         let next_page_token = body
             .as_json()
             .and_then(extract_next_page_token)

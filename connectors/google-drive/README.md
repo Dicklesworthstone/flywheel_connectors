@@ -16,7 +16,7 @@
 
 This document fixes the operator-facing contract for `fcp.google_drive`. The connector exposes the Google Drive API surface implemented in this crate: file listing, metadata lookup, content download, folder creation, file upload, trashing, and user permission creation.
 
-The connector is intentionally a bounded Drive bridge. It is not a full Google Workspace admin client, Docs/Sheets/Slides export client, sync engine, permission auditor, shared-drive administrator, resumable uploader, or long-running Drive warehouse.
+The connector is intentionally a bounded Drive bridge. Its upload sessions recover interruptions within one call; it does not persist an upload across calls or process restarts. Workspace administration, document export, sync, permission auditing, and shared-drive administration remain outside its scope.
 
 ## Current Runtime Snapshot
 
@@ -40,15 +40,18 @@ Important runtime truths the contract preserves:
 - Default base URL is `https://www.googleapis.com/drive/v3`.
 - Public base URLs must use HTTPS, must target exact host `www.googleapis.com`, and must not contain userinfo, query strings, or fragments.
 - `localhost`, `127.0.0.1`, and `::1` are accepted with HTTP or HTTPS for deterministic loopback tests.
-- Runtime request timeout is 30 seconds.
+- Individual provider requests have a 30-second timeout. Resumable uploads have a 55-second overall deadline, including initiation, chunks, status probes, and recovery backoff; a shorter caller deadline can end the call earlier.
 - The client uses the shared retry loop with `max_retries = 2`, `initial_delay_ms = 500`, `max_delay_ms = 30000`, and jitter enabled.
 - File IDs are inserted into URL path segments only after local path-segment validation and URL encoding.
 - Path-segment validation rejects empty strings, slashes, backslashes, `..`, query strings, fragments, encoded slash/backslash/query/fragment markers, and literal percent characters.
 - `drive.list_files` URL-encodes `query` and `page_token`, and forwards `max_results` as `pageSize` without clamping it in the client.
 - `drive.download_file` requests `alt=media` and returns `content_base64`; if the executor returns JSON instead of binary, the current runtime returns the JSON value as a string.
-- `drive.upload_file` sends a real `multipart/related` body to `/upload/drive/v3/files?uploadType=multipart` through `GoogleRestExecutor`: JSON metadata first, decoded binary media second. It accepts canonical standard padded base64, including an empty string for an empty file, and rejects files above 5 MiB before contacting Drive. Resumable upload is not implemented.
+- `drive.upload_file` accepts canonical standard padded base64 through 16 MiB of decoded bytes, including an empty string for an empty file. Files through 5 MiB use `multipart/related` at `/upload/drive/v3/files?uploadType=multipart`, with JSON metadata followed by exact binary media. Larger files initiate a resumable session and send 1 MiB chunks through the same shared executor.
 - Upload metadata is limited to 64 KiB after JSON serialization. The MIME type must be concrete and cannot contain header control characters. Upload responses, including error bodies, are bounded to 5 MiB while being read.
-- Upload retries are limited to confirmed rate-limit refusals and transport failures known not to have reached the service. A 5xx, uncertain transport result, malformed success response, or oversized response produces a non-retryable unknown-outcome error; inspect the destination folder before uploading again.
+- Multipart uploads retry only confirmed rate-limit refusals and transport failures known not to have reached the service. Resumable uploads use the provider's acknowledged byte ranges; after an uncertain request or server error they probe the same session before sending any remaining bytes. A completed status probe returns the existing file. Recovery is bounded to three retries and 64 session requests, and never creates a replacement session.
+- Resumable session URLs must match the configured upload origin and path, use the expected resumable query parameters, and contain no userinfo or fragment. Authentication is added only after validation, and upload requests never follow redirects. Session URLs are excluded from error messages.
+- An unresolved upload outcome remains non-retryable. Inspect the destination folder before invoking `drive.upload_file` again: a new invocation starts a new upload and can create a duplicate. Upload sessions and progress are not retained when a call or process ends.
+- The full 16 MiB allowance is usable through the local host/native transport, whose upload invocation body limit accommodates base64 expansion. The mesh request limit remains 8 MiB; selecting resumable provider transfer does not enlarge that transport limit.
 - `drive.share_file` creates a user permission and accepts roles `reader`, `commenter`, `writer`, and `organizer`.
 - Runtime handshake installs a `CapabilityVerifier`.
 - `invoke` requires `capability_token`, validates input, computes resource URIs, and verifies a bound capability token before provider execution.
@@ -134,7 +137,7 @@ The current Google Drive README slice documents the existing runtime surface:
 | `drive.get_file` | `GET /drive/v3/files/{file_id}?fields=...` | `drive.read` | `Safe` | `Low` | `Strict` | Reads metadata for one Drive file or folder. |
 | `drive.download_file` | `GET /drive/v3/files/{file_id}?alt=media` | `drive.read` | `Safe` | `Low` | `Strict` | Downloads file content and returns it as `content_base64` when the executor returns binary. |
 | `drive.create_folder` | `POST /drive/v3/files?fields=id,name,mimeType,parents` | `drive.write` | `Risky` | `Medium` | `None` | Creates a new folder, optionally under a parent folder. |
-| `drive.upload_file` | `POST /upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size` | `drive.write` | `Dangerous` | `High` | `None` | Creates a new file from at most 5 MiB of decoded base64 input using a binary multipart/related body. |
+| `drive.upload_file` | `POST /upload/drive/v3/files`, then session `PUT` requests when resumable | `drive.write` | `Dangerous` | `High` | `None` | Creates a file from at most 16 MiB of decoded base64 input. Uses multipart through 5 MiB and bounded resumable recovery for larger files. |
 | `drive.trash_file` | `PATCH /drive/v3/files/{file_id}?fields=id,name,trashed` | `drive.write` | `Dangerous` | `High` | `Strict` | Moves a file or folder to trash. |
 | `drive.share_file` | `POST /drive/v3/files/{file_id}/permissions` | `drive.write` | `Dangerous` | `Critical` | `None` | Grants another user access to a file or folder. |
 
@@ -157,7 +160,7 @@ Runtime capability-token verification binds operations to these resource URI sha
 The current implementation does not include:
 
 - Google Docs, Sheets, or Slides export before download
-- resumable uploads, upload progress, or checksum verification
+- uploads above 16 MiB, durable upload sessions across calls or restarts, progress events, or checksum verification
 - permission listing, permission deletion, link-sharing policy management, domain sharing, ownership transfer, shared-drive administration, or ACL audit
 - file copy, move, rename, patch, labels, revisions, comments, shortcuts, change feeds, watch channels, or hard delete
 - folder search/create idempotency, sync-token storage, durable file indexes, Drive warehouse export, or connector-local credential vaulting

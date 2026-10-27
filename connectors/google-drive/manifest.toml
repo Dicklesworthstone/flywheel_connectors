@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:3682350fc2b10740b91e244305771dadc3cd7752829d514f276e92b344112514"
+interface_hash = "blake3-256:fcp.interface.v2:bbf59bb6799f6839c708703784936ed5fca4798b4cd2b3681844eec00476bf8a"
 
 [connector]
 id = "fcp.google_drive"
@@ -222,7 +222,7 @@ related = ["drive.upload_file"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."drive.upload_file"]
-description = "Upload up to 5 MiB of file bytes and metadata to Google Drive"
+description = "Upload up to 16 MiB of file bytes, using resumable transfer above 5 MiB"
 capability = "drive.write"
 risk_level = "high"
 safety_tier = "dangerous"
@@ -241,8 +241,8 @@ type = "string"
 minLength = 3
 [provides.operations."drive.upload_file".input_schema.properties.content_base64]
 type = "string"
-maxLength = 6990508
-description = "Canonical standard padded base64; decoded bytes must not exceed 5 MiB. An empty string creates an empty file."
+maxLength = 22369624
+description = "Canonical standard padded base64; decoded bytes must not exceed 16 MiB. Files above 5 MiB use bounded in-process resumable transfer. An empty string creates an empty file."
 [provides.operations."drive.upload_file".input_schema.properties.parent_id]
 type = "string"
 minLength = 1
@@ -265,12 +265,12 @@ require_host_canonicalization = true
 dns_max_ips = 16
 max_redirects = 0
 connect_timeout_ms = 15000
-total_timeout_ms = 600000
+total_timeout_ms = 60000
 max_response_bytes = 5242880
 
 [provides.operations."drive.upload_file".ai_hints]
-when_to_use = "Upload up to 5 MiB of file bytes (standard base64-encoded) to Drive with an explicit MIME type and optional parent folder."
-common_mistakes = ["Files above 5 MiB require resumable upload (not supported by this connector)", "Each call creates a new file — repeat calls produce duplicates", "An unknown upload outcome requires checking the destination folder before retrying"]
+when_to_use = "Upload up to 16 MiB of file bytes (standard base64-encoded) to Drive; files above 5 MiB recover interrupted chunks within the current call."
+common_mistakes = ["Files above 16 MiB are unsupported by this buffered operation", "Resumable state is not retained across calls or process restarts", "Each new call creates a new file; inspect the destination before retrying an unknown outcome", "Large base64 requests require a transport with a sufficient request-body limit; the mesh request cap still applies"]
 examples = ["{\"name\":\"report.txt\",\"mime_type\":\"text/plain\",\"content_base64\":\"SGVsbG8=\"}"]
 related = ["drive.create_folder", "drive.get_file"]
 
