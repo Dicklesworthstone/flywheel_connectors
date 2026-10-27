@@ -1021,6 +1021,58 @@ original acknowledgement or resume the same stream after restoring the native
 process. On consumer reconnect, poll and acknowledge retained work before waiting
 for a subscription renewal that may be queued behind an invocation awaiting ACK.
 
+#### Consume events with `fwc streams`
+
+The CLI exposes the same durable workflow on the selected `--host`. Supply the
+signed capability through a regular file; it accepts base64, JSON, or COSE CBOR
+and does not put the token into command output. The following Bash example opens
+the aggregate Telegram feed and waits up to 20 seconds for one retained event:
+
+```bash
+stream_auth=(
+  --connector fcp.telegram
+  --zone z:work
+  --topic telegram.update
+  --request-id consumer-subscription-001
+  --capability-token-file telegram-capability.cbor
+)
+
+fwc --host http://127.0.0.1:8787 --format json streams open \
+  "${stream_auth[@]}" --window-size 1
+
+# Copy stream.stream_id from the open response.
+stream_id='<returned-stream-id>'
+fwc --host http://127.0.0.1:8787 --format json streams poll \
+  "${stream_auth[@]}" --stream-id "$stream_id" \
+  --batch-size 1 --wait-seconds 20
+```
+
+Process the returned event before acknowledging it. Polling returns its exact
+pairs in `ack_request`; it never sends an acknowledgement automatically. Replace
+the illustrative sequence and cursor below with the values actually delivered:
+
+```bash
+fwc --host http://127.0.0.1:8787 --format json streams ack \
+  "${stream_auth[@]}" --stream-id "$stream_id" --seq 12345 --cursor 12345
+
+fwc --host http://127.0.0.1:8787 --format json streams close \
+  "${stream_auth[@]}" --stream-id "$stream_id"
+```
+
+For a batch, repeat `--seq` and `--cursor` in corresponding order. Sequence
+numbers can repeat across connector instances when the cursors differ. Repeated
+empty polls stop at `--wait-seconds` (0–60) and return `wait_expired: true`;
+the first nonempty batch returns immediately. Each HTTP request, including its
+response body, has a separate `--timeout-seconds` deadline (1–90, default 70).
+
+To reattach, use `open --stream-id "$stream_id"` with renewed authority and the
+original window. Keep the same host, request ID, stream ID, and acknowledgement
+pairs when retrying an uncertain result. An error with `outcome_unknown: true`
+means a mutation may already have committed. An ACK response with
+`acknowledged: true` and `upstream_notified: false` has retained the consumer
+decision durably; retry that exact ACK or resume the same stream. Closing keeps
+pending deliveries available to their authorized owner.
+
 Telegram starts polling only after an authorized subscription and waits for the
 consumer ACK before advancing its durable provider cursor. Its `receive_mode`
 configuration selects `polling` (default) or `webhook`; webhook mode requires a

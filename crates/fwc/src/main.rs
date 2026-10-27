@@ -196,6 +196,7 @@ mod host_integration_streaming;
 mod identifier;
 mod intent;
 mod invocation_cmd;
+mod native_events;
 #[allow(dead_code)]
 mod json_diff;
 #[allow(dead_code)] // Install, verify, update, pin, unpin, rollback with supply-chain evidence.
@@ -804,6 +805,9 @@ enum Commands {
     /// Shows a unified view of host control-plane events with
     /// backpressure handling, filtering, and resume support.
     Tail(TailArgs),
+
+    /// Open, poll, acknowledge, and close authorized native event streams.
+    Streams(native_events::StreamsArgs),
 
     /// Watch a long-running operation for completion.
     ///
@@ -4445,6 +4449,7 @@ fn dispatch(cli: &Cli) -> Result<DispatchOutcome> {
         Commands::Bench(_) => passthrough_only_dispatch("bench"),
         Commands::New(_) => passthrough_only_dispatch("new"),
         Commands::Tail(args) => tail_dispatch(&args, cli.host.as_deref())?,
+        Commands::Streams(args) => native_events::dispatch(args, cli.host.as_deref())?,
         Commands::Watch(args) => watch_dispatch(&args, cli.host.as_deref())?,
     };
 

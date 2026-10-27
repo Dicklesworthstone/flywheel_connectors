@@ -417,6 +417,15 @@ pub const COMMAND_CLASSIFICATIONS: &[CommandClassification] = &[
     },
     // ── Live-host-required commands ─────────────────────────────────────
     CommandClassification {
+        command: "streams",
+        truth_source: CommandTruthSource::LiveHost,
+        execution_mode: CommandExecutionMode::Mutating,
+        host_absent: HostAbsentBehavior::FailFast,
+        requires_capability_token: true,
+        may_need_approval: false,
+        transport_note: "Authorized native event open, poll, explicit acknowledgement, and close on the selected host; polling never releases provider credit",
+    },
+    CommandClassification {
         command: "invoke",
         truth_source: CommandTruthSource::LiveHost,
         execution_mode: CommandExecutionMode::Mutating,
@@ -3602,6 +3611,7 @@ pub const COMMANDS: &[&str] = &[
     "bench",
     "new",
     "tail",
+    "streams",
     "watch",
 ];
 
@@ -4145,6 +4155,10 @@ fn command_contract(command: &str) -> Option<Value> {
         "tail" => Some(execution_contract(
             "Tail connector or host events in real time, with offline fallback when only local receipts exist.",
             "Streaming event surface that prefers the live host but can still surface persisted local event history truthfully.",
+        )),
+        "streams" => Some(execution_contract(
+            "Consume durable native connector events with signed capabilities and explicit acknowledgements.",
+            "Open or resume one exact topic on the selected host, poll a bounded batch, acknowledge exact delivered sequence/cursor pairs after processing, and close while retaining pending custody. Reuse stable request and stream identities on retries; pass credentials through --capability-token-file.",
         )),
         "watch" => Some(execution_contract(
             "Poll the live host for the latest state of a long-running operation.",
