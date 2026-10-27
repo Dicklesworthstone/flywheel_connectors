@@ -490,11 +490,20 @@ struct TelegramWebhookReplayCache {
 }
 
 impl TelegramWebhookReplayCache {
-    fn remember_if_fresh(&mut self, update_id: i64) -> bool {
-        if !self.seen_update_ids.insert(update_id) {
-            return false;
+    fn deliver_if_fresh<E>(
+        &mut self,
+        update_id: i64,
+        deliver: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if self.seen_update_ids.contains(&update_id) {
+            return Ok(false);
         }
 
+        // The caller holds the cache lock through this synchronous handoff.
+        // A concurrent duplicate must not be acknowledged before delivery,
+        // and a failed handoff must not evict a previously accepted update.
+        deliver()?;
+        self.seen_update_ids.insert(update_id);
         self.update_order.push_back(update_id);
         while self.update_order.len() > TELEGRAM_WEBHOOK_REPLAY_CACHE_ENTRIES {
             if let Some(evicted) = self.update_order.pop_front() {
@@ -502,13 +511,7 @@ impl TelegramWebhookReplayCache {
             }
         }
 
-        true
-    }
-
-    fn forget(&mut self, update_id: i64) {
-        if self.seen_update_ids.remove(&update_id) {
-            self.update_order.retain(|seen| *seen != update_id);
-        }
+        Ok(true)
     }
 
     fn clear(&mut self) {
@@ -2742,12 +2745,24 @@ impl TelegramConnector {
             return Ok(response);
         };
 
-        if !self
+        let topic = event.topic.clone();
+        let resource_uris = event.data.resource_uris.clone();
+        let trust = format!("{:?}", event.data.principal.trust);
+
+        let delivered = self
             .webhook_replay_cache
             .write()
             .await
-            .remember_if_fresh(update.update_id)
-        {
+            .deliver_if_fresh(update.update_id, || {
+                self.event_tx.send(Ok(event)).map(|_| ()).map_err(|_| {
+                    FcpError::ConnectorUnavailable {
+                        code: 5001,
+                        message: "Telegram webhook event consumer is unavailable; delivery was not accepted"
+                            .into(),
+                    }
+                })
+            })?;
+        if !delivered {
             let response = json!({
                 "accepted": true,
                 "event_emitted": false,
@@ -2756,30 +2771,6 @@ impl TelegramConnector {
                 "received_at": received_at,
                 "secret_verified": secret_verified,
                 "reason": "duplicate_update",
-            });
-            if let Some(schema) = Self::output_schema_for("telegram.ingest_webhook_update") {
-                validate_output_with_limits(&schema, &response, &Limits::default())?;
-            }
-            return Ok(response);
-        }
-
-        let topic = event.topic.clone();
-        let resource_uris = event.data.resource_uris.clone();
-        let trust = format!("{:?}", event.data.principal.trust);
-
-        if self.event_tx.send(Ok(event)).is_err() {
-            self.webhook_replay_cache
-                .write()
-                .await
-                .forget(update.update_id);
-            let response = json!({
-                "accepted": true,
-                "event_emitted": false,
-                "update_id": update.update_id,
-                "delivery_id": delivery_id,
-                "received_at": received_at,
-                "secret_verified": secret_verified,
-                "reason": "event_receiver_dropped",
             });
             if let Some(schema) = Self::output_schema_for("telegram.ingest_webhook_update") {
                 validate_output_with_limits(&schema, &response, &Limits::default())?;
@@ -5663,6 +5654,175 @@ mod tests {
             return;
         };
         assert_eq!(operation, "telegram.send_message");
+    }
+
+    #[test]
+    fn test_webhook_replay_cache_records_only_successful_delivery() {
+        let mut cache = TelegramWebhookReplayCache::default();
+        assert_eq!(
+            cache.deliver_if_fresh(2008, || Err("receiver unavailable")),
+            Err("receiver unavailable")
+        );
+        assert!(cache.seen_update_ids.is_empty());
+        assert!(cache.update_order.is_empty());
+
+        let mut deliveries = 0;
+        assert_eq!(
+            cache.deliver_if_fresh(2008, || {
+                deliveries += 1;
+                Ok::<(), &str>(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(deliveries, 1);
+        assert_eq!(
+            cache.deliver_if_fresh(2008, || {
+                deliveries += 1;
+                Err("a duplicate must not attempt another handoff")
+            }),
+            Ok(false)
+        );
+        assert_eq!(deliveries, 1);
+        assert_eq!(cache.seen_update_ids.len(), 1);
+        assert_eq!(cache.update_order, VecDeque::from([2008]));
+    }
+
+    #[test]
+    fn test_webhook_replay_cache_failed_delivery_preserves_confirmed_entries() {
+        let mut cache = TelegramWebhookReplayCache::default();
+        let capacity = i64::try_from(TELEGRAM_WEBHOOK_REPLAY_CACHE_ENTRIES).unwrap();
+        for update_id in 0..capacity {
+            assert_eq!(
+                cache.deliver_if_fresh(update_id, || Ok::<(), &str>(())),
+                Ok(true)
+            );
+        }
+        let previous_order = cache.update_order.clone();
+        for update_id in capacity..capacity + 3 {
+            assert_eq!(
+                cache.deliver_if_fresh(update_id, || Err("receiver unavailable")),
+                Err("receiver unavailable")
+            );
+        }
+        assert_eq!(cache.update_order, previous_order);
+        assert_eq!(
+            cache.seen_update_ids.len(),
+            TELEGRAM_WEBHOOK_REPLAY_CACHE_ENTRIES
+        );
+        assert_eq!(
+            cache.deliver_if_fresh(0, || Err("confirmed update must remain a duplicate")),
+            Ok(false)
+        );
+
+        assert_eq!(
+            cache.deliver_if_fresh(capacity, || Ok::<(), &str>(())),
+            Ok(true)
+        );
+        assert!(!cache.seen_update_ids.contains(&0));
+        assert_eq!(cache.update_order.front(), Some(&1));
+        assert_eq!(cache.update_order.back(), Some(&capacity));
+        assert_eq!(
+            cache.update_order.len(),
+            TELEGRAM_WEBHOOK_REPLAY_CACHE_ENTRIES
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn test_ingest_webhook_update_retries_after_missing_or_dropped_receiver() {
+        let (mut connector, token, _server) =
+            setup_connector_with_token("telegram.ingest_webhook_update").await;
+        let forwarded_header = webhook_test_header_value();
+        let config = connector.config.as_mut().expect("configured connector");
+        config.webhook_secret_token = Some(forwarded_header.clone());
+        config.inbound_policy = inbound_policy(json!({
+            "mode": "allowlist",
+            "allowed_user_ids": [208214988]
+        }));
+
+        // The first iteration has never had a subscriber. The second begins
+        // after dropping the last subscriber from the previous iteration.
+        for update_id in [2008, 2009] {
+            let request = json!({
+                "operation": "telegram.ingest_webhook_update",
+                "input": {
+                    "payload": json!({
+                        "update_id": update_id,
+                        "message": {
+                            "message_id": update_id,
+                            "from": {
+                                "id": 208214988,
+                                "is_bot": false,
+                                "first_name": "Retry"
+                            },
+                            "chat": {
+                                "id": 208214988,
+                                "type": "private",
+                                "first_name": "Retry"
+                            },
+                            "date": 1700000014,
+                            "text": "/new retry"
+                        }
+                    }).to_string(),
+                    "secret_token": forwarded_header.clone(),
+                    "delivery_id": format!("telegram-delivery-{update_id}")
+                },
+                "capability_token": token.clone()
+            });
+
+            for _ in 0..2 {
+                let error = connector
+                    .handle_invoke(request.clone())
+                    .await
+                    .expect_err("an undelivered webhook must not be acknowledged");
+                assert!(error.is_retryable());
+                assert!(matches!(
+                    error,
+                    FcpError::ConnectorUnavailable { code: 5001, .. }
+                ));
+                assert!(
+                    !connector
+                        .webhook_replay_cache
+                        .read()
+                        .await
+                        .seen_update_ids
+                        .contains(&update_id)
+                );
+            }
+
+            let mut event_rx = connector.event_tx.subscribe();
+            let response = connector
+                .handle_invoke(request.clone())
+                .await
+                .expect("the same delivery must succeed after a subscriber attaches");
+            assert_eq!(response["accepted"], true);
+            assert_eq!(response["event_emitted"], true);
+            let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
+                .await
+                .expect("webhook delivery should reach the restored subscriber")
+                .expect("subscriber remains connected")
+                .expect("webhook event should be valid");
+            assert_eq!(event.seq, u64::try_from(update_id).unwrap());
+
+            let duplicate = connector
+                .handle_invoke(request)
+                .await
+                .expect("a successfully handed-off update can be acknowledged again");
+            assert_eq!(duplicate["accepted"], true);
+            assert_eq!(duplicate["event_emitted"], false);
+            assert_eq!(duplicate["reason"], "duplicate_update");
+            assert!(
+                fcp_async_core::time::timeout(StdDuration::from_millis(100), event_rx.recv())
+                    .await
+                    .is_err(),
+                "retrying a confirmed delivery must not emit another event"
+            );
+            drop(event_rx);
+        }
+
+        connector
+            .handle_shutdown(json!({}))
+            .await
+            .expect("shutdown");
     }
 
     #[fcp_async_core::runtime::test]
