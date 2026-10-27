@@ -32,6 +32,7 @@ mod doctor;
 mod emergency_revocation;
 mod enforcement;
 mod error;
+mod event_delivery;
 // Retained-but-unwired: composite host-health framework
 // (`HealthAggregator`, `CompositeHealthStatus`, tri-state `HealthState`,
 // merge/rollup logic across connector / mesh / resource / named-component
@@ -86,6 +87,7 @@ pub use doctor::*;
 pub use emergency_revocation::*;
 pub use enforcement::*;
 pub use error::*;
+pub use event_delivery::*;
 pub use invoke_audit::*;
 pub use invoke_audit_snapshot::*;
 pub use migration_linux::*;
