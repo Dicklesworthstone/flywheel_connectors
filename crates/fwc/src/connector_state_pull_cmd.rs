@@ -219,7 +219,7 @@ pub(crate) fn dispatch(
         Ok(None) => return Ok(failure(PullFailure::MissingHost, false)),
         Err(_) => return Ok(failure(PullFailure::InvalidHost, false)),
     };
-    let client = match HostAdminClient::without_redirects(&host.endpoint) {
+    let client = match HostAdminClient::new(&host.endpoint) {
         Ok(client) => client,
         Err(_) => return Ok(failure(PullFailure::InvalidHost, false)),
     };
@@ -259,7 +259,7 @@ fn dispatch_inspection(
         Ok(None) => return inspection_failure(PullFailure::MissingHost, false),
         Err(_) => return inspection_failure(PullFailure::InvalidHost, false),
     };
-    let client = match HostAdminClient::without_redirects(&host.endpoint) {
+    let client = match HostAdminClient::new(&host.endpoint) {
         Ok(client) => client,
         Err(_) => return inspection_failure(PullFailure::InvalidHost, false),
     };
@@ -1000,7 +1000,7 @@ mod tests {
         }
         for body in invalid {
             let host = TestHost::start(Reply::Json(200, body));
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             assert_eq!(
                 pull(
                     &client,
@@ -1026,7 +1026,7 @@ mod tests {
             "http://{}/capture",
             destination.local_addr().unwrap()
         )));
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         assert_eq!(
             pull(
                 &client,
@@ -1045,7 +1045,7 @@ mod tests {
             403,
             json!({"message": "fixture-admin-secret reflected-private-state"}),
         ));
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         let error = pull(
             &client,
             &request,
@@ -1067,7 +1067,7 @@ mod tests {
         let request = prepare_request(&args()).unwrap();
         for known_length in [false, true] {
             let host = TestHost::start(Reply::Oversized(known_length));
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             assert_eq!(
                 pull(
                     &client,
@@ -1080,7 +1080,7 @@ mod tests {
             host.finish();
         }
         let host = TestHost::start(Reply::Stalled);
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         assert_eq!(
             pull(
                 &client,
@@ -1092,7 +1092,7 @@ mod tests {
         );
         host.finish();
         let host = TestHost::start(Reply::Disconnect);
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         assert_eq!(
             pull(
                 &client,
@@ -1401,7 +1401,7 @@ mod tests {
         wrong_winner["replica"]["peer_node"] = json!("node-other");
         for body in [json!(response(&plan.candidates[0], true)), extra, attempt_extra, wrong_winner] {
             let host = TestHost::start(Reply::Json(200, body));
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             assert_eq!(
                 recover(&client, &plan, "fixture-admin-secret", Duration::from_secs(2)),
                 Err(PullFailure::InvalidResponse),
@@ -1428,7 +1428,7 @@ mod tests {
             (Reply::Disconnect, PullFailure::Transport),
         ] {
             let host = TestHost::start(reply);
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             let error = recover(&client, &plan, "fixture-admin-secret", Duration::from_secs(2)).unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(host.finish().body, json!(plan));
@@ -1440,7 +1440,7 @@ mod tests {
         }
         assert!(matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
         let host = TestHost::start(Reply::Stalled);
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         assert_eq!(
             recover(&client, &plan, "fixture-admin-secret", Duration::from_millis(200)),
             Err(PullFailure::Timeout),
@@ -1659,7 +1659,7 @@ mod tests {
         invalid.push(json!(recovery_response(&recovery_plan(), 0, true)));
         for body in invalid {
             let host = TestHost::start(Reply::Json(200, body));
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             assert_eq!(
                 inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)),
                 Err(PullFailure::InvalidResponse),
@@ -1680,7 +1680,7 @@ mod tests {
             (Reply::Disconnect, PullFailure::Transport),
         ] {
             let host = TestHost::start(reply);
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             let error = inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)).unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(host.finish().body, json!(request));
@@ -1701,7 +1701,7 @@ mod tests {
         assert_eq!(MAX_PULL_RESPONSE_BYTES, fcp_host::MAX_CONNECTOR_STATE_INSPECTION_RESPONSE_BYTES as u64);
         for known_length in [true, false] {
             let host = TestHost::start(Reply::Oversized(known_length));
-            let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+            let client = HostAdminClient::new(&host.endpoint).unwrap();
             assert_eq!(
                 inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_secs(2)),
                 Err(PullFailure::ResponseTooLarge),
@@ -1709,7 +1709,7 @@ mod tests {
             host.finish();
         }
         let host = TestHost::start(Reply::Stalled);
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         let error = inspect_replica(&client, &request, "fixture-admin-secret", Duration::from_millis(200)).unwrap_err();
         assert_eq!(error, PullFailure::Timeout);
         assert_eq!(host.finish().body, json!(request));

@@ -4025,6 +4025,15 @@ fn build_render_options(
 }
 
 fn internal_error_dispatch(args: &[String], error: &anyhow::Error) -> DispatchOutcome {
+    if let Some(unknown) = error.downcast_ref::<invocation_cmd::BatchOutcomeUnknown>() {
+        let (command, subcommand) = truth_resolver_command_context(args);
+        let mut dispatch = unknown.dispatch(&command);
+        if let Some(subcommand) = subcommand {
+            dispatch.payload["subcommand"] = Value::String(subcommand);
+        }
+        return dispatch;
+    }
+
     if let Some(unknown) = error.downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>() {
         let (command, subcommand) = truth_resolver_command_context(args);
         let mut dispatch = unknown.dispatch(&command);
@@ -5271,6 +5280,35 @@ fn resolved_zone(explicit_zone: Option<&str>, host: &ResolvedHostConfig) -> Stri
 const HOST_READ_TIMEOUT_ENV: &str = "FWC_HOST_READ_TIMEOUT_MS";
 const DEFAULT_HOST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Match the host's invocation_deadline ceiling. The extra transport allowance
+// covers its five-second finalization grace plus response/admission overhead;
+// it never changes the execution deadline serialized in the request.
+const HOST_INVOKE_MAX_EXECUTION_MS: u64 = 60_000;
+const HOST_EXECUTION_RESPONSE_ALLOWANCE_MS: u64 = 10_000;
+
+fn host_invoke_http_timeout(deadline_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        deadline_ms
+            .unwrap_or(HOST_INVOKE_MAX_EXECUTION_MS)
+            .min(HOST_INVOKE_MAX_EXECUTION_MS)
+            + HOST_EXECUTION_RESPONSE_ALLOWANCE_MS,
+    )
+}
+
+fn host_execution_http_timeout(deadline_ms: u64) -> Result<Duration> {
+    let milliseconds = deadline_ms
+        .checked_add(HOST_EXECUTION_RESPONSE_ALLOWANCE_MS)
+        .ok_or_else(|| {
+            anyhow::anyhow!("host execution deadline exceeds the supported transport range")
+        })?;
+    let timeout = Duration::from_millis(milliseconds);
+    anyhow::ensure!(
+        std::time::Instant::now().checked_add(timeout).is_some(),
+        "host execution deadline exceeds this platform's supported transport range"
+    );
+    Ok(timeout)
+}
+
 fn parse_host_read_timeout(value: Option<&str>) -> Result<Duration> {
     let Some(value) = value else {
         return Ok(DEFAULT_HOST_READ_TIMEOUT);
@@ -5444,14 +5482,6 @@ impl HostReadProvenance {
 
 impl HostAdminClient {
     fn new(endpoint: &str) -> Result<Self> {
-        Self::with_redirects(endpoint, true)
-    }
-
-    fn without_redirects(endpoint: &str) -> Result<Self> {
-        Self::with_redirects(endpoint, false)
-    }
-
-    fn with_redirects(endpoint: &str, follow_redirects: bool) -> Result<Self> {
         let endpoint = normalize_host_endpoint(endpoint)?;
         let configured_timeout = match std::env::var(HOST_READ_TIMEOUT_ENV) {
             Ok(value) => Some(value),
@@ -5461,14 +5491,13 @@ impl HostAdminClient {
             }
         };
         let read_timeout = parse_host_read_timeout(configured_timeout.as_deref())?;
-        let builder = BlockingClientBuilder::new();
-        let builder = if follow_redirects {
-            builder
-        } else {
-            builder
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-        };
+        // Capability and approval tokens live in JSON bodies, so stripping an
+        // Authorization header on a cross-origin redirect cannot protect them.
+        // Keep every request on the chosen host and leave replay decisions to
+        // the invocation journal instead of the HTTP transport.
+        let builder = BlockingClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
 
         #[cfg(unix)]
         {
@@ -5747,7 +5776,9 @@ impl HostAdminClient {
     }
 
     fn simulate(&self, request: &HostSimulateRequest) -> Result<HostSimulateResponse> {
-        let response: HostSimulateResponse = self.post_json("/rpc/simulate", request)?;
+        let timeout = host_execution_http_timeout(request.deadline_ms)?;
+        let response: HostSimulateResponse =
+            self.post_json_with_timeout("/rpc/simulate", request, timeout)?;
         anyhow::ensure!(
             response.request_id == request.request_id
                 && response.receipt.connector_id == request.connector_id
@@ -5789,20 +5820,24 @@ impl HostAdminClient {
     }
 
     fn invoke(&self, request: &InvokeRequest) -> Result<InvokeResponse> {
-        self.post_json("/rpc/invoke", request)
-            .and_then(|response: InvokeResponse| {
-                anyhow::ensure!(
-                    response.id == request.id,
-                    "host returned an invoke response for a different request"
-                );
-                Ok(response)
-            })
-            .map_err(|error| {
-                // Drop raw bodies and transport diagnostics: either can echo request
-                // secrets. The stable identity is sufficient for safe inspection.
-                invocation_cmd::InvokeOutcomeUnknown::from_request(request, &self.endpoint, &error)
-                    .into()
-            })
+        self.post_json_with_timeout(
+            "/rpc/invoke",
+            request,
+            host_invoke_http_timeout(request.deadline_ms),
+        )
+        .and_then(|response: InvokeResponse| {
+            anyhow::ensure!(
+                response.id == request.id,
+                "host returned an invoke response for a different request"
+            );
+            Ok(response)
+        })
+        .map_err(|error| {
+            // Drop raw bodies and transport diagnostics: either can echo request
+            // secrets. The stable identity is sufficient for safe inspection.
+            invocation_cmd::InvokeOutcomeUnknown::from_request(request, &self.endpoint, &error)
+                .into()
+        })
     }
 
     fn cancel(&self, request: &HostCancellationRequest) -> Result<HostCancellationResponse> {
@@ -5814,7 +5849,33 @@ impl HostAdminClient {
     }
 
     fn batch(&self, request: &HostBatchInvokeRequest) -> Result<HostBatchInvokeResponse> {
-        self.post_json("/rpc/batch", request)
+        // The host enforces one outer batch budget across planning, queued
+        // members and dependency waves. Do not sum or replace member deadlines.
+        let timeout = host_execution_http_timeout(request.options.timeout_ms)?;
+        self.post_json_with_timeout("/rpc/batch", request, timeout)
+            .and_then(|response: HostBatchInvokeResponse| {
+                anyhow::ensure!(
+                    response.results.len() == request.operations.len()
+                        && response
+                            .results
+                            .iter()
+                            .zip(&request.operations)
+                            .all(|(result, operation)| result.id == operation.id),
+                    "host returned batch results for different operations"
+                );
+                Ok(response)
+            })
+            .map_err(|error| {
+                invocation_cmd::BatchOutcomeUnknown::from_requests(
+                    request
+                        .operations
+                        .iter()
+                        .map(|operation| (operation.id.as_str(), &operation.request)),
+                    &self.endpoint,
+                    &error,
+                )
+                .into()
+            })
     }
 
     fn pin(&self, connector_id: &str, version: &semver::Version) -> Result<HostPinState> {
@@ -6040,6 +6101,22 @@ impl HostAdminClient {
             .send()
             .with_context(|| format!("PUT {path} to host admin API failed"))?;
         Self::decode_response(response, "PUT", path)
+    }
+
+    fn post_json_with_timeout<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .timeout(timeout)
+            .send()
+            .with_context(|| format!("POST {path} to host admin API failed"))?;
+        Self::decode_response(response, "POST", path)
     }
 
     fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -11741,7 +11818,7 @@ fn mesh_live_inventory_dispatch(
             });
         }
     };
-    let client = HostAdminClient::without_redirects(&host.endpoint)?;
+    let client = HostAdminClient::new(&host.endpoint)?;
     let mut inventory = match client.mesh_inventory(&token) {
         Ok(inventory) => inventory,
         Err(error) => {
@@ -34368,10 +34445,16 @@ mod tests {
         client: super::HostAdminClient,
         release: std::sync::mpsc::Sender<()>,
         observed: std::sync::mpsc::Receiver<String>,
+        request_body: Arc<StdMutex<Vec<u8>>>,
         server: thread::JoinHandle<()>,
     }
 
     fn hold_host_response_body_or_headers(hold_body: bool) -> HeldHostResponse {
+        hold_host_response_json(hold_body, json!({}))
+    }
+
+    fn hold_host_response_json(hold_body: bool, body: Value) -> HeldHostResponse {
+        let response_body = serde_json::to_vec(&body).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").expect("held host should bind");
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -34386,6 +34469,8 @@ mod tests {
         };
         let (release, released) = std::sync::mpsc::channel();
         let (observed_request, observed) = std::sync::mpsc::channel();
+        let request_body = Arc::new(StdMutex::new(Vec::new()));
+        let captured_body = Arc::clone(&request_body);
         let server = thread::spawn(move || {
             let accept_deadline = Instant::now() + Duration::from_secs(5);
             let mut stream = loop {
@@ -34425,11 +34510,12 @@ mod tests {
                     content_length = value.trim().parse::<usize>().unwrap();
                 }
             }
-            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            *captured_body.lock().unwrap() = body;
             if hold_body {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{")
-                    .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response_body.len()).unwrap();
+                stream.write_all(&response_body[..1]).unwrap();
                 stream.flush().unwrap();
             }
             observed_request
@@ -34439,15 +34525,21 @@ mod tests {
             // bounded fallback also cleans up when the deadline regresses.
             let _ = released.recv_timeout(Duration::from_secs(5));
             if hold_body {
-                let _ = stream.write_all(b"}");
+                let _ = stream.write_all(&response_body[1..]);
             } else {
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                let _ = stream.write_all(&response_body);
             }
         });
         HeldHostResponse {
             client,
             release,
             observed,
+            request_body,
             server,
         }
     }
@@ -34579,6 +34671,162 @@ mod tests {
             "invoke must retain its transport budget beyond the read deadline"
         );
         assert_eq!(response.unwrap().unwrap(), json!({}));
+    }
+
+    fn execution_transport_request() -> super::InvokeRequest {
+        let auth = super::resolve_live_auth(&LiveAuthArgs {
+            capability_token: Some(test_capability_token_arg()),
+            ..LiveAuthArgs::default()
+        })
+        .unwrap();
+        super::build_live_invoke_request(
+            "fcp.github:enterprise:v1",
+            "issues.create",
+            "z:work",
+            json!({"title":"private-transport-input"}),
+            RequestId::new("transport-invoke"),
+            &auth,
+            None,
+            None,
+            Some(2_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn host_execution_transport_budgets_preserve_server_limits_and_outer_batch_deadlines() {
+        for (deadline, expected) in [
+            (None, 70_000),
+            (Some(0), 10_000),
+            (Some(5_000), 15_000),
+            (Some(60_000), 70_000),
+            (Some(120_000), 70_000),
+            (Some(u64::MAX), 70_000),
+        ] {
+            assert_eq!(
+                super::host_invoke_http_timeout(deadline),
+                Duration::from_millis(expected),
+            );
+        }
+        // Simulations and the batch's outer budget are explicit caller limits.
+        // A batch may legitimately contain multiple sixty-second members.
+        for deadline in [0, 5_000, 30_000, 60_000, 120_000] {
+            assert_eq!(
+                super::host_execution_http_timeout(deadline).unwrap(),
+                Duration::from_millis(deadline + 10_000),
+            );
+        }
+        assert!(super::host_execution_http_timeout(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn execution_posts_override_the_client_default_through_headers_and_body() {
+        for route in ["invoke", "simulate", "batch"] {
+            for hold_body in [false, true] {
+                let request = execution_transport_request();
+                let simulation: super::HostSimulateRequest = serde_json::from_value(json!({
+                    "request_id": request.id.to_string(),
+                    "connector_id": request.connector_id.to_string(),
+                    "operation": request.operation.to_string(),
+                    "input": request.input.clone(),
+                    "zone_id": request.zone_id.to_string(),
+                    "capability_token": request.capability_token.clone(),
+                    "deadline_ms": 90_000,
+                }))
+                .unwrap();
+                let batch = super::HostBatchInvokeRequest {
+                    operations: vec![super::HostBatchOperation {
+                        id: "member".into(),
+                        request: request.clone(),
+                        depends_on: Vec::new(),
+                    }],
+                    options: super::HostBatchOptions {
+                        timeout_ms: 90_000,
+                        ..super::HostBatchOptions::default()
+                    },
+                };
+                let response = match route {
+                    "invoke" => serde_json::to_value(InvokeResponse::ok(
+                        request.id.clone(),
+                        json!({"accepted":true}),
+                    ))
+                    .unwrap(),
+                    "simulate" => {
+                        let mut response = mock_simulate_response_json(
+                            &request.input,
+                            SimulatePhase::ConnectorReached,
+                            true,
+                        );
+                        response["request_id"] = json!(request.id.to_string());
+                        response
+                    }
+                    "batch" => mock_batch_response_json(&["member"]),
+                    _ => unreachable!(),
+                };
+                let mut held = hold_host_response_json(hold_body, response);
+                held.client.client = super::BlockingClientBuilder::new()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
+                    .timeout(Duration::from_millis(100))
+                    .build()
+                    .unwrap();
+                let (completed, result) = std::sync::mpsc::channel();
+                let worker = thread::spawn(move || {
+                    let response = match route {
+                        "invoke" => held.client.invoke(&request).map(|_| ()),
+                        "simulate" => held.client.simulate(&simulation).map(|_| ()),
+                        "batch" => held.client.batch(&batch).map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    completed.send(response).unwrap();
+                });
+                let observed = held.observed.recv_timeout(Duration::from_secs(5));
+                let early = result.recv_timeout(Duration::from_millis(300));
+                let completed_early = early.is_ok();
+                let _ = held.release.send(());
+                let response = early.or_else(|_| result.recv_timeout(Duration::from_secs(5)));
+                held.server.join().unwrap();
+                worker.join().unwrap();
+                assert_eq!(observed.unwrap(), format!("POST /rpc/{route} HTTP/1.1"));
+                assert!(
+                    !completed_early,
+                    "{route} retained the shorter client default"
+                );
+                response.unwrap().unwrap();
+                let sent: Value =
+                    serde_json::from_slice(&held.request_body.lock().unwrap()).unwrap();
+                if route == "batch" {
+                    assert_eq!(sent["options"]["timeout_ms"], 90_000);
+                    assert_eq!(sent["operations"][0]["request"]["deadline_ms"], 2_000);
+                } else {
+                    assert_eq!(
+                        sent["deadline_ms"],
+                        if route == "simulate" { 90_000 } else { 2_000 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn execution_transport_timeouts_cover_stalled_headers_and_bodies() {
+        for hold_body in [false, true] {
+            let held = hold_host_response_body_or_headers(hold_body);
+            let result: anyhow::Result<Value> = held.client.post_json_with_timeout(
+                "/rpc/invoke",
+                &execution_transport_request(),
+                Duration::from_millis(150),
+            );
+            let _ = held.release.send(());
+            held.server.join().unwrap();
+            let error = result.unwrap_err();
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            }));
+        }
     }
 
     #[test]
@@ -45379,7 +45627,7 @@ deny_ptrace = true
             stream.flush().unwrap();
             request
         });
-        let error = super::HostAdminClient::without_redirects(&endpoint)
+        let error = super::HostAdminClient::new(&endpoint)
             .unwrap()
             .mesh_inventory("test-owner-credential")
             .unwrap_err();

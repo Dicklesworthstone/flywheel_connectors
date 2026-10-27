@@ -137,7 +137,7 @@ pub(crate) fn dispatch(
         Ok(None) => return Ok(lookup_failure(args, None, LookupFailure::MissingHost)),
         Err(_) => return Ok(lookup_failure(args, None, LookupFailure::InvalidHost)),
     };
-    let client = match HostAdminClient::without_redirects(&host.endpoint) {
+    let client = match HostAdminClient::new(&host.endpoint) {
         Ok(client) => client,
         Err(_) => {
             return Ok(lookup_failure(
@@ -695,8 +695,101 @@ impl std::fmt::Display for InvokeOutcomeUnknown {
 
 impl std::error::Error for InvokeOutcomeUnknown {}
 
+/// A batch reply can disappear after any subset of members has executed.
+/// Retain only safe member identities, never their inputs or raw host errors.
+#[derive(Debug)]
+pub(crate) struct BatchOutcomeUnknown {
+    members: Vec<(String, InvokeOutcomeUnknown)>,
+}
+
+impl BatchOutcomeUnknown {
+    pub(crate) fn from_requests<'a>(
+        requests: impl IntoIterator<Item = (&'a str, &'a InvokeRequest)>,
+        endpoint: &str,
+        error: &anyhow::Error,
+    ) -> Self {
+        Self {
+            members: requests
+                .into_iter()
+                .map(|(id, request)| {
+                    (
+                        id.to_owned(),
+                        InvokeOutcomeUnknown::from_request(request, endpoint, error),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn dispatch(&self, command: &str) -> DispatchOutcome {
+        let members = self
+            .members
+            .iter()
+            .map(|(id, unknown)| {
+                let evidence = unknown.dispatch(command).payload;
+                json!({
+                    "id": id,
+                    "request_id": &unknown.request_id,
+                    "connector_id": &unknown.connector_id,
+                    "operation": &unknown.operation,
+                    "zone": &unknown.zone,
+                    "inspection": evidence["inspection"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let next_actions = vec![
+            "Inspect every member's request identity on the selected host using its retained invocation history.".to_owned(),
+            "Reconcile completed and uncertain effects before deciding whether to repeat any batch member.".to_owned(),
+        ];
+        let mut payload = json!({
+            "status": "error",
+            "command": command,
+            "schema_version": TRUTH_SOURCE_SCHEMA_VERSION,
+            "_truth_source": "unavailable",
+            "phase": "execution",
+            "outcome": "outcome_unknown",
+            "source_outcome_known": false,
+            "automatic_retry_allowed": false,
+            "message": "The batch reply was not usable. Some operations may have executed; their request identities are retained for inspection.",
+            "members": members,
+            "error": {
+                "type": "batch-outcome-unknown",
+                "message": "The host did not return a usable result for this batch. Inspect each retained request before repeating any work.",
+                "timed_out": self.members.iter().any(|(_, unknown)| unknown.timed_out),
+                "recoverable": false,
+            },
+            "caveats": [MISSING_HISTORY_CAVEAT],
+            "next_actions": &next_actions,
+        });
+        let mut envelope = CommandEnvelope::new(CommandAvailability::Unknown, command);
+        envelope.explanation =
+            "The batch outcome is unknown; repeating any member may duplicate effects.".to_owned();
+        envelope.recoverable = false;
+        envelope.next_actions = next_actions;
+        envelope.inject_into(&mut payload);
+        DispatchOutcome {
+            payload,
+            exit_code: CliExitCode::Transport,
+        }
+    }
+}
+
+impl std::fmt::Display for BatchOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "batch outcome unknown for {} members; inspect retained host history before repeating them",
+            self.members.len(),
+        )
+    }
+}
+
+impl std::error::Error for BatchOutcomeUnknown {}
+
 pub(crate) fn withhold_argument_echo(payload: &Value) -> bool {
-    payload["command"] == "invocation" || payload["error"]["type"] == "invoke-outcome-unknown"
+    payload["command"] == "invocation"
+        || payload["error"]["type"] == "invoke-outcome-unknown"
+        || payload["error"]["type"] == "batch-outcome-unknown"
 }
 
 fn safe_host_endpoint(endpoint: &str) -> Option<String> {
@@ -728,7 +821,7 @@ mod tests {
     enum Reply {
         Json(u16, Value),
         Disconnect,
-        Redirect(String),
+        Redirect(u16, String),
         StalledBody,
         OversizedBody,
     }
@@ -813,10 +906,10 @@ mod tests {
                         stream.flush().unwrap();
                     }
                     Reply::Disconnect => {}
-                    Reply::Redirect(location) => {
+                    Reply::Redirect(status, location) => {
                         write!(
                             stream,
-                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         )
                         .unwrap();
                         stream.flush().unwrap();
@@ -1425,11 +1518,11 @@ mod tests {
     fn invocation_lookup_refuses_redirects_and_bounds_stalled_response_bodies() {
         let destination = TcpListener::bind("127.0.0.1:0").unwrap();
         destination.set_nonblocking(true).unwrap();
-        let host = TestHost::start(Reply::Redirect(format!(
-            "http://{}/redirected",
-            destination.local_addr().unwrap(),
-        )));
-        let mut client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let host = TestHost::start(Reply::Redirect(
+            307,
+            format!("http://{}/redirected", destination.local_addr().unwrap()),
+        ));
+        let mut client = HostAdminClient::new(&host.endpoint).unwrap();
         client.read_timeout = Duration::from_millis(250);
         let request = InvocationQueryRequest {
             operation_id: "req-inspect".to_owned(),
@@ -1446,7 +1539,7 @@ mod tests {
         ));
 
         let host = TestHost::start(Reply::StalledBody);
-        let mut client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let mut client = HostAdminClient::new(&host.endpoint).unwrap();
         client.read_timeout = Duration::from_millis(250);
         assert!(matches!(
             query_invocation(&client, &request, "fixture-admin-secret"),
@@ -1499,7 +1592,7 @@ mod tests {
     #[test]
     fn invocation_lookup_caps_success_body_before_decoding_unknown_length_json() {
         let host = TestHost::start(Reply::OversizedBody);
-        let client = HostAdminClient::without_redirects(&host.endpoint).unwrap();
+        let client = HostAdminClient::new(&host.endpoint).unwrap();
         let request = InvocationQueryRequest {
             operation_id: "req-inspect".to_owned(),
             attempt_id: None,
@@ -1564,6 +1657,208 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn capability_bearing_host_posts_never_follow_redirects() {
+        for status in [307, 308] {
+            for path in [
+                "/rpc/invoke",
+                "/rpc/preflight",
+                "/rpc/simulate",
+                "/rpc/batch",
+            ] {
+                let sink = TestHost::start(Reply::Json(200, json!({})));
+                let host = TestHost::start(Reply::Redirect(
+                    status,
+                    format!("{}/credential-sink", sink.endpoint),
+                ));
+                let client = HostAdminClient::new(&host.endpoint).unwrap();
+                let mut body = serde_json::to_value(invoke_request()).unwrap();
+                body["approval_tokens"] = json!([{"signature": "private-approval-sentinel"}]);
+                let result: anyhow::Result<Value> = client.post_json(path, &body);
+                let captured = host.finish();
+                let leaked = sink.observed.try_recv().is_ok();
+                drop(sink);
+                assert!(
+                    result.is_err(),
+                    "HTTP {status} must remain on the chosen host"
+                );
+                assert!(!leaked, "HTTP {status} forwarded a capability-bearing body");
+                assert_eq!(captured.line, format!("POST {path} HTTP/1.1"));
+                assert_eq!(captured.body, body);
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_batch_replies_retain_all_member_inspection_identities_without_retry() {
+        let success = |ids: [&str; 2]| {
+            json!({
+                "status": "success",
+                "completed": 2,
+                "failed": 0,
+                "skipped": 0,
+                "results": ids.map(|id| json!({
+                    "id": id,
+                    "status": "success",
+                    "output": {"private_result": "raw-private-result"},
+                    "duration_ms": 1,
+                })),
+                "total_duration_ms": 2,
+            })
+        };
+        for reply in [
+            Reply::Disconnect,
+            Reply::Json(
+                200,
+                json!({"reflected": "raw-private-payload fixture-admin-secret"}),
+            ),
+            Reply::Json(200, success(["different-member", "second"])),
+            Reply::Json(200, success(["first", "first"])),
+        ] {
+            let host = TestHost::start(reply);
+            let endpoint = host.endpoint.clone();
+            let client = HostAdminClient::new(&endpoint).unwrap();
+            let first = invoke_request();
+            let mut second = first.clone();
+            second.id = crate::RequestId::new("req-inspect-second");
+            let request = crate::HostBatchInvokeRequest {
+                operations: vec![
+                    crate::HostBatchOperation {
+                        id: "first".to_owned(),
+                        request: first,
+                        depends_on: Vec::new(),
+                    },
+                    crate::HostBatchOperation {
+                        id: "second".to_owned(),
+                        request: second,
+                        depends_on: vec!["first".to_owned()],
+                    },
+                ],
+                options: crate::HostBatchOptions::default(),
+            };
+            let error = client
+                .batch(&request)
+                .expect_err("unusable aggregate reply");
+            let captured = host.finish();
+            assert_eq!(captured.line, "POST /rpc/batch HTTP/1.1");
+            assert_eq!(captured.body["operations"].as_array().unwrap().len(), 2);
+
+            let args = [
+                "fwc",
+                "map",
+                "github.create_issue",
+                "--inputs",
+                "raw-private-payload",
+                "--capability-token",
+                "fixture-admin-secret",
+            ]
+            .map(str::to_owned);
+            let mut outcome = crate::internal_error_dispatch(&args, &error);
+            crate::annotate_with_corrections(
+                &mut outcome.payload,
+                &args,
+                &args,
+                &[crate::InputCorrection {
+                    from: "mapp".to_owned(),
+                    to: "map".to_owned(),
+                    rationale: "test correction",
+                }],
+            );
+            assert_eq!(outcome.exit_code, CliExitCode::Transport);
+            assert_eq!(outcome.payload["error"]["type"], "batch-outcome-unknown");
+            assert_eq!(outcome.payload["outcome"], "outcome_unknown");
+            assert_eq!(outcome.payload["automatic_retry_allowed"], false);
+            assert_eq!(outcome.payload["availability"]["recoverable"], false);
+            for (index, request_id) in ["req-inspect", "req-inspect-second"]
+                .into_iter()
+                .enumerate()
+            {
+                let member = &outcome.payload["members"][index];
+                assert_eq!(member["request_id"], request_id);
+                assert_eq!(member["inspection"]["operation_id"], request_id);
+                assert_eq!(member["inspection"]["host_endpoint"], endpoint);
+            }
+            assert!(withhold_argument_echo(&outcome.payload));
+            assert!(outcome.payload.get("input_normalization").is_none());
+            assert!(outcome.payload["error"].get("debug_chain").is_none());
+            for private in [
+                "raw-private-payload",
+                "raw-private-result",
+                "fixture-admin-secret",
+                "different-member",
+            ] {
+                assert!(!outcome.payload.to_string().contains(private));
+                assert!(!error.to_string().contains(private));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_transport_preserves_unix_socket_endpoints() {
+        use std::os::unix::net::UnixListener;
+
+        for include_scheme in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket_path = directory.path().join("host.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = if include_scheme {
+                format!("unix://{}", socket_path.display())
+            } else {
+                socket_path.display().to_string()
+            };
+            let request = invoke_request();
+            let response = serde_json::to_vec(&crate::InvokeResponse::ok(
+                request.id.clone(),
+                json!({"unix": true}),
+            ))
+            .unwrap();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "Unix host was not contacted");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("Unix host accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "POST /rpc/invoke HTTP/1.1");
+                let mut content_length = 0;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                assert!(content_length < 1_048_576);
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            });
+            let client = HostAdminClient::new(&endpoint).unwrap();
+            let result = client.invoke(&request).unwrap();
+            let captured = server.join().unwrap();
+            assert_eq!(captured["id"], request.id.to_string());
+            assert_eq!(result.result.unwrap()["unix"], true);
+        }
     }
 
     #[test]
