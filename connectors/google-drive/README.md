@@ -46,7 +46,9 @@ Important runtime truths the contract preserves:
 - Path-segment validation rejects empty strings, slashes, backslashes, `..`, query strings, fragments, encoded slash/backslash/query/fragment markers, and literal percent characters.
 - `drive.list_files` URL-encodes `query` and `page_token`, and forwards `max_results` as `pageSize` without clamping it in the client.
 - `drive.download_file` requests `alt=media` and returns `content_base64`; if the executor returns JSON instead of binary, the current runtime returns the JSON value as a string.
-- `drive.upload_file` calls `files?uploadType=multipart` but sends a JSON wrapper containing `metadata` and `media_body_base64` through `GoogleRestExecutor`. It does not implement Google resumable upload.
+- `drive.upload_file` sends a real `multipart/related` body to `/upload/drive/v3/files?uploadType=multipart` through `GoogleRestExecutor`: JSON metadata first, decoded binary media second. It accepts canonical standard padded base64, including an empty string for an empty file, and rejects files above 5 MiB before contacting Drive. Resumable upload is not implemented.
+- Upload metadata is limited to 64 KiB after JSON serialization. The MIME type must be concrete and cannot contain header control characters. Upload responses, including error bodies, are bounded to 5 MiB while being read.
+- Upload retries are limited to confirmed rate-limit refusals and transport failures known not to have reached the service. A 5xx, uncertain transport result, malformed success response, or oversized response produces a non-retryable unknown-outcome error; inspect the destination folder before uploading again.
 - `drive.share_file` creates a user permission and accepts roles `reader`, `commenter`, `writer`, and `organizer`.
 - Runtime handshake installs a `CapabilityVerifier`.
 - `invoke` requires `capability_token`, validates input, computes resource URIs, and verifies a bound capability token before provider execution.
@@ -64,13 +66,12 @@ This README documents the runtime truth and keeps current drift visible:
 - Manifest optional capabilities include `media.download` and `media.upload`, but operation metadata and capability verification use only `drive.read` and `drive.write`.
 - Manifest marks `drive.create_folder` as policy approval and `drive.upload_file`, `drive.trash_file`, and `drive.share_file` as interactive approval. Runtime introspection now exposes that approval intent, but `invoke` and `simulate` verify bound capability tokens only and do not verify approval tokens.
 - Runtime `drive.download_file` can return a JSON string in `content_base64` if the executor gives the client a JSON response body.
-- Runtime `drive.upload_file` advertises multipart upload but sends a JSON wrapper rather than constructing a true multipart request body or resumable upload session.
 - Runtime introspection says `max_results` has a maximum of 1000, but runtime input validation and client dispatch do not clamp the value.
 - Runtime `handle_shutdown` calls client shutdown but does not clear client, verifier, session, configured flags, or handshaken flags.
 - `self_check()` reports `DEFAULT_BASE_URL` in details even when a loopback or custom base URL was configured.
 - The dedicated tracked verification shell script is `scripts/e2e/google_drive_connector_verification.sh`.
 
-A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, fix upload/download response semantics, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
+A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, fix download response semantics, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
 
 ## First-Slice Scope
 
@@ -102,7 +103,8 @@ The current Google Drive README slice documents the existing runtime surface:
 ## Network And Runtime Invariants
 
 - Production host: `www.googleapis.com`.
-- Production API prefix: `/drive/v3`.
+- Production API prefix: `/drive/v3`; media upload prefix: `/upload/drive/v3`.
+- The HTTP client does not follow redirects, including redirects on media uploads.
 - Production port: `443`.
 - TLS and SNI are required by the manifest for live traffic.
 - Manifest network policy denies localhost, private ranges, tailnet ranges, and IP literals for live operations.
@@ -132,7 +134,7 @@ The current Google Drive README slice documents the existing runtime surface:
 | `drive.get_file` | `GET /drive/v3/files/{file_id}?fields=...` | `drive.read` | `Safe` | `Low` | `Strict` | Reads metadata for one Drive file or folder. |
 | `drive.download_file` | `GET /drive/v3/files/{file_id}?alt=media` | `drive.read` | `Safe` | `Low` | `Strict` | Downloads file content and returns it as `content_base64` when the executor returns binary. |
 | `drive.create_folder` | `POST /drive/v3/files?fields=id,name,mimeType,parents` | `drive.write` | `Risky` | `Medium` | `None` | Creates a new folder, optionally under a parent folder. |
-| `drive.upload_file` | `POST /drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size` | `drive.write` | `Dangerous` | `High` | `None` | Creates a new file from base64 input using the current JSON-wrapper upload path. |
+| `drive.upload_file` | `POST /upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size` | `drive.write` | `Dangerous` | `High` | `None` | Creates a new file from at most 5 MiB of decoded base64 input using a binary multipart/related body. |
 | `drive.trash_file` | `PATCH /drive/v3/files/{file_id}?fields=id,name,trashed` | `drive.write` | `Dangerous` | `High` | `Strict` | Moves a file or folder to trash. |
 | `drive.share_file` | `POST /drive/v3/files/{file_id}/permissions` | `drive.write` | `Dangerous` | `Critical` | `None` | Grants another user access to a file or folder. |
 
@@ -155,7 +157,7 @@ Runtime capability-token verification binds operations to these resource URI sha
 The current implementation does not include:
 
 - Google Docs, Sheets, or Slides export before download
-- resumable uploads, multipart body construction outside the current executor wrapper, upload progress, or checksum verification
+- resumable uploads, upload progress, or checksum verification
 - permission listing, permission deletion, link-sharing policy management, domain sharing, ownership transfer, shared-drive administration, or ACL audit
 - file copy, move, rename, patch, labels, revisions, comments, shortcuts, change feeds, watch channels, or hard delete
 - folder search/create idempotency, sync-token storage, durable file indexes, Drive warehouse export, or connector-local credential vaulting
@@ -187,6 +189,15 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - invoke rejection for unknown operation, missing token, missing input, wrong capability, and pre-provider capability verification
 - provider 401, 403, 404, 429, retryable transport/server classes, malformed JSON, quota errors, and FCP error mapping
 - path-segment validation for traversal and double-encoded separators
+- capability-bound binary multipart uploads, empty files, exact upload URI and MIME framing, standard base64 and size validation, safe rate-limit retry, unknown mutation outcomes, and redirect refusal
+- the shared Google executor's related multipart encoder and bounded response reader, including chunked responses without a content length
+
+Focused upload regression commands (loopback only; no Google credentials required):
+
+```bash
+cargo test -p fcp-google-drive --lib upload_
+cargo test -p fcp-google-discovery --lib executor::tests
+```
 
 ## Source Notes
 
@@ -242,7 +253,7 @@ The verification surface captures:
 - If configuration fails, provide exactly one Google auth source at the top level.
 - If live checks fail with a credential reference, materialize host credentials before invoking provider operations.
 - If `drive.download_file` fails on Google-native documents, export through the appropriate Google API first; this connector does not implement export.
-- If `drive.upload_file` fails against real Drive, inspect the current upload body contract before assuming resumable or true multipart upload is implemented.
+- If `drive.upload_file` reports an unknown outcome, inspect the destination folder for the new file before retrying. The connector does not replay uploads that may already have committed. Invalid base64, MIME types, empty names/parent IDs, and size-limit failures are rejected locally.
 - If list pagination behaves unexpectedly, validate `max_results`, `query`, and `page_token` against Drive API syntax and provider limits.
 - If provider returns 403, treat it as an auth/permission failure rather than a retryable transport error.
 

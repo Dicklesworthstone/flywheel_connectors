@@ -110,9 +110,15 @@ fn validate_drive_input(operation: &str, input: &serde_json::Value) -> FcpResult
             require_str(input, "name")?;
         }
         "drive.upload_file" => {
-            require_str(input, "name")?;
-            require_str(input, "mime_type")?;
-            require_str(input, "content_base64")?;
+            let name = require_str(input, "name")?;
+            let mime_type = require_str(input, "mime_type")?;
+            let content = require_str(input, "content_base64")?;
+            let parent_id = input
+                .get("parent_id")
+                .map(|_| require_str(input, "parent_id"))
+                .transpose()?;
+            crate::client::validate_upload_input(name, mime_type, parent_id, content)
+                .map_err(|error| error.to_fcp_error())?;
         }
         "drive.share_file" => {
             require_str(input, "file_id")?;
@@ -862,6 +868,107 @@ mod tests {
             }))
             .await
             .unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_invocation_sends_authorized_binary_multipart_request() {
+        use base64::Engine as _;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path, query_param},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .and(query_param("uploadType", "multipart"))
+            .and(header("authorization", "Bearer upload-wire-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "binary-upload", "name": "résumé.bin", "mimeType": "application/octet-stream", "size": "25"
+            })))
+            .expect(1).mount(&server).await;
+        let mut connector = DriveConnector::new();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_configure(bearer_config_with_base_url(
+                "upload-wire-token",
+                format!("{}/drive/v3", server.uri()),
+            ))
+            .await
+            .unwrap();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0", "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "capabilities_requested": ["drive.read", "drive.write"], "nonce": vec![7_u8; 32]
+            }))
+            .await
+            .unwrap();
+        let bytes = b"\0\xff\r\n--not-the-boundary\r\n\x80";
+        let input = json!({
+            "name": "résumé.bin", "mime_type": "application/octet-stream",
+            "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "parent_id": "parent-folder"
+        });
+        let denied = connector.handle_invoke(json!({
+            "operation": "drive.upload_file", "input": input,
+            "capability_token": build_capability(&signing_key, connector.instance_id(), "drive.get_file")
+        })).await;
+        assert!(denied.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let response = connector.handle_invoke(json!({
+            "operation": "drive.upload_file", "input": input,
+            "capability_token": build_capability(&signing_key, connector.instance_id(), "drive.upload_file")
+        })).await.unwrap();
+        assert_eq!(response["file"]["id"], "binary-upload");
+        let requests = server.received_requests().await.unwrap();
+        let request = &requests[0];
+        let content_type = request
+            .headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let boundary = content_type
+            .strip_prefix("multipart/related; boundary=")
+            .unwrap();
+        let prefix =
+            format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+        let separator =
+            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n");
+        let offset = request
+            .body
+            .windows(separator.len())
+            .position(|part| part == separator.as_bytes())
+            .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&request.body[prefix.len()..offset]).unwrap();
+        assert_eq!(
+            metadata,
+            json!({"name":"résumé.bin", "mimeType":"application/octet-stream", "parents":["parent-folder"]})
+        );
+        let closing = format!("\r\n--{boundary}--\r\n");
+        assert!(request.body.starts_with(prefix.as_bytes()));
+        assert!(request.body.ends_with(closing.as_bytes()));
+        assert_eq!(
+            &request.body[offset + separator.len()..request.body.len() - closing.len()],
+            bytes
+        );
+    }
+
+    #[test]
+    fn upload_input_validation_applies_to_simulation_and_invocation() {
+        for input in [
+            json!({"name":"x", "mime_type":"text/plain", "content_base64":"not base64"}),
+            json!({"name":"x", "mime_type":"text/plain\r\nX-Bad: value", "content_base64":"eA=="}),
+            json!({"name":"x", "mime_type":"text/plain", "content_base64":"eA==", "parent_id": 42}),
+            json!({"name":"x", "mime_type":"text/plain", "content_base64":"eA==", "parent_id": ""}),
+        ] {
+            assert!(matches!(
+                validate_drive_input("drive.upload_file", &input),
+                Err(FcpError::InvalidRequest { .. })
+            ));
+        }
     }
 
     #[test]

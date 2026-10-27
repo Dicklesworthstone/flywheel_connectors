@@ -28,7 +28,7 @@ const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
 pub enum GoogleUploadMode {
     /// `uploadType=media` (bytes-only payload).
     Simple,
-    /// `uploadType=multipart` (metadata + media payload in multipart/form-data).
+    /// `uploadType=multipart` (metadata + media payload in multipart/related).
     Multipart,
     /// `uploadType=resumable` (session-init metadata request).
     Resumable,
@@ -395,6 +395,13 @@ pub enum GoogleRestError {
         message: String,
     },
 
+    /// A response exceeded the caller's retained-body budget.
+    #[error("google rest response exceeded {limit} bytes")]
+    ResponseTooLarge {
+        /// Maximum permitted response bytes.
+        limit: usize,
+    },
+
     /// HTTP transport failure.
     #[error("google rest transport failed: {source}")]
     Http {
@@ -459,6 +466,31 @@ impl GoogleRestExecutor {
         &self,
         request: &GoogleExecuteRequest<'_>,
     ) -> Result<GoogleExecuteResponse, GoogleRestError> {
+        self.execute_with_limit(request, None).await
+    }
+
+    /// Execute with a limit on bytes retained from either a success or error body.
+    ///
+    /// The limit is checked while reading, including responses without a
+    /// `Content-Length`. An oversized response may follow a committed mutation;
+    /// callers must not interpret this error as permission to replay the request.
+    ///
+    /// # Errors
+    /// Returns the usual execution errors, or [`GoogleRestError::ResponseTooLarge`].
+    pub async fn execute_bounded(
+        &self,
+        request: &GoogleExecuteRequest<'_>,
+        max_response_bytes: usize,
+    ) -> Result<GoogleExecuteResponse, GoogleRestError> {
+        self.execute_with_limit(request, Some(max_response_bytes))
+            .await
+    }
+
+    async fn execute_with_limit(
+        &self,
+        request: &GoogleExecuteRequest<'_>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<GoogleExecuteResponse, GoogleRestError> {
         validate_parameters(request.method, &request.parameters)?;
         let method = parse_http_method(&request.method.http_method)?;
         let path_template = resolve_path_template(request.method, request.upload.as_ref())?;
@@ -489,7 +521,7 @@ impl GoogleRestExecutor {
 
         builder = apply_payload(builder, &method, request, validation_body.as_ref())?;
 
-        let response = builder
+        let mut response = builder
             .send()
             .await
             .map_err(|source| GoogleRestError::Http { source })?;
@@ -500,10 +532,31 @@ impl GoogleRestExecutor {
             .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
         let headers = collect_headers(response.headers());
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|source| GoogleRestError::Http { source })?;
+        let bytes = if let Some(limit) = max_response_bytes {
+            if response
+                .content_length()
+                .is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX))
+            {
+                return Err(GoogleRestError::ResponseTooLarge { limit });
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|source| GoogleRestError::Http { source })?
+            {
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
+                    return Err(GoogleRestError::ResponseTooLarge { limit });
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes.into()
+        } else {
+            response
+                .bytes()
+                .await
+                .map_err(|source| GoogleRestError::Http { source })?
+        };
 
         if !status.is_success() {
             let mut error = parse_google_api_error(status, &bytes);
@@ -1001,6 +1054,7 @@ fn apply_payload(
     validation_body: Option<&serde_json::Value>,
 ) -> Result<reqwest::RequestBuilder, GoogleRestError> {
     if let Some(upload) = request.upload.as_ref() {
+        validate_upload_content_type(&upload.content_type)?;
         match upload.mode {
             GoogleUploadMode::Simple => {
                 builder = builder
@@ -1012,23 +1066,11 @@ fn apply_payload(
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
 
-                let metadata_part = reqwest::multipart::Part::text(metadata.to_string())
-                    .mime_str("application/json; charset=UTF-8")
-                    .map_err(|error| GoogleRestError::InvalidUploadContentType {
-                        content_type: "application/json; charset=UTF-8".to_string(),
-                        message: error.to_string(),
-                    })?;
-                let media_part = reqwest::multipart::Part::bytes(upload.bytes.clone())
-                    .mime_str(&upload.content_type)
-                    .map_err(|error| GoogleRestError::InvalidUploadContentType {
-                        content_type: upload.content_type.clone(),
-                        message: error.to_string(),
-                    })?;
-
-                let form = reqwest::multipart::Form::new()
-                    .part("metadata", metadata_part)
-                    .part("media", media_part);
-                builder = builder.multipart(form);
+                let (content_type, body) = multipart_related_body(upload, &metadata)?;
+                builder = builder
+                    .header(reqwest::header::CONTENT_TYPE, content_type)
+                    .header(reqwest::header::CONTENT_LENGTH, body.len())
+                    .body(body);
             }
             GoogleUploadMode::Resumable => {
                 let metadata = validation_body
@@ -1054,6 +1096,84 @@ fn apply_payload(
     }
 
     Ok(builder)
+}
+
+/// Validate a concrete media MIME type before embedding it in an upload header.
+///
+/// # Errors
+/// Rejects malformed types, wildcards, and header control characters.
+pub fn validate_upload_content_type(content_type: &str) -> Result<(), GoogleRestError> {
+    let invalid = || GoogleRestError::InvalidUploadContentType {
+        content_type: content_type.to_string(),
+        message: "expected a concrete MIME type without header control characters".to_string(),
+    };
+    if content_type.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(invalid());
+    }
+    let parsed = content_type.parse::<mime::Mime>().map_err(|_| invalid())?;
+    if parsed.type_() == mime::STAR || parsed.subtype() == mime::STAR {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn multipart_related_body(
+    upload: &GoogleUploadPayload,
+    metadata: &serde_json::Value,
+) -> Result<(String, Vec<u8>), GoogleRestError> {
+    validate_upload_content_type(&upload.content_type)?;
+    let metadata = metadata.to_string().into_bytes();
+    let mut digest = blake3::Hasher::new();
+    digest.update(&metadata);
+    digest.update(&upload.bytes);
+    let digest = digest.finalize().to_hex();
+
+    // A MIME delimiter must never appear in either part. The digest keeps
+    // ordinary requests on the first candidate; explicit collision checks
+    // preserve arbitrary binary data even when it resembles MIME framing.
+    let boundary = (0..16)
+        .map(|suffix| format!("fcp-google-{}-{suffix}", &digest.as_str()[..40]))
+        .find(|candidate| {
+            let delimiter = candidate.as_bytes();
+            !metadata
+                .windows(delimiter.len())
+                .any(|part| part == delimiter)
+                && !upload
+                    .bytes
+                    .windows(delimiter.len())
+                    .any(|part| part == delimiter)
+        })
+        .ok_or_else(|| GoogleRestError::InvalidUploadConfiguration {
+            message: "could not select an unambiguous multipart boundary".to_string(),
+        })?;
+
+    let metadata_header =
+        format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+    let media_header = format!(
+        "\r\n--{boundary}\r\nContent-Type: {}\r\n\r\n",
+        upload.content_type
+    );
+    let closing = format!("\r\n--{boundary}--\r\n");
+    let capacity = [
+        metadata_header.len(),
+        metadata.len(),
+        media_header.len(),
+        upload.bytes.len(),
+        closing.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or_else(|| GoogleRestError::InvalidUploadConfiguration {
+        message: "multipart body length overflow".to_string(),
+    })?;
+    let mut body = Vec::with_capacity(capacity);
+    body.extend_from_slice(metadata_header.as_bytes());
+    body.extend_from_slice(&metadata);
+    body.extend_from_slice(media_header.as_bytes());
+    body.extend_from_slice(&upload.bytes);
+    body.extend_from_slice(closing.as_bytes());
+
+    Ok((format!("multipart/related; boundary={boundary}"), body))
 }
 
 /// Extract the `Retry-After` header value in milliseconds.
@@ -1213,6 +1333,152 @@ pub fn parse_google_api_error(status: StatusCode, body: &[u8]) -> GoogleApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_related_preserves_binary_media_and_json_metadata() {
+        let metadata = serde_json::json!({
+            "name": "résumé\r\n\".bin",
+            "parents": ["parent-123"]
+        });
+        for media in [
+            Vec::new(),
+            b"\0\xff\xfe\r\n--old-boundary\r\n\x80data".to_vec(),
+        ] {
+            let upload = GoogleUploadPayload::multipart(
+                "application/octet-stream",
+                media.clone(),
+                metadata.clone(),
+            );
+            let (content_type, body) = multipart_related_body(&upload, &metadata).unwrap();
+            let boundary = content_type
+                .strip_prefix("multipart/related; boundary=")
+                .unwrap();
+            assert!(boundary.len() <= 70);
+            let prefix =
+                format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+            assert!(body.starts_with(prefix.as_bytes()));
+            let separator =
+                format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n");
+            let separator_offset = body
+                .windows(separator.len())
+                .position(|part| part == separator.as_bytes())
+                .unwrap();
+            let actual_metadata: serde_json::Value =
+                serde_json::from_slice(&body[prefix.len()..separator_offset]).unwrap();
+            assert_eq!(actual_metadata, metadata);
+            let closing = format!("\r\n--{boundary}--\r\n");
+            assert!(body.ends_with(closing.as_bytes()));
+            assert_eq!(
+                &body[separator_offset + separator.len()..body.len() - closing.len()],
+                media.as_slice(),
+            );
+            assert!(
+                !body
+                    .windows(b"Content-Disposition".len())
+                    .any(|part| part == b"Content-Disposition")
+            );
+        }
+    }
+
+    #[test]
+    fn upload_rejects_malformed_or_injected_mime_headers_for_every_mode() {
+        let method = method_fixture("POST", "files", BTreeMap::new());
+        let schemas = BTreeMap::new();
+        for content_type in [
+            "",
+            "text",
+            "text/",
+            "*/*",
+            "image/*",
+            "text/plain\r\nX-Injected: yes",
+            "text/plain\0",
+            "text/plain\n",
+            "text/plain; charset=\"unterminated",
+        ] {
+            for mode in [
+                GoogleUploadMode::Simple,
+                GoogleUploadMode::Multipart,
+                GoogleUploadMode::Resumable,
+            ] {
+                let mut request = GoogleExecuteRequest::new(&method, &schemas, "http://127.0.0.1/");
+                request.upload = Some(GoogleUploadPayload {
+                    mode,
+                    content_type: content_type.to_string(),
+                    bytes: b"data".to_vec(),
+                    metadata: Some(serde_json::json!({})),
+                });
+                let builder = reqwest::Client::new().post("http://127.0.0.1/files");
+                assert!(
+                    matches!(
+                        apply_payload(builder, &Method::POST, &request, None),
+                        Err(GoogleRestError::InvalidUploadContentType { .. }),
+                    ),
+                    "accepted {content_type:?} for {mode:?}"
+                );
+            }
+        }
+        for content_type in [
+            "text/plain; charset=utf-8",
+            "application/octet-stream",
+            "image/svg+xml",
+        ] {
+            validate_upload_content_type(content_type).unwrap();
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_response_rejects_oversized_success_and_error_bodies() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        for status in [200, 500] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{status}")))
+                .respond_with(ResponseTemplate::new(status).set_body_string("x".repeat(128)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let discovery_method = method_fixture("GET", &status.to_string(), BTreeMap::new());
+            let schemas = BTreeMap::new();
+            let base_url = server.uri();
+            let request = GoogleExecuteRequest::new(&discovery_method, &schemas, &base_url);
+            assert!(matches!(
+                GoogleRestExecutor::new()
+                    .execute_bounded(&request, 64)
+                    .await,
+                Err(GoogleRestError::ResponseTooLarge { limit: 64 }),
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn bounded_response_checks_chunked_bodies_without_content_length() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut input = [0u8; 4096];
+            let _ = connection.read(&mut input).unwrap();
+            connection.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n8\r\n12345678\r\n8\r\nabcdefgh\r\n0\r\n\r\n").unwrap();
+        });
+        let discovery_method = method_fixture("GET", "data", BTreeMap::new());
+        let schemas = BTreeMap::new();
+        let base_url = format!("http://{address}/");
+        let request = GoogleExecuteRequest::new(&discovery_method, &schemas, &base_url);
+        assert!(matches!(
+            GoogleRestExecutor::new()
+                .execute_bounded(&request, 12)
+                .await,
+            Err(GoogleRestError::ResponseTooLarge { limit: 12 }),
+        ));
+        server.join().unwrap();
+    }
 
     fn method_fixture(
         http_method: &str,

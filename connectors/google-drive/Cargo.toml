@@ -29,6 +29,7 @@ fcp-manifest = { path = "../../crates/fcp-manifest" }
 
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

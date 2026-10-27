@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:077576c9798e2f855de0615217d979736a21017d38e4dc59f2278fc43f98278f"
+interface_hash = "blake3-256:fcp.interface.v2:3682350fc2b10740b91e244305771dadc3cd7752829d514f276e92b344112514"
 
 [connector]
 id = "fcp.google_drive"
@@ -222,7 +222,7 @@ related = ["drive.upload_file"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."drive.upload_file"]
-description = "Upload a file to Google Drive"
+description = "Upload up to 5 MiB of file bytes and metadata to Google Drive"
 capability = "drive.write"
 risk_level = "high"
 safety_tier = "dangerous"
@@ -235,12 +235,17 @@ required = ["name", "mime_type", "content_base64"]
 type = "object"
 [provides.operations."drive.upload_file".input_schema.properties.name]
 type = "string"
+minLength = 1
 [provides.operations."drive.upload_file".input_schema.properties.mime_type]
 type = "string"
+minLength = 3
 [provides.operations."drive.upload_file".input_schema.properties.content_base64]
 type = "string"
+maxLength = 6990508
+description = "Canonical standard padded base64; decoded bytes must not exceed 5 MiB. An empty string creates an empty file."
 [provides.operations."drive.upload_file".input_schema.properties.parent_id]
 type = "string"
+minLength = 1
 
 [provides.operations."drive.upload_file".output_schema]
 required = ["file"]
@@ -264,8 +269,8 @@ total_timeout_ms = 600000
 max_response_bytes = 5242880
 
 [provides.operations."drive.upload_file".ai_hints]
-when_to_use = "Upload file bytes (base64-encoded) to Drive with an explicit MIME type and optional parent folder."
-common_mistakes = ["Large files should use resumable upload (not yet supported by this connector)", "Each call creates a new file — repeat calls produce duplicates"]
+when_to_use = "Upload up to 5 MiB of file bytes (standard base64-encoded) to Drive with an explicit MIME type and optional parent folder."
+common_mistakes = ["Files above 5 MiB require resumable upload (not supported by this connector)", "Each call creates a new file — repeat calls produce duplicates", "An unknown upload outcome requires checking the destination folder before retrying"]
 examples = ["{\"name\":\"report.txt\",\"mime_type\":\"text/plain\",\"content_base64\":\"SGVsbG8=\"}"]
 related = ["drive.create_folder", "drive.get_file"]
 

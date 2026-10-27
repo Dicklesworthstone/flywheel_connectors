@@ -20,6 +20,16 @@ pub enum DriveError {
     #[error("Drive API error ({status_code}): {message}")]
     Api { status_code: u16, message: String },
 
+    /// Invalid upload input rejected before contacting Drive.
+    #[error("Invalid Drive input: {message}")]
+    InvalidInput { message: String },
+
+    /// Drive may have created the uploaded file but no usable response arrived.
+    #[error(
+        "Drive upload outcome is unknown; inspect the destination folder before retrying because another upload may create a duplicate"
+    )]
+    UploadOutcomeUnknown,
+
     /// Rate limited
     #[error("Rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
@@ -78,6 +88,17 @@ impl DriveError {
     #[must_use]
     pub fn to_fcp_error(&self) -> FcpError {
         match self {
+            Self::InvalidInput { message } => FcpError::InvalidRequest {
+                code: 1003,
+                message: message.clone(),
+            },
+            Self::UploadOutcomeUnknown => FcpError::External {
+                service: "google_drive".into(),
+                message: self.to_string(),
+                status_code: None,
+                retryable: false,
+                retry_after: None,
+            },
             Self::Http(e) => FcpError::External {
                 service: "google_drive".into(),
                 message: e.to_string(),

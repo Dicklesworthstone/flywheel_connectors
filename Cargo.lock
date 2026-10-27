@@ -4640,6 +4640,7 @@ dependencies = [
  "fcp-core",
  "fcp-oauth",
  "fcp-prelude",
+ "mime",
  "percent-encoding",
  "reqwest 0.13.2",
  "serde",
@@ -4682,6 +4683,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "ciborium",
  "fcp-async-core",
@@ -5619,6 +5621,7 @@ dependencies = [
  "fcp-cbor",
  "fcp-core",
  "fcp-crypto",
+ "fcp-evidence",
  "fcp-policy",
  "fcp-prelude",
  "fcp-protocol",

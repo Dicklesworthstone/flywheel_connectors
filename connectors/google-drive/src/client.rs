@@ -8,12 +8,14 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use fcp_google_discovery::auth::GoogleMaterializedAuth;
 use fcp_google_discovery::executor::{
     GoogleApiError, GoogleExecuteRequest, GoogleExecuteResponse, GoogleResponseBody,
-    GoogleResponseMode, GoogleRestError, GoogleRestExecutor,
+    GoogleResponseMode, GoogleRestError, GoogleRestExecutor, GoogleUploadPayload,
+    validate_upload_content_type,
 };
-use fcp_google_discovery::{DiscoveryMethod, DiscoveryParameter};
+use fcp_google_discovery::{DiscoveryMediaUpload, DiscoveryMethod, DiscoveryParameter};
 use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use reqwest::{Client, StatusCode, Url, header};
@@ -26,6 +28,11 @@ use crate::{
 
 /// Default Google Drive API v3 base URL.
 pub const DEFAULT_BASE_URL: &str = "https://www.googleapis.com/drive/v3";
+
+/// Maximum decoded file size for the single-request multipart upload surface.
+pub const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
+const MAX_UPLOAD_METADATA_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Google Drive API v3 client.
 pub struct DriveClient {
@@ -56,6 +63,7 @@ impl DriveClient {
         let client = Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("fcp-google-drive/0.1.0")
             .build()
             .map_err(DriveError::Http)?;
@@ -171,7 +179,11 @@ impl DriveClient {
         self.post_json(&url, &body).await
     }
 
-    /// Upload a file (metadata-only, content via media upload is separate).
+    /// Upload metadata and decoded file bytes in a single multipart/related request.
+    ///
+    /// Standard padded base64 is required. Files larger than 5 MiB are rejected
+    /// locally; resumable uploads are not part of this operation. A server error
+    /// or uncertain transport outcome is never replayed automatically.
     pub async fn upload_file(
         &self,
         name: &str,
@@ -179,22 +191,30 @@ impl DriveClient {
         parent_id: Option<&str>,
         content_base64: &str,
     ) -> DriveResult<DriveFile> {
-        let url = format!(
-            "{}/files?uploadType=multipart&fields=id,name,mimeType,size",
-            self.base_url,
-        );
-        let mut metadata = serde_json::json!({
-            "name": name,
-            "mimeType": mime_type,
-        });
-        if let Some(parent) = parent_id {
-            metadata["parents"] = serde_json::json!([parent]);
+        let upload = validate_upload_input(name, mime_type, parent_id, content_base64)?;
+        let mut url = Url::parse(&self.base_url).map_err(|_| DriveError::Api {
+            status_code: 400,
+            message: "invalid Drive upload base URL".to_string(),
+        })?;
+        let upload_path = format!("/upload{}/files", url.path().trim_end_matches('/'));
+        url.set_path(&upload_path);
+        url.set_query(Some("fields=id,name,mimeType,size"));
+        let response = self
+            .execute_with_retry(
+                "POST",
+                url.as_str(),
+                None,
+                GoogleResponseMode::Json,
+                false,
+                Some(&upload),
+            )
+            .await
+            .map_err(upload_error)?;
+        let file: DriveFile = decode_json_response(response).map_err(upload_error)?;
+        if file.id.trim().is_empty() {
+            return Err(DriveError::UploadOutcomeUnknown);
         }
-        let body = serde_json::json!({
-            "metadata": metadata,
-            "media_body_base64": content_base64,
-        });
-        self.post_json(&url, &body).await
+        Ok(file)
     }
 
     /// Download a file's content as bytes (returned as base64).
@@ -206,7 +226,7 @@ impl DriveClient {
             urlencoding::encode(file_id),
         );
         let response = self
-            .execute_with_retry("GET", &url, None, GoogleResponseMode::Binary, true)
+            .execute_with_retry("GET", &url, None, GoogleResponseMode::Binary, true, None)
             .await?;
         match response.body {
             GoogleResponseBody::Binary(bytes) => Ok(base64_encode(&bytes)),
@@ -264,7 +284,7 @@ impl DriveClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> DriveResult<T> {
         let response = self
-            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true)
+            .execute_with_retry("GET", url, None, GoogleResponseMode::Json, true, None)
             .await?;
         decode_json_response(response)
     }
@@ -275,7 +295,14 @@ impl DriveClient {
         body: &serde_json::Value,
     ) -> DriveResult<T> {
         let response = self
-            .execute_with_retry("POST", url, Some(body), GoogleResponseMode::Json, false)
+            .execute_with_retry(
+                "POST",
+                url,
+                Some(body),
+                GoogleResponseMode::Json,
+                false,
+                None,
+            )
             .await?;
         decode_json_response(response)
     }
@@ -286,7 +313,14 @@ impl DriveClient {
         body: &serde_json::Value,
     ) -> DriveResult<T> {
         let response = self
-            .execute_with_retry("PATCH", url, Some(body), GoogleResponseMode::Json, true)
+            .execute_with_retry(
+                "PATCH",
+                url,
+                Some(body),
+                GoogleResponseMode::Json,
+                true,
+                None,
+            )
             .await?;
         decode_json_response(response)
     }
@@ -304,6 +338,7 @@ impl DriveClient {
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
         replay_safe: bool,
+        upload: Option<&GoogleUploadPayload>,
     ) -> DriveResult<GoogleExecuteResponse> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let ctx = self.runtime.request_context();
@@ -313,7 +348,7 @@ impl DriveClient {
             debug!(attempt, method = http_method, "drive request");
 
             match self
-                .execute_once(http_method, url, body, response_mode)
+                .execute_once(http_method, url, body, response_mode, upload)
                 .await
             {
                 Ok(response) => AttemptOutcome::Success(response),
@@ -337,6 +372,7 @@ impl DriveClient {
         raw_url: &str,
         body: Option<&serde_json::Value>,
         response_mode: GoogleResponseMode,
+        upload: Option<&GoogleUploadPayload>,
     ) -> DriveResult<GoogleExecuteResponse> {
         let parsed_url = Url::parse(raw_url).map_err(|error| DriveError::Api {
             status_code: 400,
@@ -375,7 +411,7 @@ impl DriveClient {
             http_method: http_method.to_string(),
             path: path.clone(),
             flat_path: None,
-            canonical_path: path,
+            canonical_path: path.clone(),
             resource_path: Vec::new(),
             description: None,
             scopes: Vec::new(),
@@ -383,8 +419,13 @@ impl DriveClient {
             response_ref: None,
             parameters: method_parameters,
             supports_media_download: http_method == "GET",
-            supports_media_upload: false,
-            media_upload: None,
+            supports_media_upload: upload.is_some(),
+            media_upload: upload.map(|_| DiscoveryMediaUpload {
+                accept: vec!["*/*".to_string()],
+                max_size: Some(MAX_UPLOAD_BYTES.to_string()),
+                simple_path: Some(path),
+                resumable_path: None,
+            }),
         };
 
         let schemas = BTreeMap::new();
@@ -396,13 +437,84 @@ impl DriveClient {
         let mut request = GoogleExecuteRequest::new(&method, &schemas, &base_url);
         request.parameters = parameters;
         request.body = body.cloned();
+        request.upload = upload.cloned();
         request.response_mode = response_mode;
         request.auth = Some(&self.auth);
 
-        self.executor
-            .execute(&request)
-            .await
-            .map_err(map_rest_error)
+        if upload.is_some() {
+            self.executor
+                .execute_bounded(&request, MAX_UPLOAD_RESPONSE_BYTES)
+                .await
+                .map_err(map_rest_error)
+        } else {
+            self.executor
+                .execute(&request)
+                .await
+                .map_err(map_rest_error)
+        }
+    }
+}
+
+/// Validate before any provider request; shared with invoke/simulate preflight.
+pub(crate) fn validate_upload_input(
+    name: &str,
+    mime_type: &str,
+    parent_id: Option<&str>,
+    content_base64: &str,
+) -> DriveResult<GoogleUploadPayload> {
+    let invalid = |message: &str| DriveError::InvalidInput {
+        message: message.to_string(),
+    };
+    if name.trim().is_empty() {
+        return Err(invalid("name must not be empty"));
+    }
+    if parent_id.is_some_and(|parent| parent.trim().is_empty()) {
+        return Err(invalid("parent_id must not be empty when provided"));
+    }
+    if name
+        .len()
+        .saturating_add(parent_id.map_or(0, str::len))
+        .saturating_add(mime_type.len())
+        > MAX_UPLOAD_METADATA_BYTES
+    {
+        return Err(invalid("upload metadata exceeds the 64 KiB limit"));
+    }
+    validate_upload_content_type(mime_type).map_err(|_| {
+        invalid("mime_type must be a concrete MIME type without control characters")
+    })?;
+    let mut metadata = serde_json::json!({ "name": name, "mimeType": mime_type });
+    if let Some(parent) = parent_id {
+        metadata["parents"] = serde_json::json!([parent]);
+    }
+    if metadata.to_string().len() > MAX_UPLOAD_METADATA_BYTES {
+        return Err(invalid("upload metadata exceeds the 64 KiB limit"));
+    }
+    let encoded_limit = MAX_UPLOAD_BYTES.div_ceil(3) * 4;
+    if content_base64.len() > encoded_limit {
+        return Err(invalid("decoded upload content must not exceed 5 MiB"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|_| invalid("content_base64 must be canonical standard padded base64"))?;
+    if bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(invalid("decoded upload content must not exceed 5 MiB"));
+    }
+    Ok(GoogleUploadPayload::multipart(mime_type, bytes, metadata))
+}
+
+fn upload_error(error: DriveError) -> DriveError {
+    let uncertain = match &error {
+        DriveError::Http(_) => !error.replay_is_safe(),
+        DriveError::Json(_) => true,
+        DriveError::Api { status_code, .. } => {
+            matches!(status_code, 0 | 200..=299 | 408 | 500..=599)
+        }
+        _ => false,
+    };
+    if uncertain {
+        DriveError::UploadOutcomeUnknown
+    } else {
+        error
     }
 }
 
@@ -426,6 +538,11 @@ fn map_rest_error(error: GoogleRestError) -> DriveError {
         GoogleRestError::Http { source } => DriveError::Http(source),
         GoogleRestError::JsonDecode { source } => DriveError::Json(source),
         GoogleRestError::Api { error, .. } => map_google_api_error(error),
+        GoogleRestError::InvalidUploadContentType { .. }
+        | GoogleRestError::InvalidUploadConfiguration { .. } => DriveError::InvalidInput {
+            message: "invalid Drive media upload configuration".to_string(),
+        },
+        GoogleRestError::ResponseTooLarge { .. } => DriveError::UploadOutcomeUnknown,
         other => DriveError::Api {
             status_code: 500,
             message: other.to_string(),
@@ -537,7 +654,259 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_path_segment;
+    use super::*;
+    use fcp_google_discovery::auth::GoogleAuthSourceKind;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path, query_param},
+    };
+
+    fn upload_client(server: &MockServer) -> DriveClient {
+        let mut client = DriveClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
+            access_token: "upload-test-token".to_string(),
+            source: GoogleAuthSourceKind::AccessToken,
+            granted_scopes: Vec::new(),
+            quota_project_id: None,
+        })
+        .unwrap()
+        .with_base_url(&format!("{}/drive/v3", server.uri()));
+        client.retry_config.initial_delay_ms = 1;
+        client.retry_config.max_delay_ms = 1;
+        client.retry_config.jitter_enabled = false;
+        client
+    }
+
+    #[test]
+    fn upload_validation_decodes_canonical_base64_and_allows_empty_files() {
+        let upload = validate_upload_input(
+            "binary.bin",
+            "application/octet-stream",
+            Some("folder"),
+            "AP8=",
+        )
+        .unwrap();
+        assert_eq!(upload.bytes, [0, 255]);
+        assert_eq!(
+            upload.metadata.unwrap()["parents"],
+            serde_json::json!(["folder"])
+        );
+        assert!(
+            validate_upload_input("empty.txt", "text/plain", None, "")
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+        for invalid in ["AP8", "AP9=", "AP8==", "AP 8=", "_w==", "@@@=", "\nAP8="] {
+            assert!(
+                matches!(
+                    validate_upload_input("x", "text/plain", None, invalid),
+                    Err(DriveError::InvalidInput { .. }),
+                ),
+                "accepted noncanonical base64 {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_validation_enforces_media_and_serialized_metadata_limits() {
+        let maximum = base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_UPLOAD_BYTES]);
+        assert_eq!(
+            validate_upload_input("x", "text/plain", None, &maximum)
+                .unwrap()
+                .bytes
+                .len(),
+            MAX_UPLOAD_BYTES
+        );
+        let oversized =
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_UPLOAD_BYTES + 1]);
+        assert!(validate_upload_input("x", "text/plain", None, &oversized).is_err());
+        assert!(
+            validate_upload_input(
+                &"\n".repeat(MAX_UPLOAD_METADATA_BYTES / 2),
+                "text/plain",
+                None,
+                ""
+            )
+            .is_err()
+        );
+        assert!(validate_upload_input("", "text/plain", None, "").is_err());
+        assert!(validate_upload_input("x", "text/plain", Some(" "), "").is_err());
+        assert!(validate_upload_input("x", "text/plain\r\nX-Injected: yes", None, "").is_err());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_sends_empty_media_to_upload_endpoint_without_parent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .and(query_param("uploadType", "multipart"))
+            .and(query_param("fields", "id,name,mimeType,size"))
+            .and(header("authorization", "Bearer upload-test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "empty-file", "name": "empty.txt", "mimeType": "text/plain", "size": "0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = upload_client(&server);
+        let file = client
+            .upload_file("empty.txt", "text/plain", None, "")
+            .await
+            .unwrap();
+        assert_eq!(file.id, "empty-file");
+        let requests = server.received_requests().await.unwrap();
+        let request = &requests[0];
+        assert_eq!(
+            request
+                .url
+                .query_pairs()
+                .filter(|(key, _)| key == "uploadType")
+                .count(),
+            1
+        );
+        let content_type = request
+            .headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let boundary = content_type
+            .strip_prefix("multipart/related; boundary=")
+            .unwrap();
+        let body = String::from_utf8(request.body.clone()).unwrap();
+        assert!(body.contains("\"name\":\"empty.txt\""));
+        assert!(!body.contains("\"parents\""));
+        assert!(body.ends_with(&format!(
+            "Content-Type: text/plain\r\n\r\n\r\n--{boundary}--\r\n"
+        )));
+        assert_eq!(
+            request
+                .headers
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            request.body.len()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_rejects_invalid_payload_before_sending() {
+        let server = MockServer::start().await;
+        let client = upload_client(&server);
+        assert!(matches!(
+            client
+                .upload_file("x", "text/plain", None, "not base64")
+                .await,
+            Err(DriveError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            client
+                .upload_file("x", "text/plain\r\nX-Bad: yes", None, "eA==")
+                .await,
+            Err(DriveError::InvalidInput { .. })
+        ));
+        assert_eq!(client.total_requests(), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_does_not_retry_ambiguous_server_failures_or_unusable_successes() {
+        for response in [
+            ResponseTemplate::new(503)
+                .set_body_json(serde_json::json!({"error":{"message":"provider failed"}})),
+            ResponseTemplate::new(200).set_body_string("invalid json"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"name":"missing-file-id"})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"", "name":"x", "mimeType":"text/plain"
+            })),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":" \t ", "name":"x", "mimeType":"text/plain"
+            })),
+            ResponseTemplate::new(200),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/upload/drive/v3/files"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = upload_client(&server)
+                .upload_file("x", "text/plain", None, "eA==")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, DriveError::UploadOutcomeUnknown));
+            assert!(!error.is_retryable());
+            assert!(matches!(
+                error.to_fcp_error(),
+                fcp_core::FcpError::External {
+                    retryable: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_retries_a_confirmed_rate_limit_with_identical_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"after-limit", "name":"x", "mimeType":"text/plain"
+            })))
+            .expect(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let file = upload_client(&server)
+            .upload_file("x", "text/plain", None, "eA==")
+            .await
+            .unwrap();
+        assert_eq!(file.id, "after-limit");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn upload_does_not_follow_provider_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/drive/v3/files"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/redirected", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/redirected"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            upload_client(&server)
+                .upload_file("x", "text/plain", None, "eA==")
+                .await,
+            Err(DriveError::Api {
+                status_code: 307,
+                ..
+            }),
+        ));
+    }
 
     #[test]
     fn sanitize_path_segment_rejects_traversal() {
