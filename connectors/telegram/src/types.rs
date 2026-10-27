@@ -616,6 +616,17 @@ fn is_valid_policy_numeric_id(value: &str, allow_negative: bool) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Provider intake transport selected for the native event subscription.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramReceiveMode {
+    /// Pull updates with `getUpdates` after an authorized subscription opens.
+    #[default]
+    Polling,
+    /// Accept host-forwarded updates without concurrently calling `getUpdates`.
+    Webhook,
+}
+
 /// Telegram connector configuration.
 #[derive(Clone, Default, Deserialize)]
 pub struct TelegramConfig {
@@ -634,6 +645,10 @@ pub struct TelegramConfig {
     /// Polling timeout in seconds
     #[serde(default = "default_poll_timeout")]
     pub poll_timeout: i32,
+
+    /// Intake mode; Telegram forbids polling while a webhook is registered.
+    #[serde(default)]
+    pub receive_mode: TelegramReceiveMode,
 
     /// Allowed updates filter
     #[serde(default)]
@@ -659,6 +674,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("credential_id", &self.credential_id)
             .field("base_url", &self.base_url)
             .field("poll_timeout", &self.poll_timeout)
+            .field("receive_mode", &self.receive_mode)
             .field("allowed_updates", &self.allowed_updates)
             .field("inbound_policy", &self.inbound_policy)
             .field(
@@ -780,6 +796,13 @@ impl TelegramConfig {
         self.inbound_policy.validate()?;
         if let Some(token) = self.webhook_secret_token.as_deref() {
             validate_webhook_secret_token(token)?;
+        }
+        if self.receive_mode == TelegramReceiveMode::Webhook && self.webhook_secret_token.is_none()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "webhook receive_mode requires webhook_secret_token".into(),
+            });
         }
 
         Ok(())
@@ -2073,6 +2096,28 @@ mod tests {
                 "base_url should be rejected: {base_url}"
             );
         }
+    }
+
+    #[test]
+    fn native_receive_mode_is_explicit_and_webhook_requires_secret() {
+        let default: TelegramConfig = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(default.receive_mode, TelegramReceiveMode::Polling);
+        let missing: TelegramConfig = serde_json::from_value(json!({
+            "receive_mode": "webhook"
+        }))
+        .unwrap();
+        assert!(missing.validate_runtime_settings().is_err());
+        let webhook: TelegramConfig = serde_json::from_value(json!({
+            "receive_mode": "webhook", "webhook_secret_token": "test-native-secret"
+        }))
+        .unwrap();
+        assert!(webhook.validate_runtime_settings().is_ok());
+        assert!(
+            serde_json::from_value::<TelegramConfig>(json!({
+                "receive_mode": "automatic"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

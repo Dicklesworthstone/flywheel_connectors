@@ -3,7 +3,7 @@
 //! Exercises the Telegram connector through the E2E compliance harness:
 //! - Default deny (missing capability -> error)
 //! - Allow with valid token (happy path `send_message` invoke)
-//! - Subscribe confirms requested topics (streaming protocol)
+//! - Subscribe requires an authenticated session and explicit authority
 //! - Get file with valid token (read operation)
 //!
 //! Note: No network guard test yet -- Telegram manifest.toml not yet created.
@@ -490,12 +490,12 @@ async fn telegram_allow_valid_token_connector_suite_passes() {
 }
 
 // ============================================================================
-// Test 3: Subscribe confirms topics -- streaming protocol
+// Test 3: Subscribe denies a caller without handshake and authority
 // ============================================================================
 
-/// Subscribe: the Telegram connector confirms requested topics.
+/// Configuring bot credentials alone does not grant event-read authority.
 #[fcp_async_core::runtime::test]
-async fn telegram_subscribe_confirms_topics() {
+async fn telegram_subscribe_requires_handshake_and_authority() {
     let mock = MockApiServer::start().await;
     mount_get_me_mock(&mock).await;
 
@@ -510,20 +510,13 @@ async fn telegram_subscribe_confirms_topics() {
         .await
         .expect("configure should succeed");
 
-    // Subscribe with topics
-    let subscribe_result = connector
+    let error = connector
         .handle_subscribe(json!({
             "topics": ["telegram.message", "telegram.callback_query"]
         }))
         .await
-        .expect("subscribe should succeed");
-
-    let confirmed = subscribe_result["confirmed_topics"]
-        .as_array()
-        .expect("confirmed_topics array");
-    assert_eq!(confirmed.len(), 2, "should confirm all requested topics");
-    assert_eq!(confirmed[0], "telegram.message");
-    assert_eq!(confirmed[1], "telegram.callback_query");
+        .expect_err("an unhandshaken caller must not open an event stream");
+    assert!(matches!(error, FcpError::NotHandshaken));
 }
 
 // ============================================================================

@@ -67,6 +67,55 @@ const DEFAULT_TELEGRAM_LOOPBACK_E2E_ARTIFACT: &str = "target/fcp-telegram/loopba
 const TELEGRAM_LOOPBACK_COMMAND_LINE: &str = "cargo test -p fcp-telegram --features test-support --test integration telegram_loopback_e2e_jsonl_matrix -- --nocapture";
 #[cfg(feature = "test-support")]
 const TELEGRAM_LOOPBACK_WEBHOOK_SECRET: &str = "telegram-loopback-secret_1";
+
+#[cfg(feature = "test-support")]
+struct LoopbackNativeEventWriter {
+    frame: Vec<u8>,
+    stream: Arc<Mutex<Option<fcp_sdk::prelude::JsonlEventStream>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl Write for LoopbackNativeEventWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.frame.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let frame: serde_json::Value =
+            serde_json::from_slice(&self.frame).map_err(std::io::Error::other)?;
+        self.frame.clear();
+        let event: fcp_core::EventEnvelope =
+            serde_json::from_value(frame["params"]["event"].clone())
+                .map_err(std::io::Error::other)?;
+        self.stream
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .acknowledge(json!({
+                "stream_id": frame["params"]["stream_id"],
+                "ack": fcp_core::EventAck::new(event.topic, vec![event.seq])
+                    .with_cursors(vec![event.cursor]),
+            }))
+            .map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn attach_loopback_native_event_consumer(connector: &mut TelegramConnector) {
+    // This fixture explicitly acknowledges delivery; host-journal durability
+    // is covered by host tests, not claimed by this connector-only consumer.
+    let slot = Arc::new(Mutex::new(None));
+    let stream = fcp_sdk::prelude::JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(
+        LoopbackNativeEventWriter {
+            frame: Vec::new(),
+            stream: Arc::clone(&slot),
+        },
+    ));
+    *slot.lock().unwrap() = Some(stream.clone());
+    connector.attach_event_stream(stream).unwrap();
+}
 const TELEGRAM_EGRESS_OPERATION_IDS: &[&str] = &[
     "telegram.answer_callback_query",
     "telegram.delete_webhook",
@@ -351,7 +400,7 @@ async fn mount_get_me_mock(mock_server: &MockServer) {
         .await;
 }
 
-/// Mock the `getUpdates` endpoint (polling loop started by handshake).
+/// Mock the `getUpdates` endpoint (polling starts after authorized subscription).
 async fn mount_get_updates_mock(mock_server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(token_path("getUpdates")))
@@ -802,6 +851,7 @@ async fn telegram_loopback_e2e_jsonl_matrix() {
 
     let server = TelegramLoopbackServer::start();
     let mut connector = TelegramConnector::new();
+    attach_loopback_native_event_consumer(&mut connector);
     connector
         .handle_configure(json!({
             "credential": test_bot_credential(),
@@ -829,7 +879,15 @@ async fn telegram_loopback_e2e_jsonl_matrix() {
             "requested_instance_id": TEST_INSTANCE_ID
         }))
         .await
-        .expect("handshake should start polling against loopback");
+        .expect("handshake should prepare the native session");
+    connector
+        .handle_subscribe(json!({
+            "type": "subscribe", "id": "loopback-subscribe", "stream_id": "loopback-events",
+            "topics": ["telegram.message.new"], "window_size": 1,
+            "capability_token": generate_valid_token(&signing_key, "telegram.subscribe"),
+        }))
+        .await
+        .expect("authorized event consumer starts polling");
 
     let chat_hash = telegram_loopback_hash("chat", "208214988");
     let user_hash = telegram_loopback_hash("user", "208214988");
@@ -3440,23 +3498,40 @@ async fn simulate_wrong_capability_token_denied() {
 // ============================================================================
 
 #[fcp_async_core::test]
-async fn subscribe_returns_confirmed_topics() {
+async fn subscribe_returns_only_an_authorized_exact_topic() {
     let _ctx = AsyncTestContext::for_scenario("telegram.lifecycle.subscribe");
     let mut connector = TelegramConnector::new();
-    let (_mock_server, _signing_key) = full_setup(&mut connector, &["telegram.send_message"]).await;
+    let stream = fcp_sdk::prelude::JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(
+        std::io::sink(),
+    ));
+    connector.attach_event_stream(stream).unwrap();
+    let (_mock_server, signing_key) = full_setup(&mut connector, &["telegram.subscribe"]).await;
+
+    assert!(
+        connector
+            .handle_subscribe(json!({
+                "type": "subscribe", "id": "unauthorized", "stream_id": "integration-events",
+                "topics": ["telegram.message.new"],
+            }))
+            .await
+            .is_err()
+    );
 
     let result = connector
         .handle_subscribe(json!({
-            "topics": ["telegram.message.new", "telegram.callback_query"]
+            "type": "subscribe", "id": "authorized", "stream_id": "integration-events",
+            "topics": ["telegram.message.new"], "window_size": 1,
+            "capability_token": generate_valid_token(&signing_key, "telegram.subscribe"),
         }))
         .await
         .expect("subscribe should succeed");
 
-    let confirmed = result["confirmed_topics"]
+    let confirmed = result["result"]["confirmed_topics"]
         .as_array()
         .expect("confirmed_topics should be array");
-    assert_eq!(confirmed.len(), 2);
-    assert_eq!(result["replay_supported"], false);
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(result["result"]["replay_supported"], false);
+    connector.handle_shutdown(json!({})).await.unwrap();
 }
 
 // ============================================================================

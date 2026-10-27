@@ -33,11 +33,13 @@
     clippy::wildcard_imports
 )]
 
-use std::io::{BufRead, Write};
+use std::io::BufReader;
 
 use anyhow::Result;
 use fcp_async_core::runtime::Builder;
-use fcp_sdk::prelude::dispatch_raw_invoke;
+use fcp_sdk::prelude::{
+    JsonlConfig, JsonlEventStream, JsonlWriter, dispatch_raw_invoke, serve_jsonl_events,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_telegram::connector::TelegramConnector;
@@ -59,31 +61,30 @@ fn main() -> Result<()> {
 
 /// Run the FCP JSON-RPC style protocol loop.
 fn run_fcp_loop() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let writer = JsonlWriter::new(std::io::stdout());
+    let events = JsonlEventStream::new(writer);
     let mut connector = TelegramConnector::new();
+    connector.attach_event_stream(events.clone())?;
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if should_skip_protocol_line(&line) {
-            continue;
-        }
-
-        let response = runtime.block_on(async { handle_message(&mut connector, &line).await });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+    let result = serve_jsonl_events(
+        BufReader::new(std::io::stdin()),
+        events,
+        JsonlConfig::default(),
+        |method, params| runtime.block_on(dispatch_message(&mut connector, method, params)),
+    );
+    // EOF and framing failure have the same bounded cleanup as an explicit
+    // shutdown. No outstanding event can turn a lost transport into an ACK.
+    let _ = runtime.block_on(connector.handle_shutdown(serde_json::json!({})));
+    result?;
     Ok(())
 }
 
+#[cfg(test)]
 fn should_skip_protocol_line(line: &str) -> bool {
     line.trim().is_empty()
 }
 
+#[cfg(test)]
 fn parse_error_response(error: impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -96,6 +97,7 @@ fn parse_error_response(error: impl std::fmt::Display) -> serde_json::Value {
 }
 
 /// Handle a single FCP message.
+#[cfg(test)]
 async fn handle_message(connector: &mut TelegramConnector, message: &str) -> serde_json::Value {
     let request: serde_json::Value = match serde_json::from_str(message) {
         Ok(v) => v,
@@ -109,22 +111,7 @@ async fn handle_message(connector: &mut TelegramConnector, message: &str) -> ser
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    let result = match method {
-        "configure" => connector.handle_configure(params).await,
-        "handshake" => connector.handle_handshake(params).await,
-        "health" => connector.handle_health().await,
-        "doctor" => connector.handle_doctor().await,
-        "self_check" => connector.handle_self_check().await,
-        "introspect" => connector.handle_introspect().await,
-        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
-        "simulate" => connector.handle_simulate(params).await,
-        "subscribe" => connector.handle_subscribe(params).await,
-        "shutdown" => connector.handle_shutdown(params).await,
-        _ => Err(fcp_core::FcpError::InvalidRequest {
-            code: 1002,
-            message: format!("Unknown method: {method}"),
-        }),
-    };
+    let result = dispatch_message(connector, method, params).await;
 
     match result {
         Ok(value) => {
@@ -154,6 +141,35 @@ async fn handle_message(connector: &mut TelegramConnector, message: &str) -> ser
             }
             response
         }
+    }
+}
+
+async fn dispatch_message(
+    connector: &mut TelegramConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
+        "configure" => connector.handle_configure(params).await,
+        "handshake" => connector.handle_handshake(params).await,
+        "health" => {
+            serde_json::to_value(fcp_core::FcpConnector::health(connector).await).map_err(|_| {
+                fcp_core::FcpError::Internal {
+                    message: "Failed to serialize Telegram health snapshot".into(),
+                }
+            })
+        }
+        "doctor" => connector.handle_doctor().await,
+        "self_check" => connector.handle_self_check().await,
+        "introspect" => connector.handle_introspect().await,
+        "invoke" => dispatch_raw_invoke(params, |params| connector.handle_invoke(params)).await,
+        "simulate" => connector.handle_simulate(params).await,
+        "subscribe" => connector.handle_subscribe(params).await,
+        "shutdown" => connector.handle_shutdown(params).await,
+        _ => Err(fcp_core::FcpError::InvalidRequest {
+            code: 1002,
+            message: format!("Unknown method: {method}"),
+        }),
     }
 }
 

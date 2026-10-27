@@ -33,7 +33,7 @@ Important runtime truths the contract preserves:
 - Manifest ID is `fcp.telegram`.
 - `BaseConnector` runtime ID is `fcp.telegram`.
 - Manifest version is `0.1.0`.
-- Manifest format is `wasi`.
+- Manifest format is `native`; the executable owns the continuous JSONL event transport.
 - Manifest schema version is `2.1`.
 - Manifest protocol features include `streaming`.
 - Configuration requires exactly one auth source:
@@ -48,17 +48,19 @@ Important runtime truths the contract preserves:
 - Runtime rejects base URLs with userinfo, path, query, or fragment components.
 - Runtime rejects non-local `http`.
 - `poll_timeout` defaults to 30 seconds and must be between 1 and 50 seconds.
+- `receive_mode` is `polling` by default. Select `webhook` with a configured `webhook_secret_token` to accept host-forwarded updates without issuing `getUpdates`.
 - `allowed_updates` defaults to the crate-local known update list when omitted.
 - Inbound policy defaults to deny before event emission.
 - Inbound policy modes are `deny`, `open`, and `allowlist`.
 - Allowlist policy can constrain sender user IDs, chat IDs, and topic resource URIs.
 - Webhook ingestion requires configured `webhook_secret_token` and a matching forwarded `secret_token` input.
 - Handshake requires `zone_dir` for polling cursor and singleton-writer lease persistence.
-- Handshake verifies the bot with `getMe`, installs a bound `CapabilityVerifier`, starts the polling loop, and returns streaming event caps.
+- Handshake verifies the bot with `getMe`, installs a bound `CapabilityVerifier`, and returns streaming event caps. Polling starts only after an authorized native consumer subscribes.
+- Configure and handshake cannot replace an established session; shut down that session first so a background subscription never retains an earlier zone, signing key, or configuration.
 - Runtime `invoke` uses the JSON field `operation`, not `operation_id`.
 - Runtime `invoke` requires `capability_token` and verifies a bound capability token against operation ID, capability ID, instance ID, zone, and resource URIs.
 - Runtime `simulate` also validates known operation, input shape, config/handshake state, and a bound capability token.
-- Runtime `subscribe` confirms requested topics and reports `replay_supported: false`.
+- Runtime `subscribe` admits one exact advertised topic using an instance-bound `telegram.read` token that grants `telegram.subscribe` for `telegram:events:<topic>`. It reports `replay_supported: false` and requires downstream acknowledgements.
 - Runtime `shutdown()` stops polling, shuts down the client runtime, clears config/client/verifier/session/zone state, clears webhook replay cache, and clears base configured/handshaken flags.
 
 ## Runtime API Adapter
@@ -100,26 +102,50 @@ Input and event handling:
 - Webhook ingestion uses a bounded in-memory duplicate cache keyed by Telegram `update_id`.
 - Event topics are `telegram.message.new`, `telegram.message.edited`, `telegram.channel_post.new`, `telegram.channel_post.edited`, and `telegram.callback_query`.
 
+## Native Consumer Delivery
+
+The native executable continuously emits bounded event notifications on stdout while its independent input reader handles `ack` and `stream_close` controls. Ordinary RPC responses and event notifications share one complete-frame writer. A webhook invocation can therefore wait for a downstream acknowledgement without preventing the host from sending that acknowledgement.
+
+A native `subscribe` request carries the normal `SubscribeRequest` fields plus a host-issued `stream_id`:
+
+```json
+{
+  "type": "subscribe",
+  "id": "subscribe-request-1",
+  "stream_id": "host-issued-stream-id",
+  "topics": ["telegram.message.new"],
+  "window_size": 1,
+  "capability_token": "<serialized capability token>"
+}
+```
+
+The token must bind the current connector instance and handshake zone, grant `telegram.read` and the control operation `telegram.subscribe`, and authorize the exact resource `telegram:events:telegram.message.new`. The connector verifies that authority when opening the stream and again before every delivery. While waiting for an ACK it also rechecks authority and renews the polling lease. Wildcards, unknown topics, multiple topics, replay cursors, unsupported batching/rate options, and windows outside `1..=64` are rejected. The sender conservatively uses one outstanding event even when the caller offers a larger window.
+
+Notifications have the shape `{"jsonrpc":"2.0","method":"event","params":{"stream_id":"…","event":{…}}}` with no RPC ID. Each event contains the handshake zone, `requires_ack: true`, and the Telegram `update_id` as both its sequence and decimal cursor. The complete notification, including its newline, is limited to 256 KiB. A matching no-ID `ack` control identifies the stream, exact topic, sequence, and cursor. Merely reading stdout or polling the host's consumer endpoint does not acknowledge an update.
+
+For polling, a batch reaches cursor persistence only after all selected events have received the host's durable consumer ACK. The connector then synchronizes the cursor file before issuing the next `getUpdates` request with a later offset. Inbound-policy denials and events outside the selected exact topic are intentionally filtered. A failed handoff, closed stream, expired authority, oversized event, or 60-second ACK timeout leaves the provider checkpoint at the previous replay-safe position. Closing the stream or shutting down the process releases pending waits as failures. A later authorized subscription can reopen the same stream and resume from the durable cursor; replays are deduplicated by the host using the stable event cursor.
+
+For webhooks, use `receive_mode: "webhook"`. The ingest operation returns an accepted delivery only after the consumer ACK and records the update in its bounded local deduplication cache at that point. A failed delivery remains retryable. The host retains durable pending events and acknowledgement records across its restart; the connector's local webhook cache remains in memory. A retry may therefore cross the native pipe again, with the host suppressing already acknowledged cursor identities. This is at-least-once delivery: consumer side effects need their own durable deduplication when a consumer crashes after applying an effect but before acknowledging it.
+
+The connector does not offer arbitrary historical replay. Telegram's own pending-update retention and the host's retained journal bound recovery. A native stream still draining a provider long poll returns a retryable error on reopen; it does not manufacture a successful subscription or discard an outstanding update.
+
 ## Drift Visible In This Checkout
 
 This README documents runtime truth and keeps current drift visible:
 
-- Telegram documents `getUpdates` and outgoing webhooks as mutually exclusive update-receive modes. The runtime always starts long polling during handshake when direct-token mode is available, even though it also exposes a host-forwarded webhook ingest operation.
 - Telegram currently documents more update kinds than the crate-local `KNOWN_ALLOWED_UPDATES` list covers, including newer boost, paid-media, and managed-bot update kinds.
 - Telegram documents local Bot API servers as supporting local file paths and other local-network behavior. Runtime allows local base URLs for tests, while manifest operation network constraints deny localhost for production egress operations.
-- Manifest `interface_hash` is still the all-zero placeholder value.
-- Runtime handshake response uses a SHA-256 manifest string hash, not the manifest's `blake3-256` placeholder.
+- Runtime handshake response uses a SHA-256 hash of the complete manifest; the manifest's `blake3-256` interface hash covers the operation and native event authority contracts.
 - Handshake grants every requested capability ID. It does not filter requested capabilities against the Telegram manifest.
 - Manifest marks `telegram.send_message` and `telegram.send_media` as policy-approved operations. Runtime introspection reports no approval requirement and `invoke` does not verify approval tokens.
 - Runtime capability-token enforcement is wired and bound for both `invoke` and `simulate`.
 - `get_file` uses a manual HTTP path rather than the retry helper used by the generic request method.
 - The client retry helper retries selected HTTP/connect/timeout/provider errors with `max_retries = 2`; manifest rate-limit pools are documented but not enforced locally.
 - Runtime setWebhook support does not upload custom TLS certificates or multipart files.
-- Runtime `subscribe` confirms topics but does not filter them against the advertised Telegram event catalog.
 - Event replay is not supported.
 - The tracked no-live-credential verifier exercises a local Bot API loopback plus host-forwarded webhook ingest, but the connector still does not open an inbound webhook listener itself; inbound HTTP remains a host responsibility.
 
-A follow-up parity bead should reconcile Telegram's current update taxonomy, decide whether polling and host-forwarded webhook modes should be mutually exclusive at runtime, add custom-certificate handling if needed, filter handshake grants, expose approval metadata, enforce rate-limit pools, and replace the placeholder interface hash.
+A follow-up parity bead should reconcile Telegram's current update taxonomy, add custom-certificate handling if needed, filter handshake grants, expose approval metadata, and enforce rate-limit pools.
 
 ## First-Slice Scope
 

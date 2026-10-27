@@ -4071,6 +4071,25 @@ fn telegram_manifest_parses_as_valid_toml_with_expected_structure() {
         connector.get("id").and_then(|v| v.as_str()),
         Some("fcp.telegram")
     );
+    assert_eq!(
+        connector.get("format").and_then(|v| v.as_str()),
+        Some("native")
+    );
+    let validated = ConnectorManifest::parse_str(&raw)
+        .expect("Telegram manifest must carry its actual interface hash");
+    assert_eq!(validated.provides.events.len(), 5);
+    for (topic, event) in &validated.provides.events {
+        assert!(event.requires_ack);
+        assert_eq!(event.capability.as_deref(), Some("telegram.read"));
+        assert_eq!(
+            event.subscribe_operation.as_deref(),
+            Some("telegram.subscribe")
+        );
+        assert_eq!(
+            event.resource_uri.as_deref(),
+            Some(format!("telegram:events:{topic}").as_str())
+        );
+    }
 
     // Verify all operations
     let provides = parsed.get("provides").expect("provides section");

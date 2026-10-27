@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:0000000000000000000000000000000000000000000000000000000000000000"
+interface_hash = "blake3-256:fcp.interface.v2:9b1303577a96da88569e671a4c1cd92c2f072226226babd95a1f7463508cbcc7"
 
 [connector]
 id = "fcp.telegram"
@@ -17,7 +17,7 @@ archetypes = [
     "operational",
     "streaming",
 ]
-format = "wasi"
+format = "native"
 status = "proven"
 
 [connector.state]
@@ -771,26 +771,46 @@ common_mistakes = [
 description = "New message received"
 streaming = true
 replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.message.new"
 
 [provides.events."telegram.message.edited"]
 description = "Existing message was edited"
 streaming = true
 replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.message.edited"
 
 [provides.events."telegram.channel_post.new"]
 description = "New post in a channel the bot is a member of"
 streaming = true
 replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.channel_post.new"
 
 [provides.events."telegram.channel_post.edited"]
 description = "Existing channel post was edited"
 streaming = true
 replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.channel_post.edited"
 
 [provides.events."telegram.callback_query"]
 description = "Callback query from an inline keyboard button press"
 streaming = true
 replay = false
+requires_ack = true
+capability = "telegram.read"
+subscribe_operation = "telegram.subscribe"
+resource_uri = "telegram:events:telegram.callback_query"
 
 [sandbox]
 profile = "strict"

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use fcp_async_core::channel::{broadcast, watch};
+#[cfg(any(test, feature = "test-support"))]
+use fcp_async_core::channel::broadcast;
+use fcp_async_core::channel::watch;
 use fcp_async_core::sync::RwLock;
 use fcp_core::*;
 use fcp_sdk::{
@@ -18,6 +20,7 @@ use fcp_sdk::{
     ChatCoordinationConfig, ChatCoordinationSendDecision, ChatCoordinationSendRequest, DmMode,
     ErrorClass, FormatMode, Formatter, InMemoryThreadOwnershipChecker, Limits, ThreadId,
     ThreadOwnershipChecker, classify_error_message,
+    prelude::JsonlEventStream,
     runtime::{PollResult, PollingCursor, PollingSupervisor, SupervisorConfig},
     validate_input_with_limits, validate_output_with_limits,
 };
@@ -44,6 +47,7 @@ const MAX_TELEGRAM_WEBHOOK_PAYLOAD_BYTES: usize = 1024 * 1024;
 const TELEGRAM_WEBHOOK_REPLAY_CACHE_ENTRIES: usize = 2048;
 const SEND_CHAT_ACTION_UNAUTHORIZED_SUSPEND_THRESHOLD: u8 = 2;
 const SEND_CHAT_ACTION_UNAUTHORIZED_SUSPEND_FOR: Duration = Duration::from_secs(300);
+const NATIVE_EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 fn default_telegram_chat_coordination_config() -> ChatCoordinationConfig {
@@ -568,7 +572,11 @@ pub struct TelegramConnector {
     poll_task: Option<fcp_async_core::task::JoinHandle<()>>,
     poll_shutdown_tx: Option<watch::Sender<bool>>,
 
-    // Event broadcast
+    // Native delivery is accepted only after the host's durable consumer ACK.
+    event_stream: Option<JsonlEventStream>,
+    event_subscription: Option<Arc<TelegramNativeSubscription>>,
+    // Test observers are not a production delivery/acknowledgement boundary.
+    #[cfg(any(test, feature = "test-support"))]
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
     webhook_replay_cache: Arc<RwLock<TelegramWebhookReplayCache>>,
     send_chat_action_circuit: Arc<RwLock<SendChatActionCircuit>>,
@@ -577,6 +585,95 @@ pub struct TelegramConnector {
 
     // Metrics
     start_time: Instant,
+}
+
+#[derive(Clone)]
+struct TelegramNativeSubscription {
+    stream: JsonlEventStream,
+    stream_id: String,
+    topic: String,
+    token: Arc<std::sync::Mutex<CapabilityToken>>,
+    verifier: CapabilityVerifier,
+}
+
+impl TelegramNativeSubscription {
+    fn verify_authority(&self) -> FcpResult<()> {
+        let token = self
+            .token
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Telegram event authority state poisoned".into(),
+            })?
+            .clone();
+        let verified = self.verifier.verify_bound(
+            token,
+            &CapabilityId::from_static("telegram.read"),
+            &OperationId::from_static("telegram.subscribe"),
+            &[format!("telegram:events:{}", self.topic)],
+        )?;
+        // The general RPC verifier tolerates clock skew. An asynchronous
+        // subscription must stop at the signed expiration, even when no new
+        // request arrives to force another admission check.
+        let expiration =
+            verified
+                .claims()
+                .get_expiration()
+                .ok_or_else(|| FcpError::MissingField {
+                    field: "capability_token.exp".into(),
+                })?;
+        if chrono::Utc::now().timestamp() >= expiration {
+            return Err(FcpError::TokenExpired);
+        }
+        Ok(())
+    }
+
+    async fn deliver(
+        &self,
+        mut event: EventEnvelope,
+        lease: Option<&TelegramPollLease>,
+    ) -> FcpResult<bool> {
+        if !self.stream.is_open() {
+            return Err(FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Telegram native event stream is closed".into(),
+            });
+        }
+        self.verify_authority()?;
+        if event.topic != self.topic {
+            return Ok(false);
+        }
+        event.data.zone_id = self.verifier.zone_id.clone();
+        event.cursor = event.seq.to_string();
+        event.requires_ack = true;
+        let mut delivery = self.stream.deliver(&event)?;
+        let result = fcp_async_core::time::timeout(NATIVE_EVENT_ACK_TIMEOUT, async {
+            loop {
+                fcp_async_core::select! {
+                    result = &mut delivery => return result,
+                    () = fcp_async_core::time::sleep(Duration::from_secs(1)) => {
+                        // A paused consumer cannot let the singleton lease
+                        // lapse while this process still owns an update.
+                        if let Some(lease) = lease {
+                            lease.renew()?;
+                        }
+                        self.verify_authority()?;
+                    }
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => {
+                result?;
+                self.verify_authority()?;
+                Ok(true)
+            }
+            Err(_) => Err(FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Telegram downstream event acknowledgement timed out; provider cursor was not advanced".into(),
+            }),
+        }
+    }
 }
 
 fn validate_bot_token_syntax(token: &str) -> FcpResult<()> {
@@ -675,6 +772,7 @@ fn send_chat_action_suspended_error(retry_after: Duration) -> FcpError {
 impl TelegramConnector {
     /// Create a new Telegram connector.
     pub fn new() -> Self {
+        #[cfg(any(test, feature = "test-support"))]
         let (event_tx, _) = broadcast::channel(1000);
 
         Self {
@@ -688,6 +786,9 @@ impl TelegramConnector {
             poll_running: Arc::new(RwLock::new(false)),
             poll_task: None,
             poll_shutdown_tx: None,
+            event_stream: None,
+            event_subscription: None,
+            #[cfg(any(test, feature = "test-support"))]
             event_tx,
             webhook_replay_cache: Arc::new(RwLock::new(TelegramWebhookReplayCache::default())),
             send_chat_action_circuit: Arc::new(RwLock::new(SendChatActionCircuit::default())),
@@ -701,6 +802,21 @@ impl TelegramConnector {
     #[must_use]
     pub fn instance_id(&self) -> InstanceId {
         self.base.instance_id.clone()
+    }
+
+    /// Attach the native process transport before establishing a session.
+    ///
+    /// No events are emitted until an authorized `subscribe` request opens
+    /// the stream. A transport cannot be replaced while a session is active.
+    pub fn attach_event_stream(&mut self, stream: JsonlEventStream) -> FcpResult<()> {
+        if self.session_id.is_some() || self.event_stream.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Telegram event transport must be attached once before handshake".into(),
+            });
+        }
+        self.event_stream = Some(stream);
+        Ok(())
     }
 
     /// Subscribe to raw connector events for cross-crate integration tests.
@@ -757,6 +873,12 @@ impl TelegramConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        if self.session_id.is_some() {
+            return Err(FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Shut down the active Telegram session before reconfiguring".into(),
+            });
+        }
         let mut config: TelegramConfig =
             serde_json::from_value(params.clone()).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
@@ -845,6 +967,12 @@ impl TelegramConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        if self.session_id.is_some() {
+            return Err(FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Shut down the active Telegram session before a new handshake".into(),
+            });
+        }
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
@@ -918,8 +1046,8 @@ impl TelegramConnector {
         let session_id = SessionId::new();
         self.session_id = Some(session_id.clone());
 
-        // Start polling if not already running
-        self.start_polling().await?;
+        // Provider progress begins only after an authorized consumer opens a
+        // subscription. Handshake alone grants no event-read authority.
         self.base.set_handshaken(true);
 
         // Convert capability IDs to grants
@@ -941,8 +1069,8 @@ impl TelegramConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: 1000,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
             auth_caps: None,
             op_catalog_hash: None,
@@ -1848,27 +1976,27 @@ impl TelegramConnector {
                 EventInfo {
                     topic: "telegram.message.new".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.message.edited".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.channel_post.new".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.channel_post.edited".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.callback_query".into(),
                     schema: Self::callback_query_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
             ],
             resource_types: vec![],
@@ -1876,8 +2004,8 @@ impl TelegramConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: 1000,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
         };
 
@@ -2724,7 +2852,7 @@ impl TelegramConnector {
             .unwrap_or_else(|| update.update_id.to_string());
         let received_at = input.get("received_at").and_then(|value| value.as_i64());
 
-        let Some(event) = authorized_update_to_event(
+        let Some(mut event) = authorized_update_to_event(
             &update,
             &self.base.id,
             &self.base.instance_id,
@@ -2749,19 +2877,37 @@ impl TelegramConnector {
         let resource_uris = event.data.resource_uris.clone();
         let trust = format!("{:?}", event.data.principal.trust);
 
-        let delivered = self
-            .webhook_replay_cache
-            .write()
-            .await
-            .deliver_if_fresh(update.update_id, || {
-                self.event_tx.send(Ok(event)).map(|_| ()).map_err(|_| {
-                    FcpError::ConnectorUnavailable {
+        // Keep concurrent duplicate webhook calls behind the same delivery
+        // obligation. A buffered frame is not yet an accepted update.
+        let mut replay = self.webhook_replay_cache.write().await;
+        let delivered = if replay.seen_update_ids.contains(&update.update_id) {
+            false
+        } else {
+            let subscription =
+                self.event_subscription
+                    .as_ref()
+                    .ok_or_else(|| FcpError::ConnectorUnavailable {
                         code: 5001,
-                        message: "Telegram webhook event consumer is unavailable; delivery was not accepted"
-                            .into(),
-                    }
-                })
-            })?;
+                        message: "Telegram webhook has no authorized event consumer".into(),
+                    })?;
+            event.data.zone_id = subscription.verifier.zone_id.clone();
+            let event_emitted = subscription.deliver(event.clone(), None).await?;
+            if !event_emitted {
+                return Ok(json!({
+                    "accepted": true,
+                    "event_emitted": false,
+                    "update_id": update.update_id,
+                    "delivery_id": delivery_id,
+                    "received_at": received_at,
+                    "secret_verified": secret_verified,
+                    "reason": "topic_not_subscribed",
+                }));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            let _ = self.event_tx.send(Ok(event));
+            replay.deliver_if_fresh(update.update_id, || Ok::<(), FcpError>(()))?
+        };
+        drop(replay);
         if !delivered {
             let response = json!({
                 "accepted": true,
@@ -2833,23 +2979,123 @@ impl TelegramConnector {
 
     /// Handle subscribe method.
     pub async fn handle_subscribe(
-        &self,
+        &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let topics = params
-            .get("topics")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        Ok(json!({
-            "confirmed_topics": topics,
-            "replay_supported": false
-        }))
+        self.base.check_ready()?;
+        let stream_id = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires a host-issued stream_id".into(),
+            })?
+            .to_owned();
+        let request: SubscribeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid Telegram subscribe request".into(),
+            })?;
+        if request.r#type != "subscribe"
+            || request.topics.len() != 1
+            || !matches!(
+                request.topics.first().map(String::as_str),
+                Some(
+                    "telegram.message.new"
+                        | "telegram.message.edited"
+                        | "telegram.channel_post.new"
+                        | "telegram.channel_post.edited"
+                        | "telegram.callback_query"
+                )
+            )
+            || request.since.is_some()
+            || request.max_events_per_sec.is_some()
+            || request.batch_ms.is_some()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Telegram native subscribe requires one exact topic without replay, batching, or rate options".into(),
+            });
+        }
+        let token = request
+            .capability_token
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires capability_token".into(),
+            })?;
+        let verifier = self
+            .verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .clone();
+        let stream = self
+            .event_stream
+            .as_ref()
+            .ok_or_else(|| FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Telegram native event transport is unavailable".into(),
+            })?
+            .clone();
+        let topic = request.topics[0].clone();
+        let subscription = Arc::new(TelegramNativeSubscription {
+            stream: stream.clone(),
+            stream_id: stream_id.clone(),
+            topic: topic.clone(),
+            token: Arc::new(std::sync::Mutex::new(token)),
+            verifier,
+        });
+        subscription.verify_authority()?;
+        if !stream.is_open() && *self.poll_running.read().await {
+            return Err(FcpError::ConnectorUnavailable {
+                code: 5001,
+                message: "Previous Telegram polling stream is still draining".into(),
+            });
+        }
+        stream.open(&stream_id, &topic, request.window_size.unwrap_or(1))?;
+        if let Some(active) = self
+            .event_subscription
+            .as_ref()
+            .filter(|active| active.stream_id == stream_id && active.topic == topic)
+        {
+            // Renew the token observed by an existing poll task, preserving
+            // its exact outstanding event and credit obligation.
+            let token = subscription
+                .token
+                .lock()
+                .map_err(|_| FcpError::Internal {
+                    message: "Telegram event authority state poisoned".into(),
+                })?
+                .clone();
+            *active.token.lock().map_err(|_| FcpError::Internal {
+                message: "Telegram event authority state poisoned".into(),
+            })? = token;
+        } else {
+            self.event_subscription = Some(subscription);
+        }
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.receive_mode == TelegramReceiveMode::Polling)
+        {
+            if let Err(error) = self.start_polling().await {
+                stream.close();
+                self.event_subscription = None;
+                return Err(error);
+            }
+        }
+        serde_json::to_value(SubscribeResponse {
+            r#type: "response".into(),
+            id: request.id,
+            result: SubscribeResult {
+                confirmed_topics: vec![topic],
+                cursors: Default::default(),
+                replay_supported: false,
+                buffer: None,
+            },
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Telegram subscribe response".into(),
+        })
     }
 
     /// Handle shutdown method.
@@ -2858,6 +3104,11 @@ impl TelegramConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Shutting down Telegram connector");
+
+        if let Some(stream) = &self.event_stream {
+            stream.close();
+        }
+        self.event_subscription = None;
 
         // Stop polling
         if let Some(shutdown_tx) = self.poll_shutdown_tx.take() {
@@ -2898,6 +3149,14 @@ impl TelegramConnector {
 
         let client = self.client.clone().ok_or(FcpError::NotConfigured)?;
         let config = self.config.clone().ok_or(FcpError::NotConfigured)?;
+        let subscription =
+            self.event_subscription
+                .clone()
+                .ok_or_else(|| FcpError::ConnectorUnavailable {
+                    code: 5001,
+                    message: "Telegram polling requires an authorized event subscription".into(),
+                })?;
+        #[cfg(any(test, feature = "test-support"))]
         let event_tx = self.event_tx.clone();
         let poll_running = self.poll_running.clone();
         let instance_id = self.base.instance_id.clone(); // Use base.instance_id
@@ -2942,7 +3201,19 @@ impl TelegramConnector {
                         let client = client.clone();
                         let config = config.clone();
                         let poll_lease = poll_lease.clone();
+                        let subscription = Arc::clone(&subscription);
+                        let connector_id = connector_id.clone();
+                        let instance_id = instance_id.clone();
+                        let base = Arc::clone(&base);
+                        #[cfg(any(test, feature = "test-support"))]
+                        let event_tx = event_tx.clone();
                         async move {
+                            if !subscription.stream.is_open() {
+                                return PollResult::fatal("Telegram native stream closed");
+                            }
+                            if let Err(error) = subscription.verify_authority() {
+                                return PollResult::fatal(error.to_string());
+                            }
                             if let Err(err) = poll_lease.renew() {
                                 return PollResult::fatal(format!(
                                     "singleton-writer lease renewal failed: {err}"
@@ -2957,7 +3228,58 @@ impl TelegramConnector {
                             };
 
                             match client.get_updates(request).await {
-                                Ok(updates) => PollResult::success(updates),
+                                Ok(mut updates) => {
+                                    // A long poll may outlive its subscription
+                                    // or authority. Even a wholly filtered
+                                    // batch cannot commit after that boundary.
+                                    if !subscription.stream.is_open() {
+                                        return PollResult::fatal("Telegram native stream closed");
+                                    }
+                                    if let Err(error) = subscription.verify_authority() {
+                                        return PollResult::fatal(error.to_string());
+                                    }
+                                    if let Err(error) = poll_lease.renew() {
+                                        return PollResult::fatal(error.to_string());
+                                    }
+                                    updates.retain(|update| {
+                                        is_valid_telegram_update_id(update.update_id)
+                                            && offset
+                                                .is_none_or(|offset| update.update_id >= offset)
+                                    });
+                                    for update in &updates {
+                                        if let Some(mut event) = authorized_update_to_event(
+                                            update,
+                                            &connector_id,
+                                            &instance_id,
+                                            &config.inbound_policy,
+                                        ) {
+                                            event.data.zone_id =
+                                                subscription.verifier.zone_id.clone();
+                                            match subscription
+                                                .deliver(event.clone(), Some(&poll_lease))
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    base.record_event();
+                                                    #[cfg(any(test, feature = "test-support"))]
+                                                    let _ = event_tx.send(Ok(event));
+                                                }
+                                                Ok(false) => {}
+                                                Err(error) => {
+                                                    return PollResult::fatal(error.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Only fully ACKed (or explicitly filtered)
+                                    // batches reach the cursor processor. A
+                                    // partial failure leaves the durable cursor
+                                    // at its prior replay-safe position.
+                                    if let Err(error) = poll_lease.renew() {
+                                        return PollResult::fatal(error.to_string());
+                                    }
+                                    PollResult::success(updates)
+                                }
                                 Err(err) if err.is_retryable() => {
                                     PollResult::recoverable(err.to_string())
                                 }
@@ -2974,22 +3296,6 @@ impl TelegramConnector {
                                 );
                                 continue;
                             }
-                            if let Some(event) = authorized_update_to_event(
-                                &update,
-                                &connector_id,
-                                &instance_id,
-                                &config.inbound_policy,
-                            ) {
-                                if event_tx.send(Ok(event)).is_err() {
-                                    info!("Event receiver dropped, closing polling loop");
-                                    let _ = shutdown_tx.send(true);
-                                    // Returning an error rolls the batch cursor
-                                    // back. A dropped event must not be persisted
-                                    // or acknowledged by a later getUpdates call.
-                                    return Err("Telegram polling event receiver dropped".into());
-                                }
-                                base.record_event();
-                            }
                             cursor.advance_if_newer(update.update_id);
                         }
                         Ok(())
@@ -2998,6 +3304,7 @@ impl TelegramConnector {
                 .await;
 
             info!(?outcome, "Telegram polling supervisor stopped");
+            subscription.stream.close();
             if let Err(err) = poll_lease.release() {
                 warn!(error = %err, "Failed to release Telegram polling lease");
             }
@@ -3085,7 +3392,12 @@ fn update_to_event(
 
     // update_id is always positive per Telegram API, but use saturating conversion for safety
     let seq = u64::try_from(update.update_id).unwrap_or(0);
-    Some(EventEnvelope::new(topic, event_data).with_seq(seq))
+    Some(
+        EventEnvelope::new(topic, event_data)
+            .with_seq(seq)
+            .with_cursor_seq(seq)
+            .requiring_ack(),
+    )
 }
 
 enum TelegramInboundPolicyDecision {
@@ -3334,27 +3646,30 @@ impl FcpConnector for TelegramConnector {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        let (status, details) = if self.client.is_some() {
-            (HealthState::Ready, Some(json!({ "status": "healthy" })))
+        let status = if self.client.is_some() && self.session_id.is_some() {
+            HealthState::Ready
         } else if self.config.is_some() {
-            (
-                HealthState::Degraded {
-                    reason: "credential materialization pending".into(),
-                },
-                Some(json!({ "status": "degraded_pending_credential_materialization" })),
-            )
+            HealthState::Degraded {
+                reason: "credential materialization or handshake pending".into(),
+            }
         } else {
-            (
-                HealthState::Starting,
-                Some(json!({ "status": "not_configured" })),
-            )
+            HealthState::Starting
         };
 
         HealthSnapshot {
             status,
             uptime_ms: self.start_time.elapsed().as_millis() as u64,
             load: None,
-            details,
+            details: Some(json!({
+                "configured": self.config.is_some(),
+                "handshaken": self.session_id.is_some(),
+                "instance_id": self.base.instance_id,
+                "zone_id": self.verifier.as_ref().map(|verifier| &verifier.zone_id),
+                "polling": *self.poll_running.read().await,
+                "receive_mode": self.config.as_ref().map(|config| config.receive_mode),
+                "event_stream_open": self.event_stream.as_ref().is_some_and(JsonlEventStream::is_open),
+                "event_ack_timeout_ms": NATIVE_EVENT_ACK_TIMEOUT.as_millis(),
+            })),
             rate_limit: None,
         }
     }
@@ -3504,27 +3819,27 @@ impl FcpConnector for TelegramConnector {
                 EventInfo {
                     topic: "telegram.message.new".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.message.edited".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.channel_post.new".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.channel_post.edited".into(),
                     schema: Self::message_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
                 EventInfo {
                     topic: "telegram.callback_query".into(),
                     schema: Self::callback_query_event_schema(),
-                    requires_ack: false,
+                    requires_ack: true,
                 },
             ],
             resource_types: Vec::new(),
@@ -3532,8 +3847,8 @@ impl FcpConnector for TelegramConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: 1000,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
         }
     }
@@ -3585,7 +3900,87 @@ mod tests {
 
     use super::*;
     use crate::types::{Chat, User};
+    use fcp_sdk::prelude::JsonlWriter;
     use serde_json::json;
+
+    struct NativeTestTransport {
+        stream: JsonlEventStream,
+        frames: Arc<Mutex<Vec<Value>>>,
+        acknowledge: Arc<AtomicBool>,
+    }
+
+    struct NativeTestWriter {
+        frame: Vec<u8>,
+        stream: Arc<Mutex<Option<JsonlEventStream>>>,
+        frames: Arc<Mutex<Vec<Value>>>,
+        acknowledge: Arc<AtomicBool>,
+    }
+
+    impl Write for NativeTestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.frame.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let frame: Value = serde_json::from_slice(&self.frame).map_err(io::Error::other)?;
+            self.frame.clear();
+            self.frames.lock().unwrap().push(frame.clone());
+            if self.acknowledge.load(Ordering::SeqCst) {
+                let event: EventEnvelope = serde_json::from_value(frame["params"]["event"].clone())
+                    .map_err(io::Error::other)?;
+                self.stream.lock().unwrap().as_ref().unwrap().acknowledge(json!({
+                    "stream_id": frame["params"]["stream_id"],
+                    "ack": EventAck::new(event.topic, vec![event.seq]).with_cursors(vec![event.cursor]),
+                })).map_err(io::Error::other)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn install_native_test_transport(connector: &mut TelegramConnector) -> NativeTestTransport {
+        let slot = Arc::new(Mutex::new(None));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let acknowledge = Arc::new(AtomicBool::new(true));
+        let stream = JsonlEventStream::new(JsonlWriter::new(NativeTestWriter {
+            frame: Vec::new(),
+            stream: Arc::clone(&slot),
+            frames: Arc::clone(&frames),
+            acknowledge: Arc::clone(&acknowledge),
+        }));
+        *slot.lock().unwrap() = Some(stream.clone());
+        connector
+            .attach_event_stream(stream.clone())
+            .expect("attach test transport before handshake");
+        NativeTestTransport {
+            stream,
+            frames,
+            acknowledge,
+        }
+    }
+
+    async fn open_native_test_subscription(
+        connector: &mut TelegramConnector,
+        signing_key: &Ed25519SigningKey,
+    ) {
+        let capability =
+            generate_valid_token(signing_key, "telegram.subscribe", &connector.instance_id());
+        let response = connector
+            .handle_subscribe(json!({
+                "type": "subscribe",
+                "id": "test-subscribe",
+                "stream_id": "telegram-test-stream",
+                "topics": ["telegram.message.new"],
+                "window_size": 1,
+                "capability_token": capability,
+            }))
+            .await
+            .expect("authorized native subscription");
+        assert_eq!(
+            response["result"]["confirmed_topics"],
+            json!(["telegram.message.new"])
+        );
+    }
 
     fn webhook_test_header_value() -> String {
         ["telegram", "webhook", "fixture"].join("-")
@@ -4328,6 +4723,9 @@ mod tests {
     ) {
         let server = TestTelegramServer::start();
         let mut connector = TelegramConnector::new();
+        if cap == "telegram.ingest_webhook_update" {
+            install_native_test_transport(&mut connector);
+        }
 
         connector
             .handle_configure(serde_json::json!({
@@ -4354,6 +4752,12 @@ mod tests {
             .unwrap();
 
         let capability = generate_valid_token(&signing_key, cap, &connector.base.instance_id);
+        if cap == "telegram.ingest_webhook_update" {
+            let config = connector.config.as_mut().unwrap();
+            config.receive_mode = TelegramReceiveMode::Webhook;
+            config.webhook_secret_token = Some(webhook_test_header_value());
+            open_native_test_subscription(&mut connector, &signing_key).await;
+        }
         (connector, capability, server)
     }
 
@@ -4573,6 +4977,7 @@ mod tests {
         let zone_dir = unique_zone_dir("lease-fence");
 
         let mut connector_a = TelegramConnector::new();
+        install_native_test_transport(&mut connector_a);
         connector_a
             .handle_configure(serde_json::json!({
                 "credential": test_bot_credential(),
@@ -4594,8 +4999,10 @@ mod tests {
             }))
             .await
             .expect("first handshake should succeed");
+        open_native_test_subscription(&mut connector_a, &signing_key_a).await;
 
         let mut connector_b = TelegramConnector::new();
+        install_native_test_transport(&mut connector_b);
         connector_b
             .handle_configure(serde_json::json!({
                 "credential": test_bot_credential(),
@@ -4606,7 +5013,7 @@ mod tests {
             .expect("configure B should succeed");
         let signing_key_b = Ed25519SigningKey::generate();
         let verifying_key_b = signing_key_b.verifying_key();
-        let second = connector_b
+        connector_b
             .handle_handshake(serde_json::json!({
                 "protocol_version": "1.0.0",
                 "zone": "z:work",
@@ -4615,7 +5022,13 @@ mod tests {
                 "nonce": vec![1u8; 32],
                 "capabilities_requested": ["telegram.read"]
             }))
-            .await;
+            .await
+            .expect("handshake does not acquire a polling lease");
+        let second = connector_b.handle_subscribe(json!({
+            "type": "subscribe", "id": "second-subscribe", "stream_id": "second-stream",
+            "topics": ["telegram.message.new"], "window_size": 1,
+            "capability_token": generate_valid_token(&signing_key_b, "telegram.subscribe", &connector_b.instance_id()),
+        })).await;
 
         assert!(matches!(second, Err(FcpError::Conflict { .. })));
 
@@ -5134,6 +5547,7 @@ mod tests {
         ));
 
         let mut connector = TelegramConnector::new();
+        install_native_test_transport(&mut connector);
         let mut event_rx = connector.event_tx.subscribe();
 
         connector
@@ -5163,6 +5577,14 @@ mod tests {
             }))
             .await
             .expect("handshake should succeed");
+        assert!(!*connector.poll_running.read().await);
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.path != token_path("getUpdates"))
+        );
+        open_native_test_subscription(&mut connector, &signing_key).await;
 
         let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
             .await
@@ -5172,6 +5594,9 @@ mod tests {
 
         assert_eq!(event.topic, "telegram.message.new");
         assert_eq!(event.seq, 1000);
+        assert_eq!(event.cursor, "1000");
+        assert!(event.requires_ack);
+        assert_eq!(event.data.zone_id, ZoneId::work());
         assert_eq!(event.data.principal.trust, TrustLevel::Paired);
         assert_eq!(
             event.data.payload.get("text").and_then(|v| v.as_str()),
@@ -5205,6 +5630,8 @@ mod tests {
             }),
         ));
         let mut connector = TelegramConnector::new();
+        let transport = install_native_test_transport(&mut connector);
+        transport.acknowledge.store(false, Ordering::SeqCst);
         connector
             .handle_configure(json!({
                 "credential": test_bot_credential(),
@@ -5240,7 +5667,24 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("handshake should start polling");
+            .expect("handshake should prepare the session");
+        open_native_test_subscription(&mut connector, &signing_key).await;
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while transport.frames.lock().unwrap().is_empty() {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("event reaches native transport before acknowledgement");
+        assert_eq!(
+            read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                .unwrap()
+                .unwrap()
+                .offset,
+            Some(1000),
+            "stdout delivery alone must not advance the provider checkpoint",
+        );
+        transport.stream.close();
 
         fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
             while *connector.poll_running.read().await {
@@ -5270,9 +5714,271 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
+    async fn native_subscription_requires_bound_topic_authority() {
+        let server = TestTelegramServer::start();
+        let mut connector = TelegramConnector::new();
+        let transport = install_native_test_transport(&mut connector);
+        connector
+            .handle_configure(json!({
+                "credential": test_bot_credential(),
+                "base_url": server.uri(),
+                "receive_mode": "webhook",
+                "webhook_secret_token": webhook_test_header_value(),
+            }))
+            .await
+            .unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0", "zone": "z:work",
+                "zone_dir": unique_zone_dir("native-subscription-authority"),
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32], "capabilities_requested": ["telegram.read"],
+            }))
+            .await
+            .unwrap();
+        let valid =
+            generate_valid_token(&signing_key, "telegram.subscribe", &connector.instance_id());
+        let base = json!({
+            "type": "subscribe", "id": "subscribe-authority", "stream_id": "authorized-stream",
+            "topics": ["telegram.message.new"], "window_size": 1, "capability_token": valid,
+        });
+        let mut missing_token = base.clone();
+        missing_token
+            .as_object_mut()
+            .unwrap()
+            .remove("capability_token");
+        let mut wrong_operation = base.clone();
+        wrong_operation["capability_token"] = serde_json::to_value(generate_valid_token(
+            &signing_key,
+            "telegram.get_file",
+            &connector.instance_id(),
+        ))
+        .unwrap();
+        let mut wrong_instance = base.clone();
+        wrong_instance["capability_token"] = serde_json::to_value(generate_valid_token(
+            &signing_key,
+            "telegram.subscribe",
+            &InstanceId::new(),
+        ))
+        .unwrap();
+        let mut wrong_signature = base.clone();
+        wrong_signature["capability_token"] = serde_json::to_value(generate_valid_token(
+            &Ed25519SigningKey::generate(),
+            "telegram.subscribe",
+            &connector.instance_id(),
+        ))
+        .unwrap();
+        let scoped_token = |resource: &str, expired: bool| {
+            let now = Utc::now();
+            let constraints = CapabilityConstraints {
+                resource_allow: vec![resource.into()],
+                ..Default::default()
+            };
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&constraints, &mut cbor).unwrap();
+            let expiry = if expired {
+                now - Duration::seconds(1)
+            } else {
+                now + Duration::hours(1)
+            };
+            CapabilityToken::from_raw(
+                CapabilityTokenBuilder::new()
+                    .capability_id("telegram.read")
+                    .zone_id("z:work")
+                    .principal("user:test")
+                    .operations(&["telegram.subscribe"])
+                    .target_instance(connector.instance_id().as_str())
+                    .issuer("node:test")
+                    .validity(now - Duration::minutes(5), expiry)
+                    .try_constraints_cbor(&cbor)
+                    .unwrap()
+                    .sign(&signing_key)
+                    .unwrap(),
+            )
+        };
+        let mut wrong_resource = base.clone();
+        wrong_resource["capability_token"] = serde_json::to_value(scoped_token(
+            "telegram:events:telegram.callback_query",
+            false,
+        ))
+        .unwrap();
+        let mut expired = base.clone();
+        expired["capability_token"] =
+            serde_json::to_value(scoped_token("telegram:events:telegram.message.new", true))
+                .unwrap();
+        let mut wildcard = base.clone();
+        wildcard["topics"] = json!(["telegram.*"]);
+        let mut multiple = base.clone();
+        multiple["topics"] = json!(["telegram.message.new", "telegram.callback_query"]);
+        let mut replay = base.clone();
+        replay["since"] = json!("1000");
+        let mut zero_window = base.clone();
+        zero_window["window_size"] = json!(0);
+        let mut large_window = base.clone();
+        large_window["window_size"] = json!(65);
+        for request in [
+            missing_token,
+            wrong_operation,
+            wrong_instance,
+            wrong_signature,
+            wrong_resource,
+            expired,
+            wildcard,
+            multiple,
+            replay,
+            zero_window,
+            large_window,
+        ] {
+            assert!(connector.handle_subscribe(request).await.is_err());
+            assert!(!transport.stream.is_open());
+        }
+        let response = connector.handle_subscribe(base.clone()).await.unwrap();
+        assert_eq!(response["id"], "subscribe-authority");
+        assert_eq!(
+            response["result"]["confirmed_topics"],
+            json!(["telegram.message.new"])
+        );
+        assert_eq!(response["result"]["replay_supported"], false);
+        assert!(transport.stream.is_open());
+        connector
+            .handle_subscribe(base)
+            .await
+            .expect("same authorized subscription is idempotent");
+        assert!(
+            !*connector.poll_running.read().await,
+            "webhook mode cannot issue getUpdates"
+        );
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.path != token_path("getUpdates"))
+        );
+        let health = FcpConnector::health(&connector).await;
+        assert!(health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], true);
+        assert_eq!(details["zone_id"], "z:work");
+        assert!(connector.handle_configure(json!({})).await.is_err());
+        assert!(connector.handle_handshake(json!({})).await.is_err());
+        assert!(transport.stream.is_open());
+        connector.handle_shutdown(json!({})).await.unwrap();
+        assert!(!transport.stream.is_open());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_polling_advances_checkpoint_only_after_consumer_ack() {
+        let server = TestTelegramServer::start();
+        server.respond(TestTelegramRoute::new(
+            "POST",
+            token_path("getUpdates"),
+            json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 1000,
+                    "message": {
+                        "message_id": 55,
+                        "from": {"id": 7, "is_bot": false, "first_name": "Test"},
+                        "chat": {"id": 99, "type": "private", "first_name": "Test"},
+                        "date": 1700000000,
+                        "text": "requires durable downstream acknowledgement"
+                    }
+                }]
+            }),
+        ));
+        let mut connector = TelegramConnector::new();
+        let transport = install_native_test_transport(&mut connector);
+        transport.acknowledge.store(false, Ordering::SeqCst);
+        connector
+            .handle_configure(json!({
+                "credential": test_bot_credential(), "base_url": server.uri(), "poll_timeout": 1,
+                "inbound_policy": {"mode": "allowlist", "allowed_user_ids": [7]},
+            }))
+            .await
+            .unwrap();
+        let zone_dir = unique_zone_dir("native-ack-checkpoint");
+        let cursor_path = Path::new(&zone_dir).join(TELEGRAM_POLL_CURSOR_FILE);
+        write_json_file_atomic(
+            &cursor_path,
+            &TelegramPollingCursorState {
+                version: TELEGRAM_POLLING_CURSOR_STATE_VERSION,
+                bot_id: Some(TEST_BOT_ID.into()),
+                offset: Some(1000),
+                last_poll_count: 0,
+                updated_at: current_unix_timestamp_secs(),
+            },
+        )
+        .unwrap();
+        let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "1.0.0", "zone": "z:work", "zone_dir": zone_dir,
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32], "capabilities_requested": ["telegram.read"],
+            }))
+            .await
+            .unwrap();
+        open_native_test_subscription(&mut connector, &signing_key).await;
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            while transport.frames.lock().unwrap().is_empty() {
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                .unwrap()
+                .unwrap()
+                .offset,
+            Some(1000)
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == token_path("getUpdates"))
+                .count(),
+            1
+        );
+        let frame = transport.frames.lock().unwrap()[0].clone();
+        assert_eq!(frame["params"]["event"]["data"]["zone_id"], "z:work");
+        assert_eq!(frame["params"]["event"]["cursor"], "1000");
+        transport.stream.acknowledge(json!({
+            "stream_id": "telegram-test-stream",
+            "ack": EventAck::new("telegram.message.new", vec![1000]).with_cursors(vec!["1000".into()]),
+        })).unwrap();
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                let checkpoint =
+                    read_json_file_if_exists::<TelegramPollingCursorState>(&cursor_path)
+                        .unwrap()
+                        .unwrap();
+                if checkpoint.offset == Some(1001)
+                    && server
+                        .requests()
+                        .iter()
+                        .filter(|request| request.path == token_path("getUpdates"))
+                        .count()
+                        > 1
+                {
+                    break;
+                }
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("ACK must commit the cursor before the next provider poll");
+        connector.handle_shutdown(json!({})).await.unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn test_polling_does_not_overwrite_an_unreadable_checkpoint() {
         let server = TestTelegramServer::start();
         let mut connector = TelegramConnector::new();
+        install_native_test_transport(&mut connector);
         connector
             .handle_configure(json!({
                 "credential": test_bot_credential(),
@@ -5300,7 +6006,8 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("handshake should start the polling task");
+            .expect("handshake should prepare the session");
+        open_native_test_subscription(&mut connector, &signing_key).await;
 
         fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
             while *connector.poll_running.read().await {
@@ -5331,6 +6038,7 @@ mod tests {
     async fn test_loopback_polling_routes_root_and_topic_dm_events() {
         let loopback = LoopbackTelegramServer::start();
         let mut connector = TelegramConnector::new();
+        install_native_test_transport(&mut connector);
         let mut event_rx = connector.event_tx.subscribe();
 
         connector
@@ -5359,7 +6067,8 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("handshake should start polling against loopback");
+            .expect("handshake should prepare the session");
+        open_native_test_subscription(&mut connector, &signing_key).await;
 
         let mut events = Vec::new();
         for _ in 0..3 {
@@ -5461,6 +6170,7 @@ mod tests {
     async fn test_shutdown_cancels_blocked_poll_and_releases_lease() {
         let loopback = LoopbackTelegramServer::start_blocking_get_updates();
         let mut connector = TelegramConnector::new();
+        install_native_test_transport(&mut connector);
 
         connector
             .handle_configure(json!({
@@ -5484,7 +6194,8 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("handshake should start blocked polling task");
+            .expect("handshake should prepare the session");
+        open_native_test_subscription(&mut connector, &signing_key).await;
 
         assert!(
             wait_for_loopback_get_updates(&loopback).await,
@@ -5529,6 +6240,7 @@ mod tests {
         let zone_dir = unique_zone_dir("polling-restart-cursor");
 
         let mut first = TelegramConnector::new();
+        install_native_test_transport(&mut first);
         let mut event_rx = first.event_tx.subscribe();
         first
             .handle_configure(json!({
@@ -5555,7 +6267,8 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("first handshake should start polling");
+            .expect("first handshake should prepare the session");
+        open_native_test_subscription(&mut first, &first_signing_key).await;
 
         for _ in 0..3 {
             fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
@@ -5578,6 +6291,7 @@ mod tests {
 
         let first_log_len = loopback.request_log_snapshot().len();
         let mut second = TelegramConnector::new();
+        install_native_test_transport(&mut second);
         second
             .handle_configure(json!({
                 "credential": test_bot_credential(),
@@ -5603,7 +6317,8 @@ mod tests {
                 "capabilities_requested": ["telegram.read"]
             }))
             .await
-            .expect("second handshake should reacquire released polling lease");
+            .expect("second handshake should prepare the session");
+        open_native_test_subscription(&mut second, &second_signing_key).await;
 
         let restarted_get_updates = wait_for_get_updates_log_after(&loopback, first_log_len)
             .await
@@ -5731,6 +6446,7 @@ mod tests {
     async fn test_ingest_webhook_update_retries_after_missing_or_dropped_receiver() {
         let (mut connector, token, _server) =
             setup_connector_with_token("telegram.ingest_webhook_update").await;
+        connector.event_stream.as_ref().unwrap().close();
         let forwarded_header = webhook_test_header_value();
         let config = connector.config.as_mut().expect("configured connector");
         config.webhook_secret_token = Some(forwarded_header.clone());
@@ -5739,8 +6455,8 @@ mod tests {
             "allowed_user_ids": [208214988]
         }));
 
-        // The first iteration has never had a subscriber. The second begins
-        // after dropping the last subscriber from the previous iteration.
+        // Both iterations start after an explicit consumer stream close.
+        // A test observer alone is never a production acknowledgement.
         for update_id in [2008, 2009] {
             let request = json!({
                 "operation": "telegram.ingest_webhook_update",
@@ -5790,6 +6506,12 @@ mod tests {
             }
 
             let mut event_rx = connector.event_tx.subscribe();
+            connector
+                .event_stream
+                .as_ref()
+                .unwrap()
+                .open("telegram-test-stream", "telegram.message.new", 1)
+                .unwrap();
             let response = connector
                 .handle_invoke(request.clone())
                 .await
@@ -5817,6 +6539,7 @@ mod tests {
                 "retrying a confirmed delivery must not emit another event"
             );
             drop(event_rx);
+            connector.event_stream.as_ref().unwrap().close();
         }
 
         connector
