@@ -41,6 +41,7 @@ Important runtime truths the contract preserves:
 - Package and binary name are `fcp-gmail`.
 - Runtime `BaseConnector` ID is `gmail`.
 - Manifest connector ID is `fcp.gmail`.
+- The manifest declares a native binary. History checkpoints require operating-system file locks; unsupported locking fails closed rather than weakening writer fencing.
 - The connector configure boundary accepts a secretless `credential_id`; raw bearer tokens and OAuth refresh secrets are rejected there. The low-level client and shared auth substrate retain bearer/OAuth support for host materialization and internal tests.
 - `credential_id` mode is secretless and returns `configured_pending_token_materialization`.
 - `oauth_refresh` mode can materialize granted scopes and lets `doctor()`/`self_check()` detect scope-limited operation coverage.
@@ -58,7 +59,7 @@ Important runtime truths the contract preserves:
 - Runtime handshake installs a `CapabilityVerifier`.
 - `invoke` requires `operation`, `input`, and `capability_token`; it validates input, computes resource URIs, and verifies a bound capability token before provider execution.
 - `simulate` validates operation inventory, input shape, configured state, handshaken state, and bound capability token before returning an allowed result.
-- `gmail.sync_history` persists a cursor file and requires `lease_seq` as a singleton-writer fencing token.
+- `gmail.sync_history` persists the caller-acknowledged history boundary and requires `lease_seq` as a singleton-writer fencing token. Fetching a batch never acknowledges it; `latest_history_id` becomes the next input only after the caller has processed the complete result.
 - `health()` reports local configuration/auth/scope state and request metrics.
 - `doctor()` and `self_check()` probe Gmail reachability through `list_labels()` when credentials are materialized, and degrade for `credential_id` mode.
 - `handle_shutdown()` shuts down the client runtime and clears base configured/handshaken flags.
@@ -86,7 +87,7 @@ The current Gmail README slice documents the existing runtime surface:
 - Gmail API base URL policy and loopback test allowance
 - message send/read/list/modify/trash, thread read, label list, draft read/create/send, and history sync operations
 - bound capability-token verification during both `invoke` and `simulate`
-- singleton-writer history cursor fencing and durable cursor persistence
+- consumer-acknowledged history checkpoints, restart replay, bounded pagination, and singleton-writer fencing
 - provider error mapping, retry behavior, redaction posture, doctor behavior, health behavior, and shutdown behavior
 - deterministic WireMock tests and direct proof commands
 
@@ -104,7 +105,7 @@ The current Gmail README slice documents the existing runtime surface:
   - `gmail.send` gates sending new messages and sending drafts.
   - `gmail.delete` gates moving messages to trash.
 - The connector does not persist messages, labels, threads, drafts, access tokens, credential IDs, provider payloads, or provider error bodies beyond process memory.
-- The exception is the `gmail.sync_history` cursor state file, which stores history ID, lease sequence, optional lease object ID, and update timestamp.
+- The exception is the `gmail.sync_history` cursor state file, which stores the acknowledged history ID, cursor version, a scope fingerprint, lease sequence, optional lease object ID, and update timestamp. The scope fingerprint binds the credential reference, provider base URL, and normalized history filters without persisting raw credential material or history payloads.
 - Gmail data can include personal email contents, recipients, subject lines, labels, snippets, thread context, draft content, and mailbox metadata. Treat all live reads and writes as private-zone data.
 
 ## Network And Runtime Invariants
@@ -122,6 +123,44 @@ The current Gmail README slice documents the existing runtime surface:
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `120000 ms` wall-clock timeout, read-only `/usr` and `/lib`, writable `$CONNECTOR_STATE`, no exec, and no ptrace.
 - The connector does not open inbound sockets.
 - The connector does not implement Gmail watch channels, Pub/Sub, replay streaming, or webhook ingress.
+
+## History Sync And Consumer Acknowledgement
+
+`gmail.sync_history` returns every page in a bounded history traversal. It keeps a durable checkpoint of what the caller says it has already processed. This separates receiving a provider response from acknowledging that the consumer has safely handled its records.
+
+Use the operation as follows:
+
+1. Start with a history ID obtained from an already completed mailbox sync. Supply that value as `start_history_id`, together with the current `lease_seq` and optional `lease_object_id`.
+2. Process the entire returned `history` batch durably. `latest_history_id` is a candidate for the next request; the response's `acknowledged_history_id` shows the checkpoint actually persisted.
+3. After processing succeeds, pass the prior `latest_history_id` as the next `start_history_id`. That explicit boundary acknowledges the processed range and allows the checkpoint to advance.
+4. If the response or processing outcome is uncertain, retry with the original `start_history_id`, or omit it to resume from the last acknowledged checkpoint. Repeated history records are expected, including after restart; deduplicate by provider history identity as needed.
+
+For example:
+
+| Request or result | Meaning |
+|---|---|
+| Input `{"start_history_id":"100","lease_seq":7}` | The caller has processed changes through `100`. |
+| Result includes `latest_history_id: "400"`, `acknowledged_history_id: "100"` | Changes after `100` were fetched; `400` has not been acknowledged. |
+| Retry input `{"lease_seq":7}` | Fetch again from the durable `100` boundary. |
+| Next input `{"start_history_id":"400","lease_seq":7}` after processing | Acknowledge the completed range and fetch changes after `400`. |
+
+An explicit older cursor is honored for replay. It does not move a version-2 checkpoint backward. `dedup_applied` remains present for compatibility and is always `false`; the connector never substitutes a newer checkpoint for an explicitly requested older start. A retry can include newer mailbox changes, so callers must not assume an identical cached response.
+
+Each cursor file belongs to one credential reference, provider base URL, and normalized `history_types` filter. A different scope is rejected before provider execution and must use a separate cursor file with its own known-consumed starting boundary. Use separate files for independent consumers as well. Rotating a credential reference does not prove that the mailbox identity is unchanged; migrate that consumer explicitly to a separate checkpoint. With no filter, all history types are requested. Supported explicit values are `messageAdded`, `messageDeleted`, `labelAdded`, and `labelRemoved`.
+
+### Existing Cursor Files
+
+Older unversioned files stored the newest fetched ID, which does not establish that a caller received or processed those changes. They cannot be resumed implicitly. Supply the last history ID the consumer knows it processed, using a current lease. This migrates the checkpoint to `cursor_version = 2`, even when the acknowledged boundary is below the old fetched value, and preserves stale-writer fencing. Unknown cursor versions are rejected. Keep the same checkpoint and lease identity when retrying an uncertain migration.
+
+The on-disk field `next_history_id` is retained for compatibility; in version 2 it means the acknowledged resume boundary. The connector serializes checkpoint updates through a persistent sibling lock file, rechecks the latest lease and scope under that lock, and publishes the new state with an atomic, synced file replacement. A late response from an older lease cannot overwrite a newer writer's checkpoint. Lock contention produces a conflict that can be retried with the same acknowledgement boundary.
+
+### Completion And Limits
+
+`max_results` is a page size from 1 through 500. A sync is limited to 100 provider pages and 8 MiB of serialized history records; each provider response also has an 8 MiB plus 64 KiB streaming body limit. Pagination cycles, malformed cursors, oversized replies, provider errors, and unfinished traversals fail without offering a partial batch as completed progress. The checkpoint is updated only after a complete valid traversal, and only to the caller's acknowledged boundary.
+
+Gmail returns changes after the requested history ID, and history IDs are increasing but noncontiguous. Use the ID returned from the completed traversal; do not calculate a successor. [Google's history API contract](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list) permits storing the returned history ID after the final page. This connector additionally waits for the caller to confirm consumption before recording that progress.
+
+Provider retention still limits recovery. If Gmail returns `404` because a history ID has expired, [perform a full sync](https://developers.google.com/workspace/gmail/api/guides/sync) and resume from its known-consumed boundary. The connector does not silently jump to a newer cursor or fabricate the missing history.
 
 ## Capability Families
 
@@ -143,7 +182,7 @@ The current Gmail README slice documents the existing runtime surface:
 | `gmail.get_message` | `GET /gmail/v1/users/me/messages/{message_id}` | `gmail.read` | `Safe` | `Low` | `Strict` | Reads one Gmail message by message ID. |
 | `gmail.get_attachment` | `GET /gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}` | `gmail.read` | `Safe` | `Low` | `Strict` | Retrieves a separate MIME body with validated base64url data and a decoded-byte limit. |
 | `gmail.list_messages` | `GET /gmail/v1/users/me/messages?q={query}&maxResults={max_results}&pageToken={page_token}` | `gmail.read` | `Safe` | `Low` | `Strict` | Lists or searches message IDs visible to the mailbox principal. |
-| `gmail.sync_history` | `GET /gmail/v1/users/me/history?startHistoryId={history_id}` | `gmail.history.read` | `Safe` | `Low` | `Strict` | Fetches history pages and persists a fenced cursor. |
+| `gmail.sync_history` | `GET /gmail/v1/users/me/history?startHistoryId={history_id}` | `gmail.history.read` | `Safe` | `Low` | `Strict` | Fetches complete bounded history batches and persists only caller-acknowledged progress. |
 | `gmail.modify_message` | `POST /gmail/v1/users/me/messages/{message_id}/modify` | `gmail.write` | `Risky` | `Medium` | `BestEffort` | Adds or removes label IDs on one message. |
 | `gmail.trash_message` | `POST /gmail/v1/users/me/messages/{message_id}/trash` | `gmail.delete` | `Risky` | `Medium` | `Strict` manifest; `BestEffort` introspection | Moves one message to trash. |
 | `gmail.get_thread` | `GET /gmail/v1/users/me/threads/{thread_id}` | `gmail.read` | `Safe` | `Low` | `Strict` | Reads a Gmail thread by thread ID. |
@@ -201,7 +240,7 @@ The current implementation does not include:
 These are excluded on purpose:
 
 - Gmail contains private user data and live sends are side-effecting.
-- History sync needs explicit singleton-writer fencing before broader replay semantics are added.
+- History sync uses caller acknowledgements and singleton-writer fencing; provider-retention recovery and full mailbox synchronization remain caller responsibilities.
 - Attachment reads have an explicit size/encoding contract; MIME rendering and attachment upload still need their own media contracts.
 
 ## Readiness And Verification Surface
@@ -223,7 +262,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - lifecycle, configuration, base URL policy, loopback allowance, introspection, simulation, doctor, self-check, and shutdown behavior
 - message get/list/send/modify/trash, thread get, label list, draft get/create/send, and history sync through deterministic HTTP fixtures
 - attachment HTTP fixtures cover exact binary contents, required response fields, base64url and size validation, encoded IDs, bounded bodies, provider refusals, safe read retries, redirect refusal, and message/attachment-specific capability authority
-- cursor persistence and resumed history sync with `lease_seq` fencing
+- acknowledged cursor persistence, lost-response replay, explicit older-cursor replay, legacy migration, scope isolation, bounded pagination, and `lease_seq` fencing
 - invoke rejection for unknown operation, missing token, missing input, wrong capability, and pre-provider capability verification
 - provider 401, 403, 404, 429, 500 classes and FCP error mapping
 - shared Google discovery/provisioning overlap for list, send, and history metadata
@@ -277,7 +316,7 @@ The verifier writes proof-governor artifacts under `${OUT_ROOT}/proof`. Only `ac
 - If configuration fails, provide exactly one Google auth source and do not mix `required_scopes` with `scope_triggers`.
 - If `credential_id` self-check degrades, materialize host credentials through the egress proxy before invoking provider operations.
 - If OAuth refresh self-check reports `scope_limited`, request the missing Gmail scopes or avoid the operations listed in the report.
-- If `gmail.sync_history` conflicts, inspect `lease_seq`, `lease_object_id`, and the persisted cursor state before retrying.
+- If `gmail.sync_history` conflicts, inspect `lease_seq`, `lease_object_id`, checkpoint scope, and cursor version. Retry an uncertain result from the same acknowledged boundary; supply a known-consumed start for legacy migration, and use a separate cursor path for a different credential or history filter.
 - If `gmail.list_messages` filters do not behave as expected, use runtime `query` syntax rather than manifest-only `label_ids`.
 - If provider returns 403, treat it as an auth/scope/permission failure rather than a retryable transport error.
 - If an attachment read exceeds `max_bytes`, raise the caller limit only if appropriate, up to 16 MiB; larger attachments require another retrieval path. Missing or malformed attachment fields are errors, never fabricated empty files.

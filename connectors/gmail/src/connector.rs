@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +32,10 @@ use crate::{
 };
 
 const DEFAULT_HISTORY_CURSOR_FILE: &str = "fcp-gmail-history-cursor.json";
+const HISTORY_CURSOR_VERSION: u32 = 2;
+const MAX_HISTORY_SYNC_PAGES: usize = 100;
+const MAX_HISTORY_SYNC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HISTORY_ID_BYTES: usize = 128;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,12 @@ struct GmailConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GmailHistoryCursorState {
+    /// Version zero recorded fetched progress, without proof of consumption.
+    #[serde(default)]
+    cursor_version: u32,
+    #[serde(default)]
+    scope: Option<String>,
+    /// Only a caller-confirmed boundary may become the default resume cursor.
     next_history_id: String,
     lease_seq: u64,
     #[serde(default)]
@@ -674,27 +685,28 @@ impl GmailConnector {
                 ),
                 op_info(
                     "gmail.sync_history",
-                    "Incrementally fetch mailbox history changes using historyId cursor state",
+                    "Fetch complete bounded mailbox history batches from a consumer-acknowledged cursor",
                     json!({
                         "type": "object",
                         "required": ["lease_seq"],
                         "properties": {
-                            "start_history_id": { "type": "string", "description": "Optional historyId override for first sync or explicit reset" },
-                            "max_results": { "type": "integer", "description": "Optional page size passed to Gmail History API" },
-                            "history_types": { "type": "array", "items": { "type": "string" }, "description": "Optional history type filters (messageAdded, messageDeleted, labelAdded, labelRemoved)" },
+                            "start_history_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[0-9]+$", "description": "Caller-acknowledged boundary; pass the previous latest_history_id only after processing its complete batch. Omit to replay the acknowledged checkpoint." },
+                            "max_results": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Page size within the total history page and byte limits" },
+                            "history_types": { "type": "array", "items": { "type": "string", "enum": ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"] }, "description": "History filters bound to this cursor; ordering and duplicates do not change the scope" },
                             "lease_seq": { "type": "integer", "description": "Singleton-writer fencing token; must not regress" },
                             "lease_object_id": { "type": "string", "description": "Optional lease object reference for diagnostics/audit" }
                         }
                     }),
                     json!({
                         "type": "object",
-                        "required": ["history", "latest_history_id", "effective_start_history_id", "lease_seq"],
+                        "required": ["history", "latest_history_id", "effective_start_history_id", "acknowledged_history_id", "lease_seq"],
                         "properties": {
                             "history": { "type": "array", "items": { "type": "object" } },
                             "history_count": { "type": "integer" },
-                            "latest_history_id": { "type": "string" },
+                            "latest_history_id": { "type": "string", "description": "Final-page candidate; acknowledge only after consuming the entire returned batch" },
                             "effective_start_history_id": { "type": "string" },
-                            "dedup_applied": { "type": "boolean" },
+                            "acknowledged_history_id": { "type": "string", "description": "Durable consumer-acknowledged boundary; fetching results never advances it" },
+                            "dedup_applied": { "type": "boolean", "description": "Always false; explicit older cursors are honored for replay" },
                             "used_persisted_cursor": { "type": "boolean" },
                             "lease_seq": { "type": "integer" },
                             "cursor_state_path": { "type": "string" }
@@ -706,14 +718,15 @@ impl GmailConnector {
                     IdempotencyClass::Strict,
                     None,
                     AgentHint {
-                        when_to_use: "Perform incremental mailbox sync with persisted historyId cursor and restart-safe dedup semantics.".into(),
+                        when_to_use: "Fetch a complete bounded history batch; after consuming it, pass latest_history_id as the next start_history_id to acknowledge progress.".into(),
                         common_mistakes: vec![
-                            "Not persisting or reusing historyId between runs, causing duplicate processing".into(),
+                            "Acknowledging latest_history_id before consuming the complete batch".into(),
+                            "Expecting an omitted start_history_id to advance: it replays the confirmed boundary".into(),
                             "Sending stale lease_seq from an old writer after failover".into(),
                         ],
                         examples: vec![
                             r#"{"start_history_id":"1000","lease_seq":1,"lease_object_id":"lease-a"}"#.into(),
-                            r#"{"history_types":["messageAdded","labelRemoved"],"lease_seq":2}"#.into(),
+                            r#"{"lease_seq":1,"lease_object_id":"lease-a"}"#.into(),
                         ],
                         related: vec![CapabilityId::from_static("gmail.read")],
                     },
@@ -1138,11 +1151,8 @@ impl GmailConnector {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
 
-        let requested_start = parse_optional_string_field(&input, "start_history_id")?;
-        let max_results = input
-            .get("max_results")
-            .and_then(|value| value.as_u64())
-            .map(|value| u32::try_from(value).unwrap_or(u32::MAX));
+        let requested_start = parse_history_start(&input)?;
+        let max_results = parse_history_page_size(&input)?;
         let history_types = parse_history_types(&input)?;
         let provided_lease_seq = parse_optional_u64_field(&input, "lease_seq")?;
         let provided_lease_object_id = parse_optional_string_field(&input, "lease_object_id")?;
@@ -1151,26 +1161,30 @@ impl GmailConnector {
             message: "lease_seq is required for singleton_writer cursor advancement".into(),
         })?;
 
+        let scope = history_cursor_scope(config, history_types.as_deref())?;
         let previous = load_history_cursor_state(&config.history_cursor_path)?;
+        validate_history_cursor_owner(
+            previous.as_ref(),
+            &scope,
+            lease_seq,
+            provided_lease_object_id.as_deref(),
+        )?;
         let (effective_start_history_id, dedup_applied, used_persisted_cursor) =
             determine_effective_start_history_id(requested_start, previous.as_ref())?;
 
-        if let Some(previous_state) = previous.as_ref()
-            && lease_seq < previous_state.lease_seq
-        {
-            return Err(FcpError::Conflict {
-                message: format!(
-                    "stale lease_seq for gmail history cursor: current={}, incoming={lease_seq}",
-                    previous_state.lease_seq,
-                ),
-            });
-        }
-
         let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = BTreeSet::new();
         let mut history: Vec<serde_json::Value> = Vec::new();
-        let mut latest_history_id = effective_start_history_id.clone();
+        let mut history_bytes = 2; // The empty JSON array.
+        let mut page_count = 0;
 
-        loop {
+        let latest_history_id = loop {
+            if page_count == MAX_HISTORY_SYNC_PAGES {
+                return Err(history_response_error(
+                    "History sync exceeds the 100-page limit; complete a full mailbox synchronization before advancing the checkpoint",
+                ));
+            }
+            page_count += 1;
             let page = client
                 .list_history(
                     &effective_start_history_id,
@@ -1179,46 +1193,51 @@ impl GmailConnector {
                     history_types.as_deref(),
                 )
                 .await
-                .map_err(|error: GmailError| error.to_fcp_error())?;
+                .map_err(|error: GmailError| match error {
+                    GmailError::Api { code: 404, .. } => history_response_error(
+                        "Gmail history cursor expired or is unavailable; a full mailbox synchronization is required before supplying a new acknowledged start_history_id",
+                    ),
+                    other => other.to_fcp_error(),
+                })?;
 
-            if let Some(history_id) = page.history_id {
-                if compare_history_ids(&history_id, &latest_history_id) == Ordering::Greater {
-                    latest_history_id = history_id;
-                }
-            }
-
-            history.extend(page.history);
+            extend_history_batch(&mut history, page.history, &mut history_bytes)?;
 
             if let Some(next) = page.next_page_token {
+                if next.is_empty() || next.len() > 4096 || !seen_page_tokens.insert(next.clone()) {
+                    return Err(history_response_error(
+                        "Gmail returned an invalid or repeated history page token",
+                    ));
+                }
                 page_token = Some(next);
             } else {
-                break;
+                // Only the terminal page establishes a fully traversed boundary.
+                // A larger historyId on an earlier page is not a checkpoint.
+                let final_id = page
+                    .history_id
+                    .filter(|id| valid_history_id(id))
+                    .ok_or_else(|| {
+                        history_response_error(
+                            "Gmail final history page is missing a valid historyId",
+                        )
+                    })?;
+                if compare_history_ids(&final_id, &effective_start_history_id) == Ordering::Less {
+                    return Err(history_response_error(
+                        "Gmail final historyId precedes the requested start_history_id",
+                    ));
+                }
+                break final_id;
             }
-        }
-
-        if let Some(previous_state) = previous.as_ref()
-            && compare_history_ids(&latest_history_id, &previous_state.next_history_id)
-                == Ordering::Less
-        {
-            return Err(FcpError::Conflict {
-                message: format!(
-                    "history cursor regression detected: current={}, incoming={latest_history_id}",
-                    previous_state.next_history_id
-                ),
-            });
-        }
-
-        let cursor_state = GmailHistoryCursorState {
-            next_history_id: latest_history_id.clone(),
-            lease_seq,
-            lease_object_id: provided_lease_object_id.or_else(|| {
-                previous
-                    .as_ref()
-                    .and_then(|state| state.lease_object_id.clone())
-            }),
-            updated_at: current_unix_timestamp_secs(),
         };
-        persist_history_cursor_state(&config.history_cursor_path, &cursor_state)?;
+
+        // Fetching is not consumption. A lost response must leave this entire
+        // batch replayable, including after restart or a change of writer.
+        let cursor_state = commit_history_cursor_state(
+            &config.history_cursor_path,
+            &scope,
+            &effective_start_history_id,
+            lease_seq,
+            provided_lease_object_id,
+        )?;
         let history_count = history.len();
 
         Ok(json!({
@@ -1226,6 +1245,7 @@ impl GmailConnector {
             "history_count": history_count,
             "latest_history_id": latest_history_id,
             "effective_start_history_id": effective_start_history_id,
+            "acknowledged_history_id": cursor_state.next_history_id,
             "dedup_applied": dedup_applied,
             "used_persisted_cursor": used_persisted_cursor,
             "lease_seq": lease_seq,
@@ -1629,6 +1649,42 @@ fn parse_optional_u64_field(input: &serde_json::Value, field: &str) -> FcpResult
     }
 }
 
+fn valid_history_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HISTORY_ID_BYTES
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_history_start(input: &serde_json::Value) -> FcpResult<Option<String>> {
+    let Some(value) = input.get("start_history_id") else {
+        return Ok(None);
+    };
+    let start = value
+        .as_str()
+        .filter(|value| valid_history_id(value))
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "start_history_id must contain between 1 and 128 ASCII digits".into(),
+        })?;
+    Ok(Some(start.to_owned()))
+}
+
+fn parse_history_page_size(input: &serde_json::Value) -> FcpResult<Option<u32>> {
+    let Some(value) = input.get("max_results") else {
+        return Ok(None);
+    };
+    let count = value
+        .as_u64()
+        .filter(|count| (1..=500).contains(count))
+        .ok_or_else(|| FcpError::InvalidRequest {
+            code: 1003,
+            message: "max_results for history sync must be an integer between 1 and 500".into(),
+        })?;
+    Ok(Some(
+        u32::try_from(count).expect("bounded history page size"),
+    ))
+}
+
 fn parse_history_types(input: &serde_json::Value) -> FcpResult<Option<Vec<String>>> {
     let Some(value) = input.get("history_types") else {
         return Ok(None);
@@ -1642,10 +1698,15 @@ fn parse_history_types(input: &serde_json::Value) -> FcpResult<Option<Vec<String
     let mut normalized = Vec::with_capacity(values.len());
     for history_type in values {
         let trimmed = history_type.trim();
-        if trimmed.is_empty() {
+        if trimmed != history_type
+            || !matches!(
+                trimmed,
+                "messageAdded" | "messageDeleted" | "labelAdded" | "labelRemoved"
+            )
+        {
             return Err(FcpError::InvalidRequest {
                 code: 1003,
-                message: "history_types entries must not be empty".into(),
+                message: "history_types entries must be messageAdded, messageDeleted, labelAdded, or labelRemoved".into(),
             });
         }
         normalized.push(trimmed.to_string());
@@ -1653,15 +1714,19 @@ fn parse_history_types(input: &serde_json::Value) -> FcpResult<Option<Vec<String
     if normalized.is_empty() {
         return Ok(None);
     }
+    normalized.sort();
+    normalized.dedup();
     Ok(Some(normalized))
 }
 
 fn required_capability_for_operation(operation: &str) -> Option<&'static str> {
     match operation {
         "gmail.send_message" | "gmail.send_draft" => Some("gmail.send"),
-        "gmail.get_message" | "gmail.get_attachment" | "gmail.list_messages" | "gmail.get_thread" | "gmail.list_labels" => {
-            Some("gmail.read")
-        }
+        "gmail.get_message"
+        | "gmail.get_attachment"
+        | "gmail.list_messages"
+        | "gmail.get_thread"
+        | "gmail.list_labels" => Some("gmail.read"),
         "gmail.sync_history" => Some("gmail.history.read"),
         "gmail.modify_message" | "gmail.get_draft" | "gmail.create_draft" => Some("gmail.write"),
         "gmail.trash_message" => Some("gmail.delete"),
@@ -1694,8 +1759,8 @@ fn validate_gmail_input(operation: &str, input: &serde_json::Value) -> FcpResult
             validate_optional_string_field(input, "page_token")
         }
         "gmail.sync_history" => {
-            parse_optional_string_field(input, "start_history_id")?;
-            validate_optional_u32_field(input, "max_results")?;
+            parse_history_start(input)?;
+            parse_history_page_size(input)?;
             parse_history_types(input)?;
             parse_optional_u64_field(input, "lease_seq")?.ok_or(FcpError::InvalidRequest {
                 code: 1003,
@@ -1722,7 +1787,9 @@ fn gmail_resource_uris(operation: &str, input: &serde_json::Value) -> Vec<String
         "gmail.send_message" => vec!["gmail:messages:send".into()],
         "gmail.get_attachment" => match (
             input.get("message_id").and_then(serde_json::Value::as_str),
-            input.get("attachment_id").and_then(serde_json::Value::as_str),
+            input
+                .get("attachment_id")
+                .and_then(serde_json::Value::as_str),
         ) {
             (Some(message), Some(attachment)) => vec![format!(
                 "gmail:message:{}:attachment:{}",
@@ -1933,15 +2000,14 @@ fn determine_effective_start_history_id(
     previous_state: Option<&GmailHistoryCursorState>,
 ) -> FcpResult<(String, bool, bool)> {
     match (requested_start, previous_state) {
-        (Some(requested), Some(previous)) => {
-            if compare_history_ids(&requested, &previous.next_history_id) == Ordering::Less {
-                Ok((previous.next_history_id.clone(), true, true))
-            } else {
-                Ok((requested, false, false))
-            }
+        (Some(requested), _) => Ok((requested, false, false)),
+        (None, Some(previous)) if previous.cursor_version == HISTORY_CURSOR_VERSION => {
+            Ok((previous.next_history_id.clone(), false, true))
         }
-        (Some(requested), None) => Ok((requested, false, false)),
-        (None, Some(previous)) => Ok((previous.next_history_id.clone(), false, true)),
+        (None, Some(_)) => Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "A legacy history cursor records fetched progress, not consumption; supply the last fully consumed start_history_id to migrate safely".into(),
+        }),
         (None, None) => Err(FcpError::InvalidRequest {
             code: 1003,
             message: "Missing start_history_id and no persisted history cursor is available".into(),
@@ -1950,16 +2016,18 @@ fn determine_effective_start_history_id(
 }
 
 fn load_history_cursor_state(path: &Path) -> FcpResult<Option<GmailHistoryCursorState>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = fs::read(path).map_err(|error| FcpError::Internal {
-        message: format!(
-            "Failed to read history cursor state {}: {error}",
-            path.display()
-        ),
-    })?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(FcpError::Internal {
+                message: format!(
+                    "Failed to read history cursor state {}: {error}",
+                    path.display()
+                ),
+            });
+        }
+    };
 
     let state = serde_json::from_slice(&bytes).map_err(|error| FcpError::Internal {
         message: format!(
@@ -1970,16 +2038,201 @@ fn load_history_cursor_state(path: &Path) -> FcpResult<Option<GmailHistoryCursor
     Ok(Some(state))
 }
 
-fn persist_history_cursor_state(path: &Path, state: &GmailHistoryCursorState) -> FcpResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| FcpError::Internal {
+fn history_response_error(message: impl Into<String>) -> FcpError {
+    FcpError::External {
+        service: "gmail".into(),
+        message: message.into(),
+        status_code: None,
+        retryable: false,
+        retry_after: None,
+    }
+}
+
+fn extend_history_batch(
+    history: &mut Vec<serde_json::Value>,
+    page: Vec<serde_json::Value>,
+    history_bytes: &mut usize,
+) -> FcpResult<()> {
+    let encoded = serde_json::to_vec(&page).map_err(|error| FcpError::Internal {
+        message: format!("Failed to measure history response: {error}"),
+    })?;
+    let separator = usize::from(!history.is_empty() && !page.is_empty());
+    let total = history_bytes
+        .checked_add(encoded.len().saturating_sub(2))
+        .and_then(|bytes| bytes.checked_add(separator))
+        .filter(|bytes| *bytes <= MAX_HISTORY_SYNC_BYTES)
+        .ok_or_else(|| {
+            history_response_error("History sync exceeds the 8 MiB history response limit")
+        })?;
+    history.extend(page);
+    *history_bytes = total;
+    Ok(())
+}
+
+fn history_cursor_scope(
+    config: &GmailConfig,
+    history_types: Option<&[String]>,
+) -> FcpResult<String> {
+    let credential = match &config.auth {
+        GoogleMaterializedAuth::CredentialReference { credential_id, .. } => {
+            format!("credential:{credential_id}")
+        }
+        // Public configure uses credential references. Keep internal bearer
+        // callers isolated too, without putting token material in state.
+        GoogleMaterializedAuth::BearerToken { access_token, .. } => {
+            format!(
+                "bearer-sha256:{}",
+                hex::encode(Sha256::digest(access_token.as_bytes()))
+            )
+        }
+    };
+    let base_url = Url::parse(&config.base_url).map_err(|_| FcpError::Internal {
+        message: "Invalid configured Gmail base URL".into(),
+    })?;
+    let encoded = serde_json::to_vec(&(
+        credential,
+        base_url.as_str().trim_end_matches('/'),
+        history_types.unwrap_or_default(),
+    ))
+    .map_err(|error| FcpError::Internal {
+        message: format!("Failed to encode history cursor scope: {error}"),
+    })?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
+}
+
+fn validate_history_cursor_owner(
+    previous: Option<&GmailHistoryCursorState>,
+    scope: &str,
+    lease_seq: u64,
+    lease_object_id: Option<&str>,
+) -> FcpResult<()> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if !matches!(previous.cursor_version, 0 | HISTORY_CURSOR_VERSION) {
+        return Err(FcpError::Conflict {
+            message: "Unsupported history cursor version; use a compatible connector or a separate cursor state path".into(),
+        });
+    }
+    if previous.cursor_version == HISTORY_CURSOR_VERSION {
+        if previous.scope.as_deref() != Some(scope) {
+            return Err(FcpError::Conflict {
+                message: "History cursor scope differs from this credential, base URL, or history_types; use a separate cursor state path".into(),
+            });
+        }
+        if !valid_history_id(&previous.next_history_id) {
+            return Err(FcpError::Conflict {
+                message: "Stored acknowledged history cursor is invalid".into(),
+            });
+        }
+    }
+    if lease_seq < previous.lease_seq {
+        return Err(FcpError::Conflict {
             message: format!(
-                "Failed to create history cursor directory {}: {error}",
-                parent.display()
+                "stale lease_seq for gmail history cursor: current={}, incoming={lease_seq}",
+                previous.lease_seq
+            ),
+        });
+    }
+    if lease_seq == previous.lease_seq
+        && let (Some(current), Some(incoming)) =
+            (previous.lease_object_id.as_deref(), lease_object_id)
+        && current != incoming
+    {
+        return Err(FcpError::Conflict {
+            message: "History cursor lease owner changed without a newer lease_seq".into(),
+        });
+    }
+    Ok(())
+}
+
+fn history_cursor_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn commit_history_cursor_state(
+    path: &Path,
+    scope: &str,
+    acknowledged_start: &str,
+    lease_seq: u64,
+    lease_object_id: Option<String>,
+) -> FcpResult<GmailHistoryCursorState> {
+    let parent = history_cursor_parent(path);
+    fs::create_dir_all(parent).map_err(|error| FcpError::Internal {
+        message: format!(
+            "Failed to create history cursor directory {}: {error}",
+            parent.display()
+        ),
+    })?;
+    let lock_path = path.with_file_name(format!(
+        ".{}.lock",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("gmail-history-cursor")
+    ));
+    // The sidecar is stable: renaming the data file must not change the lock
+    // inode. Keep it after release so concurrent processes share one lock.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| FcpError::Internal {
+            message: format!(
+                "Failed to open history cursor lock {}: {error}",
+                lock_path.display()
             ),
         })?;
-    }
+    lock.try_lock().map_err(|error| match error {
+        fs::TryLockError::WouldBlock => FcpError::Conflict {
+            message:
+                "History cursor commit is already in progress; retry from the acknowledged boundary"
+                    .into(),
+        },
+        fs::TryLockError::Error(error) => FcpError::Internal {
+            message: format!("Failed to lock history cursor state: {error}"),
+        },
+    })?;
+    // Network work happens outside the lock. A writer that lost its lease
+    // while fetching must not overwrite the new writer's confirmed progress.
+    let current = load_history_cursor_state(path)?;
+    validate_history_cursor_owner(
+        current.as_ref(),
+        scope,
+        lease_seq,
+        lease_object_id.as_deref(),
+    )?;
+    let next_history_id = current
+        .as_ref()
+        .filter(|state| state.cursor_version == HISTORY_CURSOR_VERSION)
+        .filter(|state| {
+            compare_history_ids(&state.next_history_id, acknowledged_start) == Ordering::Greater
+        })
+        .map_or_else(
+            || acknowledged_start.to_owned(),
+            |state| state.next_history_id.clone(),
+        );
+    let state = GmailHistoryCursorState {
+        cursor_version: HISTORY_CURSOR_VERSION,
+        scope: Some(scope.to_owned()),
+        next_history_id,
+        lease_seq,
+        lease_object_id: lease_object_id.or_else(|| {
+            current
+                .as_ref()
+                .filter(|state| state.lease_seq == lease_seq)
+                .and_then(|state| state.lease_object_id.clone())
+        }),
+        updated_at: current_unix_timestamp_secs(),
+    };
+    persist_history_cursor_state(path, &state)?;
+    Ok(state)
+}
 
+fn persist_history_cursor_state(path: &Path, state: &GmailHistoryCursorState) -> FcpResult<()> {
     let data = serde_json::to_vec_pretty(state).map_err(|error| FcpError::Internal {
         message: format!("Failed to serialize history cursor state: {error}"),
     })?;
@@ -1992,18 +2245,42 @@ fn persist_history_cursor_state(path: &Path, state: &GmailHistoryCursorState) ->
         uuid::Uuid::new_v4()
     );
     let tmp_path = path.with_file_name(tmp_name);
-    fs::write(&tmp_path, data).map_err(|error| FcpError::Internal {
-        message: format!(
-            "Failed to write temporary history cursor state {}: {error}",
-            tmp_path.display()
-        ),
-    })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp_path)
+        .map_err(|error| FcpError::Internal {
+            message: format!(
+                "Failed to create temporary history cursor state {}: {error}",
+                tmp_path.display()
+            ),
+        })?;
+    file.write_all(&data)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| FcpError::Internal {
+            message: format!(
+                "Failed to sync temporary history cursor state {}: {error}",
+                tmp_path.display()
+            ),
+        })?;
+    drop(file);
     fs::rename(&tmp_path, path).map_err(|error| FcpError::Internal {
         message: format!(
             "Failed to persist history cursor state {}: {error}",
             path.display()
         ),
     })?;
+    #[cfg(not(windows))]
+    fs::File::open(history_cursor_parent(path))
+        .and_then(|parent| parent.sync_all())
+        .map_err(|error| FcpError::Internal {
+            message: format!("Failed to sync history cursor directory: {error}"),
+        })?;
 
     Ok(())
 }
@@ -2880,9 +3157,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_history_types_trims() {
-        let result = parse_history_types(&json!({"history_types": ["  messageAdded  "]})).unwrap();
-        assert_eq!(result.unwrap()[0], "messageAdded");
+    fn parse_history_types_canonicalizes_and_rejects_unknown_values() {
+        let result = parse_history_types(&json!({
+            "history_types": ["messageAdded", "labelRemoved", "messageAdded"]
+        }))
+        .unwrap();
+        assert_eq!(result.unwrap(), vec!["labelRemoved", "messageAdded"]);
+        assert!(parse_history_types(&json!({"history_types": ["  messageAdded  "]})).is_err());
+        assert!(parse_history_types(&json!({"history_types": ["unknown"]})).is_err());
     }
 
     // ── endpoint_allowed_by_policy ─────────────────────────────────
@@ -3063,8 +3345,147 @@ mod tests {
     // ── determine_effective_start_history_id ────────────────────────
 
     #[test]
+    fn history_inputs_enforce_provider_cursor_and_page_size_bounds() {
+        for value in [
+            json!(""),
+            json!(" 100"),
+            json!("1x"),
+            json!("-1"),
+            json!(12),
+            json!(null),
+            json!("9".repeat(129)),
+        ] {
+            assert!(parse_history_start(&json!({"start_history_id": value})).is_err());
+        }
+        assert_eq!(
+            parse_history_start(&json!({"start_history_id": "000100"}))
+                .unwrap()
+                .as_deref(),
+            Some("000100")
+        );
+        for value in [
+            json!(0),
+            json!(501),
+            json!(-1),
+            json!(1.5),
+            json!("100"),
+            json!(null),
+        ] {
+            assert!(parse_history_page_size(&json!({"max_results": value})).is_err());
+        }
+        assert_eq!(
+            parse_history_page_size(&json!({"max_results": 500})).unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            history_cursor_parent(Path::new("cursor.json")),
+            Path::new(".")
+        );
+    }
+
+    #[test]
+    fn history_batch_limit_counts_separators_and_rejects_without_appending() {
+        let mut history = Vec::new();
+        let mut bytes = 2;
+        extend_history_batch(&mut history, vec![json!({"id": "1"})], &mut bytes).unwrap();
+        extend_history_batch(&mut history, vec![json!({"id": "2"})], &mut bytes).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&history).unwrap().len());
+
+        let empty_record_bytes = serde_json::to_vec(&vec![json!({"payload": ""})])
+            .unwrap()
+            .len();
+        let mut full = Vec::new();
+        let mut full_bytes = 2;
+        extend_history_batch(
+            &mut full,
+            vec![json!({
+                "payload": "x".repeat(MAX_HISTORY_SYNC_BYTES - empty_record_bytes)
+            })],
+            &mut full_bytes,
+        )
+        .unwrap();
+        assert_eq!(full_bytes, MAX_HISTORY_SYNC_BYTES);
+        extend_history_batch(&mut full, Vec::new(), &mut full_bytes).unwrap();
+        assert!(
+            extend_history_batch(&mut full, vec![json!({"id": "3"})], &mut full_bytes).is_err()
+        );
+        assert_eq!(full.len(), 1);
+        assert_eq!(full_bytes, MAX_HISTORY_SYNC_BYTES);
+    }
+
+    #[test]
+    fn history_commit_merges_acknowledged_progress_and_fences_owners() {
+        let path =
+            std::env::temp_dir().join(format!("fcp-gmail-commit-{}.json", uuid::Uuid::new_v4()));
+        commit_history_cursor_state(&path, "scope-a", "100", 1, Some("lease-a".into())).unwrap();
+        commit_history_cursor_state(&path, "scope-a", "200", 1, Some("lease-a".into())).unwrap();
+        let replay = commit_history_cursor_state(&path, "scope-a", "150", 1, None).unwrap();
+        assert_eq!(replay.next_history_id, "200");
+        assert_eq!(replay.lease_object_id.as_deref(), Some("lease-a"));
+        let takeover = commit_history_cursor_state(&path, "scope-a", "150", 2, None).unwrap();
+        assert_eq!(takeover.next_history_id, "200");
+        assert!(takeover.lease_object_id.is_none());
+        let owner = commit_history_cursor_state(&path, "scope-a", "200", 2, Some("lease-b".into()))
+            .unwrap();
+        assert_eq!(owner.lease_object_id.as_deref(), Some("lease-b"));
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            commit_history_cursor_state(&path, "scope-a", "300", 1, None),
+            Err(FcpError::Conflict { .. })
+        ));
+        assert!(matches!(
+            commit_history_cursor_state(&path, "scope-a", "300", 2, Some("other-owner".into())),
+            Err(FcpError::Conflict { .. })
+        ));
+        assert!(matches!(
+            commit_history_cursor_state(&path, "scope-b", "300", 3, None),
+            Err(FcpError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let mut unknown = owner;
+        unknown.cursor_version = HISTORY_CURSOR_VERSION + 1;
+        assert!(matches!(
+            validate_history_cursor_owner(Some(&unknown), "scope-a", 3, None),
+            Err(FcpError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn history_commit_lock_contention_preserves_checkpoint() {
+        let path =
+            std::env::temp_dir().join(format!("fcp-gmail-lock-{}.json", uuid::Uuid::new_v4()));
+        commit_history_cursor_state(&path, "scope-a", "100", 1, None).unwrap();
+        let before = fs::read(&path).unwrap();
+        let lock_path = path.with_file_name(format!(
+            ".{}.lock",
+            path.file_name().unwrap().to_str().unwrap()
+        ));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(matches!(
+            commit_history_cursor_state(&path, "scope-a", "200", 2, None),
+            Err(FcpError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(lock);
+        assert_eq!(
+            commit_history_cursor_state(&path, "scope-a", "200", 2, None)
+                .unwrap()
+                .next_history_id,
+            "200"
+        );
+    }
+
+    #[test]
     fn determine_effective_both_present_requested_newer() {
         let previous = GmailHistoryCursorState {
+            cursor_version: HISTORY_CURSOR_VERSION,
+            scope: Some("test-scope".into()),
             next_history_id: "100".into(),
             lease_seq: 1,
             lease_object_id: None,
@@ -3080,6 +3501,8 @@ mod tests {
     #[test]
     fn determine_effective_both_present_requested_older() {
         let previous = GmailHistoryCursorState {
+            cursor_version: HISTORY_CURSOR_VERSION,
+            scope: Some("test-scope".into()),
             next_history_id: "200".into(),
             lease_seq: 1,
             lease_object_id: None,
@@ -3087,9 +3510,9 @@ mod tests {
         };
         let (id, dedup, used_cursor) =
             determine_effective_start_history_id(Some("100".into()), Some(&previous)).unwrap();
-        assert_eq!(id, "200");
-        assert!(dedup);
-        assert!(used_cursor);
+        assert_eq!(id, "100");
+        assert!(!dedup);
+        assert!(!used_cursor);
     }
 
     #[test]
@@ -3104,6 +3527,8 @@ mod tests {
     #[test]
     fn determine_effective_only_persisted() {
         let previous = GmailHistoryCursorState {
+            cursor_version: HISTORY_CURSOR_VERSION,
+            scope: Some("test-scope".into()),
             next_history_id: "300".into(),
             lease_seq: 2,
             lease_object_id: None,
@@ -3604,6 +4029,8 @@ mod tests {
     #[test]
     fn history_cursor_state_serde_roundtrip() {
         let state = GmailHistoryCursorState {
+            cursor_version: HISTORY_CURSOR_VERSION,
+            scope: Some("test-scope".into()),
             next_history_id: "500".into(),
             lease_seq: 3,
             lease_object_id: Some("lease-x".into()),
@@ -3612,6 +4039,8 @@ mod tests {
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["next_history_id"], "500");
         assert_eq!(json["lease_seq"], 3);
+        assert_eq!(json["cursor_version"], HISTORY_CURSOR_VERSION);
+        assert_eq!(json["scope"], "test-scope");
 
         let back: GmailHistoryCursorState = serde_json::from_value(json).unwrap();
         assert_eq!(back.next_history_id, "500");
@@ -3627,6 +4056,9 @@ mod tests {
         });
         let state: GmailHistoryCursorState = serde_json::from_value(json).unwrap();
         assert!(state.lease_object_id.is_none());
+        assert_eq!(state.cursor_version, 0);
+        assert!(state.scope.is_none());
+        assert!(determine_effective_start_history_id(None, Some(&state)).is_err());
     }
 
     // ── DoctorStatus serde ─────────────────────────────────────────
@@ -3841,11 +4273,23 @@ mod tests {
     }
 
     #[fcp_async_core::runtime::test]
-    async fn test_sync_history_resumes_from_persisted_cursor() {
+    async fn test_sync_history_replays_lost_response_until_caller_acknowledges() {
         let state_path =
             std::env::temp_dir().join(format!("fcp-gmail-history-{}.json", uuid::Uuid::new_v4()));
+        let credential_id = CredentialId::new().to_string();
 
         let server = TestHttpServer::respond_sequence(vec![
+            TestHttpResponse::json(
+                "GET",
+                "/users/me/history",
+                vec![("startHistoryId", "100")],
+                &json!({
+                    "history": [
+                        { "id": "101", "messagesAdded": [{ "message": { "id": "m1" } }] }
+                    ],
+                    "historyId": "101"
+                }),
+            ),
             TestHttpResponse::json(
                 "GET",
                 "/users/me/history",
@@ -3871,7 +4315,7 @@ mod tests {
         let mut connector = GmailConnector::new();
         connector
             .handle_configure(json!({
-                "credential_id": CredentialId::new().to_string(),
+                "credential_id": credential_id,
                 "base_url": server.uri(),
                 "history_cursor_path": state_path.to_string_lossy().to_string()
             }))
@@ -3891,11 +4335,19 @@ mod tests {
         assert_eq!(first["latest_history_id"], "101");
         assert_eq!(first["history_count"], 1);
         assert_eq!(first["used_persisted_cursor"], false);
+        assert_eq!(first["acknowledged_history_id"], "100");
+        assert_eq!(
+            load_history_cursor_state(&state_path)
+                .unwrap()
+                .unwrap()
+                .next_history_id,
+            "100"
+        );
 
         let mut restarted = GmailConnector::new();
         restarted
             .handle_configure(json!({
-                "credential_id": CredentialId::new().to_string(),
+                "credential_id": credential_id,
                 "base_url": server.uri(),
                 "history_cursor_path": state_path.to_string_lossy().to_string()
             }))
@@ -3910,10 +4362,54 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resumed["effective_start_history_id"], "101");
+        assert_eq!(resumed["effective_start_history_id"], "100");
         assert_eq!(resumed["latest_history_id"], "101");
-        assert_eq!(resumed["history_count"], 0);
+        assert_eq!(resumed["history_count"], 1);
+        assert_eq!(resumed["acknowledged_history_id"], "100");
         assert_eq!(resumed["used_persisted_cursor"], true);
+        let acknowledged = restarted
+            .invoke_sync_history(json!({
+                "start_history_id": "101", "lease_seq": 2, "lease_object_id": "lease-b"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged["history_count"], 0);
+        assert_eq!(acknowledged["acknowledged_history_id"], "101");
+        assert_eq!(
+            load_history_cursor_state(&state_path)
+                .unwrap()
+                .unwrap()
+                .next_history_id,
+            "101"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn test_sync_history_page_limit_never_publishes_partial_checkpoint() {
+        let state_path = std::env::temp_dir().join(format!(
+            "fcp-gmail-page-limit-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let responses = (0..MAX_HISTORY_SYNC_PAGES).map(|index| TestHttpResponse::json(
+            "GET", "/users/me/history", vec![("startHistoryId", "100")],
+            &json!({"history": [], "historyId": "900", "nextPageToken": format!("page{index}")}),
+        )).collect();
+        let server = TestHttpServer::respond_sequence(responses);
+        let mut connector = GmailConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(), "base_url": server.uri(),
+                "history_cursor_path": state_path.to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap();
+        let error = connector
+            .invoke_sync_history(json!({"start_history_id": "100", "lease_seq": 1}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("100-page"));
+        assert!(!state_path.exists());
+        server._handle.join().unwrap();
     }
 
     #[fcp_async_core::runtime::test]

@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:7f4ef7a7b43dc780b07c3ea681e3c4de89d1b5b6631dc5d7ea5ca586289acb58"
+interface_hash = "blake3-256:fcp.interface.v2:1d4d8ee18af8c76aee6962bc7d263b0c17cc2b28333ab22da04bb481e59b1b38"
 
 [connector]
 id = "fcp.gmail"
@@ -13,13 +13,13 @@ name = "Gmail Connector"
 version = "0.1.0"
 description = "FCP connector for Gmail (messages, threads, labels, drafts, attachments)"
 archetypes = ["operational", "streaming", "knowledge"]
-format = "wasi"
+format = "native"
 status = "proven"
 
 [connector.state]
 model = "singleton_writer"
-state_schema_version = "1"
-migration_hint = "init"
+state_schema_version = "2"
+migration_hint = "Supply the last consumer-acknowledged start_history_id to migrate legacy cursors; fetched progress is not acknowledgement"
 
 [zones]
 home = "z:private"
@@ -247,7 +247,7 @@ related = ["gmail.get_message", "gmail.search_messages"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."gmail.sync_history"]
-description = "Incrementally fetch mailbox history changes using historyId cursor state"
+description = "Fetch complete bounded mailbox history batches from a consumer-acknowledged cursor"
 capability = "gmail.history.read"
 risk_level = "low"
 safety_tier = "safe"
@@ -260,17 +260,27 @@ required = ["lease_seq"]
 type = "object"
 [provides.operations."gmail.sync_history".input_schema.properties.start_history_id]
 type = "string"
+description = "Caller-acknowledged history boundary; pass the previous latest_history_id only after processing its complete batch. Omit to replay from the acknowledged checkpoint."
+minLength = 1
+maxLength = 128
+pattern = "^[0-9]+$"
 [provides.operations."gmail.sync_history".input_schema.properties.max_results]
 type = "integer"
+minimum = 1
+maximum = 500
+description = "Page size; each invocation must finish within the total history page and byte limits."
 [provides.operations."gmail.sync_history".input_schema.properties.history_types]
 type = "array"
+[provides.operations."gmail.sync_history".input_schema.properties.history_types.items]
+type = "string"
+enum = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
 [provides.operations."gmail.sync_history".input_schema.properties.lease_seq]
 type = "integer"
 [provides.operations."gmail.sync_history".input_schema.properties.lease_object_id]
 type = "string"
 
 [provides.operations."gmail.sync_history".output_schema]
-required = ["history", "latest_history_id", "effective_start_history_id", "lease_seq"]
+required = ["history", "latest_history_id", "effective_start_history_id", "acknowledged_history_id", "lease_seq"]
 type = "object"
 [provides.operations."gmail.sync_history".output_schema.properties.history]
 type = "array"
@@ -278,10 +288,15 @@ type = "array"
 type = "integer"
 [provides.operations."gmail.sync_history".output_schema.properties.latest_history_id]
 type = "string"
+description = "Candidate boundary from the final history page; acknowledge it only after processing the entire returned batch."
 [provides.operations."gmail.sync_history".output_schema.properties.effective_start_history_id]
 type = "string"
+[provides.operations."gmail.sync_history".output_schema.properties.acknowledged_history_id]
+type = "string"
+description = "Durably recorded consumer-acknowledged boundary; fetching results never advances it."
 [provides.operations."gmail.sync_history".output_schema.properties.dedup_applied]
 type = "boolean"
+description = "Always false: explicit older cursors are honored for replay. Consumers deduplicate repeated history records."
 [provides.operations."gmail.sync_history".output_schema.properties.used_persisted_cursor]
 type = "boolean"
 [provides.operations."gmail.sync_history".output_schema.properties.lease_seq]
@@ -305,9 +320,9 @@ total_timeout_ms = 60000
 max_response_bytes = 10485760
 
 [provides.operations."gmail.sync_history".ai_hints]
-when_to_use = "Perform incremental mailbox sync with persisted historyId cursor and restart-safe dedup semantics."
-common_mistakes = ["Not persisting or reusing historyId between runs, causing duplicate processing", "Sending stale lease_seq from an old writer after failover"]
-examples = ['{"start_history_id":"1000","lease_seq":1,"lease_object_id":"lease-a"}', '{"history_types":["messageAdded","labelRemoved"],"lease_seq":2}']
+when_to_use = "Read a complete history batch, process it durably, then pass latest_history_id as the next start_history_id to acknowledge progress."
+common_mistakes = ["Advancing start_history_id before processing every returned record", "Assuming an omitted start_history_id advances instead of replaying", "Sharing a cursor file across mailbox credentials, filters, or consumers", "Sending stale lease_seq from an old writer after failover"]
+examples = ['{"start_history_id":"1000","lease_seq":1,"lease_object_id":"lease-a"}', '{"lease_seq":1,"lease_object_id":"lease-a"}']
 related = ["gmail.get_message", "gmail.list_messages"]
 
 # ────────────────────────────────────────────────────────────────

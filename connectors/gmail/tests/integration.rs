@@ -22,6 +22,12 @@ use fcp_manifest::{ConnectorManifest, ManifestApprovalMode};
 use fcp_prelude::ApprovalMode;
 use fcp_prelude::{CapabilityConstraints, CapabilityToken, CredentialId, FcpError};
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration as StdDuration;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{header, method, path, query_param},
@@ -1006,12 +1012,52 @@ async fn oauth_refresh_mode_rejects_raw_secret_material() {
     ));
 }
 
-/// history sync operation persists cursor and resumes via invoke dispatch.
+fn history_state_path() -> PathBuf {
+    std::env::temp_dir().join(format!("fcp-gmail-history-{}.json", uuid::Uuid::new_v4()))
+}
+
+fn history_cursor_state(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(path).expect("read history checkpoint"))
+        .expect("parse history checkpoint")
+}
+
+async fn history_connector(
+    server: &MockServer,
+    state_path: &Path,
+    credential_id: &str,
+) -> (GmailConnector, Ed25519SigningKey) {
+    let mut connector = GmailConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": credential_id,
+            "base_url": server.uri(),
+            "history_cursor_path": state_path.to_string_lossy().to_string(),
+        }))
+        .await
+        .expect("configure history connector");
+    let key = setup_handshake(&mut connector, &["gmail.sync_history"]).await;
+    (connector, key)
+}
+
+async fn invoke_history(
+    connector: &GmailConnector,
+    key: &Ed25519SigningKey,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, FcpError> {
+    connector
+        .handle_invoke(json!({
+            "operation": "gmail.sync_history",
+            "input": input,
+            "capability_token": generate_valid_token(key, connector, "gmail.sync_history"),
+        }))
+        .await
+}
+
+/// A lost response must replay after restart until the caller confirms progress.
 #[fcp_async_core::runtime::test]
-async fn invoke_sync_history_persists_and_resumes_cursor() {
+async fn invoke_sync_history_replays_until_caller_confirms_consumption() {
     let mock_server = MockServer::start().await;
-    let state_path =
-        std::env::temp_dir().join(format!("fcp-gmail-history-{}.json", uuid::Uuid::new_v4()));
+    let state_path = history_state_path();
 
     Mock::given(method("GET"))
         .and(path("/users/me/history"))
@@ -1020,78 +1066,550 @@ async fn invoke_sync_history_persists_and_resumes_cursor() {
             "history": [
                 { "id": "501", "messagesAdded": [{ "message": { "id": "m501" } }] }
             ],
-            "historyId": "501"
+            "historyId": "600"
         })))
+        .expect(3)
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/users/me/history"))
-        .and(query_param("startHistoryId", "501"))
+        .and(query_param("startHistoryId", "600"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "history": [],
-            "historyId": "501"
+            "historyId": "600"
         })))
+        .expect(2)
         .mount(&mock_server)
         .await;
 
-    let mut connector = GmailConnector::new();
-    connector
-        .handle_configure(json!({
-            "credential_id": CredentialId::new().to_string(),
-            "base_url": mock_server.uri(),
-            "history_cursor_path": state_path.to_string_lossy().to_string()
-        }))
-        .await
-        .unwrap();
-    let signing_key = setup_handshake(&mut connector, &["gmail.history.read"]).await;
-    let token = generate_valid_token(&signing_key, &connector, "gmail.sync_history");
-
-    let first = connector
-        .handle_invoke(json!({
-            "operation": "gmail.sync_history",
-            "input": {
-                "start_history_id": "500",
-                "lease_seq": 1,
-                "lease_object_id": "lease-a"
-            },
-            "capability_token": token
-        }))
-        .await
-        .unwrap();
+    let (connector, signing_key) =
+        history_connector(&mock_server, &state_path, TEST_CREDENTIAL_ID).await;
+    let first = invoke_history(
+        &connector,
+        &signing_key,
+        json!({
+            "start_history_id": "500",
+            "lease_seq": 1,
+            "lease_object_id": "lease-a",
+        }),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(first["effective_start_history_id"], "500");
-    assert_eq!(first["latest_history_id"], "501");
+    assert_eq!(first["latest_history_id"], "600");
+    assert_eq!(first["acknowledged_history_id"], "500");
     assert_eq!(first["history_count"], 1);
+    assert_eq!(history_cursor_state(&state_path)["next_history_id"], "500");
+    drop(first);
+    drop(connector);
 
-    let mut restarted = GmailConnector::new();
-    restarted
-        .handle_configure(json!({
-            "credential_id": CredentialId::new().to_string(),
-            "base_url": mock_server.uri(),
-            "history_cursor_path": state_path.to_string_lossy().to_string()
-        }))
-        .await
-        .unwrap();
-    let signing_key2 = setup_handshake(&mut restarted, &["gmail.history.read"]).await;
-    let token2 = generate_valid_token(&signing_key2, &restarted, "gmail.sync_history");
-
-    let resumed = restarted
-        .handle_invoke(json!({
-            "operation": "gmail.sync_history",
-            "input": {
-                "lease_seq": 2,
-                "lease_object_id": "lease-b"
-            },
-            "capability_token": token2
-        }))
-        .await
-        .unwrap();
-
-    assert_eq!(resumed["effective_start_history_id"], "501");
-    assert_eq!(resumed["latest_history_id"], "501");
-    assert_eq!(resumed["history_count"], 0);
+    let (restarted, signing_key2) =
+        history_connector(&mock_server, &state_path, TEST_CREDENTIAL_ID).await;
+    let resumed = invoke_history(
+        &restarted,
+        &signing_key2,
+        json!({
+            "lease_seq": 2,
+            "lease_object_id": "lease-b",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed["effective_start_history_id"], "500");
+    assert_eq!(resumed["latest_history_id"], "600");
+    assert_eq!(resumed["history"][0]["id"], "501");
+    assert_eq!(resumed["history_count"], 1);
     assert_eq!(resumed["used_persisted_cursor"], true);
+    assert_eq!(history_cursor_state(&state_path)["next_history_id"], "500");
+
+    let advanced = invoke_history(
+        &restarted,
+        &signing_key2,
+        json!({
+            "start_history_id": resumed["latest_history_id"],
+            "lease_seq": 2,
+            "lease_object_id": "lease-b",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(advanced["effective_start_history_id"], "600");
+    assert_eq!(advanced["acknowledged_history_id"], "600");
+    assert_eq!(advanced["history_count"], 0);
+
+    let replay = invoke_history(
+        &restarted,
+        &signing_key2,
+        json!({
+            "start_history_id": "500",
+            "lease_seq": 2,
+            "lease_object_id": "lease-b",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["effective_start_history_id"], "500");
+    assert_eq!(replay["history"][0]["id"], "501");
+    assert_eq!(replay["acknowledged_history_id"], "600");
+    assert_eq!(replay["dedup_applied"], false);
+    assert_eq!(replay["used_persisted_cursor"], false);
+    assert_eq!(history_cursor_state(&state_path)["next_history_id"], "600");
+
+    let resumed_after_replay = invoke_history(
+        &restarted,
+        &signing_key2,
+        json!({
+            "lease_seq": 2,
+            "lease_object_id": "lease-b",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed_after_replay["effective_start_history_id"], "600");
+    assert_eq!(resumed_after_replay["history_count"], 0);
+    mock_server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_collects_all_pages_before_offering_checkpoint() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "500"))
+        .and(query_param("maxResults", "2"))
+        .respond_with(|request: &wiremock::Request| {
+            let token = request.url.query_pairs()
+                .find_map(|(key, value)| (key == "pageToken").then(|| value.into_owned()));
+            match token.as_deref() {
+                None => ResponseTemplate::new(200).set_body_json(json!({
+                    "history": [{"id": "501", "messagesAdded": [{"message": {"id": "m501"}}]}],
+                    "historyId": "900",
+                    "nextPageToken": "opaque-second-page",
+                })),
+                Some("opaque-second-page") => ResponseTemplate::new(200).set_body_json(json!({
+                    "history": [{"id": "701", "labelsRemoved": [{"message": {"id": "m701"}, "labelIds": ["UNREAD"]}]}],
+                    "historyId": "950",
+                })),
+                _ => ResponseTemplate::new(400),
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let result = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "500",
+            "max_results": 2,
+            "history_types": ["messageAdded", "labelRemoved"],
+            "lease_seq": 1,
+            "lease_object_id": "reader",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["history_count"], 2);
+    assert_eq!(result["history"][0]["id"], "501");
+    assert_eq!(result["history"][1]["id"], "701");
+    assert_eq!(result["latest_history_id"], "950");
+    assert_eq!(result["acknowledged_history_id"], "500");
+    assert_eq!(history_cursor_state(&state_path)["next_history_id"], "500");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[0]
+            .url
+            .query_pairs()
+            .any(|(key, _)| key == "pageToken")
+    );
+    assert!(
+        requests[1]
+            .url
+            .query_pairs()
+            .any(|(key, value)| { key == "pageToken" && value == "opaque-second-page" })
+    );
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_final_page_failure_preserves_checkpoint() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "history": [], "historyId": "100",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "200"))
+        .respond_with(|request: &wiremock::Request| {
+            if request.url.query_pairs().any(|(key, _)| key == "pageToken") {
+                ResponseTemplate::new(404).set_body_json(json!({
+                    "error": {"code": 404, "message": "Requested entity was not found."},
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "history": [{"id": "201"}],
+                    "historyId": "900",
+                    "nextPageToken": "last-page-unavailable",
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "100", "lease_seq": 1, "lease_object_id": "reader-a",
+        }),
+    )
+    .await
+    .unwrap();
+    let before = std::fs::read(&state_path).unwrap();
+    let error = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "200", "lease_seq": 2, "lease_object_id": "reader-b",
+        }),
+    )
+    .await
+    .expect_err("a partial traversal is not a completed sync");
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("full"),
+        "expired provider history must explain full-sync recovery: {error}"
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_legacy_cursor_requires_explicit_confirmed_start() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    let legacy = json!({
+        "next_history_id": "900",
+        "lease_seq": 7,
+        "lease_object_id": "legacy-owner",
+        "updated_at": 0,
+    });
+    std::fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "500"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "history": [{"id": "501"}], "historyId": "950",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let missing_start = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "lease_seq": 8, "lease_object_id": "new-owner",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(missing_start, FcpError::InvalidRequest { .. }));
+    assert!(missing_start.to_string().contains("legacy"));
+    assert_eq!(history_cursor_state(&state_path), legacy);
+
+    for (lease_seq, owner) in [(6, "stale-owner"), (7, "different-owner")] {
+        let error = invoke_history(
+            &connector,
+            &key,
+            json!({
+                "start_history_id": "500", "lease_seq": lease_seq, "lease_object_id": owner,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, FcpError::Conflict { .. }));
+        assert_eq!(history_cursor_state(&state_path), legacy);
+    }
+    let migrated = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "500", "lease_seq": 8, "lease_object_id": "new-owner",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(migrated["effective_start_history_id"], "500");
+    assert_eq!(migrated["acknowledged_history_id"], "500");
+    assert_eq!(migrated["history"][0]["id"], "501");
+    let state = history_cursor_state(&state_path);
+    assert_eq!(state["cursor_version"], 2);
+    assert_eq!(state["next_history_id"], "500");
+    assert_eq!(state["lease_seq"], 8);
+    assert_eq!(state["lease_object_id"], "new-owner");
+    assert!(
+        state["scope"]
+            .as_str()
+            .is_some_and(|scope| !scope.is_empty())
+    );
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_checkpoint_cannot_cross_mailbox_or_filter_scope() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "history": [], "historyId": "300",
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "100", "lease_seq": 1, "lease_object_id": "owner",
+            "history_types": ["messageAdded", "labelRemoved"],
+        }),
+    )
+    .await
+    .unwrap();
+    let equivalent = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "lease_seq": 1, "lease_object_id": "owner",
+            "history_types": ["labelRemoved", "messageAdded", "messageAdded"],
+        }),
+    )
+    .await
+    .expect("filter order and duplicates do not change logical scope");
+    assert_eq!(equivalent["effective_start_history_id"], "100");
+    let before = std::fs::read(&state_path).unwrap();
+
+    for mut input in [json!({}), json!({"start_history_id": "200"})] {
+        input["lease_seq"] = json!(2);
+        input["lease_object_id"] = json!("owner");
+        input["history_types"] = json!(["messageDeleted"]);
+        let error = invoke_history(&connector, &key, input).await.unwrap_err();
+        assert!(matches!(error, FcpError::Conflict { .. }));
+    }
+    let other_credential = CredentialId::new().to_string();
+    let (other_mailbox, other_key) =
+        history_connector(&server, &state_path, &other_credential).await;
+    let error = invoke_history(
+        &other_mailbox,
+        &other_key,
+        json!({
+            "lease_seq": 2, "lease_object_id": "owner",
+            "history_types": ["messageAdded", "labelRemoved"],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, FcpError::Conflict { .. }));
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_repeated_page_token_fails_without_checkpoint() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "history": [{"id": "101"}], "historyId": "200", "nextPageToken": "repeated",
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let result = fcp_async_core::time::timeout(
+        StdDuration::from_secs(3),
+        invoke_history(
+            &connector,
+            &key,
+            json!({"start_history_id": "100", "lease_seq": 1}),
+        ),
+    )
+    .await
+    .expect("provider pagination cycle must terminate");
+    assert!(matches!(
+        result,
+        Err(FcpError::External {
+            retryable: false,
+            ..
+        })
+    ));
+    assert!(!state_path.exists());
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_invalid_terminal_cursor_fails_without_checkpoint() {
+    for response in [
+        json!({"history": [{"id": "51"}]}),
+        json!({"history": [{"id": "51"}], "historyId": "not-a-history-id"}),
+        json!({"history": [], "historyId": "49"}),
+    ] {
+        let server = MockServer::start().await;
+        let state_path = history_state_path();
+        Mock::given(method("GET"))
+            .and(path("/users/me/history"))
+            .and(query_param("startHistoryId", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+        let result = invoke_history(
+            &connector,
+            &key,
+            json!({
+                "start_history_id": "50", "lease_seq": 1,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FcpError::External {
+                retryable: false,
+                ..
+            })
+        ));
+        assert!(!state_path.exists());
+        server.verify().await;
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_cumulative_byte_limit_does_not_publish_checkpoint() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    let page_payload = "x".repeat(5 * 1024 * 1024);
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(move |request: &wiremock::Request| {
+            let second_page = request.url.query_pairs().any(|(key, _)| key == "pageToken");
+            let mut response = json!({
+                "history": [{
+                    "id": if second_page { "102" } else { "101" },
+                    "provider_data": page_payload,
+                }],
+                "historyId": "200",
+            });
+            if !second_page {
+                response["nextPageToken"] = json!("second-large-page");
+            }
+            ResponseTemplate::new(200).set_body_json(response)
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (connector, key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let result = invoke_history(
+        &connector,
+        &key,
+        json!({
+            "start_history_id": "100", "lease_seq": 1,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(FcpError::External {
+            retryable: false,
+            ..
+        })
+    ));
+    assert!(!state_path.exists());
+    server.verify().await;
+}
+
+#[fcp_async_core::runtime::test]
+async fn invoke_sync_history_stale_writer_cannot_overwrite_newer_completion() {
+    let server = MockServer::start().await;
+    let state_path = history_state_path();
+    let old_started = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&old_started);
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "100"))
+        .respond_with(move |_request: &wiremock::Request| {
+            signal.store(true, Ordering::Release);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"history": [{"id": "101"}], "historyId": "300"}))
+                .set_delay(StdDuration::from_secs(1))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/users/me/history"))
+        .and(query_param("startHistoryId", "200"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "history": [{"id": "201"}], "historyId": "400",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (older, old_key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let (newer, new_key) = history_connector(&server, &state_path, TEST_CREDENTIAL_ID).await;
+    let mut old_request = Box::pin(invoke_history(
+        &older,
+        &old_key,
+        json!({
+            "start_history_id": "100", "lease_seq": 1, "lease_object_id": "old-owner",
+        }),
+    ));
+    fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+        fcp_async_core::select! {
+            result = &mut old_request => panic!("older request completed before overlap: {result:?}"),
+            () = async {
+                while !old_started.load(Ordering::Acquire) {
+                    fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+                }
+            } => {},
+        }
+    }).await.expect("older writer should reach the provider");
+    let newest = invoke_history(
+        &newer,
+        &new_key,
+        json!({
+            "start_history_id": "200", "lease_seq": 2, "lease_object_id": "new-owner",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(newest["acknowledged_history_id"], "200");
+    let committed = std::fs::read(&state_path).unwrap();
+    let stale = old_request.await.unwrap_err();
+    assert!(matches!(stale, FcpError::Conflict { .. }));
+    assert_eq!(std::fs::read(&state_path).unwrap(), committed);
+    assert_eq!(history_cursor_state(&state_path)["next_history_id"], "200");
+    assert_eq!(history_cursor_state(&state_path)["lease_seq"], 2);
+    server.verify().await;
 }
 
 const fn generated_approval_name(mode: Option<ApprovalMode>) -> &'static str {
