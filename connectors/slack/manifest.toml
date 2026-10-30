@@ -3,9 +3,9 @@ format = "fcp-connector-manifest"
 schema_version = "2.1"
 min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
-protocol_features = []
+protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:8f5e27c4a82b8cdda0bd53f0df3c6577ddbb765f800c14c20546d37b870657d1"
+interface_hash = "blake3-256:fcp.interface.v2:48b308c0521193bbd39c11cd0621e3beb55bfe495f903f0234de8c2ef080d636"
 
 [connector]
 id = "fcp.slack"
@@ -13,7 +13,7 @@ name = "Slack Connector"
 version = "0.1.0"
 description = "FCP connector for Slack (channels, messages, users, files, reactions, policy-gated Socket Mode events)"
 archetypes = ["operational", "streaming", "bidirectional"]
-format = "wasi"
+format = "native"
 status = "proven"
 
 [connector.state]
@@ -676,35 +676,75 @@ related = ["slack.upload_file"]
 
 # ── Events ──────────────────────────────────────────────────────
 
-[provides.events."slack.message.new"]
-description = "New Slack message event from Socket Mode after monitor-policy authorization"
+[provides.events."slack.events"]
+description = "Acknowledged feed of monitor-policy-authorized Slack events, interactions, and slash commands"
 streaming = true
 replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.events"
+
+[provides.events."slack.events".schema]
+type = "object"
+additionalProperties = false
+required = ["source_topic", "event"]
+
+[provides.events."slack.events".schema.properties.source_topic]
+type = "string"
+
+[provides.events."slack.events".schema.properties.event]
+type = "object"
+
+[provides.events."slack.message.new"]
+description = "Acknowledged new Slack message feed after monitor-policy authorization"
+streaming = true
+replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.message.new"
 
 [provides.events."slack.message.edited"]
-description = "Slack message edited event from Socket Mode after monitor-policy authorization"
+description = "Acknowledged edited Slack message feed after monitor-policy authorization"
 streaming = true
 replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.message.edited"
 
 [provides.events."slack.message.deleted"]
-description = "Slack message deleted event from Socket Mode after monitor-policy authorization"
+description = "Acknowledged deleted Slack message feed after monitor-policy authorization"
 streaming = true
 replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.message.deleted"
 
 [provides.events."slack.reaction.added"]
-description = "Slack reaction added event from Socket Mode after monitor-policy authorization"
+description = "Acknowledged added Slack reaction feed after monitor-policy authorization"
 streaming = true
 replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.reaction.added"
 
 [provides.events."slack.reaction.removed"]
-description = "Slack reaction removed event from Socket Mode after monitor-policy authorization"
+description = "Acknowledged removed Slack reaction feed after monitor-policy authorization"
 streaming = true
 replay = false
+requires_ack = true
+capability = "slack.read"
+subscribe_operation = "slack.subscribe"
+resource_uri = "slack:events:slack.reaction.removed"
 
 [event_caps]
 streaming = true
 replay = false
-min_buffer_events = 200
+min_buffer_events = 1
 
 # ── Sandbox ─────────────────────────────────────────────────────
 

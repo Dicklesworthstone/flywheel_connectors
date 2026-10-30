@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use fcp_async_core::channel::{broadcast, watch};
 use fcp_async_core::sync::RwLock;
+use fcp_core::{HealthSnapshot, HealthState, SubscribeRequest, SubscribeResponse, SubscribeResult};
 use fcp_prelude::{
     AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
     ConnectorId, CredentialId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult,
@@ -20,6 +21,7 @@ use fcp_sdk::{
     AgentId, ChannelId, ChatCoordinationAuditRecord, ChatCoordinationBackend,
     ChatCoordinationConfig, ChatCoordinationSendDecision, ChatCoordinationSendRequest, DmMode,
     InMemoryThreadOwnershipChecker, ThreadId, ThreadOwnershipChecker, normalize_slack_channel_id,
+    prelude::JsonlEventStream,
 };
 use fcp_streaming::{WsClient, WsConnection, WsMessage};
 use serde::Deserialize;
@@ -51,6 +53,8 @@ const SLACK_PROGRESS_DETAIL_MAX_CHARS: usize = 48;
 const SLACK_PROGRESS_DRAFT_MIN_THROTTLE_MS: u64 = 250;
 const SLACK_EVENTS_API_OPERATION: &str = "slack.handle_events_api";
 const SLACK_EVENTS_API_VERIFIED_SIGNATURE_RESULT: &str = "verified";
+const NATIVE_EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const NATIVE_EVENT_TOPIC: &str = "slack.events";
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 fn is_local_test_host(host: &str) -> bool {
@@ -251,6 +255,130 @@ async fn connect_socket_mode_websocket(
     WsClient::new(url).connect().await
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SlackReceiveMode {
+    #[default]
+    SocketMode,
+    EventsApi,
+}
+
+struct SlackNativeSubscription {
+    stream: JsonlEventStream,
+    stream_id: String,
+    topic: String,
+    token: std::sync::Mutex<CapabilityToken>,
+    verifier: CapabilityVerifier,
+}
+
+impl SlackNativeSubscription {
+    fn verify_authority(&self) -> FcpResult<()> {
+        let token = self
+            .token
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Slack event authority state poisoned".into(),
+            })?
+            .clone();
+        let verified = self.verifier.verify_bound(
+            token,
+            &CapabilityId::from_static("slack.read"),
+            &OperationId::from_static("slack.subscribe"),
+            &[format!("slack:events:{}", self.topic)],
+        )?;
+        let expiration =
+            verified
+                .claims()
+                .get_expiration()
+                .ok_or_else(|| FcpError::MissingField {
+                    field: "capability_token.exp".into(),
+                })?;
+        // Long-lived subscriptions must stop at the signed expiration even
+        // while the consumer is paused and no further RPC is admitted.
+        if chrono::Utc::now().timestamp() >= expiration {
+            return Err(FcpError::TokenExpired);
+        }
+        Ok(())
+    }
+
+    async fn deliver(&self, mut event: EventEnvelope) -> FcpResult<bool> {
+        self.verify_authority()?;
+        if !self.stream.is_open() {
+            return Err(slack_event_unavailable(
+                "Slack native event stream is closed",
+            ));
+        }
+        if self.topic == NATIVE_EVENT_TOPIC {
+            event.data.payload = json!({
+                "source_topic": event.topic,
+                "event": event.data.payload,
+            });
+            event.topic.clone_from(&self.topic);
+        } else if event.topic != self.topic {
+            return Ok(false);
+        }
+        event.data.zone_id = self.verifier.zone_id.clone();
+        event.requires_ack = true;
+        let mut delivery = self.stream.deliver(&event)?;
+        let result = fcp_async_core::time::timeout(NATIVE_EVENT_ACK_TIMEOUT, async {
+            loop {
+                fcp_async_core::select! {
+                    result = &mut delivery => return result,
+                    () = fcp_async_core::time::sleep(Duration::from_secs(1)) => {
+                        self.verify_authority()?;
+                    }
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(result) => {
+                result?;
+                self.verify_authority()?;
+                Ok(true)
+            }
+            Err(_) => Err(slack_event_unavailable(
+                "Slack downstream acknowledgement timed out; provider delivery was not acknowledged",
+            )),
+        }
+    }
+}
+
+fn slack_event_unavailable(message: &str) -> FcpError {
+    FcpError::ConnectorUnavailable {
+        code: 5001,
+        message: message.into(),
+    }
+}
+
+fn slack_native_topic(topic: &str) -> bool {
+    topic == NATIVE_EVENT_TOPIC || SOCKET_DEFAULT_TOPICS.contains(&topic)
+}
+
+fn slack_event_sequence(sequence: &AtomicU64) -> FcpResult<u64> {
+    sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| slack_event_unavailable("Slack event sequence exhausted"))
+}
+
+fn require_slack_event_identity(payload: &Value, envelope_id: Option<&str>) -> FcpResult<()> {
+    let identity = match payload.get("event_id") {
+        Some(value) => value.as_str(),
+        None => envelope_id,
+    };
+    if !payload.is_object()
+        || !identity.is_some_and(|value| !value.is_empty() && value.len() <= 512)
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Slack native events require a bounded provider event or envelope identifier"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 /// FCP Slack Connector.
 pub struct SlackConnector {
     base: Arc<BaseConnector>,
@@ -258,6 +386,12 @@ pub struct SlackConnector {
     socket_mode_bearer: Option<SlackAuth>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
+    configured_zone: Option<ZoneId>,
+    granted_capabilities: HashSet<CapabilityId>,
+    receive_mode: SlackReceiveMode,
+    event_stream: Option<JsonlEventStream>,
+    event_subscription: Option<Arc<SlackNativeSubscription>>,
+    start_time: Instant,
     socket_mode_running: Arc<RwLock<bool>>,
     socket_mode_task: Option<fcp_async_core::task::JoinHandle<()>>,
     socket_mode_shutdown_tx: Option<watch::Sender<bool>>,
@@ -276,11 +410,17 @@ impl SlackConnector {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(SOCKET_EVENT_BUFFER_CAPACITY);
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("slack"))),
+            base: Arc::new(BaseConnector::new(ConnectorId::from_static("fcp.slack"))),
             client: None,
             socket_mode_bearer: None,
             verifier: None,
             session_id: None,
+            configured_zone: None,
+            granted_capabilities: HashSet::new(),
+            receive_mode: SlackReceiveMode::SocketMode,
+            event_stream: None,
+            event_subscription: None,
+            start_time: Instant::now(),
             socket_mode_running: Arc::new(RwLock::new(false)),
             socket_mode_task: None,
             socket_mode_shutdown_tx: None,
@@ -306,7 +446,9 @@ impl SlackConnector {
         self
     }
 
-    /// Subscribe to emitted connector events.
+    /// Observe events already acknowledged by the native consumer.
+    ///
+    /// This diagnostic receiver never grants provider acknowledgement credit.
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<FcpResult<EventEnvelope>> {
         self.event_tx.subscribe()
@@ -316,6 +458,32 @@ impl SlackConnector {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         self.base.instance_id.as_str()
+    }
+
+    /// Attach the native JSONL transport once, before any handshake.
+    ///
+    /// # Errors
+    /// Rejects replacing a transport or attaching one during an active session.
+    pub fn attach_event_stream(&mut self, stream: JsonlEventStream) -> FcpResult<()> {
+        if self.session_id.is_some() || self.event_stream.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Slack event transport must be attached once before handshake".into(),
+            });
+        }
+        self.event_stream = Some(stream);
+        Ok(())
+    }
+
+    fn revoke_session(&mut self) {
+        if let Some(stream) = &self.event_stream {
+            stream.close();
+        }
+        self.event_subscription = None;
+        self.verifier = None;
+        self.session_id = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
     }
 
     #[must_use]
@@ -334,8 +502,31 @@ impl SlackConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        self.stop_socket_mode().await;
+        self.revoke_session();
+        self.stop_socket_mode().await?;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        self.socket_mode_bearer = None;
+        self.configured_zone = None;
+        self.progress_drafts.write().await.clear();
+        self.base.set_configured(false);
         reject_secret_config_material(&params)?;
+
+        let receive_mode = match params.get("receive_mode").and_then(Value::as_str) {
+            None | Some("socket_mode")
+                if params.get("receive_mode").is_none_or(Value::is_string) =>
+            {
+                SlackReceiveMode::SocketMode
+            }
+            Some("events_api") => SlackReceiveMode::EventsApi,
+            _ => {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "receive_mode must be socket_mode or events_api".into(),
+                });
+            }
+        };
 
         let bot_credential_id = params
             .get("credential_id")
@@ -389,6 +580,7 @@ impl SlackConnector {
 
         self.client = Some(client);
         self.socket_mode_bearer = Some(socket_mode_auth);
+        self.receive_mode = receive_mode;
         *self.subscribed_topics.write().await = Vec::new();
         *self.monitor_policy.write().await = monitor_policy.clone();
         self.progress_drafts.write().await.clear();
@@ -398,6 +590,7 @@ impl SlackConnector {
 
         Ok(json!({
             "status": "configured",
+            "receive_mode": if receive_mode == SlackReceiveMode::SocketMode { "socket_mode" } else { "events_api" },
             "auth_mode": "credential_id",
             "credential_id": bot_credential_id.to_string(),
             "socket_mode_auth": if socket_mode_credential_id.is_some() { "socket_mode_credential_id" } else { "bot_credential_id_fallback" },
@@ -413,12 +606,38 @@ impl SlackConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.revoke_session();
+        self.stop_socket_mode().await?;
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid handshake request: {e}"),
             })?;
 
+        if !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0") {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Slack requires FCP protocol version 2.0".into(),
+            });
+        }
+        if !matches!(req.zone.as_str(), "z:owner" | "z:private" | "z:work") {
+            return Err(FcpError::ZoneViolation {
+                source_zone: req.zone.to_string(),
+                target_zone: "z:work".into(),
+                message: "Slack session zone is not allowed by the manifest".into(),
+            });
+        }
+        if let Some(configured_zone) = &self.configured_zone
+            && configured_zone != &req.zone
+        {
+            return Err(FcpError::ZoneViolation {
+                source_zone: req.zone.to_string(),
+                target_zone: configured_zone.to_string(),
+                message: "Slack zone changes require reconfiguration".into(),
+            });
+        }
+        self.configured_zone = Some(req.zone.clone());
+        self.granted_capabilities = req.capabilities_requested.iter().cloned().collect();
         self.verifier = Some(CapabilityVerifier::new(
             req.host_public_key,
             req.zone.clone(),
@@ -447,8 +666,8 @@ impl SlackConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: SOCKET_EVENT_BUFFER_CAPACITY as u32,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
             auth_caps: None,
             op_catalog_hash: None,
@@ -483,6 +702,40 @@ impl SlackConnector {
             },
             "monitor_policy": monitor_policy,
         }))
+    }
+
+    /// Canonical native health, including the actual instance for token issuance.
+    ///
+    /// # Errors
+    /// Returns [`FcpError`] if the health snapshot cannot be serialized.
+    pub async fn handle_native_health(&self) -> FcpResult<Value> {
+        let status = if self.client.is_some() && self.session_id.is_some() {
+            HealthState::Ready
+        } else if self.client.is_some() {
+            HealthState::Degraded {
+                reason: "handshake pending".into(),
+            }
+        } else {
+            HealthState::Starting
+        };
+        serde_json::to_value(HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(json!({
+                "configured": self.client.is_some(),
+                "handshaken": self.session_id.is_some(),
+                "instance_id": self.base.instance_id,
+                "zone_id": self.verifier.as_ref().map(|verifier| &verifier.zone_id),
+                "receive_mode": if self.receive_mode == SlackReceiveMode::SocketMode { "socket_mode" } else { "events_api" },
+                "socket_mode_running": *self.socket_mode_running.read().await,
+                "event_stream_open": self.event_stream.as_ref().is_some_and(JsonlEventStream::is_open),
+                "event_ack_timeout_ms": NATIVE_EVENT_ACK_TIMEOUT.as_millis(),
+            })),
+            rate_limit: None,
+        }).map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Slack native health".into(),
+        })
     }
 
     fn operations_info() -> Vec<OperationInfo> {
@@ -874,12 +1127,24 @@ impl SlackConnector {
     pub async fn handle_introspect(&self) -> FcpResult<serde_json::Value> {
         let introspection = Introspection {
             operations: Self::operations_info(),
-            events: SOCKET_DEFAULT_TOPICS
-                .iter()
+            events: std::iter::once(NATIVE_EVENT_TOPIC)
+                .chain(SOCKET_DEFAULT_TOPICS.iter().copied())
                 .map(|topic| EventInfo {
-                    topic: (*topic).to_string(),
-                    schema: json!({ "type": "object" }),
-                    requires_ack: false,
+                    topic: topic.to_string(),
+                    schema: if topic == NATIVE_EVENT_TOPIC {
+                        json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["source_topic", "event"],
+                            "properties": {
+                                "source_topic": { "type": "string" },
+                                "event": { "type": "object" }
+                            }
+                        })
+                    } else {
+                        json!({ "type": "object" })
+                    },
+                    requires_ack: true,
                 })
                 .collect(),
             resource_types: vec![],
@@ -887,8 +1152,8 @@ impl SlackConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: SOCKET_EVENT_BUFFER_CAPACITY as u32,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
         };
 
@@ -1018,22 +1283,112 @@ impl SlackConnector {
             return Err(FcpError::NotHandshaken);
         }
 
-        let topics = parse_subscribe_topics(&params);
+        if !self
+            .granted_capabilities
+            .contains(&CapabilityId::from_static("slack.read"))
         {
-            let mut subscribed = self.subscribed_topics.write().await;
-            (*subscribed).clone_from(&topics);
+            return Err(FcpError::CapabilityDenied {
+                capability: "slack.read".into(),
+                reason: "Slack read authority was not negotiated in this session".into(),
+            });
         }
-
-        let started = self.ensure_socket_mode_running().await?;
-        Ok(json!({
-            "confirmed_topics": topics,
-            "replay_supported": false,
-            "buffer": {
-                "min_events": SOCKET_EVENT_BUFFER_CAPACITY,
-                "overflow": "stream.reset"
+        let stream_id = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires a host-issued stream_id".into(),
+            })?
+            .to_owned();
+        let request: SubscribeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid Slack subscribe request".into(),
+            })?;
+        if request.r#type != "subscribe"
+            || request.topics.len() != 1
+            || !request
+                .topics
+                .first()
+                .is_some_and(|topic| slack_native_topic(topic))
+            || request.since.is_some()
+            || request.max_events_per_sec.is_some()
+            || request.batch_ms.is_some()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Slack native subscribe requires one exact topic without replay, batching, or rate options".into(),
+            });
+        }
+        let token = request
+            .capability_token
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires capability_token".into(),
+            })?;
+        let stream = self
+            .event_stream
+            .as_ref()
+            .ok_or_else(|| slack_event_unavailable("Slack native event transport is unavailable"))?
+            .clone();
+        let topic = request.topics[0].clone();
+        let subscription = Arc::new(SlackNativeSubscription {
+            stream: stream.clone(),
+            stream_id: stream_id.clone(),
+            topic: topic.clone(),
+            token: std::sync::Mutex::new(token),
+            verifier: self
+                .verifier
+                .as_ref()
+                .ok_or(FcpError::NotHandshaken)?
+                .clone(),
+        });
+        subscription.verify_authority()?;
+        if !stream.is_open() && *self.socket_mode_running.read().await {
+            return Err(slack_event_unavailable(
+                "Previous Slack event stream is still draining",
+            ));
+        }
+        stream.open(&stream_id, &topic, request.window_size.unwrap_or(1))?;
+        if let Some(active) = self
+            .event_subscription
+            .as_ref()
+            .filter(|active| active.stream_id == stream_id && active.topic == topic)
+        {
+            let token = subscription
+                .token
+                .lock()
+                .map_err(|_| FcpError::Internal {
+                    message: "Slack event authority state poisoned".into(),
+                })?
+                .clone();
+            *active.token.lock().map_err(|_| FcpError::Internal {
+                message: "Slack event authority state poisoned".into(),
+            })? = token;
+        } else {
+            self.event_subscription = Some(subscription);
+        }
+        *self.subscribed_topics.write().await = vec![topic.clone()];
+        if self.receive_mode == SlackReceiveMode::SocketMode {
+            if let Err(error) = self.ensure_socket_mode_running().await {
+                stream.close();
+                self.event_subscription = None;
+                return Err(error);
+            }
+        }
+        serde_json::to_value(SubscribeResponse {
+            r#type: "response".into(),
+            id: request.id,
+            result: SubscribeResult {
+                confirmed_topics: vec![topic],
+                cursors: Default::default(),
+                replay_supported: false,
+                buffer: None,
             },
-            "connection_status": if started { "started" } else { "already_running" }
-        }))
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Slack subscribe response".into(),
+        })
     }
 
     async fn ensure_socket_mode_running(&mut self) -> FcpResult<bool> {
@@ -1044,8 +1399,11 @@ impl SlackConnector {
             return Ok(false);
         }
 
-        self.stop_socket_mode().await;
+        self.stop_socket_mode().await?;
 
+        let subscription = self.event_subscription.clone().ok_or_else(|| {
+            slack_event_unavailable("Slack Socket Mode requires an authorized native subscription")
+        })?;
         let http_client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let socket_mode_auth =
             self.socket_mode_bearer
@@ -1067,7 +1425,6 @@ impl SlackConnector {
         let base = self.base.clone();
         let socket_mode_running = self.socket_mode_running.clone();
         let next_event_seq = self.next_event_seq.clone();
-        let subscribed_topics = self.subscribed_topics.clone();
         let monitor_policy = self.monitor_policy.clone();
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -1079,7 +1436,10 @@ impl SlackConnector {
             let mut reconnect_delay_ms = SOCKET_RECONNECT_MIN_MS;
 
             loop {
-                if *shutdown_rx.borrow() {
+                if *shutdown_rx.borrow()
+                    || !subscription.stream.is_open()
+                    || subscription.verify_authority().is_err()
+                {
                     break;
                 }
 
@@ -1101,98 +1461,145 @@ impl SlackConnector {
                     }
                 };
 
+                if !subscription.stream.is_open() || subscription.verify_authority().is_err() {
+                    break;
+                }
                 match connect_socket_mode_websocket(&ws_url).await {
                     Ok(mut ws_stream) => {
                         reconnect_delay_ms = SOCKET_RECONNECT_MIN_MS;
 
                         loop {
-                            fcp_async_core::select! {
-                                changed = shutdown_rx.changed() => {
-                                    if changed.is_ok() && *shutdown_rx.borrow() {
-                                        let _ = ws_stream.close().await;
-                                        break;
-                                    }
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                },
-                                inbound = ws_stream.recv() => {
-                                    let frame = match inbound {
-                                        Ok(Some(frame)) => frame,
-                                        Ok(None) => break,
-                                        Err(err) => {
-                                            warn!("Socket Mode websocket receive error: {err}");
-                                            break;
+                            let inbound = {
+                                // Keep an incomplete frame read alive across authority
+                                // checks; dropping it on every timer tick can lose bytes.
+                                let mut receive = Box::pin(ws_stream.recv());
+                                loop {
+                                    fcp_async_core::select! {
+                                        inbound = &mut receive => break Some(inbound),
+                                        () = fcp_async_core::time::sleep(Duration::from_secs(1)) => {
+                                            if !subscription.stream.is_open() || subscription.verify_authority().is_err() {
+                                                break None;
+                                            }
+                                        },
+                                        changed = shutdown_rx.changed() => {
+                                            if changed.is_err() || *shutdown_rx.borrow() {
+                                                break None;
+                                            }
                                         }
+                                    }
+                                }
+                            };
+                            let Some(inbound) = inbound else {
+                                break;
+                            };
+                            let frame = match inbound {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) => break,
+                                Err(err) => {
+                                    warn!("Socket Mode websocket receive error: {err}");
+                                    break;
+                                }
+                            };
+
+                            match frame {
+                                WsMessage::Text(text) => {
+                                    let parsed_frame: SocketModeFrame =
+                                        match serde_json::from_str(&text) {
+                                            Ok(frame) => frame,
+                                            Err(err) => {
+                                                warn!("Socket Mode frame parse failed: {err}");
+                                                continue;
+                                            }
+                                        };
+
+                                    if parsed_frame.frame_type == "hello" {
+                                        continue;
+                                    }
+                                    if parsed_frame.frame_type == "disconnect" {
+                                        break;
+                                    }
+                                    let Some(envelope_id) = parsed_frame
+                                        .envelope_id
+                                        .as_deref()
+                                        .filter(|value| !value.is_empty() && value.len() <= 512)
+                                    else {
+                                        warn!(
+                                            "Socket Mode event omitted a bounded envelope identity"
+                                        );
+                                        break;
                                     };
-
-                                    match frame {
-                                        WsMessage::Text(text) => {
-                                            let parsed_frame: SocketModeFrame = match serde_json::from_str(&text) {
-                                                Ok(frame) => frame,
-                                                Err(err) => {
-                                                    warn!("Socket Mode frame parse failed: {err}");
-                                                    continue;
-                                                }
-                                            };
-
-                                            if parsed_frame.frame_type == "hello" {
-                                                continue;
-                                            }
-
-                                            if let Some(envelope_id) = parsed_frame.envelope_id.as_deref() {
-                                                let ack = json!({ "envelope_id": envelope_id }).to_string();
-                                                if let Err(err) = ws_stream.send_text(ack).await {
-                                                    warn!("Socket Mode ack send failed: {err}");
-                                                    break;
-                                                }
-                                            }
-
-                                            let payload = parsed_frame.payload.unwrap_or_else(|| json!({}));
-                                            let topic = socket_frame_topic(&parsed_frame.frame_type, &payload);
-                                            let allowed = {
-                                                let subscribed = subscribed_topics.read().await;
-                                                topic_allowed(&topic, subscribed.as_slice())
-                                            };
-                                            if !allowed {
-                                                continue;
-                                            }
-                                            let policy_allowed = {
-                                                let policy = monitor_policy.read().await;
-                                                policy.allows_payload(&topic, &payload)
-                                            };
-                                            if !policy_allowed {
-                                                info!(%topic, "Slack Socket Mode event suppressed by monitor policy");
-                                                continue;
-                                            }
-
-                                            let seq = next_event_seq.fetch_add(1, Ordering::Relaxed);
-                                            let event = socket_frame_to_event(
-                                                &parsed_frame.frame_type,
-                                                parsed_frame.envelope_id.as_deref(),
-                                                &payload,
-                                                &connector_id,
-                                                &instance_id,
-                                                seq,
+                                    let Some(payload) = parsed_frame.payload else {
+                                        warn!("Socket Mode event omitted its payload");
+                                        break;
+                                    };
+                                    let topic =
+                                        socket_frame_topic(&parsed_frame.frame_type, &payload);
+                                    let allowed = subscription.topic == NATIVE_EVENT_TOPIC
+                                        || subscription.topic == topic;
+                                    let policy_allowed = {
+                                        let policy = monitor_policy.read().await;
+                                        policy.allows_payload(&topic, &payload)
+                                    };
+                                    if allowed && policy_allowed {
+                                        if require_slack_event_identity(&payload, Some(envelope_id))
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                "Socket Mode event has no stable replay identity"
                                             );
-                                            base.record_event();
-                                            if event_tx.send(Ok(event)).is_err() {
-                                                warn!("Socket Mode event dropped: no active subscribers");
-                                            }
-                                        }
-                                        WsMessage::Ping(data) => {
-                                            if let Err(err) = ws_stream.send(WsMessage::Pong(data)).await {
-                                                warn!("Socket Mode pong send failed: {err}");
-                                                break;
-                                            }
-                                        }
-                                        WsMessage::Close(_frame) => {
                                             break;
                                         }
-                                        WsMessage::Binary(_) | WsMessage::Pong(_) => {
-                                            // ignore non-text control/data frames for socket-mode events
+                                        let seq = match slack_event_sequence(&next_event_seq) {
+                                            Ok(seq) => seq,
+                                            Err(_) => break,
+                                        };
+                                        let mut event = socket_frame_to_event(
+                                            &parsed_frame.frame_type,
+                                            Some(envelope_id),
+                                            &payload,
+                                            &connector_id,
+                                            &instance_id,
+                                            seq,
+                                        );
+                                        event.data.zone_id = subscription.verifier.zone_id.clone();
+                                        event.requires_ack = true;
+                                        if subscription.deliver(event.clone()).await.is_err() {
+                                            warn!(
+                                                "Socket Mode delivery was not acknowledged downstream"
+                                            );
+                                            break;
                                         }
+                                        base.record_event();
+                                        // Explicit local observers do not grant provider credit.
+                                        let _ = event_tx.send(Ok(event));
+                                    } else {
+                                        info!(%topic, "Slack Socket Mode event suppressed by monitor policy");
                                     }
+                                    if *shutdown_rx.borrow()
+                                        || !subscription.stream.is_open()
+                                        || subscription.verify_authority().is_err()
+                                    {
+                                        break;
+                                    }
+                                    // ACK accepted events only after the host's exact durable
+                                    // consumer ACK. Policy-filtered events need no custody.
+                                    let ack = json!({ "envelope_id": envelope_id }).to_string();
+                                    if ws_stream.send_text(ack).await.is_err() {
+                                        warn!("Socket Mode provider acknowledgement failed");
+                                        break;
+                                    }
+                                }
+                                WsMessage::Ping(data) => {
+                                    if let Err(err) = ws_stream.send(WsMessage::Pong(data)).await {
+                                        warn!("Socket Mode pong send failed: {err}");
+                                        break;
+                                    }
+                                }
+                                WsMessage::Close(_frame) => {
+                                    break;
+                                }
+                                WsMessage::Binary(_) | WsMessage::Pong(_) => {
+                                    // ignore non-text control/data frames for socket-mode events
                                 }
                             }
                         }
@@ -1214,6 +1621,7 @@ impl SlackConnector {
                 reconnect_delay_ms = (reconnect_delay_ms * 2).min(SOCKET_RECONNECT_MAX_MS);
             }
 
+            subscription.stream.close();
             *socket_mode_running.write().await = false;
             info!("Slack Socket Mode event loop stopped");
         });
@@ -1222,18 +1630,31 @@ impl SlackConnector {
         Ok(true)
     }
 
-    async fn stop_socket_mode(&mut self) {
+    async fn stop_socket_mode(&mut self) -> FcpResult<()> {
         if let Some(shutdown_tx) = self.socket_mode_shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
 
-        if let Some(task) = self.socket_mode_task.take() {
-            if let Err(err) = task.await {
-                warn!("Socket Mode task join failed: {err}");
+        if let Some(mut task) = self.socket_mode_task.take() {
+            if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_err()
+                {
+                    self.socket_mode_task = Some(task);
+                    return Err(slack_event_unavailable(
+                        "Slack Socket Mode worker is still draining",
+                    ));
+                }
             }
         }
 
         *self.socket_mode_running.write().await = false;
+        Ok(())
     }
 
     /// Handle invoke method.
@@ -1408,8 +1829,14 @@ impl SlackConnector {
             }));
         }
 
-        let seq = self.next_event_seq.fetch_add(1, Ordering::Relaxed);
-        let event = socket_frame_to_event(
+        let subscription = self.event_subscription.as_ref().ok_or_else(|| {
+            slack_event_unavailable(
+                "Slack Events API delivery requires an authorized native consumer",
+            )
+        })?;
+        require_slack_event_identity(payload, None)?;
+        let seq = slack_event_sequence(&self.next_event_seq)?;
+        let mut event = socket_frame_to_event(
             "events_api",
             payload.get("event_id").and_then(Value::as_str),
             payload,
@@ -1417,15 +1844,20 @@ impl SlackConnector {
             &self.base.instance_id,
             seq,
         );
-        self.base.record_event();
-        if self.event_tx.send(Ok(event.clone())).is_err() {
-            warn!("Slack Events API event dropped: no active subscribers");
+        event.data.zone_id = subscription.verifier.zone_id.clone();
+        event.requires_ack = true;
+        let delivered = subscription.deliver(event.clone()).await?;
+        if delivered {
+            self.base.record_event();
+            // An observer is diagnostic only; the native ACK above is the
+            // production delivery boundary.
+            let _ = self.event_tx.send(Ok(event.clone()));
         }
 
         Ok(json!({
-            "status": "event_emitted",
+            "status": if delivered { "event_emitted" } else { "event_filtered" },
             "acknowledged": true,
-            "event_emitted": true,
+            "event_emitted": delivered,
             "event_topic": topic,
             "signature_result": signature_result,
             "sender_policy_decision": "allowed",
@@ -2163,11 +2595,15 @@ impl SlackConnector {
         &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        self.stop_socket_mode().await;
+        self.revoke_session();
+        self.stop_socket_mode().await?;
         self.progress_drafts.write().await.clear();
-        if let Some(client) = &self.client {
+        if let Some(client) = self.client.take() {
             client.shutdown();
         }
+        self.socket_mode_bearer = None;
+        self.configured_zone = None;
+        self.base.set_configured(false);
         info!("Slack connector shutting down");
         Ok(json!({ "status": "shutdown" }))
     }
@@ -3623,9 +4059,433 @@ mod tests {
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
     use fcp_prelude::CapabilityConstraints;
+    use fcp_sdk::prelude::JsonlWriter;
+    use std::future::Future;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, atomic::AtomicBool};
+    use std::task::Poll;
     use std::thread::{self, JoinHandle};
+
+    struct NativeCapture {
+        stream: JsonlEventStream,
+        frames: Arc<Mutex<Vec<Value>>>,
+        auto_ack: Arc<AtomicBool>,
+    }
+
+    struct NativeCaptureWriter {
+        buffer: Vec<u8>,
+        stream: Arc<Mutex<Option<JsonlEventStream>>>,
+        frames: Arc<Mutex<Vec<Value>>>,
+        auto_ack: Arc<AtomicBool>,
+    }
+
+    impl Write for NativeCaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buffer.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let frame: Value =
+                serde_json::from_slice(&self.buffer).map_err(std::io::Error::other)?;
+            self.buffer.clear();
+            self.frames.lock().unwrap().push(frame.clone());
+            if self.auto_ack.load(Ordering::SeqCst) {
+                let event = &frame["params"]["event"];
+                self.stream
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .acknowledge(json!({
+                        "stream_id": frame["params"]["stream_id"],
+                        "ack": {
+                            "type": "ack", "topic": event["topic"],
+                            "seqs": [event["seq"]], "cursors": [event["cursor"]],
+                        }
+                    }))
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        }
+    }
+
+    async fn native_test_connector() -> (SlackConnector, Ed25519SigningKey, NativeCapture) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let auto_ack = Arc::new(AtomicBool::new(true));
+        let slot = Arc::new(Mutex::new(None));
+        let stream = JsonlEventStream::new(JsonlWriter::new(NativeCaptureWriter {
+            buffer: Vec::new(),
+            stream: slot.clone(),
+            frames: frames.clone(),
+            auto_ack: auto_ack.clone(),
+        }));
+        *slot.lock().unwrap() = Some(stream.clone());
+        let mut connector = SlackConnector::new();
+        connector.attach_event_stream(stream.clone()).unwrap();
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+                "base_url": "http://localhost:9999",
+                "monitor_policy": { "require_mention": false },
+            }))
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0", "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+            }))
+            .await
+            .unwrap();
+        (
+            connector,
+            key,
+            NativeCapture {
+                stream,
+                frames,
+                auto_ack,
+            },
+        )
+    }
+
+    fn native_token(
+        key: &Ed25519SigningKey,
+        instance: &str,
+        operation: &str,
+        resource: &str,
+        expires_after: i64,
+    ) -> CapabilityToken {
+        let constraints = CapabilityConstraints {
+            resource_allow: vec![resource.into()],
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id("slack.read")
+                .zone_id("z:work")
+                .principal("user:test")
+                .operations(&[operation])
+                .issuer("node:test")
+                .target_instance(instance)
+                .validity(
+                    now - Duration::seconds(60),
+                    now + Duration::seconds(expires_after),
+                )
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(key)
+                .unwrap(),
+        )
+    }
+
+    fn native_subscribe_request(connector: &SlackConnector, key: &Ed25519SigningKey) -> Value {
+        json!({
+            "type": "subscribe", "id": "subscribe-1", "stream_id": "slack-native-test",
+            "topics": ["slack.events"], "window_size": 1,
+            "capability_token": native_token(key, connector.instance_id(), "slack.subscribe", "slack:events:slack.events", 3600),
+        })
+    }
+
+    fn native_callback_payload() -> Value {
+        json!({
+            "type": "event_callback", "event_id": "Ev-native-1", "team_id": "T1",
+            "event": { "type": "message", "user": "U1", "channel": "C1", "text": "hello" }
+        })
+    }
+
+    fn acknowledge_capture(capture: &NativeCapture, index: usize) {
+        let frame = capture.frames.lock().unwrap()[index].clone();
+        let event = &frame["params"]["event"];
+        capture.stream.acknowledge(json!({
+            "stream_id": frame["params"]["stream_id"],
+            "ack": { "type": "ack", "topic": event["topic"], "seqs": [event["seq"]], "cursors": [event["cursor"]] },
+        })).unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_subscription_enforces_exact_authority_and_request_shape() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        let base = native_subscribe_request(&connector, &key);
+        for change in [
+            json!({"topics": ["slack.*"]}),
+            json!({"topics": []}),
+            json!({"topics": ["slack.events", "slack.message.new"]}),
+            json!({"since": "Ev-old"}),
+            json!({"batch_ms": 1}),
+            json!({"max_events_per_sec": 1}),
+            json!({"window_size": 65}),
+            json!({"capability_token": null}),
+            json!({"stream_id": "bad/id"}),
+        ] {
+            let mut request = base.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            assert!(connector.handle_subscribe(request).await.is_err());
+            assert!(!capture.stream.is_open());
+        }
+        for token in [
+            native_token(
+                &key,
+                "wrong-instance",
+                "slack.subscribe",
+                "slack:events:slack.events",
+                3600,
+            ),
+            native_token(
+                &key,
+                connector.instance_id(),
+                "slack.handle_events_api",
+                "slack:events:slack.events",
+                3600,
+            ),
+            native_token(
+                &key,
+                connector.instance_id(),
+                "slack.subscribe",
+                "slack:events:slack.message.new",
+                3600,
+            ),
+            native_token(
+                &key,
+                connector.instance_id(),
+                "slack.subscribe",
+                "slack:events:slack.events",
+                -1,
+            ),
+            native_token(
+                &Ed25519SigningKey::generate(),
+                connector.instance_id(),
+                "slack.subscribe",
+                "slack:events:slack.events",
+                3600,
+            ),
+        ] {
+            let mut request = base.clone();
+            request["capability_token"] = serde_json::to_value(token).unwrap();
+            assert!(connector.handle_subscribe(request).await.is_err());
+            assert!(!capture.stream.is_open());
+        }
+        connector.granted_capabilities.clear();
+        assert!(matches!(
+            connector.handle_subscribe(base.clone()).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        connector
+            .granted_capabilities
+            .insert(CapabilityId::from_static("slack.read"));
+        let response = connector.handle_subscribe(base).await.unwrap();
+        assert_eq!(
+            response["result"]["confirmed_topics"],
+            json!(["slack.events"])
+        );
+        assert!(!*connector.socket_mode_running.read().await);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_events_api_requires_consumer_and_exact_downstream_ack() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        let _observer = connector.subscribe_events();
+        let payload = native_callback_payload();
+        assert!(matches!(
+            connector
+                .handle_verified_events_api_callback(&payload, "verified")
+                .await,
+            Err(FcpError::ConnectorUnavailable { .. })
+        ));
+        assert_eq!(connector.base.metrics().events_emitted, 0);
+        connector
+            .handle_subscribe(native_subscribe_request(&connector, &key))
+            .await
+            .unwrap();
+        capture.auto_ack.store(false, Ordering::SeqCst);
+        let mut delivery =
+            Box::pin(connector.handle_verified_events_api_callback(&payload, "verified"));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(delivery.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(capture.frames.lock().unwrap().len(), 1);
+        let frame = capture.frames.lock().unwrap()[0].clone();
+        let event = &frame["params"]["event"];
+        assert_eq!(event["topic"], "slack.events");
+        assert_eq!(event["cursor"], "Ev-native-1");
+        assert_eq!(event["data"]["connector_id"], "fcp.slack");
+        assert_eq!(event["data"]["zone_id"], "z:work");
+        assert_eq!(
+            event["data"]["payload"]["source_topic"],
+            "slack.message.new"
+        );
+        assert_eq!(event["data"]["payload"]["event"], payload);
+        assert_eq!(connector.base.metrics().events_emitted, 0);
+        assert!(capture.stream.acknowledge(json!({
+            "stream_id": "slack-native-test",
+            "ack": { "type": "ack", "topic": "slack.events", "seqs": [event["seq"]], "cursors": ["wrong-cursor"] }
+        })).is_err());
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(delivery.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        acknowledge_capture(&capture, 0);
+        let result = delivery.await.unwrap();
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(result["event_emitted"], true);
+        assert_eq!(connector.base.metrics().events_emitted, 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_failed_lifecycle_attempt_fails_pending_delivery() {
+        for configure in [true, false] {
+            let (mut connector, key, capture) = native_test_connector().await;
+            connector
+                .handle_subscribe(native_subscribe_request(&connector, &key))
+                .await
+                .unwrap();
+            capture.auto_ack.store(false, Ordering::SeqCst);
+            let subscription = connector.event_subscription.clone().unwrap();
+            let event = socket_frame_to_event(
+                "events_api",
+                Some("envelope"),
+                &native_callback_payload(),
+                &connector.base.id,
+                &connector.base.instance_id,
+                1,
+            );
+            let mut pending = Box::pin(subscription.deliver(event));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let result = if configure {
+                connector.handle_configure(json!({})).await
+            } else {
+                connector.handle_handshake(json!({})).await
+            };
+            assert!(result.is_err());
+            assert!(pending.await.is_err());
+            assert!(!capture.stream.is_open());
+            assert!(connector.verifier.is_none());
+            assert!(connector.granted_capabilities.is_empty());
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_subscription_renewal_preserves_pending_credit() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        let request = native_subscribe_request(&connector, &key);
+        connector.handle_subscribe(request.clone()).await.unwrap();
+        capture.auto_ack.store(false, Ordering::SeqCst);
+        let subscription = connector.event_subscription.clone().unwrap();
+        let event = socket_frame_to_event(
+            "events_api",
+            Some("envelope"),
+            &native_callback_payload(),
+            &connector.base.id,
+            &connector.base.instance_id,
+            1,
+        );
+        let mut pending = Box::pin(subscription.deliver(event.clone()));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        connector.handle_subscribe(request).await.unwrap();
+        assert!(subscription.deliver(event).await.is_err());
+        assert_eq!(capture.frames.lock().unwrap().len(), 1);
+        acknowledge_capture(&capture, 0);
+        assert!(pending.await.unwrap());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_health_exposes_instance_and_shutdown_revokes_authority() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        connector
+            .handle_subscribe(native_subscribe_request(&connector, &key))
+            .await
+            .unwrap();
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_native_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
+        assert_eq!(
+            health.details.unwrap()["instance_id"],
+            connector.instance_id()
+        );
+        connector.handle_shutdown(json!({})).await.unwrap();
+        assert!(!capture.stream.is_open());
+        let health = connector.handle_native_health().await.unwrap();
+        assert_eq!(health["details"]["configured"], false);
+        assert_eq!(health["details"]["handshaken"], false);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_handshake_rejects_protocol_zone_and_cross_zone_reuse() {
+        let (mut connector, key, capture) = native_test_connector().await;
+        connector
+            .handle_subscribe(native_subscribe_request(&connector, &key))
+            .await
+            .unwrap();
+        let handshake = json!({
+            "protocol_version": "2.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+        });
+        for change in [
+            json!({"protocol_version": "1.0.0"}),
+            json!({"zone": "z:community"}),
+            json!({"zone": "z:private"}),
+        ] {
+            let mut request = handshake.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            assert!(connector.handle_handshake(request).await.is_err());
+            assert!(!capture.stream.is_open());
+            assert!(connector.verifier.is_none());
+            assert!(connector.granted_capabilities.is_empty());
+        }
+        connector.handle_handshake(handshake.clone()).await.unwrap();
+        connector
+            .handle_configure(json!({
+                "credential_id": CredentialId::new().to_string(),
+                "receive_mode": "events_api",
+            }))
+            .await
+            .unwrap();
+        let mut next_zone = handshake;
+        next_zone["zone"] = json!("z:private");
+        connector.handle_handshake(next_zone).await.unwrap();
+        assert_eq!(
+            connector.verifier.as_ref().unwrap().zone_id.as_str(),
+            "z:private"
+        );
+    }
+
+    #[test]
+    fn native_identity_rejects_unstable_or_malformed_provider_identifiers() {
+        assert!(require_slack_event_identity(&json!({}), None).is_err());
+        assert!(require_slack_event_identity(&json!({"event_id": ""}), Some("envelope")).is_err());
+        assert!(require_slack_event_identity(&json!({"event_id": 123}), Some("envelope")).is_err());
+        assert!(require_slack_event_identity(&json!([]), Some("envelope")).is_err());
+        assert!(require_slack_event_identity(&json!({}), Some("envelope")).is_ok());
+        assert!(
+            require_slack_event_identity(&json!({"event_id": "event"}), Some("envelope")).is_ok()
+        );
+        assert!(slack_event_sequence(&AtomicU64::new(u64::MAX)).is_err());
+    }
 
     #[test]
     fn validate_slack_base_url_accepts_slack_com() {
@@ -3868,7 +4728,7 @@ mod tests {
         instance_id: Option<&str>,
     ) -> serde_json::Value {
         let req = SimulateRequest::new(
-            ConnectorId::from_static("slack"),
+            ConnectorId::from_static("fcp.slack"),
             OperationId::from_static(operation),
             ZoneId::work(),
             input,
@@ -4000,7 +4860,7 @@ mod tests {
         let mut connector = SlackConnector::new();
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -4160,7 +5020,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -4201,7 +5061,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -4245,7 +5105,7 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -4283,7 +5143,7 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -4323,7 +5183,7 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -5006,7 +5866,7 @@ mod tests {
         let result = connector.handle_introspect().await.unwrap();
         let events = result["events"].as_array().unwrap();
 
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
         let topics: Vec<&str> = events
             .iter()
             .map(|e| e["topic"].as_str().unwrap())
@@ -5016,6 +5876,17 @@ mod tests {
         assert!(topics.contains(&"slack.message.deleted"));
         assert!(topics.contains(&"slack.reaction.added"));
         assert!(topics.contains(&"slack.reaction.removed"));
+        assert!(topics.contains(&"slack.events"));
+        assert!(events.iter().all(|event| event["requires_ack"] == true));
+        let aggregate = events
+            .iter()
+            .find(|event| event["topic"] == "slack.events")
+            .unwrap();
+        assert_eq!(aggregate["schema"]["additionalProperties"], false);
+        assert_eq!(
+            aggregate["schema"]["required"],
+            json!(["source_topic", "event"])
+        );
     }
 
     #[fcp_async_core::runtime::test]
@@ -5026,10 +5897,8 @@ mod tests {
         let event_caps = &result["event_caps"];
         assert!(event_caps["streaming"].as_bool().unwrap());
         assert!(!event_caps["replay"].as_bool().unwrap());
-        assert_eq!(
-            event_caps["min_buffer_events"].as_u64().unwrap(),
-            SOCKET_EVENT_BUFFER_CAPACITY as u64
-        );
+        assert!(event_caps["requires_ack"].as_bool().unwrap());
+        assert_eq!(event_caps["min_buffer_events"].as_u64().unwrap(), 1);
     }
 
     // ── Helper function tests ────────────────────────────────────
@@ -5560,7 +6429,7 @@ mod tests {
 
     #[test]
     fn test_socket_frame_to_event_sets_thread_info_from_thread_ts() {
-        let connector_id = ConnectorId::from_static("slack");
+        let connector_id = ConnectorId::from_static("fcp.slack");
         let instance_id = fcp_core::InstanceId::new();
         let payload = json!({
             "event": {
@@ -5590,7 +6459,7 @@ mod tests {
 
     #[test]
     fn test_socket_frame_to_event_ignores_invalid_thread_ts() {
-        let connector_id = ConnectorId::from_static("slack");
+        let connector_id = ConnectorId::from_static("fcp.slack");
         let instance_id = fcp_core::InstanceId::new();
         let payload = json!({
             "event": {

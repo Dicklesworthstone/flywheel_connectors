@@ -207,7 +207,7 @@ async fn setup_live_connector(connector: &mut SlackConnector, token: &str) -> Ed
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -373,7 +373,7 @@ async fn live_error_mapping_invalid_token() {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],

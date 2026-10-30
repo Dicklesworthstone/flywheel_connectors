@@ -46,6 +46,7 @@ use wiremock::{
     matchers::{method, path},
 };
 
+use fcp_sdk::prelude::{JsonlEventStream, JsonlWriter};
 use fcp_sdk::{
     AgentId, ChatCoordinationBackend, ClaimKey, ClaimOutcome, InMemoryThreadOwnershipChecker,
     ThreadOwnershipChecker,
@@ -426,7 +427,7 @@ async fn setup_handshake(connector: &mut SlackConnector, caps: &[&str]) -> Ed255
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
@@ -448,6 +449,103 @@ async fn setup_configure(connector: &mut SlackConnector, base_url: &str) {
         }))
         .await
         .expect("configure should succeed");
+}
+
+const NATIVE_TEST_STREAM_ID: &str = "slack-integration-stream";
+
+struct NativeTestWriter {
+    pending: Vec<u8>,
+    frames: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Write for NativeTestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let frame = serde_json::from_slice(&self.pending).map_err(io::Error::other)?;
+        self.frames.lock().expect("capture frame lock").push(frame);
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+struct NativeTestTransport {
+    stream: JsonlEventStream,
+    frames: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl NativeTestTransport {
+    fn attach(connector: &mut SlackConnector) -> Self {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let stream = JsonlEventStream::new(JsonlWriter::new(NativeTestWriter {
+            pending: Vec::new(),
+            frames: Arc::clone(&frames),
+        }));
+        connector
+            .attach_event_stream(stream.clone())
+            .expect("attach transport before handshake");
+        Self { stream, frames }
+    }
+
+    async fn next_event(&self, index: usize) -> fcp_core::EventEnvelope {
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                let frame = self
+                    .frames
+                    .lock()
+                    .expect("capture frame lock")
+                    .get(index)
+                    .cloned();
+                if let Some(frame) = frame {
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    assert_eq!(frame["method"], "event");
+                    assert!(frame.get("id").is_none());
+                    assert_eq!(frame["params"]["stream_id"], NATIVE_TEST_STREAM_ID);
+                    let event: fcp_core::EventEnvelope =
+                        serde_json::from_value(frame["params"]["event"].clone())
+                            .expect("canonical native event envelope");
+                    assert!(event.requires_ack);
+                    assert_eq!(
+                        event.data.connector_id,
+                        fcp_core::ConnectorId::from_static("fcp.slack"),
+                    );
+                    assert_eq!(event.data.zone_id, fcp_core::ZoneId::work());
+                    return event;
+                }
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native event should reach the production JSONL writer")
+    }
+
+    fn acknowledge(&self, event: &fcp_core::EventEnvelope) {
+        self.stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_TEST_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&event.topic, vec![event.seq])
+                    .with_cursors(vec![event.cursor.clone()]),
+            }))
+            .expect("acknowledge the exact delivered event");
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.lock().expect("capture frame lock").is_empty()
+    }
+}
+
+fn native_subscribe_request(key: &Ed25519SigningKey, topic: &str) -> serde_json::Value {
+    json!({
+        "type": "subscribe",
+        "id": "native-subscribe-test",
+        "stream_id": NATIVE_TEST_STREAM_ID,
+        "topics": [topic],
+        "window_size": 1,
+        "capability_token": generate_valid_token_for_operation(key, "slack.read", "slack.subscribe"),
+    })
 }
 
 fn signed_slack_headers(body: &[u8]) -> HashMap<String, String> {
@@ -797,8 +895,8 @@ async fn post_message_happy_path() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -847,10 +945,10 @@ async fn post_message_threaded_denies_duplicate_owner_before_http_send() {
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
     let mut second = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let first_key = setup_handshake(&mut first, &["slack.post_message"]).await;
-    let second_key = setup_handshake(&mut second, &["slack.post_message"]).await;
     setup_configure(&mut first, fake_server.url()).await;
     setup_configure(&mut second, fake_server.url()).await;
+    let first_key = setup_handshake(&mut first, &["slack.post_message"]).await;
+    let second_key = setup_handshake(&mut second, &["slack.post_message"]).await;
 
     let first_cap = generate_valid_token_for_principal(
         &first_key,
@@ -911,8 +1009,8 @@ async fn post_message_rejects_invalid_thread_ts_before_coordination_or_http() {
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -956,8 +1054,8 @@ async fn post_message_threaded_slack_api_failure_returns_no_coordination_success
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -1005,8 +1103,8 @@ async fn reply_thread_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -1057,10 +1155,10 @@ async fn reply_thread_denies_duplicate_owner_before_http_send() {
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
     let mut second = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let first_key = setup_handshake(&mut first, &["slack.reply_thread"]).await;
-    let second_key = setup_handshake(&mut second, &["slack.reply_thread"]).await;
     setup_configure(&mut first, fake_server.url()).await;
     setup_configure(&mut second, fake_server.url()).await;
+    let first_key = setup_handshake(&mut first, &["slack.reply_thread"]).await;
+    let second_key = setup_handshake(&mut second, &["slack.reply_thread"]).await;
 
     let first_cap = generate_valid_token_for_principal(
         &first_key,
@@ -1121,8 +1219,8 @@ async fn reply_thread_rejects_invalid_thread_ts_before_coordination_or_http() {
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -1166,8 +1264,8 @@ async fn reply_thread_slack_api_failure_returns_no_coordination_success() {
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -1219,8 +1317,8 @@ async fn reply_thread_fail_open_sends_with_degraded_coordination_audit() {
     });
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::AgentMail);
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -1308,8 +1406,8 @@ async fn progress_draft_text_sends_then_edits() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     let cap =
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
@@ -1407,8 +1505,8 @@ async fn progress_draft_rich_blocks_and_duplicate_suppression() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     let cap =
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
@@ -1506,8 +1604,8 @@ async fn progress_draft_clear_deletes_visible_message() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     let cap =
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
@@ -1551,8 +1649,8 @@ async fn progress_draft_rejects_oversized_text_before_outbound_call() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
     let cap =
         generate_valid_token_for_operation(&key, "slack.write", "slack.update_progress_draft");
 
@@ -1594,8 +1692,8 @@ async fn get_channel_history_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -1631,8 +1729,8 @@ async fn search_messages_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.search_messages"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.search_messages"]).await;
 
     let cap = generate_valid_token(&key, "slack.search_messages");
     let result = connector
@@ -1692,8 +1790,8 @@ async fn list_channels_happy_path() {
     });
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
@@ -1737,8 +1835,8 @@ async fn get_user_info_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.get_user_info"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.get_user_info"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_user_info");
     let result = connector
@@ -1773,8 +1871,8 @@ async fn upload_file_happy_path() {
     .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
@@ -1860,10 +1958,10 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
     let mut second = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let first_key = setup_handshake(&mut first, &["slack.files.write"]).await;
-    let second_key = setup_handshake(&mut second, &["slack.files.write"]).await;
     setup_configure(&mut first, fake_server.url()).await;
     setup_configure(&mut second, fake_server.url()).await;
+    let first_key = setup_handshake(&mut first, &["slack.files.write"]).await;
+    let second_key = setup_handshake(&mut second, &["slack.files.write"]).await;
 
     let first_cap = generate_valid_token_for_principal(
         &first_key,
@@ -1929,8 +2027,8 @@ async fn upload_file_rejects_invalid_thread_ts_before_coordination_or_http() {
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -1986,8 +2084,8 @@ async fn upload_file_slack_api_failure_returns_no_coordination_success() {
     let checker = Arc::new(InMemoryThreadOwnershipChecker::new());
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
-    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
     setup_configure(&mut connector, fake_server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
 
     let cap = generate_valid_token_for_principal(
         &key,
@@ -2266,8 +2364,8 @@ async fn download_file_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.files.read"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.read"]).await;
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.read", "slack.download_file");
     let result = connector
@@ -2304,8 +2402,8 @@ async fn add_reaction_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
@@ -2339,8 +2437,8 @@ async fn set_channel_topic_happy_path() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -2379,8 +2477,8 @@ async fn post_message_emits_receipt() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -2422,8 +2520,8 @@ async fn reply_thread_emits_receipt() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -2464,8 +2562,8 @@ async fn upload_file_emits_receipt() {
     .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
@@ -2505,8 +2603,8 @@ async fn add_reaction_emits_receipt() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
@@ -2543,8 +2641,8 @@ async fn set_channel_topic_emits_receipt() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -2581,8 +2679,8 @@ async fn read_operations_have_no_receipt() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
@@ -2645,29 +2743,45 @@ async fn events_api_event_callback_emits_after_monitor_policy() {
     assert_eq!(verified.event_type, "message");
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
             "base_url": mock_server.uri(),
+            "receive_mode": "events_api",
             "monitor_policy": { "require_mention": false }
         }))
         .await
         .expect("configure");
 
-    let mut event_rx = connector.subscribe_events();
-    let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
-    let result = connector
-        .handle_invoke(json!({
-            "operation": "slack.handle_events_api",
-            "input": {
-                "payload": verified.payload,
-                "signature_result": "verified"
-            },
-            "capability_token": cap
-        }))
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
+    connector
+        .handle_subscribe(native_subscribe_request(&key, "slack.message.new"))
         .await
-        .expect("verified event callback should succeed");
+        .expect("subscribe to authorized native Events API delivery");
+    let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
+    let mut invocation = Box::pin(connector.handle_invoke(json!({
+        "operation": "slack.handle_events_api",
+        "input": {
+            "payload": verified.payload,
+            "signature_result": "verified"
+        },
+        "capability_token": cap
+    })));
+    let event = fcp_async_core::select! {
+        result = &mut invocation => panic!("callback completed before downstream ACK: {result:?}"),
+        event = native.next_event(0) => event,
+    };
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), &mut invocation)
+            .await
+            .is_err(),
+        "event emission alone cannot acknowledge the provider callback",
+    );
+    native.acknowledge(&event);
+    let result = invocation
+        .await
+        .expect("verified callback succeeds after native ACK");
 
     assert_eq!(result["status"], "event_emitted");
     assert_eq!(result["acknowledged"], true);
@@ -2677,12 +2791,8 @@ async fn events_api_event_callback_emits_after_monitor_policy() {
     assert_eq!(result["capability_decision"], "bound_capability_verified");
     assert_eq!(result["event"]["topic"], "slack.message.new");
     assert_eq!(result["event"]["cursor"], "EvHttp01");
+    assert_eq!(result["event"], serde_json::to_value(&event).unwrap());
 
-    let event = fcp_async_core::time::timeout(StdDuration::from_secs(1), event_rx.recv())
-        .await
-        .expect("timeout waiting for Events API event")
-        .expect("broadcast receive")
-        .expect("event payload");
     assert_eq!(event.topic, "slack.message.new");
     assert_eq!(event.cursor, "EvHttp01");
     assert!(
@@ -2706,7 +2816,6 @@ async fn events_api_event_callback_denied_by_monitor_policy_before_emit() {
         .expect("Slack event callback should verify");
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -2719,6 +2828,7 @@ async fn events_api_event_callback_denied_by_monitor_policy_before_emit() {
         .await
         .expect("configure");
 
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let mut event_rx = connector.subscribe_events();
     let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.handle_events_api");
     let result = connector
@@ -2747,6 +2857,186 @@ async fn events_api_event_callback_denied_by_monitor_policy_before_emit() {
             .await
             .is_err(),
         "policy-denied Events API payload must not emit an EventEnvelope"
+    );
+}
+
+fn events_api_native_fixture(key: &Ed25519SigningKey, event_id: &str) -> serde_json::Value {
+    json!({
+        "operation": "slack.handle_events_api",
+        "input": {
+            "signature_result": "verified",
+            "payload": {
+                "type": "event_callback",
+                "event_id": event_id,
+                "team_id": "T_NATIVE",
+                "event": {
+                    "type": "message", "user": "U_NATIVE", "channel": "C_NATIVE",
+                    "text": "native delivery fixture", "ts": "1700000000.000999",
+                },
+            },
+        },
+        "capability_token": generate_valid_token_for_operation(
+            key, "slack.read", "slack.handle_events_api",
+        ),
+    })
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_api_broadcast_observer_cannot_acknowledge_an_undelivered_callback() {
+    let mut connector = SlackConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": TEST_BOT_CREDENTIAL_ID,
+            "receive_mode": "events_api",
+            "monitor_policy": { "require_mention": false },
+        }))
+        .await
+        .unwrap();
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
+    let mut observer = connector.subscribe_events();
+    let result = connector
+        .handle_invoke(events_api_native_fixture(&key, "EvNoConsumer"))
+        .await;
+    assert!(matches!(
+        result,
+        Err(fcp_core::FcpError::ConnectorUnavailable { .. })
+    ));
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(50), observer.recv())
+            .await
+            .is_err(),
+        "a diagnostic observer is not an authorized durable consumer",
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_api_closed_stream_preserves_provider_identity_for_retry() {
+    let mut connector = SlackConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": TEST_BOT_CREDENTIAL_ID,
+            "receive_mode": "events_api",
+            "monitor_policy": { "require_mention": false },
+        }))
+        .await
+        .unwrap();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
+    connector
+        .handle_subscribe(native_subscribe_request(&key, "slack.events"))
+        .await
+        .unwrap();
+
+    let mut first = Box::pin(connector.handle_invoke(events_api_native_fixture(&key, "EvRetry")));
+    let first_event = fcp_async_core::select! {
+        result = &mut first => panic!("callback completed without native ACK: {result:?}"),
+        event = native.next_event(0) => event,
+    };
+    native.stream.close();
+    assert!(matches!(
+        first.await,
+        Err(fcp_core::FcpError::ConnectorUnavailable { .. })
+    ));
+    assert!(
+        native
+            .stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_TEST_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&first_event.topic, vec![first_event.seq])
+                    .with_cursors(vec![first_event.cursor.clone()]),
+            }))
+            .is_err(),
+        "closed session cannot accept a late ACK"
+    );
+
+    connector
+        .handle_subscribe(native_subscribe_request(&key, "slack.events"))
+        .await
+        .expect("resume the same authorized stream");
+    let mut retry = Box::pin(connector.handle_invoke(events_api_native_fixture(&key, "EvRetry")));
+    let replayed = fcp_async_core::select! {
+        result = &mut retry => panic!("retry completed without native ACK: {result:?}"),
+        event = native.next_event(1) => event,
+    };
+    assert_eq!(replayed.cursor, first_event.cursor);
+    assert_eq!(replayed.data.payload, first_event.data.payload);
+    assert_eq!(
+        replayed.data.principal.kind,
+        first_event.data.principal.kind
+    );
+    assert_eq!(replayed.data.principal.id, first_event.data.principal.id);
+    assert_eq!(
+        replayed.data.principal.trust,
+        first_event.data.principal.trust
+    );
+    assert_eq!(
+        replayed.data.principal.display,
+        first_event.data.principal.display
+    );
+    assert_eq!(replayed.data.resource_uris, first_event.data.resource_uris);
+    assert_ne!(replayed.seq, first_event.seq);
+    native.acknowledge(&replayed);
+    let result = retry.await.expect("retry succeeds only after exact ACK");
+    assert_eq!(result["acknowledged"], true);
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_api_pending_delivery_stops_at_signed_subscription_expiry() {
+    let mut connector = SlackConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": TEST_BOT_CREDENTIAL_ID,
+            "receive_mode": "events_api",
+            "monitor_policy": { "require_mention": false },
+        }))
+        .await
+        .unwrap();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
+    let constraints = CapabilityConstraints {
+        resource_allow: vec!["slack:events:slack.events".into()],
+        ..Default::default()
+    };
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut cbor).unwrap();
+    let now = Utc::now();
+    let token = fcp_core::CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id("slack.read")
+            .zone_id("z:work")
+            .principal("user:test")
+            .operations(&["slack.subscribe"])
+            .issuer("node:test")
+            .target_instance(connector.instance_id())
+            .validity(now, now + Duration::seconds(2))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(&key)
+            .unwrap(),
+    );
+    let mut request = native_subscribe_request(&key, "slack.events");
+    request["capability_token"] = serde_json::to_value(token).unwrap();
+    connector.handle_subscribe(request).await.unwrap();
+    let mut invocation =
+        Box::pin(connector.handle_invoke(events_api_native_fixture(&key, "EvExpiry")));
+    let event = fcp_async_core::select! {
+        result = &mut invocation => panic!("callback completed before event delivery: {result:?}"),
+        event = native.next_event(0) => event,
+    };
+    let result = fcp_async_core::time::timeout(StdDuration::from_secs(4), &mut invocation)
+        .await
+        .expect("expired authority must stop a pending delivery without another request");
+    assert!(matches!(result, Err(fcp_core::FcpError::TokenExpired)));
+    assert!(!native.stream.is_open());
+    assert!(
+        native
+            .stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_TEST_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&event.topic, vec![event.seq])
+                    .with_cursors(vec![event.cursor]),
+            }))
+            .is_err()
     );
 }
 
@@ -3186,8 +3476,8 @@ async fn invoke_401_not_authed() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -3220,8 +3510,8 @@ async fn invoke_401_invalid_auth() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -3254,8 +3544,8 @@ async fn invoke_403_missing_scope() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -3291,8 +3581,8 @@ async fn invoke_403_not_in_channel() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -3328,8 +3618,8 @@ async fn invoke_403_restricted_action() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -3365,8 +3655,8 @@ async fn invoke_429_rate_limited_api() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -3399,8 +3689,8 @@ async fn invoke_resource_not_found() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -3448,8 +3738,8 @@ async fn fcp2_invoke_requires_capability_token() {
     let _ctx = AsyncTestContext::for_scenario("slack.capability.missing_token");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let _key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let result = connector
         .handle_invoke(json!({
@@ -3465,9 +3755,9 @@ async fn fcp2_wrong_capability_denied() {
     let _ctx = AsyncTestContext::for_scenario("slack.capability.wrong_cap");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, &mock_server.uri()).await;
     // Handshake grants only slack.read
     let key = setup_handshake(&mut connector, &["slack.read"]).await;
-    setup_configure(&mut connector, &mock_server.uri()).await;
 
     // Token is for slack.read, but we invoke slack.post_message
     let cap = generate_valid_token(&key, "slack.read");
@@ -3486,8 +3776,8 @@ async fn fcp2_unknown_operation_rejected() {
     let _ctx = AsyncTestContext::for_scenario("slack.capability.unknown_op");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.nonexistent"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.nonexistent"]).await;
 
     let cap = generate_valid_token(&key, "slack.nonexistent");
     let result = connector
@@ -3512,8 +3802,8 @@ async fn fcp2_missing_operation_field() {
     let _ctx = AsyncTestContext::for_scenario("slack.capability.missing_op");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let result = connector
         .handle_invoke(json!({
@@ -3554,7 +3844,7 @@ async fn lifecycle_handshake_returns_accepted() {
 
     let result = connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": vec![0u8; 32],
             "nonce": vec![0u8; 32],
@@ -3626,7 +3916,7 @@ async fn socket_mode_subscribe_emits_event_envelope_and_ack() {
         listener.local_addr().expect("listener local addr")
     );
 
-    let (ack_tx, ack_rx) = oneshot::channel::<Option<String>>();
+    let (ack_tx, mut ack_rx) = oneshot::channel::<Option<String>>();
     let ws_task = fcp_async_core::task::spawn(async move {
         let (tcp_stream, _) = listener.accept().await.expect("accept websocket client");
         let mut ws_stream = accept_test_websocket(tcp_stream).await;
@@ -3676,7 +3966,6 @@ async fn socket_mode_subscribe_emits_event_envelope_and_ack() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -3687,30 +3976,52 @@ async fn socket_mode_subscribe_emits_event_envelope_and_ack() {
         .await
         .expect("configure");
 
-    let mut event_rx = connector.subscribe_events();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let subscribe_result = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.message.new"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.message.new")))
         .expect("subscribe should succeed");
-    assert_eq!(subscribe_result["connection_status"], "started");
+    assert_eq!(
+        subscribe_result["result"]["confirmed_topics"],
+        json!(["slack.message.new"])
+    );
 
-    let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-        .await
-        .expect("timeout waiting for socket mode event")
-        .expect("broadcast receive")
-        .expect("event payload");
+    let event = native.next_event(0).await;
 
     assert_eq!(event.topic, "slack.message.new");
     assert_eq!(event.cursor, "Ev01");
     assert_eq!(event.data.principal.kind, "slack_user");
     assert_eq!(event.data.principal.id, "U_EVT_1");
     assert_eq!(event.data.principal.trust, fcp_core::TrustLevel::Untrusted);
-    assert_eq!(event.data.zone_id, fcp_core::ZoneId::community());
+    assert_eq!(event.data.zone_id, fcp_core::ZoneId::work());
     assert_eq!(
         event.data.payload["event"]["text"].as_str(),
         Some("hello from socket mode")
     );
+
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), &mut ack_rx)
+            .await
+            .is_err(),
+        "reading native stdout must not acknowledge Slack",
+    );
+    assert!(
+        native
+            .stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_TEST_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&event.topic, vec![event.seq])
+                    .with_cursors(vec!["different-provider-event".into()]),
+            }))
+            .is_err()
+    );
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), &mut ack_rx)
+            .await
+            .is_err(),
+        "a mismatched native ACK must not release provider credit",
+    );
+    native.acknowledge(&event);
 
     let ack_json = fcp_async_core::time::timeout(StdDuration::from_secs(3), ack_rx)
         .await
@@ -3725,6 +4036,118 @@ async fn socket_mode_subscribe_emits_event_envelope_and_ack() {
         .block_on(connector.handle_shutdown(json!({})))
         .expect("shutdown should succeed");
 
+    fcp_async_core::time::timeout(StdDuration::from_secs(3), ws_task)
+        .await
+        .expect("timeout waiting for ws task")
+        .expect("ws task join");
+}
+
+#[fcp_async_core::runtime::test]
+async fn socket_mode_closed_native_stream_does_not_acknowledge_provider() {
+    let _ctx = AsyncTestContext::for_scenario("slack.socket_mode.closed_native_stream");
+    let mock_server = MockServer::start().await;
+    let runtime = fcp_async_core::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build async-core runtime");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket listener");
+    let ws_url = format!(
+        "ws://{}",
+        listener.local_addr().expect("listener local addr")
+    );
+    let (frame_tx, mut frame_rx) = oneshot::channel::<Result<Option<String>, String>>();
+    let ws_task = fcp_async_core::task::spawn(async move {
+        let (tcp_stream, _) = listener.accept().await.expect("accept websocket client");
+        let mut ws_stream = accept_test_websocket(tcp_stream).await;
+        send_json_frame(
+            &mut ws_stream,
+            json!({
+                "envelope_id": "envelope-uncommitted",
+                "type": "events_api",
+                "payload": {
+                    "event_id": "EvUncommitted",
+                    "team_id": "T_TEAM_1",
+                    "event": {
+                        "type": "message",
+                        "user": "U_EVT_1",
+                        "channel": "C_EVT_1",
+                        "text": "preserve this unacknowledged event",
+                        "ts": "1700000000.000010"
+                    }
+                }
+            }),
+            "send event before downstream closure",
+        )
+        .await;
+        let result = recv_text_frame(&mut ws_stream, "uncommitted provider frame").await;
+        let _ = frame_tx.send(result);
+        close_test_websocket(&mut ws_stream).await;
+    });
+    Mock::given(method("POST"))
+        .and(path("/apps.connections.open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "url": ws_url
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut connector = SlackConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": TEST_BOT_CREDENTIAL_ID,
+            "socket_mode_credential_id": TEST_SOCKET_CREDENTIAL_ID,
+            "base_url": mock_server.uri(),
+            "monitor_policy": { "require_mention": false }
+        }))
+        .await
+        .expect("configure");
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
+    let mut observer = connector.subscribe_events();
+    runtime
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.events")))
+        .expect("subscribe should succeed");
+
+    let event = native.next_event(0).await;
+    assert_eq!(event.cursor, "EvUncommitted");
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), &mut frame_rx)
+            .await
+            .is_err(),
+        "provider acknowledgement must remain pending before consumer commit",
+    );
+    native.stream.close();
+    let provider_frame = fcp_async_core::time::timeout(StdDuration::from_secs(3), frame_rx)
+        .await
+        .expect("socket should close after failed native delivery")
+        .expect("server should report the final provider frame");
+    assert!(
+        !matches!(provider_frame, Ok(Some(_))),
+        "closed native delivery must not acknowledge the provider: {provider_frame:?}",
+    );
+    assert!(
+        native
+            .stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_TEST_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&event.topic, vec![event.seq])
+                    .with_cursors(vec![event.cursor.clone()]),
+            }))
+            .is_err()
+    );
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(50), observer.recv())
+            .await
+            .is_err(),
+        "a diagnostic observer must not receive an uncommitted event",
+    );
+    runtime
+        .block_on(connector.handle_shutdown(json!({})))
+        .expect("shutdown should succeed");
     fcp_async_core::time::timeout(StdDuration::from_secs(3), ws_task)
         .await
         .expect("timeout waiting for ws task")
@@ -3798,7 +4221,6 @@ async fn socket_mode_monitor_policy_acks_but_drops_unauthorized_message() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -3812,13 +4234,15 @@ async fn socket_mode_monitor_policy_acks_but_drops_unauthorized_message() {
         .await
         .expect("configure");
 
-    let mut event_rx = connector.subscribe_events();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let subscribe_result = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.message.new"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.message.new")))
         .expect("subscribe should succeed");
-    assert_eq!(subscribe_result["connection_status"], "started");
+    assert_eq!(
+        subscribe_result["result"]["confirmed_topics"],
+        json!(["slack.message.new"])
+    );
 
     let ack_json = fcp_async_core::time::timeout(StdDuration::from_secs(3), ack_rx)
         .await
@@ -3830,9 +4254,7 @@ async fn socket_mode_monitor_policy_acks_but_drops_unauthorized_message() {
     assert_eq!(ack_value["envelope_id"], "envelope-policy-drop");
 
     assert!(
-        fcp_async_core::time::timeout(StdDuration::from_millis(200), event_rx.recv())
-            .await
-            .is_err(),
+        native.is_empty(),
         "monitor policy should suppress the unauthorized message event"
     );
 
@@ -3953,7 +4375,6 @@ async fn socket_mode_monitor_policy_filters_commands_and_interactions() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -3968,13 +4389,15 @@ async fn socket_mode_monitor_policy_filters_commands_and_interactions() {
         .await
         .expect("configure");
 
-    let mut event_rx = connector.subscribe_events();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let subscribe_result = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.command", "slack.interactive"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.events")))
         .expect("subscribe should succeed");
-    assert_eq!(subscribe_result["connection_status"], "started");
+    assert_eq!(
+        subscribe_result["result"]["confirmed_topics"],
+        json!(["slack.events"])
+    );
 
     let drop_ack_json = fcp_async_core::time::timeout(StdDuration::from_secs(3), drop_ack_rx)
         .await
@@ -3985,28 +4408,24 @@ async fn socket_mode_monitor_policy_filters_commands_and_interactions() {
         serde_json::from_str(&drop_ack_json).expect("drop ack should be valid json");
     assert_eq!(drop_ack_value["envelope_id"], "envelope-command-drop");
     assert!(
-        fcp_async_core::time::timeout(StdDuration::from_millis(200), event_rx.recv())
-            .await
-            .is_err(),
+        native.is_empty(),
         "monitor policy should suppress unauthorized slash command events"
     );
 
     let _ = slash_go_tx.send(());
-    let slash_event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-        .await
-        .expect("timeout waiting for authorized slash command event")
-        .expect("broadcast receive")
-        .expect("event payload");
-    assert_eq!(slash_event.topic, "slack.command");
+    let slash_event = native.next_event(0).await;
+    assert_eq!(slash_event.topic, "slack.events");
+    assert_eq!(slash_event.data.payload["source_topic"], "slack.command");
     assert_eq!(slash_event.cursor, "envelope-command-allowed");
     assert_eq!(slash_event.data.principal.id, "U_CMD");
-    assert_eq!(slash_event.data.payload["channel_id"], "C_CMD");
+    assert_eq!(slash_event.data.payload["event"]["channel_id"], "C_CMD");
     assert!(
         slash_event
             .data
             .resource_uris
             .contains(&"slack:channel:C_CMD".to_string())
     );
+    native.acknowledge(&slash_event);
     let slash_ack_json = fcp_async_core::time::timeout(StdDuration::from_secs(3), slash_ack_rx)
         .await
         .expect("timeout waiting for command allowed ack")
@@ -4017,22 +4436,25 @@ async fn socket_mode_monitor_policy_filters_commands_and_interactions() {
     assert_eq!(slash_ack_value["envelope_id"], "envelope-command-allowed");
 
     let _ = interactive_go_tx.send(());
-    let interactive_event =
-        fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-            .await
-            .expect("timeout waiting for authorized interactive event")
-            .expect("broadcast receive")
-            .expect("event payload");
-    assert_eq!(interactive_event.topic, "slack.interactive");
+    let interactive_event = native.next_event(1).await;
+    assert_eq!(interactive_event.topic, "slack.events");
+    assert_eq!(
+        interactive_event.data.payload["source_topic"],
+        "slack.interactive"
+    );
     assert_eq!(interactive_event.cursor, "envelope-interactive-allowed");
     assert_eq!(interactive_event.data.principal.id, "U_CMD");
-    assert_eq!(interactive_event.data.payload["channel"]["id"], "C_CMD");
+    assert_eq!(
+        interactive_event.data.payload["event"]["channel"]["id"],
+        "C_CMD"
+    );
     assert!(
         interactive_event
             .data
             .resource_uris
             .contains(&"slack:channel:C_CMD".to_string())
     );
+    native.acknowledge(&interactive_event);
     let interactive_ack_json =
         fcp_async_core::time::timeout(StdDuration::from_secs(3), interactive_ack_rx)
             .await
@@ -4119,7 +4541,6 @@ async fn socket_mode_subscribe_reuses_single_connection() {
         .await;
 
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -4129,23 +4550,31 @@ async fn socket_mode_subscribe_reuses_single_connection() {
         .await
         .expect("configure");
 
+    let _native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let first = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.message.new"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.events")))
         .expect("first subscribe should succeed");
-    assert_eq!(first["connection_status"], "started");
+    assert_eq!(first["result"]["confirmed_topics"], json!(["slack.events"]));
     fcp_async_core::time::timeout(StdDuration::from_secs(3), connected_rx)
         .await
         .expect("timeout waiting for socket connection")
         .expect("socket connection signal should complete");
 
     let second = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.message.new", "slack.reaction.added"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.events")))
         .expect("second subscribe should succeed");
-    assert_eq!(second["connection_status"], "already_running");
+    assert_eq!(
+        second["result"]["confirmed_topics"],
+        json!(["slack.events"])
+    );
+
+    let replacement = runtime
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.message.new")));
+    assert!(
+        replacement.is_err(),
+        "a different topic cannot replace the live stream"
+    );
 
     let health = connector.handle_health().await.expect("health");
     assert_eq!(health["streaming"]["socket_mode_running"], true);
@@ -4272,7 +4701,6 @@ async fn socket_mode_reconnects_after_websocket_close_and_shutdown_cleans_up() {
     });
 
     let mut connector = SlackConnector::new();
-    let _key = setup_handshake(&mut connector, &["slack.read"]).await;
     connector
         .handle_configure(json!({
             "credential_id": TEST_BOT_CREDENTIAL_ID,
@@ -4283,13 +4711,15 @@ async fn socket_mode_reconnects_after_websocket_close_and_shutdown_cleans_up() {
         .await
         .expect("configure");
 
-    let mut event_rx = connector.subscribe_events();
+    let native = NativeTestTransport::attach(&mut connector);
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
     let subscribe_result = runtime
-        .block_on(connector.handle_subscribe(json!({
-            "topics": ["slack.message.new"]
-        })))
+        .block_on(connector.handle_subscribe(native_subscribe_request(&key, "slack.message.new")))
         .expect("subscribe should succeed");
-    assert_eq!(subscribe_result["connection_status"], "started");
+    assert_eq!(
+        subscribe_result["result"]["confirmed_topics"],
+        json!(["slack.message.new"])
+    );
 
     fcp_async_core::time::timeout(StdDuration::from_secs(3), first_ws_task)
         .await
@@ -4300,11 +4730,7 @@ async fn socket_mode_reconnects_after_websocket_close_and_shutdown_cleans_up() {
         .expect("timeout waiting for reconnected socket")
         .expect("reconnected socket signal should complete");
 
-    let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-        .await
-        .expect("timeout waiting for reconnected socket event")
-        .expect("broadcast receive")
-        .expect("event payload");
+    let event = native.next_event(0).await;
     assert_eq!(event.topic, "slack.message.new");
     assert_eq!(event.cursor, "EvAfterReconnect");
     assert_eq!(event.data.principal.id, "U_EVT_RECONNECT");
@@ -4312,6 +4738,7 @@ async fn socket_mode_reconnects_after_websocket_close_and_shutdown_cleans_up() {
         event.data.payload["event"]["text"].as_str(),
         Some("hello after reconnect")
     );
+    native.acknowledge(&event);
 
     let ack_json = fcp_async_core::time::timeout(StdDuration::from_secs(3), second_ack_rx)
         .await
@@ -4352,8 +4779,8 @@ async fn validate_post_message_missing_channel() {
     let _ctx = AsyncTestContext::for_scenario("slack.validation.missing_channel");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4371,8 +4798,8 @@ async fn validate_post_message_missing_text() {
     let _ctx = AsyncTestContext::for_scenario("slack.validation.missing_text");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4390,8 +4817,8 @@ async fn validate_reply_thread_missing_thread_ts() {
     let _ctx = AsyncTestContext::for_scenario("slack.validation.missing_thread_ts");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -4409,8 +4836,8 @@ async fn validate_add_reaction_missing_name() {
     let _ctx = AsyncTestContext::for_scenario("slack.validation.missing_name");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
@@ -4436,8 +4863,8 @@ async fn validate_upload_file_missing_channels() {
     let _ctx = AsyncTestContext::for_scenario("slack.validation.missing_channels");
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
-    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
     setup_configure(&mut connector, &mock_server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file");
     let result = connector
