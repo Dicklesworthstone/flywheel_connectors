@@ -3995,7 +3995,7 @@ mod slack_e2e_tests {
                         "type": "object",
                         "properties": { "message": { "type": "object" } }
                     }),
-                    capability: CapabilityId::from_static("slack.post_message"),
+                    capability: CapabilityId::from_static("slack.write"),
                     risk_level: RiskLevel::Medium,
                     safety_tier: SafetyTier::Risky,
                     idempotency: IdempotencyClass::None,
@@ -4177,18 +4177,19 @@ mod slack_e2e_tests {
 
     #[fcp_async_core::runtime::test]
     async fn slack_default_deny_capability_mismatch() {
+        let mock_server = MockServer::start().await;
         let mut connector = SlackConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
-        // Handshake grants slack.list_channels (read), but token+invoke target
-        // slack.post_message (write) → capability denial expected.
+        // The token names the requested write operation but grants only the
+        // read capability, so the capability mismatch must deny it.
         let handshake = handshake_request(
             signing_key.verifying_key().to_bytes(),
-            &["slack.list_channels"],
+            &["slack.read", "slack.write"],
         );
         let token = build_token(
             &signing_key,
-            "slack.list_channels",
-            &["slack.list_channels"],
+            "slack.read",
+            &["slack.post_message"],
             connector.instance_id(),
         );
         let invoke = invoke_request(
@@ -4198,7 +4199,10 @@ mod slack_e2e_tests {
         );
 
         let dynamic = DynamicSuite {
-            config: json!({ "credential_id": TEST_SLACK_CREDENTIAL_ID }),
+            config: json!({
+                "credential_id": TEST_SLACK_CREDENTIAL_ID,
+                "base_url": mock_server.uri()
+            }),
             handshake: handshake.clone(),
             invoke: Some(invoke),
             expect_invoke_error: true,
@@ -4220,6 +4224,7 @@ mod slack_e2e_tests {
             report.passed,
             "default deny compliance should pass: {report:#?}"
         );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
     #[fcp_async_core::runtime::test]
@@ -4244,13 +4249,10 @@ mod slack_e2e_tests {
 
         let mut connector = SlackConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
-        let handshake = handshake_request(
-            signing_key.verifying_key().to_bytes(),
-            &["slack.post_message"],
-        );
+        let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["slack.write"]);
         let token = build_token(
             &signing_key,
-            "slack.post_message",
+            "slack.write",
             &["slack.post_message"],
             connector.instance_id(),
         );
@@ -4338,10 +4340,10 @@ mod slack_e2e_tests {
         let mut connector = SlackConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
 
-        // Handshake grants slack.list_channels only
+        // Negotiate both families so the token is the sole authority mismatch.
         let handshake = handshake_request(
             signing_key.verifying_key().to_bytes(),
-            &["slack.list_channels"],
+            &["slack.read", "slack.write"],
         );
 
         connector
@@ -4357,11 +4359,11 @@ mod slack_e2e_tests {
             .await
             .expect("handshake should succeed");
 
-        // Token is for slack.list_channels but we invoke slack.post_message
+        // The operation grant matches, but a read capability cannot authorize a write.
         let token = build_token(
             &signing_key,
-            "slack.list_channels",
-            &["slack.list_channels"],
+            "slack.read",
+            &["slack.post_message"],
             connector.instance_id(),
         );
         let invoke = invoke_request(
@@ -4375,6 +4377,7 @@ mod slack_e2e_tests {
             result.is_err(),
             "Invoke with wrong capability should be denied"
         );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
     #[fcp_async_core::runtime::test]
@@ -4401,13 +4404,10 @@ mod slack_e2e_tests {
 
         let mut connector = SlackConnectorAdapter::new();
         let signing_key = Ed25519SigningKey::generate();
-        let handshake = handshake_request(
-            signing_key.verifying_key().to_bytes(),
-            &["slack.list_channels"],
-        );
+        let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["slack.read"]);
         let token = build_token(
             &signing_key,
-            "slack.list_channels",
+            "slack.read",
             &["slack.list_channels"],
             connector.instance_id(),
         );

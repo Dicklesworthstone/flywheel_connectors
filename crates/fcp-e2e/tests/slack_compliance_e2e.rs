@@ -11,10 +11,16 @@
 #![cfg(feature = "slack")]
 #![allow(clippy::too_many_lines)]
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{Duration as ChronoDuration, Utc};
 use fcp_conformance::DynamicSuite;
-use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
+use fcp_crypto::{
+    cose::{CapabilityTokenBuilder, CoseToken},
+    ed25519::Ed25519SigningKey,
+};
 use fcp_e2e::{ComplianceSuite, ConnectorSuite, E2eRunner, InvokeExpectations};
+use fcp_host::{CapabilityIssuanceRequest, HostAdminStateStore};
 use fcp_manifest::ConnectorManifest;
 use fcp_prelude::{
     AgentHint, CapabilityId, CapabilityToken, ConnectorId, ConnectorMetrics, FcpConnector,
@@ -27,7 +33,7 @@ use fcp_testkit::MockApiServer;
 use serde_json::json;
 use wiremock::{
     Mock, ResponseTemplate,
-    matchers::{method, path_regex},
+    matchers::{header, method, path_regex},
 };
 
 use fcp_slack::connector::SlackConnector;
@@ -206,9 +212,7 @@ fn build_token(
     let mut constraints_cbor = Vec::new();
     ciborium::into_writer(&constraints, &mut constraints_cbor)
         .expect("serialize constraints to CBOR");
-    // The connector's required_capability_for_operation() maps
-    // slack.get_channel_history to its own operation-named capability,
-    // so the token capability is used verbatim (no remap).
+    // The capability family and the exact operation are distinct signed claims.
     let cose = CapabilityTokenBuilder::new()
         .capability_id(capability)
         .zone_id("z:work")
@@ -316,12 +320,15 @@ fn slack_channel_history_response() -> serde_json::Value {
 async fn slack_default_deny_compliance_suite_passes() {
     let mut connector = SlackConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
-    let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["slack.write"]);
+    let handshake = handshake_request(
+        signing_key.verifying_key().to_bytes(),
+        &["slack.read", "slack.write"],
+    );
     // Token grants "slack.write" but invoke targets "slack.get_channel_history" -> denial
     let token = build_token(
         &signing_key,
         "slack.write",
-        &["slack.write"],
+        &["slack.get_channel_history"],
         connector.connector.instance_id(),
     );
     let invoke = invoke_request(
@@ -377,13 +384,10 @@ async fn slack_allow_valid_token_connector_suite_passes() {
 
     let mut connector = SlackConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
-    let handshake = handshake_request(
-        signing_key.verifying_key().to_bytes(),
-        &["slack.get_channel_history"],
-    );
+    let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["slack.read"]);
     let token = build_token(
         &signing_key,
-        "slack.get_channel_history",
+        "slack.read",
         &["slack.get_channel_history"],
         connector.connector.instance_id(),
     );
@@ -439,6 +443,171 @@ async fn slack_allow_valid_token_connector_suite_passes() {
         query.contains("channel=C0123456789"),
         "expected channel query fingerprint, got {query}"
     );
+}
+
+/// Tokens minted by the production host issuer must authorize the exact
+/// manifest-declared capability, operation, zone, instance, and resource.
+#[fcp_async_core::runtime::test]
+async fn slack_host_issued_manifest_capabilities_reach_provider() {
+    const CHANNEL: &str = "C0123456789";
+    const RESOURCE: &str = "slack:channel:C0123456789";
+    const CREDENTIAL: &str = "550e8400-e29b-41d4-a716-446655440000";
+    let manifest =
+        ConnectorManifest::parse_str(include_str!("../../../connectors/slack/manifest.toml"))
+            .expect("the actual bundled Slack manifest must validate");
+    let mock = MockApiServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/conversations\.history$"))
+        .and(header("X-FCP-Credential-ID", CREDENTIAL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(slack_channel_history_response()))
+        .expect(1)
+        .mount(mock.inner())
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/chat\.postMessage$"))
+        .and(header("X-FCP-Credential-ID", CREDENTIAL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "channel": CHANNEL,
+            "ts": "1709136001.000100",
+            "message": {
+                "type": "message", "user": "U0123456789",
+                "text": "host-issued message", "ts": "1709136001.000100"
+            }
+        })))
+        .expect(1)
+        .mount(mock.inner())
+        .await;
+
+    let mut connector = SlackConnector::new();
+    connector
+        .handle_configure(json!({
+            "credential_id": CREDENTIAL,
+            "base_url": mock.base_url()
+        }))
+        .await
+        .expect("configure Slack loopback");
+    let signing_key = Ed25519SigningKey::generate();
+    let read_capability = manifest.provides.operations["slack.get_channel_history"]
+        .capability
+        .as_str();
+    let write_capability = manifest.provides.operations["slack.post_message"]
+        .capability
+        .as_str();
+    connector
+        .handle_handshake(
+            serde_json::to_value(handshake_request(
+                signing_key.verifying_key().to_bytes(),
+                &[read_capability, write_capability],
+            ))
+            .expect("serialize real handshake"),
+        )
+        .await
+        .expect("negotiate manifest capability families");
+    let health: HealthSnapshot = serde_json::from_value(
+        connector
+            .handle_native_health()
+            .await
+            .expect("native health"),
+    )
+    .expect("canonical native health");
+    assert!(health.is_ready());
+    let details = health.details.expect("prepared Slack session details");
+    assert_eq!(details["zone_id"], "z:work");
+    let instance_id: InstanceId = details["instance_id"]
+        .as_str()
+        .expect("actual native instance")
+        .parse()
+        .expect("valid instance ID");
+    assert_eq!(instance_id.as_str(), connector.instance_id());
+    let issuer = HostAdminStateStore::new();
+
+    for (operation, expected_capability, input) in [
+        (
+            "slack.get_channel_history",
+            "slack.read",
+            json!({"channel": CHANNEL}),
+        ),
+        (
+            "slack.post_message",
+            "slack.write",
+            json!({
+                "channel": CHANNEL, "text": "host-issued message"
+            }),
+        ),
+    ] {
+        let capability = manifest.provides.operations[operation].capability.as_str();
+        assert_eq!(capability, expected_capability);
+        let issued = issuer
+            .issue_capability_token(
+                &CapabilityIssuanceRequest {
+                    connector_id: manifest.connector.id.to_string(),
+                    capability_id: capability.to_string(),
+                    zone_id: "z:work".into(),
+                    instance_id: Some(instance_id.clone()),
+                    principal_id: "agent:host-slack-e2e".into(),
+                    operations: vec![operation.to_string()],
+                    ttl_secs: 60,
+                    not_before_delay_secs: None,
+                    holder_node: None,
+                    max_delegation_depth: 0,
+                    resource_allow: vec![RESOURCE.into()],
+                    resource_deny: Vec::new(),
+                    max_calls: None,
+                    max_bytes: None,
+                    credential_allow: vec![fcp_core::CredentialId::parse(CREDENTIAL).unwrap()],
+                    dry_run: false,
+                },
+                &signing_key,
+            )
+            .await
+            .expect("production host capability issuance");
+        assert_eq!(issued.inspection.capability_id.as_deref(), Some(capability));
+        assert_eq!(issued.inspection.operations, vec![operation.to_string()]);
+        assert_eq!(issued.inspection.resource_allow, vec![RESOURCE.to_string()]);
+        assert_eq!(issued.inspection.zone_id, "z:work");
+        let bytes = BASE64_STANDARD
+            .decode(issued.token_cbor_b64.expect("signed token"))
+            .expect("host token base64");
+        let token = CapabilityToken::from_raw(
+            CoseToken::from_cbor(&bytes).expect("host-issued COSE token"),
+        );
+        let result = connector
+            .handle_invoke(json!({
+                "operation": operation, "input": input, "capability_token": token.clone()
+            }))
+            .await
+            .expect("host-issued manifest grant must reach Slack");
+        if operation == "slack.get_channel_history" {
+            assert_eq!(result["messages"].as_array().unwrap().len(), 2);
+        } else {
+            assert_eq!(result["message"]["text"], "host-issued message");
+            assert_eq!(result["receipt"]["operation"], operation);
+            // The grouped capability does not grant another write operation
+            // on the same resource, or the granted operation on another resource.
+            for (denied_operation, denied_input) in [
+                (
+                    "slack.set_channel_topic",
+                    json!({"channel": CHANNEL, "topic": "denied"}),
+                ),
+                (
+                    "slack.post_message",
+                    json!({"channel": "COTHER", "text": "denied"}),
+                ),
+            ] {
+                assert!(
+                    connector
+                        .handle_invoke(json!({
+                            "operation": denied_operation, "input": denied_input,
+                            "capability_token": token.clone()
+                        }))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+    mock.assert_request_count(2).await;
 }
 
 // ============================================================================

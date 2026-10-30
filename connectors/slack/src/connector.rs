@@ -1196,7 +1196,7 @@ impl SlackConnector {
             })?;
 
         let operation = req.operation.as_str();
-        if !is_supported_operation(operation) {
+        let Some(capability) = required_capability_for_operation(operation) else {
             let error = FcpError::OperationNotGranted {
                 operation: operation.into(),
             };
@@ -1205,14 +1205,8 @@ impl SlackConnector {
                 error.to_string(),
                 error.error_code(),
             ));
-        }
-
-        let cap_id: CapabilityId = required_capability_for_operation(operation)
-            .parse()
-            .map_err(|_| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invalid capability ID format".into(),
-            })?;
+        };
+        let cap_id = CapabilityId::from_static(capability);
 
         if let Err(error) = validate_simulate_input(operation, &req.input) {
             return Self::serialize_simulate_response(SimulateResponse::denied(
@@ -1714,12 +1708,12 @@ impl SlackConnector {
             code: 1003,
             message: "Invalid operation ID format".into(),
         })?;
-        let cap_id: CapabilityId = required_capability_for_operation(operation)
-            .parse()
-            .map_err(|_| FcpError::InvalidRequest {
-                code: 1003,
-                message: "Invalid capability ID format".into(),
-            })?;
+        let capability = required_capability_for_operation(operation).ok_or_else(|| {
+            FcpError::OperationNotGranted {
+                operation: operation.into(),
+            }
+        })?;
+        let cap_id = CapabilityId::from_static(capability);
 
         let resource_uris = resource_uris_for_operation(operation, &input)?;
 
@@ -3727,32 +3721,24 @@ fn socket_payload_principal(payload: &Value) -> Principal {
     }
 }
 
-fn required_capability_for_operation(operation: &str) -> &str {
+// The host authorizes the declared capability family and the exact operation
+// independently. Keep invoke and simulate on that same manifest contract.
+fn required_capability_for_operation(operation: &str) -> Option<&'static str> {
     match operation {
-        SLACK_EVENTS_API_OPERATION => "slack.read",
-        "slack.update_progress_draft" => "slack.write",
-        "slack.upload_file" => "slack.files.write",
-        "slack.download_file" => "slack.files.read",
-        _ => operation,
-    }
-}
-
-fn is_supported_operation(operation: &str) -> bool {
-    matches!(
-        operation,
         SLACK_EVENTS_API_OPERATION
-            | "slack.post_message"
-            | "slack.reply_thread"
-            | "slack.update_progress_draft"
-            | "slack.get_channel_history"
-            | "slack.search_messages"
-            | "slack.list_channels"
-            | "slack.get_user_info"
-            | "slack.upload_file"
-            | "slack.download_file"
-            | "slack.add_reaction"
-            | "slack.set_channel_topic"
-    )
+        | "slack.get_channel_history"
+        | "slack.search_messages"
+        | "slack.list_channels"
+        | "slack.get_user_info" => Some("slack.read"),
+        "slack.post_message"
+        | "slack.reply_thread"
+        | "slack.update_progress_draft"
+        | "slack.add_reaction"
+        | "slack.set_channel_topic" => Some("slack.write"),
+        "slack.upload_file" => Some("slack.files.write"),
+        "slack.download_file" => Some("slack.files.read"),
+        _ => None,
+    }
 }
 
 fn validate_simulate_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
@@ -4728,14 +4714,16 @@ mod tests {
     fn generate_valid_token(
         signing_key: &Ed25519SigningKey,
         cap: &str,
+        operation: &str,
         instance_id: &str,
     ) -> CapabilityToken {
-        generate_token_with_resources(signing_key, cap, &["*"], Some(instance_id))
+        generate_token_with_resources(signing_key, cap, operation, &["*"], Some(instance_id))
     }
 
     fn generate_token_with_resources(
         signing_key: &Ed25519SigningKey,
         cap: &str,
+        operation: &str,
         resource_allow: &[&str],
         instance_id: Option<&str>,
     ) -> CapabilityToken {
@@ -4754,7 +4742,7 @@ mod tests {
             .capability_id(cap)
             .zone_id("z:work")
             .principal("user:test")
-            .operations(&[cap])
+            .operations(&[operation])
             .issuer("node:test")
             .validity(now, now + Duration::hours(1))
             .try_constraints_cbor(&cbor)
@@ -4789,7 +4777,7 @@ mod tests {
             OperationId::from_static(operation),
             ZoneId::work(),
             input,
-            generate_token_with_resources(signing_key, cap, resource_allow, instance_id),
+            generate_token_with_resources(signing_key, cap, operation, resource_allow, instance_id),
         );
         serde_json::to_value(req).expect("serialize simulate request")
     }
@@ -5070,7 +5058,7 @@ mod tests {
             connector
                 .handle_simulate(simulate_request_for_instance(
                     &signing_key,
-                    "slack.post_message",
+                    "slack.write",
                     "slack.post_message",
                     json!({"channel": "C123", "text": "hello"}),
                     &["*"],
@@ -5100,7 +5088,7 @@ mod tests {
             connector
                 .handle_simulate(simulate_request_for_instance(
                     &signing_key,
-                    "slack.post_message",
+                    "slack.write",
                     "slack.post_message",
                     json!({"channel": "C123", "text": "hello"}),
                     &["*"],
@@ -5143,7 +5131,7 @@ mod tests {
             connector
                 .handle_simulate(simulate_request(
                     &signing_key,
-                    "slack.post_message",
+                    "slack.write",
                     "slack.post_message",
                     json!({"channel": "C123"}),
                     &["*"],
@@ -5166,17 +5154,62 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_simulate_unknown_operation_denied() {
-        let connector = SlackConnector::new();
+        let mut connector = SlackConnector::new();
+        connector.client = Some(SlackClient::new("fake_key").unwrap());
+        connector.base.set_configured(true);
         let signing_key = Ed25519SigningKey::generate();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0",
+                "zone": "z:work",
+                "host_public_key": signing_key.verifying_key().to_bytes(),
+                "nonce": vec![0u8; 32],
+                "capabilities_requested": ["slack.write"]
+            }))
+            .await
+            .unwrap();
+        let token = generate_valid_token(
+            &signing_key,
+            "slack.write",
+            "slack.noop",
+            connector.instance_id(),
+        );
+        // A valid issuer-signed operation grant cannot add an undeclared
+        // operation to the connector's supported surface.
+        connector
+            .verifier
+            .as_ref()
+            .unwrap()
+            .verify_bound(
+                token.clone(),
+                &CapabilityId::from_static("slack.write"),
+                &OperationId::from_static("slack.noop"),
+                &[],
+            )
+            .expect("test token must otherwise be valid and instance-bound");
+        let invoke_error = connector
+            .handle_invoke(json!({
+                "operation": "slack.noop",
+                "input": {},
+                "capability_token": token.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            invoke_error,
+            FcpError::OperationNotGranted { operation } if operation == "slack.noop"
+        ));
+
+        let request = SimulateRequest::new(
+            ConnectorId::from_static("fcp.slack"),
+            OperationId::from_static("slack.noop"),
+            ZoneId::work(),
+            json!({}),
+            token,
+        );
         let response: SimulateResponse = serde_json::from_value(
             connector
-                .handle_simulate(simulate_request(
-                    &signing_key,
-                    "slack.noop",
-                    "slack.noop",
-                    json!({}),
-                    &["*"],
-                ))
+                .handle_simulate(serde_json::to_value(request).unwrap())
                 .await
                 .unwrap(),
         )
@@ -5184,6 +5217,7 @@ mod tests {
 
         assert!(!response.would_succeed);
         assert_eq!(response.denial_code.as_deref(), Some("FCP-3003"));
+        assert_eq!(connector.client.as_ref().unwrap().total_requests(), 0);
     }
 
     #[fcp_async_core::runtime::test]
@@ -5204,7 +5238,7 @@ mod tests {
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.post_message"]
+                "capabilities_requested": ["slack.write"]
             }))
             .await
             .unwrap();
@@ -5213,7 +5247,7 @@ mod tests {
             connector
                 .handle_simulate(simulate_request_for_instance(
                     &signing_key,
-                    "slack.post_message",
+                    "slack.write",
                     "slack.post_message",
                     json!({"channel": "C123", "text": "hello"}),
                     &["*"],
@@ -5245,7 +5279,7 @@ mod tests {
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.post_message"]
+                "capabilities_requested": ["slack.write"]
             }))
             .await
             .unwrap();
@@ -5254,7 +5288,7 @@ mod tests {
             connector
                 .handle_simulate(simulate_request_for_instance(
                     &signing_key,
-                    "slack.post_message",
+                    "slack.write",
                     "slack.post_message",
                     json!({"channel": "C-denied", "text": "hello"}),
                     &["slack:channel:C-allowed"],
@@ -5289,13 +5323,17 @@ mod tests {
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.list_channels"]
+                "capabilities_requested": ["slack.read"]
             }))
             .await
             .unwrap();
 
-        let cap =
-            generate_valid_token(&signing_key, "slack.list_channels", connector.instance_id());
+        let cap = generate_valid_token(
+            &signing_key,
+            "slack.read",
+            "slack.list_channels",
+            connector.instance_id(),
+        );
 
         let result = connector
             .handle_invoke(json!({
@@ -5327,12 +5365,17 @@ mod tests {
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.post_message"]
+                "capabilities_requested": ["slack.write"]
             }))
             .await
             .unwrap();
 
-        let cap = generate_valid_token(&signing_key, "slack.post_message", connector.instance_id());
+        let cap = generate_valid_token(
+            &signing_key,
+            "slack.write",
+            "slack.post_message",
+            connector.instance_id(),
+        );
 
         let result = connector
             .handle_invoke(json!({
@@ -5367,13 +5410,14 @@ mod tests {
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["slack.post_message"]
+                "capabilities_requested": ["slack.write"]
             }))
             .await
             .unwrap();
 
         let cap = generate_token_with_resources(
             &signing_key,
+            "slack.write",
             "slack.post_message",
             &["slack:channel:C-allowed"],
             Some(connector.instance_id()),

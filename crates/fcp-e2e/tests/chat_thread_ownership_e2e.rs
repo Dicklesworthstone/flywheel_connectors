@@ -164,8 +164,8 @@ async fn run_slack_duplicate_claim_fixture(
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
     configure_slack(&mut first, &server.uri()).await;
     configure_slack(&mut second, &server.uri()).await;
-    let first_key = handshake_slack(&mut first, &["slack.reply_thread"]).await;
-    let second_key = handshake_slack(&mut second, &["slack.reply_thread"]).await;
+    let first_key = handshake_slack(&mut first, &["slack.write"]).await;
+    let second_key = handshake_slack(&mut second, &["slack.write"]).await;
 
     let first_result = first
         .handle_invoke(json!({
@@ -178,7 +178,7 @@ async fn run_slack_duplicate_claim_fixture(
             "capability_token": build_capability_token(
                 &first_key.signing_key,
                 &first_key.instance_id,
-                "slack.reply_thread",
+                "slack.write",
                 "slack.reply_thread",
                 "agent:slack-a"
             )
@@ -218,7 +218,7 @@ async fn run_slack_duplicate_claim_fixture(
             "capability_token": build_capability_token(
                 &second_key.signing_key,
                 &second_key.instance_id,
-                "slack.reply_thread",
+                "slack.write",
                 "slack.reply_thread",
                 "agent:slack-b"
             )

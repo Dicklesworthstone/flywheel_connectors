@@ -62,20 +62,7 @@ Important runtime truths the contract preserves:
 
 This README documents runtime truth and keeps current drift visible:
 
-- Manifest and introspection describe capability IDs such as `slack.read`, `slack.write`, `slack.files.read`, and `slack.files.write`.
-- Runtime bound-token verification instead requires the operation ID itself for most operations:
-  - `slack.post_message`
-  - `slack.reply_thread`
-  - `slack.get_channel_history`
-  - `slack.search_messages`
-  - `slack.list_channels`
-  - `slack.get_user_info`
-  - `slack.add_reaction`
-  - `slack.set_channel_topic`
-- Runtime bound-token verification uses manifest-style capability IDs only for:
-  - `slack.update_progress_draft` -> `slack.write`
-  - `slack.upload_file` -> `slack.files.write`
-  - `slack.download_file` -> `slack.files.read`
+- Manifest, introspection, invoke, and simulation use the same declared capabilities: `slack.read`, `slack.write`, `slack.files.read`, and `slack.files.write`. A token must separately grant the exact operation; granting `slack.write` for one operation does not authorize another write operation.
 - Manifest marks `slack.post_message`, `slack.reply_thread`, `slack.update_progress_draft`, `slack.upload_file`, and `slack.set_channel_topic` as policy-approved operations. Runtime `OperationInfo` sets `requires_approval = None`, and invoke checks no approval token.
 - Doctor/self-check required scopes are only `channels:read`, `channels:history`, `chat:write`, and `users:read`; they do not prove file upload/download, reactions, topic updates, search, or Socket Mode app-token readiness.
 - File operations deliver actual inline bytes with exact byte counts and SHA-256 digests. They do not persist or materialize mesh content objects.
@@ -84,7 +71,7 @@ This README documents runtime truth and keeps current drift visible:
 - Manifest rate-limit pools are documented intent; runtime relies on Slack 429 handling and the client retry loop, not connector-local pool enforcement.
 - The dedicated tracked verification script is `scripts/e2e/slack_connector_verification.sh`, which writes loopback and live-smoke JSONL evidence under `/tmp/fcp-slack-e2e/<run-id>/` by default.
 
-A follow-up parity bead should align runtime bound-token capability IDs with manifest capability IDs, add approval-token verification for policy-approved mutations, and expand doctor/self-check scope readiness.
+Approval-token verification for policy-approved mutations and broader doctor/self-check scope readiness remain incomplete.
 
 ## First-Slice Scope
 
@@ -93,7 +80,7 @@ The current Slack README slice documents the existing runtime surface:
 - secretless bot/app credential references and Socket Mode or Events API receive modes
 - Slack Web API transport, timeout, retry, rate-limit, error, and scope-check behavior
 - message, thread, progress draft, read, search, channel/user, file, reaction, and topic operations
-- bound capability-token verification and current capability-ID drift
+- bound capability-token verification with manifest-aligned capabilities and exact operation grants
 - signed native event subscriptions, explicit downstream acknowledgements, and monitor-policy gating
 - lifecycle, health, doctor, self-check, simulation, introspection, subscribe, and shutdown behavior
 - deterministic connector tests and direct proof commands
@@ -110,7 +97,7 @@ The current Slack README slice documents the existing runtime surface:
   - `slack.write`
   - `slack.files.read`
   - `slack.files.write`
-- Runtime verification surface currently differs from metadata as described in Drift.
+- Tokens use the declared capability family and name each authorized operation independently. For example, posting a message requires capability `slack.write` with an operation grant for `slack.post_message`, bound to the actual instance, negotiated zone, and allowed channel/thread resources.
 - Invoke rejects missing, malformed, unbound, wrong-operation, wrong-resource, or wrong-capability tokens.
 - Invoke does not verify approval tokens.
 - The connector does not persist tokens, Slack messages, file contents, file URLs, search results, channel/user data, Socket Mode events, progress drafts, request counters, or provider errors outside process memory.
@@ -197,18 +184,18 @@ The host's durable journal protects events it has actually received. It does not
 
 | Operation | Runtime Slack method/path | Runtime verification capability | Metadata capability | SafetyTier | RiskLevel | Idempotency | Required input |
 |-----------|---------------------------|---------------------------------|---------------------|------------|-----------|-------------|----------------|
-| `slack.post_message` | `chat.postMessage` | `slack.post_message` | `slack.write` | `Risky` | `Medium` | `None` | `channel`, `text` |
-| `slack.reply_thread` | `chat.postMessage` with `thread_ts` | `slack.reply_thread` | `slack.write` | `Risky` | `Medium` | `None` | `channel`, `text`, `thread_ts` |
+| `slack.post_message` | `chat.postMessage` | `slack.write` | `slack.write` | `Risky` | `Medium` | `None` | `channel`, `text` |
+| `slack.reply_thread` | `chat.postMessage` with `thread_ts` | `slack.write` | `slack.write` | `Risky` | `Medium` | `None` | `channel`, `text`, `thread_ts` |
 | `slack.update_progress_draft` | `chat.postMessage`, `chat.update`, `chat.delete` | `slack.write` | `slack.write` | `Risky` | `Medium` | `BestEffort` | `draft_id`, `channel`; update requires `text` or `progress_lines` |
-| `slack.get_channel_history` | `conversations.history` | `slack.get_channel_history` | `slack.read` | `Safe` | `Low` | `Strict` | `channel`; optional `limit` |
-| `slack.search_messages` | `search.messages` | `slack.search_messages` | `slack.read` | `Safe` | `Low` | `Strict` | `query` |
-| `slack.list_channels` | `conversations.list` | `slack.list_channels` | `slack.read` | `Safe` | `Low` | `Strict` | optional `types` |
-| `slack.get_user_info` | `users.info` | `slack.get_user_info` | `slack.read` | `Safe` | `Low` | `Strict` | `user` |
+| `slack.get_channel_history` | `conversations.history` | `slack.read` | `slack.read` | `Safe` | `Low` | `Strict` | `channel`; optional `limit` |
+| `slack.search_messages` | `search.messages` | `slack.read` | `slack.read` | `Safe` | `Low` | `Strict` | `query` |
+| `slack.list_channels` | `conversations.list` | `slack.read` | `slack.read` | `Safe` | `Low` | `Strict` | optional `types` |
+| `slack.get_user_info` | `users.info` | `slack.read` | `slack.read` | `Safe` | `Low` | `Strict` | `user` |
 | `slack.handle_events_api` | Host/fcp-webhook verified Events API payload | `slack.read` | `slack.read` | `Safe` | `Medium` | `BestEffort` | `payload`, `signature_result="verified"` |
 | `slack.upload_file` | `files.getUploadURLExternal` → raw upload → `files.completeUploadExternal` | `slack.files.write` | `slack.files.write` | `Risky` | `Medium` | `None` | `channels`, exactly one of `content_base64` or `resolved_content` |
 | `slack.download_file` | `files.info` → authenticated byte download | `slack.files.read` | `slack.files.read` | `Safe` | `Low` | `Strict` | `file_id` |
-| `slack.add_reaction` | `reactions.add` | `slack.add_reaction` | `slack.write` | `Safe` | `Low` | `BestEffort` | `channel`, `timestamp`, `name` |
-| `slack.set_channel_topic` | `conversations.setTopic` | `slack.set_channel_topic` | `slack.write` | `Risky` | `Medium` | `BestEffort` | `channel`, `topic` |
+| `slack.add_reaction` | `reactions.add` | `slack.write` | `slack.write` | `Safe` | `Low` | `BestEffort` | `channel`, `timestamp`, `name` |
+| `slack.set_channel_topic` | `conversations.setTopic` | `slack.write` | `slack.write` | `Risky` | `Medium` | `BestEffort` | `channel`, `topic` |
 
 ### File Upload Contract
 

@@ -70,8 +70,24 @@ const TEST_SLACK_SIGNING_SECRET: &str = "slack_signing_secret_2026";
 // Helpers
 // ============================================================================
 
-fn generate_valid_token(signing_key: &Ed25519SigningKey, cap: &str) -> fcp_core::CapabilityToken {
-    generate_valid_token_for_operation(signing_key, cap, cap)
+fn bundled_slack_manifest() -> &'static fcp_manifest::ConnectorManifest {
+    static MANIFEST: OnceLock<fcp_manifest::ConnectorManifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+            .expect("bundled Slack manifest must validate")
+    })
+}
+
+fn generate_valid_token(
+    signing_key: &Ed25519SigningKey,
+    operation: &str,
+) -> fcp_core::CapabilityToken {
+    let declaration = bundled_slack_manifest()
+        .provides
+        .operations
+        .get(operation)
+        .expect("positive token fixtures must name a manifest operation");
+    generate_valid_token_for_operation(signing_key, declaration.capability.as_str(), operation)
 }
 
 fn generate_valid_token_for_operation(
@@ -899,7 +915,7 @@ async fn post_message_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -950,12 +966,12 @@ async fn post_message_threaded_denies_duplicate_owner_before_http_send() {
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
     setup_configure(&mut first, fake_server.url()).await;
     setup_configure(&mut second, fake_server.url()).await;
-    let first_key = setup_handshake(&mut first, &["slack.post_message"]).await;
-    let second_key = setup_handshake(&mut second, &["slack.post_message"]).await;
+    let first_key = setup_handshake(&mut first, &["slack.write"]).await;
+    let second_key = setup_handshake(&mut second, &["slack.write"]).await;
 
     let first_cap = generate_valid_token_for_principal(
         &first_key,
-        "slack.post_message",
+        "slack.write",
         "slack.post_message",
         "agent:a",
     );
@@ -976,7 +992,7 @@ async fn post_message_threaded_denies_duplicate_owner_before_http_send() {
 
     let second_cap = generate_valid_token_for_principal(
         &second_key,
-        "slack.post_message",
+        "slack.write",
         "slack.post_message",
         "agent:b",
     );
@@ -1013,14 +1029,10 @@ async fn post_message_rejects_invalid_thread_ts_before_coordination_or_http() {
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
-    let cap = generate_valid_token_for_principal(
-        &key,
-        "slack.post_message",
-        "slack.post_message",
-        "agent:a",
-    );
+    let cap =
+        generate_valid_token_for_principal(&key, "slack.write", "slack.post_message", "agent:a");
     let result = connector
         .handle_invoke(json!({
             "operation": "slack.post_message",
@@ -1058,14 +1070,10 @@ async fn post_message_threaded_slack_api_failure_returns_no_coordination_success
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
-    let cap = generate_valid_token_for_principal(
-        &key,
-        "slack.post_message",
-        "slack.post_message",
-        "agent:a",
-    );
+    let cap =
+        generate_valid_token_for_principal(&key, "slack.write", "slack.post_message", "agent:a");
     let error = connector
         .handle_invoke(json!({
             "operation": "slack.post_message",
@@ -1107,7 +1115,7 @@ async fn reply_thread_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -1160,12 +1168,12 @@ async fn reply_thread_denies_duplicate_owner_before_http_send() {
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
     setup_configure(&mut first, fake_server.url()).await;
     setup_configure(&mut second, fake_server.url()).await;
-    let first_key = setup_handshake(&mut first, &["slack.reply_thread"]).await;
-    let second_key = setup_handshake(&mut second, &["slack.reply_thread"]).await;
+    let first_key = setup_handshake(&mut first, &["slack.write"]).await;
+    let second_key = setup_handshake(&mut second, &["slack.write"]).await;
 
     let first_cap = generate_valid_token_for_principal(
         &first_key,
-        "slack.reply_thread",
+        "slack.write",
         "slack.reply_thread",
         "agent:a",
     );
@@ -1186,7 +1194,7 @@ async fn reply_thread_denies_duplicate_owner_before_http_send() {
 
     let second_cap = generate_valid_token_for_principal(
         &second_key,
-        "slack.reply_thread",
+        "slack.write",
         "slack.reply_thread",
         "agent:b",
     );
@@ -1223,14 +1231,10 @@ async fn reply_thread_rejects_invalid_thread_ts_before_coordination_or_http() {
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker.clone(), ChatCoordinationBackend::InMemory);
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
-    let cap = generate_valid_token_for_principal(
-        &key,
-        "slack.reply_thread",
-        "slack.reply_thread",
-        "agent:a",
-    );
+    let cap =
+        generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let result = connector
         .handle_invoke(json!({
             "operation": "slack.reply_thread",
@@ -1268,14 +1272,10 @@ async fn reply_thread_slack_api_failure_returns_no_coordination_success() {
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::InMemory);
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
-    let cap = generate_valid_token_for_principal(
-        &key,
-        "slack.reply_thread",
-        "slack.reply_thread",
-        "agent:a",
-    );
+    let cap =
+        generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let error = connector
         .handle_invoke(json!({
             "operation": "slack.reply_thread",
@@ -1321,14 +1321,10 @@ async fn reply_thread_fail_open_sends_with_degraded_coordination_audit() {
     let mut connector = SlackConnector::new()
         .with_thread_ownership_checker(checker, ChatCoordinationBackend::AgentMail);
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
-    let cap = generate_valid_token_for_principal(
-        &key,
-        "slack.reply_thread",
-        "slack.reply_thread",
-        "agent:a",
-    );
+    let cap =
+        generate_valid_token_for_principal(&key, "slack.write", "slack.reply_thread", "agent:a");
     let result = connector
         .handle_invoke(json!({
             "operation": "slack.reply_thread",
@@ -1696,7 +1692,7 @@ async fn get_channel_history_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -1733,7 +1729,7 @@ async fn search_messages_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.search_messages"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.search_messages");
     let result = connector
@@ -1794,7 +1790,7 @@ async fn list_channels_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, fake_server.url()).await;
-    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
@@ -1839,7 +1835,7 @@ async fn get_user_info_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.get_user_info"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_user_info");
     let result = connector
@@ -2930,7 +2926,7 @@ async fn add_reaction_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
@@ -2965,7 +2961,7 @@ async fn set_channel_topic_happy_path() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -3005,7 +3001,7 @@ async fn post_message_emits_receipt() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -3048,7 +3044,7 @@ async fn reply_thread_emits_receipt() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -3125,7 +3121,7 @@ async fn add_reaction_emits_receipt() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector
@@ -3163,7 +3159,7 @@ async fn set_channel_topic_emits_receipt() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -3201,7 +3197,7 @@ async fn read_operations_have_no_receipt() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.list_channels"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.list_channels");
     let result = connector
@@ -3998,7 +3994,7 @@ async fn invoke_401_not_authed() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4032,7 +4028,7 @@ async fn invoke_401_invalid_auth() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -4066,7 +4062,7 @@ async fn invoke_403_missing_scope() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4103,7 +4099,7 @@ async fn invoke_403_not_in_channel() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4140,7 +4136,7 @@ async fn invoke_403_restricted_action() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.set_channel_topic"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.set_channel_topic");
     let result = connector
@@ -4177,7 +4173,7 @@ async fn invoke_429_rate_limited_api() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -4211,7 +4207,7 @@ async fn invoke_resource_not_found() {
 
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.get_channel_history"]).await;
+    let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     let cap = generate_valid_token(&key, "slack.get_channel_history");
     let result = connector
@@ -4237,6 +4233,201 @@ async fn invoke_resource_not_found() {
 // ============================================================================
 
 #[fcp_async_core::runtime::test]
+async fn every_manifest_operation_accepts_its_declared_capability_in_simulation() {
+    let manifest = bundled_slack_manifest();
+    let fixtures = [
+        (
+            "slack.post_message",
+            json!({"channel": "C01234567", "text": "hello"}),
+        ),
+        (
+            "slack.reply_thread",
+            json!({"channel": "C01234567", "thread_ts": "123.456", "text": "reply"}),
+        ),
+        (
+            "slack.update_progress_draft",
+            json!({"channel": "C01234567", "draft_id": "manifest-parity", "text": "working"}),
+        ),
+        ("slack.get_channel_history", json!({"channel": "C01234567"})),
+        ("slack.search_messages", json!({"query": "status"})),
+        ("slack.list_channels", json!({})),
+        ("slack.get_user_info", json!({"user": "U01234567"})),
+        (
+            "slack.upload_file",
+            json!({"channels": "C01234567", "content_base64": "AA==", "filename": "byte.bin"}),
+        ),
+        ("slack.download_file", json!({"file_id": "F01234567"})),
+        (
+            "slack.add_reaction",
+            json!({"channel": "C01234567", "timestamp": "123.456", "name": "thumbsup"}),
+        ),
+        (
+            "slack.set_channel_topic",
+            json!({"channel": "C01234567", "topic": "status"}),
+        ),
+        (
+            "slack.handle_events_api",
+            json!({"payload": {"type": "url_verification", "challenge": "manifest-parity"}, "signature_result": "verified"}),
+        ),
+    ];
+    assert_eq!(fixtures.len(), 12);
+    assert_eq!(fixtures.len(), manifest.provides.operations.len());
+    let server = MockServer::start().await;
+    let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let mut capabilities = manifest
+        .provides
+        .operations
+        .values()
+        .map(|operation| operation.capability.as_str())
+        .collect::<Vec<_>>();
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    let key = setup_handshake(&mut connector, &capabilities).await;
+    let introspection = connector.handle_introspect().await.unwrap();
+    let runtime_operations = introspection["operations"].as_array().unwrap();
+    assert_eq!(runtime_operations.len(), fixtures.len());
+
+    for (operation_id, input) in fixtures {
+        let declaration = manifest
+            .provides
+            .operations
+            .get(operation_id)
+            .expect("fixture must exercise a declared operation");
+        let runtime = runtime_operations
+            .iter()
+            .find(|operation| operation["id"] == operation_id)
+            .expect("every manifest operation must be introspected");
+        assert_eq!(
+            runtime["capability"],
+            declaration.capability.as_str(),
+            "{operation_id}"
+        );
+        // Take authority from the actual bundled manifest, independently of the
+        // connector's runtime mapping; preserve the exact operation restriction.
+        let token =
+            generate_valid_token_for_operation(&key, declaration.capability.as_str(), operation_id);
+        let request = fcp_core::SimulateRequest::new(
+            fcp_core::ConnectorId::from_static("fcp.slack"),
+            fcp_core::OperationId::from_static(operation_id),
+            fcp_core::ZoneId::work(),
+            input,
+            token,
+        );
+        let response: fcp_core::SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(serde_json::to_value(request).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            response.would_succeed,
+            "{operation_id} rejected manifest authority: {response:?}"
+        );
+        assert!(response.missing_capabilities.is_empty(), "{operation_id}");
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "simulation must not contact Slack"
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn grouped_capabilities_preserve_operation_and_resource_boundaries_before_http() {
+    let server = MockServer::start().await;
+    let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.read", "slack.write"]).await;
+    let input = json!({"channel": "C01234567", "text": "must not be sent"});
+
+    for (case, capability, granted_operation, resource, denial_code) in [
+        (
+            "correct family, wrong operation",
+            "slack.write",
+            "slack.reply_thread",
+            "slack:channel:C01234567",
+            "FCP-3003",
+        ),
+        (
+            "read cannot authorize write",
+            "slack.read",
+            "slack.post_message",
+            "slack:channel:C01234567",
+            "FCP-3001",
+        ),
+        (
+            "operation name is not a capability",
+            "slack.post_message",
+            "slack.post_message",
+            "slack:channel:C01234567",
+            "FCP-3001",
+        ),
+        (
+            "correct family and operation, wrong resource",
+            "slack.write",
+            "slack.post_message",
+            "slack:channel:COTHER",
+            "FCP-3004",
+        ),
+    ] {
+        let constraints = CapabilityConstraints {
+            resource_allow: vec![resource.into()],
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        let token = fcp_core::CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id(capability)
+                .zone_id("z:work")
+                .principal("user:test")
+                .operations(&[granted_operation])
+                .issuer("node:test")
+                .target_instance(connector.instance_id())
+                .validity(now, now + Duration::hours(1))
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(&key)
+                .unwrap(),
+        );
+        let request = fcp_core::SimulateRequest::new(
+            fcp_core::ConnectorId::from_static("fcp.slack"),
+            fcp_core::OperationId::from_static("slack.post_message"),
+            fcp_core::ZoneId::work(),
+            input.clone(),
+            token.clone(),
+        );
+        let simulation: fcp_core::SimulateResponse = serde_json::from_value(
+            connector
+                .handle_simulate(serde_json::to_value(request).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!simulation.would_succeed, "{case}");
+        assert_eq!(
+            simulation.denial_code.as_deref(),
+            Some(denial_code),
+            "{case}"
+        );
+        let error = connector
+            .handle_invoke(json!({
+                "operation": "slack.post_message", "input": input,
+                "capability_token": token,
+            }))
+            .await
+            .expect_err(case);
+        assert_eq!(error.error_code(), denial_code, "{case}");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "{case} reached Slack"
+        );
+    }
+}
+
+#[fcp_async_core::runtime::test]
 async fn fcp2_invoke_requires_handshake() {
     let _ctx = AsyncTestContext::for_scenario("slack.capability.no_handshake");
     let mock_server = MockServer::start().await;
@@ -4260,7 +4451,7 @@ async fn fcp2_invoke_requires_capability_token() {
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let _key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let _key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let result = connector
         .handle_invoke(json!({
@@ -4281,7 +4472,7 @@ async fn fcp2_wrong_capability_denied() {
     let key = setup_handshake(&mut connector, &["slack.read"]).await;
 
     // Token is for slack.read, but we invoke slack.post_message
-    let cap = generate_valid_token(&key, "slack.read");
+    let cap = generate_valid_token_for_operation(&key, "slack.read", "slack.read");
     let result = connector
         .handle_invoke(json!({
             "operation": "slack.post_message",
@@ -4300,7 +4491,7 @@ async fn fcp2_unknown_operation_rejected() {
     setup_configure(&mut connector, &mock_server.uri()).await;
     let key = setup_handshake(&mut connector, &["slack.nonexistent"]).await;
 
-    let cap = generate_valid_token(&key, "slack.nonexistent");
+    let cap = generate_valid_token_for_operation(&key, "slack.nonexistent", "slack.nonexistent");
     let result = connector
         .handle_invoke(json!({
             "operation": "slack.nonexistent",
@@ -5301,7 +5492,7 @@ async fn validate_post_message_missing_channel() {
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -5320,7 +5511,7 @@ async fn validate_post_message_missing_text() {
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.post_message"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.post_message");
     let result = connector
@@ -5339,7 +5530,7 @@ async fn validate_reply_thread_missing_thread_ts() {
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.reply_thread"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.reply_thread");
     let result = connector
@@ -5358,7 +5549,7 @@ async fn validate_add_reaction_missing_name() {
     let mock_server = MockServer::start().await;
     let mut connector = SlackConnector::new();
     setup_configure(&mut connector, &mock_server.uri()).await;
-    let key = setup_handshake(&mut connector, &["slack.add_reaction"]).await;
+    let key = setup_handshake(&mut connector, &["slack.write"]).await;
 
     let cap = generate_valid_token(&key, "slack.add_reaction");
     let result = connector

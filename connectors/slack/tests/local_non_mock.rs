@@ -238,6 +238,7 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpFixtureResponse) {
 fn generate_valid_token(
     signing_key: &Ed25519SigningKey,
     connector: &SlackConnector,
+    capability: &str,
     operation: &str,
 ) -> fcp_core::CapabilityToken {
     let now = Utc::now();
@@ -248,7 +249,7 @@ fn generate_valid_token(
     let mut constraints_cbor = Vec::new();
     ciborium::into_writer(&constraints, &mut constraints_cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
-        .capability_id(operation)
+        .capability_id(capability)
         .zone_id("z:work")
         .principal("user:local-non-mock")
         .operations(&[operation])
@@ -273,9 +274,8 @@ async fn setup_handshake(connector: &mut SlackConnector) -> Ed25519SigningKey {
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0_u8; 32],
             "capabilities_requested": [
-                "slack.post_message",
-                "slack.list_channels",
-                "slack.set_channel_topic"
+                "slack.read",
+                "slack.write"
             ]
         }))
         .await
@@ -308,6 +308,7 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
             "capability_token": generate_valid_token(
                 &signing_key,
                 &connector,
+                "slack.write",
                 "slack.post_message"
             )
         }))
@@ -322,6 +323,7 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
             "capability_token": generate_valid_token(
                 &signing_key,
                 &connector,
+                "slack.read",
                 "slack.list_channels"
             )
         }))
@@ -337,6 +339,7 @@ async fn loopback_acceptance_exercises_write_list_and_topic_paths() {
             "capability_token": generate_valid_token(
                 &signing_key,
                 &connector,
+                "slack.write",
                 "slack.set_channel_topic"
             )
         }))

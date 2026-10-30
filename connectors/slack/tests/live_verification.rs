@@ -178,7 +178,7 @@ fn generate_read_token(
     let mut cbor = Vec::new();
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
-        .capability_id(op)
+        .capability_id("slack.read")
         .zone_id("z:work")
         .principal("user:live-test")
         .operations(&[op])
@@ -211,7 +211,7 @@ async fn setup_live_connector(connector: &mut SlackConnector, token: &str) -> Ed
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": ["slack.list_channels", "slack.post_message", "slack.get_channel_history"]
+            "capabilities_requested": ["slack.read", "slack.write"]
         }))
         .await
         .expect("handshake should succeed");
@@ -377,7 +377,7 @@ async fn live_error_mapping_invalid_token() {
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": ["slack.list_channels"]
+            "capabilities_requested": ["slack.read"]
         }))
         .await
         .expect("handshake should succeed");

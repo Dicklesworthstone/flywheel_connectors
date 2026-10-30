@@ -28,8 +28,14 @@ async fn slack_schema_operation_and_error_contracts_are_advertised() {
             OperationContract {
                 id: "slack.upload_file",
                 capability: "slack.files.write",
-                required_input_fields: &["channels", "content_object_id", "resolved_content"],
-                output_fields: &["file", "file_object_id", "source_object_id"],
+                required_input_fields: &["channels"],
+                output_fields: &["file", "content_length", "content_sha256", "receipt"],
+            },
+            OperationContract {
+                id: "slack.download_file",
+                capability: "slack.files.read",
+                required_input_fields: &["file_id"],
+                output_fields: &["file", "content_base64", "content_length", "content_sha256"],
             },
         ],
     );
