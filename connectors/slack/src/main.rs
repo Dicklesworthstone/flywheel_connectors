@@ -277,6 +277,237 @@ mod tests {
         assert!(details["instance_id"].is_string());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn production_loop_accepts_ack_while_events_api_invoke_is_pending() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use fcp_core::{CapabilityConstraints, CapabilityToken, CredentialId};
+        use fcp_crypto::cose::CapabilityTokenBuilder;
+        use fcp_crypto::ed25519::Ed25519SigningKey;
+        use serde_json::{Value, json};
+
+        fn send(input: &mut UnixStream, frame: &Value) {
+            writeln!(input, "{frame}").expect("write complete native request");
+        }
+
+        fn receive(output: &mut BufReader<UnixStream>) -> Value {
+            let mut line = String::new();
+            assert!(
+                output
+                    .read_line(&mut line)
+                    .expect("bounded native response")
+                    > 0
+            );
+            serde_json::from_str(&line).expect("complete JSONL response")
+        }
+
+        fn bound_read_token(
+            key: &Ed25519SigningKey,
+            instance_id: &str,
+            operation: &str,
+            resources: &[&str],
+        ) -> CapabilityToken {
+            let constraints = CapabilityConstraints {
+                resource_allow: resources
+                    .iter()
+                    .map(|resource| (*resource).into())
+                    .collect(),
+                ..Default::default()
+            };
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&constraints, &mut cbor).unwrap();
+            let now = chrono::Utc::now();
+            CapabilityToken::from_raw(
+                CapabilityTokenBuilder::new()
+                    .capability_id("slack.read")
+                    .zone_id("z:work")
+                    .principal("user:native-wire-test")
+                    .operations(&[operation])
+                    .issuer("node:native-wire-test")
+                    .target_instance(instance_id)
+                    .validity(
+                        now - chrono::Duration::seconds(30),
+                        now + chrono::Duration::minutes(5),
+                    )
+                    .try_constraints_cbor(&cbor)
+                    .unwrap()
+                    .sign(key)
+                    .unwrap(),
+            )
+        }
+
+        let (mut host, connector) = UnixStream::pair().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        host.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut output = BufReader::new(host.try_clone().unwrap());
+        let stdout = connector.try_clone().unwrap();
+        let (stopped, stopped_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = run_fcp_loop_with_io(BufReader::new(connector), stdout);
+            let _ = stopped.send(result.map_err(|error| error.to_string()));
+        });
+
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "configure", "method": "configure",
+                "params": {
+                    "credential_id": CredentialId::new().to_string(),
+                    "receive_mode": "events_api",
+                    "monitor_policy": {"require_mention": false},
+                },
+            }),
+        );
+        let configured = receive(&mut output);
+        assert_eq!(configured["id"], "configure");
+        assert_eq!(configured["result"]["status"], "configured");
+
+        let key = Ed25519SigningKey::generate();
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "handshake", "method": "handshake",
+                "params": {
+                    "protocol_version": "2.0.0", "zone": "z:work",
+                    "host_public_key": key.verifying_key().to_bytes(),
+                    "nonce": vec![0u8; 32], "capabilities_requested": ["slack.read"],
+                },
+            }),
+        );
+        let handshaken = receive(&mut output);
+        assert_eq!(handshaken["id"], "handshake");
+        assert_eq!(handshaken["result"]["status"], "accepted");
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "health", "method": "health",
+            }),
+        );
+        let health = receive(&mut output);
+        assert_eq!(health["id"], "health");
+        let instance_id = health["result"]["details"]["instance_id"].as_str().unwrap();
+
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "subscribe-rpc", "method": "subscribe",
+                "params": {
+                    "type": "subscribe", "id": "subscribe-native", "stream_id": "slack-wire-test",
+                    "topics": ["slack.events"], "window_size": 1,
+                    "capability_token": bound_read_token(&key, instance_id, "slack.subscribe", &["slack:events:slack.events"]),
+                },
+            }),
+        );
+        let subscribed = receive(&mut output);
+        assert_eq!(subscribed["id"], "subscribe-rpc");
+        assert_eq!(subscribed["result"]["id"], "subscribe-native");
+        assert_eq!(
+            subscribed["result"]["result"]["confirmed_topics"],
+            json!(["slack.events"])
+        );
+
+        let payload = json!({
+            "type": "event_callback", "event_id": "Ev-wire-1", "team_id": "T_WIRE",
+            "event": {"type": "message", "user": "U_WIRE", "channel": "C_WIRE", "text": "native transport"},
+        });
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "callback-rpc", "method": "invoke",
+                "params": {
+                    "id": "callback-native", "operation": "slack.handle_events_api",
+                    "input": {"payload": payload, "signature_result": "verified"},
+                    "capability_token": bound_read_token(&key, instance_id, "slack.handle_events_api", &["slack:channel:C_WIRE", "slack:user:U_WIRE", "slack:team:T_WIRE"]),
+                },
+            }),
+        );
+
+        // The event must reach the real stdout path before this invoke can reply.
+        let notification = receive(&mut output);
+        assert_eq!(notification["method"], "event");
+        assert!(notification.get("id").is_none());
+        assert_eq!(notification["params"]["stream_id"], "slack-wire-test");
+        let event = &notification["params"]["event"];
+        assert_eq!(event["topic"], "slack.events");
+        assert_eq!(event["cursor"], "Ev-wire-1");
+        assert_eq!(event["requires_ack"], true);
+        assert_eq!(event["data"]["connector_id"], "fcp.slack");
+        assert_eq!(event["data"]["instance_id"], instance_id);
+        assert_eq!(event["data"]["zone_id"], "z:work");
+        assert_eq!(
+            event["data"]["payload"],
+            json!({"source_topic": "slack.message.new", "event": payload})
+        );
+
+        let ack = json!({
+            "jsonrpc": "2.0", "method": "ack",
+            "params": {
+                "stream_id": "slack-wire-test",
+                "ack": {"type": "ack", "topic": event["topic"], "seqs": [event["seq"]], "cursors": [event["cursor"]]},
+            },
+        });
+        let mut wrong_ack = ack.clone();
+        wrong_ack["params"]["ack"]["cursors"] = json!(["wrong-cursor"]);
+        send(&mut host, &wrong_ack);
+        // This invalid control receives an immediate reader-path error. Seeing
+        // it proves that stdin progressed past the wrong ACK while invoke waits.
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "control-barrier", "method": "ack", "params": {},
+            }),
+        );
+        let barrier = receive(&mut output);
+        assert_eq!(barrier["id"], "control-barrier");
+        assert_eq!(barrier["error"]["code"], "FCP-1003");
+        host.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut premature_response = String::new();
+        let error = output
+            .read_line(&mut premature_response)
+            .expect_err("wrong ACK cannot finish invoke");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(premature_response.is_empty());
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        send(&mut host, &ack);
+        let completed = receive(&mut output);
+        assert_eq!(completed["id"], "callback-rpc");
+        let response: fcp_core::InvokeResponse =
+            serde_json::from_value(completed["result"].clone()).unwrap();
+        assert_eq!(response.r#type, "response");
+        assert_eq!(response.id.as_str(), "callback-native");
+        assert_eq!(response.status, fcp_core::InvokeStatus::Ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(result["event_emitted"], true);
+        assert_eq!(result["event"]["data"]["zone_id"], "z:work");
+
+        send(
+            &mut host,
+            &json!({
+                "jsonrpc": "2.0", "id": "shutdown", "method": "shutdown",
+            }),
+        );
+        let shutdown = receive(&mut output);
+        assert_eq!(shutdown["id"], "shutdown");
+        assert_eq!(shutdown["result"]["status"], "shutdown");
+        host.shutdown(Shutdown::Both).unwrap();
+        stopped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("native loop must stop")
+            .unwrap();
+        worker.join().unwrap();
+    }
+
     #[fcp_async_core::runtime::test]
     async fn invoke_requires_an_inner_id_and_preserves_handler_errors() {
         let mut connector = SlackConnector::new();
