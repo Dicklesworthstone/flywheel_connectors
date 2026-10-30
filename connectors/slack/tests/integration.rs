@@ -6,7 +6,7 @@
 //! - Messages (post, reply, history, search)
 //! - Channels (list, set topic)
 //! - Users (get info)
-//! - Files (upload, download/info)
+//! - Files (bounded binary download/upload and UTF-8 text upload)
 //! - Reactions (add)
 //! - Error taxonomy (`not_authed`/`channel_not_found`/`ratelimited` -> `FcpError` mapping)
 //! - FCP2 default-deny + capability verification
@@ -19,6 +19,8 @@ use asupersync::io::{AsyncRead, ReadBuf};
 use asupersync::net::websocket::{
     CloseReason, Message as ServerWsMessage, ServerWebSocket, WebSocketAcceptor,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{Duration, Utc};
 use fcp_async_core::channel::oneshot;
 use fcp_async_core::net::{TcpListener, TcpStream};
@@ -28,6 +30,7 @@ use fcp_prelude::CapabilityConstraints;
 use fcp_testkit::AsyncTestContext;
 use fcp_webhook::{HmacSha256Verifier, SlackWebhook};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -1880,7 +1883,6 @@ async fn upload_file_happy_path() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "log data here",
                 "filename": "output.log"
             },
@@ -1891,15 +1893,13 @@ async fn upload_file_happy_path() {
 
     assert_eq!(result["file"]["id"], "F01234567");
     assert_eq!(result["file"]["name"], "output.log");
+    assert_eq!(result["content_length"], 13);
     assert_eq!(
-        result["source_object_id"],
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        result["content_sha256"],
+        hex::encode(Sha256::digest(b"log data here"))
     );
-    assert_eq!(
-        result["file_object_id"].as_str().unwrap().len(),
-        64,
-        "file_object_id should be a hex ObjectId"
-    );
+    assert!(result.get("source_object_id").is_none());
+    assert!(result.get("file_object_id").is_none());
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 3);
     let reservation: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -1974,7 +1974,6 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "agent A upload",
                 "filename": "output.log",
                 "thread_ts": "1234567890.123456"
@@ -1998,7 +1997,6 @@ async fn upload_file_threaded_denies_duplicate_owner_before_http_send() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "resolved_content": "agent B upload",
                 "filename": "output.log",
                 "thread_ts": "1234567890.123456"
@@ -2041,7 +2039,6 @@ async fn upload_file_rejects_invalid_thread_ts_before_coordination_or_http() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "should not upload",
                 "filename": "output.log",
                 "thread_ts": "not-a-slack-ts"
@@ -2098,7 +2095,6 @@ async fn upload_file_slack_api_failure_returns_no_coordination_success() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "will fail",
                 "filename": "output.log",
                 "thread_ts": "1234567890.123456"
@@ -2161,7 +2157,7 @@ async fn external_upload_sends_utf8_bytes_without_token_or_credential_reference(
             .unwrap()
             .with_base_url(server.url());
         let file = client
-            .upload_file(" C0123, G4567 ", "hello 🌍\n", None, None)
+            .upload_file(" C0123, G4567 ", "hello 🌍\n".as_bytes(), None, None)
             .await
             .unwrap();
         assert_eq!(file.id, "FUPLOAD1");
@@ -2177,7 +2173,7 @@ async fn external_upload_single_user_uses_the_user_capable_channels_field() {
         .unwrap()
         .with_base_url(server.uri());
     let file = client
-        .upload_file("U0123", "hello", None, None)
+        .upload_file("U0123", b"hello", None, None)
         .await
         .unwrap();
     assert_eq!(file.id, "FUPLOAD1");
@@ -2224,7 +2220,7 @@ async fn external_upload_rejects_untrusted_reservation_before_sending_content() 
         .unwrap()
         .with_base_url(server.url());
     let error = client
-        .upload_file("C0123", "private content", None, None)
+        .upload_file("C0123", b"private content", None, None)
         .await
         .unwrap_err();
     assert!(!error.to_string().contains("169.254"));
@@ -2253,7 +2249,7 @@ async fn external_upload_refuses_redirects_and_failed_transfers_without_finalizi
             .unwrap()
             .with_base_url(server.url());
         let error = client
-            .upload_file("C0123", "content", None, None)
+            .upload_file("C0123", b"content", None, None)
             .await
             .unwrap_err();
         assert!(
@@ -2289,7 +2285,7 @@ async fn external_upload_uncertain_completion_is_not_retried_or_reported_as_succ
             .with_base_url(server.url())
             .with_retry_config(3, 1, 1);
         let error = client
-            .upload_file("C0123", "content", None, None)
+            .upload_file("C0123", b"content", None, None)
             .await
             .unwrap_err();
         assert!(
@@ -2329,7 +2325,7 @@ async fn external_upload_rate_limit_retries_only_completion_with_the_same_file_i
         .with_base_url(server.url())
         .with_retry_config(3, 1, 1);
     let file = client
-        .upload_file("C0123", "content", None, None)
+        .upload_file("C0123", b"content", None, None)
         .await
         .unwrap();
     assert_eq!(file.id, "FUPLOAD1");
@@ -2343,28 +2339,43 @@ async fn external_upload_rate_limit_retries_only_completion_with_the_same_file_i
 #[fcp_async_core::runtime::test]
 async fn download_file_happy_path() {
     let _ctx = AsyncTestContext::for_scenario("slack.download_file.happy_path");
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/files.info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "ok": true,
-            "file": {
-                "id": "F01234567",
-                "name": "report.pdf",
-                "title": "Q4 Report",
-                "mimetype": "application/pdf",
-                "filetype": "pdf",
-                "size": 102_400,
-                "url_private": "https://files.slack.com/files-pri/T01234-F01234567/report.pdf",
-                "url_private_download": "https://files.slack.com/files-pri/T01234-F01234567/download/report.pdf"
-            }
-        })))
-        .mount(&mock_server)
-        .await;
+    let content: &[u8] = b"%PDF-1.7\n\xff\0";
+    let server = StructuredFakeHttpServer::spawn(2, move |idx, request| {
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.headers["x-fcp-credential-id"],
+            TEST_BOT_CREDENTIAL_ID
+        );
+        assert!(!request.headers.contains_key("authorization"));
+        if idx == 0 {
+            assert_eq!(request.path, "/files.info?file=F01234567");
+            return StructuredHttpResponse::json(
+                200,
+                &json!({
+                    "ok": true,
+                    "file": {
+                        "id": "F01234567", "name": "report.pdf", "title": "Q4 Report",
+                        "mimetype": "application/pdf", "filetype": "pdf", "size": content.len(),
+                        "url_private": format!("http://{}/files-pri/TTEST-F01234567/report.pdf", request.headers["host"]),
+                        "url_private_download": format!("http://{}/files-pri/TTEST-F01234567/download/report.pdf", request.headers["host"]),
+                    }
+                }),
+            );
+        }
+        assert_eq!(
+            request.path,
+            "/files-pri/TTEST-F01234567/download/report.pdf"
+        );
+        assert_eq!(request.headers["accept"], "*/*");
+        StructuredHttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/pdf".into())],
+            body: content.to_vec(),
+        }
+    });
 
     let mut connector = SlackConnector::new();
-    setup_configure(&mut connector, &mock_server.uri()).await;
+    setup_configure(&mut connector, server.url()).await;
     let key = setup_handshake(&mut connector, &["slack.files.read"]).await;
 
     let cap = generate_valid_token_for_operation(&key, "slack.files.read", "slack.download_file");
@@ -2375,17 +2386,533 @@ async fn download_file_happy_path() {
             "capability_token": cap
         }))
         .await
-        .expect("invoke should succeed");
+        .expect("download must fetch the actual file bytes");
 
     assert_eq!(result["file"]["id"], "F01234567");
     assert_eq!(result["file"]["name"], "report.pdf");
     assert!(result["file"]["url_private_download"].is_null());
     assert!(result["file"]["url_private"].is_null());
+    assert_eq!(result["content_base64"], BASE64_STANDARD.encode(content));
+    assert_eq!(result["content_length"], content.len());
     assert_eq!(
-        result["content_object_id"].as_str().unwrap().len(),
-        64,
-        "content_object_id should be a hex ObjectId"
+        result["content_sha256"],
+        hex::encode(Sha256::digest(content))
     );
+    assert!(result.get("content_object_id").is_none());
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn binary_file_manifest_matches_runtime_contract() {
+    let manifest = fcp_manifest::ConnectorManifest::parse_str(include_str!("../manifest.toml"))
+        .expect("bundled Slack manifest must have a valid canonical interface hash");
+    let introspection = SlackConnector::new().handle_introspect().await.unwrap();
+    let operations = introspection["operations"].as_array().unwrap();
+    for operation_id in ["slack.upload_file", "slack.download_file"] {
+        let operation = &manifest.provides.operations[operation_id];
+        let runtime = operations
+            .iter()
+            .find(|entry| entry["id"] == operation_id)
+            .unwrap();
+        assert_eq!(
+            operation.input_schema["required"],
+            runtime["input_schema"]["required"]
+        );
+        assert_eq!(
+            operation.output_schema["required"],
+            runtime["output_schema"]["required"]
+        );
+        assert_eq!(
+            operation.output_schema["properties"]["content_length"]["maximum"],
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            operation.output_schema["properties"]["content_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        let network = operation.network_constraints.as_ref().unwrap();
+        assert_eq!(network.max_redirects, 0);
+        assert!(
+            network
+                .host_allow
+                .iter()
+                .any(|host| host == "files.slack.com")
+        );
+    }
+    let upload = &manifest.provides.operations["slack.upload_file"];
+    assert_eq!(upload.input_schema["required"], json!(["channels"]));
+    assert_eq!(
+        upload.input_schema["oneOf"],
+        json!([
+            {"required": ["content_base64"]}, {"required": ["resolved_content"]},
+        ])
+    );
+    assert!(
+        upload.input_schema["properties"]
+            .get("content_object_id")
+            .is_none()
+    );
+    let download = &manifest.provides.operations["slack.download_file"];
+    assert_eq!(download.input_schema["required"], json!(["file_id"]));
+    assert_eq!(
+        download.output_schema["required"],
+        json!(["file", "content_base64", "content_length", "content_sha256",])
+    );
+    assert_eq!(
+        download
+            .network_constraints
+            .as_ref()
+            .unwrap()
+            .max_response_bytes,
+        16 * 1024 * 1024
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn binary_download_upload_roundtrip_preserves_bytes_and_scopes_credentials() {
+    let content: &[u8] = b"\0\xff\x80Slack\r\n\0\x01";
+    let server = StructuredFakeHttpServer::spawn(5, move |idx, request| {
+        if idx == 3 {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/upload/v1/fixture");
+            assert_eq!(request.body, content);
+            assert_eq!(request.headers["content-type"], "application/octet-stream");
+            assert!(!request.headers.contains_key("authorization"));
+            assert!(!request.headers.contains_key("x-fcp-credential-id"));
+            return StructuredHttpResponse::json(200, &json!({}));
+        }
+        assert_eq!(
+            request.headers["x-fcp-credential-id"],
+            TEST_BOT_CREDENTIAL_ID
+        );
+        assert!(!request.headers.contains_key("authorization"));
+        match idx {
+            0 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.path, "/files.info?file=FBINARY1");
+                StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "file": {
+                            "id": "FBINARY1", "name": "source.bin", "size": content.len(),
+                            "url_private_download": format!("http://{}/files-pri/TTEST-FBINARY1/download/source.bin", request.headers["host"]),
+                        }
+                    }),
+                )
+            }
+            1 => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(
+                    request.path,
+                    "/files-pri/TTEST-FBINARY1/download/source.bin"
+                );
+                assert_eq!(request.headers["accept"], "*/*");
+                StructuredHttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "application/octet-stream".into())],
+                    body: content.to_vec(),
+                }
+            }
+            2 => {
+                assert_eq!(request.path, "/files.getUploadURLExternal");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"filename": "copy.bin", "length": content.len()})
+                );
+                external_upload_reservation(request, "FCOPY1")
+            }
+            4 => {
+                assert_eq!(request.path, "/files.completeUploadExternal");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({
+                        "files": [{"id": "FCOPY1", "title": "copy.bin"}],
+                        "channel_id": "C01234567",
+                    })
+                );
+                StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true, "files": [{"id": "FCOPY1", "name": "copy.bin", "size": content.len()}],
+                    }),
+                )
+            }
+            _ => unreachable!("unexpected transfer stage"),
+        }
+    });
+    let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, server.url()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.read", "slack.files.write"]).await;
+    let download = connector.handle_invoke(json!({
+        "operation": "slack.download_file",
+        "input": { "file_id": "FBINARY1" },
+        "capability_token": generate_valid_token_for_operation(&key, "slack.files.read", "slack.download_file"),
+    })).await.expect("binary download");
+    assert_eq!(download["content_base64"], BASE64_STANDARD.encode(content));
+    assert_eq!(download["content_length"], content.len());
+    assert_eq!(
+        download["content_sha256"],
+        hex::encode(Sha256::digest(content))
+    );
+    let upload = connector.handle_invoke(json!({
+        "operation": "slack.upload_file",
+        "input": {
+            "channels": "C01234567",
+            "content_base64": download["content_base64"],
+            "filename": "copy.bin",
+        },
+        "capability_token": generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file"),
+    })).await.expect("binary upload using the downloaded inline content");
+    assert_eq!(upload["file"]["id"], "FCOPY1");
+    assert_eq!(upload["content_length"], download["content_length"]);
+    assert_eq!(upload["content_sha256"], download["content_sha256"]);
+    assert_eq!(upload["receipt"]["resource"], "slack:file:FCOPY1");
+    assert!(upload.get("source_object_id").is_none());
+    assert!(upload.get("file_object_id").is_none());
+    assert_eq!(server.requests().len(), 5);
+}
+
+#[fcp_async_core::runtime::test]
+async fn private_download_authenticates_both_token_and_credential_reference_modes() {
+    use fcp_slack::client::SlackAuth;
+
+    for auth in [
+        SlackAuth::Token("xoxb-download-secret".into()),
+        SlackAuth::CredentialId(fcp_core::CredentialId::new()),
+    ] {
+        let (header, expected) = match &auth {
+            SlackAuth::Token(token) => ("authorization", format!("Bearer {token}")),
+            SlackAuth::CredentialId(id) => ("x-fcp-credential-id", id.to_string()),
+        };
+        let server = StructuredFakeHttpServer::spawn(2, move |idx, request| {
+            assert_eq!(request.headers[header], expected);
+            assert_eq!(request.method, "GET");
+            assert_eq!(
+                request.headers.contains_key("authorization"),
+                header == "authorization"
+            );
+            assert_eq!(
+                request.headers.contains_key("x-fcp-credential-id"),
+                header == "x-fcp-credential-id"
+            );
+            if idx == 0 {
+                return StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "file": {
+                            "id": "FAUTH1", "size": 3,
+                            "url_private": format!("http://{}/files-pri/TTEST-FAUTH1/file.bin", request.headers["host"]),
+                        }
+                    }),
+                );
+            }
+            assert_eq!(request.path, "/files-pri/TTEST-FAUTH1/file.bin");
+            assert_eq!(request.headers["accept"], "*/*");
+            StructuredHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: vec![0, 128, 255],
+            }
+        });
+        let client = SlackClient::new_with_auth(auth)
+            .unwrap()
+            .with_base_url(server.url());
+        let (file, bytes) = client.download_file("FAUTH1").await.unwrap();
+        assert_eq!(file.id, "FAUTH1");
+        assert_eq!(bytes, [0, 128, 255]);
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn download_file_rejects_untrusted_origin_without_sending_credentials() {
+    let untrusted = MockServer::start().await;
+    for url in [
+        format!(
+            "{}/files-pri/TTEST-FSAFE1/secret-capability",
+            untrusted.uri()
+        ),
+        "https://files.slack.com.evil.invalid/files-pri/secret-capability".into(),
+        "http://169.254.169.254/files-pri/secret-capability".into(),
+    ] {
+        let server = StructuredFakeHttpServer::spawn(1, move |_idx, _request| {
+            StructuredHttpResponse::json(
+                200,
+                &json!({
+                    "ok": true,
+                    "file": {"id": "FSAFE1", "size": 3, "url_private_download": url},
+                }),
+            )
+        });
+        let client = SlackClient::new("xoxb-private-secret")
+            .unwrap()
+            .with_base_url(server.url())
+            .with_request_timeout(StdDuration::from_secs(2));
+        let error = client.download_file("FSAFE1").await.unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains("secret-capability"));
+        assert!(!message.contains("xoxb-private-secret"));
+        assert!(!message.contains("169.254"));
+        assert_eq!(server.requests().len(), 1);
+    }
+    assert!(untrusted.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn download_file_rejects_unusable_metadata_before_fetching_content() {
+    for patch in [
+        json!({"id": "FDIFFERENT"}),
+        json!({"is_external": true}),
+        json!({"mode": "external"}),
+        json!({"filetype": "remote"}),
+        json!({"size": 16 * 1024 * 1024 + 1}),
+        json!({"size": null}),
+        json!({"url_private_download": null}),
+    ] {
+        let server = StructuredFakeHttpServer::spawn(1, move |_idx, request| {
+            let mut file = json!({
+                "id": "FSAFE1", "size": 3,
+                "url_private_download": format!("http://{}/files-pri/TTEST-FSAFE1/file.bin", request.headers["host"]),
+            });
+            for (key, value) in patch.as_object().unwrap() {
+                file[key] = value.clone();
+            }
+            StructuredHttpResponse::json(200, &json!({"ok": true, "file": file}))
+        });
+        let client = SlackClient::new("token")
+            .unwrap()
+            .with_base_url(server.url());
+        assert!(client.download_file("FSAFE1").await.is_err());
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn download_file_refuses_redirects_and_failed_transfers_without_retrying() {
+    let redirect_target = MockServer::start().await;
+    for status in [302, 401, 403, 429, 500] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files.info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "FSAFE1", "size": 3,
+                    "url_private_download": format!("{}/files-pri/TTEST-FSAFE1/secret-capability", server.uri()),
+                }
+            })))
+            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/files-pri/TTEST-FSAFE1/secret-capability"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header(
+                        "location",
+                        format!("{}/must-not-follow", redirect_target.uri()),
+                    )
+                    .insert_header("retry-after", "0")
+                    .set_body_string("private provider failure body"),
+            )
+            .mount(&server)
+            .await;
+        let client = SlackClient::new("xoxb-private-secret")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_retry_config(3, 1, 1);
+        let error = client.download_file("FSAFE1").await.unwrap_err();
+        assert!(!error.to_string().contains("private provider failure body"));
+        assert!(!error.to_string().contains("secret-capability"));
+        assert!(!error.to_string().contains("xoxb-private-secret"));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "download failures must not be retried implicitly"
+        );
+    }
+    assert!(
+        redirect_target
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[fcp_async_core::runtime::test]
+async fn download_file_rejects_actual_size_that_disagrees_with_metadata() {
+    for metadata_size in [0, 2, 4] {
+        let server = StructuredFakeHttpServer::spawn(2, move |idx, request| {
+            if idx == 0 {
+                return StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "file": {
+                            "id": "FSIZE1", "size": metadata_size,
+                            "url_private_download": format!("http://{}/files-pri/TTEST-FSIZE1/file.bin", request.headers["host"]),
+                        }
+                    }),
+                );
+            }
+            StructuredHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: vec![0, 128, 255],
+            }
+        });
+        let client = SlackClient::new("token")
+            .unwrap()
+            .with_base_url(server.url());
+        assert!(client.download_file("FSIZE1").await.is_err());
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn download_file_bounds_chunked_content_and_rejects_truncated_http_bodies() {
+    for scenario in ["chunked", "oversized_chunked", "truncated"] {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let accept = || {
+                let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(StdDuration::from_secs(5)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "download fixture connection timed out"
+                            );
+                            thread::sleep(StdDuration::from_millis(5));
+                        }
+                        Err(error) => panic!("download fixture accept failed: {error}"),
+                    }
+                }
+            };
+            let mut metadata_stream = accept();
+            let request = read_structured_http_request(&mut metadata_stream);
+            assert_eq!(request.path, "/files.info?file=FBOUNDED1");
+            let metadata_size = match scenario {
+                "chunked" => 3,
+                "oversized_chunked" => 16 * 1024 * 1024,
+                _ => 4,
+            };
+            write_structured_http_response(
+                &mut metadata_stream,
+                StructuredHttpResponse::json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "file": {
+                            "id": "FBOUNDED1", "size": metadata_size,
+                            "url_private_download": format!("http://{address}/files-pri/TTEST-FBOUNDED1/file.bin"),
+                        }
+                    }),
+                ),
+            );
+            drop(metadata_stream);
+            let mut content_stream = accept();
+            let request = read_structured_http_request(&mut content_stream);
+            assert_eq!(request.path, "/files-pri/TTEST-FBOUNDED1/file.bin");
+            if scenario == "truncated" {
+                content_stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabc",
+                    )
+                    .unwrap();
+                return;
+            }
+            content_stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let oversized = scenario == "oversized_chunked";
+            let chunk = if oversized {
+                vec![0xAB; 1024 * 1024]
+            } else {
+                vec![0, 128, 255]
+            };
+            let chunk_header = format!("{:X}\r\n", chunk.len());
+            for _ in 0..if oversized { 17 } else { 1 } {
+                // A bounded reader may close the connection immediately after
+                // crossing its limit; that cancellation is expected here.
+                if content_stream.write_all(chunk_header.as_bytes()).is_err()
+                    || content_stream.write_all(&chunk).is_err()
+                    || content_stream.write_all(b"\r\n").is_err()
+                {
+                    return;
+                }
+            }
+            let _ = content_stream.write_all(b"0\r\n\r\n");
+        });
+        let client = SlackClient::new("token")
+            .unwrap()
+            .with_base_url(format!("http://{address}"))
+            .with_request_timeout(StdDuration::from_secs(5));
+        let result = client.download_file("FBOUNDED1").await;
+        if scenario == "chunked" {
+            assert_eq!(result.unwrap().1, [0, 128, 255]);
+        } else {
+            assert!(
+                result.is_err(),
+                "{scenario} must not produce partial content"
+            );
+        }
+        worker.join().expect("bounded download fixture completed");
+    }
+}
+
+#[fcp_async_core::runtime::test]
+async fn binary_upload_rejects_invalid_content_before_network() {
+    let server = MockServer::start().await;
+    let mut connector = SlackConnector::new();
+    setup_configure(&mut connector, &server.uri()).await;
+    let key = setup_handshake(&mut connector, &["slack.files.write"]).await;
+    for content in [
+        json!({}),
+        json!({"content_base64": "AA==", "resolved_content": "text"}),
+        json!({"content_base64": "AA"}),
+        json!({"content_base64": "AB=="}),
+        json!({"content_base64": "_w=="}),
+        json!({"content_base64": "AA==\n"}),
+        json!({"content_base64": 42}),
+    ] {
+        let mut input = content;
+        input["channels"] = json!("C01234567");
+        input["thread_ts"] = json!("123.456");
+        let error = connector.handle_invoke(json!({
+            "operation": "slack.upload_file",
+            "input": input,
+            "capability_token": generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file"),
+        })).await.unwrap_err();
+        assert!(
+            matches!(error, fcp_core::FcpError::InvalidRequest { .. }),
+            "unexpected validation error: {error:?}"
+        );
+    }
+    let oversized = BASE64_STANDARD.encode(vec![0; 16 * 1024 * 1024 + 1]);
+    let error = connector.handle_invoke(json!({
+        "operation": "slack.upload_file",
+        "input": {"channels": "C01234567", "content_base64": oversized},
+        "capability_token": generate_valid_token_for_operation(&key, "slack.files.write", "slack.upload_file"),
+    })).await.unwrap_err();
+    assert!(matches!(error, fcp_core::FcpError::InvalidRequest { .. }));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[fcp_async_core::runtime::test]
@@ -2571,7 +3098,6 @@ async fn upload_file_emits_receipt() {
             "operation": "slack.upload_file",
             "input": {
                 "channels": "C01234567",
-                "content_object_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "resolved_content": "a,b,c",
                 "filename": "data.csv"
             },
@@ -2583,12 +3109,7 @@ async fn upload_file_emits_receipt() {
     let receipt = &result["receipt"];
     assert_eq!(receipt["operation"], "slack.upload_file");
     assert_eq!(receipt["effect"], "file_uploaded");
-    assert!(
-        receipt["resource"]
-            .as_str()
-            .unwrap()
-            .starts_with("file_object:")
-    );
+    assert_eq!(receipt["resource"], "slack:file:F09876543");
 }
 
 #[fcp_async_core::runtime::test]
@@ -4871,7 +5392,6 @@ async fn validate_upload_file_missing_channels() {
         .handle_invoke(json!({
             "operation": "slack.upload_file",
             "input": {
-                "content_object_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "resolved_content": "data"
             },
             "capability_token": cap

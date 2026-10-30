@@ -64,7 +64,12 @@ where
     let mut connector = SlackConnector::new();
     connector.attach_event_stream(events.clone())?;
     let runtime = Builder::new_multi_thread().enable_all().build()?;
-    let result = serve_jsonl_events(reader, events, JsonlConfig::default(), |method, params| {
+    // A 16 MiB file expands to roughly 22 MiB as base64. Keep the request
+    // envelope within the host's 32 MiB invoke limit while admitting that file.
+    let config = JsonlConfig {
+        max_request_bytes: 32 * 1024 * 1024,
+    };
+    let result = serve_jsonl_events(reader, events, config, |method, params| {
         runtime.block_on(dispatch_message(&mut connector, method, params))
     });
     // EOF, read failure, and a broken stdout must release outstanding event
@@ -275,6 +280,40 @@ mod tests {
         assert_eq!(details["configured"], false);
         assert_eq!(details["handshaken"], false);
         assert!(details["instance_id"].is_string());
+    }
+
+    #[test]
+    fn production_loop_admits_a_maximum_binary_upload_envelope() {
+        use base64::Engine as _;
+
+        let content = base64::engine::general_purpose::STANDARD
+            .encode(vec![0_u8; fcp_slack::client::MAX_UPLOAD_BYTES]);
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "binary-upload",
+            "method": "invoke",
+            "params": {
+                "operation": "slack.upload_file",
+                "input": {"channels": "C123", "content_base64": content}
+            }
+        }))
+        .unwrap();
+        assert!(request.len() > JsonlConfig::default().max_request_bytes);
+        request.push(b'\n');
+        let output = CapturedOutput::default();
+        run_fcp_loop_with_io(io::Cursor::new(request), output.clone()).unwrap();
+        let bytes = output.0.lock().unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The invocation reaches connector validation (this instance is not
+        // configured), rather than being rejected by JSONL framing first.
+        assert_eq!(response["id"], "binary-upload");
+        assert!(response["error"].is_object());
+        assert!(
+            !response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds")
+        );
     }
 
     #[cfg(unix)]

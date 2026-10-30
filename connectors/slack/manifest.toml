@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:48b308c0521193bbd39c11cd0621e3beb55bfe495f903f0234de8c2ef080d636"
+interface_hash = "blake3-256:fcp.interface.v2:51e8630632bd9eca3ef9c8098ecf5be11f7ef49ce1a64d31a3288ffb70134587"
 
 [connector]
 id = "fcp.slack"
@@ -465,7 +465,7 @@ related = ["slack.get_channel_history"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."slack.upload_file"]
-description = "Upload a file to a Slack channel"
+description = "Upload binary or UTF-8 file content to Slack channels"
 capability = "slack.files.write"
 risk_level = "medium"
 safety_tier = "risky"
@@ -474,16 +474,21 @@ idempotency = "none"
 revocation_freshness = "risky"
 
 [provides.operations."slack.upload_file".input_schema]
-required = ["channels", "content_object_id", "resolved_content"]
+required = ["channels"]
 type = "object"
+oneOf = [{ required = ["content_base64"] }, { required = ["resolved_content"] }]
 [provides.operations."slack.upload_file".input_schema.properties.channels]
 type = "string"
 description = "1 to 100 comma-separated Slack channel or user IDs"
-[provides.operations."slack.upload_file".input_schema.properties.content_object_id]
-type = "string"
 [provides.operations."slack.upload_file".input_schema.properties.resolved_content]
 type = "string"
-description = "Host-materialized UTF-8 content, at most 16 MiB when encoded"
+maxLength = 16777216
+description = "Inline UTF-8 content, at most 16 MiB of bytes; exclusive with content_base64"
+[provides.operations."slack.upload_file".input_schema.properties.content_base64]
+type = "string"
+contentEncoding = "base64"
+maxLength = 22369624
+description = "Canonical padded standard base64 for at most 16 MiB of bytes; exclusive with resolved_content"
 [provides.operations."slack.upload_file".input_schema.properties.filename]
 type = "string"
 description = "Display filename, at most 255 UTF-8 bytes; defaults to upload.txt"
@@ -492,14 +497,22 @@ type = "string"
 description = "Optional parent thread timestamp; requires exactly one channel"
 
 [provides.operations."slack.upload_file".output_schema]
-required = ["file", "file_object_id", "source_object_id"]
+required = ["file", "content_length", "content_sha256", "receipt"]
 type = "object"
 [provides.operations."slack.upload_file".output_schema.properties.file]
 type = "object"
-[provides.operations."slack.upload_file".output_schema.properties.file_object_id]
+[provides.operations."slack.upload_file".output_schema.properties.content_length]
+type = "integer"
+minimum = 0
+maximum = 16777216
+description = "Number of bytes successfully transferred"
+[provides.operations."slack.upload_file".output_schema.properties.content_sha256]
 type = "string"
-[provides.operations."slack.upload_file".output_schema.properties.source_object_id]
-type = "string"
+pattern = "^[0-9a-f]{64}$"
+description = "SHA-256 of the actual uploaded bytes"
+[provides.operations."slack.upload_file".output_schema.properties.receipt]
+type = "object"
+description = "Completed upload receipt naming the actual Slack file resource"
 [provides.operations."slack.upload_file".output_schema.properties.coordination]
 description = "Redacted chat coordination audit records for threaded uploads"
 type = "array"
@@ -522,9 +535,9 @@ total_timeout_ms = 60000
 max_response_bytes = 1048576
 
 [provides.operations."slack.upload_file".ai_hints]
-when_to_use = "Upload a file to a Slack channel."
-common_mistakes = ["Using channel name instead of channel ID"]
-examples = ['{"channels": "C01234567", "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "resolved_content": "log output...", "filename": "output.txt"}']
+when_to_use = "Upload inline binary or UTF-8 content to Slack channels, including content_base64 returned by slack.download_file."
+common_mistakes = ["Using a channel name instead of a channel ID", "Supplying both content_base64 and resolved_content", "Passing an object reference without actual inline content"]
+examples = ['{"channels":"C01234567","content_base64":"AP+AQUI=","filename":"data.bin"}', '{"channels":"C01234567","resolved_content":"log output...","filename":"output.txt"}']
 related = ["slack.post_message"]
 
 # ────────────────────────────────────────────────────────────────
@@ -628,7 +641,7 @@ related = ["slack.list_channels"]
 # ────────────────────────────────────────────────────────────────
 
 [provides.operations."slack.download_file"]
-description = "Download a shared file from Slack"
+description = "Download Slack-hosted file bytes with an exact length and SHA-256 digest"
 capability = "slack.files.read"
 risk_level = "low"
 safety_tier = "safe"
@@ -643,12 +656,24 @@ type = "object"
 type = "string"
 
 [provides.operations."slack.download_file".output_schema]
-required = ["file", "content_object_id"]
+required = ["file", "content_base64", "content_length", "content_sha256"]
 type = "object"
 [provides.operations."slack.download_file".output_schema.properties.file]
 type = "object"
-[provides.operations."slack.download_file".output_schema.properties.content_object_id]
+[provides.operations."slack.download_file".output_schema.properties.content_base64]
 type = "string"
+contentEncoding = "base64"
+maxLength = 22369624
+description = "Actual file bytes as canonical padded standard base64"
+[provides.operations."slack.download_file".output_schema.properties.content_length]
+type = "integer"
+minimum = 0
+maximum = 16777216
+description = "Number of downloaded bytes"
+[provides.operations."slack.download_file".output_schema.properties.content_sha256]
+type = "string"
+pattern = "^[0-9a-f]{64}$"
+description = "SHA-256 of the actual downloaded bytes"
 
 [provides.operations."slack.download_file".network_constraints]
 host_allow = ["slack.com", "*.slack.com", "files.slack.com"]
@@ -660,16 +685,18 @@ require_sni = true
 deny_ip_literals = true
 require_host_canonicalization = true
 dns_max_ips = 16
-max_redirects = 5
+max_redirects = 0
 connect_timeout_ms = 10000
 total_timeout_ms = 60000
-max_response_bytes = 20971520
+max_response_bytes = 16777216
 
 [provides.operations."slack.download_file".ai_hints]
-when_to_use = "Download a file shared in Slack."
+when_to_use = "Retrieve up to 16 MiB of Slack-hosted file bytes for processing or a binary upload."
 common_mistakes = [
     "Using the file URL directly instead of the file_id — the API requires authentication via the file ID endpoint.",
     "Not checking that the file is still available (files can be deleted or expired in free-tier workspaces).",
+    "Requesting remote files hosted outside Slack, which this operation refuses.",
+    "Assuming downloaded inline content has been persisted to the mesh object store.",
 ]
 examples = ['{"file_id": "F01234567"}']
 related = ["slack.upload_file"]

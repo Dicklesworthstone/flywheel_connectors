@@ -1,5 +1,6 @@
 //! FCP Slack Connector implementation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{
     Arc,
@@ -7,13 +8,15 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fcp_async_core::channel::{broadcast, watch};
 use fcp_async_core::sync::RwLock;
 use fcp_core::{HealthSnapshot, HealthState, SubscribeRequest, SubscribeResponse, SubscribeResult};
 use fcp_prelude::{
     AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
     ConnectorId, CredentialId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult,
-    HandshakeRequest, HandshakeResponse, IdempotencyClass, Introspection, ObjectId, OperationId,
+    HandshakeRequest, HandshakeResponse, IdempotencyClass, Introspection, OperationId,
     OperationInfo, Principal, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
     SimulateResponse, ThreadInfo, TrustLevel, ZoneId, reject_secret_config_material,
 };
@@ -55,6 +58,7 @@ const SLACK_EVENTS_API_OPERATION: &str = "slack.handle_events_api";
 const SLACK_EVENTS_API_VERIFIED_SIGNATURE_RESULT: &str = "verified";
 const NATIVE_EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const NATIVE_EVENT_TOPIC: &str = "slack.events";
+const MAX_FILE_CONTENT_BASE64_BYTES: usize = crate::client::MAX_UPLOAD_BYTES.div_ceil(3) * 4;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
 
 fn is_local_test_host(host: &str) -> bool {
@@ -997,26 +1001,31 @@ impl SlackConnector {
                 ),
                 op_info(
                     "slack.upload_file",
-                    "Upload host-resolved object content to Slack channels",
+                    "Upload binary or UTF-8 content to Slack channels, up to 16 MiB",
                     json!({
                         "type": "object",
-                        "required": ["channels", "content_object_id", "resolved_content"],
+                        "required": ["channels"],
+                        "oneOf": [
+                            { "required": ["content_base64"] },
+                            { "required": ["resolved_content"] }
+                        ],
                         "properties": {
                             "channels": { "type": "string", "description": "1 to 100 comma-separated Slack channel or user IDs" },
-                            "content_object_id": { "type": "string", "description": "Source mesh object reference (hex ObjectId)" },
-                            "resolved_content": { "type": "string", "description": "Host-materialized UTF-8 content for content_object_id, at most 16 MiB when encoded" },
+                            "content_base64": { "type": "string", "contentEncoding": "base64", "maxLength": MAX_FILE_CONTENT_BASE64_BYTES, "description": "Canonical standard padded base64 of at most 16 MiB of file bytes; mutually exclusive with resolved_content" },
+                            "resolved_content": { "type": "string", "maxLength": crate::client::MAX_UPLOAD_BYTES, "description": "Inline UTF-8 text, at most 16 MiB in bytes; mutually exclusive with content_base64" },
                             "filename": { "type": "string", "description": "Filename to display, at most 255 UTF-8 bytes; defaults to upload.txt" },
                             "thread_ts": { "type": "string", "description": "Optional parent thread timestamp for a single-channel threaded upload" }
                         }
                     }),
                     json!({
                         "type": "object",
-                        "required": ["file", "file_object_id", "source_object_id"],
+                        "required": ["file", "content_length", "content_sha256", "receipt"],
                         "properties": {
                             "file": { "type": "object" },
-                            "file_object_id": { "type": "string" },
-                            "source_object_id": { "type": "string" },
-                            "coordination": { "type": "array", "description": "Redacted chat coordination audit records for threaded uploads" }
+                            "content_length": { "type": "integer", "minimum": 0, "maximum": crate::client::MAX_UPLOAD_BYTES, "description": "Number of actual uploaded bytes" },
+                            "content_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 digest of the actual uploaded bytes" },
+                            "receipt": { "type": "object", "description": "Upload receipt identifying the actual Slack file as slack:file:<file_id>" },
+                            "coordination": { "type": "array", "items": { "type": "object" }, "description": "Redacted chat coordination audit records for threaded uploads" }
                         }
                     }),
                     "slack.files.write",
@@ -1024,20 +1033,21 @@ impl SlackConnector {
                     SafetyTier::Risky,
                     IdempotencyClass::None,
                     AgentHint {
-                        when_to_use: "Upload content referenced by a mesh object to one or more Slack channels.".into(),
+                        when_to_use: "Upload binary bytes as canonical base64 or inline UTF-8 text to one or more Slack channels. No host object materialization is available.".into(),
                         common_mistakes: vec![
-                            "Forgetting to pass content_object_id".into(),
-                            "Not providing host-resolved content for the object reference".into(),
+                            "Providing both content_base64 and resolved_content, or neither".into(),
+                            "Using URL-safe or unpadded base64, or exceeding 16 MiB of decoded bytes".into(),
                         ],
                         examples: vec![
-                            r#"{"channels":"C01234567","content_object_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","resolved_content":"log data here","filename":"output.log"}"#.into(),
+                            r#"{"channels":"C01234567","content_base64":"AP9/gA==","filename":"sample.bin"}"#.into(),
+                            r#"{"channels":"C01234567","resolved_content":"log data here","filename":"output.log"}"#.into(),
                         ],
                         related: vec![CapabilityId::from_static("slack.download_file")],
                     },
                 ),
                 op_info(
                     "slack.download_file",
-                    "Fetch Slack file metadata and emit a content object reference",
+                    "Download Slack file bytes as base64 with a SHA-256 digest, up to 16 MiB",
                     json!({
                         "type": "object",
                         "required": ["file_id"],
@@ -1047,10 +1057,12 @@ impl SlackConnector {
                     }),
                     json!({
                         "type": "object",
-                        "required": ["file", "content_object_id"],
+                        "required": ["file", "content_base64", "content_length", "content_sha256"],
                         "properties": {
                             "file": { "type": "object" },
-                            "content_object_id": { "type": "string" }
+                            "content_base64": { "type": "string", "contentEncoding": "base64", "maxLength": MAX_FILE_CONTENT_BASE64_BYTES, "description": "Canonical standard padded base64 of the downloaded file bytes" },
+                            "content_length": { "type": "integer", "minimum": 0, "maximum": crate::client::MAX_DOWNLOAD_BYTES, "description": "Number of actual downloaded bytes" },
+                            "content_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 digest of the actual downloaded bytes" }
                         }
                     }),
                     "slack.files.read",
@@ -1058,8 +1070,10 @@ impl SlackConnector {
                     SafetyTier::Safe,
                     IdempotencyClass::Strict,
                     AgentHint {
-                        when_to_use: "Get sanitized Slack file metadata plus a deterministic content object reference.".into(),
-                        common_mistakes: vec![],
+                        when_to_use: "Fetch Slack-hosted file bytes, sanitized metadata, and their SHA-256 digest. Decode content_base64 locally; no mesh object is materialized or stored.".into(),
+                        common_mistakes: vec![
+                            "Requesting externally hosted files or files larger than 16 MiB".into(),
+                        ],
                         examples: vec![
                             r#"{"file_id": "F01234567"}"#.into(),
                         ],
@@ -2262,12 +2276,12 @@ impl SlackConnector {
     ) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
         let channels = require_str(&input, "channels")?;
-        let source_object_id = require_object_id_str(&input, "content_object_id")?;
-        let content = require_str(&input, "resolved_content")?;
+        let content = upload_content_bytes(&input)?;
         let filename = input.get("filename").and_then(|v| v.as_str());
         let thread_ts = optional_slack_thread_ts(&input, "thread_ts")?;
-        crate::client::validate_upload_input(channels, content, filename, thread_ts)
+        crate::client::validate_upload_input(channels, &content, filename, thread_ts)
             .map_err(|error| error.to_fcp_error())?;
+        let content_sha256 = file_content_sha256(&content);
         let coordination = if let Some(thread_ts) = thread_ts {
             let channel = require_single_threaded_upload_channel(channels)?;
             let coordination = self
@@ -2291,23 +2305,21 @@ impl SlackConnector {
         };
 
         let file = client
-            .upload_file(channels, content, filename, thread_ts)
+            .upload_file(channels, &content, filename, thread_ts)
             .await
             .map_err(|e: SlackError| e.to_fcp_error())?;
-        let file_object_id = derive_slack_file_object_id("upload", &file.id, source_object_id);
-        let redacted_file = redact_file_urls(file);
-
         let receipt = OperationReceipt {
             operation: "slack.upload_file".into(),
             effect: "file_uploaded".into(),
-            resource: format!("file_object:{file_object_id}"),
+            resource: format!("slack:file:{}", file.id),
             timestamp: String::new(),
         };
+        let redacted_file = redact_file_urls(file);
 
         let mut response = json!({
             "file": redacted_file,
-            "file_object_id": file_object_id.to_string(),
-            "source_object_id": source_object_id,
+            "content_length": content.len(),
+            "content_sha256": content_sha256,
             "receipt": receipt
         });
         if let Some(coordination) = coordination.as_ref() {
@@ -2322,18 +2334,19 @@ impl SlackConnector {
 
     async fn invoke_download_file(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
-        let file_id = require_str(&input, "file_id")?;
+        let file_id = require_download_file_id(&input)?;
 
-        let file = client
-            .get_file_info(file_id)
+        let (file, content) = client
+            .download_file(file_id)
             .await
             .map_err(|e: SlackError| e.to_fcp_error())?;
-        let content_object_id = derive_slack_file_object_id("download", &file.id, "slack");
         let redacted_file = redact_file_urls(file);
 
         Ok(json!({
             "file": redacted_file,
-            "content_object_id": content_object_id.to_string()
+            "content_base64": BASE64_STANDARD.encode(&content),
+            "content_length": content.len(),
+            "content_sha256": file_content_sha256(&content)
         }))
     }
 
@@ -3800,19 +3813,18 @@ fn validate_simulate_input(operation: &str, input: &serde_json::Value) -> FcpRes
         }
         "slack.upload_file" => {
             let channels = require_str(input, "channels")?;
-            require_object_id_str(input, "content_object_id")?;
-            let content = require_str(input, "resolved_content")?;
+            let content = upload_content_bytes(input)?;
             let thread_ts = optional_slack_thread_ts(input, "thread_ts")?;
             crate::client::validate_upload_input(
                 channels,
-                content,
+                &content,
                 input.get("filename").and_then(Value::as_str),
                 thread_ts,
             )
             .map_err(|error| error.to_fcp_error())?;
         }
         "slack.download_file" => {
-            require_str(input, "file_id")?;
+            require_download_file_id(input)?;
         }
         "slack.add_reaction" => {
             require_str(input, "channel")?;
@@ -3983,15 +3995,65 @@ fn is_valid_slack_thread_ts(thread_ts: &str) -> bool {
         && fraction.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn require_object_id_str<'a>(input: &'a serde_json::Value, field: &str) -> FcpResult<&'a str> {
-    let object_id = require_str(input, field)?;
-    if object_id.len() != 64 || !object_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(FcpError::InvalidRequest {
+fn upload_content_bytes(input: &Value) -> FcpResult<Cow<'_, [u8]>> {
+    match (input.get("content_base64"), input.get("resolved_content")) {
+        (Some(Value::String(encoded)), None) => {
+            // Bound allocation before decoding. A final exact-byte check handles
+            // the two excess bytes that can share the last base64 quartet.
+            if encoded.len() > MAX_FILE_CONTENT_BASE64_BYTES {
+                return Err(upload_content_too_large());
+            }
+            // STANDARD requires canonical padding and rejects nonzero trailing
+            // bits, whitespace, and the URL-safe alphabet.
+            let content =
+                BASE64_STANDARD
+                    .decode(encoded)
+                    .map_err(|_| FcpError::InvalidRequest {
+                        code: 1003,
+                        message: "content_base64 must be canonical standard padded base64".into(),
+                    })?;
+            if content.len() > crate::client::MAX_UPLOAD_BYTES {
+                return Err(upload_content_too_large());
+            }
+            Ok(Cow::Owned(content))
+        }
+        (None, Some(Value::String(content))) => {
+            if content.len() > crate::client::MAX_UPLOAD_BYTES {
+                return Err(upload_content_too_large());
+            }
+            Ok(Cow::Borrowed(content.as_bytes()))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(FcpError::InvalidRequest {
             code: 1003,
-            message: format!("Field `{field}` must be a 64-char hex ObjectId"),
-        });
+            message: "content_base64 and resolved_content must be strings when supplied".into(),
+        }),
+        (None, None) | (Some(_), Some(_)) => Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "slack.upload_file requires exactly one of content_base64 or resolved_content"
+                .into(),
+        }),
     }
-    Ok(object_id)
+}
+
+fn upload_content_too_large() -> FcpError {
+    FcpError::InvalidRequest {
+        code: 1003,
+        message: "slack.upload_file content exceeds the 16 MiB byte limit".into(),
+    }
+}
+
+fn file_content_sha256(content: &[u8]) -> String {
+    hex::encode(Sha256::digest(content))
+}
+
+fn require_download_file_id(input: &Value) -> FcpResult<&str> {
+    let file_id = require_str(input, "file_id")?;
+    crate::client::validate_download_file_id(file_id).map_err(|_| FcpError::InvalidRequest {
+        code: 1003,
+        message: "file_id must be a Slack file ID (F followed by 1 to 63 ASCII letters or digits)"
+            .into(),
+    })?;
+    Ok(file_id)
 }
 
 fn parse_upload_channels(channels: &str) -> Vec<&str> {
@@ -4011,11 +4073,6 @@ fn require_single_threaded_upload_channel(channels: &str) -> FcpResult<&str> {
             message: "slack.upload_file thread_ts requires exactly one channel".into(),
         }),
     }
-}
-
-fn derive_slack_file_object_id(namespace: &str, file_id: &str, seed: &str) -> ObjectId {
-    let material = format!("slack:{namespace}:{file_id}:{seed}");
-    ObjectId::from_unscoped_bytes(material.as_bytes())
 }
 
 fn redact_file_urls(mut file: crate::types::SlackFile) -> crate::types::SlackFile {
@@ -4738,6 +4795,133 @@ mod tests {
     }
 
     #[test]
+    fn upload_content_requires_exactly_one_string_encoding() {
+        for input in [
+            json!({}),
+            json!({"content_base64": "", "resolved_content": ""}),
+            json!({"content_base64": null}),
+            json!({"content_base64": [0, 255]}),
+            json!({"resolved_content": 42}),
+            json!({"resolved_content": null}),
+        ] {
+            assert!(upload_content_bytes(&input).is_err(), "{input}");
+        }
+        for input in [
+            json!({"content_base64": ""}),
+            json!({"resolved_content": ""}),
+        ] {
+            assert!(upload_content_bytes(&input).unwrap().is_empty());
+        }
+        let binary_input = json!({"content_base64": "AP9/gA=="});
+        let bytes = upload_content_bytes(&binary_input).unwrap();
+        assert_eq!(bytes.as_ref(), &[0, 255, 127, 128]);
+        assert_eq!(
+            file_content_sha256(&bytes),
+            "56cf8b6ea0b1b7dda3a88534b3d494f0fee24e53f791bdf9b6bcf883f63abd65"
+        );
+
+        let text_input = json!({"resolved_content": "🌍"});
+        let bytes = upload_content_bytes(&text_input).unwrap();
+        assert!(matches!(bytes, Cow::Borrowed(_)));
+        assert_eq!(
+            bytes.len(),
+            4,
+            "content lengths count bytes, not characters"
+        );
+        assert_eq!(bytes.as_ref(), "🌍".as_bytes());
+    }
+
+    #[test]
+    fn upload_base64_rejects_noncanonical_encodings() {
+        for encoded in [
+            "Zg", "Zg=", "Zg===", "Zh==", "Zm9=", "AA=A", "AP9_gA==", "AP9-gA==", "/w==\n",
+            " /w==", "====", "é===",
+        ] {
+            let input = json!({"content_base64": encoded});
+            assert!(upload_content_bytes(&input).is_err(), "{encoded:?}");
+        }
+        for (encoded, expected) in [("Zg==", "f"), ("Zm8=", "fo"), ("Zm9v", "foo")] {
+            let input = json!({"content_base64": encoded});
+            assert_eq!(
+                upload_content_bytes(&input).unwrap().as_ref(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn upload_content_enforces_exact_decoded_and_utf8_byte_limits() {
+        let limit = crate::client::MAX_UPLOAD_BYTES;
+        {
+            let input = json!({"content_base64": BASE64_STANDARD.encode(vec![0xff; limit])});
+            let encoded = input["content_base64"].as_str().unwrap();
+            assert_eq!(encoded.len(), MAX_FILE_CONTENT_BASE64_BYTES);
+            assert_eq!(upload_content_bytes(&input).unwrap().len(), limit);
+        }
+        {
+            // MAX_UPLOAD_BYTES is 1 modulo 3: the first excess byte still fits
+            // the permitted encoded length, so only the decoded check rejects it.
+            let input = json!({"content_base64": BASE64_STANDARD.encode(vec![0xff; limit + 1])});
+            assert_eq!(
+                input["content_base64"].as_str().unwrap().len(),
+                MAX_FILE_CONTENT_BASE64_BYTES
+            );
+            assert!(upload_content_bytes(&input).is_err());
+        }
+        {
+            let input = json!({"content_base64": "!".repeat(MAX_FILE_CONTENT_BASE64_BYTES + 1)});
+            let error = upload_content_bytes(&input).unwrap_err();
+            assert!(
+                matches!(error, FcpError::InvalidRequest { message, .. } if message.contains("16 MiB"))
+            );
+        }
+        {
+            let input = json!({"resolved_content": "é".repeat(limit / 2)});
+            assert_eq!(upload_content_bytes(&input).unwrap().len(), limit);
+        }
+        let input = json!({"resolved_content": "é".repeat(limit / 2 + 1)});
+        assert!(upload_content_bytes(&input).is_err());
+    }
+
+    #[test]
+    fn file_transfer_preflight_checks_binary_contract_without_network() {
+        assert!(
+            validate_simulate_input(
+                "slack.upload_file",
+                &json!({
+                    "channels": "C123", "content_base64": "AP9/gA==", "filename": "sample.bin"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_simulate_input(
+                "slack.upload_file",
+                &json!({
+                    "channels": "C123", "resolved_content": "plain text"
+                })
+            )
+            .is_ok()
+        );
+        for input in [
+            json!({"channels": "C123", "content_base64": "Zh=="}),
+            json!({"channels": "C123", "content_base64": "", "resolved_content": ""}),
+            json!({"channels": "C123"}),
+        ] {
+            assert!(validate_simulate_input("slack.upload_file", &input).is_err());
+        }
+        assert!(
+            validate_simulate_input("slack.download_file", &json!({"file_id": "F0123"})).is_ok()
+        );
+        for file_id in ["", "F", "C123", " F123", "F123/file"] {
+            assert!(
+                validate_simulate_input("slack.download_file", &json!({"file_id": file_id}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn test_resource_uris_for_operation_bind_slack_targets() {
         let uris = resource_uris_for_operation(
             "slack.post_message",
@@ -4776,7 +4960,6 @@ mod tests {
             "slack.upload_file",
             &json!({
                 "channels": "C111, C222,C111",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "hello"
             }),
         )
@@ -4793,7 +4976,6 @@ mod tests {
             "slack.upload_file",
             &json!({
                 "channels": "C111",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "hello",
                 "thread_ts": "171234.5678"
             }),
@@ -4811,7 +4993,6 @@ mod tests {
             "slack.upload_file",
             &json!({
                 "channels": "C111,C222",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "hello",
                 "thread_ts": "171234.5678"
             }),
@@ -4842,7 +5023,6 @@ mod tests {
             "slack.upload_file",
             &json!({
                 "channels": "C111",
-                "content_object_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "resolved_content": "hello",
                 "thread_ts": "   "
             }),
@@ -5836,10 +6016,7 @@ mod tests {
             ("slack.search_messages", &["query"]),
             ("slack.get_user_info", &["user"]),
             (SLACK_EVENTS_API_OPERATION, &["payload", "signature_result"]),
-            (
-                "slack.upload_file",
-                &["channels", "content_object_id", "resolved_content"],
-            ),
+            ("slack.upload_file", &["channels"]),
             ("slack.download_file", &["file_id"]),
             ("slack.add_reaction", &["channel", "timestamp", "name"]),
             ("slack.set_channel_topic", &["channel", "topic"]),
@@ -5854,6 +6031,45 @@ mod tests {
 
             for field in *expected {
                 assert!(required.contains(field), "{op_id} should require '{field}'");
+            }
+        }
+
+        let upload = ops
+            .iter()
+            .find(|op| op["id"] == "slack.upload_file")
+            .unwrap();
+        assert_eq!(upload["input_schema"]["required"], json!(["channels"]));
+        assert_eq!(
+            upload["input_schema"]["oneOf"],
+            json!([
+                {"required": ["content_base64"]}, {"required": ["resolved_content"]}
+            ])
+        );
+        assert_eq!(
+            upload["input_schema"]["properties"]["content_base64"]["maxLength"],
+            MAX_FILE_CONTENT_BASE64_BYTES
+        );
+        assert!(
+            upload["input_schema"]["properties"]
+                .get("content_object_id")
+                .is_none()
+        );
+        for id in ["slack.upload_file", "slack.download_file"] {
+            let operation = ops.iter().find(|op| op["id"] == id).unwrap();
+            let required = operation["output_schema"]["required"].as_array().unwrap();
+            assert!(required.contains(&json!("content_length")));
+            assert!(required.contains(&json!("content_sha256")));
+            if id == "slack.download_file" {
+                assert!(required.contains(&json!("content_base64")));
+            } else {
+                assert!(required.contains(&json!("receipt")));
+            }
+            for removed in ["content_object_id", "source_object_id", "file_object_id"] {
+                assert!(
+                    operation["output_schema"]["properties"]
+                        .get(removed)
+                        .is_none()
+                );
             }
         }
     }

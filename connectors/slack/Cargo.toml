@@ -29,6 +29,7 @@ asupersync = { version = "=0.5.0", default-features = false, features = ["tls", 
 
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 hex.workspace = true

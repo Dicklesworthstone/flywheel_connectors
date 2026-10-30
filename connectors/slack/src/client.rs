@@ -4,10 +4,14 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fcp_async_core::http::{HttpClient, HttpClientBuilder, HttpResponse, Method};
+use fcp_async_core::http::{
+    HttpClient, HttpClientBuilder, HttpClientError, HttpError, HttpResponse, Method,
+};
 use fcp_async_core::time;
 use fcp_prelude::CredentialId;
-use fcp_sdk::migration::{AttemptOutcome, HttpRetryConfig, RetryLoop};
+use fcp_sdk::migration::{
+    AttemptOutcome, HttpRetryConfig, RetryLoop, http_client_error_reached_service,
+};
 use fcp_sdk::{ConnectorRuntime, ConnectorRuntimeConfig};
 use serde_json::Value;
 use tracing::{debug, instrument};
@@ -27,8 +31,10 @@ const DEFAULT_BASE_URL: &str = "https://slack.com/api";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const FCP_CREDENTIAL_ID_HEADER: &str = "X-FCP-Credential-ID";
 const MAX_API_RESPONSE_BYTES: usize = 1024 * 1024;
-/// Maximum UTF-8 content accepted by the buffered file-upload operation.
+/// Maximum decoded content accepted by the buffered file-upload operation.
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum file bytes returned by the buffered download operation.
+pub const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Authentication mode for Slack Web API calls.
 #[derive(Clone)]
@@ -69,6 +75,7 @@ impl SlackAuth {
 pub struct SlackClient {
     client: HttpClient,
     upload_client: HttpClient,
+    download_client: HttpClient,
     auth: SlackAuth,
     base_url: String,
     runtime: ConnectorRuntime,
@@ -107,6 +114,13 @@ impl SlackClient {
                 .no_cookie_store()
                 .no_retries()
                 .max_body_size(MAX_API_RESPONSE_BYTES)
+                .build(),
+            download_client: HttpClientBuilder::new()
+                .user_agent("fcp-slack/0.1.0")
+                .no_redirects()
+                .no_cookie_store()
+                .no_retries()
+                .max_body_size(MAX_DOWNLOAD_BYTES)
                 .build(),
             auth,
             base_url: DEFAULT_BASE_URL.into(),
@@ -409,14 +423,14 @@ impl SlackClient {
     /// Upload a file through Slack's external-upload protocol.
     ///
     /// Only the reservation and completion calls receive API credentials. The
-    /// returned upload capability receives the exact UTF-8 content bytes and no
+    /// returned upload capability receives the exact file bytes and no
     /// authorization or credential-reference header. Completion failures that
     /// may have committed the file are surfaced as non-retryable uncertainty.
     #[instrument(skip(self, content))]
     pub async fn upload_file(
         &self,
         channels: &str,
-        content: &str,
+        content: &[u8],
         filename: Option<&str>,
         thread_ts: Option<&str>,
     ) -> SlackResult<crate::types::SlackFile> {
@@ -441,8 +455,7 @@ impl SlackClient {
             });
         }
         let upload_url = validate_upload_url(&reservation.upload_url, &self.base_url)?;
-        self.send_upload_bytes(&upload_url, content.as_bytes())
-            .await?;
+        self.send_upload_bytes(&upload_url, content).await?;
 
         let normalized_channels = channels.split(',').map(str::trim).collect::<Vec<_>>();
         let mut completion = serde_json::json!({
@@ -530,7 +543,7 @@ impl SlackClient {
         Ok(())
     }
 
-    /// Download a file by ID (returns the file info with download URL).
+    /// Get metadata for a file by ID without fetching its bytes.
     #[instrument(skip(self))]
     pub async fn get_file_info(&self, file_id: &str) -> SlackResult<crate::types::SlackFile> {
         let params = [("file", file_id.to_string())];
@@ -538,6 +551,105 @@ impl SlackClient {
             self.get_with_params("files.info", &params).await?;
         Self::check_response(&resp)?;
         Ok(Self::expect_data(resp.data, "files.info")?.file)
+    }
+
+    /// Fetch and verify an entire Slack-hosted file.
+    ///
+    /// Both metadata and bytes use bounded clients without redirects, cookies,
+    /// or automatic retries. Remote-file URLs never receive Slack authority.
+    #[instrument(skip(self))]
+    pub async fn download_file(
+        &self,
+        file_id: &str,
+    ) -> SlackResult<(crate::types::SlackFile, Vec<u8>)> {
+        validate_download_file_id(file_id)?;
+        let mut metadata_url = Url::parse(&format!("{}/files.info", self.base_url))
+            .map_err(|_| invalid_download("Invalid configured Slack API URL"))?;
+        metadata_url.query_pairs_mut().append_pair("file", file_id);
+        let metadata = self
+            .download_request(
+                &self.upload_client,
+                metadata_url.as_str(),
+                JSON_CONTENT_TYPE,
+            )
+            .await?;
+        let payload = metadata
+            .json::<Value>()
+            .map_err(|_| invalid_download("Slack returned invalid file metadata JSON"))?;
+        let file = decode_download_metadata(payload, file_id)?;
+        let raw_url = file
+            .url_private_download
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                file.url_private
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+            })
+            .ok_or_else(|| invalid_download("Slack file metadata has no download URL"))?;
+        let url = validate_download_url(raw_url, &self.base_url)?;
+        let response = self
+            .download_request(&self.download_client, url.as_str(), "*/*")
+            .await?;
+        if response.body.len() > MAX_DOWNLOAD_BYTES {
+            return Err(invalid_download(
+                "Slack file exceeds the 16 MiB download limit",
+            ));
+        }
+        if usize::try_from(file.size).ok() != Some(response.body.len()) {
+            return Err(invalid_download(
+                "Slack file bytes do not match the declared file size",
+            ));
+        }
+        Ok((file, response.body))
+    }
+
+    async fn download_request(
+        &self,
+        client: &HttpClient,
+        url: &str,
+        accept: &str,
+    ) -> SlackResult<HttpResponse> {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        let cx = fcp_async_core::compatibility_cx();
+        let response = time::timeout(
+            self.request_timeout,
+            client.request(
+                &cx,
+                Method::Get,
+                url,
+                self.authenticated_headers(accept),
+                Vec::new(),
+            ),
+        )
+        .await
+        // Transport failures may contain private URLs or headers. Keep
+        // safe retry metadata while discarding all provider-controlled text.
+        .map_err(|error| SlackError::Http {
+            message: "Slack file request timed out or was cancelled".into(),
+            status_code: None,
+            is_timeout: matches!(error, fcp_async_core::AsyncError::Timeout { .. }),
+            reached_service: true,
+        })?
+        .map_err(sanitized_download_http_error)?;
+        match response.status {
+            200 => Ok(response),
+            401 | 403 => Err(SlackError::Unauthorized),
+            429 => Err(SlackError::RateLimited {
+                retry_after_secs: header_value(&response.headers, "retry-after")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(60),
+            }),
+            status @ (500..=599) => Err(SlackError::Http {
+                message: "Slack file service is temporarily unavailable".into(),
+                status_code: Some(status),
+                is_timeout: false,
+                reached_service: true,
+            }),
+            status => Err(invalid_download(format!(
+                "Slack file request returned HTTP {status}"
+            ))),
+        }
     }
 
     // ── Reaction operations ──────────────────────────────────────
@@ -744,14 +856,8 @@ impl SlackClient {
             .await
     }
 
-    async fn send_request_with_client(
-        &self,
-        client: &HttpClient,
-        method: Method,
-        url: &str,
-        body: Vec<u8>,
-    ) -> SlackResult<HttpResponse> {
-        let mut headers = vec![("Accept".to_string(), JSON_CONTENT_TYPE.to_string())];
+    fn authenticated_headers(&self, accept: &str) -> Vec<(String, String)> {
+        let mut headers = vec![("Accept".to_string(), accept.to_string())];
         match &self.auth {
             SlackAuth::Token(token) => {
                 headers.push(("Authorization".to_string(), format!("Bearer {token}")));
@@ -763,6 +869,17 @@ impl SlackClient {
                 ));
             }
         }
+        headers
+    }
+
+    async fn send_request_with_client(
+        &self,
+        client: &HttpClient,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+    ) -> SlackResult<HttpResponse> {
+        let mut headers = self.authenticated_headers(JSON_CONTENT_TYPE);
         if !body.is_empty() {
             headers.push(("Content-Type".to_string(), JSON_CONTENT_TYPE.to_string()));
         }
@@ -787,7 +904,7 @@ impl SlackClient {
 /// Validate buffered upload arguments before reservation or channel coordination.
 pub(crate) fn validate_upload_input(
     channels: &str,
-    content: &str,
+    content: &[u8],
     filename: Option<&str>,
     thread_ts: Option<&str>,
 ) -> SlackResult<()> {
@@ -795,9 +912,7 @@ pub(crate) fn validate_upload_input(
         message: message.into(),
     };
     if content.len() > MAX_UPLOAD_BYTES {
-        return Err(invalid(
-            "resolved_content exceeds the 16 MiB UTF-8 upload limit",
-        ));
+        return Err(invalid("file content exceeds the 16 MiB upload limit"));
     }
     let channel_ids = channels.split(',').map(str::trim).collect::<Vec<_>>();
     if channel_ids.len() > 100
@@ -855,6 +970,147 @@ fn valid_file_id(file_id: &str) -> bool {
         && file_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+pub(crate) fn validate_download_file_id(file_id: &str) -> SlackResult<()> {
+    if !valid_file_id(file_id) {
+        return Err(invalid_download(
+            "file_id must be an F-prefixed Slack ID with 2 to 64 ASCII letters or digits",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_download(message: impl Into<String>) -> SlackError {
+    SlackError::Api {
+        error: message.into(),
+        code: None,
+        ok: false,
+    }
+}
+
+fn sanitized_download_http_error(error: HttpClientError) -> SlackError {
+    if matches!(
+        error,
+        HttpClientError::HttpError(
+            HttpError::BodyTooLarge | HttpError::BodyTooLargeDetailed { .. }
+        )
+    ) {
+        return invalid_download("Slack file response exceeds its allowed byte limit");
+    }
+    SlackError::Http {
+        message: "Slack file request failed before a complete response was received".into(),
+        status_code: match &error {
+            HttpClientError::ConnectTunnelRefused { status, .. } => Some(*status),
+            _ => None,
+        },
+        is_timeout: matches!(error, HttpClientError::DeadlineExceeded),
+        reached_service: http_client_error_reached_service(&error),
+    }
+}
+
+fn decode_download_metadata(
+    payload: Value,
+    requested_file_id: &str,
+) -> SlackResult<crate::types::SlackFile> {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(match payload.get("error").and_then(Value::as_str) {
+            Some("not_authed" | "invalid_auth" | "token_revoked" | "token_expired") => {
+                SlackError::Unauthorized
+            }
+            Some("ratelimited") => SlackError::RateLimited {
+                retry_after_secs: 60,
+            },
+            Some(
+                error @ ("missing_scope"
+                | "access_denied"
+                | "ekm_access_denied"
+                | "internal_error"
+                | "request_timeout"
+                | "service_unavailable"
+                | "fatal_error"),
+            ) => SlackError::Api {
+                error: error.to_owned(),
+                code: None,
+                ok: false,
+            },
+            Some("file_not_found") => {
+                invalid_download("Slack file was not found or is inaccessible")
+            }
+            _ => invalid_download("Slack refused the file metadata request"),
+        });
+    }
+    let raw_file = payload
+        .get("file")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| invalid_download("Slack returned missing or invalid file metadata"))?;
+    // SlackFile's default size remains useful for ordinary message metadata,
+    // but a download must distinguish an absent size from an empty file.
+    let size = raw_file
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            invalid_download("Slack file metadata must declare an unsigned byte size")
+        })?;
+    if usize::try_from(size)
+        .ok()
+        .filter(|size| *size <= MAX_DOWNLOAD_BYTES)
+        .is_none()
+    {
+        return Err(invalid_download(
+            "Slack file exceeds the 16 MiB download limit",
+        ));
+    }
+    let file: crate::types::SlackFile = serde_json::from_value(raw_file.clone())
+        .map_err(|_| invalid_download("Slack returned malformed file metadata"))?;
+    if file.id != requested_file_id || !valid_file_id(&file.id) {
+        return Err(invalid_download(
+            "Slack file metadata does not match the requested file ID",
+        ));
+    }
+    if file.is_external
+        || file.mode.as_deref() == Some("external")
+        || file.filetype.as_deref() == Some("remote")
+    {
+        return Err(invalid_download(
+            "Remote Slack files cannot be downloaded with Slack credentials",
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_download_url(raw_url: &str, api_base_url: &str) -> SlackResult<Url> {
+    let invalid = || invalid_download("Slack returned an untrusted file download URL");
+    if raw_url.len() > 8192 || raw_url.trim() != raw_url || raw_url.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let url = Url::parse(raw_url).map_err(|_| invalid())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !url.path().starts_with("/files-pri/")
+    {
+        return Err(invalid());
+    }
+    let trusted_slack = url.scheme() == "https"
+        && url.host_str() == Some("files.slack.com")
+        && url.port_or_known_default() == Some(443);
+    if !trusted_slack && !is_loopback_fixture_origin(&url, api_base_url) {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+fn is_loopback_fixture_origin(url: &Url, api_base_url: &str) -> bool {
+    Url::parse(api_base_url).ok().is_some_and(|base| {
+        base.scheme() == "http"
+            && match base.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            }
+            && base.origin() == url.origin()
+    })
+}
+
 fn validate_upload_url(raw_url: &str, api_base_url: &str) -> SlackResult<Url> {
     let invalid = || SlackError::Api {
         error: "files.getUploadURLExternal returned an untrusted upload URL".into(),
@@ -877,16 +1133,7 @@ fn validate_upload_url(raw_url: &str, api_base_url: &str) -> SlackResult<Url> {
         && url.port_or_known_default() == Some(443);
     // Explicit loopback API fixtures may serve their own upload endpoint, but
     // never authorize a different host/port or a local URL returned by Slack.
-    let fixture_origin = Url::parse(api_base_url).ok().is_some_and(|base| {
-        base.scheme() == "http"
-            && match base.host() {
-                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                _ => false,
-            }
-            && base.origin() == url.origin()
-    });
-    if !trusted_slack && !fixture_origin {
+    if !trusted_slack && !is_loopback_fixture_origin(&url, api_base_url) {
         return Err(invalid());
     }
     Ok(url)
@@ -936,8 +1183,173 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_UPLOAD_BYTES, post_replay_is_safe, validate_upload_input, validate_upload_url,
+        MAX_DOWNLOAD_BYTES, MAX_UPLOAD_BYTES, decode_download_metadata, post_replay_is_safe,
+        sanitized_download_http_error, validate_download_file_id, validate_download_url,
+        validate_upload_input, validate_upload_url,
     };
+    use crate::error::SlackError;
+    use fcp_async_core::http::{HttpClientError, HttpError};
+    use serde_json::json;
+
+    #[test]
+    fn download_errors_preserve_retry_metadata_without_private_details() {
+        for error in [
+            HttpClientError::HttpError(HttpError::BodyTooLarge),
+            HttpClientError::HttpError(HttpError::BodyTooLargeDetailed {
+                actual: (MAX_DOWNLOAD_BYTES + 1) as u64,
+                limit: MAX_DOWNLOAD_BYTES as u64,
+            }),
+        ] {
+            assert!(!sanitized_download_http_error(error).is_retryable());
+        }
+        let error = sanitized_download_http_error(HttpClientError::ConnectError(
+            std::io::Error::other("private-host-token"),
+        ));
+        assert!(error.is_retryable());
+        assert!(matches!(
+            error,
+            SlackError::Http {
+                reached_service: false,
+                ..
+            }
+        ));
+        assert!(!format!("{error:?} {error}").contains("private-host-token"));
+        let error = sanitized_download_http_error(HttpClientError::ConnectTunnelRefused {
+            status: 503,
+            reason: "private-proxy-reason".into(),
+        });
+        assert!(matches!(
+            error,
+            SlackError::Http {
+                status_code: Some(503),
+                ..
+            }
+        ));
+        assert!(!format!("{error:?} {error}").contains("private-proxy-reason"));
+        let error = sanitized_download_http_error(HttpClientError::DeadlineExceeded);
+        assert!(matches!(
+            error,
+            SlackError::Http {
+                is_timeout: true,
+                ..
+            }
+        ));
+        for code in [
+            "internal_error",
+            "request_timeout",
+            "service_unavailable",
+            "fatal_error",
+        ] {
+            let error =
+                decode_download_metadata(json!({"ok": false, "error": code}), "F123").unwrap_err();
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn download_urls_require_a_trusted_slack_host_and_private_file_path() {
+        for candidate in [
+            "https://files.slack.com/files-pri/T123-F123/download/report.pdf",
+            "https://FILES.SLACK.COM:443/files-pri/T123-F123/report.pdf?download=1",
+        ] {
+            assert!(validate_download_url(candidate, "https://slack.com/api").is_ok());
+        }
+        for candidate in [
+            "http://files.slack.com/files-pri/T123-F123/file",
+            "https://files.slack.com.evil.example/files-pri/T123-F123/file",
+            "https://evil.example/files-pri/T123-F123/file",
+            "https://files.slack.com:8443/files-pri/T123-F123/file",
+            "https://private-token@files.slack.com/files-pri/T123-F123/file",
+            "https://files.slack.com/files-pri/T123-F123/file#private-token",
+            "https://files.slack.com/upload/v1/private-token",
+            "https://files.slack.com/files-pri/../api/auth.test",
+            "http://127.0.0.1:9000/files-pri/T123-F123/file",
+            "http://169.254.169.254/files-pri/T123-F123/file",
+            "file:///files-pri/T123-F123/private-token",
+            " https://files.slack.com/files-pri/T123-F123/file",
+            "https://files.slack.com/\nfiles-pri/T123-F123/file",
+        ] {
+            let error = validate_download_url(candidate, "https://slack.com/api").unwrap_err();
+            assert!(!error.to_string().contains(candidate));
+            assert!(!format!("{error:?}").contains("private-token"));
+        }
+    }
+
+    #[test]
+    fn download_fixture_urls_require_the_same_literal_loopback_origin() {
+        let base = "http://127.0.0.1:9000/api";
+        assert!(validate_download_url("http://127.0.0.1:9000/files-pri/T-F123/file", base).is_ok());
+        for candidate in [
+            "http://127.0.0.1:9001/files-pri/T-F123/file",
+            "http://localhost:9000/files-pri/T-F123/file",
+            "http://127.0.0.2:9000/files-pri/T-F123/file",
+            "https://127.0.0.1:9000/files-pri/T-F123/file",
+        ] {
+            assert!(validate_download_url(candidate, base).is_err());
+        }
+        assert!(
+            validate_download_url(
+                "http://[::1]:9000/files-pri/T-F123/file",
+                "http://[::1]:9000/api"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn download_metadata_requires_matching_ids_explicit_size_and_hosted_files() {
+        let valid = json!({"ok": true, "file": {
+            "id": "F123", "size": 4, "mode": "hosted", "is_external": false,
+            "url_private": "https://files.slack.com/files-pri/T-F123/private-file"
+        }});
+        assert_eq!(
+            decode_download_metadata(valid.clone(), "F123")
+                .unwrap()
+                .size,
+            4
+        );
+        assert!(decode_download_metadata(valid.clone(), "FOTHER").is_err());
+        for (field, value) in [
+            ("size", json!(null)),
+            ("size", json!(-1)),
+            ("size", json!(4.5)),
+            ("size", json!("4")),
+            ("size", json!(MAX_DOWNLOAD_BYTES + 1)),
+            ("is_external", json!(true)),
+            ("mode", json!("external")),
+            ("filetype", json!("remote")),
+            ("id", json!("F_INVALID")),
+        ] {
+            let mut payload = valid.clone();
+            payload["file"][field] = value;
+            let error = decode_download_metadata(payload, "F123").unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("private-file"));
+        }
+        let mut missing = valid.clone();
+        missing["file"].as_object_mut().unwrap().remove("size");
+        assert!(decode_download_metadata(missing, "F123").is_err());
+        for size in [0, MAX_DOWNLOAD_BYTES] {
+            let mut payload = valid.clone();
+            payload["file"]["size"] = json!(size);
+            assert!(decode_download_metadata(payload, "F123").is_ok());
+        }
+        let error = decode_download_metadata(
+            json!({"ok": false, "error": "private-provider-body"}),
+            "F123",
+        )
+        .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("private-provider-body"));
+    }
+
+    #[test]
+    fn download_file_ids_are_bounded_provider_identifiers() {
+        assert!(validate_download_file_id("F123").is_ok());
+        assert!(validate_download_file_id(&format!("F{}", "A".repeat(63))).is_ok());
+        for value in ["", "F", "C123", "F_123", "F123/other", "F123\n", "Fé"] {
+            assert!(validate_download_file_id(value).is_err());
+        }
+        assert!(validate_download_file_id(&format!("F{}", "A".repeat(64))).is_err());
+    }
 
     #[test]
     fn upload_urls_require_slack_https_without_credentials_or_redirect_targets() {
@@ -976,30 +1388,38 @@ mod tests {
 
     #[test]
     fn upload_user_destinations_cannot_anchor_a_thread() {
-        assert!(validate_upload_input("U0123", "hello", None, None).is_ok());
-        assert!(validate_upload_input("U0123", "hello", None, Some("123.456")).is_err());
+        assert!(validate_upload_input("U0123", b"hello", None, None).is_ok());
+        assert!(validate_upload_input("U0123", b"hello", None, Some("123.456")).is_err());
         for conversation in ["C0123", "D0123", "G0123"] {
-            assert!(validate_upload_input(conversation, "hello", None, Some("123.456")).is_ok());
+            assert!(validate_upload_input(conversation, b"hello", None, Some("123.456")).is_ok());
         }
     }
 
     #[test]
     fn upload_validation_rejects_invalid_or_unbounded_inputs() {
         assert!(
-            validate_upload_input("C0123, G4567", "hello 🌍", Some("report.txt"), None).is_ok()
+            validate_upload_input(
+                "C0123, G4567",
+                "hello 🌍".as_bytes(),
+                Some("report.txt"),
+                None
+            )
+            .is_ok()
         );
-        assert!(validate_upload_input("C0123", "", None, Some("123.456")).is_ok());
+        assert!(validate_upload_input("C0123", b"", None, Some("123.456")).is_ok());
+        assert!(validate_upload_input("C0123", b"\0\xff\xfe", Some("binary.bin"), None).is_ok());
         for channels in ["", "  ", ",", "C0123,", "#general", "C0123,invalid"] {
-            assert!(validate_upload_input(channels, "data", None, None).is_err());
+            assert!(validate_upload_input(channels, b"data", None, None).is_err());
         }
-        assert!(validate_upload_input("C0123,G4567", "data", None, Some("123.456")).is_err());
-        assert!(validate_upload_input("C0123", "data", None, Some("123.bad")).is_err());
-        assert!(validate_upload_input("C0123", "data", Some("bad\r\nname"), None).is_err());
-        assert!(validate_upload_input("C0123", "data", Some("  "), None).is_err());
-        let oversized = "x".repeat(MAX_UPLOAD_BYTES + 1);
+        assert!(validate_upload_input("C0123,G4567", b"data", None, Some("123.456")).is_err());
+        assert!(validate_upload_input("C0123", b"data", None, Some("123.bad")).is_err());
+        assert!(validate_upload_input("C0123", b"data", Some("bad\r\nname"), None).is_err());
+        assert!(validate_upload_input("C0123", b"data", Some("  "), None).is_err());
+        let oversized = vec![0_u8; MAX_UPLOAD_BYTES + 1];
+        assert!(validate_upload_input("C0123", &oversized[..MAX_UPLOAD_BYTES], None, None).is_ok());
         assert!(validate_upload_input("C0123", &oversized, None, None).is_err());
         let too_many_channels = vec!["C0123"; 101].join(",");
-        assert!(validate_upload_input(&too_many_channels, "data", None, None).is_err());
+        assert!(validate_upload_input(&too_many_channels, b"data", None, None).is_err());
     }
 
     /// br-kxd3e: replaying these cannot duplicate a side effect.

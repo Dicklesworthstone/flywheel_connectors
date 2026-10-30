@@ -10,7 +10,7 @@
 
 ## Purpose
 
-This document fixes the operator-facing contract for `fcp.slack`. The connector currently exposes a Slack Web API and Socket Mode surface implemented in this crate: channel messages, thread replies, progress drafts, channel history, message search, channel/user lookup, file upload/download metadata, reactions, channel topic updates, and policy-gated Socket Mode events.
+This document fixes the operator-facing contract for `fcp.slack`. The connector currently exposes a Slack Web API and Socket Mode surface implemented in this crate: channel messages, thread replies, progress drafts, channel history, message search, channel/user lookup, binary file upload/download, reactions, channel topic updates, and policy-gated Socket Mode events.
 
 The connector is intentionally a bounded Slack collaboration bridge. It is not a complete Slack SDK, admin API client, workflow builder, Enterprise Grid admin tool, SCIM client, OAuth app installer, durable event store, file-content vault, or general Slack API proxy.
 
@@ -36,7 +36,7 @@ Important runtime truths the contract preserves:
 - Package and binary name are `fcp-slack`.
 - Runtime `BaseConnector` ID is the canonical `fcp.slack`, matching the manifest and host journal identity.
 - Manifest connector ID is `fcp.slack`.
-- Manifest interface hash is `blake3-256:fcp.interface.v2:48b308c0521193bbd39c11cd0621e3beb55bfe495f903f0234de8c2ef080d636`.
+- Manifest interface hash is `blake3-256:fcp.interface.v2:51e8630632bd9eca3ef9c8098ecf5be11f7ef49ce1a64d31a3288ffb70134587`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`, not the manifest interface hash.
 - Configuration requires a valid `credential_id`; raw token material is rejected. The host egress boundary resolves the credential reference.
 - Optional `socket_mode_credential_id` names the app-level credential used for Socket Mode.
@@ -78,8 +78,7 @@ This README documents runtime truth and keeps current drift visible:
   - `slack.download_file` -> `slack.files.read`
 - Manifest marks `slack.post_message`, `slack.reply_thread`, `slack.update_progress_draft`, `slack.upload_file`, and `slack.set_channel_topic` as policy-approved operations. Runtime `OperationInfo` sets `requires_approval = None`, and invoke checks no approval token.
 - Doctor/self-check required scopes are only `channels:read`, `channels:history`, `chat:write`, and `users:read`; they do not prove file upload/download, reactions, topic updates, search, or Socket Mode app-token readiness.
-- Runtime `download_file` returns redacted Slack file metadata and a deterministic content object ID, but it does not download or persist file bytes.
-- Runtime `upload_file` reserves a file with `files.getUploadURLExternal`, sends the UTF-8 bytes of host-materialized `resolved_content` to the returned upload URL, then finalizes the same file ID with `files.completeUploadExternal`. Returned file URLs remain redacted.
+- File operations deliver actual inline bytes with exact byte counts and SHA-256 digests. They do not persist or materialize mesh content objects.
 - Runtime `handle_subscribe()` requires a canonical, instance-bound signed subscription for one exact declared topic. Topic-only and wildcard subscriptions are rejected. See the native stream contract below.
 - Manifest state model is singleton-writer. Runtime keeps token, Socket Mode state, progress drafts, monitor policy, subscriptions, and verifier/session state in process memory.
 - Manifest rate-limit pools are documented intent; runtime relies on Slack 429 handling and the client retry loop, not connector-local pool enforcement.
@@ -206,8 +205,8 @@ The host's durable journal protects events it has actually received. It does not
 | `slack.list_channels` | `conversations.list` | `slack.list_channels` | `slack.read` | `Safe` | `Low` | `Strict` | optional `types` |
 | `slack.get_user_info` | `users.info` | `slack.get_user_info` | `slack.read` | `Safe` | `Low` | `Strict` | `user` |
 | `slack.handle_events_api` | Host/fcp-webhook verified Events API payload | `slack.read` | `slack.read` | `Safe` | `Medium` | `BestEffort` | `payload`, `signature_result="verified"` |
-| `slack.upload_file` | `files.getUploadURLExternal` → raw upload → `files.completeUploadExternal` | `slack.files.write` | `slack.files.write` | `Risky` | `Medium` | `None` | `channels`, `content_object_id`, `resolved_content` |
-| `slack.download_file` | `files.info` metadata | `slack.files.read` | `slack.files.read` | `Safe` | `Low` | `Strict` | `file_id` |
+| `slack.upload_file` | `files.getUploadURLExternal` → raw upload → `files.completeUploadExternal` | `slack.files.write` | `slack.files.write` | `Risky` | `Medium` | `None` | `channels`, exactly one of `content_base64` or `resolved_content` |
+| `slack.download_file` | `files.info` → authenticated byte download | `slack.files.read` | `slack.files.read` | `Safe` | `Low` | `Strict` | `file_id` |
 | `slack.add_reaction` | `reactions.add` | `slack.add_reaction` | `slack.write` | `Safe` | `Low` | `BestEffort` | `channel`, `timestamp`, `name` |
 | `slack.set_channel_topic` | `conversations.setTopic` | `slack.set_channel_topic` | `slack.write` | `Risky` | `Medium` | `BestEffort` | `channel`, `topic` |
 
@@ -215,13 +214,40 @@ The host's durable journal protects events it has actually received. It does not
 
 Uploads use Slack's current [external-upload workflow](https://docs.slack.dev/messaging/working-with-files/). Both reservation and completion require a token with `files:write`, supplied either directly or through the host's credential reference. The deprecated `files.upload` endpoint is no longer called.
 
-- `resolved_content` is UTF-8 text with a maximum encoded size of 16 MiB; the reservation length is the byte count, including multi-byte characters. `filename` defaults to `upload.txt` and is limited to 255 UTF-8 bytes without control characters.
+- Supply exactly one of `content_base64` or `resolved_content`. Binary input uses canonical standard base64 with padding; whitespace, URL-safe alphabet substitutions, malformed padding, and nonzero trailing bits are rejected. The decoded file is limited to **16 MiB**, including for text after UTF-8 encoding. The connector validates input before channel coordination or an upload reservation.
+- The reservation length is the exact byte count, including multi-byte characters in text uploads. `filename` defaults to `upload.txt` and is limited to 255 UTF-8 bytes without control characters; specify a suitable filename for binary data.
+- Successful uploads return `file`, `content_length`, `content_sha256`, and a receipt naming the actual `slack:file:<file_id>` resource. The content fields describe the bytes sent, not a synthetic object reference.
 - `channels` accepts 1 to 100 comma-separated channel or user IDs. A single conversation uses `channel_id`; user destinations and multiple destinations use `channels` on completion. A `thread_ts` requires exactly one conversation ID (`C`, `D`, or `G` prefix) and retains the existing thread-ownership check before any upload request.
 - The returned upload URL must use HTTPS on `files.slack.com:443` under `/upload/`, without embedded credentials or a fragment. Explicit loopback API fixtures may return an upload URL on their own exact origin. The upload sends raw bytes without the Slack bearer token or `X-FCP-Credential-ID` header; redirects and cookie persistence are disabled.
 - Each HTTP attempt is bounded by the configured request timeout, and upload response bodies are capped at 1 MiB using a dedicated HTTP client. Other Slack operations retain their existing response capacity. The upload URL and raw transfer-error bodies are never returned to callers.
 - Completion is attempted only after an HTTP 200 transfer response. Slack 429 refusals retry the same completion request and file ID; they do not reserve or upload a second file. A timeout, 5xx, transient Slack error, or malformed/mismatched completion response reports a **non-retryable unknown outcome** containing the file ID for reconciliation. Inspect that file in Slack before manually resubmitting; the connector emits no success receipt for an uncertain completion.
 
 The completion contract follows [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/): finalization can be called only once. This operation does not promise idempotency across independent invocations or process restarts.
+
+### File Download And Binary Roundtrip
+
+`slack.download_file` resolves `file_id` through `files.info`, verifies that the returned metadata names that same file, and downloads its bytes with the configured Slack credential. A successful result includes:
+
+- `file`: Slack metadata with private download URLs redacted.
+- `content_base64`: the actual bytes encoded as canonical padded standard base64.
+- `content_length`: the exact downloaded byte count, at most 16 MiB.
+- `content_sha256`: the lowercase hexadecimal SHA-256 digest of those bytes.
+
+Downloads accept Slack-hosted files only. Remote or external files, mismatched file IDs, missing or untrusted URLs, redirects, unsuccessful HTTP responses, and bodies above the byte limit fail without returning a successful content result. The dedicated download client disables redirects, cookies, and automatic retries. Only HTTPS on the exact `files.slack.com` host at port 443 under `/files-pri/` can receive Slack authentication; an explicit HTTP loopback API fixture may use its own exact origin. Provider transfer errors and private URLs are redacted. Temporary network and provider failures remain retryable by the caller; invalid metadata, size mismatches, and body-limit violations are terminal.
+
+To upload downloaded bytes, pass the result's `content_base64` to `slack.upload_file` with the destination channel and filename. For example, this input uploads five binary bytes, including values that are not valid UTF-8:
+
+```json
+{
+  "channels": "C01234567",
+  "content_base64": "AP+AQUI=",
+  "filename": "data.bin"
+}
+```
+
+Compare the upload result's `content_sha256` and `content_length` with the download result to verify a byte-preserving roundtrip. The connector's JSONL request envelope permits 32 MiB so a 16 MiB binary file fits after base64 expansion. The host must load this manifest's download response policy; its native invocation response cap is also 32 MiB. Batch substitution has a separate, smaller input limit, so maximum-size transfers require direct invocation.
+
+File contents remain buffered in memory for the invocation. This interface does not persist a file in the mesh object store or stream large files incrementally.
 
 ## Explicit Non-Goals
 
@@ -231,7 +257,7 @@ The current implementation does not include:
 - Slack admin, audit logs, SCIM, user-group, Enterprise Grid, Workflow Builder, Canvas, Lists, or app-management APIs
 - connector-local durable event storage, provider-history replay, dead-letter storage, or exactly-once Socket Mode processing; retained native deliveries and consumer decisions are host responsibilities
 - connector-owned public HTTP Events API request verification or inbound HTTP request URL handling
-- full file byte download, durable file storage, file upload streaming, multipart upload, or external object-store integration
+- durable file storage, incremental file transfer streaming, multipart upload, or external object-store integration
 - arbitrary Slack Web API proxying, granular per-channel policy storage, or rate-limit pool enforcement
 - approval-token verification for message/file/topic mutations
 
@@ -262,7 +288,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - native authority, stable provider identities, one-event credit, exact ACK matching, token expiry, failed lifecycle attempts, and delivery refusal without a real consumer
 - real loopback Socket Mode ordering: no provider ACK before the native ACK, and no provider ACK after the native stream closes
 - progress draft rendering, duplicate/throttle/clear/seal behavior, block limits, and text compaction
-- file URL redaction, object ID derivation, provider error classes, scope extraction, and rate-limit handling
+- binary file download/upload roundtrips, exact byte counts and SHA-256 digests, URL trust boundaries, redirect refusal, bounded bodies, file URL redaction, provider error classes, scope extraction, and rate-limit handling
 
 ## Source Notes
 
