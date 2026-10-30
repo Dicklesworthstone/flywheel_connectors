@@ -450,7 +450,7 @@ fn run_connector_namespace_isolation_fixture(
     let checker = InMemoryThreadOwnershipChecker::new();
     let slack_key = ClaimKey::for_chat_message(
         ZoneId::work(),
-        ConnectorId::from_static("slack"),
+        ConnectorId::from_static("fcp.slack"),
         ChannelId::new("shared-conversation"),
         Some(ThreadId::new("shared-thread")),
         DmMode::TreatAsThread,
@@ -512,7 +512,7 @@ async fn run_fail_open_degraded_fixture(
             &checker,
             ChatCoordinationSendRequest::new(
                 ZoneId::work(),
-                ConnectorId::from_static("slack"),
+                ConnectorId::from_static("fcp.slack"),
                 ChannelId::new("degraded-channel"),
                 Some(ThreadId::new("degraded-thread")),
                 claimant.clone(),
@@ -560,7 +560,7 @@ async fn handshake_slack(connector: &mut SlackConnector, caps: &[&str]) -> Bound
     let signing_key = Ed25519SigningKey::generate();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": signing_key.verifying_key().to_bytes(),
             "nonce": vec![0u8; 32],

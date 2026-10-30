@@ -3926,7 +3926,7 @@ mod slack_e2e_tests {
         fn new() -> Self {
             Self {
                 connector: SlackConnector::new(),
-                id: ConnectorId::from_static("slack"),
+                id: ConnectorId::from_static("fcp.slack"),
             }
         }
 
@@ -3961,18 +3961,10 @@ mod slack_e2e_tests {
         }
 
         async fn health(&self) -> HealthSnapshot {
-            match self.connector.handle_health().await {
-                Ok(payload) => {
-                    let status = payload
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
-                    match status {
-                        "healthy" => HealthSnapshot::ready(),
-                        "not_configured" => HealthSnapshot::degraded("not_configured"),
-                        other => HealthSnapshot::degraded(format!("slack_status:{other}")),
-                    }
-                }
+            match self.connector.handle_native_health().await {
+                Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|err| {
+                    HealthSnapshot::error(format!("invalid Slack health snapshot: {err}"))
+                }),
                 Err(err) => HealthSnapshot::error(err.to_string()),
             }
         }
@@ -4129,7 +4121,7 @@ mod slack_e2e_tests {
         InvokeRequest {
             r#type: "invoke".to_string(),
             id: RequestId::from("slack-e2e"),
-            connector_id: ConnectorId::from_static("slack"),
+            connector_id: ConnectorId::from_static("fcp.slack"),
             operation: OperationId::from_static(operation),
             zone_id: ZoneId::work(),
             input,
@@ -4280,6 +4272,13 @@ mod slack_e2e_tests {
             .handshake(handshake)
             .await
             .expect("handshake should succeed");
+
+        assert_eq!(connector.id().as_str(), "fcp.slack");
+        let health = connector.health().await;
+        assert!(health.is_ready());
+        let details = health.details.expect("native Slack health details");
+        assert_eq!(details["instance_id"], connector.instance_id());
+        assert_eq!(details["zone_id"], "z:work");
 
         let response = connector
             .invoke(invoke)
