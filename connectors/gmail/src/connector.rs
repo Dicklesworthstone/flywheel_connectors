@@ -991,6 +991,13 @@ impl GmailConnector {
                 code: 1003,
                 message: format!("Invalid simulate request: {e}"),
             })?;
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
+            });
+        }
 
         let capability = match gmail_capability_for_operation(req.operation.as_str()) {
             Ok(capability) => capability,
@@ -2734,10 +2741,27 @@ mod tests {
                 "field {field}"
             );
         }
-        let mut preview = simulate_request("gmail.list_labels", json!({}), token);
-        preview["zone_id"] = json!("z:owner");
-        let response = parse_simulate_response(connector.handle_simulate(preview).await.unwrap());
+        let preview = simulate_request("gmail.list_labels", json!({}), token);
+        let mut wrong_zone = preview.clone();
+        wrong_zone["zone_id"] = json!("z:owner");
+        let response =
+            parse_simulate_response(connector.handle_simulate(wrong_zone).await.unwrap());
         assert!(!response.would_succeed);
+        for (field, value) in [
+            ("type", json!("invoke")),
+            ("id", json!("")),
+            ("input", json!(null)),
+        ] {
+            let mut malformed = preview.clone();
+            malformed[field] = value;
+            assert!(
+                matches!(
+                    connector.handle_simulate(malformed).await,
+                    Err(FcpError::InvalidRequest { .. })
+                ),
+                "preview field {field}",
+            );
+        }
     }
 
     #[fcp_async_core::runtime::test]

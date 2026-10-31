@@ -30,11 +30,14 @@
 use std::io::{BufRead, Write};
 
 use anyhow::Result;
-use fcp_async_core::runtime::Builder;
-use fcp_sdk::prelude::dispatch_raw_invoke;
+use fcp_async_core::runtime::{Builder, Runtime};
+use fcp_sdk::prelude::{JsonlConfig, dispatch_raw_invoke, serve_jsonl};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use fcp_gmail::connector::GmailConnector;
+
+// Leave room for encoded MIME payloads while bounding the frame before allocation.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -52,57 +55,40 @@ fn main() -> Result<()> {
 /// Run the FCP JSON-RPC style protocol loop.
 fn run_fcp_loop() -> Result<()> {
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let stdout = std::io::stdout();
     let mut connector = GmailConnector::new();
-
     let runtime = Builder::new_multi_thread().enable_all().build()?;
+    run_fcp_io(&runtime, &mut connector, stdin.lock(), stdout.lock())
+}
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if should_skip_protocol_line(&line) {
-            continue;
-        }
-
-        let response = runtime.block_on(async { handle_message(&mut connector, &line).await });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+fn run_fcp_io(
+    runtime: &Runtime,
+    connector: &mut GmailConnector,
+    reader: impl BufRead,
+    writer: impl Write,
+) -> Result<()> {
+    let result = serve_jsonl(
+        reader,
+        writer,
+        JsonlConfig {
+            max_request_bytes: MAX_REQUEST_BYTES,
+        },
+        |method, params| runtime.block_on(handle_method(connector, method, params)),
+    );
+    // EOF, oversized frames, and broken transports revoke the same authority
+    // and close the same client runtime as an explicit shutdown.
+    runtime.block_on(connector.handle_shutdown(serde_json::json!({})))?;
+    result?;
     Ok(())
 }
 
-fn should_skip_protocol_line(line: &str) -> bool {
-    line.trim().is_empty()
-}
-
-fn parse_error_response(error: impl std::fmt::Display) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": null,
-        "error": {
-            "code": "FCP-1001",
-            "message": format!("Invalid JSON: {error}")
-        }
-    })
-}
-
-/// Handle a single FCP message.
-async fn handle_message(connector: &mut GmailConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => return parse_error_response(e),
-    };
-
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
-
-    let result = match method {
+/// Dispatch a request validated by the shared native JSONL transport.
+async fn handle_method(
+    connector: &mut GmailConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
         "configure" => connector.handle_configure(params).await,
         "handshake" => connector.handle_handshake(params).await,
         "health" => connector.handle_health().await,
@@ -116,36 +102,6 @@ async fn handle_message(connector: &mut GmailConnector, message: &str) -> serde_
             code: 1002,
             message: format!("Unknown method: {method}"),
         }),
-    };
-
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
-        }
     }
 }
 
@@ -153,8 +109,26 @@ async fn handle_message(connector: &mut GmailConnector, message: &str) -> serde_
 mod tests {
     use super::*;
 
-    #[fcp_async_core::runtime::test]
-    async fn native_host_session_preserves_scope_budgets_and_typed_results() {
+    fn handle_message(
+        runtime: &Runtime,
+        connector: &mut GmailConnector,
+        message: &str,
+    ) -> serde_json::Value {
+        let mut output = Vec::new();
+        serve_jsonl(
+            std::io::Cursor::new(format!("{message}\n")),
+            &mut output,
+            JsonlConfig {
+                max_request_bytes: MAX_REQUEST_BYTES,
+            },
+            |method, params| runtime.block_on(handle_method(connector, method, params)),
+        )
+        .unwrap();
+        serde_json::from_slice(&output).unwrap()
+    }
+
+    #[test]
+    fn native_host_session_preserves_scope_budgets_and_typed_results() {
         use chrono::{Duration, Utc};
         use fcp_core::{
             CapabilityConstraints, CapabilityToken, HealthSnapshot, InvokeResponse, InvokeStatus,
@@ -167,32 +141,35 @@ mod tests {
             matchers::{header, method, path},
         };
 
-        let server = MockServer::start().await;
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let server = runtime.block_on(MockServer::start());
         let credential = "00000000-0000-0000-0000-000000000001";
-        Mock::given(method("GET"))
-            .and(path("/users/me/labels"))
-            .and(header(FCP_CREDENTIAL_ID_HEADER, credential))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"labels": [{"id":"INBOX", "name":"INBOX"}]})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        runtime.block_on(
+            Mock::given(method("GET"))
+                .and(path("/users/me/labels"))
+                .and(header(FCP_CREDENTIAL_ID_HEADER, credential))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"labels": [{"id":"INBOX", "name":"INBOX"}]})),
+                )
+                .expect(1)
+                .mount(&server),
+        );
         let mut connector = GmailConnector::new();
         let configured = handle_message(
+            &runtime,
             &mut connector,
             &json!({
                 "jsonrpc":"2.0", "id":"rpc-configure", "method":"configure",
                 "params":{"credential_id":credential, "base_url":server.uri()},
             })
             .to_string(),
-        )
-        .await;
+        );
         assert!(configured.get("error").is_none(), "{configured}");
         let key = Ed25519SigningKey::generate();
         let preferred = connector.instance_id().clone();
         let handshake = handle_message(
+            &runtime,
             &mut connector,
             &json!({
                 "jsonrpc":"2.0", "id":"rpc-handshake", "method":"handshake",
@@ -204,8 +181,7 @@ mod tests {
                 },
             })
             .to_string(),
-        )
-        .await;
+        );
         assert!(handshake.get("error").is_none(), "{handshake}");
         assert_eq!(
             handshake["result"]["capabilities_granted"]
@@ -220,13 +196,13 @@ mod tests {
             json!(connector.instance_id())
         );
         let health = handle_message(
+            &runtime,
             &mut connector,
             &json!({
                 "jsonrpc":"2.0", "id":"rpc-health", "method":"health", "params":{},
             })
             .to_string(),
-        )
-        .await;
+        );
         let health: HealthSnapshot = serde_json::from_value(health["result"].clone()).unwrap();
         assert!(health.is_ready());
         let details = health.details.unwrap();
@@ -271,19 +247,25 @@ mod tests {
             let mut denied = params.clone();
             denied[field] = value;
             let reply = handle_message(
+                &runtime,
                 &mut connector,
                 &json!({
                     "jsonrpc":"2.0", "id":"rpc-denied", "method":"invoke", "params":denied,
                 })
                 .to_string(),
-            )
-            .await;
+            );
             assert!(reply.get("error").is_some(), "scope field {field}: {reply}");
         }
-        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(
+            runtime
+                .block_on(server.received_requests())
+                .unwrap()
+                .is_empty()
+        );
         // Authorization previews do not spend the one admitted provider call.
         for _ in 0..2 {
             let preview = handle_message(
+                &runtime,
                 &mut connector,
                 &json!({
                     "jsonrpc":"2.0", "id":"rpc-preview", "method":"simulate",
@@ -294,37 +276,40 @@ mod tests {
                     },
                 })
                 .to_string(),
-            )
-            .await;
+            );
             assert_eq!(preview["result"]["would_succeed"], true, "{preview}");
         }
         let reply = handle_message(
+            &runtime,
             &mut connector,
             &json!({
                 "jsonrpc":"2.0", "id":"rpc-invoke", "method":"invoke", "params":params,
             })
             .to_string(),
-        )
-        .await;
+        );
         assert_eq!(reply["id"], "rpc-invoke");
         let response: InvokeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
         assert_eq!(response.id.0, "mailbox-read");
         assert_eq!(response.status, InvokeStatus::Ok);
         assert_eq!(response.result.unwrap()["labels"][0]["id"], "INBOX");
         let spent = handle_message(
+            &runtime,
             &mut connector,
             &json!({
                 "jsonrpc":"2.0", "id":"rpc-spent", "method":"invoke", "params":params,
             })
             .to_string(),
-        )
-        .await;
+        );
         assert!(spent.get("error").is_some());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            runtime.block_on(server.received_requests()).unwrap().len(),
+            1
+        );
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn invoke_requires_an_inner_string_id_before_dispatch() {
+    #[test]
+    fn invoke_requires_an_inner_string_id_before_dispatch() {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
         let mut connector = GmailConnector::new();
         for inner_id in [
             None,
@@ -340,6 +325,7 @@ mod tests {
                 params["id"] = inner_id;
             }
             let response = handle_message(
+                &runtime,
                 &mut connector,
                 &serde_json::json!({
                     "jsonrpc": "2.0",
@@ -348,8 +334,7 @@ mod tests {
                     "params": params
                 })
                 .to_string(),
-            )
-            .await;
+            );
 
             assert_eq!(response["id"], "transport:invalid");
             assert_eq!(response["error"]["code"], "FCP-1003");
@@ -361,20 +346,21 @@ mod tests {
         }
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn invoke_preserves_handler_errors_and_the_outer_id() {
+    #[test]
+    fn invoke_preserves_handler_errors_and_the_outer_id() {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
         let mut connector = GmailConnector::new();
         let params = serde_json::json!({
             "id": "invocation:error",
             "operation": "gmail.list_labels",
             "input": {}
         });
-        let expected = connector
-            .handle_invoke(params.clone())
-            .await
+        let expected = runtime
+            .block_on(connector.handle_invoke(params.clone()))
             .expect_err("unconfigured invocation must fail")
             .to_response();
         let response = handle_message(
+            &runtime,
             &mut connector,
             &serde_json::json!({
                 "jsonrpc": "2.0",
@@ -383,8 +369,7 @@ mod tests {
                 "params": params
             })
             .to_string(),
-        )
-        .await;
+        );
 
         assert_eq!(response["id"], "transport:error");
         assert_eq!(response["error"], serde_json::to_value(expected).unwrap());
@@ -393,15 +378,24 @@ mod tests {
 
     #[test]
     fn protocol_loop_skips_whitespace_only_lines() {
-        assert!(should_skip_protocol_line(""));
-        assert!(should_skip_protocol_line(" \t "));
-        assert!(!should_skip_protocol_line("{\"jsonrpc\":\"2.0\"}"));
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let mut connector = GmailConnector::new();
+        let mut output = Vec::new();
+        run_fcp_io(
+            &runtime,
+            &mut connector,
+            std::io::Cursor::new("\n \t \n\r\n"),
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.is_empty());
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn invalid_json_is_wrapped_in_jsonrpc_parse_error() {
+    #[test]
+    fn invalid_json_is_wrapped_in_jsonrpc_parse_error() {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
         let mut connector = GmailConnector::new();
-        let response = handle_message(&mut connector, "{not json").await;
+        let response = handle_message(&runtime, &mut connector, "{not json");
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response["id"].is_null());
@@ -411,5 +405,94 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.starts_with("Invalid JSON:"))
         );
+    }
+
+    #[test]
+    fn native_stream_stops_at_shutdown_and_revokes_authority_at_eof() {
+        use fcp_core::HealthSnapshot;
+        use fcp_crypto::ed25519::Ed25519SigningKey;
+        use serde_json::{Value, json};
+
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let key = Ed25519SigningKey::generate();
+        for explicit_shutdown in [false, true] {
+            let mut connector = GmailConnector::new();
+            let mut requests = vec![
+                json!({ "jsonrpc": "2.0", "id": "config", "method": "configure",
+                    "params": { "access_token": "private-fixture-token" } }),
+                json!({ "jsonrpc": "2.0", "id": "hello", "method": "handshake",
+                    "params": {
+                        "protocol_version": "2.0", "zone": "z:private",
+                        "host_public_key": key.verifying_key().to_bytes(), "nonce": vec![7u8; 32],
+                        "capabilities_requested": ["gmail.read"]
+                    } }),
+                json!({ "jsonrpc": "2.0", "id": "ready", "method": "health", "params": {} }),
+            ];
+            if explicit_shutdown {
+                requests.push(json!({
+                    "jsonrpc": "2.0", "id": "stop", "method": "shutdown", "params": {}
+                }));
+                requests.push(json!({
+                    "jsonrpc": "2.0", "id": "after-stop", "method": "health", "params": {}
+                }));
+            }
+            let input = requests
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let mut output = Vec::new();
+            run_fcp_io(
+                &runtime,
+                &mut connector,
+                std::io::Cursor::new(input),
+                &mut output,
+            )
+            .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(!text.contains("private-fixture-token"));
+            let responses: Vec<Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(responses.len(), if explicit_shutdown { 4 } else { 3 });
+            let ready: HealthSnapshot =
+                serde_json::from_value(responses[2]["result"].clone()).unwrap();
+            assert!(ready.is_ready());
+            let stopped: HealthSnapshot =
+                serde_json::from_value(runtime.block_on(connector.handle_health()).unwrap())
+                    .unwrap();
+            assert!(!stopped.is_ready());
+            let details = stopped.details.unwrap();
+            assert_eq!(details["configured"], false);
+            assert_eq!(details["handshaken"], false);
+        }
+    }
+
+    #[test]
+    fn oversized_native_frame_closes_stream_and_revokes_configuration() {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let mut connector = GmailConnector::new();
+        runtime
+            .block_on(connector.handle_configure(serde_json::json!({
+                "access_token": "private-fixture-token"
+            })))
+            .unwrap();
+        let input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        let mut output = Vec::new();
+        let error = run_fcp_io(
+            &runtime,
+            &mut connector,
+            std::io::Cursor::new(input),
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["error"]["code"], "FCP-1004");
+        let health = runtime.block_on(connector.handle_health()).unwrap();
+        assert_eq!(health["details"]["configured"], false);
+        assert_eq!(health["details"]["handshaken"], false);
     }
 }
