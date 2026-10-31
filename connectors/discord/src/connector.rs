@@ -3,7 +3,7 @@
 //! Implements handler methods for FCP protocol with Discord-specific operations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -1167,7 +1167,7 @@ impl DiscordConnector {
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
-    fn rest_rate_limit(max: u32) -> RateLimit {
+    const fn rest_rate_limit(max: u32) -> RateLimit {
         RateLimit {
             max,
             per_ms: 60_000,
@@ -3201,7 +3201,7 @@ impl DiscordConnector {
             id: request.id,
             result: SubscribeResult {
                 confirmed_topics: vec![topic],
-                cursors: Default::default(),
+                cursors: HashMap::default(),
                 replay_supported: false,
                 buffer: None,
             },
@@ -3242,21 +3242,20 @@ impl DiscordConnector {
         if let Some(shutdown) = &self.gateway_shutdown_tx {
             let _ = shutdown.send(true);
         }
-        if let Some(mut task) = self.gateway_task.take() {
+        if let Some(mut task) = self.gateway_task.take()
+            && fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
             if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
                 .await
                 .is_err()
             {
-                task.abort();
-                if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
-                    .await
-                    .is_err()
-                {
-                    self.gateway_task = Some(task);
-                    return Err(discord_stream_unavailable(
-                        "Discord Gateway supervisor is still draining",
-                    ));
-                }
+                self.gateway_task = Some(task);
+                return Err(discord_stream_unavailable(
+                    "Discord Gateway supervisor is still draining",
+                ));
             }
         }
         if let Some(gateway) = &self.gateway {
@@ -3264,21 +3263,20 @@ impl DiscordConnector {
                 discord_stream_unavailable("Discord Gateway connection is still draining")
             })?;
         }
-        if let Some(mut task) = self.gateway_lease_task.take() {
+        if let Some(mut task) = self.gateway_lease_task.take()
+            && fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
             if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
                 .await
                 .is_err()
             {
-                task.abort();
-                if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
-                    .await
-                    .is_err()
-                {
-                    self.gateway_lease_task = Some(task);
-                    return Err(discord_stream_unavailable(
-                        "Discord Gateway lease worker is still draining",
-                    ));
-                }
+                self.gateway_lease_task = Some(task);
+                return Err(discord_stream_unavailable(
+                    "Discord Gateway lease worker is still draining",
+                ));
             }
         }
         self.gateway_shutdown_tx = None;
@@ -3318,10 +3316,10 @@ impl DiscordConnector {
 
     /// Connect to the Discord gateway.
     async fn connect_gateway(&mut self) -> FcpResult<()> {
-        if let Some(task) = &self.gateway_task {
-            if !task.is_finished() {
-                return Ok(()); // Already connected
-            }
+        if let Some(task) = &self.gateway_task
+            && !task.is_finished()
+        {
+            return Ok(()); // Already connected
         }
         self.stop_gateway().await?;
 
@@ -3475,26 +3473,25 @@ impl DiscordConnector {
                         async move {
                             let result: Result<Option<EventEnvelope>, StreamingError> = async {
                                 subscription.require_active().map_err(|error| -> StreamingError { Box::new(error) })?;
-                                let mut delivered = None;
-                                if let Some(mut event) = gateway_event_to_fcp_with_policy(
+                                let delivered = if let Some(mut event) = gateway_event_to_fcp_with_policy(
                                     &gateway_event, &connector_id, &instance_id,
                                     &inbound_policy, bot_user_id.as_deref(),
-                                ) {
-                                    if subscription.topic == DISCORD_NATIVE_EVENT_TOPIC || subscription.topic == event.topic {
-                                        let cursor = gateway_event.cursor().ok_or_else(|| {
-                                            discord_stream_unavailable("Discord Gateway event has no committed-delivery identity")
-                                        }).map_err(|error| -> StreamingError { Box::new(error) })?;
-                                        event.cursor = cursor.to_owned();
-                                        event.seq = discord_native_sequence(&next_event_seq)
-                                            .map_err(|error| -> StreamingError { Box::new(error) })?;
-                                        event.data.zone_id = subscription.verifier.zone_id.clone();
-                                        event.requires_ack = true;
-                                        register_discord_inbound_delivery_from_event(&inbound_delivery_state, &event);
-                                        subscription.deliver(event.clone()).await
-                                            .map_err(|error| -> StreamingError { Box::new(error) })?;
-                                        delivered = Some(event);
-                                    }
-                                }
+                                ) && (subscription.topic == DISCORD_NATIVE_EVENT_TOPIC || subscription.topic == event.topic) {
+                                    let cursor = gateway_event.cursor().ok_or_else(|| {
+                                        discord_stream_unavailable("Discord Gateway event has no committed-delivery identity")
+                                    }).map_err(|error| -> StreamingError { Box::new(error) })?;
+                                    event.cursor = cursor.to_owned();
+                                    event.seq = discord_native_sequence(&next_event_seq)
+                                        .map_err(|error| -> StreamingError { Box::new(error) })?;
+                                    event.data.zone_id = subscription.verifier.zone_id.clone();
+                                    event.requires_ack = true;
+                                    register_discord_inbound_delivery_from_event(&inbound_delivery_state, &event);
+                                    subscription.deliver(event.clone()).await
+                                        .map_err(|error| -> StreamingError { Box::new(error) })?;
+                                    Some(event)
+                                } else {
+                                    None
+                                };
                                 // Policy/topic discards are deliberate only while the
                                 // signed subscription remains live. Broadcast observers
                                 // cannot acknowledge an event or advance this checkpoint.
@@ -5204,11 +5201,12 @@ mod tests {
         assert_eq!(value["details"]["token_ok"], true);
         assert_eq!(value["details"]["intents_ok"], false);
         assert_eq!(value["details"]["network_ok"], true);
-        assert!(
-            !value["details"]["missing_intents"]
+        assert_ne!(
+            value["details"]["missing_intents"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
     }
 

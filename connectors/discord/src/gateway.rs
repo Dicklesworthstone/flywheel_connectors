@@ -65,6 +65,8 @@ const GATEWAY_FRAME_MAX_BYTES: usize = 1024 * 1024;
 const GATEWAY_STATE_MAX_BYTES: u64 = 64 * 1024;
 const GATEWAY_STATE_VERSION: u32 = 2;
 const GATEWAY_STOP_POLL: Duration = Duration::from_millis(100);
+const GATEWAY_LEASE_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
+const GATEWAY_LEASE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 pub const DISCORD_GATEWAY_STATE_FILE: &str = "discord_gateway_state.json";
 const GATEWAY_SEND_LIMIT: usize = 120;
 const GATEWAY_SEND_WINDOW: Duration = Duration::from_secs(60);
@@ -1185,6 +1187,92 @@ mod tests {
         assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
     }
 
+    #[fcp_async_core::runtime::test]
+    async fn gateway_checkpoint_waits_for_brief_external_lease_update() {
+        let checkpoint = test_checkpoint("brief-lease-contention");
+        let state = acknowledged_test_session();
+        persist_checkpoint(Some(&checkpoint), &state).expect("initial checkpoint");
+        let delivery = delivery_state(state.clone(), Some(checkpoint.clone()));
+        let (tx, mut rx) = mpsc::channel(8);
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 2, 40, &delivery, 0)
+            .await
+            .expect("pending dispatch");
+        let frame = rx.recv().await.expect("pending frame");
+        let lease_path = checkpoint.lease_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = lock_gateway_lease(&lease_path).expect("external lease writer lock");
+            held_tx.send(()).expect("announce held lock");
+            attempt_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("checkpoint attempt");
+            std::thread::sleep(Duration::from_millis(25));
+            drop(lock);
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for external lock");
+        let started = Instant::now();
+        attempt_tx.send(()).expect("start bounded overlap");
+        let acknowledged = frame.acknowledge().await;
+        holder.join().expect("external writer finishes");
+        acknowledged.expect("a brief renewal overlap must not terminate delivery");
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        let delivery = delivery.lock().await;
+        assert_eq!(delivery.committed.sequence, Some(2));
+        assert!(delivery.pending.is_empty());
+        assert_eq!(delivery.pending_bytes, 0);
+        let persisted = read_json_file_if_exists::<GatewayStateRecord>(&checkpoint.state_path)
+            .expect("read committed checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(persisted.sequence, Some(2));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_checkpoint_contention_deadline_preserves_pending_progress() {
+        let checkpoint = test_checkpoint("long-lease-contention");
+        let state = acknowledged_test_session();
+        persist_checkpoint(Some(&checkpoint), &state).expect("initial checkpoint");
+        let original = fs::read(&checkpoint.state_path).expect("checkpoint bytes");
+        let delivery = delivery_state(state.clone(), Some(checkpoint.clone()));
+        let (tx, mut rx) = mpsc::channel(8);
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 2, 40, &delivery, 0)
+            .await
+            .expect("pending dispatch");
+        let frame = rx.recv().await.expect("pending frame");
+        let lease_path = checkpoint.lease_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = lock_gateway_lease(&lease_path).expect("external lease writer lock");
+            held_tx.send(()).expect("announce held lock");
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("bounded checkpoint returns");
+            drop(lock);
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for external lock");
+        let started = Instant::now();
+        let acknowledged = frame.acknowledge().await;
+        let elapsed = started.elapsed();
+        release_tx.send(()).expect("release held lock");
+        holder.join().expect("external writer finishes");
+        acknowledged.expect_err("long contention must have a bounded failure");
+        assert!(elapsed >= GATEWAY_LEASE_LOCK_TIMEOUT);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "lock wait must leave time for the two-second drain bound"
+        );
+        let delivery = delivery.lock().await;
+        assert_eq!(delivery.committed.sequence, Some(1));
+        assert_eq!(delivery.pending.len(), 1);
+        assert_eq!(delivery.pending_bytes, 40);
+        assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
+    }
+
     #[test]
     fn gateway_checkpoint_rejects_legacy_scope_mismatch_and_oversized_state() {
         let checkpoint = test_checkpoint("checkpoint-validation");
@@ -1403,7 +1491,7 @@ impl GatewayEventFrame {
 
 /// A fenced durable checkpoint owned by the connector's singleton lease.
 #[derive(Clone, Debug)]
-pub(crate) struct GatewayCheckpoint {
+pub struct GatewayCheckpoint {
     pub state_path: PathBuf,
     pub lease_path: PathBuf,
     pub holder_instance_id: String,
@@ -1808,7 +1896,9 @@ where
 
 /// Lock the stable sidecar shared by lease transitions and checkpoint writes.
 /// The sidecar must never be unlinked while a zone directory is in use.
-pub(crate) fn lock_gateway_lease(path: &Path) -> io::Result<File> {
+/// Brief renewal/checkpoint overlap waits for at most 200 ms; other I/O errors
+/// return immediately. Lease authority must still be checked under this lock.
+pub fn lock_gateway_lease(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -1820,14 +1910,26 @@ pub(crate) fn lock_gateway_lease(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     let lock = options.open(path.with_extension("lock"))?;
-    lock.try_lock().map_err(|error| match error {
-        fs::TryLockError::WouldBlock => io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "Gateway lease/checkpoint update is in progress",
-        ),
-        fs::TryLockError::Error(error) => error,
-    })?;
-    Ok(lock)
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+            Err(fs::TryLockError::WouldBlock) => {}
+        }
+        let remaining = GATEWAY_LEASE_LOCK_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(GATEWAY_LEASE_LOCK_RETRY_INTERVAL));
+        if started.elapsed() >= GATEWAY_LEASE_LOCK_TIMEOUT {
+            break;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "Gateway lease/checkpoint update remained busy past the lock deadline",
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2306,7 +2408,7 @@ async fn run_gateway_loop_inner(
         // asupersync WebSocket::recv is cancel-safe: partial frames and message
         // fragments live in the connection's codec/assembler, not this future.
         match fcp_async_core::time::timeout(wait_for_message, ws_stream.recv()).await {
-            Err(_) => continue,
+            Err(_) => {}
             Ok(Ok(Some(WsMessage::Text(text)))) => {
                 let payload: GatewayPayload = serde_json::from_str(&text).map_err(|_| {
                     gateway_failure(

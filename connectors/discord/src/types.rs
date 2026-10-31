@@ -1362,7 +1362,7 @@ mod tests {
         let json = serde_json::to_string(&ready).unwrap();
         let back: GatewayReady = serde_json::from_str(&json).unwrap();
         assert_eq!(back.v, 10);
-        assert!(back.guilds.is_empty());
+        assert_eq!(back.guilds, [] as [serde_json::Value; 0]);
         assert_eq!(back.session_id, "sess123");
     }
 
@@ -1376,7 +1376,7 @@ mod tests {
             "resume_gateway_url": "wss://gw.test"
         });
         let ready: GatewayReady = serde_json::from_value(json).unwrap();
-        assert!(ready.guilds.is_empty());
+        assert_eq!(ready.guilds, [] as [serde_json::Value; 0]);
     }
 
     #[test]

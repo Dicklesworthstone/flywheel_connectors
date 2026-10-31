@@ -498,7 +498,7 @@ async fn wait_for_gateway_disconnect(ws: &mut TestGatewayWebSocket) {
     fcp_async_core::time::timeout(StdDuration::from_secs(15), async {
         loop {
             match ws.recv(&fcp_async_core::compatibility_cx()).await {
-                Ok(None) | Err(_) | Ok(Some(ServerWsMessage::Close(_))) => break,
+                Ok(None | Some(ServerWsMessage::Close(_))) | Err(_) => break,
                 Ok(Some(ServerWsMessage::Text(text))) => {
                     let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
                     assert_eq!(

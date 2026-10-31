@@ -91,6 +91,8 @@ The Gateway reader continues processing heartbeats while downstream consumption 
 
 State schema version 2 binds the consumed checkpoint to its credential/configuration, Gateway intents and shard, inbound policy, subscribed topic, and zone. A stable OS sidecar lock serializes checkpoint writes with lease acquisition, renewal, and release. Each write revalidates the lease holder and fencing generation; stale connections and previous lease holders cannot commit. Writes use private temporary files, file synchronization, atomic replacement, and parent-directory synchronization. Releasing a lease preserves its fencing generation rather than removing the lease history.
 
+Brief contention between lease renewal and checkpoint writes retries for at most 200 ms. A longer wait fails without advancing consumption; stale ownership, expired leases, and other I/O failures are never retried as contention.
+
 The initial READY records a provisional session identity without a consumed sequence. If the connector stops before that first event is acknowledged, restart reports recovery required instead of silently starting a different session. Provider invalidation of an existing resume session also records a recovery marker and stops automatic reconnects.
 
 The earlier checkpoint format recorded receipt rather than consumption. A populated legacy checkpoint is therefore rejected with an explicit migration error; it is never silently upgraded into evidence that its events were consumed. A checkpoint for a different subscription scope is rejected for the same reason.
