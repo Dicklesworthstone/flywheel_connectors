@@ -170,6 +170,7 @@ async fn setup_connector(base_url: &str) -> (DriveConnector, Ed25519SigningKey, 
         .await
         .expect("handshake connector");
 
+    let instance_id = connector.instance_id().parse().expect("actual instance ID");
     (connector, signing_key, instance_id)
 }
 
@@ -180,6 +181,10 @@ async fn loopback_get_file_uses_production_client_request() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke",
+            "id": "drive-local-get-file",
+            "connector_id": "fcp.google_drive",
+            "zone_id": "z:work",
             "operation": OP_GET_FILE,
             "input": {
                 "file_id": "file-123"

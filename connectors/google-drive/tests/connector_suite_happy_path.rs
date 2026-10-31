@@ -38,7 +38,7 @@ impl GoogleDriveAdapter {
     fn new() -> Self {
         Self {
             connector: DriveConnector::new(),
-            id: ConnectorId::from_static("google-drive"),
+            id: ConnectorId::from_static("fcp.google_drive"),
         }
     }
 }
@@ -67,11 +67,9 @@ impl FcpConnector for GoogleDriveAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => match payload.get("status").and_then(serde_json::Value::as_str) {
-                Some("healthy") => HealthSnapshot::ready(),
-                Some(other) => HealthSnapshot::degraded(format!("drive_status:{other}")),
-                None => HealthSnapshot::error("drive_status:missing".to_string()),
-            },
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|err| {
+                HealthSnapshot::error(format!("invalid Drive health: {err}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -155,12 +153,10 @@ impl FcpConnector for GoogleDriveAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|err| FcpError::Internal {
+            message: format!("failed to serialize invoke request: {err}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -243,7 +239,7 @@ fn drive_invoke(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from(id),
-        connector_id: ConnectorId::from_static("google-drive"),
+        connector_id: ConnectorId::from_static("fcp.google_drive"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -293,14 +289,6 @@ async fn connector_suite_happy_path_lists_files() {
         &["drive.read"],
         &instance_id,
     );
-    let invoke = drive_invoke(
-        &signing_key,
-        &instance_id,
-        "drive-happy-path",
-        "drive.list_files",
-        json!({ "query": "name contains 'Report'" }),
-    );
-
     let suite = ConnectorSuite {
         test_name: "google_drive_happy_path".to_string(),
         config: json!({
@@ -308,7 +296,7 @@ async fn connector_suite_happy_path_lists_files() {
             "base_url": format!("{}/drive/v3", server.uri()),
         }),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations::default(),
     };
 
@@ -333,6 +321,20 @@ async fn connector_suite_happy_path_lists_files() {
     );
     assert!(report.passed, "connector suite should pass");
     assert!(!report.logs.is_empty(), "structured logs should be present");
+    let actual_instance: InstanceId = connector.connector.instance_id().parse().unwrap();
+    assert_ne!(actual_instance, instance_id);
+    let response = connector
+        .invoke(drive_invoke(
+            &signing_key,
+            &actual_instance,
+            "drive-happy-path",
+            "drive.list_files",
+            json!({ "query": "name contains 'Report'" }),
+        ))
+        .await
+        .expect("invoke with the negotiated instance");
+    assert_eq!(response.result.unwrap()["files"][0]["id"], "file_123");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[fcp_async_core::runtime::test]
@@ -373,14 +375,6 @@ async fn connector_suite_error_path_reports_not_found_file() {
         &["drive.read"],
         &instance_id,
     );
-    let invoke = drive_invoke(
-        &signing_key,
-        &instance_id,
-        "drive-not-found",
-        "drive.get_file",
-        json!({ "file_id": "file_missing" }),
-    );
-
     let suite = ConnectorSuite {
         test_name: "google_drive_get_file_not_found".to_string(),
         config: json!({
@@ -388,12 +382,8 @@ async fn connector_suite_error_path_reports_not_found_file() {
             "base_url": format!("{}/drive/v3", server.uri()),
         }),
         handshake,
-        invoke: Some(invoke),
-        invoke_expectations: InvokeExpectations {
-            expect_error: true,
-            expected_reason_code: Some("FCP-6001".to_string()),
-            ..InvokeExpectations::default()
-        },
+        invoke: None,
+        invoke_expectations: InvokeExpectations::default(),
     };
 
     let mut runner = E2eRunner::new("fcp-google-drive");
@@ -416,30 +406,24 @@ async fn connector_suite_error_path_reports_not_found_file() {
         log_entries = report.logs.len()
     );
     assert!(report.passed, "connector suite should pass");
-    let execute = report
-        .logs
-        .iter()
-        .map(|entry| serde_json::to_value(entry).expect("serialize report log"))
-        .find(|entry| {
-            matches!(
-                entry.get("phase").and_then(serde_json::Value::as_str),
-                Some("execute")
-            )
-        })
-        .expect("execute log entry");
+    let actual_instance: InstanceId = connector.connector.instance_id().parse().unwrap();
+    let error = connector
+        .invoke(drive_invoke(
+            &signing_key,
+            &actual_instance,
+            "drive-not-found",
+            "drive.get_file",
+            json!({ "file_id": "file_missing" }),
+        ))
+        .await
+        .expect_err("provider returns the requested missing file");
     assert_eq!(
-        execute["context"]["expected_error"],
-        json!(true),
-        "suite must assert the expected error path"
-    );
-    assert_eq!(
-        execute["context"]["reason_code"],
-        json!("FCP-6001"),
+        error.error_code(),
+        "FCP-6001",
         "Drive 404 should map to the FCP not-found code"
     );
-    assert_eq!(
-        execute["context"]["retryable"],
-        json!(false),
+    assert!(
+        !error.is_retryable(),
         "not-found responses should be reported as terminal"
     );
 }

@@ -1,16 +1,17 @@
 //! FCP Google Drive Connector implementation.
 
-use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use fcp_google_discovery::auth::{GoogleAuthSelection, GoogleMaterializedAuth};
 use fcp_manifest::{ConnectorManifest, ManifestApprovalMode, OperationSection};
 use fcp_prelude::{
-    ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, EventCaps, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, Introspection, OperationId, OperationInfo, SelfCheckReport, SessionId,
-    SimulateRequest, SimulateResponse,
+    ApprovalMode, BaseConnector, CapabilityId, ConnectorId, EventCaps, FcpError, FcpResult,
+    HandshakeRequest, HealthSnapshot, HealthState, InstanceId, Introspection, InvokeRequest,
+    InvokeResponse, OperationId, OperationInfo, SelfCheckReport, SessionId, SimulateRequest,
+    SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::StandaloneSession;
 use reqwest::Url;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -186,6 +187,7 @@ use crate::{
 };
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const OPERATION_ORDER: &[&str] = &[
     "drive.list_files",
     "drive.get_file",
@@ -199,20 +201,24 @@ const OPERATION_ORDER: &[&str] = &[
 
 /// FCP Google Drive Connector.
 pub struct DriveConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     client: Option<DriveClient>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
+    zone: Option<ZoneId>,
+    started_at: Instant,
 }
 
 impl DriveConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("google-drive"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.google_drive")),
             client: None,
-            verifier: None,
+            authority: None,
             session_id: None,
+            zone: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -220,6 +226,13 @@ impl DriveConnector {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         self.base.instance_id.as_str()
+    }
+
+    fn invalidate_authority(&mut self) {
+        self.authority = None;
+        self.session_id = None;
+        self.base.instance_id = InstanceId::new();
+        self.base.set_handshaken(false);
     }
 
     #[must_use]
@@ -234,6 +247,22 @@ impl DriveConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Failed configuration must revoke the old credentials and session too.
+        self.invalidate_authority();
+        self.zone = None;
+        self.base.set_configured(false);
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        let base_url = match params.get("base_url") {
+            Some(value) => {
+                validate_drive_base_url(value.as_str().ok_or(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "`base_url` must be a string".into(),
+                })?)?
+            }
+            None => DEFAULT_BASE_URL.to_string(),
+        };
         let selection = GoogleAuthSelection::from_connector_config(&params).map_err(|error| {
             FcpError::InvalidRequest {
                 code: 1003,
@@ -257,16 +286,6 @@ impl DriveConnector {
             GoogleMaterializedAuth::BearerToken { .. } => "configured",
         };
 
-        let base_url = match params.get("base_url") {
-            Some(value) => {
-                validate_drive_base_url(value.as_str().ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "`base_url` must be a string".into(),
-                })?)?
-            }
-            None => DEFAULT_BASE_URL.to_string(),
-        };
-
         let client = DriveClient::new_with_auth(materialized)
             .map_err(|e| FcpError::Internal {
                 message: format!("Failed to create HTTP client: {e}"),
@@ -285,71 +304,85 @@ impl DriveConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
+        if self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid handshake request: {e}"),
             })?;
 
-        let verifier_instance_id = req
-            .requested_instance_id
-            .clone()
-            .unwrap_or_else(|| self.base.instance_id.clone());
-
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            verifier_instance_id,
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: false,
-                replay: false,
-                min_buffer_events: 100,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
+        if self.zone.as_ref().is_some_and(|zone| zone != &req.zone) {
+            return Err(FcpError::CapabilityDenied {
+                capability: "drive.handshake".into(),
+                reason: "Reconfigure before binding these Drive credentials to another zone".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let mut response = authority.handshake(req)?;
+        response.event_caps = Some(EventCaps {
+            streaming: false,
+            replay: false,
+            min_buffer_events: 100,
+            requires_ack: false,
+        });
+        let mut value = serde_json::to_value(&response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
-        })
+        })?;
+        value["instance_id"] = json!(authority.instance_id());
+        value["connector_id"] = json!(self.base.id);
+        value["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.zone = Some(zone);
+        self.authority = Some(authority);
+        self.base.set_handshaken(true);
+        Ok(value)
     }
 
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let status = if self.client.is_some() {
-            "healthy"
+        let configured = self.client.is_some();
+        let handshaken = self
+            .authority
+            .as_ref()
+            .is_some_and(StandaloneSession::is_established);
+        let status = if configured && handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "No negotiated capability authority".into(),
+            }
         } else {
-            "not_configured"
+            HealthState::Starting
         };
         let metrics = self.base.metrics();
-        Ok(json!({
-            "status": status,
-            "metrics": {
-                "requests_total": metrics.requests_total,
-                "requests_error": metrics.requests_error,
-            }
-        }))
+        let snapshot = HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(json!({
+                "connector_id": self.base.id,
+                "configured": configured,
+                "handshaken": handshaken,
+                "instance_id": self.base.instance_id,
+                "session_id": self.session_id,
+                "zone_id": self.zone,
+                "credential_materialized": self.client.as_ref().is_some_and(|client| {
+                    matches!(client.auth(), GoogleMaterializedAuth::BearerToken { .. })
+                }),
+                "metrics": {
+                    "requests_total": metrics.requests_total,
+                    "requests_error": metrics.requests_error,
+                },
+            })),
+            rate_limit: None,
+        };
+        serde_json::to_value(snapshot).map_err(|e| FcpError::Internal {
+            message: format!("Failed to serialize health snapshot: {e}"),
+        })
     }
 
     /// Handle doctor diagnostics.
@@ -442,7 +475,7 @@ impl DriveConnector {
                 let mut report = SelfCheckReport::ok();
                 report.details = Some(json!({
                     "api_reachable": true,
-                    "base_url": DEFAULT_BASE_URL,
+                    "base_url": client.base_url(),
                 }));
                 report
             }
@@ -480,6 +513,13 @@ impl DriveConnector {
                 code: 1003,
                 message: format!("Invalid simulate request: {e}"),
             })?;
+        if req.r#type != "simulate" || req.id.0.is_empty() || !req.input.is_object() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Simulation requires a typed request, non-empty ID and object input"
+                    .into(),
+            });
+        }
         let operation = req.operation.as_str();
         let response = match drive_capability_for_operation(operation) {
             Ok(capability) => {
@@ -491,12 +531,13 @@ impl DriveConnector {
                         "Connector is not configured",
                         FcpError::NotConfigured.error_code(),
                     )
-                } else if let Some(verifier) = &self.verifier {
+                } else if let Some(authority) = &self.authority {
                     let resource_uris = drive_resource_uris_for_operation(operation, &req.input)?;
-                    match verifier.verify_bound(
-                        req.capability_token,
-                        &capability,
+                    match authority.authorize(
+                        &req.connector_id,
+                        &req.zone_id,
                         &req.operation,
+                        req.capability_token,
                         &resource_uris,
                     ) {
                         Ok(_) => SimulateResponse::allowed(req.id),
@@ -543,45 +584,28 @@ impl DriveConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        self.base.check_ready()?;
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
-        let capability =
-            serde_json::from_value::<CapabilityToken>(token_value.clone()).map_err(|e| {
-                FcpError::InvalidRequest {
-                    code: 1003,
-                    message: format!("Invalid capability_token format: {e}"),
-                }
-            })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let cap_id = drive_capability_for_operation(operation)?;
-        validate_drive_input(operation, &input)?;
-        let resource_uris = drive_resource_uris_for_operation(operation, &input)?;
-
-        if let Some(verifier) = &self.verifier {
-            verifier.verify_bound(capability, &cap_id, &op_id, &resource_uris)?;
-        } else {
-            return Err(FcpError::NotConfigured);
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires object input and an unexpired deadline".into(),
+            });
         }
-
-        match operation {
+        let operation = request.operation.as_str();
+        validate_drive_input(operation, &request.input)?;
+        let resource_uris = drive_resource_uris_for_operation(operation, &request.input)?;
+        let witness = self
+            .authority
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .admit_bounded(&request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES)?;
+        let input = request.input;
+        let result = match operation {
             "drive.list_files" => self.invoke_list_files(input).await,
             "drive.get_file" => self.invoke_get_file(input).await,
             "drive.download_file" => self.invoke_download_file(input).await,
@@ -593,7 +617,13 @@ impl DriveConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+        };
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id, value.clone()),
+            Err(error) => InvokeResponse::error(request.id, error.clone()),
+        };
+        witness.finish_response(&response)?;
+        result
     }
 
     async fn invoke_list_files(&self, input: serde_json::Value) -> FcpResult<serde_json::Value> {
@@ -714,10 +744,13 @@ impl DriveConnector {
     }
 
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        if let Some(client) = &self.client {
+        self.invalidate_authority();
+        self.zone = None;
+        self.base.set_configured(false);
+        if let Some(client) = self.client.take() {
             client.shutdown();
         }
         info!("Drive connector shutting down");
@@ -806,7 +839,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
-    use fcp_prelude::CapabilityConstraints;
+    use fcp_prelude::{CapabilityConstraints, CapabilityToken, HandshakeResponse};
 
     fn bearer_config(value: &str) -> serde_json::Value {
         let mut params = serde_json::Map::new();
@@ -838,6 +871,23 @@ mod tests {
         operation: &'static str,
         resources: &[&str],
     ) -> CapabilityToken {
+        build_capability_with_constraints(
+            signing_key,
+            instance_id,
+            operation,
+            CapabilityConstraints {
+                resource_allow: resources.iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn build_capability_with_constraints(
+        signing_key: &Ed25519SigningKey,
+        instance_id: &str,
+        operation: &'static str,
+        constraints: CapabilityConstraints,
+    ) -> CapabilityToken {
         let capability = match operation {
             "drive.list_files" | "drive.get_file" | "drive.download_file" | "drive.export_file" => {
                 "drive.read"
@@ -848,15 +898,12 @@ mod tests {
             | "drive.share_file" => "drive.write",
             _ => "drive.read",
         };
-        let constraints = CapabilityConstraints {
-            resource_allow: resources.iter().map(ToString::to_string).collect(),
-            ..Default::default()
-        };
         let mut constraints_cbor = Vec::new();
         ciborium::into_writer(&constraints, &mut constraints_cbor)
             .expect("serialize capability constraints");
         let now = Utc::now();
         let cose = CapabilityTokenBuilder::new()
+            .token_id(fcp_core::RequestId::random().0.as_bytes())
             .capability_id(capability)
             .zone_id("z:work")
             .principal("user:test")
@@ -880,7 +927,7 @@ mod tests {
     ) -> serde_json::Value {
         let capability = build_capability(signing_key, instance_id, operation);
         serde_json::to_value(SimulateRequest::new(
-            ConnectorId::from_static("google-drive"),
+            ConnectorId::from_static("fcp.google_drive"),
             OperationId::from_static(operation),
             fcp_core::ZoneId::work(),
             input,
@@ -891,6 +938,18 @@ mod tests {
 
     fn parse_simulate_response(value: serde_json::Value) -> SimulateResponse {
         serde_json::from_value(value).expect("simulate response")
+    }
+
+    fn invoke_request(
+        operation: &str,
+        input: serde_json::Value,
+        capability_token: CapabilityToken,
+    ) -> serde_json::Value {
+        json!({
+            "type": "invoke", "id": "drive-test-request",
+            "connector_id": "fcp.google_drive", "zone_id": "z:work",
+            "operation": operation, "input": input, "capability_token": capability_token,
+        })
     }
 
     async fn configure_and_handshake(
@@ -912,6 +971,313 @@ mod tests {
             }))
             .await
             .unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn host_health_reports_actual_instance_and_negotiated_manifest_grants() {
+        let key = Ed25519SigningKey::generate();
+        let preferred = InstanceId::new();
+        let handshake = json!({
+            "protocol_version": "2.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "capabilities_requested": ["drive.read", "drive.read", "unrelated.admin"],
+            "requested_instance_id": preferred, "nonce": vec![7_u8; 32],
+        });
+        let mut connector = DriveConnector::new();
+        assert!(matches!(
+            connector.handle_handshake(handshake.clone()).await,
+            Err(FcpError::NotConfigured)
+        ));
+        connector
+            .handle_configure(bearer_config("test"))
+            .await
+            .unwrap();
+        let before: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(!before.is_ready());
+        let mut forbidden = handshake.clone();
+        forbidden["zone"] = json!("z:public");
+        assert!(connector.handle_handshake(forbidden).await.is_err());
+        assert!(connector.zone.is_none());
+        let response = connector.handle_handshake(handshake).await.unwrap();
+        let typed: HandshakeResponse = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(typed.nonce, [7_u8; 32]);
+        assert_eq!(typed.manifest_hash, DriveConnector::manifest_hash());
+        assert_eq!(typed.capabilities_granted.len(), 1);
+        assert_eq!(
+            typed.capabilities_granted[0].capability.as_str(),
+            "drive.read"
+        );
+        assert_eq!(response["connector_id"], "fcp.google_drive");
+        assert_ne!(response["instance_id"], json!(preferred));
+        assert_eq!(response["instance_id"], connector.instance_id());
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], true);
+        assert_eq!(details["connector_id"], "fcp.google_drive");
+        assert_eq!(details["zone_id"], "z:work");
+        assert_eq!(details["instance_id"], response["instance_id"]);
+        assert_eq!(details["session_id"], response["session_id"]);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn credential_reference_supports_native_session_preparation() {
+        let key = Ed25519SigningKey::generate();
+        let mut connector = DriveConnector::new();
+        connector
+            .handle_configure(json!({
+                "credential_id": fcp_core::CredentialId::new().to_string(),
+            }))
+            .await
+            .unwrap();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0", "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "capabilities_requested": ["drive.read"], "nonce": vec![7_u8; 32],
+            }))
+            .await
+            .unwrap();
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
+        assert_eq!(health.details.unwrap()["credential_materialized"], false);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn lifecycle_transitions_revoke_old_authority_before_provider_work() {
+        let server = wiremock::MockServer::start().await;
+        let key = Ed25519SigningKey::generate();
+        let config = bearer_config_with_base_url("test", format!("{}/drive/v3", server.uri()));
+        let handshake = json!({
+            "protocol_version": "2.0", "zone": "z:work",
+            "host_public_key": key.verifying_key().to_bytes(),
+            "capabilities_requested": ["drive.read"], "nonce": vec![7_u8; 32],
+        });
+        for transition in [
+            "malformed_handshake",
+            "unsupported_protocol",
+            "forbidden_zone",
+            "rebind_zone",
+            "failed_configure",
+            "reconfigure",
+            "shutdown",
+        ] {
+            let mut connector = DriveConnector::new();
+            connector.handle_configure(config.clone()).await.unwrap();
+            connector.handle_handshake(handshake.clone()).await.unwrap();
+            let original_instance = connector.instance_id().to_owned();
+            let request = invoke_request(
+                "drive.get_file",
+                json!({"file_id": "file-123"}),
+                build_capability(&key, &original_instance, "drive.get_file"),
+            );
+            match transition {
+                "malformed_handshake" => {
+                    assert!(connector.handle_handshake(json!({})).await.is_err());
+                }
+                "unsupported_protocol" => {
+                    let mut invalid = handshake.clone();
+                    invalid["protocol_version"] = json!("3.0");
+                    assert!(connector.handle_handshake(invalid).await.is_err());
+                }
+                "forbidden_zone" => {
+                    let mut invalid = handshake.clone();
+                    invalid["zone"] = json!("z:public");
+                    assert!(connector.handle_handshake(invalid).await.is_err());
+                }
+                "rebind_zone" => {
+                    let mut invalid = handshake.clone();
+                    invalid["zone"] = json!("z:private");
+                    assert!(connector.handle_handshake(invalid).await.is_err());
+                }
+                "failed_configure" => {
+                    let mut invalid = config.clone();
+                    invalid["base_url"] = json!("https://not-google.invalid/drive/v3");
+                    assert!(connector.handle_configure(invalid).await.is_err());
+                }
+                "reconfigure" => {
+                    connector.handle_configure(config.clone()).await.unwrap();
+                }
+                "shutdown" => {
+                    connector.handle_shutdown(json!({})).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                connector.handle_invoke(request.clone()).await.is_err(),
+                "{transition}"
+            );
+            assert_ne!(connector.instance_id(), original_instance);
+            let health: HealthSnapshot =
+                serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+            assert!(!health.is_ready(), "{transition}");
+            assert_eq!(health.details.as_ref().unwrap()["handshaken"], false);
+            assert!(connector.session_id.is_none());
+            if matches!(transition, "failed_configure" | "reconfigure" | "shutdown") {
+                assert!(connector.zone.is_none());
+            } else {
+                assert_eq!(connector.zone.as_ref(), Some(&ZoneId::work()));
+            }
+            if matches!(transition, "failed_configure" | "shutdown") {
+                assert!(connector.client.is_none());
+                assert_eq!(health.details.unwrap()["configured"], false);
+                assert!(matches!(
+                    connector.handle_handshake(handshake.clone()).await,
+                    Err(FcpError::NotConfigured)
+                ));
+                connector.handle_configure(config.clone()).await.unwrap();
+            }
+            connector.handle_handshake(handshake.clone()).await.unwrap();
+            assert!(
+                connector.handle_invoke(request).await.is_err(),
+                "{transition}"
+            );
+            let simulation = connector
+                .handle_simulate(simulate_request(
+                    &key,
+                    connector.instance_id(),
+                    "drive.get_file",
+                    json!({"file_id": "file-123"}),
+                ))
+                .await
+                .unwrap();
+            assert!(parse_simulate_response(simulation).would_succeed);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn canonical_scope_and_signed_usage_gate_actual_provider_requests() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files/file-123"))
+            .and(header("authorization", "Bearer metered-drive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "file-123", "name": "authorized.txt", "mimeType": "text/plain",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let key = Ed25519SigningKey::generate();
+        let mut connector = DriveConnector::new();
+        connector
+            .handle_configure(bearer_config_with_base_url(
+                "metered-drive",
+                format!("{}/drive/v3", server.uri()),
+            ))
+            .await
+            .unwrap();
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0", "zone": "z:work",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "capabilities_requested": ["drive.read"], "nonce": vec![7_u8; 32],
+            }))
+            .await
+            .unwrap();
+        let token = build_capability_with_constraints(
+            &key,
+            connector.instance_id(),
+            "drive.get_file",
+            CapabilityConstraints {
+                resource_allow: vec!["drive://files/file-123".into()],
+                max_calls: Some(1),
+                max_bytes: Some(16 * 1024),
+                ..Default::default()
+            },
+        );
+        let request = invoke_request(
+            "drive.get_file",
+            json!({"file_id": "file-123"}),
+            token.clone(),
+        );
+        for (field, value) in [
+            ("connector_id", json!("fcp.some_other_connector")),
+            ("zone_id", json!("z:private")),
+            ("type", json!("simulate")),
+            ("id", json!("")),
+            ("deadline_ms", json!(0)),
+            ("input", json!({"file_id": "other-file"})),
+        ] {
+            let mut denied = request.clone();
+            denied[field] = value;
+            assert!(connector.handle_invoke(denied).await.is_err(), "{field}");
+        }
+        let write = invoke_request(
+            "drive.trash_file",
+            json!({"file_id": "file-123"}),
+            build_capability(&key, connector.instance_id(), "drive.trash_file"),
+        );
+        assert!(matches!(
+            connector.handle_invoke(write).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        for constraints in [
+            CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_calls: Some(0),
+                ..Default::default()
+            },
+            CapabilityConstraints {
+                resource_allow: vec!["*".into()],
+                max_bytes: Some(1),
+                ..Default::default()
+            },
+        ] {
+            let limited = invoke_request(
+                "drive.get_file",
+                json!({"file_id": "file-123"}),
+                build_capability_with_constraints(
+                    &key,
+                    connector.instance_id(),
+                    "drive.get_file",
+                    constraints,
+                ),
+            );
+            assert!(connector.handle_invoke(limited).await.is_err());
+        }
+        let simulation = serde_json::to_value(SimulateRequest::new(
+            ConnectorId::from_static("fcp.google_drive"),
+            OperationId::from_static("drive.get_file"),
+            ZoneId::work(),
+            json!({"file_id": "file-123"}),
+            token,
+        ))
+        .unwrap();
+        for (field, value) in [
+            ("connector_id", json!("fcp.some_other_connector")),
+            ("zone_id", json!("z:private")),
+        ] {
+            let mut denied = simulation.clone();
+            denied[field] = value;
+            assert!(
+                !parse_simulate_response(connector.handle_simulate(denied).await.unwrap())
+                    .would_succeed
+            );
+        }
+        assert!(
+            parse_simulate_response(connector.handle_simulate(simulation.clone()).await.unwrap())
+                .would_succeed
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let result = connector.handle_invoke(request.clone()).await.unwrap();
+        assert_eq!(result["file"]["id"], "file-123");
+        let mut repeated = request;
+        repeated["id"] = json!("new-id-cannot-refill-signed-grant");
+        assert!(connector.handle_invoke(repeated).await.is_err());
+        assert!(
+            !parse_simulate_response(connector.handle_simulate(simulation).await.unwrap())
+                .would_succeed
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
@@ -1016,7 +1382,7 @@ mod tests {
             build_capability(&signing_key, "another-instance", "drive.export_file"),
         ] {
             let simulation = SimulateRequest::new(
-                ConnectorId::from_static("google-drive"),
+                ConnectorId::from_static("fcp.google_drive"),
                 OperationId::from_static("drive.export_file"),
                 fcp_core::ZoneId::work(),
                 input.clone(),
@@ -1029,10 +1395,7 @@ mod tests {
             assert!(!parse_simulate_response(result).would_succeed);
             assert!(
                 connector
-                    .handle_invoke(json!({
-                        "operation":"drive.export_file", "input":input,
-                        "capability_token":token
-                    }))
+                    .handle_invoke(invoke_request("drive.export_file", input.clone(), token))
                     .await
                     .is_err()
             );
@@ -1044,7 +1407,7 @@ mod tests {
             &["drive://files/native-doc"],
         );
         let simulation = SimulateRequest::new(
-            ConnectorId::from_static("google-drive"),
+            ConnectorId::from_static("fcp.google_drive"),
             OperationId::from_static("drive.export_file"),
             fcp_core::ZoneId::work(),
             input.clone(),
@@ -1058,10 +1421,7 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
 
         let result = connector
-            .handle_invoke(json!({
-                "operation":"drive.export_file", "input":input,
-                "capability_token":token
-            }))
+            .handle_invoke(invoke_request("drive.export_file", input, token))
             .await
             .unwrap();
         assert_eq!(result["file_id"], "native-doc");
@@ -1114,16 +1474,23 @@ mod tests {
             "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
             "parent_id": "parent-folder"
         });
-        let denied = connector.handle_invoke(json!({
-            "operation": "drive.upload_file", "input": input,
-            "capability_token": build_capability(&signing_key, connector.instance_id(), "drive.get_file")
-        })).await;
+        let denied = connector
+            .handle_invoke(invoke_request(
+                "drive.upload_file",
+                input.clone(),
+                build_capability(&signing_key, connector.instance_id(), "drive.get_file"),
+            ))
+            .await;
         assert!(denied.is_err());
         assert!(server.received_requests().await.unwrap().is_empty());
-        let response = connector.handle_invoke(json!({
-            "operation": "drive.upload_file", "input": input,
-            "capability_token": build_capability(&signing_key, connector.instance_id(), "drive.upload_file")
-        })).await.unwrap();
+        let response = connector
+            .handle_invoke(invoke_request(
+                "drive.upload_file",
+                input,
+                build_capability(&signing_key, connector.instance_id(), "drive.upload_file"),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response["file"]["id"], "binary-upload");
         let requests = server.received_requests().await.unwrap();
         let request = &requests[0];
@@ -1356,7 +1723,10 @@ mod tests {
     async fn health_unconfigured() {
         let connector = DriveConnector::new();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(matches!(health.status, HealthState::Starting));
+        assert!(!health.is_ready());
+        assert_eq!(health.details.unwrap()["configured"], false);
     }
 
     #[fcp_async_core::runtime::test]
@@ -1367,12 +1737,16 @@ mod tests {
             .await
             .unwrap();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "healthy");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(!health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], false);
     }
 
     #[fcp_async_core::runtime::test]
     async fn shutdown_succeeds() {
-        let connector = DriveConnector::new();
+        let mut connector = DriveConnector::new();
         let result = connector.handle_shutdown(json!({})).await.unwrap();
         assert_eq!(result["status"], "shutdown");
     }

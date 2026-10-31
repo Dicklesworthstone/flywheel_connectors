@@ -13,7 +13,7 @@ name = "Google Drive Connector"
 version = "0.1.0"
 description = "FCP connector for Google Drive v3 (list, get, download, create folders, upload, trash, and share files)"
 archetypes = ["operational", "knowledge"]
-format = "wasi"
+format = "native"
 status = "proven"
 
 [connector.state]

@@ -43,6 +43,6 @@ tracing-subscriber.workspace = true
 ciborium.workspace = true
 wiremock.workspace = true
 fcp-crypto = { path = "../../crates/fcp-crypto" }
-fcp-e2e = { path = "../../crates/fcp-e2e" }
+fcp-e2e = { path = "../../crates/fcp-e2e", default-features = false, features = ["google_drive"] }
 fcp-testkit = { path = "../../crates/fcp-testkit" }
 chrono.workspace = true

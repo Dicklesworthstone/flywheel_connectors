@@ -38,7 +38,7 @@ impl GoogleDriveConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: DriveConnector::new(),
-            id: ConnectorId::from_static("google-drive"),
+            id: ConnectorId::from_static("fcp.google_drive"),
         }
     }
 }
@@ -67,17 +67,9 @@ impl FcpConnector for GoogleDriveConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("drive_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|err| {
+                HealthSnapshot::error(format!("invalid Drive health: {err}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -130,12 +122,10 @@ impl FcpConnector for GoogleDriveConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|err| FcpError::Internal {
+            message: format!("failed to serialize invoke request: {err}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -205,9 +195,8 @@ fn handshake_request(
             .collect(),
         host: None,
         transport_caps: None,
-        // The connector honors requested_instance_id and verifies with
-        // verify_bound; pin it to the test instance so the token's INSTANCE_ID
-        // claim matches (instance-binding pattern, commit 16171621d).
+        // This is a preference. Tokens must bind to the actual instance
+        // exposed in health after the handshake succeeds.
         requested_instance_id: Some(instance_id),
     }
 }
@@ -230,9 +219,8 @@ fn build_token(
         .zone_id("z:work")
         .principal("user:test")
         .operations(operations)
-        // dja9u typestate ratchet: connector verifies with verify_bound, which
-        // requires an INSTANCE_ID claim; bind to the test instance
-        // (instance-binding pattern, commit 16171621d).
+        // Bind the caller's token to the negotiated instance without changing
+        // it inside the adapter.
         .target_instance(instance_id)
         .issuer("node:test")
         .validity(now, now + ChronoDuration::hours(1))
@@ -251,7 +239,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("drive-e2e"),
-        connector_id: ConnectorId::from_static("google-drive"),
+        connector_id: ConnectorId::from_static("fcp.google_drive"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -363,6 +351,22 @@ async fn google_drive_default_deny_compliance_suite_passes() {
         report.passed,
         "default deny compliance should pass: {report:#?}"
     );
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id(),
+        "drive.write",
+        &["drive.upload_file"],
+    );
+    let error = connector
+        .invoke(invoke_request(
+            "drive.get_file",
+            json!({ "file_id": "file_123" }),
+            token,
+        ))
+        .await
+        .expect_err("an actual-instance token still cannot cross negotiated capabilities");
+    assert!(matches!(error, FcpError::CapabilityDenied { .. }));
+    assert!(mock.received_requests().await.is_empty());
 }
 
 #[fcp_async_core::runtime::test]
@@ -383,19 +387,11 @@ async fn google_drive_happy_path_connector_suite_passes() {
         &["drive.read"],
         instance_id.clone(),
     );
-    let token = build_token(
-        &signing_key,
-        instance_id.as_str(),
-        "drive.read",
-        &["drive.get_file"],
-    );
-    let invoke = invoke_request("drive.get_file", json!({ "file_id": "file_123" }), token);
-
     let suite = ConnectorSuite {
         test_name: "google_drive_happy_path".to_string(),
         config: drive_config(&mock.base_url()),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -413,16 +409,23 @@ async fn google_drive_happy_path_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "happy path should pass: {report:#?}");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
-    assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+    assert_ne!(connector.connector.instance_id(), instance_id.as_str());
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id(),
+        "drive.read",
+        &["drive.get_file"],
     );
+    let response = connector
+        .invoke(invoke_request(
+            "drive.get_file",
+            json!({ "file_id": "file_123" }),
+            token,
+        ))
+        .await
+        .expect("invoke with negotiated instance");
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.result.unwrap()["file"]["id"], "file_123");
     let received = mock.received_requests().await;
     let hits = received
         .iter()
@@ -443,8 +446,8 @@ fn google_drive_manifest_network_guard_allows_and_denies() {
 
     assert_eq!(
         operations.len(),
-        7,
-        "Google Drive manifest should declare 7 operations (matching the \
+        8,
+        "Google Drive manifest should declare 8 operations (matching the \
          connector's dispatch surface in connectors/google-drive/src/connector.rs)"
     );
 

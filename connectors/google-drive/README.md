@@ -36,7 +36,8 @@ The current crate exposes these operations:
 Important runtime truths the contract preserves:
 
 - Package and binary name are `fcp-google-drive`.
-- Runtime `BaseConnector` ID is `google-drive`.
+- The manifest declares the native executable runtime. Its shared JSONL loop bounds request frames to 32 MiB, preserving full 16 MiB uploads after base64 expansion. Successful shutdown ends the loop; EOF and transport failures close credentials and session authority before the runtime exits.
+- Runtime, manifest, health, and invocation connector ID is `fcp.google_drive`.
 - Configuration accepts Google auth at the top level through `GoogleAuthSelection`: direct bearer token, `credential_id`, or `oauth_refresh`.
 - Direct bearer-token mode sends the Google Authorization header through `GoogleRestExecutor`.
 - `credential_id` mode is secretless and reports `configured_pending_token_materialization`.
@@ -58,27 +59,26 @@ Important runtime truths the contract preserves:
 - An unresolved upload outcome remains non-retryable. Inspect the destination folder before invoking `drive.upload_file` again: a new invocation starts a new upload and can create a duplicate. Upload sessions and progress are not retained when a call or process ends.
 - The full 16 MiB allowance is usable through the local host/native transport, whose upload invocation body limit accommodates base64 expansion. The mesh request limit remains 8 MiB; selecting resumable provider transfer does not enlarge that transport limit.
 - `drive.share_file` creates a user permission and accepts roles `reader`, `commenter`, `writer`, and `organizer`.
-- Runtime handshake installs a `CapabilityVerifier`.
-- `invoke` requires `capability_token`, validates input, computes resource URIs, and verifies a bound capability token before provider execution.
-- `simulate` validates operation inventory, input shape, configured/handshaken state, and bound capability token before returning an allowed result.
+- Runtime handshake installs an SDK `StandaloneSession`, accepts protocol 2.0, rejects forbidden zones, and grants only requested capabilities declared by the manifest. Each successful handshake generates a fresh instance ID; callers must bind tokens to the actual instance returned in handshake and health, rather than the requested instance preference.
+- `invoke` accepts a complete typed request with `type`, nonempty `id`, canonical `connector_id`, `zone_id`, `operation`, object `input`, and `capability_token`. It verifies the negotiated target, zone, grant, instance, operation, and resource constraints before provider execution, and atomically enforces signed call and byte budgets.
+- `simulate` validates the same scope, operation, input, lifecycle, and remaining signed budget without spending a call or issuing provider requests.
 - `doctor()` and `self_check()` probe Drive API reachability through the `about` endpoint when credentials are materialized.
-- `health()` reports local configured/client state only.
+- `health()` returns a typed `HealthSnapshot` with local lifecycle readiness and configured/handshaken flags, actual instance, session, zone, and credential-materialization diagnostics. A configured and handshaken credential reference is lifecycle-ready for host session preparation; provider readiness is checked separately by `doctor()` and `self_check()`.
+- Every configuration attempt, handshake attempt, and shutdown revokes the previous authority and instance binding before validation. Failed configuration and shutdown also discard the client, so stale tokens cannot regain access when a later session starts.
+- Configured credentials remain bound to the first negotiated zone until reconfiguration or shutdown. A failed handshake cannot move them into another zone.
 
 ## Drift Visible In This Checkout
 
 This README documents the runtime truth and keeps current drift visible:
 
-- Manifest connector ID is `fcp.google_drive`, while runtime `BaseConnector` ID is `google-drive`.
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
 - Runtime introspection derives operation descriptions, schemas, capability, risk, safety, idempotency, approval mode, rate limits, and AI hints from `manifest.toml`.
 - Manifest optional capabilities include `media.download` and `media.upload`, but operation metadata and capability verification use only `drive.read` and `drive.write`.
 - Manifest marks `drive.create_folder` as policy approval and `drive.upload_file`, `drive.trash_file`, and `drive.share_file` as interactive approval. Runtime introspection now exposes that approval intent, but `invoke` and `simulate` verify bound capability tokens only and do not verify approval tokens.
 - Runtime introspection says `max_results` has a maximum of 1000, but runtime input validation and client dispatch do not clamp the value.
-- Runtime `handle_shutdown` calls client shutdown but does not clear client, verifier, session, configured flags, or handshaken flags.
-- `self_check()` reports `DEFAULT_BASE_URL` in details even when a loopback or custom base URL was configured.
 - The dedicated tracked verification shell script is `scripts/e2e/google_drive_connector_verification.sh`.
 
-A follow-up parity bead should align connector ID spelling, reconcile media capabilities, add approval-token enforcement for approval-marked write operations, clamp or reject out-of-range pagination input, reset lifecycle state consistently on shutdown, and report the active base URL in self-check.
+A follow-up parity bead should reconcile media capabilities, add approval-token enforcement for approval-marked write operations, and clamp or reject out-of-range pagination input. Approval policy remains the host's responsibility in this slice.
 
 ## First-Slice Scope
 
@@ -200,9 +200,9 @@ These are excluded on purpose:
 - Drive API reachability and storage quota through the `about` endpoint in `doctor()`
 - provider-backed self-check through the same health path when credentials are materialized
 - operation metadata with capability, risk, safety tier, idempotency, approval mode, schemas, and AI hints
-- bound capability-token verification during `invoke`
-- simulation denial for unknown operation, unconfigured connector, missing handshake, invalid input, and bound capability-token mismatch
-- local-only `health()` behavior
+- negotiated connector, zone, capability, instance, and resource verification during `invoke`, with signed call and byte budgets
+- simulation denial for unknown operation, unconfigured connector, missing handshake, invalid input, scope mismatch, and exhausted budgets
+- local-only typed `health()` behavior that distinguishes lifecycle readiness from provider credentials
 - typed provider/FCP error mapping
 
 The deterministic integration evidence is anchored on connector-local tests covering:
@@ -210,6 +210,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - lifecycle, configuration, base URL policy, loopback allowance, introspection, simulation, doctor, self-check, and shutdown behavior
 - file list/get/download, folder create, file upload, file trash, and file share through deterministic HTTP fixtures
 - invoke rejection for unknown operation, missing token, missing input, wrong capability, and pre-provider capability verification
+- host JSON-RPC configure/handshake/health/invoke/shutdown, actual-instance token binding, fail-closed reconfiguration and handshake, forbidden zones, stale tokens, and signed budget exhaustion before provider work
 - provider 401, 403, 404, 429, retryable transport/server classes, malformed JSON, quota errors, and FCP error mapping
 - path-segment validation for traversal and double-encoded separators
 - capability-bound binary multipart uploads, empty files, exact upload URI and MIME framing, standard base64 and size validation, safe rate-limit retry, unknown mutation outcomes, and redirect refusal
