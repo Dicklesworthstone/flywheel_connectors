@@ -1,6 +1,6 @@
 # Discord Connector V3 Contract
 
-> **Status**: native acknowledged Gateway delivery with durable consumed checkpoints; remaining REST metadata gaps are listed below
+> **Status**: native acknowledged Gateway delivery with durable consumed checkpoints and aligned REST operation authorities
 > **Bead**: `flywheel_connectors-6n7.19`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -45,20 +45,20 @@ Important runtime truths the contract preserves:
 - Handshake installs a bound `CapabilityVerifier`.
 - `invoke` verifies bound capability tokens against the requested operation and resource URIs such as `discord:channel:<id>` and `discord:guild:<id>`.
 - `simulate` is stricter than legacy connectors: it checks readiness, operation support, input validation, and bound capability verification.
-- `health`, `doctor`, and `self_check` call Discord when configured, so invalid or revoked bot credentials surface through diagnostics.
+- Native `health` reports local readiness, instance/zone identity, and terminal Gateway failures. `doctor`, `self_check`, and the provider health helper probe Discord when configured, so invalid or revoked bot credentials surface through diagnostics.
 - `subscribe` starts the Gateway only after validating a signed, instance-bound token for `discord.read`, operation `discord.subscribe`, and resource `discord:events:<topic>`. One exact declared topic is selected per native stream.
 - The production JSONL loop writes native events and processes consumer acknowledgements concurrently with RPC responses. A local diagnostic listener cannot advance the Gateway checkpoint.
 - Heartbeats report the last received provider sequence. The durable resume checkpoint advances only after ordered consumption, including explicit inbound-policy filtering; receiving or printing an event does not count as consuming it.
 
-## Known Contract Gaps
+## Runtime And Manifest Contract
 
-The runtime, manifest, and introspection metadata are not fully aligned in this checkout:
+The manifest and runtime use the same nine fully qualified REST operation IDs. The host can select each operation's network policy, capability, approval mode, and quota using the same ID that the connector accepts. Runtime introspection matches the manifest's capability, risk, safety, idempotency, approval, and per-operation rate-limit metadata.
 
-- `manifest.toml` declares operation tables as `send_message`, `edit_message`, and similar unprefixed names, while runtime introspection and invocation use fully qualified IDs such as `discord.send_message`.
-- `manifest.toml` marks `send_message`, `edit_message`, and `create_thread` as policy-approved and `delete_message` as interactive, but runtime `OperationInfo` currently sets `requires_approval` to `None` for every operation.
-- Runtime allows loopback endpoints for deterministic tests in debug/test builds, while the manifest network constraints remain production-strict.
+`discord.send_message`, `discord.edit_message`, and `discord.create_thread` declare policy approval; `discord.delete_message` declares interactive approval. Read, typing, and reaction operations declare no approval requirement. Host policy enforces these declarations before issuing an invocation grant.
 
-The native event catalog and subscription authorities are declared in the manifest and runtime. REST operation IDs and approval metadata still need alignment before this connector is described as fully contract-aligned.
+Each operation is also mapped to its declared shared rate-limit pool. Channel and guild reads share `discord.read`; message sending and typing share `discord.send`. The manifest supplies both the per-operation ceilings and the shared allowances to host rate-limit policy.
+
+The native event catalog and subscription authorities are declared in the manifest and runtime. Runtime allows loopback endpoints for deterministic tests in debug/test builds, while the manifest network constraints remain production-strict.
 
 ## Native Gateway Delivery
 

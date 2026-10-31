@@ -16,11 +16,11 @@ use std::{
 use fcp_async_core::channel::{broadcast, watch};
 use fcp_core::{HealthSnapshot, HealthState, SubscribeRequest, SubscribeResponse, SubscribeResult};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult,
-    HandshakeRequest, HandshakeResponse, IdempotencyClass, InstanceId, Introspection, OperationId,
-    OperationInfo, Principal, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
-    SimulateResponse, ThreadInfo, TrustLevel, ZoneId,
+    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
+    CapabilityVerifier, ConnectorId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError,
+    FcpResult, HandshakeRequest, HandshakeResponse, IdempotencyClass, InstanceId, Introspection,
+    OperationId, OperationInfo, Principal, RateLimit, RiskLevel, SafetyTier, SelfCheckReport,
+    SessionId, SimulateRequest, SimulateResponse, ThreadInfo, TrustLevel, ZoneId,
 };
 use fcp_sdk::prelude::JsonlEventStream;
 use fcp_sdk::{
@@ -1167,6 +1167,16 @@ impl DiscordConnector {
         format!("sha256:{}", hex::encode(hasher.finalize()))
     }
 
+    fn rest_rate_limit(max: u32) -> RateLimit {
+        RateLimit {
+            max,
+            per_ms: 60_000,
+            burst: None,
+            scope: None,
+            pool_name: None,
+        }
+    }
+
     /// Handle configure method.
     pub async fn handle_configure(
         &mut self,
@@ -1974,8 +1984,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.send"),
                     risk_level: RiskLevel::Medium,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(50)),
+                    requires_approval: Some(ApprovalMode::Policy),
                     safety_tier: SafetyTier::Risky,
                     idempotency: IdempotencyClass::None,
                     ai_hints: AgentHint {
@@ -1998,8 +2008,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.edit"),
                     risk_level: RiskLevel::Medium,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(50)),
+                    requires_approval: Some(ApprovalMode::Policy),
                     safety_tier: SafetyTier::Risky,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2017,8 +2027,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.delete"),
                     risk_level: RiskLevel::High,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(30)),
+                    requires_approval: Some(ApprovalMode::Interactive),
                     safety_tier: SafetyTier::Dangerous,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2036,8 +2046,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.read"),
                     risk_level: RiskLevel::Low,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(100)),
+                    requires_approval: Some(ApprovalMode::None),
                     safety_tier: SafetyTier::Safe,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2055,8 +2065,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.read"),
                     risk_level: RiskLevel::Low,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(100)),
+                    requires_approval: Some(ApprovalMode::None),
                     safety_tier: SafetyTier::Safe,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2074,8 +2084,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.send"),
                     risk_level: RiskLevel::Low,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(100)),
+                    requires_approval: Some(ApprovalMode::None),
                     safety_tier: SafetyTier::Safe,
                     idempotency: IdempotencyClass::None,
                     ai_hints: AgentHint {
@@ -2095,8 +2105,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.react"),
                     risk_level: RiskLevel::Low,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(50)),
+                    requires_approval: Some(ApprovalMode::None),
                     safety_tier: SafetyTier::Safe,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2119,8 +2129,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.read"),
                     risk_level: RiskLevel::Low,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(100)),
+                    requires_approval: Some(ApprovalMode::None),
                     safety_tier: SafetyTier::Safe,
                     idempotency: IdempotencyClass::Strict,
                     ai_hints: AgentHint {
@@ -2138,8 +2148,8 @@ impl DiscordConnector {
                     capability: CapabilityId::from_static("discord.threads"),
                     risk_level: RiskLevel::Medium,
                     description: None,
-                    rate_limit: None,
-                    requires_approval: None,
+                    rate_limit: Some(Self::rest_rate_limit(30)),
+                    requires_approval: Some(ApprovalMode::Policy),
                     safety_tier: SafetyTier::Risky,
                     idempotency: IdempotencyClass::None,
                     ai_hints: AgentHint {
@@ -5984,6 +5994,86 @@ mod tests {
     }
 
     // ─── Introspection metadata tests ──────────────────────────────────
+
+    #[fcp_async_core::runtime::test]
+    async fn all_rest_operation_metadata_matches_the_complete_manifest() {
+        let manifest = fcp_manifest::ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("the complete bundled manifest must validate");
+        let connector = DiscordConnector::new();
+        let introspection: Introspection =
+            serde_json::from_value(connector.handle_introspect().await.unwrap()).unwrap();
+        let expected_ids: BTreeSet<&str> = ALL_OPERATIONS.iter().copied().collect();
+        let runtime_ids: BTreeSet<&str> = introspection
+            .operations
+            .iter()
+            .map(|operation| operation.id.as_ref())
+            .collect();
+        let manifest_ids: BTreeSet<&str> = manifest
+            .provides
+            .operations
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            runtime_ids, expected_ids,
+            "runtime must expose every canonical REST operation exactly once"
+        );
+        assert_eq!(
+            manifest_ids, expected_ids,
+            "host constraints must use the same fully qualified operation IDs"
+        );
+        assert_eq!(introspection.operations.len(), expected_ids.len());
+        let pools = manifest
+            .rate_limits
+            .as_ref()
+            .expect("shared REST rate-limit pools");
+        assert_eq!(pools.operation_pools.len(), expected_ids.len());
+
+        for operation in &introspection.operations {
+            let id: &str = operation.id.as_ref();
+            let declared = &manifest.provides.operations[id];
+            assert_eq!(
+                pools.operation_pools.get(id),
+                Some(&vec![operation.capability.to_string()]),
+                "{id}: shared rate-limit pool must be reachable by its canonical operation ID"
+            );
+            assert_eq!(
+                operation.capability, declared.capability,
+                "{id}: capability drift"
+            );
+            assert_eq!(
+                operation.risk_level, declared.risk_level,
+                "{id}: risk drift"
+            );
+            assert_eq!(
+                operation.safety_tier, declared.safety_tier,
+                "{id}: safety tier drift"
+            );
+            assert_eq!(
+                operation.idempotency, declared.idempotency,
+                "{id}: retry contract drift"
+            );
+            assert_eq!(
+                operation.requires_approval,
+                Some(declared.requires_approval.into()),
+                "{id}: approval drift"
+            );
+            let runtime_rate = operation
+                .rate_limit
+                .as_ref()
+                .expect("REST operation rate limit");
+            let declared_rate = declared
+                .rate_limit
+                .as_ref()
+                .expect("manifest rate limit")
+                .as_inner();
+            assert_eq!(
+                serde_json::to_value(runtime_rate).unwrap(),
+                serde_json::to_value(declared_rate).unwrap(),
+                "{id}: rate-limit metadata drift",
+            );
+        }
+    }
 
     #[fcp_async_core::runtime::test]
     async fn test_introspect_all_ops_have_capability() {

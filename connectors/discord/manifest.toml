@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:ecd10a5d0dff854137a581ba30a0f5ace71786e9df8fd35cf0127568426f95c8"
+interface_hash = "blake3-256:fcp.interface.v2:43617183c6519d4672aec9f0f72d9541ee038ba6a11843d09d025c0fb77da263"
 
 [connector]
 id = "fcp.discord"
@@ -58,7 +58,7 @@ forbidden = [
 # Operations
 # -----------------------------------------------------------------------------
 
-[provides.operations.send_message]
+[provides.operations."discord.send_message"]
 description = "Send a message to a Discord channel"
 capability = "discord.send"
 risk_level = "medium"
@@ -66,154 +66,154 @@ safety_tier = "risky"
 requires_approval = "policy"
 idempotency = "none"
 
-[provides.operations.send_message.rate_limit]
+[provides.operations."discord.send_message".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.send_message.input_schema]
+[provides.operations."discord.send_message".input_schema]
 required = ["channel_id"]
 type = "object"
 
-[provides.operations.send_message.input_schema.properties.channel_id]
+[provides.operations."discord.send_message".input_schema.properties.channel_id]
 description = "Discord channel ID (snowflake)"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.send_message.input_schema.properties.content]
+[provides.operations."discord.send_message".input_schema.properties.content]
 description = "Message text content (max 2000 chars)"
 type = "string"
 maxLength = 2000
 
-[provides.operations.send_message.input_schema.properties.embeds]
+[provides.operations."discord.send_message".input_schema.properties.embeds]
 description = "Rich embed objects (max 10)"
 type = "array"
 maxItems = 10
 
-[provides.operations.send_message.input_schema.properties.embeds.items]
+[provides.operations."discord.send_message".input_schema.properties.embeds.items]
 type = "object"
 
-[provides.operations.send_message.input_schema.properties.reply_to]
+[provides.operations."discord.send_message".input_schema.properties.reply_to]
 description = "Message ID to reply to"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.send_message.input_schema.properties.delivery]
+[provides.operations."discord.send_message".input_schema.properties.delivery]
 description = "Delivery-control metadata for visible/final accounting, hidden progress suppression, and inbound event correlation"
 type = "object"
 
-[provides.operations.send_message.input_schema.properties.delivery.properties.kind]
+[provides.operations."discord.send_message".input_schema.properties.delivery.properties.kind]
 description = "Logical delivery kind"
 type = "string"
 enum = ["final", "progress", "tool", "block"]
 
-[provides.operations.send_message.input_schema.properties.delivery.properties.visibility]
+[provides.operations."discord.send_message".input_schema.properties.delivery.properties.visibility]
 description = "Whether the delivery should create a provider-visible Discord message"
 type = "string"
 enum = ["visible", "hidden"]
 
-[provides.operations.send_message.input_schema.properties.delivery.properties.label]
+[provides.operations."discord.send_message".input_schema.properties.delivery.properties.label]
 description = "Optional operator-facing label copied into the delivery receipt"
 type = "string"
 maxLength = 64
 
-[provides.operations.send_message.input_schema.properties.delivery.properties.inbound_event]
+[provides.operations."discord.send_message".input_schema.properties.delivery.properties.inbound_event]
 description = "Optional inbound Discord event correlation retained until a matching visible outbound delivery succeeds"
 type = "object"
 required = ["session_key"]
 
-[provides.operations.send_message.input_schema.properties.delivery.properties.inbound_event.properties.session_key]
+[provides.operations."discord.send_message".input_schema.properties.delivery.properties.inbound_event.properties.session_key]
 description = "Opaque fcp_delivery.session_key from a prior discord.message event"
 type = "string"
 maxLength = 256
 
-[provides.operations.send_message.output_schema]
+[provides.operations."discord.send_message".output_schema]
 required = ["id", "channel_id"]
 type = "object"
 
-[provides.operations.send_message.output_schema.properties.id]
+[provides.operations."discord.send_message".output_schema.properties.id]
 description = "Created message ID, or null when a hidden non-final delivery is suppressed before REST"
 type = ["string", "null"]
 
-[provides.operations.send_message.output_schema.properties.channel_id]
+[provides.operations."discord.send_message".output_schema.properties.channel_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.content]
+[provides.operations."discord.send_message".output_schema.properties.content]
 type = ["string", "null"]
 
-[provides.operations.send_message.output_schema.properties.coordination]
+[provides.operations."discord.send_message".output_schema.properties.coordination]
 description = "Redacted chat coordination audit records"
 type = "array"
 
-[provides.operations.send_message.output_schema.properties.coordination.items]
+[provides.operations."discord.send_message".output_schema.properties.coordination.items]
 type = "object"
 
-[provides.operations.send_message.output_schema.properties.delivery]
+[provides.operations."discord.send_message".output_schema.properties.delivery]
 description = "Redacted delivery receipt for Discord REST sends, hidden suppression, and inbound event correlation"
 type = "object"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.status]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.status]
 description = "Connector delivery outcome"
 type = "string"
 enum = ["delivered", "suppressed"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.kind]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.kind]
 type = "string"
 enum = ["final", "progress", "tool", "block"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.visibility]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.visibility]
 type = "string"
 enum = ["visible", "hidden"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.final]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.final]
 type = "boolean"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.visible]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.visible]
 type = "boolean"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.message_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.message_id]
 type = ["string", "null"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.reason]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.reason]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event]
 description = "Receipt for an optional inbound_event session_key supplied on the send"
 type = "object"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.status]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.status]
 description = "Inbound event retention outcome"
 type = "string"
 enum = ["pending", "target_mismatch", "marked_delivered", "not_found"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.session_key]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.session_key]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.event_kind]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.event_kind]
 type = "string"
 enum = ["room_event", "direct_message"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.channel_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.channel_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.guild_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.guild_id]
 type = ["string", "null"]
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.source_message_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.source_message_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.delivered_message_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.delivered_message_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.expected_channel_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.expected_channel_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.actual_channel_id]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.actual_channel_id]
 type = "string"
 
-[provides.operations.send_message.output_schema.properties.delivery.properties.inbound_event.properties.reason]
+[provides.operations."discord.send_message".output_schema.properties.delivery.properties.inbound_event.properties.reason]
 type = "string"
 
-[provides.operations.send_message.network_constraints]
+[provides.operations."discord.send_message".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -231,7 +231,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.send_message.ai_hints]
+[provides.operations."discord.send_message".ai_hints]
 when_to_use = "Send a message to a Discord channel. Use channel_id (numeric snowflake), not channel name."
 common_mistakes = [
     "Using channel name instead of ID.",
@@ -245,7 +245,7 @@ related = ["discord.edit_message", "discord.trigger_typing"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.edit_message]
+[provides.operations."discord.edit_message"]
 description = "Edit an existing message in a Discord channel"
 capability = "discord.edit"
 risk_level = "medium"
@@ -253,45 +253,45 @@ safety_tier = "risky"
 requires_approval = "policy"
 idempotency = "strict"
 
-[provides.operations.edit_message.rate_limit]
+[provides.operations."discord.edit_message".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.edit_message.input_schema]
+[provides.operations."discord.edit_message".input_schema]
 required = ["channel_id", "message_id"]
 type = "object"
 
-[provides.operations.edit_message.input_schema.properties.channel_id]
+[provides.operations."discord.edit_message".input_schema.properties.channel_id]
 description = "Discord channel ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.edit_message.input_schema.properties.message_id]
+[provides.operations."discord.edit_message".input_schema.properties.message_id]
 description = "Message ID to edit"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.edit_message.input_schema.properties.content]
+[provides.operations."discord.edit_message".input_schema.properties.content]
 description = "New message content"
 type = "string"
 maxLength = 2000
 
-[provides.operations.edit_message.input_schema.properties.embeds]
+[provides.operations."discord.edit_message".input_schema.properties.embeds]
 description = "New embed objects"
 type = "array"
 maxItems = 10
 
-[provides.operations.edit_message.output_schema]
+[provides.operations."discord.edit_message".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.edit_message.output_schema.properties.id]
+[provides.operations."discord.edit_message".output_schema.properties.id]
 type = "string"
 
-[provides.operations.edit_message.output_schema.properties.content]
+[provides.operations."discord.edit_message".output_schema.properties.content]
 type = "string"
 
-[provides.operations.edit_message.network_constraints]
+[provides.operations."discord.edit_message".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -309,7 +309,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.edit_message.ai_hints]
+[provides.operations."discord.edit_message".ai_hints]
 when_to_use = "Edit an existing Discord message. Only the bot can edit its own messages."
 common_mistakes = [
     "Trying to edit messages from other users.",
@@ -319,7 +319,7 @@ related = ["discord.send_message"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.delete_message]
+[provides.operations."discord.delete_message"]
 description = "Delete a message from a Discord channel (irreversible)"
 capability = "discord.delete"
 risk_level = "high"
@@ -327,32 +327,32 @@ safety_tier = "dangerous"
 requires_approval = "interactive"
 idempotency = "strict"
 
-[provides.operations.delete_message.rate_limit]
+[provides.operations."discord.delete_message".rate_limit]
 max = 30
 per_ms = 60000
 
-[provides.operations.delete_message.input_schema]
+[provides.operations."discord.delete_message".input_schema]
 required = ["channel_id", "message_id"]
 type = "object"
 
-[provides.operations.delete_message.input_schema.properties.channel_id]
+[provides.operations."discord.delete_message".input_schema.properties.channel_id]
 description = "Discord channel ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.delete_message.input_schema.properties.message_id]
+[provides.operations."discord.delete_message".input_schema.properties.message_id]
 description = "Message ID to delete"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.delete_message.output_schema]
+[provides.operations."discord.delete_message".output_schema]
 required = ["deleted"]
 type = "object"
 
-[provides.operations.delete_message.output_schema.properties.deleted]
+[provides.operations."discord.delete_message".output_schema.properties.deleted]
 type = "boolean"
 
-[provides.operations.delete_message.network_constraints]
+[provides.operations."discord.delete_message".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -370,7 +370,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.delete_message.ai_hints]
+[provides.operations."discord.delete_message".ai_hints]
 when_to_use = "Delete a Discord message. This is irreversible - use with caution."
 common_mistakes = [
     "Deleting important messages without confirmation.",
@@ -380,7 +380,7 @@ related = []
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.get_channel]
+[provides.operations."discord.get_channel"]
 description = "Get information about a Discord channel"
 capability = "discord.read"
 risk_level = "low"
@@ -388,34 +388,34 @@ safety_tier = "safe"
 requires_approval = "none"
 idempotency = "strict"
 
-[provides.operations.get_channel.rate_limit]
+[provides.operations."discord.get_channel".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.get_channel.input_schema]
+[provides.operations."discord.get_channel".input_schema]
 required = ["channel_id"]
 type = "object"
 
-[provides.operations.get_channel.input_schema.properties.channel_id]
+[provides.operations."discord.get_channel".input_schema.properties.channel_id]
 description = "Discord channel ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.get_channel.output_schema]
+[provides.operations."discord.get_channel".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.get_channel.output_schema.properties.id]
+[provides.operations."discord.get_channel".output_schema.properties.id]
 type = "string"
 
-[provides.operations.get_channel.output_schema.properties.name]
+[provides.operations."discord.get_channel".output_schema.properties.name]
 type = "string"
 
-[provides.operations.get_channel.output_schema.properties.type]
+[provides.operations."discord.get_channel".output_schema.properties.type]
 description = "Channel type (0=text, 2=voice, 4=category, etc.)"
 type = "integer"
 
-[provides.operations.get_channel.network_constraints]
+[provides.operations."discord.get_channel".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -433,7 +433,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.get_channel.ai_hints]
+[provides.operations."discord.get_channel".ai_hints]
 when_to_use = "Get metadata about a Discord channel."
 common_mistakes = [
     "Using channel name or URL fragment instead of the numeric snowflake ID.",
@@ -444,7 +444,7 @@ related = ["discord.get_guild"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.get_guild]
+[provides.operations."discord.get_guild"]
 description = "Get information about a Discord server (guild)"
 capability = "discord.read"
 risk_level = "low"
@@ -452,36 +452,36 @@ safety_tier = "safe"
 requires_approval = "none"
 idempotency = "strict"
 
-[provides.operations.get_guild.rate_limit]
+[provides.operations."discord.get_guild".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.get_guild.input_schema]
+[provides.operations."discord.get_guild".input_schema]
 required = ["guild_id"]
 type = "object"
 
-[provides.operations.get_guild.input_schema.properties.guild_id]
+[provides.operations."discord.get_guild".input_schema.properties.guild_id]
 description = "Discord guild/server ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.get_guild.output_schema]
+[provides.operations."discord.get_guild".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.get_guild.output_schema.properties.id]
+[provides.operations."discord.get_guild".output_schema.properties.id]
 type = "string"
 
-[provides.operations.get_guild.output_schema.properties.name]
+[provides.operations."discord.get_guild".output_schema.properties.name]
 type = "string"
 
-[provides.operations.get_guild.output_schema.properties.icon]
+[provides.operations."discord.get_guild".output_schema.properties.icon]
 type = "string"
 
-[provides.operations.get_guild.output_schema.properties.owner_id]
+[provides.operations."discord.get_guild".output_schema.properties.owner_id]
 type = "string"
 
-[provides.operations.get_guild.network_constraints]
+[provides.operations."discord.get_guild".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -499,7 +499,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.get_guild.ai_hints]
+[provides.operations."discord.get_guild".ai_hints]
 when_to_use = "Get metadata about a Discord server/guild."
 common_mistakes = [
     "Using server name instead of guild ID.",
@@ -509,7 +509,7 @@ related = ["discord.get_channel"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.trigger_typing]
+[provides.operations."discord.trigger_typing"]
 description = "Show typing indicator in a Discord channel (lasts 10 seconds)"
 capability = "discord.send"
 risk_level = "low"
@@ -517,27 +517,27 @@ safety_tier = "safe"
 requires_approval = "none"
 idempotency = "none"
 
-[provides.operations.trigger_typing.rate_limit]
+[provides.operations."discord.trigger_typing".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.trigger_typing.input_schema]
+[provides.operations."discord.trigger_typing".input_schema]
 required = ["channel_id"]
 type = "object"
 
-[provides.operations.trigger_typing.input_schema.properties.channel_id]
+[provides.operations."discord.trigger_typing".input_schema.properties.channel_id]
 description = "Discord channel ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.trigger_typing.output_schema]
+[provides.operations."discord.trigger_typing".output_schema]
 required = ["triggered"]
 type = "object"
 
-[provides.operations.trigger_typing.output_schema.properties.triggered]
+[provides.operations."discord.trigger_typing".output_schema.properties.triggered]
 type = "boolean"
 
-[provides.operations.trigger_typing.network_constraints]
+[provides.operations."discord.trigger_typing".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -555,7 +555,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.trigger_typing.ai_hints]
+[provides.operations."discord.trigger_typing".ai_hints]
 when_to_use = "Show typing indicator before sending a message. Lasts 10 seconds or until a message is sent."
 common_mistakes = [
     "Calling trigger_typing after sending a message — the indicator is automatically cleared on send.",
@@ -566,7 +566,7 @@ related = ["discord.send_message"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.add_reaction]
+[provides.operations."discord.add_reaction"]
 description = "Add a reaction emoji to a Discord message"
 capability = "discord.react"
 risk_level = "low"
@@ -574,36 +574,36 @@ safety_tier = "safe"
 requires_approval = "none"
 idempotency = "strict"
 
-[provides.operations.add_reaction.rate_limit]
+[provides.operations."discord.add_reaction".rate_limit]
 max = 50
 per_ms = 60000
 
-[provides.operations.add_reaction.input_schema]
+[provides.operations."discord.add_reaction".input_schema]
 required = ["channel_id", "message_id", "emoji"]
 type = "object"
 
-[provides.operations.add_reaction.input_schema.properties.channel_id]
+[provides.operations."discord.add_reaction".input_schema.properties.channel_id]
 description = "Discord channel ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.add_reaction.input_schema.properties.message_id]
+[provides.operations."discord.add_reaction".input_schema.properties.message_id]
 description = "Message ID to react to"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.add_reaction.input_schema.properties.emoji]
+[provides.operations."discord.add_reaction".input_schema.properties.emoji]
 description = "Emoji to add (Unicode character or custom format name:id)"
 type = "string"
 
-[provides.operations.add_reaction.output_schema]
+[provides.operations."discord.add_reaction".output_schema]
 required = ["added"]
 type = "object"
 
-[provides.operations.add_reaction.output_schema.properties.added]
+[provides.operations."discord.add_reaction".output_schema.properties.added]
 type = "boolean"
 
-[provides.operations.add_reaction.network_constraints]
+[provides.operations."discord.add_reaction".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -621,7 +621,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.add_reaction.ai_hints]
+[provides.operations."discord.add_reaction".ai_hints]
 when_to_use = "Add an emoji reaction to an existing message."
 common_mistakes = [
     "Using emoji name instead of Unicode character for standard emoji.",
@@ -631,7 +631,7 @@ related = ["discord.send_message"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.list_channels]
+[provides.operations."discord.list_channels"]
 description = "List all channels in a Discord server (guild)"
 capability = "discord.read"
 risk_level = "low"
@@ -639,31 +639,31 @@ safety_tier = "safe"
 requires_approval = "none"
 idempotency = "strict"
 
-[provides.operations.list_channels.rate_limit]
+[provides.operations."discord.list_channels".rate_limit]
 max = 100
 per_ms = 60000
 
-[provides.operations.list_channels.input_schema]
+[provides.operations."discord.list_channels".input_schema]
 required = ["guild_id"]
 type = "object"
 
-[provides.operations.list_channels.input_schema.properties.guild_id]
+[provides.operations."discord.list_channels".input_schema.properties.guild_id]
 description = "Discord guild/server ID"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.list_channels.output_schema]
+[provides.operations."discord.list_channels".output_schema]
 required = ["channels"]
 type = "object"
 
-[provides.operations.list_channels.output_schema.properties.channels]
+[provides.operations."discord.list_channels".output_schema.properties.channels]
 description = "Array of channel objects"
 type = "array"
 
-[provides.operations.list_channels.output_schema.properties.channels.items]
+[provides.operations."discord.list_channels".output_schema.properties.channels.items]
 type = "object"
 
-[provides.operations.list_channels.network_constraints]
+[provides.operations."discord.list_channels".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -681,7 +681,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.list_channels.ai_hints]
+[provides.operations."discord.list_channels".ai_hints]
 when_to_use = "List all channels in a guild/server."
 common_mistakes = [
     "Using server name instead of guild ID.",
@@ -691,7 +691,7 @@ related = ["discord.get_guild", "discord.get_channel"]
 
 # -----------------------------------------------------------------------------
 
-[provides.operations.create_thread]
+[provides.operations."discord.create_thread"]
 description = "Create a thread from an existing Discord message"
 capability = "discord.threads"
 risk_level = "medium"
@@ -699,50 +699,50 @@ safety_tier = "risky"
 requires_approval = "policy"
 idempotency = "none"
 
-[provides.operations.create_thread.rate_limit]
+[provides.operations."discord.create_thread".rate_limit]
 max = 30
 per_ms = 60000
 
-[provides.operations.create_thread.input_schema]
+[provides.operations."discord.create_thread".input_schema]
 required = ["channel_id", "message_id", "name"]
 type = "object"
 
-[provides.operations.create_thread.input_schema.properties.channel_id]
+[provides.operations."discord.create_thread".input_schema.properties.channel_id]
 description = "Channel ID containing the message"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.create_thread.input_schema.properties.message_id]
+[provides.operations."discord.create_thread".input_schema.properties.message_id]
 description = "Message ID to create thread from"
 type = "string"
 pattern = "^[0-9]+$"
 
-[provides.operations.create_thread.input_schema.properties.name]
+[provides.operations."discord.create_thread".input_schema.properties.name]
 description = "Thread name (1-100 characters)"
 type = "string"
 minLength = 1
 maxLength = 100
 
-[provides.operations.create_thread.input_schema.properties.auto_archive_duration]
+[provides.operations."discord.create_thread".input_schema.properties.auto_archive_duration]
 description = "Minutes before auto-archiving (60, 1440, 4320, 10080)"
 type = "integer"
 enum = [60, 1440, 4320, 10080]
 
-[provides.operations.create_thread.output_schema]
+[provides.operations."discord.create_thread".output_schema]
 required = ["id"]
 type = "object"
 
-[provides.operations.create_thread.output_schema.properties.id]
+[provides.operations."discord.create_thread".output_schema.properties.id]
 type = "string"
 
-[provides.operations.create_thread.output_schema.properties.name]
+[provides.operations."discord.create_thread".output_schema.properties.name]
 type = "string"
 
-[provides.operations.create_thread.output_schema.properties.type]
+[provides.operations."discord.create_thread".output_schema.properties.type]
 description = "Channel type (11=public thread, 12=private thread)"
 type = "integer"
 
-[provides.operations.create_thread.network_constraints]
+[provides.operations."discord.create_thread".network_constraints]
 host_allow = ["discord.com", "*.discord.com"]
 port_allow = [443]
 ip_allow = []
@@ -760,7 +760,7 @@ connect_timeout_ms = 10000
 total_timeout_ms = 30000
 max_response_bytes = 1048576
 
-[provides.operations.create_thread.ai_hints]
+[provides.operations."discord.create_thread".ai_hints]
 when_to_use = "Create a new thread from an existing message."
 common_mistakes = [
     "Thread names exceeding 100 characters.",
@@ -1045,3 +1045,12 @@ burst = 5
 scope = "instance"
 
 [rate_limits.operation_pools]
+"discord.send_message" = ["discord.send"]
+"discord.edit_message" = ["discord.edit"]
+"discord.delete_message" = ["discord.delete"]
+"discord.get_channel" = ["discord.read"]
+"discord.get_guild" = ["discord.read"]
+"discord.trigger_typing" = ["discord.send"]
+"discord.add_reaction" = ["discord.react"]
+"discord.list_channels" = ["discord.read"]
+"discord.create_thread" = ["discord.threads"]

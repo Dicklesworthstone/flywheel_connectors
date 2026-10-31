@@ -128,8 +128,14 @@ impl FcpConnector for DiscordConnectorAdapter {
                     examples: vec![r#"{"channel_id":"123456789","content":"Hello!"}"#.to_string()],
                     related: Vec::new(),
                 },
-                rate_limit: None,
-                requires_approval: None,
+                rate_limit: Some(fcp_core::RateLimit {
+                    max: 50,
+                    per_ms: 60_000,
+                    burst: None,
+                    scope: None,
+                    pool_name: None,
+                }),
+                requires_approval: Some(fcp_core::ApprovalMode::Policy),
             }],
             events: Vec::new(),
             resource_types: Vec::new(),
@@ -494,14 +500,17 @@ async fn discord_allow_valid_token_connector_suite_passes() {
 fn discord_manifest_network_guard_allows_and_denies() {
     let manifest = discord_manifest_toml();
 
-    // Manifest operation names (without discord. prefix)
+    // Use the exact runtime IDs the host uses to select operation policy.
     let operations = [
-        "send_message",
-        "edit_message",
-        "delete_message",
-        "get_channel",
-        "get_guild",
-        "trigger_typing",
+        "discord.send_message",
+        "discord.edit_message",
+        "discord.delete_message",
+        "discord.get_channel",
+        "discord.get_guild",
+        "discord.trigger_typing",
+        "discord.add_reaction",
+        "discord.list_channels",
+        "discord.create_thread",
     ];
 
     for operation_name in operations {
