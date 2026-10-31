@@ -1,6 +1,6 @@
 # Discord Connector V3 Contract
 
-> **Status**: runtime contract documented with known manifest/introspection drift
+> **Status**: native acknowledged Gateway delivery with durable consumed checkpoints; remaining REST metadata gaps are listed below
 > **Bead**: `flywheel_connectors-6n7.19`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -40,13 +40,15 @@ Important runtime truths the contract preserves:
 - The connector requires the Gateway intent bits for `GUILDS`, `GUILD_MESSAGES`, `DIRECT_MESSAGES`, and `MESSAGE_CONTENT`.
 - Configure validates the REST and Gateway endpoint hosts before request construction.
 - Configure makes a live `GET /users/@me` probe and requires the credential to authenticate as a bot user.
-- Handshake requires `zone_dir`; the connector stores Gateway resume state in `discord_gateway_state.json` and a singleton-writer lease in `discord_gateway_lease.json`.
+- Handshake requires `zone_dir`; the connector stores Gateway resume state in `discord_gateway_state.json` and a singleton-writer lease in `discord_gateway_lease.json`. Handshake establishes authority but does not open the Gateway.
 - Gateway lease TTL is `120 seconds`; the connector renews it every `30 seconds`.
 - Handshake installs a bound `CapabilityVerifier`.
 - `invoke` verifies bound capability tokens against the requested operation and resource URIs such as `discord:channel:<id>` and `discord:guild:<id>`.
 - `simulate` is stricter than legacy connectors: it checks readiness, operation support, input validation, and bound capability verification.
 - `health`, `doctor`, and `self_check` call Discord when configured, so invalid or revoked bot credentials surface through diagnostics.
-- `subscribe` currently confirms requested topics and reports no replay support; event delivery comes from the Gateway task once handshake has started streaming.
+- `subscribe` starts the Gateway only after validating a signed, instance-bound token for `discord.read`, operation `discord.subscribe`, and resource `discord:events:<topic>`. One exact declared topic is selected per native stream.
+- The production JSONL loop writes native events and processes consumer acknowledgements concurrently with RPC responses. A local diagnostic listener cannot advance the Gateway checkpoint.
+- Heartbeats report the last received provider sequence. The durable resume checkpoint advances only after ordered consumption, including explicit inbound-policy filtering; receiving or printing an event does not count as consuming it.
 
 ## Known Contract Gaps
 
@@ -54,13 +56,46 @@ The runtime, manifest, and introspection metadata are not fully aligned in this 
 
 - `manifest.toml` declares operation tables as `send_message`, `edit_message`, and similar unprefixed names, while runtime introspection and invocation use fully qualified IDs such as `discord.send_message`.
 - `manifest.toml` marks `send_message`, `edit_message`, and `create_thread` as policy-approved and `delete_message` as interactive, but runtime `OperationInfo` currently sets `requires_approval` to `None` for every operation.
-- `manifest.toml` declares event topics including `discord.message_update`, `discord.message_delete`, `discord.typing`, `discord.guild_create`, and `discord.ready`; runtime introspection advertises only `discord.message`.
-- The Gateway event mapper can emit additional `discord.*` topics, including update/delete/guild/channel/interaction variants, but the formal introspection event list has not caught up.
-- `subscribe` does not validate requested topic names against the introspection or manifest event catalogs.
 - Runtime allows loopback endpoints for deterministic tests in debug/test builds, while the manifest network constraints remain production-strict.
-- `manifest.toml` now describes `discord.send_message` delivery-control fields and `discord.message` `fcp_delivery` metadata, but the broader manifest/introspection drift above still remains.
 
-Operators should treat this README as the current truthfulness snapshot. A follow-up should align manifest operation IDs, approval metadata, event introspection, and subscription validation before this connector is described as fully contract-aligned.
+The native event catalog and subscription authorities are declared in the manifest and runtime. REST operation IDs and approval metadata still need alignment before this connector is described as fully contract-aligned.
+
+## Native Gateway Delivery
+
+The host must attach a native event transport and complete configure and handshake before subscribing. A subscription must carry a valid capability token bound to the connector's actual instance and negotiated zone. Tokens must grant `discord.read`, operation `discord.subscribe`, and the exact event resource, such as `discord:events:discord.events`. Missing tokens, undeclared topics, multi-topic requests, unsupported replay seeks, and unavailable native transports fail closed.
+
+The supported topics are:
+
+| Topic | Payload |
+|---|---|
+| `discord.events` | Aggregate `{ "source_topic": "discord.message", "event": { ... } }` feed of the declared topics below |
+| `discord.message` | Created message, after inbound-policy authorization, with stable `fcp_delivery` correlation |
+| `discord.message_update` | Edited message |
+| `discord.message_delete` | Deleted message |
+| `discord.typing` | Typing notification |
+| `discord.guild_create` | Available or newly joined guild |
+| `discord.guild_update` | Updated guild |
+| `discord.channel_create` | Available or newly created channel |
+| `discord.channel_update` | Updated channel |
+| `discord.ready` | Initial session readiness, without the provider session ID or resume URL |
+| `discord.resumed` | Confirmation of a resumed provider session |
+| `discord.interaction_create` | Inbound interaction, without its provider response token |
+
+Every native event requires acknowledgement. Its cursor combines an opaque digest of the provider session ID with the provider sequence, so replay within a resumed session has the same cursor while a new session cannot collide with an old one. Envelopes identify `fcp.discord`, the actual connector instance, and the negotiated zone. Unknown provider dispatch kinds are intentionally filtered instead of creating undeclared topics.
+
+The Gateway reader continues processing heartbeats while downstream consumption is pending. Its dispatch queue is bounded by both event count and bytes; overflow or a disconnected consumer cannot move the durable checkpoint beyond unconsumed work. A checkpoint is written only after the exact native acknowledgement. Deliberately filtered events can advance the checkpoint only in order under the active subscription authority. Authority expiry, stream closure, reconfiguration, failed handshake, and shutdown stop delivery without acknowledging pending events.
+
+`replay = false` means the subscription does not implement arbitrary history seeks. Discord may replay buffered dispatches when the connector resumes the same provider session. That provider buffer is finite; durable local checkpoints do not create an independent archive of Discord events.
+
+## Checkpoint State And Recovery
+
+State schema version 2 binds the consumed checkpoint to its credential/configuration, Gateway intents and shard, inbound policy, subscribed topic, and zone. A stable OS sidecar lock serializes checkpoint writes with lease acquisition, renewal, and release. Each write revalidates the lease holder and fencing generation; stale connections and previous lease holders cannot commit. Writes use private temporary files, file synchronization, atomic replacement, and parent-directory synchronization. Releasing a lease preserves its fencing generation rather than removing the lease history.
+
+The initial READY records a provisional session identity without a consumed sequence. If the connector stops before that first event is acknowledged, restart reports recovery required instead of silently starting a different session. Provider invalidation of an existing resume session also records a recovery marker and stops automatic reconnects.
+
+The earlier checkpoint format recorded receipt rather than consumption. A populated legacy checkpoint is therefore rejected with an explicit migration error; it is never silently upgraded into evidence that its events were consumed. A checkpoint for a different subscription scope is rejected for the same reason.
+
+For migration or a deliberate scope change, stop the old connector, retain its state directory for investigation and any application-level recovery, and use a fresh host-assigned `zone_dir` when intentionally beginning a new Gateway session. Starting a new session does not recover historical events. Reuse a version 2 directory only with the same subscription scope when resuming its consumed checkpoint.
 
 ## First-Slice Scope
 
@@ -92,7 +127,7 @@ The current Discord README slice documents the existing runtime surface:
   - `discord.send` gates message send and typing indicator operations.
   - `discord.edit` gates message edits.
   - `discord.delete` gates message deletion.
-  - `discord.read` gates channel, guild, and guild-channel reads.
+  - `discord.read` gates channel, guild, and guild-channel reads, plus signed native Gateway subscriptions.
   - `discord.react` gates adding reactions.
   - `discord.threads` gates thread creation.
 - The connector persists Gateway resume and lease state under the handshake `zone_dir`.
@@ -111,7 +146,8 @@ The current Discord README slice documents the existing runtime surface:
 - Manifest network policy denies localhost, private ranges, tailnet ranges, and IP literals for live operations.
 - Runtime request timeout defaults to `30 seconds`.
 - Manifest network constraints set `10_000 ms` connect timeout and `30_000 ms` total timeout.
-- Maximum manifest response bytes are `1_048_576` for REST operations and `65_536` for Gateway events.
+- Manifest REST response limits are `1_048_576` bytes. Gateway frame and queue bounds are enforced by the Gateway reader; the native JSONL transport separately caps each event envelope at `262_144` bytes.
+- Gateway endpoints are validated by the connector's WebSocket policy. The manifest uses the supported event authority declarations; it contains no unsupported `provides.streaming` table that would prevent host loading.
 - Sandbox profile is `strict`, with `256 MB` memory, `50%` CPU, `120_000 ms` wall-clock timeout, no exec, and no ptrace.
 - The connector does not open network listeners.
 
@@ -186,7 +222,7 @@ The current implementation does not include:
 - bulk delete, pin/unpin, crosspost, webhooks, polls, scheduled events, invites, roles, members, bans, moderation, or guild administration
 - voice, presence management, rich presence, activities, or stage channels
 - direct REST APIs for channel creation/update/delete, guild creation/update/delete, or thread listing
-- replayable event subscriptions
+- arbitrary historical event seeks or an independent provider-event archive
 - provider-local credential vaulting
 
 These are excluded on purpose:
@@ -207,8 +243,8 @@ These are excluded on purpose:
 - redacted inbound policy status
 - known operation metadata, schemas, capability IDs, risk levels, safety tiers, idempotency, and AI hints
 - bound capability-token simulation results
-- streaming capability with replay disabled
-- Gateway lease and resume-state teardown on shutdown
+- signed native streaming with consumer acknowledgements and arbitrary replay seeks disabled
+- bounded Gateway shutdown that releases the lease while preserving the consumed resume checkpoint
 
 The deterministic integration evidence is anchored on connector-local tests covering:
 
@@ -218,7 +254,7 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - bound capability-token verification and denial cases
 - input validation for snowflake IDs, message length, embed count, embed character totals, delivery controls, and thread-name bounds
 - endpoint URL policy rejection for userinfo, query strings, fragments, bad schemes, public plaintext, and non-Discord hosts
-- Gateway state files, lease fencing, inbound-policy filtering, event envelope mapping, loopback Gateway behavior, and inbound delivery retention through hidden progress, target mismatch, visible 5xx, final success, and shutdown
+- Gateway consumed checkpoints, lease fencing, inbound-policy filtering, native event mapping, heartbeat progress during pending consumption, replay across connector restarts, and inbound delivery retention through hidden progress, target mismatch, visible 5xx, final success, and shutdown
 
 ## Source Notes
 

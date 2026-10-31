@@ -592,7 +592,7 @@ async fn handshake_discord(connector: &mut DiscordConnector, caps: &[&str]) -> B
     let signing_key = Ed25519SigningKey::generate();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "zone_dir": unique_zone_dir("discord"),
             "host_public_key": signing_key.verifying_key().to_bytes(),

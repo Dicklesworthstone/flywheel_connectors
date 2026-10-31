@@ -3,9 +3,9 @@ format = "fcp-connector-manifest"
 schema_version = "2.1"
 min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
-protocol_features = []
+protocol_features = ["streaming"]
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:e86a7f98ef2d1c08b20bed0feefd475f3f04027016a08ec6cb5aaa3929f8d114"
+interface_hash = "blake3-256:fcp.interface.v2:ecd10a5d0dff854137a581ba30a0f5ace71786e9df8fd35cf0127568426f95c8"
 
 [connector]
 id = "fcp.discord"
@@ -21,8 +21,8 @@ format = "native"
 
 [connector.state]
 model = "singleton_writer"
-state_schema_version = "1"
-migration_hint = "Persists gateway session_id/sequence resume state in zone_dir and enforces singleton-writer gateway lease fencing."
+state_schema_version = "2"
+migration_hint = "Persists only consumed Gateway sequences in scope-bound v2 checkpoints with OS-locked lease fencing. Populated legacy received-sequence checkpoints require explicit recovery before starting a fresh session."
 
 [zones]
 home = "z:work"
@@ -772,10 +772,36 @@ related = ["discord.send_message"]
 # Events
 # -----------------------------------------------------------------------------
 
+[provides.events.events]
+description = "Acknowledged feed of declared Discord Gateway events after inbound-policy authorization"
+topic = "discord.events"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.events"
+
+[provides.events.events.schema]
+type = "object"
+additionalProperties = false
+required = ["source_topic", "event"]
+
+[provides.events.events.schema.properties.source_topic]
+type = "string"
+
+[provides.events.events.schema.properties.event]
+type = "object"
+
 [provides.events.message]
 description = "Discord message created in a channel"
 topic = "discord.message"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.message"
 
 [provides.events.message.schema]
 type = "object"
@@ -823,7 +849,12 @@ enum = ["pending_until_outbound_delivery"]
 [provides.events.message_update]
 description = "Discord message was edited"
 topic = "discord.message_update"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.message_update"
 
 [provides.events.message_update.schema]
 type = "object"
@@ -831,7 +862,12 @@ type = "object"
 [provides.events.message_delete]
 description = "Discord message was deleted"
 topic = "discord.message_delete"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.message_delete"
 
 [provides.events.message_delete.schema]
 type = "object"
@@ -839,7 +875,12 @@ type = "object"
 [provides.events.typing]
 description = "User started typing in a channel"
 topic = "discord.typing"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.typing"
 
 [provides.events.typing.schema]
 type = "object"
@@ -847,46 +888,98 @@ type = "object"
 [provides.events.guild_create]
 description = "Bot joined a guild or guild became available"
 topic = "discord.guild_create"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.guild_create"
 
 [provides.events.guild_create.schema]
 type = "object"
 
+[provides.events.guild_update]
+description = "Guild metadata changed"
+topic = "discord.guild_update"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.guild_update"
+
+[provides.events.guild_update.schema]
+type = "object"
+
+[provides.events.channel_create]
+description = "Channel became available to the bot"
+topic = "discord.channel_create"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.channel_create"
+
+[provides.events.channel_create.schema]
+type = "object"
+
+[provides.events.channel_update]
+description = "Channel metadata changed"
+topic = "discord.channel_update"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.channel_update"
+
+[provides.events.channel_update.schema]
+type = "object"
+
 [provides.events.ready]
-description = "Gateway connection ready"
+description = "Gateway connection ready, with provider resume credentials removed"
 topic = "discord.ready"
-requires_ack = false
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.ready"
 
 [provides.events.ready.schema]
 type = "object"
 
-# -----------------------------------------------------------------------------
-# Gateway (streaming)
-# -----------------------------------------------------------------------------
+[provides.events.resumed]
+description = "Gateway session resumed from its consumed checkpoint"
+topic = "discord.resumed"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.resumed"
 
-[provides.streaming]
-gateway_host = "gateway.discord.gg"
-protocol = "wss"
-heartbeat_interval_ms = 41250
-reconnect_policy = "exponential_backoff"
+[provides.events.resumed.schema]
+type = "object"
 
-[provides.streaming.network_constraints]
-host_allow = ["gateway.discord.gg", "*.discord.gg"]
-port_allow = [443]
-ip_allow = []
-cidr_deny = []
-deny_localhost = true
-deny_private_ranges = true
-deny_tailnet_ranges = true
-require_sni = true
-spki_pins = []
-deny_ip_literals = true
-require_host_canonicalization = true
-dns_max_ips = 16
-max_redirects = 0
-connect_timeout_ms = 30000
-total_timeout_ms = 0
-max_response_bytes = 0
+[provides.events.interaction_create]
+description = "Discord interaction received, with the provider response token removed"
+topic = "discord.interaction_create"
+streaming = true
+replay = false
+requires_ack = true
+capability = "discord.read"
+subscribe_operation = "discord.subscribe"
+resource_uri = "discord:events:discord.interaction_create"
+
+[provides.events.interaction_create.schema]
+type = "object"
+
+[event_caps]
+streaming = true
+replay = false
+min_buffer_events = 1
 
 # -----------------------------------------------------------------------------
 # Sandbox

@@ -6,25 +6,30 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fcp_async_core::channel::{broadcast, watch};
+use fcp_core::{HealthSnapshot, HealthState, SubscribeRequest, SubscribeResponse, SubscribeResult};
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier, ConnectorId,
-    EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, IdempotencyClass, InstanceId, Introspection, OperationId, OperationInfo,
-    Principal, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
+    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
+    ConnectorId, EventCaps, EventData, EventEnvelope, EventInfo, FcpError, FcpResult,
+    HandshakeRequest, HandshakeResponse, IdempotencyClass, InstanceId, Introspection, OperationId,
+    OperationInfo, Principal, RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest,
     SimulateResponse, ThreadInfo, TrustLevel, ZoneId,
 };
+use fcp_sdk::prelude::JsonlEventStream;
 use fcp_sdk::{
     AgentId, ChannelId, ChatCoordinationAuditRecord, ChatCoordinationBackend,
     ChatCoordinationConfig, ChatCoordinationSendDecision, ChatCoordinationSendRequest, DmMode,
     InMemoryThreadOwnershipChecker, Limits, ThreadId, ThreadOwnershipChecker,
     runtime::{
         InMemoryStreamingSession, StreamingConnection, StreamingError, StreamingSupervisor,
-        SupervisorConfig,
+        SupervisorConfig, SupervisorOutcome,
     },
     validate_input_with_limits, validate_output_with_limits,
 };
@@ -37,7 +42,10 @@ use url::Url;
 use crate::{
     api::DiscordApiClient,
     config::DiscordConfig,
-    gateway::{DISCORD_GATEWAY_STATE_FILE, GatewayConnection, GatewayEvent, GatewayEventFrame},
+    gateway::{
+        DISCORD_GATEWAY_STATE_FILE, GatewayCheckpoint, GatewayConnection, GatewayEvent,
+        GatewayEventFrame, lock_gateway_lease,
+    },
     limits::{
         EMBED_DESCRIPTION_MAX_CHARS, EMBED_TITLE_MAX_CHARS, EMBED_TOTAL_MAX_CHARS,
         EMBEDS_MAX_COUNT, MESSAGE_CONTENT_MAX_CHARS, THREAD_NAME_MAX_CHARS,
@@ -53,6 +61,13 @@ pub struct DiscordConnector {
     gateway: Option<Arc<GatewayConnection>>,
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
+    configured_zone: Option<ZoneId>,
+    granted_capabilities: BTreeSet<CapabilityId>,
+    event_stream: Option<JsonlEventStream>,
+    event_subscription: Option<Arc<DiscordNativeSubscription>>,
+    native_stream_identity: Option<(String, String)>,
+    next_event_seq: Arc<AtomicU64>,
+    gateway_failure: Arc<Mutex<Option<String>>>,
     zone_dir: Option<PathBuf>,
     bot_user_id: Option<String>,
     inbound_policy: DiscordInboundPolicy,
@@ -86,6 +101,121 @@ const DISCORD_INBOUND_POLICY_ID_MAX_CHARS: usize = 128;
 const DISCORD_DELIVERY_LABEL_MAX_CHARS: usize = 96;
 const DISCORD_INBOUND_DELIVERY_MAX_PENDING: usize = 1024;
 const DISCORD_INBOUND_DELIVERY_SESSION_KEY_MAX_CHARS: usize = 192;
+const DISCORD_NATIVE_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const DISCORD_NATIVE_EVENT_TOPIC: &str = "discord.events";
+const DISCORD_NATIVE_TOPICS: [&str; 11] = [
+    "discord.message",
+    "discord.message_update",
+    "discord.message_delete",
+    "discord.typing",
+    "discord.guild_create",
+    "discord.guild_update",
+    "discord.channel_create",
+    "discord.channel_update",
+    "discord.ready",
+    "discord.resumed",
+    "discord.interaction_create",
+];
+
+struct DiscordNativeSubscription {
+    stream: JsonlEventStream,
+    stream_id: String,
+    topic: String,
+    token: Mutex<CapabilityToken>,
+    verifier: CapabilityVerifier,
+}
+
+impl DiscordNativeSubscription {
+    fn verify_authority(&self) -> FcpResult<()> {
+        let token = self
+            .token
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Discord event authority state poisoned".into(),
+            })?
+            .clone();
+        let verified = self.verifier.verify_bound(
+            token,
+            &CapabilityId::from_static("discord.read"),
+            &OperationId::from_static("discord.subscribe"),
+            &[format!("discord:events:{}", self.topic)],
+        )?;
+        let expiration =
+            verified
+                .claims()
+                .get_expiration()
+                .ok_or_else(|| FcpError::MissingField {
+                    field: "capability_token.exp".into(),
+                })?;
+        if chrono::Utc::now().timestamp() >= expiration {
+            return Err(FcpError::TokenExpired);
+        }
+        Ok(())
+    }
+
+    fn require_active(&self) -> FcpResult<()> {
+        self.verify_authority()?;
+        if !self.stream.is_open() {
+            return Err(discord_stream_unavailable(
+                "Discord native event stream is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn deliver(&self, mut event: EventEnvelope) -> FcpResult<bool> {
+        self.require_active()?;
+        if self.topic == DISCORD_NATIVE_EVENT_TOPIC {
+            event.data.payload = json!({"source_topic": event.topic, "event": event.data.payload});
+            event.topic.clone_from(&self.topic);
+        } else if event.topic != self.topic {
+            return Ok(false);
+        }
+        event.data.zone_id = self.verifier.zone_id.clone();
+        event.requires_ack = true;
+        let mut pending = self.stream.deliver(&event)?;
+        let acknowledged = fcp_async_core::time::timeout(DISCORD_NATIVE_ACK_TIMEOUT, async {
+            loop {
+                fcp_async_core::select! {
+                    result = &mut pending => return result,
+                    () = fcp_async_core::time::sleep(Duration::from_secs(1)) => self.require_active()?,
+                }
+            }
+        }).await.map_err(|_| discord_stream_unavailable(
+            "Discord downstream acknowledgement timed out; Gateway checkpoint was not advanced",
+        ))?;
+        acknowledged?;
+        self.require_active()?;
+        Ok(true)
+    }
+}
+
+fn discord_stream_unavailable(message: &str) -> FcpError {
+    FcpError::ConnectorUnavailable {
+        code: 5001,
+        message: message.into(),
+    }
+}
+
+fn discord_native_topic(topic: &str) -> bool {
+    topic == DISCORD_NATIVE_EVENT_TOPIC || DISCORD_NATIVE_TOPICS.contains(&topic)
+}
+
+fn discord_native_sequence(sequence: &AtomicU64) -> FcpResult<u64> {
+    sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| discord_stream_unavailable("Discord event sequence exhausted"))
+}
+
+fn record_discord_gateway_failure(state: &Mutex<Option<String>>, message: impl Into<String>) {
+    if let Ok(mut failure) = state.lock()
+        && failure.is_none()
+    {
+        *failure = Some(message.into());
+    }
+}
 
 const REQUIRED_GATEWAY_INTENTS: [(&str, u64); 4] = [
     ("GUILDS", INTENT_GUILDS),
@@ -219,8 +349,22 @@ fn write_json_file_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()
 
     let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    fs::write(&tmp_path, payload)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp_path)?;
+    io::Write::write_all(&mut file, &payload)?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -255,7 +399,22 @@ struct DiscordGatewayLease {
 }
 
 impl DiscordGatewayLease {
+    fn lock(path: &Path) -> FcpResult<fs::File> {
+        lock_gateway_lease(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                FcpError::Conflict {
+                    message: "Discord Gateway lease is being updated".into(),
+                }
+            } else {
+                FcpError::Internal {
+                    message: format!("Failed to lock Discord Gateway lease: {error}"),
+                }
+            }
+        })
+    }
+
     fn acquire(path: PathBuf, holder_instance_id: String, ttl_seconds: u64) -> FcpResult<Self> {
+        let _lock = Self::lock(&path)?;
         let ttl_seconds = ttl_seconds.max(DISCORD_GATEWAY_LEASE_RENEW_INTERVAL_SECONDS);
         let now = current_unix_timestamp_secs();
         let previous =
@@ -281,8 +440,10 @@ impl DiscordGatewayLease {
         }
 
         let lease_seq = previous
-            .map(|record| record.lease_seq.saturating_add(1))
-            .unwrap_or(1);
+            .map_or(Some(1), |record| record.lease_seq.checked_add(1))
+            .ok_or_else(|| FcpError::Conflict {
+                message: "Discord Gateway lease generation exhausted".into(),
+            })?;
 
         let record = DiscordGatewayLeaseRecord {
             holder_instance_id: holder_instance_id.clone(),
@@ -306,6 +467,7 @@ impl DiscordGatewayLease {
     }
 
     fn renew(&self) -> FcpResult<()> {
+        let _lock = Self::lock(&self.path)?;
         let Some(mut record) = read_json_file_if_exists::<DiscordGatewayLeaseRecord>(&self.path)
             .map_err(|err| FcpError::Internal {
                 message: format!(
@@ -321,6 +483,7 @@ impl DiscordGatewayLease {
 
         if record.holder_instance_id != self.holder_instance_id
             || record.lease_seq != self.lease_seq
+            || record.expires_at <= current_unix_timestamp_secs()
         {
             return Err(FcpError::Conflict {
                 message: format!(
@@ -346,6 +509,7 @@ impl DiscordGatewayLease {
     }
 
     fn release(&self) -> FcpResult<()> {
+        let _lock = Self::lock(&self.path)?;
         let existing =
             read_json_file_if_exists::<DiscordGatewayLeaseRecord>(&self.path).map_err(|err| {
                 FcpError::Internal {
@@ -356,18 +520,15 @@ impl DiscordGatewayLease {
                 }
             })?;
 
-        if let Some(record) = existing
+        if let Some(mut record) = existing
             && record.holder_instance_id == self.holder_instance_id
             && record.lease_seq == self.lease_seq
-            && let Err(err) = fs::remove_file(&self.path)
-            && err.kind() != io::ErrorKind::NotFound
         {
-            return Err(FcpError::Internal {
-                message: format!(
-                    "Failed to release Discord gateway lease file '{}': {err}",
-                    self.path.display()
-                ),
-            });
+            record.updated_at = current_unix_timestamp_secs();
+            record.expires_at = 0;
+            write_json_file_atomic(&self.path, &record).map_err(|error| FcpError::Internal {
+                message: format!("Failed to release Discord Gateway lease: {error}"),
+            })?;
         }
 
         Ok(())
@@ -931,6 +1092,13 @@ impl DiscordConnector {
             gateway: None,
             verifier: None,
             session_id: None,
+            configured_zone: None,
+            granted_capabilities: BTreeSet::new(),
+            event_stream: None,
+            event_subscription: None,
+            native_stream_identity: None,
+            next_event_seq: Arc::new(AtomicU64::new(1)),
+            gateway_failure: Arc::new(Mutex::new(None)),
             zone_dir: None,
             bot_user_id: None,
             inbound_policy: DiscordInboundPolicy::default(),
@@ -970,6 +1138,29 @@ impl DiscordConnector {
         self.event_tx.subscribe()
     }
 
+    /// Attach the host's acknowledged native transport once before handshake.
+    pub fn attach_event_stream(&mut self, stream: JsonlEventStream) -> FcpResult<()> {
+        if self.session_id.is_some() || self.event_stream.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Discord event transport must be attached once before handshake".into(),
+            });
+        }
+        self.event_stream = Some(stream);
+        Ok(())
+    }
+
+    fn revoke_session(&mut self) {
+        if let Some(stream) = &self.event_stream {
+            stream.close();
+        }
+        self.event_subscription = None;
+        self.verifier = None;
+        self.session_id = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
+    }
+
     fn manifest_hash() -> String {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
@@ -981,6 +1172,23 @@ impl DiscordConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.revoke_session();
+        self.stop_gateway().await?;
+        self.api_client = None;
+        self.gateway = None;
+        self.config = None;
+        self.bot_user_id = None;
+        self.zone_dir = None;
+        self.configured_zone = None;
+        self.native_stream_identity = None;
+        *self
+            .gateway_failure
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Discord Gateway health state poisoned".into(),
+            })? = None;
+        self.base.set_configured(false);
+        lock_discord_inbound_delivery_state(&self.inbound_delivery_state).clear();
         let inbound_policy = DiscordInboundPolicy::from_config(params.get("inbound_policy"))?;
         let chat_coordination_config = parse_discord_chat_coordination_config(
             params.get("chat_coordination"),
@@ -1066,6 +1274,8 @@ impl DiscordConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.revoke_session();
+        self.stop_gateway().await?;
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
@@ -1075,12 +1285,40 @@ impl DiscordConnector {
         if self.api_client.is_none() {
             return Err(FcpError::NotConfigured);
         }
+        if !matches!(req.protocol_version.as_str(), "2.0" | "2.0.0") {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Discord requires FCP protocol version 2.0".into(),
+            });
+        }
+        if !matches!(req.zone.as_str(), "z:owner" | "z:private" | "z:work") {
+            return Err(FcpError::ZoneViolation {
+                source_zone: req.zone.to_string(),
+                target_zone: "z:work".into(),
+                message: "Discord session zone is not allowed by the manifest".into(),
+            });
+        }
+        if let Some(configured_zone) = &self.configured_zone
+            && configured_zone != &req.zone
+        {
+            return Err(FcpError::ZoneViolation {
+                source_zone: req.zone.to_string(),
+                target_zone: configured_zone.to_string(),
+                message: "Discord zone changes require reconfiguration".into(),
+            });
+        }
 
         let zone_dir = req.zone_dir.clone().ok_or(FcpError::InvalidRequest {
             code: 1003,
             message: "zone_dir is required for Discord gateway resume-state and singleton-writer lease persistence".into(),
         })?;
         let zone_dir = PathBuf::from(zone_dir);
+        if !zone_dir.is_absolute() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Discord zone_dir must be an absolute state directory".into(),
+            });
+        }
         fs::create_dir_all(&zone_dir).map_err(|err| FcpError::Internal {
             message: format!(
                 "Failed to prepare Discord zone_dir '{}': {err}",
@@ -1088,6 +1326,8 @@ impl DiscordConnector {
             ),
         })?;
         self.zone_dir = Some(zone_dir);
+        self.configured_zone = Some(req.zone.clone());
+        self.granted_capabilities = req.capabilities_requested.iter().cloned().collect();
 
         // Set up verifier
         self.verifier = Some(CapabilityVerifier::new(
@@ -1099,8 +1339,7 @@ impl DiscordConnector {
         let session_id = SessionId::new();
         self.session_id = Some(session_id.clone());
 
-        // Connect to gateway
-        self.connect_gateway().await?;
+        // Provider traffic starts only after a signed native subscription.
         self.base.set_handshaken(true);
 
         // Convert capability IDs to grants
@@ -1122,8 +1361,8 @@ impl DiscordConnector {
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
             auth_caps: None,
             op_catalog_hash: None,
@@ -1159,6 +1398,49 @@ impl DiscordConnector {
                 "error": e.to_string()
             })),
         }
+    }
+
+    /// Canonical native health exposes the real instance for bound token issuance.
+    pub async fn handle_native_health(&self) -> FcpResult<Value> {
+        let configured = self.api_client.is_some();
+        let handshaken = self.session_id.is_some();
+        let gateway_failure = self
+            .gateway_failure
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Discord Gateway health state poisoned".into(),
+            })?
+            .clone();
+        let status = if configured && handshaken && gateway_failure.is_some() {
+            HealthState::Degraded {
+                reason: gateway_failure.clone().unwrap_or_default(),
+            }
+        } else if configured && handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "handshake pending".into(),
+            }
+        } else {
+            HealthState::Starting
+        };
+        serde_json::to_value(HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(json!({
+                "configured": configured,
+                "handshaken": handshaken,
+                "instance_id": self.base.instance_id,
+                "zone_id": self.verifier.as_ref().map(|verifier| &verifier.zone_id),
+                "gateway_running": self.gateway_task.as_ref().is_some_and(|task| !task.is_finished()),
+                "gateway_failure": gateway_failure,
+                "event_stream_open": self.event_stream.as_ref().is_some_and(JsonlEventStream::is_open),
+                "event_topic": self.event_subscription.as_ref().map(|subscription| &subscription.topic),
+                "event_ack_timeout_ms": DISCORD_NATIVE_ACK_TIMEOUT.as_millis(),
+            })),
+            rate_limit: None,
+        }).map_err(|_| FcpError::Internal { message: "Failed to serialize Discord native health".into() })
     }
 
     /// Handle doctor diagnostics.
@@ -1871,18 +2153,30 @@ impl DiscordConnector {
                     },
                 },
             ],
-            events: vec![EventInfo {
-                topic: "discord.message".into(),
-                schema: Self::message_event_schema(),
-                requires_ack: false,
-            }],
+            events: std::iter::once(DISCORD_NATIVE_EVENT_TOPIC)
+                .chain(DISCORD_NATIVE_TOPICS.iter().copied())
+                .map(|topic| EventInfo {
+                    topic: topic.into(),
+                    schema: if topic == DISCORD_NATIVE_EVENT_TOPIC {
+                        json!({
+                            "type": "object", "additionalProperties": false,
+                            "required": ["source_topic", "event"],
+                            "properties": {"source_topic": {"type": "string"}, "event": {"type": "object"}},
+                        })
+                    } else if topic == "discord.message" {
+                        Self::message_event_schema()
+                    } else {
+                        json!({"type": "object"})
+                    },
+                    requires_ack: true,
+                }).collect(),
             resource_types: vec![],
             auth_caps: None,
             event_caps: Some(EventCaps {
                 streaming: true,
                 replay: false,
-                min_buffer_events: 0,
-                requires_ack: false,
+                min_buffer_events: 1,
+                requires_ack: true,
             }),
         };
 
@@ -2777,23 +3071,134 @@ impl DiscordConnector {
 
     /// Handle subscribe method.
     pub async fn handle_subscribe(
-        &self,
+        &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let topics = params
-            .get("topics")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        Ok(json!({
-            "confirmed_topics": topics,
-            "replay_supported": false
-        }))
+        if self.api_client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        let verifier = self
+            .verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .clone();
+        if !self
+            .granted_capabilities
+            .contains(&CapabilityId::from_static("discord.read"))
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "discord.read".into(),
+                reason: "Discord read authority was not negotiated in this session".into(),
+            });
+        }
+        let stream_id = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires a host-issued stream_id".into(),
+            })?
+            .to_owned();
+        let request: SubscribeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid Discord subscribe request".into(),
+            })?;
+        if request.r#type != "subscribe"
+            || request.topics.len() != 1
+            || !request
+                .topics
+                .first()
+                .is_some_and(|topic| discord_native_topic(topic))
+            || request.since.is_some()
+            || request.max_events_per_sec.is_some()
+            || request.batch_ms.is_some()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Discord native subscribe requires one exact topic without replay, batching, or rate options".into(),
+            });
+        }
+        let token = request
+            .capability_token
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires capability_token".into(),
+            })?;
+        let topic = request.topics[0].clone();
+        let stream = self
+            .event_stream
+            .as_ref()
+            .ok_or_else(|| {
+                discord_stream_unavailable("Discord native event transport is unavailable")
+            })?
+            .clone();
+        let subscription = Arc::new(DiscordNativeSubscription {
+            stream: stream.clone(),
+            stream_id: stream_id.clone(),
+            topic: topic.clone(),
+            token: Mutex::new(token),
+            verifier,
+        });
+        subscription.verify_authority()?;
+        if self
+            .native_stream_identity
+            .as_ref()
+            .is_some_and(|identity| identity.0 != stream_id || identity.1 != topic)
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Changing Discord native stream identity requires reconfiguration".into(),
+            });
+        }
+        if !stream.is_open()
+            && self
+                .gateway_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            return Err(discord_stream_unavailable(
+                "Previous Discord Gateway stream is still draining",
+            ));
+        }
+        stream.open(&stream_id, &topic, request.window_size.unwrap_or(1))?;
+        if let Some(active) = self
+            .event_subscription
+            .as_ref()
+            .filter(|active| active.stream_id == stream_id && active.topic == topic)
+        {
+            let token = subscription
+                .token
+                .lock()
+                .map_err(|_| FcpError::Internal {
+                    message: "Discord event authority state poisoned".into(),
+                })?
+                .clone();
+            *active.token.lock().map_err(|_| FcpError::Internal {
+                message: "Discord event authority state poisoned".into(),
+            })? = token;
+        } else {
+            self.event_subscription = Some(subscription);
+        }
+        self.native_stream_identity = Some((stream_id, topic.clone()));
+        if let Err(error) = self.connect_gateway().await {
+            stream.close();
+            self.event_subscription = None;
+            return Err(error);
+        }
+        serde_json::to_value(SubscribeResponse {
+            r#type: "response".into(),
+            id: request.id,
+            result: SubscribeResult {
+                confirmed_topics: vec![topic],
+                cursors: Default::default(),
+                replay_supported: false,
+                buffer: None,
+            },
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Discord subscribe response".into(),
+        })
     }
 
     /// Handle shutdown method.
@@ -2802,29 +3207,15 @@ impl DiscordConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Shutting down Discord connector");
-
-        if let Some(shutdown_tx) = self.gateway_shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-
-        if let Some(task) = self.gateway_lease_task.take() {
-            task.abort();
-        }
-
-        if let Some(task) = self.gateway_task.take() {
-            task.abort();
-        }
-
-        if let Some(lease) = self.gateway_lease.take()
-            && let Err(err) = lease.release()
-        {
-            warn!(error = %err, "Failed to release Discord gateway lease");
-        }
+        self.revoke_session();
+        self.stop_gateway().await?;
 
         self.api_client = None;
         self.gateway = None;
         self.verifier = None;
         self.session_id = None;
+        self.configured_zone = None;
+        self.native_stream_identity = None;
         self.zone_dir = None;
         self.bot_user_id = None;
         self.inbound_policy = DiscordInboundPolicy::default();
@@ -2837,6 +3228,84 @@ impl DiscordConnector {
         Ok(json!({ "status": "shutdown" }))
     }
 
+    async fn stop_gateway(&mut self) -> FcpResult<()> {
+        if let Some(shutdown) = &self.gateway_shutdown_tx {
+            let _ = shutdown.send(true);
+        }
+        if let Some(mut task) = self.gateway_task.take() {
+            if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_err()
+                {
+                    self.gateway_task = Some(task);
+                    return Err(discord_stream_unavailable(
+                        "Discord Gateway supervisor is still draining",
+                    ));
+                }
+            }
+        }
+        if let Some(gateway) = &self.gateway {
+            gateway.stop_active().await.map_err(|_| {
+                discord_stream_unavailable("Discord Gateway connection is still draining")
+            })?;
+        }
+        if let Some(mut task) = self.gateway_lease_task.take() {
+            if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                if fcp_async_core::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_err()
+                {
+                    self.gateway_lease_task = Some(task);
+                    return Err(discord_stream_unavailable(
+                        "Discord Gateway lease worker is still draining",
+                    ));
+                }
+            }
+        }
+        self.gateway_shutdown_tx = None;
+        if let Some(lease) = &self.gateway_lease {
+            lease.release()?;
+        }
+        self.gateway_lease = None;
+        Ok(())
+    }
+
+    fn gateway_checkpoint_scope(
+        &self,
+        subscription: &DiscordNativeSubscription,
+    ) -> FcpResult<String> {
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        let material = json!({
+            "version": 1, "zone": subscription.verifier.zone_id, "topic": subscription.topic,
+            "bot_id": self.bot_user_id, "credential": config.bot_credential,
+            "api_url": config.api_url, "gateway_url": config.gateway_url,
+            "application_id": config.application_id, "intents": config.intents, "shard": config.shard,
+            "policy": {
+                "require_mention_in_guilds": self.inbound_policy.require_mention_in_guilds,
+                "allow_dms": self.inbound_policy.allow_dms,
+                "allowed_guilds": self.inbound_policy.allowed_guilds,
+                "allowed_channels": self.inbound_policy.allowed_channels,
+                "allowed_users": self.inbound_policy.allowed_users,
+            },
+        });
+        let encoded = serde_json::to_vec(&material).map_err(|_| FcpError::Internal {
+            message: "Failed to bind Discord Gateway checkpoint scope".into(),
+        })?;
+        let mut hash = Sha256::new();
+        hash.update(b"fcp.discord.native-checkpoint-scope.v1\0");
+        hash.update(encoded);
+        Ok(hex::encode(hash.finalize()))
+    }
+
     /// Connect to the Discord gateway.
     async fn connect_gateway(&mut self) -> FcpResult<()> {
         if let Some(task) = &self.gateway_task {
@@ -2844,19 +3313,19 @@ impl DiscordConnector {
                 return Ok(()); // Already connected
             }
         }
-        self.gateway_task = None;
-        self.gateway_shutdown_tx = None;
-        if let Some(task) = self.gateway_lease_task.take() {
-            task.abort();
-        }
-        if let Some(lease) = self.gateway_lease.take()
-            && let Err(err) = lease.release()
-        {
-            warn!(
-                error = %err,
-                "Failed to release previous Discord gateway lease before reconnect"
-            );
-        }
+        self.stop_gateway().await?;
+
+        let subscription = self.event_subscription.clone().ok_or_else(|| {
+            discord_stream_unavailable("Discord Gateway requires an authorized native subscription")
+        })?;
+        subscription.require_active()?;
+        let scope = self.gateway_checkpoint_scope(&subscription)?;
+        *self
+            .gateway_failure
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "Discord Gateway health state poisoned".into(),
+            })? = None;
 
         let gateway = self.gateway.clone().ok_or(FcpError::NotConfigured)?;
         let zone_dir = self.zone_dir.clone().ok_or(FcpError::InvalidRequest {
@@ -2867,10 +3336,17 @@ impl DiscordConnector {
         let state_path = zone_dir.join(DISCORD_GATEWAY_STATE_FILE);
         let lease_path = zone_dir.join(DISCORD_GATEWAY_LEASE_FILE);
         let lease = DiscordGatewayLease::acquire(
-            lease_path,
+            lease_path.clone(),
             self.base.instance_id.to_string(),
             DISCORD_GATEWAY_LEASE_TTL_SECONDS,
         )?;
+        let checkpoint = GatewayCheckpoint {
+            state_path,
+            lease_path,
+            holder_instance_id: lease.holder_instance_id.clone(),
+            lease_seq: lease.lease_seq,
+            scope,
+        };
         self.gateway_lease = Some(lease.clone());
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2884,7 +3360,11 @@ impl DiscordConnector {
         let inbound_delivery_state = Arc::clone(&self.inbound_delivery_state);
         let bot_user_id = self.bot_user_id.clone();
         let base = self.base.clone();
+        let next_event_seq = Arc::clone(&self.next_event_seq);
         let lease_shutdown_tx = shutdown_tx.clone();
+        let lease_subscription = subscription.clone();
+        let lease_failure = Arc::clone(&self.gateway_failure);
+        let gateway_failure = Arc::clone(&self.gateway_failure);
 
         let mut supervisor = StreamingSupervisor::new(
             SupervisorConfig {
@@ -2899,14 +3379,26 @@ impl DiscordConnector {
                 DISCORD_GATEWAY_LEASE_RENEW_INTERVAL_SECONDS,
             ));
             renew_timer.tick().await;
+            let mut authority_timer = fcp_async_core::time::interval(Duration::from_secs(1));
+            authority_timer.tick().await;
             loop {
                 fcp_async_core::select! {
                     _ = renew_timer.tick() => {
                         if let Err(err) = lease.renew() {
+                            record_discord_gateway_failure(&lease_failure, err.to_string());
                             warn!(
                                 error = %err,
                                 "Discord gateway lease renewal failed; stopping gateway"
                             );
+                            let _ = lease_shutdown_tx.send(true);
+                            lease_subscription.stream.close();
+                            break;
+                        }
+                    },
+                    _ = authority_timer.tick() => {
+                        if let Err(error) = lease_subscription.require_active() {
+                            record_discord_gateway_failure(&lease_failure, error.to_string());
+                            lease_subscription.stream.close();
                             let _ = lease_shutdown_tx.send(true);
                             break;
                         }
@@ -2927,23 +3419,34 @@ impl DiscordConnector {
                     shutdown_rx,
                     |session| {
                         let gateway = Arc::clone(&gateway);
-                        let state_path = state_path.clone();
+                        let checkpoint = checkpoint.clone();
+                        let subscription = subscription.clone();
+                        let shutdown_tx = shutdown_tx.clone();
+                        let gateway_failure = gateway_failure.clone();
                         async move {
-                            let stream = gateway
-                                .connect_once_with_state_path(Some(state_path.clone()))
+                            subscription.require_active().map_err(|error| -> StreamingError { Box::new(error) })?;
+                            gateway.stop_active().await.map_err(|error| -> StreamingError { Box::new(error) })?;
+                            let stream = match gateway
+                                .connect_once_with_checkpoint(Some(checkpoint))
                                 .await
-                                .map_err(|e| -> StreamingError { Box::new(e) })?;
-                            let join_handle = fcp_async_core::task::spawn(async move {
-                                match stream.join_handle.await {
-                                    Ok(Ok(())) => Ok(()),
-                                    Ok(Err(e)) => Err(Box::new(e) as StreamingError),
-                                    Err(e) => Err(Box::new(e) as StreamingError),
+                            {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    if !error.is_retryable() {
+                                        // Recovery failures cannot be repaired by reconnecting.
+                                        // Keep their actionable reason visible to the host and
+                                        // stop before another IDENTIFY can discard a replay gap.
+                                        record_discord_gateway_failure(&gateway_failure, error.to_string());
+                                        subscription.stream.close();
+                                        let _ = shutdown_tx.send(true);
+                                    }
+                                    return Err(Box::new(error) as StreamingError);
                                 }
-                            });
+                            };
                             let _ = session; // Session reserved for future use
                             Ok(StreamingConnection {
                                 events: stream.events,
-                                join_handle,
+                                join_handle: stream.join_handle,
                             })
                         }
                     },
@@ -2956,33 +3459,72 @@ impl DiscordConnector {
                         let bot_user_id = bot_user_id.clone();
                         let base = base.clone();
                         let shutdown_tx = shutdown_tx.clone();
+                        let subscription = subscription.clone();
+                        let next_event_seq = next_event_seq.clone();
+                        let gateway_failure = gateway_failure.clone();
                         async move {
-                            if let Some(event) = gateway_event_to_fcp_with_policy(
-                                &gateway_event,
-                                &connector_id,
-                                &instance_id,
-                                &inbound_policy,
-                                bot_user_id.as_deref(),
-                            ) {
-                                register_discord_inbound_delivery_from_event(
-                                    &inbound_delivery_state,
-                                    &event,
-                                );
-                                base.record_event();
-                                if event_tx.send(Ok(event)).is_err() {
-                                    tracing::info!(
-                                        "Event receiver dropped, stopping gateway stream"
-                                    );
+                            let result: Result<Option<EventEnvelope>, StreamingError> = async {
+                                subscription.require_active().map_err(|error| -> StreamingError { Box::new(error) })?;
+                                let mut delivered = None;
+                                if let Some(mut event) = gateway_event_to_fcp_with_policy(
+                                    &gateway_event, &connector_id, &instance_id,
+                                    &inbound_policy, bot_user_id.as_deref(),
+                                ) {
+                                    if subscription.topic == DISCORD_NATIVE_EVENT_TOPIC || subscription.topic == event.topic {
+                                        let cursor = gateway_event.cursor().ok_or_else(|| {
+                                            discord_stream_unavailable("Discord Gateway event has no committed-delivery identity")
+                                        }).map_err(|error| -> StreamingError { Box::new(error) })?;
+                                        event.cursor = cursor.to_owned();
+                                        event.seq = discord_native_sequence(&next_event_seq)
+                                            .map_err(|error| -> StreamingError { Box::new(error) })?;
+                                        event.data.zone_id = subscription.verifier.zone_id.clone();
+                                        event.requires_ack = true;
+                                        register_discord_inbound_delivery_from_event(&inbound_delivery_state, &event);
+                                        subscription.deliver(event.clone()).await
+                                            .map_err(|error| -> StreamingError { Box::new(error) })?;
+                                        delivered = Some(event);
+                                    }
+                                }
+                                // Policy/topic discards are deliberate only while the
+                                // signed subscription remains live. Broadcast observers
+                                // cannot acknowledge an event or advance this checkpoint.
+                                subscription.require_active().map_err(|error| -> StreamingError { Box::new(error) })?;
+                                gateway_event.acknowledge().await.map_err(|error| -> StreamingError { Box::new(error) })?;
+                                Ok(delivered)
+                            }.await;
+                            match result {
+                                Ok(Some(event)) => {
+                                    base.record_event();
+                                    let _ = event_tx.send(Ok(event));
+                                    Ok(())
+                                }
+                                Ok(None) => Ok(()),
+                                Err(error) => {
+                                    record_discord_gateway_failure(&gateway_failure, error.to_string());
+                                    subscription.stream.close();
                                     let _ = shutdown_tx.send(true);
+                                    Err(error)
                                 }
                             }
-                            Ok(())
                         }
                     },
                 )
                 .await;
 
+            match &outcome {
+                SupervisorOutcome::FatalError { message } => {
+                    record_discord_gateway_failure(&gateway_failure, message.clone());
+                }
+                SupervisorOutcome::MaxFailuresReached { failures } => {
+                    record_discord_gateway_failure(
+                        &gateway_failure,
+                        format!("Discord Gateway stopped after {failures} connection failures"),
+                    );
+                }
+                SupervisorOutcome::Shutdown => {}
+            }
             let _ = shutdown_tx.send(true);
+            subscription.stream.close();
             tracing::info!(?outcome, "Discord gateway supervisor stopped");
         });
 
@@ -3589,7 +4131,6 @@ fn gateway_event_to_fcp_with_policy(
     let (topic, payload, principal_info, thread_info) = match &event.event {
         GatewayEvent::Ready(ready) => {
             let payload = json!({
-                "session_id": ready.session_id,
                 "user": ready.user
             });
             (
@@ -3690,9 +4231,15 @@ fn gateway_event_to_fcp_with_policy(
             )
         }
         GatewayEvent::Unknown { event_name, data } => {
-            let topic = format!("discord.{}", event_name.to_lowercase());
+            if event_name != "INTERACTION_CREATE" {
+                return None;
+            }
+            let mut payload = data.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("token");
+            }
             let mut envelope = EventEnvelope::new(
-                topic,
+                "discord.interaction_create",
                 EventData::new(
                     connector_id.clone(),
                     instance_id.clone(),
@@ -3703,7 +4250,7 @@ fn gateway_event_to_fcp_with_policy(
                         trust: TrustLevel::Untrusted,
                         display: None,
                     },
-                    data.clone(),
+                    payload,
                 ),
             );
             if let Some(seq) = event.seq {
@@ -3869,6 +4416,125 @@ mod tests {
         }
         let cose = builder.sign(signing_key).unwrap();
         CapabilityArtifact::from_raw(cose)
+    }
+
+    fn native_subscription_token(
+        key: &Ed25519SigningKey,
+        instance: &InstanceId,
+        zone: &str,
+        expires_after: i64,
+    ) -> CapabilityToken {
+        let constraints = fcp_core::CapabilityConstraints {
+            resource_allow: vec!["discord:events:discord.events".into()],
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&constraints, &mut encoded).unwrap();
+        let now = Utc::now();
+        CapabilityToken::from_raw(
+            CapabilityBuilder::new()
+                .capability_id("discord.read")
+                .zone_id(zone)
+                .principal("user:test")
+                .operations(&["discord.subscribe"])
+                .issuer("node:test")
+                .target_instance(instance.as_ref())
+                .validity(
+                    now - Duration::minutes(2),
+                    now + Duration::seconds(expires_after),
+                )
+                .try_constraints_cbor(&encoded)
+                .unwrap()
+                .sign(key)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn native_authority_rejects_wrong_instance_and_zone() {
+        let key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(io::sink()));
+        stream
+            .open("native-authority", DISCORD_NATIVE_EVENT_TOPIC, 1)
+            .unwrap();
+        let subscription = DiscordNativeSubscription {
+            stream,
+            stream_id: "native-authority".into(),
+            topic: DISCORD_NATIVE_EVENT_TOPIC.into(),
+            token: Mutex::new(native_subscription_token(&key, &instance, "z:work", 60)),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::work(),
+                instance.clone(),
+            ),
+        };
+        subscription.require_active().unwrap();
+        *subscription.token.lock().unwrap() =
+            native_subscription_token(&key, &InstanceId::new(), "z:work", 60);
+        assert!(subscription.verify_authority().is_err());
+        *subscription.token.lock().unwrap() =
+            native_subscription_token(&key, &instance, "z:private", 60);
+        assert!(subscription.verify_authority().is_err());
+        *subscription.token.lock().unwrap() =
+            native_subscription_token(&key, &instance, "z:work", 60);
+        subscription.require_active().unwrap();
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_ack_rechecks_authority_before_provider_commit() {
+        let key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(io::sink()));
+        stream
+            .open("native-expiry", DISCORD_NATIVE_EVENT_TOPIC, 1)
+            .unwrap();
+        let subscription = DiscordNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "native-expiry".into(),
+            topic: DISCORD_NATIVE_EVENT_TOPIC.into(),
+            token: Mutex::new(native_subscription_token(&key, &instance, "z:work", 60)),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::work(),
+                instance.clone(),
+            ),
+        };
+        let mut event = EventEnvelope::new(
+            "discord.message",
+            EventData::new(
+                ConnectorId::from_static("fcp.discord"),
+                instance.clone(),
+                ZoneId::work(),
+                Principal {
+                    kind: "discord_user".into(),
+                    id: "123".into(),
+                    trust: TrustLevel::Untrusted,
+                    display: None,
+                },
+                json!({"id":"456", "channel_id":"789", "content":"pending"}),
+            ),
+        );
+        event.seq = 7;
+        event.cursor = "opaque-session-event-7".into();
+        let mut delivery = Box::pin(subscription.deliver(event));
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(delivery.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "delivery must wait for an exact native ACK"
+        );
+        // Revoke while credit is outstanding, then deliver an otherwise exact
+        // ACK. The final authority check must still reject provider progress.
+        *subscription.token.lock().unwrap() =
+            native_subscription_token(&key, &instance, "z:work", -1);
+        stream.acknowledge(json!({
+            "stream_id":"native-expiry",
+            "ack":{"type":"ack", "topic":"discord.events", "seqs":[7], "cursors":["opaque-session-event-7"]}
+        })).unwrap();
+        assert!(matches!(delivery.await, Err(FcpError::TokenExpired)));
     }
 
     fn simulate_send_message_payload(capability: &CapabilityArtifact) -> serde_json::Value {
@@ -4291,7 +4957,7 @@ mod tests {
         // Discord needs zone_dir for gateway resume-state and lease persistence.
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -4311,7 +4977,7 @@ mod tests {
 
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "zone_dir": zone_dir,
                 "host_public_key": verifying_key.to_bytes(),
@@ -4344,12 +5010,33 @@ mod tests {
         )
         .unwrap();
         let second = DiscordGatewayLease::acquire(
-            lease_path,
+            lease_path.clone(),
             "holder-b".to_string(),
             DISCORD_GATEWAY_LEASE_TTL_SECONDS,
         );
         assert!(matches!(second, Err(FcpError::Conflict { .. })));
         first.release().unwrap();
+        let released: DiscordGatewayLeaseRecord =
+            read_json_file_if_exists(&lease_path).unwrap().unwrap();
+        assert_eq!(released.expires_at, 0);
+        assert_eq!(released.lease_seq, first.lease_seq);
+        let next = DiscordGatewayLease::acquire(
+            lease_path.clone(),
+            "holder-b".into(),
+            DISCORD_GATEWAY_LEASE_TTL_SECONDS,
+        )
+        .unwrap();
+        assert_eq!(next.lease_seq, first.lease_seq + 1);
+        assert!(matches!(first.renew(), Err(FcpError::Conflict { .. })));
+        first.release().unwrap();
+        let after_stale_release: DiscordGatewayLeaseRecord =
+            read_json_file_if_exists(&lease_path).unwrap().unwrap();
+        assert_eq!(after_stale_release.holder_instance_id, "holder-b");
+        assert!(after_stale_release.expires_at > 0);
+        let lock = lock_gateway_lease(&lease_path).unwrap();
+        assert!(matches!(next.release(), Err(FcpError::Conflict { .. })));
+        drop(lock);
+        next.release().unwrap();
     }
 
     #[fcp_async_core::runtime::test]
@@ -4831,6 +5518,7 @@ mod tests {
         let event = GatewayEventFrame {
             seq: Some(77),
             event: GatewayEvent::MessageCreate(payload.clone()),
+            acknowledgement: None,
         };
         let envelope =
             gateway_event_to_fcp(&event, &connector_id, &instance_id).expect("event envelope");
@@ -4862,6 +5550,7 @@ mod tests {
         let event = GatewayEventFrame {
             seq: Some(78),
             event: GatewayEvent::MessageCreate(payload),
+            acknowledgement: None,
         };
 
         let envelope = gateway_event_to_fcp_with_policy(
@@ -4965,6 +5654,7 @@ mod tests {
         let event = GatewayEventFrame {
             seq: Some(91),
             event: GatewayEvent::ChannelCreate(payload),
+            acknowledgement: None,
         };
         let envelope =
             gateway_event_to_fcp(&event, &connector_id, &instance_id).expect("event envelope");
@@ -5095,6 +5785,7 @@ mod tests {
 
         let allowed = GatewayEventFrame {
             seq: Some(101),
+            acknowledgement: None,
             event: GatewayEvent::MessageCreate(json!({
                 "id": "message-1",
                 "guild_id": "100",
@@ -5119,6 +5810,7 @@ mod tests {
 
         let wrong_channel = GatewayEventFrame {
             seq: Some(102),
+            acknowledgement: None,
             event: GatewayEvent::MessageCreate(json!({
                 "id": "message-2",
                 "guild_id": "100",
@@ -5140,6 +5832,7 @@ mod tests {
 
         let missing_mention = GatewayEventFrame {
             seq: Some(103),
+            acknowledgement: None,
             event: GatewayEvent::MessageCreate(json!({
                 "id": "message-3",
                 "guild_id": "100",
@@ -5174,10 +5867,12 @@ mod tests {
 
         let allowed = GatewayEventFrame {
             seq: Some(201),
+            acknowledgement: None,
             event: GatewayEvent::Unknown {
                 event_name: "INTERACTION_CREATE".into(),
                 data: json!({
                     "id": "interaction-1",
+                    "token": "must-not-enter-the-native-journal",
                     "guild_id": "100",
                     "channel_id": "200",
                     "member": {
@@ -5195,9 +5890,11 @@ mod tests {
         )
         .expect("authorized interaction should pass");
         assert_eq!(envelope.topic, "discord.interaction_create");
+        assert!(envelope.data.payload.get("token").is_none());
 
         let wrong_user = GatewayEventFrame {
             seq: Some(202),
+            acknowledgement: None,
             event: GatewayEvent::Unknown {
                 event_name: "INTERACTION_CREATE".into(),
                 data: json!({
@@ -5578,30 +6275,10 @@ mod tests {
 
     #[test]
     fn test_manifest_parses_and_hash_is_stable() {
-        let manifest_str = include_str!("../manifest.toml");
-        // Strip sections the manifest parser doesn't support
-        let filtered: String = manifest_str
-            .lines()
-            .scan(false, |in_unsupported, line| {
-                if line.starts_with("[provides.events") || line.starts_with("[provides.streaming") {
-                    *in_unsupported = true;
-                    Some("")
-                } else if *in_unsupported && line.starts_with('[') {
-                    *in_unsupported = false;
-                    Some(line)
-                } else if *in_unsupported {
-                    Some("")
-                } else {
-                    Some(line)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let manifest_a = fcp_manifest::ConnectorManifest::parse_str_unchecked(&filtered)
-            .expect("manifest should parse");
-        let manifest_b = fcp_manifest::ConnectorManifest::parse_str_unchecked(&filtered)
-            .expect("manifest should parse");
+        let manifest_a = fcp_manifest::ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("the complete bundled manifest must validate");
+        let manifest_b = fcp_manifest::ConnectorManifest::parse_str(MANIFEST_TOML)
+            .expect("the complete bundled manifest must validate");
 
         let hash_a = manifest_a
             .compute_interface_hash()
@@ -5613,6 +6290,7 @@ mod tests {
             hash_a, hash_b,
             "Interface hash must be deterministic across parses"
         );
+        assert_eq!(manifest_a.manifest.interface_hash, hash_a);
         // Hash display should produce a non-trivial string
         let hash_str = hash_a.to_string();
         assert!(

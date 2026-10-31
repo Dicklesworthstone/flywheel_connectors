@@ -28,20 +28,14 @@
     clippy::wildcard_imports
 )]
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use anyhow::Result;
+use fcp_async_core::runtime::Builder;
+use fcp_sdk::prelude::{JsonlConfig, JsonlEventStream, JsonlWriter, serve_jsonl_events};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-mod api;
-mod config;
-mod connector;
-mod error;
-mod gateway;
-mod limits;
-mod types;
-
-use connector::DiscordConnector;
+use fcp_discord::DiscordConnector;
 
 fn main() -> Result<()> {
     // Initialize tracing
@@ -60,37 +54,31 @@ fn main() -> Result<()> {
 
 /// Run the FCP JSON-RPC style protocol loop.
 fn run_fcp_loop() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    run_fcp_loop_with_io(BufReader::new(std::io::stdin()), std::io::stdout())
+}
+
+fn run_fcp_loop_with_io<R, W>(reader: R, stdout: W) -> Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let events = JsonlEventStream::new(JsonlWriter::new(stdout));
     let mut connector = DiscordConnector::new();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-
-        let response =
-            fcp_async_core::runtime::block_on_sync(handle_message(&mut connector, &line))
-                .unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": "FCP-9001",
-                            "message": format!("Runtime error: {e}")
-                        }
-                    })
-                });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+    connector.attach_event_stream(events.clone())?;
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    let result = serve_jsonl_events(reader, events, JsonlConfig::default(), |method, params| {
+        runtime.block_on(dispatch_message(&mut connector, method, params))
+    });
+    // The reader closes outstanding native obligations on EOF or transport
+    // failure. Join the Gateway before releasing its checkpoint writer lease.
+    let shutdown = runtime.block_on(connector.handle_shutdown(serde_json::json!({})));
+    result?;
+    shutdown?;
     Ok(())
 }
 
 /// Handle a single FCP message.
+#[cfg(test)]
 async fn handle_message(connector: &mut DiscordConnector, message: &str) -> serde_json::Value {
     let request: serde_json::Value = match serde_json::from_str(message) {
         Ok(v) => v,
@@ -113,22 +101,7 @@ async fn handle_message(connector: &mut DiscordConnector, message: &str) -> serd
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let result = match method {
-        "configure" => connector.handle_configure(params).await,
-        "handshake" => connector.handle_handshake(params).await,
-        "health" => connector.handle_health().await,
-        "doctor" => connector.handle_doctor().await,
-        "self_check" => connector.handle_self_check().await,
-        "introspect" => connector.handle_introspect().await,
-        "invoke" => connector.handle_invoke(params).await,
-        "simulate" => connector.handle_simulate(params).await,
-        "subscribe" => connector.handle_subscribe(params).await,
-        "shutdown" => connector.handle_shutdown(params).await,
-        _ => Err(fcp_core::FcpError::InvalidRequest {
-            code: 1002,
-            message: format!("Unknown method: {method}"),
-        }),
-    };
+    let result = dispatch_message(connector, method, params).await;
 
     match result {
         Ok(value) => {
@@ -161,9 +134,105 @@ async fn handle_message(connector: &mut DiscordConnector, message: &str) -> serd
     }
 }
 
+async fn dispatch_message(
+    connector: &mut DiscordConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> fcp_core::FcpResult<serde_json::Value> {
+    match method {
+        "configure" => connector.handle_configure(params).await,
+        "handshake" => connector.handle_handshake(params).await,
+        "health" => connector.handle_native_health().await,
+        "doctor" => connector.handle_doctor().await,
+        "self_check" => connector.handle_self_check().await,
+        "introspect" => connector.handle_introspect().await,
+        "invoke" => {
+            fcp_sdk::prelude::dispatch_raw_invoke(params, |params| connector.handle_invoke(params))
+                .await
+        }
+        "simulate" => connector.handle_simulate(params).await,
+        "subscribe" => connector.handle_subscribe(params).await,
+        "shutdown" => connector.handle_shutdown(params).await,
+        _ => Err(fcp_core::FcpError::InvalidRequest {
+            code: 1002,
+            message: format!("Unknown method: {method}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct CapturedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn production_loop_serves_canonical_health_and_drains_on_eof() {
+        let output = CapturedOutput::default();
+        run_fcp_loop_with_io(
+            io::Cursor::new(
+                b" \t\n{\"jsonrpc\":\"2.0\",\"id\":\"health\",\"method\":\"health\"}\n",
+            ),
+            output.clone(),
+        )
+        .expect("health RPC and EOF shutdown must complete");
+        let bytes = output.0.lock().unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["id"], "health");
+        let snapshot: fcp_core::HealthSnapshot =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        let details = snapshot.details.unwrap();
+        assert_eq!(details["configured"], false);
+        assert_eq!(details["handshaken"], false);
+        assert_eq!(details["gateway_running"], false);
+        assert!(details["instance_id"].is_string());
+    }
+
+    #[test]
+    fn production_loop_rejects_invalid_json_and_does_not_reply_to_native_controls() {
+        let output = CapturedOutput::default();
+        run_fcp_loop_with_io(
+            io::Cursor::new(b"{\n{\"jsonrpc\":\"2.0\",\"method\":\"ack\",\"params\":{\"stream_id\":\"unknown\"}}\n{\"jsonrpc\":\"2.0\",\"id\":\"stop\",\"method\":\"shutdown\"}\n"),
+            output.clone(),
+        ).unwrap();
+        let bytes = output.0.lock().unwrap();
+        let responses: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            responses.len(),
+            2,
+            "native controls are notifications, even when invalid"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["error"]["code"] == "FCP-1001")
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|response| response["id"] == "stop" && response["result"].is_object())
+        );
+    }
 
     #[test]
     fn invalid_json_returns_jsonrpc_parse_error_shape() {

@@ -4,7 +4,7 @@
 //! - Default deny (missing capability -> error)
 //! - Allow with valid token (happy path `send_message` invoke)
 //! - Network guard allow/deny (manifest `host_allow` validation)
-//! - Gateway streaming subscribe protocol (topic confirmation)
+//! - Gateway streaming authority and native event catalog
 //! - Rate limit behavior (429 response handling)
 //!
 //! All tests are deterministic -- no real API calls.
@@ -47,7 +47,7 @@ impl DiscordConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: DiscordConnector::new(),
-            id: ConnectorId::from_static("discord"),
+            id: ConnectorId::from_static("fcp.discord"),
         }
     }
 
@@ -79,18 +79,10 @@ impl FcpConnector for DiscordConnectorAdapter {
     }
 
     async fn health(&self) -> HealthSnapshot {
-        match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("discord_status:{other}")),
-                }
-            }
+        match self.connector.handle_native_health().await {
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|err| {
+                HealthSnapshot::error(format!("invalid Discord health snapshot: {err}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -260,7 +252,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("discord-e2e"),
-        connector_id: ConnectorId::from_static("discord"),
+        connector_id: ConnectorId::from_static("fcp.discord"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -546,55 +538,32 @@ fn discord_manifest_network_guard_allows_and_denies() {
         );
     }
 
-    // Also verify the gateway streaming constraints
-    let gateway_host_allow = manifest
-        .get("provides")
-        .and_then(toml::Value::as_table)
-        .and_then(|p| p.get("streaming"))
-        .and_then(toml::Value::as_table)
-        .and_then(|s| s.get("network_constraints"))
-        .and_then(toml::Value::as_table)
-        .and_then(|c| c.get("host_allow"))
-        .and_then(toml::Value::as_array)
-        .map(|hosts| {
-            hosts
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .expect("gateway host_allow");
-
-    assert!(host_allowed("gateway.discord.gg", &gateway_host_allow));
-    assert!(!host_allowed("evil.example.com", &gateway_host_allow));
+    // The production manifest parser must accept the complete file. Gateway
+    // endpoint validation is exercised by the connector's WebSocket fixtures;
+    // an unsupported provides.streaming table is not enforceable host policy.
+    ConnectorManifest::parse_str(include_str!("../../../connectors/discord/manifest.toml"))
+        .expect("complete Discord manifest must load in the host");
 }
 
 // ============================================================================
 // Test 4: Gateway streaming subscribe protocol
 // ============================================================================
 
-/// Gateway streaming: the subscribe handler confirms requested topics.
-/// Validates the subscribe/unsubscribe protocol contract.
+/// Gateway traffic requires a configured, handshaken, authorized native stream.
+/// Handshake alone only advertises the stream; it must not open the Gateway.
 #[fcp_async_core::runtime::test]
-async fn discord_subscribe_confirms_topics() {
-    let connector = DiscordConnector::new();
+async fn discord_subscribe_requires_authority() {
+    let mut connector = DiscordConnector::new();
 
-    // Subscribe with specific topics
-    let subscribe_result = connector
-        .handle_subscribe(json!({
-            "topics": ["discord.message", "discord.typing", "discord.guild_create"]
-        }))
-        .await
-        .expect("subscribe should succeed");
-
-    let confirmed = subscribe_result["confirmed_topics"]
-        .as_array()
-        .expect("confirmed_topics array");
-    assert_eq!(confirmed.len(), 3, "should confirm all 3 requested topics");
-    assert_eq!(confirmed[0], "discord.message");
-    assert_eq!(confirmed[1], "discord.typing");
-    assert_eq!(confirmed[2], "discord.guild_create");
-    assert_eq!(subscribe_result["replay_supported"], false);
+    assert!(
+        connector
+            .handle_subscribe(json!({
+                "topics": ["discord.message", "discord.typing", "discord.guild_create"]
+            }))
+            .await
+            .is_err(),
+        "unconfigured unsigned subscriptions must fail closed"
+    );
 
     // Handshake should advertise streaming support (requires configure first)
     let mock = MockApiServer::start().await;
@@ -619,7 +588,7 @@ async fn discord_subscribe_confirms_topics() {
             "zone_dir": zone_dir.to_string_lossy(),
             "host_public_key": signing_key.verifying_key().to_bytes().to_vec(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": ["discord.send"]
+            "capabilities_requested": ["discord.read"]
         }))
         .await
         .expect("handshake should succeed");
@@ -627,6 +596,47 @@ async fn discord_subscribe_confirms_topics() {
     assert_eq!(response["status"], "accepted");
     let event_caps = response.get("event_caps").expect("event_caps in handshake");
     assert_eq!(event_caps["streaming"], true, "streaming should be enabled");
+    assert_eq!(
+        event_caps["replay"], false,
+        "arbitrary cursor seeks are unsupported"
+    );
+    assert!(
+        handshake_connector
+            .handle_subscribe(json!({"topics": ["discord.message"]}))
+            .await
+            .is_err(),
+        "handshake must not authorize an unsigned subscription"
+    );
+
+    let health = handshake_connector.handle_native_health().await.unwrap();
+    assert_eq!(
+        health["details"]["instance_id"],
+        handshake_connector.instance_id().as_str()
+    );
+    assert_eq!(health["details"]["zone_id"], "z:work");
+
+    let manifest =
+        ConnectorManifest::parse_str(include_str!("../../../connectors/discord/manifest.toml"))
+            .expect("valid Discord manifest and interface hash");
+    assert_eq!(manifest.provides.events.len(), 12);
+    for event in manifest.provides.events.values() {
+        let topic = event.topic.as_deref().expect("declared native topic");
+        assert!(event.streaming && event.requires_ack);
+        assert!(!event.replay);
+        assert_eq!(event.capability.as_deref(), Some("discord.read"));
+        assert_eq!(
+            event.subscribe_operation.as_deref(),
+            Some("discord.subscribe")
+        );
+        assert_eq!(
+            event.resource_uri.as_deref(),
+            Some(format!("discord:events:{topic}").as_str())
+        );
+    }
+    handshake_connector
+        .handle_shutdown(json!({}))
+        .await
+        .unwrap();
 }
 
 // ============================================================================

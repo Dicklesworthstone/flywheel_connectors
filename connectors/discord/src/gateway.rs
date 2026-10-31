@@ -6,16 +6,19 @@ use std::sync::{
 };
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fcp_async_core::channel::mpsc;
 use fcp_async_core::sync::Mutex;
-use fcp_streaming::{WsClient, WsConnection, WsMessage};
+use fcp_sdk::runtime::StreamingError;
+use fcp_streaming::{WsClient, WsConfig, WsConnection, WsMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
@@ -57,6 +60,11 @@ pub enum GatewayOpcode {
 }
 
 const GATEWAY_EVENT_BUFFER_CAPACITY: usize = 256;
+const GATEWAY_PENDING_MAX_BYTES: usize = 16 * 1024 * 1024;
+const GATEWAY_FRAME_MAX_BYTES: usize = 1024 * 1024;
+const GATEWAY_STATE_MAX_BYTES: u64 = 64 * 1024;
+const GATEWAY_STATE_VERSION: u32 = 2;
+const GATEWAY_STOP_POLL: Duration = Duration::from_millis(100);
 pub const DISCORD_GATEWAY_STATE_FILE: &str = "discord_gateway_state.json";
 const GATEWAY_SEND_LIMIT: usize = 120;
 const GATEWAY_SEND_WINDOW: Duration = Duration::from_secs(60);
@@ -69,10 +77,13 @@ const GATEWAY_SEND_WINDOW: Duration = Duration::from_secs(60);
 // tests set it explicitly and cannot be surprised by it again.
 
 async fn connect_gateway_websocket(url: &str) -> DiscordResult<WsConnection> {
-    WsClient::new(url)
-        .connect()
-        .await
-        .map_err(DiscordError::from)
+    WsClient::with_config(
+        url,
+        WsConfig::default().with_max_message_size(GATEWAY_FRAME_MAX_BYTES),
+    )
+    .connect()
+    .await
+    .map_err(DiscordError::from)
 }
 
 #[derive(Debug)]
@@ -213,9 +224,9 @@ async fn send_gateway_payload(
 ) -> DiscordResult<()> {
     let serialized = serde_json::to_string(payload)?;
     send_limiter.wait_for_slot(critical).await;
-    ws_stream
-        .send_text(serialized)
+    fcp_async_core::time::timeout(Duration::from_secs(1), ws_stream.send_text(serialized))
         .await
+        .map_err(|_| gateway_failure(format!("Timed out sending Gateway {context}")))?
         .map_err(|error| DiscordError::Gateway(format!("Failed to send {context}: {error}")))
 }
 
@@ -344,6 +355,7 @@ mod tests {
             api_url: "https://discord.com/api/v10".into(),
             gateway_url: Some(gateway_url),
             intents: 513,
+            gateway_identify_window_ms: 5,
             ..Default::default()
         }
     }
@@ -356,6 +368,38 @@ mod tests {
             "fcp-discord-gateway-{label}-{}-{nanos}.json",
             std::process::id()
         ))
+    }
+
+    fn test_checkpoint(label: &str) -> GatewayCheckpoint {
+        let state_path = unique_state_path(label);
+        let checkpoint = GatewayCheckpoint {
+            lease_path: state_path.with_extension("lease.json"),
+            state_path,
+            holder_instance_id: "gateway-test-holder".into(),
+            lease_seq: 1,
+            scope: "gateway-test-scope".into(),
+        };
+        write_json_file_atomic(
+            &checkpoint.lease_path,
+            &json!({
+                "holder_instance_id": checkpoint.holder_instance_id,
+                "lease_seq": checkpoint.lease_seq,
+                "expires_at": current_unix_timestamp_secs() + 60,
+            }),
+        )
+        .expect("write lease fence");
+        checkpoint
+    }
+
+    fn delivery_state(
+        state: GatewayState,
+        checkpoint: Option<GatewayCheckpoint>,
+    ) -> Arc<Mutex<GatewayDeliveryState>> {
+        Arc::new(Mutex::new(GatewayDeliveryState {
+            committed: state,
+            checkpoint,
+            ..GatewayDeliveryState::default()
+        }))
     }
 
     #[test]
@@ -438,6 +482,7 @@ mod tests {
     #[test]
     fn gateway_identify_params_default_to_safe_single_bucket() {
         let mut config = test_config("ws://127.0.0.1:1".into());
+        config.gateway_identify_window_ms = 5_000;
         config.shard = Some(crate::config::ShardConfig {
             shard_id: 7,
             shard_count: 16,
@@ -576,29 +621,40 @@ mod tests {
             .expect("connect websocket");
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut state = GatewayState::default();
+        let delivery = delivery_state(state.clone(), None);
 
         Box::pin(run_gateway_loop_inner(
             client_ws,
             test_config(ws_url),
             &event_tx,
             &mut state,
-            None,
+            &delivery,
+            0,
+            &AtomicBool::new(false),
         ))
         .await
         .expect("gateway loop success");
 
-        match event_rx.recv().await.expect("ready event") {
+        let ready = event_rx.recv().await.expect("ready event");
+        assert_eq!(delivery.lock().await.committed.sequence, None);
+        ready.acknowledge().await.expect("acknowledge ready");
+        match ready {
             GatewayEventFrame {
                 seq: Some(1),
                 event: GatewayEvent::Ready(ready),
+                ..
             } => assert_eq!(ready.session_id, "sess-identify"),
             other => panic!("expected Ready event with seq=1, got {other:?}"),
         }
 
-        match event_rx.recv().await.expect("message create event") {
+        let message = event_rx.recv().await.expect("message create event");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+        message.acknowledge().await.expect("acknowledge message");
+        match message {
             GatewayEventFrame {
                 seq: Some(2),
                 event: GatewayEvent::MessageCreate(message),
+                ..
             } => assert_eq!(message["id"], "msg-1"),
             other => panic!("expected MessageCreate event with seq=2, got {other:?}"),
         }
@@ -608,7 +664,11 @@ mod tests {
             state.resume_url.as_deref(),
             Some("wss://gateway.discord.gg")
         );
-        assert_eq!(state.sequence, Some(2));
+        assert_eq!(
+            state.sequence, None,
+            "received dispatches must not mutate the resume snapshot"
+        );
+        assert_eq!(delivery.lock().await.committed.sequence, Some(2));
 
         server.await.expect("server task should complete");
     }
@@ -650,32 +710,41 @@ mod tests {
             session_id: Some("sess-resume".into()),
             resume_url: Some("wss://gateway.discord.gg".into()),
             sequence: Some(7),
+            ..GatewayState::default()
         };
+        let delivery = delivery_state(state.clone(), None);
 
         Box::pin(run_gateway_loop_inner(
             client_ws,
             test_config(ws_url),
             &event_tx,
             &mut state,
-            None,
+            &delivery,
+            0,
+            &AtomicBool::new(false),
         ))
         .await
         .expect("gateway loop success");
 
-        match event_rx.recv().await.expect("resumed event") {
+        let resumed = event_rx.recv().await.expect("resumed event");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(7));
+        resumed.acknowledge().await.expect("acknowledge resumed");
+        match resumed {
             GatewayEventFrame {
                 seq: Some(8),
                 event: GatewayEvent::Resumed,
+                ..
             } => {}
             other => panic!("expected Resumed event with seq=8, got {other:?}"),
         }
-        assert_eq!(state.sequence, Some(8));
+        assert_eq!(state.sequence, Some(7));
+        assert_eq!(delivery.lock().await.committed.sequence, Some(8));
 
         server.await.expect("server task should complete");
     }
 
     #[fcp_async_core::runtime::test]
-    async fn gateway_loop_ignores_malformed_dispatch_frames() {
+    async fn gateway_loop_does_not_skip_malformed_dispatch_frames() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -695,12 +764,6 @@ mod tests {
                 "send malformed frame",
             )
             .await;
-            send_message(
-                &mut ws,
-                dispatch_payload("MESSAGE_DELETE", 9, &json!({ "id": "msg-delete-1" })),
-                "send valid dispatch",
-            )
-            .await;
             close_test_websocket(&mut ws).await;
         });
 
@@ -709,73 +772,38 @@ mod tests {
             .expect("connect websocket");
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut state = GatewayState::default();
+        let delivery = delivery_state(state.clone(), None);
 
         Box::pin(run_gateway_loop_inner(
             client_ws,
             test_config(ws_url),
             &event_tx,
             &mut state,
-            None,
+            &delivery,
+            0,
+            &AtomicBool::new(false),
         ))
         .await
-        .expect("gateway loop success");
-
-        match event_rx.recv().await.expect("message delete event") {
-            GatewayEventFrame {
-                seq: Some(9),
-                event: GatewayEvent::MessageDelete(payload),
-            } => assert_eq!(payload["id"], "msg-delete-1"),
-            other => panic!("expected MessageDelete event with seq=9, got {other:?}"),
-        }
-        assert_eq!(state.sequence, Some(9));
+        .expect_err("malformed history must reconnect without skipping a dispatch");
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(delivery.lock().await.committed.sequence, None);
 
         server.await.expect("server task should complete");
     }
 
-    #[fcp_async_core::runtime::test]
-    async fn gateway_loop_clears_incomplete_resume_state_and_identifies() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let ws_url = format!("ws://{addr}");
-
-        let server = fcp_async_core::task::spawn(async move {
-            let (socket, _) = listener.accept().await.expect("accept client");
-            let mut ws = accept_test_websocket(socket).await;
-
-            send_message(&mut ws, hello_payload(1_000), "send hello").await;
-
-            let first_payload = recv_payload(&mut ws, "client frame").await;
-            assert_eq!(first_payload.op, GatewayOpcode::Identify as i32);
-            close_test_websocket(&mut ws).await;
-        });
-
-        let client_ws = connect_gateway_websocket(&ws_url)
-            .await
-            .expect("connect websocket");
-        let (event_tx, _event_rx) = mpsc::channel(8);
-        let mut state = GatewayState {
+    #[test]
+    fn gateway_loop_rejects_incomplete_resume_state() {
+        let state = GatewayState {
             session_id: Some("sess-incomplete".into()),
             resume_url: Some("wss://stale.gateway.discord.gg".into()),
             sequence: None,
+            ..GatewayState::default()
         };
-
-        Box::pin(run_gateway_loop_inner(
-            client_ws,
-            test_config(ws_url),
-            &event_tx,
-            &mut state,
-            None,
-        ))
-        .await
-        .expect("gateway loop success");
-
-        assert_eq!(state.session_id, None);
-        assert_eq!(state.resume_url, None);
+        let error = validate_resume_state(&state)
+            .expect_err("must not identify after an uncommitted READY");
+        assert!(!error.is_retryable());
+        assert_eq!(state.session_id.as_deref(), Some("sess-incomplete"));
         assert_eq!(state.sequence, None);
-
-        server.await.expect("server task should complete");
     }
 
     #[fcp_async_core::runtime::test]
@@ -826,7 +854,8 @@ mod tests {
             .expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let ws_url = format!("ws://{addr}");
-        let state_path = unique_state_path("persist");
+        let checkpoint = test_checkpoint("persist");
+        let state_path = checkpoint.state_path.clone();
 
         let server = fcp_async_core::task::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept client");
@@ -862,12 +891,18 @@ mod tests {
         let api_client = Arc::new(DiscordApiClient::new(&config).expect("create api client"));
         let connection = GatewayConnection::new(config, api_client);
         let mut stream = connection
-            .connect_once_with_state_path(Some(state_path.clone()))
+            .connect_once_with_checkpoint(Some(checkpoint))
             .await
             .expect("connect with state path");
 
-        let _ = stream.events.recv().await.expect("ready event");
-        let _ = stream.events.recv().await.expect("message event");
+        let ready = stream.events.recv().await.expect("ready event");
+        ready.acknowledge().await.expect("acknowledge ready");
+        let message = stream.events.recv().await.expect("message event");
+        let observed = read_json_file_if_exists::<GatewayStateRecord>(&state_path)
+            .expect("state file read")
+            .expect("state file exists");
+        assert_eq!(observed.sequence, Some(1));
+        message.acknowledge().await.expect("acknowledge message");
         stream
             .join_handle
             .await
@@ -880,6 +915,7 @@ mod tests {
             .expect("state file exists");
         assert_eq!(persisted.session_id.as_deref(), Some("sess-persist"));
         assert_eq!(persisted.sequence, Some(2));
+        assert_eq!(persisted.version, GATEWAY_STATE_VERSION);
         let _ = fs::remove_file(state_path);
     }
 
@@ -890,14 +926,19 @@ mod tests {
             .expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let ws_url = format!("ws://{addr}");
-        let state_path = unique_state_path("resume");
+        let checkpoint = test_checkpoint("resume");
+        let state_path = checkpoint.state_path.clone();
         write_json_file_atomic(
             &state_path,
             &GatewayStateRecord {
+                version: GATEWAY_STATE_VERSION,
+                scope: checkpoint.scope.clone(),
+                lease_seq: checkpoint.lease_seq,
                 session_id: Some("sess-resume-file".into()),
                 resume_url: Some(ws_url.clone()),
                 sequence: Some(7),
                 updated_at: current_unix_timestamp_secs(),
+                ..GatewayStateRecord::default()
             },
         )
         .expect("write persisted state");
@@ -926,14 +967,17 @@ mod tests {
         let api_client = Arc::new(DiscordApiClient::new(&config).expect("create api client"));
         let connection = GatewayConnection::new(config, api_client);
         let mut stream = connection
-            .connect_once_with_state_path(Some(state_path.clone()))
+            .connect_once_with_checkpoint(Some(checkpoint))
             .await
             .expect("connect with persisted state");
 
-        match stream.events.recv().await.expect("resumed event") {
+        let resumed = stream.events.recv().await.expect("resumed event");
+        resumed.acknowledge().await.expect("acknowledge resumed");
+        match resumed {
             GatewayEventFrame {
                 seq: Some(8),
                 event: GatewayEvent::Resumed,
+                ..
             } => {}
             other => panic!("expected Resumed event with seq=8, got {other:?}"),
         }
@@ -953,53 +997,323 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn gateway_connection_fails_closed_on_incomplete_persisted_state() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let ws_url = format!("ws://{addr}");
-        let state_path = unique_state_path("fail-closed");
+        let checkpoint = test_checkpoint("fail-closed");
+        let state_path = checkpoint.state_path.clone();
         write_json_file_atomic(
             &state_path,
             &GatewayStateRecord {
+                version: GATEWAY_STATE_VERSION,
+                scope: checkpoint.scope.clone(),
+                lease_seq: checkpoint.lease_seq,
                 session_id: Some("sess-incomplete".into()),
                 resume_url: Some("wss://stale.gateway.discord.gg".into()),
                 sequence: None,
                 updated_at: current_unix_timestamp_secs(),
+                ..GatewayStateRecord::default()
             },
         )
         .expect("write persisted state");
 
-        let server = fcp_async_core::task::spawn(async move {
-            let (socket, _) = listener.accept().await.expect("accept client");
-            let mut ws = accept_test_websocket(socket).await;
-            send_message(&mut ws, hello_payload(1_000), "send hello").await;
-
-            let first_payload = recv_payload(&mut ws, "client frame").await;
-            assert_eq!(first_payload.op, GatewayOpcode::Identify as i32);
-            close_test_websocket(&mut ws).await;
-        });
-
-        let config = test_config(ws_url);
+        let original = fs::read(&state_path).expect("checkpoint bytes");
+        let config = test_config("ws://127.0.0.1:1".into());
         let api_client = Arc::new(DiscordApiClient::new(&config).expect("create api client"));
         let connection = GatewayConnection::new(config, api_client);
-        let stream = connection
-            .connect_once_with_state_path(Some(state_path.clone()))
+        let error = connection
+            .connect_once_with_checkpoint(Some(checkpoint.clone()))
             .await
-            .expect("connect should succeed with identify fallback");
-        stream
-            .join_handle
+            .expect_err("must fail before connecting or identifying");
+        assert!(!error.is_retryable());
+        let error = connection
+            .connect_once_with_checkpoint(Some(checkpoint))
             .await
-            .expect("join")
-            .expect("loop success");
-        server.await.expect("server task");
+            .expect_err("failure must release the active-connection guard");
+        assert!(!error.is_retryable());
+        assert_eq!(fs::read(&state_path).expect("unchanged bytes"), original);
 
         let persisted = read_json_file_if_exists::<GatewayStateRecord>(&state_path)
             .expect("state file read")
             .expect("state file exists");
-        assert_eq!(persisted.session_id, None);
+        assert_eq!(persisted.session_id.as_deref(), Some("sess-incomplete"));
         assert_eq!(persisted.sequence, None);
         let _ = fs::remove_file(state_path);
+    }
+
+    fn acknowledged_test_session() -> GatewayState {
+        GatewayState {
+            session_id: Some("private-session-identity".into()),
+            resume_url: Some("wss://gateway.discord.gg".into()),
+            sequence: Some(1),
+            ..GatewayState::default()
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_acknowledgements_are_ordered_and_generation_bound() {
+        let state = acknowledged_test_session();
+        let delivery = delivery_state(state.clone(), None);
+        let (tx, mut rx) = mpsc::channel(8);
+        for sequence in [2, 3] {
+            queue_dispatch(
+                &tx,
+                &state,
+                GatewayEvent::Resumed,
+                sequence,
+                40,
+                &delivery,
+                0,
+            )
+            .await
+            .expect("queue dispatch");
+        }
+        let first = rx.recv().await.expect("first");
+        let second = rx.recv().await.expect("second");
+        assert!(!first.cursor().unwrap().contains("private-session-identity"));
+        assert_eq!(
+            first.cursor(),
+            Some(dispatch_cursor("private-session-identity", 2).as_str())
+        );
+        assert_ne!(first.cursor(), second.cursor());
+        second
+            .acknowledge()
+            .await
+            .expect_err("cannot skip pending first event");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+        first.acknowledge().await.expect("first acknowledged");
+        second.acknowledge().await.expect("second acknowledged");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(3));
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 4, 40, &delivery, 0)
+            .await
+            .expect("queue stale generation frame");
+        let stale = rx.recv().await.expect("stale frame");
+        delivery.lock().await.generation = 1;
+        stale
+            .acknowledge()
+            .await
+            .expect_err("old connection cannot commit");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(3));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_pending_buffer_is_bounded_until_acknowledgement() {
+        let state = acknowledged_test_session();
+        let delivery = delivery_state(state.clone(), None);
+        let (tx, mut rx) = mpsc::channel(GATEWAY_EVENT_BUFFER_CAPACITY);
+        for index in 0..GATEWAY_EVENT_BUFFER_CAPACITY {
+            queue_dispatch(
+                &tx,
+                &state,
+                GatewayEvent::Resumed,
+                index as u64 + 2,
+                1,
+                &delivery,
+                0,
+            )
+            .await
+            .expect("queue within count budget");
+            let _unacknowledged = rx.recv().await.expect("drain transport without ACK");
+        }
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 999, 1, &delivery, 0)
+            .await
+            .expect_err("receiving a frame does not free pending capacity");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+        assert_eq!(
+            delivery.lock().await.pending.len(),
+            GATEWAY_EVENT_BUFFER_CAPACITY
+        );
+
+        let delivery = delivery_state(state.clone(), None);
+        for index in 0..(GATEWAY_PENDING_MAX_BYTES / GATEWAY_FRAME_MAX_BYTES) {
+            queue_dispatch(
+                &tx,
+                &state,
+                GatewayEvent::Resumed,
+                index as u64 + 2,
+                GATEWAY_FRAME_MAX_BYTES,
+                &delivery,
+                0,
+            )
+            .await
+            .expect("queue within byte budget");
+            let _unacknowledged = rx.recv().await.expect("drain byte-budget frame");
+        }
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 999, 1, &delivery, 0)
+            .await
+            .expect_err("cumulative bytes must be bounded below the count limit");
+        assert_eq!(
+            delivery.lock().await.pending_bytes,
+            GATEWAY_PENDING_MAX_BYTES
+        );
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_failed_or_stale_checkpoint_commit_keeps_pending_progress() {
+        let checkpoint = test_checkpoint("ack-fence");
+        let state = acknowledged_test_session();
+        persist_checkpoint(Some(&checkpoint), &state).expect("initial checkpoint");
+        let original = fs::read(&checkpoint.state_path).expect("checkpoint bytes");
+        let delivery = delivery_state(state.clone(), Some(checkpoint.clone()));
+        let (tx, mut rx) = mpsc::channel(8);
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 2, 40, &delivery, 0)
+            .await
+            .expect("queue dispatch");
+        let frame = rx.recv().await.expect("pending frame");
+        let lock = lock_gateway_lease(&checkpoint.lease_path).expect("concurrent lease writer");
+        frame
+            .acknowledge()
+            .await
+            .expect_err("commit must not bypass shared lock");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+        assert_eq!(delivery.lock().await.pending.len(), 1);
+        assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
+        drop(lock);
+
+        write_json_file_atomic(
+            &checkpoint.lease_path,
+            &json!({
+                "holder_instance_id": "new-lease-holder", "lease_seq": 2,
+                "expires_at": current_unix_timestamp_secs() + 60,
+            }),
+        )
+        .expect("replace lease after handoff");
+        frame
+            .acknowledge()
+            .await
+            .expect_err("former owner cannot advance checkpoint");
+        assert_eq!(delivery.lock().await.committed.sequence, Some(1));
+        assert_eq!(delivery.lock().await.pending.len(), 1);
+        assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
+    }
+
+    #[test]
+    fn gateway_checkpoint_rejects_legacy_scope_mismatch_and_oversized_state() {
+        let checkpoint = test_checkpoint("checkpoint-validation");
+        let mut record = acknowledged_test_session().to_record(&checkpoint);
+        for version in [0, 1, 99] {
+            record.version = version;
+            write_json_file_atomic(&checkpoint.state_path, &record).expect("write old version");
+            let original = fs::read(&checkpoint.state_path).unwrap();
+            let error =
+                load_checkpoint(&checkpoint).expect_err("only consumer-committed v2 is valid");
+            assert!(!error.is_retryable());
+            assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
+        }
+        record.version = GATEWAY_STATE_VERSION;
+        record.scope = "different-subscription-policy".into();
+        write_json_file_atomic(&checkpoint.state_path, &record).expect("write different scope");
+        assert!(
+            !load_checkpoint(&checkpoint)
+                .expect_err("scope mismatch")
+                .is_retryable()
+        );
+        fs::write(
+            &checkpoint.state_path,
+            vec![b' '; GATEWAY_STATE_MAX_BYTES as usize + 1],
+        )
+        .expect("write oversized fixture");
+        assert!(
+            !load_checkpoint(&checkpoint)
+                .expect_err("bounded state read")
+                .is_retryable()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_invalid_session_persists_recovery_requirement_without_acknowledging() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+        let checkpoint = test_checkpoint("invalid-session");
+        let state = acknowledged_test_session();
+        persist_checkpoint(Some(&checkpoint), &state).expect("initial checkpoint");
+        let delivery = delivery_state(state.clone(), Some(checkpoint.clone()));
+        let server = fcp_async_core::task::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut ws = accept_test_websocket(socket).await;
+            send_message(&mut ws, hello_payload(1_000), "hello").await;
+            assert_eq!(
+                recv_payload(&mut ws, "resume").await.op,
+                GatewayOpcode::Resume as i32
+            );
+            send_message(
+                &mut ws,
+                dispatch_payload("MESSAGE_CREATE", 2, &json!({"id":"pending"})),
+                "pending message",
+            )
+            .await;
+            send_message(
+                &mut ws,
+                ServerWsMessage::Text(json!({"op":9,"d":false}).to_string()),
+                "invalidated session",
+            )
+            .await;
+            close_test_websocket(&mut ws).await;
+        });
+        let socket = connect_gateway_websocket(&ws_url).await.expect("connect");
+        let (tx, mut rx) = mpsc::channel(8);
+        let error = run_gateway_loop(
+            socket,
+            test_config(ws_url),
+            tx,
+            state,
+            Arc::clone(&delivery),
+            0,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("unavailable replay must stop recovery");
+        assert!(!error.is_retryable());
+        let pending = rx.recv().await.expect("pending event");
+        pending
+            .acknowledge()
+            .await
+            .expect_err("invalidated session cannot commit");
+        let persisted = load_checkpoint(&checkpoint).unwrap().unwrap();
+        assert_eq!(persisted.sequence, Some(1));
+        assert!(persisted.resume_invalidated);
+        assert!(
+            !validate_resume_state(&persisted)
+                .expect_err("must never IDENTIFY automatically")
+                .is_retryable()
+        );
+        assert!(delivery.lock().await.recovery_reason.is_some());
+        server.await.expect("server task");
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn gateway_failed_invalidation_write_still_fences_pending_acknowledgements() {
+        let checkpoint = test_checkpoint("invalid-session-write-failure");
+        let state = acknowledged_test_session();
+        persist_checkpoint(Some(&checkpoint), &state).expect("initial checkpoint");
+        let original = fs::read(&checkpoint.state_path).unwrap();
+        let delivery = delivery_state(state.clone(), Some(checkpoint.clone()));
+        let (tx, mut rx) = mpsc::channel(8);
+        queue_dispatch(&tx, &state, GatewayEvent::Resumed, 2, 40, &delivery, 0)
+            .await
+            .expect("pending dispatch");
+        let frame = rx.recv().await.expect("pending frame");
+        let lock = lock_gateway_lease(&checkpoint.lease_path).expect("block marker write");
+        let error = invalidate_resume(&delivery)
+            .await
+            .expect_err("invalidated session is terminal");
+        assert!(
+            !error.is_retryable(),
+            "write failure must not permit another session attempt"
+        );
+        drop(lock);
+        assert!(
+            !frame
+                .acknowledge()
+                .await
+                .expect_err("late ACK cannot clear invalidation")
+                .is_retryable()
+        );
+        let delivery = delivery.lock().await;
+        assert_eq!(delivery.committed.sequence, Some(1));
+        assert!(delivery.committed.resume_invalidated);
+        assert!(delivery.recovery_reason.is_some());
+        assert_eq!(fs::read(&checkpoint.state_path).unwrap(), original);
     }
 }
 
@@ -1061,14 +1375,164 @@ pub struct GatewayEventFrame {
     pub seq: Option<u64>,
     /// Parsed event payload.
     pub event: GatewayEvent,
+    /// Authoritative acknowledgement handle; diagnostic envelopes never carry it.
+    pub acknowledgement: Option<GatewayAcknowledgement>,
+}
+
+impl GatewayEventFrame {
+    /// Stable opaque cursor across RESUME and process restart in this session.
+    #[must_use]
+    pub fn cursor(&self) -> Option<&str> {
+        self.acknowledgement.as_ref().map(|ack| ack.cursor.as_str())
+    }
+
+    /// Commit this dispatch only after accepted downstream delivery or an
+    /// authorized policy decision to discard it.
+    ///
+    /// # Errors
+    /// Rejects missing authority, out-of-order or stale acknowledgements,
+    /// expired/stale leases, and checkpoint persistence failures.
+    pub async fn acknowledge(&self) -> DiscordResult<()> {
+        self.acknowledgement
+            .as_ref()
+            .ok_or_else(|| gateway_failure("Gateway frame has no acknowledgement authority"))?
+            .acknowledge()
+            .await
+    }
+}
+
+/// A fenced durable checkpoint owned by the connector's singleton lease.
+#[derive(Clone, Debug)]
+pub(crate) struct GatewayCheckpoint {
+    pub state_path: PathBuf,
+    pub lease_path: PathBuf,
+    pub holder_instance_id: String,
+    pub lease_seq: u64,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDispatch {
+    sequence: u64,
+    session_id: String,
+    resume_url: String,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct GatewayDeliveryState {
+    committed: GatewayState,
+    checkpoint: Option<GatewayCheckpoint>,
+    generation: u64,
+    pending: VecDeque<PendingDispatch>,
+    pending_bytes: usize,
+    recovery_reason: Option<String>,
+}
+
+/// An ordered acknowledgement bound to one Gateway connection generation.
+#[derive(Clone)]
+pub struct GatewayAcknowledgement {
+    state: Arc<Mutex<GatewayDeliveryState>>,
+    generation: u64,
+    sequence: u64,
+    session_id: String,
+    cursor: String,
+}
+
+impl std::fmt::Debug for GatewayAcknowledgement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayAcknowledgement")
+            .field("generation", &self.generation)
+            .field("sequence", &self.sequence)
+            .field("cursor", &self.cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GatewayAcknowledgement {
+    async fn acknowledge(&self) -> DiscordResult<()> {
+        let mut state = self.state.lock().await;
+        if let Some(reason) = &state.recovery_reason {
+            return Err(recovery_required(reason));
+        }
+        if state.generation != self.generation {
+            return Err(gateway_failure(
+                "Gateway acknowledgement belongs to a retired connection",
+            ));
+        }
+        let pending = state
+            .pending
+            .front()
+            .ok_or_else(|| gateway_failure("Gateway acknowledgement has no pending dispatch"))?;
+        if pending.sequence != self.sequence || pending.session_id != self.session_id {
+            return Err(gateway_failure(
+                "Gateway acknowledgements must commit in dispatch order",
+            ));
+        }
+        let candidate = GatewayState {
+            session_id: Some(pending.session_id.clone()),
+            resume_url: Some(pending.resume_url.clone()),
+            sequence: Some(self.sequence),
+            resume_invalidated: false,
+        };
+        if state.committed.resume_invalidated {
+            return Err(gateway_failure(
+                "Discord invalidated this resume session; reconcile before restarting",
+            ));
+        }
+        let already_committed = state.committed.session_id == candidate.session_id
+            && state
+                .committed
+                .sequence
+                .is_some_and(|sequence| sequence >= self.sequence);
+        if !already_committed {
+            persist_checkpoint(state.checkpoint.as_ref(), &candidate)?;
+            // No in-memory advancement is visible before durable persistence.
+            state.committed = candidate;
+        }
+        let committed = state
+            .pending
+            .pop_front()
+            .expect("pending dispatch checked above");
+        state.pending_bytes = state.pending_bytes.saturating_sub(committed.bytes);
+        Ok(())
+    }
+}
+
+fn gateway_failure(message: impl Into<String>) -> DiscordError {
+    DiscordError::Gateway(message.into())
+}
+
+fn recovery_required(message: &str) -> DiscordError {
+    DiscordError::InvalidInput(format!(
+        "Discord Gateway recovery required: {message}; reconcile unavailable events before using a new zone directory"
+    ))
+}
+
+fn dispatch_cursor(session_id: &str, sequence: u64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"fcp.discord.gateway.cursor.v2\0");
+    hash.update(session_id.as_bytes());
+    hash.update([0]);
+    hash.update(sequence.to_be_bytes());
+    format!("discord:{}", hex::encode(hash.finalize()))
+}
+
+struct GatewayActivityGuard(Arc<AtomicBool>);
+
+impl Drop for GatewayActivityGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Discord Gateway connection.
 pub struct GatewayConnection {
     config: DiscordConfig,
     api_client: Arc<DiscordApiClient>,
-    state: Arc<Mutex<GatewayState>>,
+    state: Arc<Mutex<GatewayDeliveryState>>,
     active_connection: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl GatewayConnection {
@@ -1077,23 +1541,28 @@ impl GatewayConnection {
         Self {
             config,
             api_client,
-            state: Arc::new(Mutex::new(GatewayState::default())),
+            state: Arc::new(Mutex::new(GatewayDeliveryState::default())),
             active_connection: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Connect to the gateway once and return the event stream handle.
     /// If we have a previous session, will attempt to resume.
+    ///
+    /// # Errors
+    /// Rejects concurrent connections and unsafe resume state, or returns the
+    /// provider connection error.
     #[instrument(skip(self))]
     pub async fn connect_once(&self) -> DiscordResult<GatewayStream> {
-        self.connect_once_with_state_path(None).await
+        self.connect_once_with_checkpoint(None).await
     }
 
     /// Connect to the gateway once with optional persisted gateway state.
     #[instrument(skip(self))]
-    pub async fn connect_once_with_state_path(
+    pub(crate) async fn connect_once_with_checkpoint(
         &self,
-        state_path: Option<PathBuf>,
+        checkpoint: Option<GatewayCheckpoint>,
     ) -> DiscordResult<GatewayStream> {
         if self
             .active_connection
@@ -1104,26 +1573,41 @@ impl GatewayConnection {
                 "Gateway connection already active".into(),
             ));
         }
+        let activity = GatewayActivityGuard(Arc::clone(&self.active_connection));
+        self.shutdown_requested.store(false, Ordering::Release);
 
         let (event_tx, event_rx) = mpsc::channel(GATEWAY_EVENT_BUFFER_CAPACITY);
 
         let config = self.config.clone();
         let api_client = self.api_client.clone();
         let state_store = Arc::clone(&self.state);
-
-        let mut state_snapshot = {
-            let state = state_store.lock().await;
-            state.clone()
+        let (state_snapshot, generation) = {
+            let mut state = state_store.lock().await;
+            if let Some(reason) = &state.recovery_reason {
+                return Err(recovery_required(reason));
+            }
+            if let (Some(old), Some(new)) = (&state.checkpoint, &checkpoint)
+                && old.scope != new.scope
+            {
+                return Err(recovery_required("Gateway checkpoint scope changed"));
+            }
+            let snapshot = match checkpoint.as_ref() {
+                Some(checkpoint) => {
+                    load_checkpoint(checkpoint)?.unwrap_or_else(|| state.committed.clone())
+                }
+                None => state.committed.clone(),
+            };
+            validate_resume_state(&snapshot)?;
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| gateway_failure("Gateway connection generation exhausted"))?;
+            state.pending.clear();
+            state.pending_bytes = 0;
+            state.checkpoint = checkpoint;
+            state.committed = snapshot.clone();
+            (snapshot, state.generation)
         };
-
-        if let Some(path) = state_path.as_deref()
-            && let Some(persisted) = load_persisted_gateway_state(path)?
-            && (!state_snapshot.is_resume_ready()
-                || state_snapshot.sequence.unwrap_or_default()
-                    < persisted.sequence.unwrap_or_default())
-        {
-            state_snapshot = persisted;
-        }
 
         // Determine gateway URL
         let gateway_url = if let Some(ref url) = state_snapshot.resume_url {
@@ -1131,10 +1615,15 @@ impl GatewayConnection {
         } else if let Some(url) = &config.gateway_url {
             url.clone()
         } else {
-            match api_client.get_gateway().await {
+            match gateway_operation(
+                api_client.get_gateway(),
+                &self.shutdown_requested,
+                Duration::from_secs(30),
+            )
+            .await?
+            {
                 Ok(url) => url,
                 Err(e) => {
-                    self.active_connection.store(false, Ordering::Release);
                     return Err(e);
                 }
             }
@@ -1142,38 +1631,58 @@ impl GatewayConnection {
 
         let ws_url = format!("{gateway_url}/?v=10&encoding=json");
         info!(
-            url = %ws_url,
             resuming = state_snapshot.session_id.is_some(),
             "Connecting to Discord gateway"
         );
 
-        let ws_stream = match connect_gateway_websocket(&ws_url).await {
+        let ws_stream = match gateway_operation(
+            connect_gateway_websocket(&ws_url),
+            &self.shutdown_requested,
+            Duration::from_secs(30),
+        )
+        .await?
+        {
             Ok(stream) => stream,
             Err(e) => {
-                self.active_connection.store(false, Ordering::Release);
                 return Err(DiscordError::Gateway(format!("Failed to connect WS: {e}")));
             }
         };
 
-        let active_connection = Arc::clone(&self.active_connection);
+        let shutdown_requested = Arc::clone(&self.shutdown_requested);
         let join_handle = fcp_async_core::task::spawn(async move {
+            let _activity = activity;
             let result = Box::pin(run_gateway_loop(
                 ws_stream,
                 config,
                 event_tx,
                 state_snapshot,
                 state_store,
-                state_path,
+                generation,
+                shutdown_requested,
             ))
             .await;
-            active_connection.store(false, Ordering::Release);
-            result
+            result.map_err(|error| Box::new(error) as StreamingError)
         });
 
         Ok(GatewayStream {
             events: event_rx,
             join_handle,
         })
+    }
+
+    /// Signal the actual socket worker and wait for bounded drain before lease release.
+    ///
+    /// # Errors
+    /// Returns an error if the socket worker does not stop within two seconds.
+    pub async fn stop_active(&self) -> DiscordResult<()> {
+        self.shutdown_requested.store(true, Ordering::Release);
+        fcp_async_core::time::timeout(Duration::from_secs(2), async {
+            while self.active_connection.load(Ordering::Acquire) {
+                fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| gateway_failure("Discord Gateway worker is still draining"))
     }
 }
 
@@ -1182,32 +1691,28 @@ struct GatewayState {
     session_id: Option<String>,
     resume_url: Option<String>,
     sequence: Option<u64>,
+    resume_invalidated: bool,
 }
 
 impl GatewayState {
-    const fn is_resume_ready(&self) -> bool {
-        self.session_id.is_some() && self.sequence.is_some()
-    }
-
-    fn clear_resume(&mut self) {
-        self.session_id = None;
-        self.resume_url = None;
-        self.sequence = None;
-    }
-
     fn from_record(record: GatewayStateRecord) -> Self {
         Self {
             session_id: record.session_id,
             resume_url: record.resume_url,
             sequence: record.sequence,
+            resume_invalidated: record.resume_invalidated,
         }
     }
 
-    fn to_record(&self) -> GatewayStateRecord {
+    fn to_record(&self, checkpoint: &GatewayCheckpoint) -> GatewayStateRecord {
         GatewayStateRecord {
+            version: GATEWAY_STATE_VERSION,
+            scope: checkpoint.scope.clone(),
+            lease_seq: checkpoint.lease_seq,
             session_id: self.session_id.clone(),
             resume_url: self.resume_url.clone(),
             sequence: self.sequence,
+            resume_invalidated: self.resume_invalidated,
             updated_at: current_unix_timestamp_secs(),
         }
     }
@@ -1215,9 +1720,17 @@ impl GatewayState {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct GatewayStateRecord {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    lease_seq: u64,
     session_id: Option<String>,
     resume_url: Option<String>,
     sequence: Option<u64>,
+    #[serde(default)]
+    resume_invalidated: bool,
     updated_at: u64,
 }
 
@@ -1228,14 +1741,33 @@ fn current_unix_timestamp_secs() -> u64 {
 }
 
 fn write_json_file_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
     let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    fs::write(&tmp_path, payload)?;
+    if payload.len() as u64 > GATEWAY_STATE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Gateway state exceeds its byte limit",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&tmp_path)?;
+    temporary.write_all(&payload)?;
+    temporary.sync_all()?;
+    drop(temporary);
     fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1243,8 +1775,23 @@ fn read_json_file_if_exists<T>(path: &Path) -> io::Result<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
-    match fs::read(path) {
-        Ok(bytes) => {
+    match File::open(path) {
+        Ok(file) => {
+            if file.metadata()?.len() > GATEWAY_STATE_MAX_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Gateway state exceeds its byte limit",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(GATEWAY_STATE_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > GATEWAY_STATE_MAX_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Gateway state exceeds its byte limit",
+                ));
+            }
             let value = serde_json::from_slice::<T>(&bytes).map_err(io::Error::other)?;
             Ok(Some(value))
         }
@@ -1253,49 +1800,129 @@ where
     }
 }
 
-fn persist_gateway_state(path: &Path, state: &GatewayState) -> DiscordResult<()> {
-    let record = state.to_record();
-    write_json_file_atomic(path, &record).map_err(|err| {
-        DiscordError::Gateway(format!(
-            "Failed to persist gateway state file '{}': {err}",
-            path.display()
-        ))
+/// Lock the stable sidecar shared by lease transitions and checkpoint writes.
+/// The sidecar must never be unlinked while a zone directory is in use.
+pub(crate) fn lock_gateway_lease(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(path.with_extension("lock"))?;
+    lock.try_lock().map_err(|error| match error {
+        fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Gateway lease/checkpoint update is in progress",
+        ),
+        fs::TryLockError::Error(error) => error,
     })?;
+    Ok(lock)
+}
+
+#[derive(Deserialize)]
+struct GatewayLeaseFence {
+    holder_instance_id: String,
+    lease_seq: u64,
+    expires_at: u64,
+}
+
+fn verify_checkpoint_lease(checkpoint: &GatewayCheckpoint) -> DiscordResult<()> {
+    let lease = read_json_file_if_exists::<GatewayLeaseFence>(&checkpoint.lease_path)
+        .map_err(|error| gateway_failure(format!("Cannot read Gateway lease fence: {error}")))?
+        .ok_or_else(|| gateway_failure("Gateway checkpoint lease is missing"))?;
+    if lease.lease_seq != checkpoint.lease_seq
+        || lease.holder_instance_id != checkpoint.holder_instance_id
+        || lease.expires_at <= current_unix_timestamp_secs()
+    {
+        return Err(gateway_failure(
+            "Gateway checkpoint lease is expired or belongs to another owner",
+        ));
+    }
     Ok(())
 }
 
-fn persist_gateway_state_if_configured(
-    state_path: Option<&Path>,
+fn read_checkpoint_record(
+    checkpoint: &GatewayCheckpoint,
+) -> DiscordResult<Option<GatewayStateRecord>> {
+    let record = read_json_file_if_exists::<GatewayStateRecord>(&checkpoint.state_path).map_err(
+        |error| recovery_required(&format!("cannot read the existing checkpoint: {error}")),
+    )?;
+    if let Some(record) = &record {
+        if record.version != GATEWAY_STATE_VERSION {
+            return Err(recovery_required(
+                "legacy or unsupported checkpoint version cannot establish consumer-confirmed progress",
+            ));
+        }
+        if record.scope != checkpoint.scope || record.scope.is_empty() {
+            return Err(recovery_required(
+                "checkpoint scope differs from the credential, zone, subscription or policy",
+            ));
+        }
+        if record.lease_seq > checkpoint.lease_seq {
+            return Err(gateway_failure(
+                "Gateway checkpoint is fenced by a newer lease",
+            ));
+        }
+    }
+    Ok(record)
+}
+
+fn validate_resume_state(state: &GatewayState) -> DiscordResult<()> {
+    if state.resume_invalidated {
+        return Err(recovery_required(
+            "the provider invalidated this resume session",
+        ));
+    }
+    match (&state.session_id, &state.resume_url, state.sequence) {
+        (None, None, None) => Ok(()),
+        (Some(session), Some(url), Some(_)) if !session.is_empty() && !url.is_empty() => Ok(()),
+        _ => Err(recovery_required(
+            "the stored session has no complete consumer-confirmed resume position",
+        )),
+    }
+}
+
+fn load_checkpoint(checkpoint: &GatewayCheckpoint) -> DiscordResult<Option<GatewayState>> {
+    let _lock = lock_gateway_lease(&checkpoint.lease_path)
+        .map_err(|error| gateway_failure(format!("Cannot lock Gateway checkpoint: {error}")))?;
+    verify_checkpoint_lease(checkpoint)?;
+    read_checkpoint_record(checkpoint).map(|record| record.map(GatewayState::from_record))
+}
+
+fn persist_checkpoint(
+    checkpoint: Option<&GatewayCheckpoint>,
     state: &GatewayState,
 ) -> DiscordResult<()> {
-    if let Some(path) = state_path {
-        persist_gateway_state(path, state)?;
-    }
-    Ok(())
-}
-
-fn load_persisted_gateway_state(path: &Path) -> DiscordResult<Option<GatewayState>> {
-    let Some(record) = read_json_file_if_exists::<GatewayStateRecord>(path).map_err(|err| {
-        DiscordError::Gateway(format!(
-            "Failed to read gateway state file '{}': {err}",
-            path.display()
-        ))
-    })?
-    else {
-        return Ok(None);
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
     };
-
-    let mut state = GatewayState::from_record(record);
-    if state.session_id.is_some() ^ state.sequence.is_some() {
-        warn!(
-            path = %path.display(),
-            "Incomplete persisted gateway resume state detected; clearing state and re-identifying"
-        );
-        state.clear_resume();
-        persist_gateway_state(path, &state)?;
+    let _lock = lock_gateway_lease(&checkpoint.lease_path)
+        .map_err(|error| gateway_failure(format!("Cannot lock Gateway checkpoint: {error}")))?;
+    verify_checkpoint_lease(checkpoint)?;
+    if let Some(current) = read_checkpoint_record(checkpoint)? {
+        if current.resume_invalidated && !state.resume_invalidated {
+            return Err(recovery_required(
+                "the provider invalidated the stored resume session",
+            ));
+        }
+        if current.session_id.is_some() && current.session_id != state.session_id {
+            return Err(recovery_required(
+                "a different session cannot replace consumer-confirmed history",
+            ));
+        }
+        if current.sequence > state.sequence {
+            return Err(gateway_failure(
+                "Gateway checkpoint would regress committed progress",
+            ));
+        }
     }
-
-    Ok(Some(state))
+    write_json_file_atomic(&checkpoint.state_path, &state.to_record(checkpoint))
+        .map_err(|error| gateway_failure(format!("Cannot persist Gateway checkpoint: {error}")))
 }
 
 fn dispatch_event(
@@ -1306,13 +1933,21 @@ fn dispatch_event(
     let event = match event_name.as_str() {
         "READY" => {
             let ready: GatewayReady = serde_json::from_value(data)?;
+            if ready.session_id.is_empty() || ready.resume_gateway_url.is_empty() {
+                return Err(recovery_required("READY omitted its resume identity"));
+            }
+            if state
+                .session_id
+                .as_ref()
+                .is_some_and(|session| session != &ready.session_id)
+            {
+                return Err(recovery_required(
+                    "the provider replaced the previous session instead of resuming it",
+                ));
+            }
             state.session_id = Some(ready.session_id.clone());
             state.resume_url = Some(ready.resume_gateway_url.clone());
-            info!(
-                user = ?ready.user.username,
-                session_id = %ready.session_id,
-                "Gateway ready"
-            );
+            info!("Gateway ready");
             GatewayEvent::Ready(ready)
         }
         "RESUMED" => {
@@ -1336,7 +1971,7 @@ fn dispatch_event(
 /// Handle for a single gateway connection attempt.
 pub struct GatewayStream {
     pub events: mpsc::Receiver<GatewayEventFrame>,
-    pub join_handle: fcp_async_core::task::JoinHandle<DiscordResult<()>>,
+    pub join_handle: fcp_async_core::task::JoinHandle<Result<(), StreamingError>>,
 }
 
 impl std::fmt::Debug for GatewayStream {
@@ -1351,23 +1986,148 @@ async fn run_gateway_loop(
     config: DiscordConfig,
     event_tx: mpsc::Sender<GatewayEventFrame>,
     mut state: GatewayState,
-    state_store: Arc<Mutex<GatewayState>>,
-    state_path: Option<PathBuf>,
+    state_store: Arc<Mutex<GatewayDeliveryState>>,
+    generation: u64,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> DiscordResult<()> {
     let result = Box::pin(run_gateway_loop_inner(
         ws_stream,
         config,
         &event_tx,
         &mut state,
-        state_path.as_deref(),
+        &state_store,
+        generation,
+        &shutdown_requested,
     ))
     .await;
-    let persisted_state = state.clone();
-    let mut store = state_store.lock().await;
-    *store = state;
-    drop(store);
-    persist_gateway_state_if_configured(state_path.as_deref(), &persisted_state)?;
+    if let Err(error) = &result
+        && !error.is_retryable()
+    {
+        state_store.lock().await.recovery_reason = Some(error.to_string());
+    }
     result
+}
+
+async fn gateway_operation<F: std::future::Future>(
+    operation: F,
+    shutdown_requested: &AtomicBool,
+    deadline: Duration,
+) -> DiscordResult<F::Output> {
+    let mut operation = Box::pin(operation);
+    let started = Instant::now();
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err(gateway_failure("Gateway worker was stopped"));
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(gateway_failure("Gateway operation timed out"));
+        }
+        if let Ok(value) =
+            fcp_async_core::time::timeout(remaining.min(GATEWAY_STOP_POLL), &mut operation).await
+        {
+            return Ok(value);
+        }
+    }
+}
+
+async fn queue_dispatch(
+    event_tx: &mpsc::Sender<GatewayEventFrame>,
+    state: &GatewayState,
+    event: GatewayEvent,
+    sequence: u64,
+    bytes: usize,
+    state_store: &Arc<Mutex<GatewayDeliveryState>>,
+    generation: u64,
+) -> DiscordResult<()> {
+    let session_id = state
+        .session_id
+        .as_ref()
+        .ok_or_else(|| recovery_required("dispatch arrived before a valid READY session"))?;
+    let resume_url = state
+        .resume_url
+        .as_ref()
+        .ok_or_else(|| recovery_required("dispatch has no resume endpoint"))?;
+    let mut delivery = state_store.lock().await;
+    if generation != delivery.generation || delivery.committed.resume_invalidated {
+        return Err(gateway_failure(
+            "Gateway dispatch belongs to a retired connection",
+        ));
+    }
+    if delivery.pending.len() >= GATEWAY_EVENT_BUFFER_CAPACITY
+        || bytes > GATEWAY_PENDING_MAX_BYTES.saturating_sub(delivery.pending_bytes)
+    {
+        return Err(gateway_failure(
+            "Gateway unacknowledged dispatch buffer is full; resume from the committed cursor",
+        ));
+    }
+    if delivery.committed.session_id.is_none() {
+        let provisional = GatewayState {
+            session_id: Some(session_id.clone()),
+            resume_url: Some(resume_url.clone()),
+            sequence: None,
+            resume_invalidated: false,
+        };
+        // Record that a session exists without claiming any dispatch was consumed.
+        // An interrupted first READY must not silently become a fresh IDENTIFY.
+        if let Err(error) = persist_checkpoint(delivery.checkpoint.as_ref(), &provisional) {
+            let reason = format!("cannot record the first unacknowledged session: {error}");
+            delivery.recovery_reason = Some(reason.clone());
+            return Err(recovery_required(&reason));
+        }
+        delivery.committed = provisional;
+    } else if delivery.committed.session_id.as_ref() != Some(session_id) {
+        return Err(recovery_required(
+            "dispatch session differs from the committed checkpoint",
+        ));
+    }
+    let frame = GatewayEventFrame {
+        seq: Some(sequence),
+        event,
+        acknowledgement: Some(GatewayAcknowledgement {
+            state: Arc::clone(state_store),
+            generation,
+            sequence,
+            session_id: session_id.clone(),
+            cursor: dispatch_cursor(session_id, sequence),
+        }),
+    };
+    // The pending queue includes the currently delivered frame. Capacity does not
+    // become available merely because the downstream worker received a frame.
+    delivery.pending.push_back(PendingDispatch {
+        sequence,
+        session_id: session_id.clone(),
+        resume_url: resume_url.clone(),
+        bytes,
+    });
+    delivery.pending_bytes += bytes;
+    if event_tx.try_send(frame).is_err() {
+        delivery.pending.pop_back();
+        delivery.pending_bytes = delivery.pending_bytes.saturating_sub(bytes);
+        return Err(gateway_failure(
+            "Gateway consumer is unavailable; resume from the committed cursor",
+        ));
+    }
+    Ok(())
+}
+
+async fn invalidate_resume(state_store: &Arc<Mutex<GatewayDeliveryState>>) -> DiscordResult<()> {
+    let mut delivery = state_store.lock().await;
+    let mut invalidated = delivery.committed.clone();
+    invalidated.resume_invalidated = true;
+    // This is a safety fence, not cursor advancement. Install it before I/O:
+    // an unavailable disk must not let a late ACK undo known provider loss.
+    delivery.recovery_reason = Some("the provider can no longer replay this session".into());
+    let persisted = persist_checkpoint(delivery.checkpoint.as_ref(), &invalidated);
+    delivery.committed = invalidated;
+    if let Err(error) = persisted {
+        return Err(recovery_required(&format!(
+            "the provider invalidated the session and its recovery marker could not be persisted: {error}"
+        )));
+    }
+    Err(recovery_required(
+        "the provider can no longer replay this session",
+    ))
 }
 
 #[allow(clippy::large_futures)]
@@ -1376,10 +2136,19 @@ async fn run_gateway_loop_inner(
     config: DiscordConfig,
     event_tx: &mpsc::Sender<GatewayEventFrame>,
     state: &mut GatewayState,
-    state_path: Option<&Path>,
+    state_store: &Arc<Mutex<GatewayDeliveryState>>,
+    generation: u64,
+    shutdown_requested: &AtomicBool,
 ) -> DiscordResult<()> {
+    validate_resume_state(state)?;
     // Wait for Hello
-    let hello = match ws_stream.recv().await {
+    let hello = match gateway_operation(
+        ws_stream.recv(),
+        shutdown_requested,
+        Duration::from_secs(10),
+    )
+    .await?
+    {
         Ok(Some(WsMessage::Text(text))) => match serde_json::from_str::<GatewayPayload>(&text) {
             Ok(payload) => {
                 if payload.op != GatewayOpcode::Hello as i32 {
@@ -1395,10 +2164,8 @@ async fn run_gateway_loop_inner(
             }
             Err(e) => return Err(e.into()),
         },
-        Ok(Some(msg)) => {
-            return Err(DiscordError::Gateway(format!(
-                "Unexpected message: {msg:?}"
-            )));
+        Ok(Some(_)) => {
+            return Err(gateway_failure("Unexpected Gateway message before Hello"));
         }
         Ok(None) => {
             return Err(DiscordError::Gateway(
@@ -1412,16 +2179,10 @@ async fn run_gateway_loop_inner(
     debug!(interval_ms = hello.heartbeat_interval, "Received Hello");
     let mut send_limiter = GatewaySendLimiter::default();
 
-    if state.session_id.is_some() ^ state.sequence.is_some() {
-        warn!("Incomplete resume state detected; clearing state and re-identifying");
-        state.clear_resume();
-        persist_gateway_state_if_configured(state_path, state)?;
-    }
-
     // Send Resume if we have a session, otherwise Identify
     if let (Some(sess_id), Some(seq)) = (&state.session_id, state.sequence) {
         // We have a session to resume
-        info!(session_id = %sess_id, sequence = seq, "Attempting to resume session");
+        info!(sequence = seq, "Attempting to resume session");
 
         let resume = GatewayResume {
             token: config.bot_credential.clone(),
@@ -1477,7 +2238,12 @@ async fn run_gateway_loop_inner(
             identify_window_ms = identify_window.as_millis() as u64,
             "Waiting for Discord gateway identify limiter"
         );
-        shared_gateway_identify_limiter().wait(&config).await;
+        gateway_operation(
+            shared_gateway_identify_limiter().wait(&config),
+            shutdown_requested,
+            Duration::from_secs(60),
+        )
+        .await?;
         send_gateway_payload(
             &mut ws_stream,
             &mut send_limiter,
@@ -1491,69 +2257,89 @@ async fn run_gateway_loop_inner(
     // Main event loop
     let mut heartbeat_acked = true;
     let mut next_heartbeat_at = std::time::Instant::now() + heartbeat_interval;
+    // The provider needs the most recently received sequence in heartbeat
+    // packets. Only consumer acknowledgements advance the separate checkpoint.
+    let mut received_sequence = state.sequence;
 
     loop {
+        if shutdown_requested.load(Ordering::Acquire) || event_tx.is_closed() {
+            return Ok(());
+        }
         let now = std::time::Instant::now();
-        let wait_for_message = next_heartbeat_at.saturating_duration_since(now);
-
-        match fcp_async_core::time::timeout(wait_for_message, ws_stream.recv()).await {
-            Err(_) => {
-                if !heartbeat_acked {
-                    warn!("Heartbeat not acknowledged, connection zombied");
-                    return Err(DiscordError::Gateway("Heartbeat timeout (zombied)".into()));
-                }
-                let heartbeat = GatewayPayload {
-                    op: GatewayOpcode::Heartbeat as i32,
-                    d: Some(json!(state.sequence)),
-                    s: None,
-                    t: None,
-                };
-                if let Err(e) = send_gateway_payload(
-                    &mut ws_stream,
-                    &mut send_limiter,
-                    &heartbeat,
-                    true,
-                    "heartbeat",
-                )
-                .await
-                {
-                    error!(error = %e, "Failed to send heartbeat");
-                    return Err(e);
-                }
-                heartbeat_acked = false;
-                next_heartbeat_at = std::time::Instant::now() + heartbeat_interval;
-                debug!("Sent heartbeat");
+        // Check the deadline before polling the socket. A continuously ready
+        // dispatch stream must not starve heartbeats by winning every timeout.
+        if now >= next_heartbeat_at {
+            if !heartbeat_acked {
+                warn!("Heartbeat not acknowledged, connection zombied");
+                return Err(gateway_failure("Heartbeat timeout (zombied)"));
             }
-            Ok(Ok(Some(WsMessage::Text(text)))) => {
-                let payload: GatewayPayload = match serde_json::from_str(&text) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse gateway payload");
-                        continue;
-                    }
-                };
+            let heartbeat = GatewayPayload {
+                op: GatewayOpcode::Heartbeat as i32,
+                d: Some(json!(received_sequence)),
+                s: None,
+                t: None,
+            };
+            send_gateway_payload(
+                &mut ws_stream,
+                &mut send_limiter,
+                &heartbeat,
+                true,
+                "heartbeat",
+            )
+            .await?;
+            heartbeat_acked = false;
+            next_heartbeat_at = Instant::now() + heartbeat_interval;
+            debug!("Sent heartbeat");
+            continue;
+        }
+        let wait_for_message = next_heartbeat_at
+            .saturating_duration_since(now)
+            .min(GATEWAY_STOP_POLL);
 
-                // Update sequence
-                if let Some(s) = payload.s {
-                    state.sequence = Some(s);
-                    persist_gateway_state_if_configured(state_path, state)?;
-                }
+        // asupersync WebSocket::recv is cancel-safe: partial frames and message
+        // fragments live in the connection's codec/assembler, not this future.
+        match fcp_async_core::time::timeout(wait_for_message, ws_stream.recv()).await {
+            Err(_) => continue,
+            Ok(Ok(Some(WsMessage::Text(text)))) => {
+                let payload: GatewayPayload = serde_json::from_str(&text).map_err(|_| {
+                    gateway_failure(
+                        "Malformed Gateway payload; refusing to skip unconsumed history",
+                    )
+                })?;
 
                 match GatewayOpcode::try_from(payload.op) {
                     Ok(GatewayOpcode::Dispatch) => {
-                        let event_name = payload.t.unwrap_or_default();
-                        let data = payload.d.unwrap_or_default();
-                        let event = dispatch_event(event_name, data, state)?;
-                        let frame = GatewayEventFrame {
-                            seq: payload.s,
-                            event,
-                        };
-                        persist_gateway_state_if_configured(state_path, state)?;
-
-                        if event_tx.send(frame).await.is_err() {
-                            info!("Event receiver dropped, closing gateway");
-                            return Ok(());
+                        let sequence = payload
+                            .s
+                            .ok_or_else(|| recovery_required("dispatch omitted its sequence"))?;
+                        if received_sequence.is_some_and(|previous| sequence < previous) {
+                            return Err(recovery_required(
+                                "dispatch sequence regressed within the provider session",
+                            ));
                         }
+                        received_sequence = Some(sequence);
+                        let event_name = payload
+                            .t
+                            .filter(|name| !name.is_empty())
+                            .ok_or_else(|| recovery_required("dispatch omitted its event type"))?;
+                        let data =
+                            payload
+                                .d
+                                .filter(serde_json::Value::is_object)
+                                .ok_or_else(|| {
+                                    recovery_required("dispatch payload is not an object")
+                                })?;
+                        let event = dispatch_event(event_name, data, state)?;
+                        queue_dispatch(
+                            event_tx,
+                            state,
+                            event,
+                            sequence,
+                            text.len(),
+                            state_store,
+                            generation,
+                        )
+                        .await?;
                     }
                     Ok(GatewayOpcode::HeartbeatAck) => {
                         heartbeat_acked = true;
@@ -1567,16 +2353,14 @@ async fn run_gateway_loop_inner(
                         let resumable = payload.d.and_then(|v| v.as_bool()).unwrap_or(false);
                         warn!(resumable, "Session invalidated");
                         if !resumable {
-                            // Clear session state - must re-identify
-                            state.clear_resume();
-                            persist_gateway_state_if_configured(state_path, state)?;
+                            return invalidate_resume(state_store).await;
                         }
                         return Ok(());
                     }
                     Ok(GatewayOpcode::Heartbeat) => {
                         let heartbeat = GatewayPayload {
                             op: GatewayOpcode::Heartbeat as i32,
-                            d: Some(json!(state.sequence)),
+                            d: Some(json!(received_sequence)),
                             s: None,
                             t: None,
                         };
@@ -1599,7 +2383,13 @@ async fn run_gateway_loop_inner(
                 }
             }
             Ok(Ok(Some(WsMessage::Close(frame)))) => {
-                info!(frame = ?frame, "Gateway connection closed");
+                if frame
+                    .as_ref()
+                    .is_some_and(|frame| matches!(frame.code, 4007 | 4009))
+                {
+                    return invalidate_resume(state_store).await;
+                }
+                info!("Gateway connection closed");
                 return Ok(());
             }
             Ok(Ok(Some(_))) => {

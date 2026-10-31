@@ -13,14 +13,13 @@
 #![allow(clippy::too_many_lines)]
 
 use asupersync::io::{AsyncRead, ReadBuf};
-use asupersync::net::websocket::{
-    CloseReason, Message as ServerWsMessage, ServerWebSocket, WebSocketAcceptor,
-};
+use asupersync::net::websocket::{Message as ServerWsMessage, ServerWebSocket, WebSocketAcceptor};
 use chrono::{Duration, Utc};
 use fcp_async_core::net::TcpListener;
 use fcp_crypto::cose::CapabilityTokenBuilder;
 use fcp_crypto::ed25519::Ed25519SigningKey;
 use fcp_prelude::{CapabilityConstraints, InstanceId};
+use fcp_sdk::prelude::{JsonlEventStream, JsonlWriter};
 use fcp_sdk::{
     AgentId, ChatCoordinationBackend, ClaimKey, ClaimOutcome, InMemoryThreadOwnershipChecker,
     ThreadOwnershipChecker,
@@ -128,6 +127,131 @@ fn unique_zone_dir(label: &str) -> String {
         .join(format!("{label}-{}", Uuid::new_v4()))
         .to_string_lossy()
         .into_owned()
+}
+
+const NATIVE_STREAM_ID: &str = "discord-integration-stream";
+
+struct NativeCaptureWriter {
+    pending: Vec<u8>,
+    frames: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Write for NativeCaptureWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let frame = serde_json::from_slice(&self.pending).map_err(std::io::Error::other)?;
+        self.frames.lock().expect("native capture lock").push(frame);
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+struct NativeCapture {
+    stream: JsonlEventStream,
+    frames: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl NativeCapture {
+    fn attach(connector: &mut DiscordConnector) -> Self {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let stream = JsonlEventStream::new(JsonlWriter::new(NativeCaptureWriter {
+            pending: Vec::new(),
+            frames: Arc::clone(&frames),
+        }));
+        connector
+            .attach_event_stream(stream.clone())
+            .expect("attach native event writer before handshake");
+        Self { stream, frames }
+    }
+
+    async fn next_event(&self, index: usize) -> fcp_core::EventEnvelope {
+        fcp_async_core::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let frame = self
+                    .frames
+                    .lock()
+                    .expect("native capture lock")
+                    .get(index)
+                    .cloned();
+                if let Some(frame) = frame {
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    assert_eq!(frame["method"], "event");
+                    assert!(frame.get("id").is_none());
+                    assert_eq!(frame["params"]["stream_id"], NATIVE_STREAM_ID);
+                    let event: fcp_core::EventEnvelope =
+                        serde_json::from_value(frame["params"]["event"].clone())
+                            .expect("canonical native event envelope");
+                    assert!(event.requires_ack);
+                    assert!(!event.cursor.is_empty());
+                    assert_eq!(event.data.connector_id.as_str(), "fcp.discord");
+                    assert_eq!(event.data.zone_id, fcp_core::ZoneId::work());
+                    return event;
+                }
+                fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native event must reach the JSONL transport")
+    }
+
+    fn acknowledge(&self, event: &fcp_core::EventEnvelope) {
+        self.stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&event.topic, vec![event.seq])
+                    .with_cursors(vec![event.cursor.clone()]),
+            }))
+            .expect("acknowledge the exact native event identity");
+    }
+
+    fn len(&self) -> usize {
+        self.frames.lock().expect("native capture lock").len()
+    }
+}
+
+fn native_subscription_request(
+    signing_key: &BoundTestSigningKey,
+    topic: &str,
+) -> serde_json::Value {
+    native_subscription_request_with_lifetime(signing_key, topic, Duration::hours(1))
+}
+
+fn native_subscription_request_with_lifetime(
+    signing_key: &BoundTestSigningKey,
+    topic: &str,
+    lifetime: Duration,
+) -> serde_json::Value {
+    let now = Utc::now();
+    let constraints = CapabilityConstraints {
+        resource_allow: vec![format!("discord:events:{topic}")],
+        ..Default::default()
+    };
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&constraints, &mut cbor).expect("serialize subscription constraints");
+    let token = CapabilityTokenBuilder::new()
+        .capability_id("discord.read")
+        .zone_id("z:work")
+        .principal("user:native-consumer")
+        .operations(&["discord.subscribe"])
+        .issuer("node:test")
+        .validity(now, now + lifetime)
+        .target_instance(signing_key.instance_id.as_ref())
+        .try_constraints_cbor(&cbor)
+        .expect("subscription constraints")
+        .sign(&signing_key.signing_key)
+        .expect("sign subscription");
+    json!({
+        "type": "subscribe",
+        "id": "discord-native-subscribe",
+        "stream_id": NATIVE_STREAM_ID,
+        "topics": [topic],
+        "window_size": 1,
+        "capability_token": fcp_core::CapabilityToken::from_raw(token),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -336,11 +460,14 @@ async fn accept_test_gateway_websocket(
 }
 
 async fn recv_gateway_payload(ws: &mut TestGatewayWebSocket, context: &str) -> serde_json::Value {
-    let message = ws
-        .recv(&fcp_async_core::compatibility_cx())
-        .await
-        .expect(context)
-        .unwrap_or_else(|| panic!("{context} missing"));
+    let message = fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        ws.recv(&fcp_async_core::compatibility_cx()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timeout waiting for {context}"))
+    .expect(context)
+    .unwrap_or_else(|| panic!("{context} missing"));
     match message {
         ServerWsMessage::Text(text) => serde_json::from_str(&text).expect("gateway payload json"),
         other => panic!("expected text gateway payload for {context}, got {other:?}"),
@@ -360,10 +487,27 @@ async fn send_gateway_json(
     .expect(context);
 }
 
-async fn close_test_gateway_websocket(ws: &mut TestGatewayWebSocket) {
-    let _ = ws
-        .close(&fcp_async_core::compatibility_cx(), CloseReason::normal())
-        .await;
+async fn wait_for_gateway_disconnect(ws: &mut TestGatewayWebSocket) {
+    // This fixture waits through the consumer assertions before shutdown.
+    // Individual shutdown calls have their own tighter five-second deadline.
+    fcp_async_core::time::timeout(StdDuration::from_secs(15), async {
+        loop {
+            match ws.recv(&fcp_async_core::compatibility_cx()).await {
+                Ok(None) | Err(_) | Ok(Some(ServerWsMessage::Close(_))) => break,
+                Ok(Some(ServerWsMessage::Text(text))) => {
+                    let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(
+                        payload["op"], 1,
+                        "only heartbeat frames may precede shutdown"
+                    );
+                    send_gateway_json(ws, &json!({"op": 11, "d": null}), "heartbeat ACK").await;
+                }
+                other => panic!("unexpected Gateway frame during shutdown: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("connector shutdown must close the provider WebSocket promptly");
 }
 
 fn gateway_hello(interval_ms: u64) -> serde_json::Value {
@@ -411,18 +555,8 @@ async fn setup_configure(connector: &mut DiscordConnector, base_url: &str) {
         .handle_configure(json!({
             "bot_credential": "test_token",
             "api_url": base_url,
-            // Pin an unreachable gateway_url so handle_handshake's background
-            // gateway-connect task cannot race the REST fake server by
-            // issuing a GET /gateway/bot over the same 127.0.0.1:<port>
-            // listener. Without this pin, a targeted single-crate run of
-            // `send_message_happy_path` is flaky: the gateway task's
-            // discovery GET can win the second accept() slot, consuming
-            // the response intended for POST /channels/111/messages and
-            // leaving the send_message call with Connection refused.
-            // The WebSocket connect to port 1 fails immediately; the
-            // supervisor retries with backoff long enough to outlive the
-            // test, and the gateway task is torn down when the connector
-            // drops.
+            // Keep Gateway attempts isolated from the REST fixture when a
+            // test explicitly opens a native event subscription.
             "gateway_url": "ws://127.0.0.1:1/",
             "intents": ALL_REQUIRED_INTENTS
         }))
@@ -431,13 +565,21 @@ async fn setup_configure(connector: &mut DiscordConnector, base_url: &str) {
 }
 
 async fn setup_handshake(connector: &mut DiscordConnector, caps: &[&str]) -> BoundTestSigningKey {
+    let zone_dir = unique_zone_dir("integration-handshake");
+    setup_handshake_in_zone_dir(connector, caps, &zone_dir).await
+}
+
+async fn setup_handshake_in_zone_dir(
+    connector: &mut DiscordConnector,
+    caps: &[&str],
+    zone_dir: &str,
+) -> BoundTestSigningKey {
     let signing_key = Ed25519SigningKey::generate();
     let verifying_key = signing_key.verifying_key();
-    let zone_dir = unique_zone_dir("integration-handshake");
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "zone_dir": zone_dir,
             "host_public_key": verifying_key.to_bytes(),
@@ -451,6 +593,40 @@ async fn setup_handshake(connector: &mut DiscordConnector, caps: &[&str]) -> Bou
         signing_key,
         instance_id: connector.instance_id().clone(),
     }
+}
+
+fn native_source(event: &fcp_core::EventEnvelope) -> (&str, &serde_json::Value) {
+    assert_eq!(event.topic, "discord.events");
+    (
+        event.data.payload["source_topic"]
+            .as_str()
+            .expect("aggregate source topic"),
+        &event.data.payload["event"],
+    )
+}
+
+fn gateway_checkpoint(zone_dir: &str) -> Option<serde_json::Value> {
+    let path = std::path::Path::new(zone_dir).join("discord_gateway_state.json");
+    match std::fs::read(path) {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes).expect("atomic gateway checkpoint JSON")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot read gateway checkpoint: {error}"),
+    }
+}
+
+async fn wait_for_gateway_checkpoint(zone_dir: &str, sequence: u64) -> serde_json::Value {
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            if let Some(checkpoint) = gateway_checkpoint(zone_dir)
+                && checkpoint["sequence"].as_u64() == Some(sequence)
+            {
+                return checkpoint;
+            }
+            fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("consumer acknowledgement must durably commit its provider sequence")
 }
 
 /// Full lifecycle: configure + mock user + handshake.
@@ -3104,19 +3280,393 @@ async fn api_503_maps_to_retryable_error() {
 async fn subscribe_confirms_topics() {
     let mock_server = MockServer::start().await;
     let mut connector = DiscordConnector::new();
-    let _signing_key = setup_full(&mut connector, &mock_server, &["discord.read"]).await;
+    let capture = NativeCapture::attach(&mut connector);
+    let signing_key = setup_full(&mut connector, &mock_server, &["discord.read"]).await;
 
-    let result = connector
-        .handle_subscribe(json!({
-            "topics": ["discord.message"]
+    let result: fcp_core::SubscribeResponse = serde_json::from_value(
+        connector
+            .handle_subscribe(native_subscription_request(&signing_key, "discord.message"))
+            .await
+            .expect("signed exact-topic subscribe should succeed"),
+    )
+    .expect("canonical subscription response");
+
+    assert_eq!(result.result.confirmed_topics, vec!["discord.message"]);
+    assert!(!result.result.replay_supported);
+    assert!(capture.stream.is_open());
+    connector.handle_shutdown(json!({})).await.unwrap();
+    assert!(!capture.stream.is_open());
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_subscribe_rejects_invalid_or_insufficient_authority_before_gateway_start() {
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok(&mock_server, "test_token").await;
+    let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", gateway_listener.local_addr().unwrap());
+    let mut connector = DiscordConnector::new();
+    let capture = NativeCapture::attach(&mut connector);
+    connector
+        .handle_configure(json!({
+            "bot_credential": "test_token", "api_url": mock_server.uri(),
+            "gateway_url": gateway_url, "intents": ALL_REQUIRED_INTENTS,
+            "gateway_identify_window_ms": 5,
         }))
         .await
-        .expect("subscribe should succeed");
+        .unwrap();
+    let signing_key = setup_handshake(&mut connector, &["discord.read"]).await;
+    let valid = native_subscription_request(&signing_key, "discord.events");
+    let mut missing_token = valid.clone();
+    missing_token
+        .as_object_mut()
+        .unwrap()
+        .remove("capability_token");
+    let mut wrong_operation = valid.clone();
+    wrong_operation["capability_token"] =
+        serde_json::to_value(generate_valid_token(&signing_key, "discord.get_message")).unwrap();
+    let mut wrong_capability = valid.clone();
+    wrong_capability["capability_token"] =
+        serde_json::to_value(generate_valid_token(&signing_key, "discord.send_message")).unwrap();
+    let mut narrow_grant = native_subscription_request(&signing_key, "discord.message");
+    narrow_grant["topics"] = json!(["discord.events"]);
+    let expired = native_subscription_request_with_lifetime(
+        &signing_key,
+        "discord.events",
+        Duration::seconds(-60),
+    );
+    let mut invalid_requests = vec![
+        missing_token,
+        wrong_operation,
+        wrong_capability,
+        narrow_grant,
+        expired,
+    ];
+    for topics in [
+        json!([]),
+        json!(["discord.*"]),
+        json!(["discord.unknown"]),
+        json!(["discord.message", "discord.ready"]),
+    ] {
+        let mut request = valid.clone();
+        request["topics"] = topics;
+        invalid_requests.push(request);
+    }
+    for request in invalid_requests {
+        assert!(connector.handle_subscribe(request).await.is_err());
+        assert!(!capture.stream.is_open());
+        assert_eq!(capture.len(), 0);
+    }
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), gateway_listener.accept(),)
+            .await
+            .is_err(),
+        "neither handshake nor rejected subscriptions may open the Gateway",
+    );
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    connector.handle_shutdown(json!({})).await.unwrap();
+}
 
-    let confirmed = result["confirmed_topics"].as_array().unwrap();
-    assert_eq!(confirmed.len(), 1);
-    assert_eq!(confirmed[0], "discord.message");
-    assert_eq!(result["replay_supported"], false);
+#[fcp_async_core::runtime::test]
+async fn native_gateway_restart_replays_unacknowledged_dispatch_and_keeps_heartbeats_current() {
+    const PRIVATE_SESSION: &str = "session-private-replay-fixture";
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok_with_id(&mock_server, "test_token", "999").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    let server_gateway_url = gateway_url.clone();
+    let (heartbeat_tx, heartbeat_rx) = fcp_async_core::channel::oneshot::channel();
+    let gateway_task = fcp_async_core::task::spawn(async move {
+        let message = json!({
+            "id": "700", "guild_id": "100", "channel_id": "200",
+            "content": "replay this message", "author": {"id": "300", "username": "alice"}
+        });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut first_ws = accept_test_gateway_websocket(socket).await;
+        send_gateway_json(&mut first_ws, &gateway_hello(10_000), "first Hello").await;
+        assert_eq!(
+            recv_gateway_payload(&mut first_ws, "first Identify").await["op"],
+            2
+        );
+        send_gateway_json(
+            &mut first_ws,
+            &gateway_dispatch(
+                "READY",
+                1,
+                &json!({
+                    "v": 10, "user": {"id": "999", "username": "TestBot"},
+                    "session_id": PRIVATE_SESSION, "resume_gateway_url": server_gateway_url,
+                }),
+            ),
+            "first READY",
+        )
+        .await;
+        send_gateway_json(
+            &mut first_ws,
+            &gateway_dispatch("MESSAGE_CREATE", 2, &message),
+            "unacknowledged dispatch",
+        )
+        .await;
+        send_gateway_json(
+            &mut first_ws,
+            &json!({"op": 1, "d": null}),
+            "request heartbeat",
+        )
+        .await;
+        let heartbeat =
+            recv_gateway_payload(&mut first_ws, "heartbeat while native ACK is pending").await;
+        assert_eq!(heartbeat["op"], 1);
+        assert_eq!(
+            heartbeat["d"], 2,
+            "heartbeat must track received frames, not consumer commits"
+        );
+        send_gateway_json(
+            &mut first_ws,
+            &json!({"op": 11, "d": null}),
+            "heartbeat ACK",
+        )
+        .await;
+        heartbeat_tx.send(()).unwrap();
+        wait_for_gateway_disconnect(&mut first_ws).await;
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut resumed_ws = accept_test_gateway_websocket(socket).await;
+        send_gateway_json(&mut resumed_ws, &gateway_hello(10_000), "second Hello").await;
+        let resume = recv_gateway_payload(&mut resumed_ws, "restart Resume").await;
+        assert_eq!(resume["op"], 6);
+        assert_eq!(resume["d"]["session_id"], PRIVATE_SESSION);
+        assert_eq!(
+            resume["d"]["seq"], 1,
+            "resume must not skip the unacknowledged dispatch"
+        );
+        send_gateway_json(
+            &mut resumed_ws,
+            &gateway_dispatch("MESSAGE_CREATE", 2, &message),
+            "provider replay",
+        )
+        .await;
+        wait_for_gateway_disconnect(&mut resumed_ws).await;
+    });
+
+    let zone_dir = unique_zone_dir("native-replay");
+    let config = json!({
+        "bot_credential": "test_token", "api_url": mock_server.uri(),
+        "gateway_url": gateway_url, "intents": ALL_REQUIRED_INTENTS,
+        "gateway_identify_window_ms": 5,
+        "inbound_policy": {
+            "require_mention_in_guilds": false,
+            "allowed_guilds": ["100"], "allowed_channels": ["200"], "allowed_users": ["300"],
+        },
+    });
+    let mut first = DiscordConnector::new();
+    let first_capture = NativeCapture::attach(&mut first);
+    first.handle_configure(config.clone()).await.unwrap();
+    let first_key = setup_handshake_in_zone_dir(&mut first, &["discord.read"], &zone_dir).await;
+    first
+        .handle_subscribe(native_subscription_request(&first_key, "discord.events"))
+        .await
+        .unwrap();
+    let ready = first_capture.next_event(0).await;
+    assert_eq!(native_source(&ready).0, "discord.ready");
+    assert!(
+        !serde_json::to_string(&ready)
+            .unwrap()
+            .contains(PRIVATE_SESSION)
+    );
+    assert!(
+        !serde_json::to_string(&ready)
+            .unwrap()
+            .contains("resume_gateway_url")
+    );
+    assert!(
+        gateway_checkpoint(&zone_dir)
+            .is_none_or(|checkpoint| { checkpoint["sequence"].as_u64().unwrap_or(0) < 1 }),
+        "READY must not be committed before its native ACK"
+    );
+    first_capture.acknowledge(&ready);
+    wait_for_gateway_checkpoint(&zone_dir, 1).await;
+
+    let pending = first_capture.next_event(1).await;
+    assert_eq!(native_source(&pending).0, "discord.message");
+    assert_eq!(native_source(&pending).1["id"], "700");
+    assert!(!pending.cursor.contains(PRIVATE_SESSION));
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), heartbeat_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    for ack in [
+        fcp_core::EventAck::new(&pending.topic, vec![pending.seq + 1])
+            .with_cursors(vec![pending.cursor.clone()]),
+        fcp_core::EventAck::new(&pending.topic, vec![pending.seq])
+            .with_cursors(vec!["wrong-cursor".into()]),
+    ] {
+        assert!(
+            first_capture
+                .stream
+                .acknowledge(json!({
+                    "stream_id": NATIVE_STREAM_ID, "ack": ack,
+                }))
+                .is_err()
+        );
+        assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    }
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), first.handle_shutdown(json!({})))
+        .await
+        .expect("pending native ACK must not block shutdown")
+        .unwrap();
+    assert!(!first_capture.stream.is_open());
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+
+    let mut restarted = DiscordConnector::new();
+    let restarted_capture = NativeCapture::attach(&mut restarted);
+    restarted.handle_configure(config).await.unwrap();
+    let restarted_key =
+        setup_handshake_in_zone_dir(&mut restarted, &["discord.read"], &zone_dir).await;
+    restarted
+        .handle_subscribe(native_subscription_request(
+            &restarted_key,
+            "discord.events",
+        ))
+        .await
+        .unwrap();
+    let replay = restarted_capture.next_event(0).await;
+    assert_eq!(replay.cursor, pending.cursor);
+    assert_eq!(replay.data.payload, pending.data.payload);
+    assert_eq!(
+        serde_json::to_value(&replay.data.principal).unwrap(),
+        serde_json::to_value(&pending.data.principal).unwrap()
+    );
+    assert_eq!(replay.data.resource_uris, pending.data.resource_uris);
+    assert_eq!(replay.data.thread_info, pending.data.thread_info);
+    assert_eq!(replay.stream_key, pending.stream_key);
+    assert_eq!(replay.ordering, pending.ordering);
+    assert_ne!(replay.data.instance_id, pending.data.instance_id);
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    restarted_capture.acknowledge(&replay);
+    wait_for_gateway_checkpoint(&zone_dir, 2).await;
+    fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        restarted.handle_shutdown(json!({})),
+    )
+    .await
+    .expect("acknowledged stream must shut down promptly")
+    .unwrap();
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 2);
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), gateway_task)
+        .await
+        .expect("both provider connections must finish")
+        .unwrap();
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_gateway_expired_authority_cannot_commit_a_pending_dispatch() {
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok_with_id(&mock_server, "test_token", "999").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    let server_gateway_url = gateway_url.clone();
+    let gateway_task = fcp_async_core::task::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_test_gateway_websocket(socket).await;
+        send_gateway_json(&mut ws, &gateway_hello(10_000), "Hello").await;
+        assert_eq!(recv_gateway_payload(&mut ws, "Identify").await["op"], 2);
+        send_gateway_json(
+            &mut ws,
+            &gateway_dispatch(
+                "READY",
+                1,
+                &json!({
+                    "v": 10, "user": {"id": "999", "username": "TestBot"},
+                    "session_id": "expiry-session", "resume_gateway_url": server_gateway_url,
+                }),
+            ),
+            "READY",
+        )
+        .await;
+        send_gateway_json(
+            &mut ws,
+            &gateway_dispatch(
+                "MESSAGE_CREATE",
+                2,
+                &json!({
+                    "id": "701", "channel_id": "200", "content": "must remain replayable",
+                    "author": {"id": "300", "username": "alice"},
+                }),
+            ),
+            "pending dispatch",
+        )
+        .await;
+        wait_for_gateway_disconnect(&mut ws).await;
+    });
+    let mut connector = DiscordConnector::new();
+    let capture = NativeCapture::attach(&mut connector);
+    connector
+        .handle_configure(json!({
+            "bot_credential": "test_token", "api_url": mock_server.uri(),
+            "gateway_url": gateway_url, "intents": ALL_REQUIRED_INTENTS,
+            "gateway_identify_window_ms": 5,
+            "inbound_policy": {"allow_dms": true},
+        }))
+        .await
+        .unwrap();
+    let zone_dir = unique_zone_dir("native-expired-authority");
+    let key = setup_handshake_in_zone_dir(&mut connector, &["discord.read"], &zone_dir).await;
+    let mut observer = connector.subscribe_events();
+    connector
+        .handle_subscribe(native_subscription_request_with_lifetime(
+            &key,
+            "discord.events",
+            Duration::seconds(3),
+        ))
+        .await
+        .unwrap();
+    let ready = capture.next_event(0).await;
+    capture.acknowledge(&ready);
+    wait_for_gateway_checkpoint(&zone_dir, 1).await;
+    fcp_async_core::time::timeout(StdDuration::from_secs(3), observer.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let pending = capture.next_event(1).await;
+    assert_eq!(native_source(&pending).1["id"], "701");
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), async {
+        while capture.stream.is_open() {
+            fcp_async_core::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("token expiry must interrupt a pending native ACK wait");
+    assert!(
+        capture
+            .stream
+            .acknowledge(json!({
+                "stream_id": NATIVE_STREAM_ID,
+                "ack": fcp_core::EventAck::new(&pending.topic, vec![pending.seq])
+                    .with_cursors(vec![pending.cursor.clone()]),
+            }))
+            .is_err(),
+        "an exact but expired ACK must never release provider credit"
+    );
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), observer.recv())
+            .await
+            .is_err()
+    );
+    fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        connector.handle_shutdown(json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), gateway_task)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[fcp_async_core::runtime::test]
@@ -3129,6 +3679,7 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
         .expect("bind gateway listener");
     let addr = listener.local_addr().expect("gateway listener addr");
     let gateway_url = format!("ws://{addr}");
+    let server_gateway_url = gateway_url.clone();
 
     let gateway_task = fcp_async_core::task::spawn(async move {
         let (socket, _) = listener.accept().await.expect("accept gateway client");
@@ -3148,7 +3699,7 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
                     "v": 10,
                     "user": { "id": "999", "username": "TestBot" },
                     "session_id": "sess-policy",
-                    "resume_gateway_url": "wss://gateway.discord.gg"
+                    "resume_gateway_url": server_gateway_url,
                 }),
             ),
             "send ready",
@@ -3189,10 +3740,11 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
         )
         .await;
 
-        close_test_gateway_websocket(&mut ws).await;
+        wait_for_gateway_disconnect(&mut ws).await;
     });
 
     let mut connector = DiscordConnector::new();
+    let capture = NativeCapture::attach(&mut connector);
     connector
         .handle_configure(json!({
             "bot_credential": "test_token",
@@ -3215,41 +3767,43 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
         .expect("configure should succeed");
 
     let mut event_rx = connector.subscribe_events();
-    let _signing_key = setup_handshake(&mut connector, &["discord.read"]).await;
+    let signing_key = setup_handshake(&mut connector, &["discord.read"]).await;
     connector
-        .handle_subscribe(json!({
-            "topics": ["discord.ready", "discord.message"]
-        }))
+        .handle_subscribe(native_subscription_request(&signing_key, "discord.events"))
         .await
         .expect("subscribe should succeed");
 
     let mut saw_ready = false;
     let mut saw_authorized = false;
-    for _ in 0..2 {
-        let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-            .await
-            .expect("timeout waiting for Discord gateway event")
-            .expect("broadcast receive")
-            .expect("event payload");
+    for index in 0..2 {
+        let event = capture.next_event(index).await;
+        let (source_topic, payload) = native_source(&event);
 
         assert_ne!(
-            event.data.payload["id"], "message-denied",
+            payload["id"], "message-denied",
             "unauthorized Discord gateway event leaked through inbound policy"
         );
 
-        match event.topic.as_str() {
+        match source_topic {
             "discord.ready" => {
                 saw_ready = true;
                 assert_eq!(event.seq, 1);
+                assert!(payload.get("session_id").is_none());
             }
             "discord.message" => {
                 saw_authorized = true;
-                assert_eq!(event.seq, 3);
-                assert_eq!(event.data.payload["id"], "message-allowed");
+                assert_eq!(event.seq, 2);
+                assert_eq!(payload["id"], "message-allowed");
                 assert_eq!(event.data.principal.id, "300");
             }
             other => panic!("unexpected Discord gateway event topic {other}"),
         }
+        capture.acknowledge(&event);
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
+            .await
+            .expect("post-ACK diagnostic event")
+            .expect("diagnostic observer")
+            .expect("committed event");
     }
 
     assert!(saw_ready, "READY event should still be emitted");
@@ -3263,6 +3817,7 @@ async fn gateway_inbound_policy_loopback_drops_unauthorized_and_emits_authorized
         extra.is_err(),
         "only READY and the authorized message should be emitted"
     );
+    assert_eq!(capture.len(), 2);
 
     connector
         .handle_shutdown(json!({}))
@@ -3371,6 +3926,7 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
         .expect("bind gateway listener");
     let addr = listener.local_addr().expect("gateway listener addr");
     let gateway_url = format!("ws://{addr}");
+    let server_gateway_url = gateway_url.clone();
 
     let gateway_task = fcp_async_core::task::spawn(async move {
         let (socket, _) = listener.accept().await.expect("accept gateway client");
@@ -3390,7 +3946,7 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
                     "v": 10,
                     "user": { "id": "999", "username": "TestBot" },
                     "session_id": "sess-delivery",
-                    "resume_gateway_url": "wss://gateway.discord.gg"
+                    "resume_gateway_url": server_gateway_url,
                 }),
             ),
             "send ready",
@@ -3430,10 +3986,11 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
         )
         .await;
 
-        close_test_gateway_websocket(&mut ws).await;
+        wait_for_gateway_disconnect(&mut ws).await;
     });
 
     let mut connector = DiscordConnector::new();
+    let native_capture = NativeCapture::attach(&mut connector);
     connector
         .handle_configure(json!({
             "bot_credential": "test_token",
@@ -3462,73 +4019,53 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
     let mut event_rx = connector.subscribe_events();
     let signing_key = setup_handshake(&mut connector, &["discord.read", "discord.send"]).await;
     connector
-        .handle_subscribe(json!({
-            "topics": ["discord.ready", "discord.message"]
-        }))
+        .handle_subscribe(native_subscription_request(&signing_key, "discord.events"))
         .await
         .expect("subscribe should succeed");
 
     let mut saw_ready = false;
     let mut guild_session_key = None;
     let mut dm_session_key = None;
-    for _ in 0..3 {
-        let event = fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
-            .await
-            .expect("timeout waiting for Discord gateway event")
-            .expect("broadcast receive")
-            .expect("event payload");
+    for index in 0..3 {
+        let event = native_capture.next_event(index).await;
+        let (source_topic, payload) = native_source(&event);
 
-        match event.topic.as_str() {
+        match source_topic {
             "discord.ready" => {
                 saw_ready = true;
                 assert_eq!(event.seq, 1);
             }
-            "discord.message" if event.data.payload["id"] == "message-allowed" => {
+            "discord.message" if payload["id"] == "message-allowed" => {
                 assert_eq!(event.seq, 2);
                 assert_eq!(event.data.principal.id, "300");
+                assert_eq!(payload["fcp_delivery"]["event_kind"], "room_event");
+                assert_eq!(payload["fcp_delivery"]["channel_id"], "200");
+                assert_eq!(payload["fcp_delivery"]["guild_id"], "100");
+                assert_eq!(payload["fcp_delivery"]["message_id"], "message-allowed");
                 assert_eq!(
-                    event.data.payload["fcp_delivery"]["event_kind"],
-                    "room_event"
-                );
-                assert_eq!(event.data.payload["fcp_delivery"]["channel_id"], "200");
-                assert_eq!(event.data.payload["fcp_delivery"]["guild_id"], "100");
-                assert_eq!(
-                    event.data.payload["fcp_delivery"]["message_id"],
-                    "message-allowed"
-                );
-                assert_eq!(
-                    event.data.payload["fcp_delivery"]["retention"],
+                    payload["fcp_delivery"]["retention"],
                     "pending_until_outbound_delivery"
                 );
                 guild_session_key = Some(
-                    event.data.payload["fcp_delivery"]["session_key"]
+                    payload["fcp_delivery"]["session_key"]
                         .as_str()
                         .expect("guild fcp_delivery session key")
                         .to_owned(),
                 );
             }
-            "discord.message" if event.data.payload["id"] == "message-dm" => {
+            "discord.message" if payload["id"] == "message-dm" => {
                 assert_eq!(event.seq, 3);
                 assert_eq!(event.data.principal.id, "301");
+                assert_eq!(payload["fcp_delivery"]["event_kind"], "direct_message");
+                assert_eq!(payload["fcp_delivery"]["channel_id"], "201");
+                assert_eq!(payload["fcp_delivery"]["guild_id"], serde_json::Value::Null);
+                assert_eq!(payload["fcp_delivery"]["message_id"], "message-dm");
                 assert_eq!(
-                    event.data.payload["fcp_delivery"]["event_kind"],
-                    "direct_message"
-                );
-                assert_eq!(event.data.payload["fcp_delivery"]["channel_id"], "201");
-                assert_eq!(
-                    event.data.payload["fcp_delivery"]["guild_id"],
-                    serde_json::Value::Null
-                );
-                assert_eq!(
-                    event.data.payload["fcp_delivery"]["message_id"],
-                    "message-dm"
-                );
-                assert_eq!(
-                    event.data.payload["fcp_delivery"]["retention"],
+                    payload["fcp_delivery"]["retention"],
                     "pending_until_outbound_delivery"
                 );
                 dm_session_key = Some(
-                    event.data.payload["fcp_delivery"]["session_key"]
+                    payload["fcp_delivery"]["session_key"]
                         .as_str()
                         .expect("dm fcp_delivery session key")
                         .to_owned(),
@@ -3539,6 +4076,14 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
                 event.data.payload
             ),
         }
+        native_capture.acknowledge(&event);
+        // The observer is a post-commit barrier only; provider credit comes
+        // exclusively from the exact native acknowledgement above.
+        fcp_async_core::time::timeout(StdDuration::from_secs(3), event_rx.recv())
+            .await
+            .expect("post-ACK diagnostic event")
+            .expect("diagnostic observer")
+            .expect("committed event");
     }
 
     assert!(saw_ready, "READY event should be emitted");
@@ -3746,17 +4291,19 @@ async fn gateway_inbound_delivery_loopback_retains_until_visible_send_success() 
 async fn subscribe_empty_topics() {
     let mock_server = MockServer::start().await;
     let mut connector = DiscordConnector::new();
-    let _signing_key = setup_full(&mut connector, &mock_server, &["discord.read"]).await;
+    let capture = NativeCapture::attach(&mut connector);
+    let signing_key = setup_full(&mut connector, &mock_server, &["discord.read"]).await;
 
-    let result = connector
-        .handle_subscribe(json!({
-            "topics": []
-        }))
+    let mut request = native_subscription_request(&signing_key, "discord.events");
+    request["topics"] = json!([]);
+    let error = connector
+        .handle_subscribe(request)
         .await
-        .expect("subscribe with empty topics should succeed");
+        .expect_err("an empty topic set must not open an unscoped Gateway stream");
 
-    let confirmed = result["confirmed_topics"].as_array().unwrap();
-    assert!(confirmed.is_empty());
+    assert!(matches!(error, fcp_core::FcpError::InvalidRequest { .. }));
+    assert!(!capture.stream.is_open());
+    connector.handle_shutdown(json!({})).await.unwrap();
 }
 
 // ============================================================================
