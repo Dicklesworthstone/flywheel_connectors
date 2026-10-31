@@ -26715,6 +26715,13 @@ fn append_history_entry(
     idempotency_key: Option<&str>,
     latency_ms: u64,
 ) -> Result<()> {
+    // Concurrent MCP completions share history rotation and the session's
+    // read-modify-write update. Provider calls run before this section.
+    static HISTORY_SESSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _persistence_guard = HISTORY_SESSION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let store = cli_history_store()?;
     let active_session = cli_session_store().active_session().ok().flatten();
     let entry = history::HistoryEntry {
@@ -50915,6 +50922,118 @@ depends_on = ["missing"]
             .expect("session load should succeed")
             .expect("session should still exist");
         assert_eq!(updated_session.operations_completed, 2);
+        assert_eq!(
+            updated_session.status,
+            super::session::SessionStatus::Active
+        );
+    }
+
+    #[test]
+    fn concurrent_completions_preserve_history_and_active_session_updates() {
+        const WORKERS: usize = 8;
+        const COMPLETIONS_PER_WORKER: usize = 32;
+        let directory = TempDir::new().expect("persistence tempdir should exist");
+        let session_dir = directory.path().join("sessions");
+        let history_path = directory.path().join("history.jsonl");
+        let _session_guard = super::install_test_session_dir(session_dir.clone());
+        let _history_guard = super::install_test_history_path(history_path.clone());
+        let session = super::session::Session::new(
+            "ParallelMcp",
+            "record concurrent operation completions",
+            Some("z:work".to_owned()),
+        );
+        let session_id = session.id.to_string();
+        super::cli_session_store()
+            .save(&session)
+            .expect("initial session should save");
+        let completion_wave = std::sync::Barrier::new(WORKERS);
+
+        let errors = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..WORKERS {
+                let session_dir = session_dir.clone();
+                let history_path = history_path.clone();
+                let completion_wave = &completion_wave;
+                workers.push(scope.spawn(move || {
+                    // Overrides are thread-local, so every actual completion
+                    // must select the shared fixture from its own worker.
+                    let _session_guard = super::install_test_session_dir(session_dir);
+                    let _history_guard = super::install_test_history_path(history_path);
+                    let mut errors = Vec::new();
+                    for sequence in 0..COMPLETIONS_PER_WORKER {
+                        completion_wave.wait();
+                        let idempotency_key = format!("completion-{worker}-{sequence}");
+                        if let Err(error) = super::append_history_entry(
+                            super::history::OpStatus::Success,
+                            "fcp.test",
+                            "test.echo",
+                            Some("z:work"),
+                            &json!({"worker": worker, "sequence": sequence}),
+                            Some(&json!({"ok": true})),
+                            None,
+                            Some(&idempotency_key),
+                            1,
+                        ) {
+                            // Finish every barrier round before reporting an
+                            // IO failure, so a regression cannot strand peers.
+                            errors.push(error.to_string());
+                        }
+                    }
+                    errors
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("completion worker should finish"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            errors.is_empty(),
+            "concurrent persistence failed: {errors:?}"
+        );
+
+        // Parse the physical log directly: HistoryStore::query deliberately
+        // skips malformed lines and could otherwise conceal interleaved writes.
+        let raw = fs::read_to_string(&history_path).expect("history should remain readable");
+        let entries = raw
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<super::history::HistoryEntry>(line)
+                    .expect("each completion must remain one valid JSONL record")
+            })
+            .collect::<Vec<_>>();
+        let expected_count = WORKERS * COMPLETIONS_PER_WORKER;
+        assert_eq!(entries.len(), expected_count);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| &entry.entry_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            expected_count
+        );
+        let recorded_keys = entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.agent_session.as_deref(), Some(session_id.as_str()));
+                entry
+                    .idempotency_key
+                    .clone()
+                    .expect("completion identity should remain present")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = (0..WORKERS)
+            .flat_map(|worker| {
+                (0..COMPLETIONS_PER_WORKER)
+                    .map(move |sequence| format!("completion-{worker}-{sequence}"))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(recorded_keys, expected_keys);
+        let updated_session = super::cli_session_store()
+            .load_resolved(&session_id)
+            .expect("session JSON must remain valid")
+            .expect("active session must remain present");
+        assert_eq!(updated_session.operations_completed, expected_count as u64);
         assert_eq!(
             updated_session.status,
             super::session::SessionStatus::Active
