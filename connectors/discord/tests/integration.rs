@@ -10,6 +10,7 @@
 //! - Input validation (content length, required fields)
 //! - Introspection completeness
 
+#![recursion_limit = "256"]
 #![allow(clippy::too_many_lines)]
 
 use asupersync::io::{AsyncRead, ReadBuf};
@@ -453,6 +454,10 @@ async fn accept_test_gateway_websocket(
     let request = read_gateway_websocket_headers(&mut stream)
         .await
         .expect("read gateway websocket handshake");
+    assert!(
+        request.starts_with(b"GET /?v=10&encoding=json HTTP/1.1\r\n"),
+        "Gateway URLs must use the canonical root path and explicit protocol parameters"
+    );
     WebSocketAcceptor::new()
         .accept(&fcp_async_core::compatibility_cx(), &request, stream)
         .await
@@ -627,6 +632,39 @@ async fn wait_for_gateway_checkpoint(zone_dir: &str, sequence: u64) -> serde_jso
     })
     .await
     .expect("consumer acknowledgement must durably commit its provider sequence")
+}
+
+async fn wait_for_native_gateway_failure(
+    connector: &DiscordConnector,
+    capture: &NativeCapture,
+) -> fcp_core::HealthSnapshot {
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let health: fcp_core::HealthSnapshot = serde_json::from_value(
+                connector
+                    .handle_native_health()
+                    .await
+                    .expect("native health"),
+            )
+            .expect("canonical health snapshot");
+            if !capture.stream.is_open()
+                && health.details.as_ref().is_some_and(|details| {
+                    details["gateway_failure"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.is_empty())
+                })
+            {
+                assert!(matches!(
+                    &health.status,
+                    fcp_core::HealthState::Degraded { .. }
+                ));
+                return health;
+            }
+            fcp_async_core::time::sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("invalid provider URLs must close the stream and expose a terminal recovery failure")
 }
 
 /// Full lifecycle: configure + mock user + handshake.
@@ -3372,7 +3410,9 @@ async fn native_gateway_restart_replays_unacknowledged_dispatch_and_keeps_heartb
     let mock_server = MockServer::start().await;
     mock_current_user_ok_with_id(&mock_server, "test_token", "999").await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    // A trailing slash must not become a double-slash handshake path, including
+    // when the same endpoint is later restored from the READY checkpoint.
+    let gateway_url = format!("ws://{}/", listener.local_addr().unwrap());
     let server_gateway_url = gateway_url.clone();
     let (heartbeat_tx, heartbeat_rx) = fcp_async_core::channel::oneshot::channel();
     let gateway_task = fcp_async_core::task::spawn(async move {
@@ -3557,6 +3597,256 @@ async fn native_gateway_restart_replays_unacknowledged_dispatch_and_keeps_heartb
         .expect("both provider connections must finish")
         .unwrap();
     assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_gateway_discovery_cannot_authorize_an_unconfigured_loopback_origin() {
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok(&mock_server, "test_token").await;
+    let unapproved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unapproved_url = format!("ws://{}", unapproved_listener.local_addr().unwrap());
+    Mock::given(method("GET"))
+        .and(path("/gateway/bot"))
+        .and(header("Authorization", "Bot test_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": unapproved_url,
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut connector = DiscordConnector::new();
+    let capture = NativeCapture::attach(&mut connector);
+    connector
+        .handle_configure(json!({
+            "bot_credential": "test_token", "api_url": mock_server.uri(),
+            "intents": ALL_REQUIRED_INTENTS, "gateway_identify_window_ms": 5,
+        }))
+        .await
+        .unwrap();
+    let zone_dir = unique_zone_dir("unapproved-gateway-discovery");
+    let key = setup_handshake_in_zone_dir(&mut connector, &["discord.read"], &zone_dir).await;
+    connector
+        .handle_subscribe(native_subscription_request(&key, "discord.events"))
+        .await
+        .unwrap();
+
+    let health = wait_for_native_gateway_failure(&connector, &capture).await;
+    let health_json = serde_json::to_string(&health).unwrap();
+    assert!(!health_json.contains(&unapproved_url));
+    assert!(!health_json.contains("test_token"));
+    assert_eq!(capture.len(), 0);
+    assert!(gateway_checkpoint(&zone_dir).is_none());
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), unapproved_listener.accept(),)
+            .await
+            .is_err(),
+        "a loopback REST fixture must not authorize a discovered Gateway connection",
+    );
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "discovery rejection must not retry or fall back"
+    );
+    assert_eq!(requests[0].url.path(), "/users/@me");
+    assert_eq!(requests[1].url.path(), "/gateway/bot");
+    fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        connector.handle_shutdown(json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_gateway_rejects_foreign_ready_resume_url_without_publishing_it() {
+    const PRIVATE_SESSION: &str = "rejected-resume-private-session";
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok_with_id(&mock_server, "test_token", "999").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    let unapproved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unapproved_url = format!("ws://{}", unapproved_listener.local_addr().unwrap());
+    let injected_resume_url = unapproved_url.clone();
+    let gateway_task = fcp_async_core::task::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_test_gateway_websocket(socket).await;
+        send_gateway_json(&mut ws, &gateway_hello(10_000), "Hello").await;
+        assert_eq!(recv_gateway_payload(&mut ws, "Identify").await["op"], 2);
+        send_gateway_json(
+            &mut ws,
+            &gateway_dispatch(
+                "READY",
+                1,
+                &json!({
+                    "v": 10, "user": {"id": "999", "username": "TestBot"},
+                    "session_id": PRIVATE_SESSION, "resume_gateway_url": injected_resume_url,
+                }),
+            ),
+            "READY with unapproved resume origin",
+        )
+        .await;
+        wait_for_gateway_disconnect(&mut ws).await;
+    });
+
+    let mut connector = DiscordConnector::new();
+    let capture = NativeCapture::attach(&mut connector);
+    connector
+        .handle_configure(json!({
+            "bot_credential": "test_token", "api_url": mock_server.uri(),
+            "gateway_url": gateway_url, "intents": ALL_REQUIRED_INTENTS,
+            "gateway_identify_window_ms": 5,
+        }))
+        .await
+        .unwrap();
+    let zone_dir = unique_zone_dir("unapproved-ready-resume");
+    let key = setup_handshake_in_zone_dir(&mut connector, &["discord.read"], &zone_dir).await;
+    connector
+        .handle_subscribe(native_subscription_request(&key, "discord.events"))
+        .await
+        .unwrap();
+
+    let health = wait_for_native_gateway_failure(&connector, &capture).await;
+    let health_json = serde_json::to_string(&health).unwrap();
+    assert!(!health_json.contains(&unapproved_url));
+    assert!(!health_json.contains(PRIVATE_SESSION));
+    assert_eq!(
+        capture.len(),
+        0,
+        "an unusable READY must not reach the consumer"
+    );
+    let checkpoint = gateway_checkpoint(&zone_dir).expect("durable recovery marker");
+    assert_eq!(checkpoint["version"], 2);
+    assert_eq!(checkpoint["resume_invalidated"], true);
+    assert!(checkpoint["sequence"].is_null());
+    assert!(checkpoint["session_id"].is_null());
+    assert!(checkpoint["resume_url"].is_null());
+    let checkpoint_json = serde_json::to_string(&checkpoint).unwrap();
+    assert!(!checkpoint_json.contains(&unapproved_url));
+    assert!(!checkpoint_json.contains(PRIVATE_SESSION));
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), unapproved_listener.accept(),)
+            .await
+            .is_err(),
+        "READY must not redirect a RESUME token to another loopback service",
+    );
+    fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        connector.handle_shutdown(json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), gateway_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_gateway_rejects_poisoned_checkpoint_url_before_connecting() {
+    const PRIVATE_SESSION: &str = "persisted-safe-session";
+    let mock_server = MockServer::start().await;
+    mock_current_user_ok_with_id(&mock_server, "test_token", "999").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("ws://{}", listener.local_addr().unwrap());
+    let server_gateway_url = gateway_url.clone();
+    let gateway_task = fcp_async_core::task::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_test_gateway_websocket(socket).await;
+        send_gateway_json(&mut ws, &gateway_hello(10_000), "Hello").await;
+        assert_eq!(recv_gateway_payload(&mut ws, "Identify").await["op"], 2);
+        send_gateway_json(
+            &mut ws,
+            &gateway_dispatch(
+                "READY",
+                1,
+                &json!({
+                    "v": 10, "user": {"id": "999", "username": "TestBot"},
+                    "session_id": PRIVATE_SESSION, "resume_gateway_url": server_gateway_url,
+                }),
+            ),
+            "valid READY",
+        )
+        .await;
+        wait_for_gateway_disconnect(&mut ws).await;
+    });
+    let zone_dir = unique_zone_dir("poisoned-resume-checkpoint");
+    let config = json!({
+        "bot_credential": "test_token", "api_url": mock_server.uri(),
+        "gateway_url": gateway_url, "intents": ALL_REQUIRED_INTENTS,
+        "gateway_identify_window_ms": 5,
+    });
+    let mut first = DiscordConnector::new();
+    let first_capture = NativeCapture::attach(&mut first);
+    first.handle_configure(config.clone()).await.unwrap();
+    let first_key = setup_handshake_in_zone_dir(&mut first, &["discord.read"], &zone_dir).await;
+    first
+        .handle_subscribe(native_subscription_request(&first_key, "discord.events"))
+        .await
+        .unwrap();
+    let ready = first_capture.next_event(0).await;
+    first_capture.acknowledge(&ready);
+    wait_for_gateway_checkpoint(&zone_dir, 1).await;
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), first.handle_shutdown(json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    fcp_async_core::time::timeout(StdDuration::from_secs(5), gateway_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let unapproved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unapproved_url = format!("ws://{}", unapproved_listener.local_addr().unwrap());
+    let checkpoint_path = std::path::Path::new(&zone_dir).join("discord_gateway_state.json");
+    let mut checkpoint = gateway_checkpoint(&zone_dir).unwrap();
+    checkpoint["resume_url"] = json!(unapproved_url);
+    let poisoned_bytes = serde_json::to_vec(&checkpoint).unwrap();
+    std::fs::write(&checkpoint_path, &poisoned_bytes).expect("install poisoned fixture URL");
+
+    let mut restarted = DiscordConnector::new();
+    let restarted_capture = NativeCapture::attach(&mut restarted);
+    restarted.handle_configure(config).await.unwrap();
+    let restarted_key =
+        setup_handshake_in_zone_dir(&mut restarted, &["discord.read"], &zone_dir).await;
+    restarted
+        .handle_subscribe(native_subscription_request(
+            &restarted_key,
+            "discord.events",
+        ))
+        .await
+        .unwrap();
+    let health = wait_for_native_gateway_failure(&restarted, &restarted_capture).await;
+    let health_json = serde_json::to_string(&health).unwrap();
+    assert!(!health_json.contains(&unapproved_url));
+    assert!(!health_json.contains(PRIVATE_SESSION));
+    assert_eq!(restarted_capture.len(), 0);
+    assert_eq!(std::fs::read(&checkpoint_path).unwrap(), poisoned_bytes);
+    assert_eq!(gateway_checkpoint(&zone_dir).unwrap()["sequence"], 1);
+    assert!(
+        fcp_async_core::time::timeout(StdDuration::from_millis(100), unapproved_listener.accept(),)
+            .await
+            .is_err(),
+        "restoring a checkpoint must not bypass endpoint validation or expose a RESUME token",
+    );
+    fcp_async_core::time::timeout(
+        StdDuration::from_secs(5),
+        restarted.handle_shutdown(json!({})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(std::fs::read(&checkpoint_path).unwrap(), poisoned_bytes);
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() == "/users/@me")
+    );
 }
 
 #[fcp_async_core::runtime::test]

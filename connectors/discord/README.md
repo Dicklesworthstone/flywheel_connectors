@@ -137,12 +137,14 @@ The current Discord README slice documents the existing runtime surface:
 
 - Production REST host: `discord.com`.
 - Production REST API prefix: `/api/v10`.
-- Production Gateway host: `gateway.discord.gg`, or a Discord-provided resume Gateway URL.
+- Production Gateway hosts: `gateway.discord.gg` and regional `gateway-<region>.discord.gg` hosts with a single DNS label before `.discord.gg`.
 - Production port: `443`.
 - TLS and SNI are required for live traffic.
 - Runtime endpoint validation rejects empty URLs, bad schemes, public `http` or `ws`, userinfo, query strings, and fragments.
-- Runtime host policy allows `discord.com`, subdomains of `discord.com`, `discord.gg`, and subdomains of `discord.gg`.
-- Runtime loopback overrides are test/debug only.
+- REST endpoint host policy allows `discord.com`, subdomains of `discord.com`, `discord.gg`, and subdomains of `discord.gg`. Gateway endpoints use the narrower Gateway host list above.
+- Every configured, discovered, READY-supplied, and restored Gateway URL must use WSS on port `443`, the root path, and no credentials, query, fragment, or control characters. The connector adds the Gateway version and encoding parameters after validation.
+- Runtime loopback overrides are test/debug only. A provider-supplied Gateway URL may use literal loopback only when its parsed IP, scheme, and effective port match the explicitly configured Gateway origin; configuring a loopback REST endpoint does not authorize another Gateway destination.
+- Rejected discovery or stored resume endpoints fail before any socket is opened. A rejected READY resume URL records a safe recovery marker without persisting that endpoint or advancing the consumed sequence. Rejected URLs are not echoed in diagnostics.
 - Manifest network policy denies localhost, private ranges, tailnet ranges, and IP literals for live operations.
 - Runtime request timeout defaults to `30 seconds`.
 - Manifest network constraints set `10_000 ms` connect timeout and `30_000 ms` total timeout.

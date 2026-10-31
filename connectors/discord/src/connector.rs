@@ -3,7 +3,7 @@
 //! Implements handler methods for FCP protocol with Discord-specific operations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -62,7 +62,7 @@ pub struct DiscordConnector {
     verifier: Option<CapabilityVerifier>,
     session_id: Option<SessionId>,
     configured_zone: Option<ZoneId>,
-    granted_capabilities: BTreeSet<CapabilityId>,
+    granted_capabilities: HashSet<CapabilityId>,
     event_stream: Option<JsonlEventStream>,
     event_subscription: Option<Arc<DiscordNativeSubscription>>,
     native_stream_identity: Option<(String, String)>,
@@ -203,7 +203,7 @@ fn discord_native_topic(topic: &str) -> bool {
 
 fn discord_native_sequence(sequence: &AtomicU64) -> FcpResult<u64> {
     sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| discord_stream_unavailable("Discord event sequence exhausted"))
@@ -1093,7 +1093,7 @@ impl DiscordConnector {
             verifier: None,
             session_id: None,
             configured_zone: None,
-            granted_capabilities: BTreeSet::new(),
+            granted_capabilities: HashSet::new(),
             event_stream: None,
             event_subscription: None,
             native_stream_identity: None,
@@ -3619,9 +3619,10 @@ fn network_readiness(config: &DiscordConfig) -> NetworkReadiness {
         .is_some_and(host_allowed_by_network_constraints);
 
     let gateway_host = config.gateway_url.as_deref().and_then(extract_host);
-    let gateway_allowed = gateway_host
+    let gateway_allowed = config
+        .gateway_url
         .as_deref()
-        .is_none_or(host_allowed_by_network_constraints);
+        .is_none_or(|gateway_url| config.validate_gateway_url(gateway_url).is_ok());
 
     NetworkReadiness {
         api_host,
@@ -3643,7 +3644,12 @@ fn validate_network_constraints_hosts(config: &DiscordConfig) -> FcpResult<()> {
     // notion / whatsapp.
     validate_discord_endpoint_url(&config.api_url, "api_url")?;
     if let Some(gateway_url) = &config.gateway_url {
-        validate_discord_endpoint_url(gateway_url, "gateway_url")?;
+        config
+            .validate_gateway_url(gateway_url)
+            .map_err(|error| FcpError::InvalidRequest {
+                code: 1003,
+                message: error.to_string(),
+            })?;
     }
 
     let readiness = network_readiness(config);
@@ -3660,17 +3666,15 @@ fn validate_network_constraints_hosts(config: &DiscordConfig) -> FcpResult<()> {
     })
 }
 
-/// Reject URL overrides with bad scheme or sneaky components.
+/// Reject REST URL overrides with bad scheme or sneaky components.
 ///
 /// The host allowlist is enforced separately via
 /// `host_allowed_by_network_constraints`; this function only owns the
 /// scheme / userinfo / query / fragment discipline so that a
 /// well-hosted URL cannot smuggle junk into downstream `format!` URL
-/// construction. Accepts `wss://` on `gateway_url` because Discord's
-/// gateway uses WebSocket; the scheme check permits both `https` and
-/// `wss` for either field since `validate_network_constraints_hosts` is
-/// called with a single helper, and misapplied schemes are caught at
-/// connect time by `WsClient` / `reqwest`.
+/// construction. Gateway endpoints use the stricter shared
+/// `DiscordConfig::validate_gateway_url` policy, including provider-discovered
+/// and persisted resume endpoints.
 fn validate_discord_endpoint_url(raw: &str, field: &str) -> FcpResult<()> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4327,7 +4331,6 @@ mod tests {
     #[test]
     fn validate_discord_endpoint_url_accepts_discord_https() {
         validate_discord_endpoint_url("https://discord.com/api/v10", "api_url").unwrap();
-        validate_discord_endpoint_url("wss://gateway.discord.gg/", "gateway_url").unwrap();
     }
 
     #[test]
@@ -4380,7 +4383,72 @@ mod tests {
     #[test]
     fn validate_discord_endpoint_url_allows_local_http_for_tests() {
         validate_discord_endpoint_url("http://localhost:9999/api", "api_url").unwrap();
-        validate_discord_endpoint_url("ws://127.0.0.1:9999/gateway", "gateway_url").unwrap();
+    }
+
+    #[test]
+    fn configured_gateway_readiness_uses_the_credential_destination_policy() {
+        for (gateway_url, allowed) in [
+            ("wss://gateway.discord.gg/", true),
+            ("wss://gateway-us-east1-b.discord.gg/", true),
+            ("ws://127.0.0.1:8765/", true),
+            ("ws://[::1]:8765/", true),
+            ("ws://localhost:8765/", false),
+            ("wss://discord.com/", false),
+            ("wss://gateway.discord.gg:8443/", false),
+            ("wss://gateway.discord.gg/?secret=gateway-private", false),
+            ("", false),
+        ] {
+            let config = DiscordConfig {
+                gateway_url: Some(gateway_url.into()),
+                ..Default::default()
+            };
+            let readiness = network_readiness(&config);
+            assert_eq!(
+                readiness.gateway_allowed, allowed,
+                "Gateway readiness: {gateway_url}"
+            );
+            assert_eq!(
+                readiness.network_ok, allowed,
+                "Network readiness: {gateway_url}"
+            );
+            assert_eq!(
+                validate_network_constraints_hosts(&config).is_ok(),
+                allowed,
+                "configuration and readiness must agree: {gateway_url}"
+            );
+        }
+        assert!(network_readiness(&DiscordConfig::default()).gateway_allowed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn configure_rejects_gateway_override_before_bot_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let mut connector = DiscordConnector::new();
+        for gateway_url in [
+            "wss://gateway.discord.gg:8443/",
+            "wss://gateway.discord.gg.evil.invalid/",
+            "wss://gateway.discord.gg/?token=gateway-private",
+        ] {
+            let error = connector
+                .handle_configure(json!({
+                    "bot_credential": "private-bot-token",
+                    "api_url": api_url,
+                    "gateway_url": gateway_url,
+                    "timeout": 1,
+                }))
+                .await
+                .expect_err("unsafe Gateway override must fail before credentials are sent");
+            assert!(matches!(error, FcpError::InvalidRequest { code: 1003, .. }));
+            assert!(!error.to_string().contains("gateway-private"));
+            assert!(!error.to_string().contains("private-bot-token"));
+            assert!(connector.api_client.is_none());
+        }
+        let error = listener
+            .accept()
+            .expect_err("configuration rejection must not authenticate against REST");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]

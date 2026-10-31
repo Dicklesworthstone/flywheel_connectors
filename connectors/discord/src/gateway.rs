@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("sess-identify"));
         assert_eq!(
             state.resume_url.as_deref(),
-            Some("wss://gateway.discord.gg")
+            Some("wss://gateway.discord.gg/")
         );
         assert_eq!(
             state.sequence, None,
@@ -1294,7 +1294,7 @@ mod tests {
             .expect("pending dispatch");
         let frame = rx.recv().await.expect("pending frame");
         let lock = lock_gateway_lease(&checkpoint.lease_path).expect("block marker write");
-        let error = invalidate_resume(&delivery)
+        let error = invalidate_resume(&delivery, "the provider can no longer replay this session")
             .await
             .expect_err("invalidated session is terminal");
         assert!(
@@ -1629,14 +1629,20 @@ impl GatewayConnection {
             }
         };
 
-        let ws_url = format!("{gateway_url}/?v=10&encoding=json");
+        // Discovery and persisted resume metadata are untrusted routing input.
+        // Validate before opening a socket that will receive the bot credential.
+        let mut ws_url = config.validate_gateway_url(&gateway_url)?;
+        ws_url
+            .query_pairs_mut()
+            .append_pair("v", "10")
+            .append_pair("encoding", "json");
         info!(
             resuming = state_snapshot.session_id.is_some(),
             "Connecting to Discord gateway"
         );
 
         let ws_stream = match gateway_operation(
-            connect_gateway_websocket(&ws_url),
+            connect_gateway_websocket(ws_url.as_str()),
             &self.shutdown_requested,
             Duration::from_secs(30),
         )
@@ -2111,23 +2117,24 @@ async fn queue_dispatch(
     Ok(())
 }
 
-async fn invalidate_resume(state_store: &Arc<Mutex<GatewayDeliveryState>>) -> DiscordResult<()> {
+async fn invalidate_resume(
+    state_store: &Arc<Mutex<GatewayDeliveryState>>,
+    reason: &str,
+) -> DiscordResult<()> {
     let mut delivery = state_store.lock().await;
     let mut invalidated = delivery.committed.clone();
     invalidated.resume_invalidated = true;
     // This is a safety fence, not cursor advancement. Install it before I/O:
     // an unavailable disk must not let a late ACK undo known provider loss.
-    delivery.recovery_reason = Some("the provider can no longer replay this session".into());
+    delivery.recovery_reason = Some(reason.into());
     let persisted = persist_checkpoint(delivery.checkpoint.as_ref(), &invalidated);
     delivery.committed = invalidated;
     if let Err(error) = persisted {
         return Err(recovery_required(&format!(
-            "the provider invalidated the session and its recovery marker could not be persisted: {error}"
+            "{reason}; its recovery marker could not be persisted: {error}"
         )));
     }
-    Err(recovery_required(
-        "the provider can no longer replay this session",
-    ))
+    Err(recovery_required(reason))
 }
 
 #[allow(clippy::large_futures)]
@@ -2329,7 +2336,36 @@ async fn run_gateway_loop_inner(
                                 .ok_or_else(|| {
                                     recovery_required("dispatch payload is not an object")
                                 })?;
-                        let event = dispatch_event(event_name, data, state)?;
+                        let is_ready = event_name == "READY";
+                        let mut event = match dispatch_event(event_name, data, state) {
+                            Ok(event) => event,
+                            Err(_) if is_ready => {
+                                return invalidate_resume(
+                                    state_store,
+                                    "READY did not establish a valid resumable session",
+                                )
+                                .await;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if let GatewayEvent::Ready(ready) = &mut event {
+                            let resume_url =
+                                match config.validate_gateway_url(&ready.resume_gateway_url) {
+                                    Ok(url) => url.to_string(),
+                                    Err(_) => {
+                                        // Persist only safe committed metadata (or an empty
+                                        // invalidated marker before the first READY). Never
+                                        // store a hostile endpoint or silently re-identify.
+                                        return invalidate_resume(
+                                            state_store,
+                                            "READY supplied a rejected Gateway resume URL",
+                                        )
+                                        .await;
+                                    }
+                                };
+                            ready.resume_gateway_url.clone_from(&resume_url);
+                            state.resume_url = Some(resume_url);
+                        }
                         queue_dispatch(
                             event_tx,
                             state,
@@ -2353,7 +2389,11 @@ async fn run_gateway_loop_inner(
                         let resumable = payload.d.and_then(|v| v.as_bool()).unwrap_or(false);
                         warn!(resumable, "Session invalidated");
                         if !resumable {
-                            return invalidate_resume(state_store).await;
+                            return invalidate_resume(
+                                state_store,
+                                "the provider can no longer replay this session",
+                            )
+                            .await;
                         }
                         return Ok(());
                     }
@@ -2387,7 +2427,11 @@ async fn run_gateway_loop_inner(
                     .as_ref()
                     .is_some_and(|frame| matches!(frame.code, 4007 | 4009))
                 {
-                    return invalidate_resume(state_store).await;
+                    return invalidate_resume(
+                        state_store,
+                        "the provider can no longer replay this session",
+                    )
+                    .await;
                 }
                 info!("Gateway connection closed");
                 return Ok(());
