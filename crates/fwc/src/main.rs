@@ -258,6 +258,7 @@ mod search;
 mod secretless;
 #[allow(dead_code)] // MCP server module — data layer for `fwc serve-mcp`.
 mod serve_mcp;
+mod serve_mcp_host;
 #[allow(dead_code)]
 mod session;
 #[allow(dead_code)] // Onboarding and repair command family.
@@ -2879,6 +2880,9 @@ struct ServeMcpArgs {
 
     #[command(flatten)]
     auth: LiveAuthArgs,
+
+    #[command(flatten)]
+    cancellation: serve_mcp_host::CancellationArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -3537,6 +3541,9 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
             &prepared.render_options,
         );
     }
+    // Validate explicit cancellation credentials before opening the MCP stream.
+    // Each accepted call then retains its own credential snapshot for cleanup.
+    args.cancellation.resolve()?;
     if let Some(zone) = args.zone.as_deref() {
         return render_dispatch(
             DispatchOutcome {
@@ -3604,11 +3611,12 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
     let host_context = resolved_host.clone();
     let principal = args.principal.clone();
     let auth = args.auth.clone();
+    let cancellation = args.cancellation.clone();
     serve_mcp::run_stdio_transport_blocking(
         &state,
         stdin.lock(),
-        stdout.lock(),
-        move |tool, id, arguments| {
+        stdout,
+        move |tool, id, arguments, context| {
             mcp_tool_call_response(
                 tool,
                 id,
@@ -3617,6 +3625,8 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec
                 principal.as_deref(),
                 zone.as_deref(),
                 &auth,
+                &cancellation,
+                context,
             )
         },
     )?;
@@ -3649,15 +3659,27 @@ fn mcp_tool_call_response(
     principal: Option<&str>,
     zone: Option<&str>,
     auth: &LiveAuthArgs,
+    cancellation: &serve_mcp_host::CancellationArgs,
+    context: serve_mcp::McpCallContext,
 ) -> serve_mcp::JsonRpcResponse {
     let invoke_args = mcp_tool_invoke_args(tool, arguments, host, principal, zone, auth);
+    let Some(host) = host else {
+        return serve_mcp::JsonRpcResponse::error(
+            id,
+            serve_mcp::JsonRpcError::internal("MCP tool execution requires a live host"),
+        );
+    };
+    let control = match serve_mcp_host::McpInvocationControl::new(context, cancellation) {
+        Ok(control) => control,
+        Err(error) => {
+            return serve_mcp::JsonRpcResponse::error(
+                id,
+                serve_mcp::JsonRpcError::internal(error.to_string()),
+            );
+        }
+    };
 
-    match invoke_dispatch(
-        "invoke",
-        &invoke_args,
-        host.map(|config| config.endpoint.as_str()),
-        None,
-    ) {
+    match invoke_dispatch_host_controlled("invoke", &invoke_args, host, None, Some(&control)) {
         Ok(dispatch) => {
             let mut structured_content = dispatch.payload;
             let message = structured_content["message"]
@@ -25104,13 +25126,26 @@ fn invoke_dispatch(
     invoke_dispatch_without_host(command, args)
 }
 
-#[allow(clippy::too_many_lines)]
 fn invoke_dispatch_host(
     command: &str,
     args: &InvokeArgs,
     host: &ResolvedHostConfig,
     simulation: Option<&SimulateArgs>,
 ) -> Result<DispatchOutcome> {
+    invoke_dispatch_host_controlled(command, args, host, simulation, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn invoke_dispatch_host_controlled(
+    command: &str,
+    args: &InvokeArgs,
+    host: &ResolvedHostConfig,
+    simulation: Option<&SimulateArgs>,
+    control: Option<&serve_mcp_host::McpInvocationControl>,
+) -> Result<DispatchOutcome> {
+    if let Some(control) = control {
+        control.checkpoint()?;
+    }
     let auth = match resolve_live_auth(&args.auth) {
         Ok(auth) => auth,
         Err(error) => {
@@ -25128,7 +25163,12 @@ fn invoke_dispatch_host(
         }
     };
 
-    let client = HostAdminClient::new(&host.endpoint)?;
+    let mut client = HostAdminClient::new(&host.endpoint)?;
+    if let Some(control) = control {
+        control.checkpoint()?;
+        // MCP shutdown must be able to drain preparation as well as invocation.
+        client.read_timeout = client.read_timeout.min(DEFAULT_HOST_READ_TIMEOUT);
+    }
     let (catalog, _) = client.catalog(None)?;
     let connector = match catalog.resolve_connector(&args.connector) {
         Ok(connector) => connector,
@@ -25140,6 +25180,9 @@ fn invoke_dispatch_host(
             ));
         }
     };
+    if let Some(control) = control {
+        control.checkpoint()?;
+    }
     let introspection = client.introspect(connector.summary.id.as_str())?;
     let operation = match resolve_host_tool(&introspection.tools, &args.operation) {
         Ok(operation) => operation,
@@ -25207,12 +25250,16 @@ fn invoke_dispatch_host(
         &zone,
         &prepared_payload,
         args.idempotency_key.as_deref(),
-        None,
+        control.map(serve_mcp_host::McpInvocationControl::scope_salt),
     )?;
     let effective_principal = args
         .principal
         .clone()
         .or_else(|| auth.principal_hint.clone());
+    if let Some(control) = control {
+        control.checkpoint()?;
+        control.validate_authority(&auth, &zone, effective_principal.as_deref())?;
+    }
 
     let mut payload = json!({
         "status": if valid { "ready" } else { "error" },
@@ -25424,7 +25471,12 @@ fn invoke_dispatch_host(
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
     };
-    let preflight = client.preflight(&preflight_request)?;
+    let preflight: HostPreflightResponse = if let Some(control) = control {
+        control.checkpoint()?;
+        client.post_json_with_timeout("/rpc/preflight", &preflight_request, client.read_timeout)?
+    } else {
+        client.preflight(&preflight_request)?
+    };
     payload["preflight"] = serde_json::to_value(&preflight)?;
 
     if !preflight.allowed {
@@ -25487,7 +25539,12 @@ fn invoke_dispatch_host(
         approval_tokens: auth.approval_tokens,
     };
     let started_at = std::time::Instant::now();
-    let response = match client.invoke(&invoke_request) {
+    let invocation = if let Some(control) = control {
+        control.invoke(&client, &invoke_request)
+    } else {
+        client.invoke(&invoke_request)
+    };
+    let response = match invocation {
         Ok(response) => response,
         Err(error) => {
             if let Some(unknown) = error.downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>() {
@@ -34280,6 +34337,9 @@ fn is_sensitive_flag(flag: &str) -> bool {
     matches!(
         flag,
         "--capability-token"
+            | "--capability-token-file"
+            | "--cancel-capability-token"
+            | "--cancel-capability-token-file"
             | "--source-capability-token"
             | "--step-capability-token"
             | "--step-capability-token-file"
@@ -39005,6 +39065,39 @@ deny_ptrace = true
     }
 
     #[test]
+    fn mcp_auth_diagnostics_redact_cancellation_credentials() {
+        for credential in [
+            "--cancel-capability-token=CANCEL_TOKEN_SECRET",
+            "--cancel-capability-token-file=CANCEL_PATH_SECRET",
+        ] {
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--extract",
+                ".connector[",
+                "serve-mcp",
+                credential,
+            ]);
+            assert_eq!(exit_code, CliExitCode::Validation.into());
+            assert_eq!(payload["error"]["type"], "invalid-extract-filter");
+            for view in ["received", "normalized"] {
+                let arguments = payload["input"][view].as_array().unwrap();
+                assert!(
+                    arguments
+                        .last()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .ends_with("=<redacted>")
+                );
+            }
+            let encoded = payload.to_string();
+            assert!(!encoded.contains("CANCEL_TOKEN_SECRET"));
+            assert!(!encoded.contains("CANCEL_PATH_SECRET"));
+        }
+    }
+
+    #[test]
     fn redact_sensitive_args_masks_auth_and_live_tokens() {
         let args = [
             "fwc",
@@ -39018,6 +39111,13 @@ deny_ptrace = true
             "api_key=value",
             "--capability-token",
             "cap-secret",
+            "--cancel-capability-token",
+            "cancel-secret",
+            "--cancel-capability-token-file=cancel-path-secret",
+            "--cancel-capability-token-file",
+            "another-cancel-path-secret",
+            "--cancel-capability-token=another-cancel-secret",
+            "--capability-token-file=invoke-path-secret",
         ]
         .map(str::to_owned);
 
@@ -39026,6 +39126,11 @@ deny_ptrace = true
         assert_eq!(redacted[6], "token=<redacted>");
         assert_eq!(redacted[8], "api_key=<redacted>");
         assert_eq!(redacted[10], "<redacted>");
+        assert_eq!(redacted[12], "<redacted>");
+        assert_eq!(redacted[13], "--cancel-capability-token-file=<redacted>");
+        assert_eq!(redacted[15], "<redacted>");
+        assert_eq!(redacted[16], "--cancel-capability-token=<redacted>");
+        assert_eq!(redacted[17], "--capability-token-file=<redacted>");
     }
 
     #[test]

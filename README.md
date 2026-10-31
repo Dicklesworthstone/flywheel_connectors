@@ -1249,14 +1249,18 @@ fwc batch-file operations.jsonl
 ### MCP Tool Export
 
 ```bash
-# Serve all connectors as MCP tools
-fwc serve-mcp --host http://127.0.0.1:8787
+# Serve the host's connector inventory with explicit invocation authority
+fwc serve-mcp --host http://127.0.0.1:8787 \
+    --capability-token-file invoke.token
 
-# Serve specific connectors only
-fwc serve-mcp --host http://127.0.0.1:8787 github slack gmail
+# Serve one connector, with owner-scoped cancellation of active host calls
+fwc serve-mcp --host http://127.0.0.1:8787 github \
+    --capability-token-file invoke.token \
+    --cancel-capability-token-file cancel-self.token
 
 # Cap the live MCP surface at a risk ceiling (inclusive)
-fwc serve-mcp --host http://127.0.0.1:8787 --risk-max medium github
+fwc serve-mcp --host http://127.0.0.1:8787 --risk-max medium github \
+    --capability-token-file invoke.token
 
 # Offline tool schema export
 fwc export-tools --offline --format mcp --json
@@ -1265,6 +1269,12 @@ fwc export-tools --offline --format openai --risk-max medium --output tools.json
 ```
 
 `--risk-max` excludes operations above a risk threshold, preventing agents from accidentally invoking dangerous operations. Both `export-tools` and `serve-mcp` honor it with the same inclusive boundary semantics; a live `serve-mcp` server enforces the ceiling on `tools/list` and on `tools/call`, and tools without declared risk metadata are excluded whenever a ceiling is set.
+
+The stdio server admits up to eight queued or running tool calls and continues reading requests while those calls execute. `ping` and tool discovery can respond while a provider call is pending. Requests and responses are limited to 32 MiB, and request IDs to 256 bytes. Calls beyond the concurrency limit receive a `server_busy` error before execution. Each accepted tool call has a fresh host request identity, including calls with identical arguments or a reused MCP request ID.
+
+MCP `notifications/cancelled` cancels the matching active call. Closing the input stream cancels all active calls and waits for their workers to drain. Cancellation prevents queued work and suppresses cancelled responses. To request cancellation of work already admitted by the host, supply a separate, host-issued `host.cancel-self` capability using `--cancel-capability-token-file` or `--cancel-capability-token`. It must have the same principal and zone as the invocation capability and cannot be holder-bound. The host verifies its signature, persisted issuance, validity, revocation, and operation ownership. Each call retains its original cancellation credential even if the file changes afterward.
+
+Host cancellation is best effort: acknowledgement means the cancellation request was accepted, and does not prove that provider effects were rolled back. Without the optional cancellation capability, an already dispatched host operation can continue until its normal deadline. Transport failures also signal cancellation; because portable blocking stdin cannot be interrupted, an output failure is returned after the input reader next unblocks.
 
 ---
 

@@ -24,157 +24,15 @@ use crate::zone_scope::{
 };
 use crate::{catalog, export_tools};
 
-// ── JSON-RPC 2.0 Error Codes ────────────────────────────────────────────
+pub(crate) mod cancellation;
+mod transport;
 
-/// Parse error: invalid JSON was received by the server.
-pub const PARSE_ERROR: i32 = -32_700;
-/// Invalid request: the JSON sent is not a valid request object.
-pub const INVALID_REQUEST: i32 = -32_600;
-/// Method not found: the method does not exist or is not available.
-pub const METHOD_NOT_FOUND: i32 = -32_601;
-/// Invalid params: invalid method parameters.
-pub const INVALID_PARAMS: i32 = -32_602;
-/// Internal error: internal JSON-RPC error.
-pub const INTERNAL_ERROR: i32 = -32_603;
-
-// ── JSON-RPC 2.0 Protocol Types ─────────────────────────────────────────
-
-/// A JSON-RPC 2.0 request.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonRpcRequest {
-    /// Protocol version, always `"2.0"`.
-    pub jsonrpc: String,
-    /// Request ID (may be null for notifications).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
-    /// Method name to invoke.
-    pub method: String,
-    /// Optional method parameters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
-
-/// A JSON-RPC 2.0 response.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonRpcResponse {
-    /// Protocol version, always `"2.0"`.
-    pub jsonrpc: String,
-    /// Request ID this response corresponds to.
-    pub id: Value,
-    /// Successful result (mutually exclusive with `error`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    /// Error result (mutually exclusive with `result`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-}
-
-impl JsonRpcResponse {
-    /// Create a success response.
-    pub fn success(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    /// Create an error response.
-    pub fn error(id: Value, error: JsonRpcError) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: None,
-            error: Some(error),
-        }
-    }
-
-    /// Return the id.
-    pub const fn id(&self) -> &Value {
-        &self.id
-    }
-
-    /// Return the result if present.
-    pub const fn result(&self) -> Option<&Value> {
-        self.result.as_ref()
-    }
-
-    /// Return whether this response is an error.
-    pub const fn is_error(&self) -> bool {
-        self.error.is_some()
-    }
-}
-
-/// A JSON-RPC 2.0 error object.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct JsonRpcError {
-    /// Error code.
-    pub code: i32,
-    /// Human-readable error message.
-    pub message: String,
-    /// Optional structured data about the error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-impl JsonRpcError {
-    /// Create a new error with code and message.
-    pub fn new(code: i32, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            data: None,
-        }
-    }
-
-    /// Builder: attach extra data to the error.
-    pub fn with_data(mut self, data: Value) -> Self {
-        self.data = Some(data);
-        self
-    }
-
-    /// Create a parse error.
-    pub fn parse_error(detail: impl Into<String>) -> Self {
-        Self::new(PARSE_ERROR, detail)
-    }
-
-    /// Create an invalid request error.
-    pub fn invalid_request(detail: impl Into<String>) -> Self {
-        Self::new(INVALID_REQUEST, detail)
-    }
-
-    /// Create a method-not-found error.
-    pub fn method_not_found(method: &str) -> Self {
-        Self::new(METHOD_NOT_FOUND, format!("Method not found: {method}"))
-    }
-
-    /// Create an invalid-params error.
-    pub fn invalid_params(detail: impl Into<String>) -> Self {
-        Self::new(INVALID_PARAMS, detail)
-    }
-
-    /// Create an internal error.
-    pub fn internal(detail: impl Into<String>) -> Self {
-        Self::new(INTERNAL_ERROR, detail)
-    }
-
-    /// Return the error code.
-    pub const fn code(&self) -> i32 {
-        self.code
-    }
-
-    /// Return the error message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for JsonRpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)
-    }
-}
+use transport::parse_jsonrpc_request;
+#[cfg(test)]
+pub use transport::{
+    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+};
+pub use transport::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpCallContext};
 
 // ── Transport Mode ──────────────────────────────────────────────────────
 
@@ -1045,6 +903,7 @@ pub fn handle_request(state: &McpServerState, request: &JsonRpcRequest) -> JsonR
 
     match request.method.as_str() {
         "initialize" => handle_initialize(state, id),
+        "ping" => JsonRpcResponse::success(id, json!({})),
         "notifications/initialized" => handle_initialized_notification(id),
         "tools/list" => handle_tools_list(state, id),
         "tools/call" => handle_tools_call(state, id, request.params.as_ref()),
@@ -1054,76 +913,6 @@ pub fn handle_request(state: &McpServerState, request: &JsonRpcRequest) -> JsonR
         "prompts/get" => handle_prompts_get(state, id, request.params.as_ref()),
         _ => JsonRpcResponse::error(id, JsonRpcError::method_not_found(&request.method)),
     }
-}
-
-fn parse_jsonrpc_request(raw: &str) -> Result<JsonRpcRequest, JsonRpcResponse> {
-    let value: Value = match serde_json::from_str(raw) {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(JsonRpcResponse::error(
-                Value::Null,
-                JsonRpcError::parse_error(format!("Failed to parse request: {error}")),
-            ));
-        }
-    };
-
-    let id = value
-        .get("id")
-        .filter(|request_id| {
-            request_id.is_null() || request_id.is_string() || request_id.is_number()
-        })
-        .cloned()
-        .unwrap_or(Value::Null);
-    let Some(object) = value.as_object() else {
-        return Err(JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request("JSON-RPC request must be an object."),
-        ));
-    };
-
-    let jsonrpc = object.get("jsonrpc").and_then(Value::as_str);
-    if jsonrpc != Some("2.0") {
-        return Err(JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request("`jsonrpc` must be the string \"2.0\"."),
-        ));
-    }
-
-    if let Some(request_id) = object.get("id")
-        && !(request_id.is_null() || request_id.is_string() || request_id.is_number())
-    {
-        return Err(JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request("`id` must be null, a string, or a number."),
-        ));
-    }
-
-    let method = object.get("method").and_then(Value::as_str);
-    if method.is_none_or(str::is_empty) {
-        return Err(JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request(
-                "JSON-RPC request is missing a non-empty string `method`.",
-            ),
-        ));
-    }
-
-    if let Some(params) = object.get("params")
-        && !params.is_object()
-        && !params.is_array()
-    {
-        return Err(JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request("`params` must be an object or array if present."),
-        ));
-    }
-
-    serde_json::from_value(value).map_err(|error| {
-        JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_request(format!("Invalid JSON-RPC request object: {error}")),
-        )
-    })
 }
 
 /// Parse a raw JSON string into a request and route it.
@@ -1187,7 +976,13 @@ where
     Ok(())
 }
 
-/// Run the newline-delimited JSON stdio transport on blocking stdio handles.
+/// Run bounded concurrent MCP calls on blocking stdio handles.
+///
+/// At most eight queued or running tool calls are admitted. Input and output
+/// frames are capped at 32 MiB, and request IDs at 256 bytes. Cancellation and
+/// metadata requests remain responsive while the owned tool workers run.
+/// The callback must observe its context and bound its external I/O; EOF or a
+/// transport error cancels active calls and joins them before returning.
 ///
 /// # Errors
 ///
@@ -1196,44 +991,22 @@ where
 pub fn run_stdio_transport_blocking<R, W, F>(
     state: &McpServerState,
     reader: R,
-    mut writer: W,
-    mut tool_handler: F,
+    writer: W,
+    tool_handler: F,
 ) -> Result<()>
 where
     R: std::io::BufRead,
-    W: std::io::Write,
-    F: FnMut(&McpToolDefinition, Value, Value) -> JsonRpcResponse,
+    W: std::io::Write + Send,
+    F: Fn(&McpToolDefinition, Value, Value, McpCallContext) -> JsonRpcResponse + Sync,
 {
-    for line in reader.lines() {
-        let line = line?;
-        let raw = line.trim();
-        if raw.is_empty() {
-            continue;
-        }
-
-        let response = match parse_jsonrpc_request(raw) {
-            Ok(request) => {
-                if request.id.is_none() {
-                    if request.method.starts_with("notifications/") {
-                        let _ = handle_request(state, &request);
-                    }
-                    continue;
-                }
-                if request.method == "tools/call" {
-                    handle_stdio_tools_call(state, &request, &mut tool_handler)
-                } else {
-                    handle_request(state, &request)
-                }
-            }
-            Err(response) => response,
-        };
-
-        let encoded = serde_json::to_string(&response)?;
-        writer.write_all(encoded.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-    }
-
+    transport::run_blocking(
+        reader,
+        writer,
+        transport::TransportLimits::default(),
+        |request| handle_request(state, request),
+        |request| prepare_stdio_tools_call(state, request),
+        |(tool, id, arguments), context| tool_handler(tool, id, arguments, context),
+    )?;
     Ok(())
 }
 
@@ -1245,12 +1018,22 @@ fn handle_stdio_tools_call<F>(
 where
     F: FnMut(&McpToolDefinition, Value, Value) -> JsonRpcResponse,
 {
+    match prepare_stdio_tools_call(state, request) {
+        Ok((tool, id, arguments)) => tool_handler(tool, id, arguments),
+        Err(response) => response,
+    }
+}
+
+fn prepare_stdio_tools_call<'a>(
+    state: &'a McpServerState,
+    request: &JsonRpcRequest,
+) -> Result<(&'a McpToolDefinition, Value, Value), JsonRpcResponse> {
     let id = request.id.clone().unwrap_or(Value::Null);
     let Some(params) = request.params.as_ref() else {
-        return JsonRpcResponse::error(
+        return Err(JsonRpcResponse::error(
             id,
             JsonRpcError::invalid_params("Missing params for tools/call"),
-        );
+        ));
     };
 
     let tool_name = params
@@ -1259,25 +1042,25 @@ where
         .unwrap_or_default();
 
     if tool_name.is_empty() {
-        return JsonRpcResponse::error(
+        return Err(JsonRpcResponse::error(
             id,
             JsonRpcError::invalid_params("Missing 'name' in tools/call params"),
-        );
+        ));
     }
 
     let Some(tool) = state.find_tool(tool_name) else {
-        return JsonRpcResponse::error(
+        return Err(JsonRpcResponse::error(
             id,
             JsonRpcError::invalid_params(format!("Tool not found: {tool_name}")),
-        );
+        ));
     };
 
     if let Err(error) = validate_tool_access(state, tool, params) {
-        return JsonRpcResponse::error(id, error);
+        return Err(JsonRpcResponse::error(id, error));
     }
 
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-    tool_handler(tool, id, arguments)
+    Ok((tool, id, arguments))
 }
 
 // ── Method Handlers ─────────────────────────────────────────────────────
