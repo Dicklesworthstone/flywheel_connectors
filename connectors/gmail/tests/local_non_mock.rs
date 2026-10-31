@@ -259,7 +259,7 @@ fn generate_valid_token(
     ciborium::into_writer(&constraints, &mut constraints_cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(capability_for_operation(operation))
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:local-non-mock")
         .operations(&[operation])
         .issuer("node:local-non-mock")
@@ -278,8 +278,8 @@ async fn setup_handshake(connector: &mut GmailConnector) -> Ed25519SigningKey {
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0_u8; 32],
             "capabilities_requested": [
@@ -309,6 +309,8 @@ async fn loopback_acceptance_exercises_label_read_message_read_and_send_paths() 
 
     let labels = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-labels",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.list_labels",
             "input": {},
             "capability_token": generate_valid_token(
@@ -321,6 +323,8 @@ async fn loopback_acceptance_exercises_label_read_message_read_and_send_paths() 
         .expect("list labels through loopback fixture");
     let read_message = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-message",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.get_message",
             "input": {
                 "message_id": MESSAGE_ID
@@ -335,6 +339,8 @@ async fn loopback_acceptance_exercises_label_read_message_read_and_send_paths() 
         .expect("get message through loopback fixture");
     let sent_message = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-send",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.send_message",
             "input": {
                 "raw": RAW_MESSAGE

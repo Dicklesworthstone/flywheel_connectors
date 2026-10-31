@@ -90,7 +90,7 @@ fn generate_read_token(
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(cap)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:live-test")
         .operations(&[op])
         .issuer("node:live-test")
@@ -123,8 +123,8 @@ async fn setup_live_connector(
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
             "capabilities_requested": ["gmail.read"]
@@ -156,6 +156,8 @@ async fn live_labels_list() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "live-labels",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.list_labels",
             "input": {},
             "capability_token": cap_token

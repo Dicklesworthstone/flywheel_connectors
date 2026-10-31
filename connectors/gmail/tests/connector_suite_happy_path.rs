@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use chrono::{Duration, Utc};
 use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
 use fcp_e2e::{ConnectorSuite, E2eRunner, InvokeExpectations};
@@ -16,7 +18,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-const CONNECTOR_ID: &str = "gmail";
+const CONNECTOR_ID: &str = "fcp.gmail";
 const OP_LIST_MESSAGES: &str = "gmail.list_messages";
 const CAP_READ: &str = "gmail.read";
 const TEST_CREDENTIAL_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -59,11 +61,9 @@ impl FcpConnector for GmailAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => match payload.get("status").and_then(serde_json::Value::as_str) {
-                Some("healthy") => HealthSnapshot::ready(),
-                Some(other) => HealthSnapshot::degraded(format!("gmail_status:{other}")),
-                None => HealthSnapshot::error("gmail_status:missing".to_string()),
-            },
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                HealthSnapshot::error(format!("invalid Gmail health: {error}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -119,12 +119,10 @@ impl FcpConnector for GmailAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode invocation: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -151,7 +149,7 @@ impl FcpConnector for GmailAdapter {
 fn handshake_request(host_public_key: [u8; 32], instance_id: &InstanceId) -> HandshakeRequest {
     HandshakeRequest {
         protocol_version: "2.0".to_string(),
-        zone: ZoneId::work(),
+        zone: ZoneId::private(),
         zone_dir: None,
         host_public_key,
         nonce: [37u8; 32],
@@ -173,7 +171,7 @@ fn build_token(signing_key: &Ed25519SigningKey, instance_id: &InstanceId) -> Cap
 
     let raw = CapabilityTokenBuilder::new()
         .capability_id(CAP_READ)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:test")
         .operations(&[OP_LIST_MESSAGES])
         .issuer("node:test")
@@ -209,17 +207,17 @@ async fn connector_suite_happy_path_lists_messages() {
         .await;
 
     let signing_key = Ed25519SigningKey::generate();
-    let invoke = InvokeRequest {
+    let mut invoke = InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::new("gmail-connector-suite"),
         connector_id: ConnectorId::from_static(CONNECTOR_ID),
         operation: OperationId::from_static(OP_LIST_MESSAGES),
-        zone_id: ZoneId::work(),
+        zone_id: ZoneId::private(),
         input: json!({
             "query": "is:unread",
             "max_results": 2
         }),
-        capability_token: build_token(&signing_key, &instance_id),
+        capability_token: CapabilityToken::test_token(),
         holder_proof: None,
         context: None,
         idempotency_key: None,
@@ -237,7 +235,7 @@ async fn connector_suite_happy_path_lists_messages() {
             "base_url": server.uri(),
         }),
         handshake: handshake_request(signing_key.verifying_key().to_bytes(), &instance_id),
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations::default(),
     };
 
@@ -246,6 +244,20 @@ async fn connector_suite_happy_path_lists_messages() {
         .run_connector_suite(&mut connector, suite)
         .await
         .expect("connector suite run");
+
+    // Native authority is issued only after the connector reports its actual
+    // negotiated instance; the adapter must never rewrite caller tokens.
+    assert_ne!(connector.connector.instance_id(), &instance_id);
+    assert!(connector.health().await.is_ready());
+    invoke.capability_token = build_token(&signing_key, connector.connector.instance_id());
+    let response = connector.invoke(invoke).await.expect("authorized invoke");
+    assert_eq!(
+        response.result.unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     for entry in &report.logs {
         println!(

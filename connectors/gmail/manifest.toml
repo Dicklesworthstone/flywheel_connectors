@@ -647,9 +647,9 @@ related = ["gmail.get_message"]
 # ── Events ──────────────────────────────────────────────────────
 
 [event_caps]
-streaming = true
+streaming = false
 replay = false
-min_buffer_events = 50
+min_buffer_events = 0
 
 # ── Sandbox ─────────────────────────────────────────────────────
 

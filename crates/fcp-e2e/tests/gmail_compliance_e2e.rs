@@ -9,6 +9,7 @@
 //! Run: `cargo test --package fcp-e2e --features gmail`
 
 #![cfg(feature = "gmail")]
+#![recursion_limit = "256"]
 #![allow(clippy::too_many_lines)]
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -45,7 +46,7 @@ impl GmailConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: GmailConnector::new(),
-            id: ConnectorId::from_static("gmail"),
+            id: ConnectorId::from_static("fcp.gmail"),
         }
     }
 }
@@ -74,17 +75,9 @@ impl FcpConnector for GmailConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("gmail_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload).unwrap_or_else(|error| {
+                HealthSnapshot::error(format!("invalid Gmail health: {error}"))
+            }),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -138,12 +131,10 @@ impl FcpConnector for GmailConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("Failed to encode invocation: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -186,7 +177,7 @@ fn reference_manifest_with_hash() -> String {
 fn handshake_request(host_public_key: [u8; 32], capabilities: &[&str]) -> HandshakeRequest {
     HandshakeRequest {
         protocol_version: "2.0".to_string(),
-        zone: ZoneId::work(),
+        zone: ZoneId::private(),
         zone_dir: None,
         host_public_key,
         nonce: [7u8; 32],
@@ -215,7 +206,7 @@ fn build_token(
     ciborium::into_writer(&constraints, &mut constraints_cbor).expect("serialize test constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(capability)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:test")
         .operations(operations)
         // dja9u typestate ratchet: the Gmail connector verifies with
@@ -239,9 +230,9 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("gmail-e2e"),
-        connector_id: ConnectorId::from_static("gmail"),
+        connector_id: ConnectorId::from_static("fcp.gmail"),
         operation: OperationId::from_static(operation),
-        zone_id: ZoneId::work(),
+        zone_id: ZoneId::private(),
         input,
         capability_token: token,
         holder_proof: None,
@@ -389,16 +380,10 @@ async fn gmail_allow_valid_token_connector_suite_passes() {
     let mut connector = GmailConnectorAdapter::new();
     let signing_key = Ed25519SigningKey::generate();
     let handshake = handshake_request(signing_key.verifying_key().to_bytes(), &["gmail.read"]);
-    let token = build_token(
-        &signing_key,
-        connector.connector.instance_id().as_str(),
-        "gmail.read",
-        &["gmail.get_message"],
-    );
-    let invoke = invoke_request(
+    let mut invoke = invoke_request(
         "gmail.get_message",
         json!({ "message_id": "18d1234abc567890" }),
-        token,
+        CapabilityToken::test_token(),
     );
     let suite = ConnectorSuite {
         test_name: "gmail_allow_valid_token".to_string(),
@@ -408,7 +393,7 @@ async fn gmail_allow_valid_token_connector_suite_passes() {
             "base_url": mock.base_url(),
         }),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -426,15 +411,21 @@ async fn gmail_allow_valid_token_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "allow suite should pass");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
+    assert!(connector.health().await.is_ready());
+    invoke.capability_token = build_token(
+        &signing_key,
+        connector.connector.instance_id().as_str(),
+        "gmail.read",
+        &["gmail.get_message"],
+    );
+    let response = connector
+        .invoke(invoke)
+        .await
+        .expect("authorized invocation");
+    assert_eq!(response.status, InvokeStatus::Ok);
     assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+        response.result.unwrap()["message"]["id"],
+        "18d1234abc567890"
     );
     let received = mock.received_requests().await;
     let hits = received

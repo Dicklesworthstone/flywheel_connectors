@@ -56,28 +56,27 @@ Important runtime truths the contract preserves:
 - Message IDs, thread IDs, and draft IDs used in URL path segments are validated to reject empty strings, slashes, backslashes, traversal, and encoded slash/backslash variants.
 - Attachment reads validate and percent-encode both IDs as individual URL path segments; message IDs are limited to 128 bytes and attachment IDs to 4096 bytes.
 - `gmail.get_attachment` checks canonical URL-safe base64 and decoded size, with a caller-controlled `max_bytes` ceiling up to 16 MiB. Malformed or oversized replies never return partial file contents.
-- Runtime handshake installs a `CapabilityVerifier`.
-- `invoke` requires `operation`, `input`, and `capability_token`; it validates input, computes resource URIs, and verifies a bound capability token before provider execution.
-- `simulate` validates operation inventory, input shape, configured state, handshaken state, and bound capability token before returning an allowed result.
+- The native connector identity is `fcp.gmail`. A protocol `2.0` or `2.0.0` handshake negotiates only manifest-declared capabilities through the shared SDK session authority. An empty requested capability list grants nothing, and manifest-forbidden zones are rejected.
+- Each handshake returns a fresh actual `instance_id`, also reported in `health().details.instance_id`. Bind capability tokens to that returned identity; a host's requested instance is a preference and cannot revive old tokens. Reconfigure before rebinding the mailbox to another zone.
+- `invoke` requires the complete FCP `InvokeRequest`, including its type, inner request ID, connector ID, zone ID, operation, input, and signed capability token. Admission verifies the negotiated grant and actual resource URIs, charges signed call and FCP-message byte allowances, and enforces any signed idempotency-key restriction before provider execution. Complete invocation responses are capped at 32 MiB.
+- `simulate` verifies the same target, zone, operation, resources, and remaining call allowance without spending a provider invocation. Host revocation, approval, holder-proof, and lease checks remain host responsibilities.
 - `gmail.sync_history` persists the caller-acknowledged history boundary and requires `lease_seq` as a singleton-writer fencing token. Fetching a batch never acknowledges it; `latest_history_id` becomes the next input only after the caller has processed the complete result.
-- `health()` reports local configuration/auth/scope state and request metrics.
+- `health()` returns a canonical `HealthSnapshot`. Native readiness requires configuration and a valid handshake; `details` contains the actual instance, lifecycle flags, negotiated zone, auth/scope diagnostics, and request metrics. Secretless credential references can be natively ready while provider materialization remains separately reported as pending.
 - `doctor()` and `self_check()` probe Gmail reachability through `list_labels()` when credentials are materialized, and degrade for `credential_id` mode.
-- `handle_shutdown()` shuts down the client runtime and clears base configured/handshaken flags.
+- Every configure attempt invalidates prior authority before resolving replacement credentials. Failed handshakes also revoke prior authority. Shutdown invalidates the session, stops the client runtime, and clears stored configuration and lifecycle state.
 
 ## Drift Visible In This Checkout
 
 This README documents the runtime truth and keeps current drift visible:
 
 - Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest event caps say `streaming = true` with `min_buffer_events = 50`, but runtime handshake reports `streaming = false` with `min_buffer_events = 100`.
 - Manifest `gmail.list_messages` input schema mentions `label_ids`, but runtime input validation and client dispatch use `query`, `max_results`, and `page_token`.
 - Manifest AI hints mention `gmail.search_messages` and `gmail.modify_labels`, but neither operation exists in runtime dispatch.
 - Runtime introspection marks `gmail.trash_message` idempotency as `BestEffort`; manifest marks it `strict`.
 - Runtime base URL policy accepts any `googleapis.com` subdomain, while manifest operation allowlists name `gmail.googleapis.com` and `www.googleapis.com`.
-- Runtime `handle_shutdown` does not clear stored `config`, `client`, `verifier`, or `session_id` fields, though it marks base configured/handshaken flags false.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should align list-message schema, event caps, idempotency metadata, base URL policy wording, manifest hints, and shutdown state cleanup.
+A follow-up parity bead should align list-message schema, idempotency metadata, base URL policy wording, and manifest hints. Native event streaming is not advertised; mailbox history remains available through the acknowledged `gmail.sync_history` operation.
 
 ## First-Slice Scope
 

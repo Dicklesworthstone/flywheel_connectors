@@ -5,8 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fcp_google_discovery::{
@@ -14,12 +13,13 @@ use fcp_google_discovery::{
     provisioning::load_default_google_provisioning_bundle,
 };
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
-    CapabilityVerifier, ConnectorId, EventCaps, FcpError, FcpResult, HandshakeRequest,
-    HandshakeResponse, IdempotencyClass, InstanceId, Introspection, OperationId, OperationInfo,
-    RiskLevel, SafetyTier, SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    AgentHint, ApprovalMode, BaseConnector, CapabilityId, ConnectorId, FcpError, FcpResult,
+    HandshakeRequest, HealthSnapshot, HealthState, IdempotencyClass, InstanceId, Introspection,
+    InvokeRequest, InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier,
+    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse, ZoneId,
     reject_secret_config_material,
 };
+use fcp_sdk::prelude::StandaloneSession;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +37,7 @@ const MAX_HISTORY_SYNC_PAGES: usize = 100;
 const MAX_HISTORY_SYNC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY_ID_BYTES: usize = 128;
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct GmailConfig {
@@ -99,11 +100,13 @@ impl DoctorResult {
 
 /// FCP Gmail Connector.
 pub struct GmailConnector {
-    base: Arc<BaseConnector>,
+    base: BaseConnector,
     config: Option<GmailConfig>,
     client: Option<GmailClient>,
-    verifier: Option<CapabilityVerifier>,
+    authority: Option<StandaloneSession>,
     session_id: Option<SessionId>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
 }
 
 impl GmailConnector {
@@ -111,11 +114,13 @@ impl GmailConnector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base: Arc::new(BaseConnector::new(ConnectorId::from_static("gmail"))),
+            base: BaseConnector::new(ConnectorId::from_static("fcp.gmail")),
             config: None,
             client: None,
-            verifier: None,
+            authority: None,
             session_id: None,
+            bound_zone: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -125,10 +130,15 @@ impl GmailConnector {
         &self.base.instance_id
     }
 
-    fn manifest_hash() -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(MANIFEST_TOML.as_bytes());
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+    fn invalidate_authority(&mut self) {
+        if let Some(authority) = self.authority.as_mut() {
+            authority.invalidate();
+            self.base.instance_id = authority.instance_id().clone();
+        } else {
+            self.base.instance_id = InstanceId::new();
+        }
+        self.session_id = None;
+        self.base.set_handshaken(false);
     }
 
     /// Handle configure method.
@@ -145,6 +155,15 @@ impl GmailConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Even a rejected replacement configuration must revoke the previous
+        // account's authority before any credential resolution can take place.
+        self.invalidate_authority();
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
+        self.config = None;
+        self.bound_zone = None;
+        self.base.set_configured(false);
         reject_secret_config_material(&params)?;
         let base_url = parse_base_url(&params)?;
         let required_scopes = resolve_gmail_required_scopes(&params)?;
@@ -233,50 +252,41 @@ impl GmailConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
+        if self.config.is_none() || self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid handshake request: {e}"),
             })?;
 
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: false,
-                replay: false,
-                min_buffer_events: 100,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "gmail.handshake".into(),
+                reason: "Reconfigure before binding this mailbox to another zone".into(),
+            });
+        }
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let response = authority.handshake(req)?;
+        let mut result = serde_json::to_value(&response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
-        })
+        })?;
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.gmail");
+        result["protocol_version"] = json!("2.0");
+        self.base.instance_id = authority.instance_id().clone();
+        self.session_id = Some(response.session_id);
+        self.bound_zone = Some(zone);
+        self.authority = Some(authority);
+        self.base.set_handshaken(true);
+        Ok(result)
     }
 
     /// Handle health check.
@@ -290,7 +300,7 @@ impl GmailConnector {
             .as_ref()
             .filter(|config| granted_scopes_are_authoritative(config))
             .map_or_else(Vec::new, missing_scope_limited_operations);
-        let status = match self.config.as_ref() {
+        let provider_status = match self.config.as_ref() {
             Some(GmailConfig {
                 auth: GoogleMaterializedAuth::CredentialReference { .. },
                 ..
@@ -303,8 +313,31 @@ impl GmailConnector {
             || "unconfigured".to_string(),
             |config| auth_label_for_materialized(&config.auth),
         );
-        Ok(json!({
-            "status": status,
+        let configured = self.config.is_some() && self.client.is_some();
+        let handshaken = self
+            .authority
+            .as_ref()
+            .is_some_and(StandaloneSession::is_established);
+        // Native readiness describes the authenticated execution boundary.
+        // Credential references are intentionally materialized by host egress;
+        // provider diagnostics must not prevent that host from preparing it.
+        let status = if configured && handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "Capability handshake required".into(),
+            }
+        } else {
+            HealthState::Starting
+        };
+        let details = json!({
+            "connector_id": "fcp.gmail",
+            "configured": configured,
+            "handshaken": handshaken,
+            "instance_id": self.instance_id(),
+            "zone": self.bound_zone,
+            "session_id": self.session_id,
+            "provider_status": provider_status,
             "auth_mode": auth_label,
             "base_url": self.config.as_ref().map(|config| config.base_url.clone()),
             "history_cursor_path": self.config.as_ref().map(|config| config.history_cursor_path.to_string_lossy().to_string()),
@@ -315,7 +348,17 @@ impl GmailConnector {
                 "requests_total": metrics.requests_total,
                 "requests_error": metrics.requests_error,
             }
-        }))
+        });
+        serde_json::to_value(HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(details),
+            rate_limit: None,
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "Failed to encode Gmail health".into(),
+        })
     }
 
     /// Handle doctor checks.
@@ -978,7 +1021,7 @@ impl GmailConnector {
             });
         }
 
-        let Some(verifier) = &self.verifier else {
+        let Some(authority) = &self.authority else {
             let response = SimulateResponse::denied(
                 req.id,
                 "Connector handshake not completed",
@@ -990,10 +1033,11 @@ impl GmailConnector {
         };
 
         let resource_uris = gmail_resource_uris(req.operation.as_str(), &req.input);
-        let response = match verifier.verify_bound(
-            req.capability_token,
-            &capability,
+        let response = match authority.authorize(
+            &req.connector_id,
+            &req.zone_id,
             &req.operation,
+            req.capability_token,
             &resource_uris,
         ) {
             Ok(_) => SimulateResponse::allowed(req.id),
@@ -1029,43 +1073,27 @@ impl GmailConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
-                code: 1003,
-                message: "Missing capability_token".into(),
-            })?;
-
-        let token: CapabilityToken =
-            serde_json::from_value(token_value.clone()).map_err(|e| FcpError::InvalidRequest {
-                code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
-            })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let cap_id = gmail_capability_for_operation(operation)?;
-        validate_gmail_input(operation, &input)?;
         self.base.check_ready()?;
-
-        let verifier = self.verifier.as_ref().ok_or(FcpError::NotHandshaken)?;
-        let resource_uris = gmail_resource_uris(operation, &input);
-        verifier.verify_bound(token, &cap_id, &op_id, &resource_uris)?;
-
-        match operation {
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid FCP invoke request".into(),
+            })?;
+        if !request.input.is_object() || request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invocation requires object input and an unexpired deadline".into(),
+            });
+        }
+        let operation = request.operation.as_str();
+        gmail_capability_for_operation(operation)?;
+        validate_gmail_input(operation, &request.input)?;
+        let resource_uris = gmail_resource_uris(operation, &request.input);
+        let authority = self.authority.as_ref().ok_or(FcpError::NotHandshaken)?;
+        let witness =
+            authority.admit_bounded(&request, &resource_uris, MAX_INVOKE_RESPONSE_BYTES)?;
+        let input = request.input;
+        let result = match operation {
             "gmail.send_message" => self.invoke_send_message(input).await,
             "gmail.get_message" => self.invoke_get_message(input).await,
             "gmail.get_attachment" => self.invoke_get_attachment(input).await,
@@ -1081,7 +1109,13 @@ impl GmailConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+        };
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id, value.clone()),
+            Err(error) => InvokeResponse::error(request.id, error.clone()),
+        };
+        witness.finish_response(&response)?;
+        result
     }
 
     // ── Operation implementations ─────────────────────────────────
@@ -1350,14 +1384,16 @@ impl GmailConnector {
     /// # Errors
     /// Returns [`FcpError`] if the shutdown process fails.
     pub async fn handle_shutdown(
-        &self,
+        &mut self,
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Gmail connector shutting down");
-        if let Some(client) = &self.client {
+        self.invalidate_authority();
+        if let Some(client) = self.client.take() {
             client.shutdown();
         }
-        self.base.set_handshaken(false);
+        self.config = None;
+        self.bound_zone = None;
         self.base.set_configured(false);
         Ok(json!({ "status": "shutdown" }))
     }
@@ -2384,8 +2420,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
-    use fcp_prelude::CapabilityConstraints;
     use fcp_prelude::CredentialId;
+    use fcp_prelude::{CapabilityConstraints, CapabilityToken};
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
@@ -2420,7 +2456,7 @@ mod tests {
 
     struct TestHttpServer {
         base_url: String,
-        _handle: JoinHandle<()>,
+        handle: JoinHandle<()>,
     }
 
     impl TestHttpServer {
@@ -2437,10 +2473,7 @@ mod tests {
                     handle_test_http_request(stream, &response);
                 }
             });
-            Self {
-                base_url,
-                _handle: handle,
-            }
+            Self { base_url, handle }
         }
 
         fn uri(&self) -> String {
@@ -2523,7 +2556,7 @@ mod tests {
         ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
         let cose = CapabilityTokenBuilder::new()
             .capability_id(cap)
-            .zone_id("z:work")
+            .zone_id("z:private")
             .principal("user:test")
             .operations(operations)
             .issuer("node:test")
@@ -2551,9 +2584,9 @@ mod tests {
         capability: CapabilityToken,
     ) -> serde_json::Value {
         serde_json::to_value(SimulateRequest::new(
-            ConnectorId::from_static("gmail"),
+            ConnectorId::from_static("fcp.gmail"),
             OperationId::from_static(operation),
-            fcp_core::ZoneId::work(),
+            fcp_core::ZoneId::private(),
             input,
             capability,
         ))
@@ -2582,8 +2615,8 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": [
@@ -2597,6 +2630,147 @@ mod tests {
             .await
             .unwrap();
         (connector, signing_key)
+    }
+
+    fn labels_request(token: &CapabilityToken) -> serde_json::Value {
+        json!({
+            "type": "invoke", "id": "gmail-authority-test",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
+            "operation": "gmail.list_labels", "input": {}, "capability_token": token,
+        })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_health_reports_the_actual_negotiated_instance() {
+        let (connector, _) = handshaken_connector().await;
+        let snapshot: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(snapshot.is_ready());
+        let details = snapshot.details.unwrap();
+        assert_eq!(details["connector_id"], "fcp.gmail");
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], true);
+        assert_eq!(details["instance_id"], json!(connector.instance_id()));
+        assert_eq!(details["zone"], "z:private");
+        assert_eq!(
+            details["provider_status"],
+            "degraded_pending_credential_materialization"
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn replacement_configuration_revokes_old_mailbox_authority_even_on_error() {
+        for valid in [true, false] {
+            let (mut connector, key) = handshaken_connector().await;
+            let old_instance = connector.instance_id().clone();
+            let old_token = generate_valid_token(&key, &connector, "gmail.list_labels");
+            let params = if valid {
+                json!({"credential_id": CredentialId::new().to_string(), "base_url": "http://localhost:9999"})
+            } else {
+                json!({})
+            };
+            assert_eq!(connector.handle_configure(params).await.is_ok(), valid);
+            assert_ne!(connector.instance_id(), &old_instance);
+            let health: HealthSnapshot =
+                serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+            assert!(!health.is_ready());
+            let details = health.details.unwrap();
+            assert_eq!(details["configured"], valid);
+            assert_eq!(details["handshaken"], false);
+            assert!(
+                connector
+                    .handle_invoke(labels_request(&old_token))
+                    .await
+                    .is_err()
+            );
+            if !valid {
+                assert!(connector.client.is_none());
+                assert!(connector.config.is_none());
+            }
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn invalid_handshakes_cannot_retain_or_rebind_mailbox_authority() {
+        for replacement in [
+            json!({}),
+            json!({"protocol_version": "1.0.0", "zone": "z:private"}),
+            json!({"protocol_version": "2.0", "zone": "z:work"}),
+            json!({"protocol_version": "2.0", "zone": "z:owner"}),
+        ] {
+            let (mut connector, key) = handshaken_connector().await;
+            let old_instance = connector.instance_id().clone();
+            let token = generate_valid_token(&key, &connector, "gmail.list_labels");
+            let mut request = replacement;
+            request["host_public_key"] = json!(key.verifying_key().to_bytes());
+            request["nonce"] = json!(vec![7u8; 32]);
+            request["capabilities_requested"] = json!(["gmail.read"]);
+            request["requested_instance_id"] = json!(old_instance);
+            assert!(connector.handle_handshake(request).await.is_err());
+            assert_ne!(connector.instance_id(), &old_instance);
+            assert!(matches!(
+                connector.handle_invoke(labels_request(&token)).await,
+                Err(FcpError::NotHandshaken)
+            ));
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn typed_request_scope_is_enforced_before_provider_access() {
+        let (connector, key) = handshaken_connector().await;
+        let token = generate_valid_token(&key, &connector, "gmail.list_labels");
+        for (field, value) in [
+            ("connector_id", json!("fcp.other")),
+            ("zone_id", json!("z:owner")),
+            ("type", json!("simulate")),
+            ("id", json!("")),
+            ("deadline_ms", json!(0)),
+            ("input", json!(null)),
+        ] {
+            let mut request = labels_request(&token);
+            request[field] = value;
+            assert!(
+                connector.handle_invoke(request).await.is_err(),
+                "field {field}"
+            );
+        }
+        let mut preview = simulate_request("gmail.list_labels", json!({}), token);
+        preview["zone_id"] = json!("z:owner");
+        let response = parse_simulate_response(connector.handle_simulate(preview).await.unwrap());
+        assert!(!response.would_succeed);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn empty_negotiation_and_shutdown_reject_freshly_signed_tokens() {
+        let (mut connector, key) = handshaken_connector().await;
+        let old_instance = connector.instance_id().clone();
+        let response = connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0", "zone": "z:private",
+                "host_public_key": key.verifying_key().to_bytes(), "nonce": vec![5u8; 32],
+                "capabilities_requested": [], "requested_instance_id": old_instance,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            response["capabilities_granted"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_ne!(connector.instance_id(), &old_instance);
+        let token = generate_valid_token(&key, &connector, "gmail.list_labels");
+        assert!(matches!(
+            connector.handle_invoke(labels_request(&token)).await,
+            Err(FcpError::CapabilityDenied { .. })
+        ));
+        connector.handle_shutdown(json!({})).await.unwrap();
+        assert!(matches!(
+            connector.handle_invoke(labels_request(&token)).await,
+            Err(FcpError::NotConfigured)
+        ));
+        assert!(connector.client.is_none());
+        assert!(connector.session_id.is_none());
     }
 
     #[test]
@@ -3664,7 +3838,7 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn shutdown_returns_status() {
-        let connector = GmailConnector::new();
+        let mut connector = GmailConnector::new();
         let result = connector.handle_shutdown(json!({})).await.unwrap();
         assert_eq!(result["status"], "shutdown");
     }
@@ -3792,19 +3966,7 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn invoke_unknown_op_returns_not_granted() {
-        let mut connector = GmailConnector::new();
-        connector.client = Some(
-            GmailClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
-                access_token: "fake_key".into(),
-                source: fcp_google_discovery::auth::GoogleAuthSourceKind::AccessToken,
-                granted_scopes: vec![],
-                quota_project_id: None,
-            })
-            .unwrap()
-            .with_base_url("http://localhost:9999"),
-        );
-
-        let signing_key = Ed25519SigningKey::generate();
+        let (connector, signing_key) = handshaken_connector().await;
         let token = generate_token_with_cap(
             &signing_key,
             &connector,
@@ -3814,6 +3976,8 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "unknown-operation",
+                "connector_id": "fcp.gmail", "zone_id": "z:private",
                 "operation": "gmail.nonexistent",
                 "input": {},
                 "capability_token": token
@@ -3829,8 +3993,7 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn invoke_missing_operation_field() {
-        let connector = GmailConnector::new();
-        let signing_key = Ed25519SigningKey::generate();
+        let (connector, signing_key) = handshaken_connector().await;
         let token = generate_valid_token(&signing_key, &connector, "gmail.get_message");
         let result = connector
             .handle_invoke(json!({
@@ -3842,7 +4005,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("Missing operation"));
+                assert!(message.contains("Invalid FCP invoke request"));
             }
             other => panic!("Expected InvalidRequest, got {other:?}"),
         }
@@ -3850,7 +4013,7 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn invoke_missing_capability_token() {
-        let connector = GmailConnector::new();
+        let (connector, _) = handshaken_connector().await;
         let result = connector
             .handle_invoke(json!({
                 "operation": "gmail.get_message",
@@ -3861,7 +4024,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             FcpError::InvalidRequest { message, .. } => {
-                assert!(message.contains("capability_token"));
+                assert!(message.contains("Invalid FCP invoke request"));
             }
             other => panic!("Expected InvalidRequest, got {other:?}"),
         }
@@ -3952,11 +4115,11 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn handshake_sets_session_id() {
-        let mut connector = GmailConnector::new();
+        let mut connector = configured_connector().await;
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": ["gmail.read"]
@@ -3969,29 +4132,33 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn handshake_grants_requested_capabilities() {
-        let mut connector = GmailConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["gmail.read", "gmail.send"]
+                "capabilities_requested": ["gmail.read", "gmail.send", "gmail.read", "foreign.admin"]
             }))
             .await
             .unwrap();
 
         let caps = result["capabilities_granted"].as_array().unwrap();
         assert_eq!(caps.len(), 2);
+        assert!(caps.iter().all(|grant| matches!(
+            grant["capability"].as_str(),
+            Some("gmail.read" | "gmail.send")
+        )));
     }
 
     #[fcp_async_core::runtime::test]
     async fn handshake_event_caps() {
-        let mut connector = GmailConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": []
@@ -4002,7 +4169,7 @@ mod tests {
         let event_caps = &result["event_caps"];
         assert_eq!(event_caps["streaming"], false);
         assert_eq!(event_caps["replay"], false);
-        assert_eq!(event_caps["min_buffer_events"], 100);
+        assert_eq!(event_caps["requires_ack"], false);
     }
 
     // ── Health details ─────────────────────────────────────────────
@@ -4020,7 +4187,7 @@ mod tests {
             .unwrap();
 
         let health = connector.handle_health().await.unwrap();
-        let scopes = health["required_scopes"].as_array().unwrap();
+        let scopes = health["details"]["required_scopes"].as_array().unwrap();
         assert_eq!(scopes.len(), 1);
     }
 
@@ -4083,11 +4250,11 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
-        let mut connector = GmailConnector::new();
+        let mut connector = configured_connector().await;
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": ["gmail.read"]
@@ -4102,7 +4269,9 @@ mod tests {
     async fn test_health_not_configured() {
         let connector = GmailConnector::new();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let snapshot: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(matches!(snapshot.status, HealthState::Starting));
+        assert_eq!(snapshot.details.unwrap()["configured"], false);
     }
 
     #[fcp_async_core::runtime::test]
@@ -4120,16 +4289,16 @@ mod tests {
         assert_eq!(result["status"], "configured_pending_token_materialization");
         let health = connector.handle_health().await.unwrap();
         assert_eq!(
-            health["status"],
+            health["details"]["provider_status"],
             "degraded_pending_credential_materialization"
         );
         assert!(
-            health["auth_mode"]
+            health["details"]["auth_mode"]
                 .as_str()
                 .unwrap()
                 .starts_with("credential_id:"),
             "expected auth_mode starting with 'credential_id:', got {:?}",
-            health["auth_mode"]
+            health["details"]["auth_mode"]
         );
     }
 
@@ -4200,16 +4369,16 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        connector
+        let handshake = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
+                "protocol_version": "2.0.0",
+                "zone": "z:private",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
                 "capabilities_requested": ["gmail.read"]
             }))
-            .await
-            .unwrap();
+            .await;
+        assert!(matches!(handshake, Err(FcpError::NotConfigured)));
 
         let token = generate_valid_token(&signing_key, &connector, "gmail.list_labels");
 
@@ -4227,36 +4396,13 @@ mod tests {
 
     #[fcp_async_core::runtime::test]
     async fn test_invoke_missing_field() {
-        let mut connector = GmailConnector::new();
-        connector.client = Some(
-            GmailClient::new_with_auth(GoogleMaterializedAuth::BearerToken {
-                access_token: "fake_key".into(),
-                source: fcp_google_discovery::auth::GoogleAuthSourceKind::AccessToken,
-                granted_scopes: vec![],
-                quota_project_id: None,
-            })
-            .unwrap()
-            .with_base_url("http://localhost:9999"),
-        );
-
-        let signing_key = Ed25519SigningKey::generate();
-        let verifying_key = signing_key.verifying_key();
-
-        connector
-            .handle_handshake(json!({
-                "protocol_version": "1.0.0",
-                "zone": "z:work",
-                "host_public_key": verifying_key.to_bytes(),
-                "nonce": vec![0u8; 32],
-                "capabilities_requested": ["gmail.read"]
-            }))
-            .await
-            .unwrap();
-
+        let (connector, signing_key) = handshaken_connector().await;
         let token = generate_valid_token(&signing_key, &connector, "gmail.get_message");
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "missing-message-id",
+                "connector_id": "fcp.gmail", "zone_id": "z:private",
                 "operation": "gmail.get_message",
                 "input": {},
                 "capability_token": token
@@ -4409,7 +4555,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("100-page"));
         assert!(!state_path.exists());
-        server._handle.join().unwrap();
+        server.handle.join().unwrap();
     }
 
     #[fcp_async_core::runtime::test]
@@ -4486,13 +4632,22 @@ mod tests {
         assert_eq!(ops.len(), 12);
     }
 
-    #[test]
-    fn handshake_manifest_hash_tracks_bundled_manifest() {
+    #[fcp_async_core::runtime::test]
+    async fn handshake_manifest_hash_tracks_bundled_manifest() {
         let mut hasher = Sha256::new();
         hasher.update(MANIFEST_TOML.as_bytes());
         let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
 
-        let actual = GmailConnector::manifest_hash();
+        let mut connector = configured_connector().await;
+        let response = connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0", "zone": "z:private",
+                "host_public_key": vec![0u8; 32], "nonce": vec![0u8; 32],
+                "capabilities_requested": [],
+            }))
+            .await
+            .unwrap();
+        let actual = response["manifest_hash"].as_str().unwrap();
 
         assert_eq!(actual, expected);
         assert_ne!(actual, "sha256:gmail-connector-v1");

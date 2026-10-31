@@ -154,6 +154,176 @@ mod tests {
     use super::*;
 
     #[fcp_async_core::runtime::test]
+    async fn native_host_session_preserves_scope_budgets_and_typed_results() {
+        use chrono::{Duration, Utc};
+        use fcp_core::{
+            CapabilityConstraints, CapabilityToken, HealthSnapshot, InvokeResponse, InvokeStatus,
+        };
+        use fcp_crypto::{cose::CapabilityTokenBuilder, ed25519::Ed25519SigningKey};
+        use fcp_google_discovery::auth::FCP_CREDENTIAL_ID_HEADER;
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let server = MockServer::start().await;
+        let credential = "00000000-0000-0000-0000-000000000001";
+        Mock::given(method("GET"))
+            .and(path("/users/me/labels"))
+            .and(header(FCP_CREDENTIAL_ID_HEADER, credential))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"labels": [{"id":"INBOX", "name":"INBOX"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut connector = GmailConnector::new();
+        let configured = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc":"2.0", "id":"rpc-configure", "method":"configure",
+                "params":{"credential_id":credential, "base_url":server.uri()},
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(configured.get("error").is_none(), "{configured}");
+        let key = Ed25519SigningKey::generate();
+        let preferred = connector.instance_id().clone();
+        let handshake = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc":"2.0", "id":"rpc-handshake", "method":"handshake",
+                "params":{
+                    "protocol_version":"2.0", "zone":"z:private",
+                    "host_public_key":key.verifying_key().to_bytes(), "nonce":vec![9u8;32],
+                    "capabilities_requested":["gmail.read", "gmail.read", "unrelated.admin"],
+                    "requested_instance_id":preferred,
+                },
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(handshake.get("error").is_none(), "{handshake}");
+        assert_eq!(
+            handshake["result"]["capabilities_granted"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_ne!(connector.instance_id(), &preferred);
+        assert_eq!(
+            handshake["result"]["instance_id"],
+            json!(connector.instance_id())
+        );
+        let health = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc":"2.0", "id":"rpc-health", "method":"health", "params":{},
+            })
+            .to_string(),
+        )
+        .await;
+        let health: HealthSnapshot = serde_json::from_value(health["result"].clone()).unwrap();
+        assert!(health.is_ready());
+        let details = health.details.unwrap();
+        assert_eq!(details["configured"], true);
+        assert_eq!(details["handshaken"], true);
+        assert_eq!(details["instance_id"], json!(connector.instance_id()));
+
+        let constraints = CapabilityConstraints {
+            resource_allow: vec!["gmail:labels".into()],
+            max_calls: Some(1),
+            idempotency_key: Some("labels-once".into()),
+            ..Default::default()
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&constraints, &mut cbor).unwrap();
+        let now = Utc::now();
+        let token = CapabilityToken::from_raw(
+            CapabilityTokenBuilder::new()
+                .capability_id("gmail.read")
+                .zone_id("z:private")
+                .principal("user:host")
+                .operations(&["gmail.list_labels"])
+                .issuer("node:host")
+                .token_id(b"native-gmail-one-call")
+                .target_instance(connector.instance_id().as_str())
+                .validity(now, now + Duration::minutes(5))
+                .try_constraints_cbor(&cbor)
+                .unwrap()
+                .sign(&key)
+                .unwrap(),
+        );
+        let params = json!({
+            "type":"invoke", "id":"mailbox-read", "connector_id":"fcp.gmail",
+            "zone_id":"z:private", "operation":"gmail.list_labels", "input":{},
+            "capability_token":token, "idempotency_key":"labels-once",
+        });
+        for (field, value) in [
+            ("connector_id", json!("fcp.other")),
+            ("zone_id", json!("z:owner")),
+            ("idempotency_key", json!("different-call")),
+        ] {
+            let mut denied = params.clone();
+            denied[field] = value;
+            let reply = handle_message(
+                &mut connector,
+                &json!({
+                    "jsonrpc":"2.0", "id":"rpc-denied", "method":"invoke", "params":denied,
+                })
+                .to_string(),
+            )
+            .await;
+            assert!(reply.get("error").is_some(), "scope field {field}: {reply}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        // Authorization previews do not spend the one admitted provider call.
+        for _ in 0..2 {
+            let preview = handle_message(
+                &mut connector,
+                &json!({
+                    "jsonrpc":"2.0", "id":"rpc-preview", "method":"simulate",
+                    "params":{
+                        "type":"simulate", "id":"mailbox-preview", "connector_id":"fcp.gmail",
+                        "zone_id":"z:private", "operation":"gmail.list_labels", "input":{},
+                        "capability_token":params["capability_token"],
+                    },
+                })
+                .to_string(),
+            )
+            .await;
+            assert_eq!(preview["result"]["would_succeed"], true, "{preview}");
+        }
+        let reply = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc":"2.0", "id":"rpc-invoke", "method":"invoke", "params":params,
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reply["id"], "rpc-invoke");
+        let response: InvokeResponse = serde_json::from_value(reply["result"].clone()).unwrap();
+        assert_eq!(response.id.0, "mailbox-read");
+        assert_eq!(response.status, InvokeStatus::Ok);
+        assert_eq!(response.result.unwrap()["labels"][0]["id"], "INBOX");
+        let spent = handle_message(
+            &mut connector,
+            &json!({
+                "jsonrpc":"2.0", "id":"rpc-spent", "method":"invoke", "params":params,
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(spent.get("error").is_some());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
     async fn invoke_requires_an_inner_string_id_before_dispatch() {
         let mut connector = GmailConnector::new();
         for inner_id in [

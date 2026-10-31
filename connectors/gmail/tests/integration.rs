@@ -44,6 +44,7 @@ const TEST_CREDENTIAL_ID: &str = "00000000-0000-0000-0000-000000000001";
 /// Map an operation ID to the capability ID that governs it.
 fn capability_for_operation(op: &str) -> &str {
     match op {
+        "gmail.read" | "gmail.send" | "gmail.write" | "gmail.delete" | "gmail.history.read" => op,
         "gmail.send_message" | "gmail.send_draft" => "gmail.send",
         "gmail.sync_history" => "gmail.history.read",
         "gmail.modify_message" | "gmail.get_draft" | "gmail.create_draft" => "gmail.write",
@@ -68,7 +69,7 @@ fn generate_valid_token(
     ciborium::into_writer(&constraints, &mut cbor).expect("serialize constraints");
     let cose = CapabilityTokenBuilder::new()
         .capability_id(cap)
-        .zone_id("z:work")
+        .zone_id("z:private")
         .principal("user:test")
         .operations(&[op])
         .issuer("node:test")
@@ -88,8 +89,8 @@ async fn setup_handshake(connector: &mut GmailConnector, caps: &[&str]) -> Ed255
 
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
-            "zone": "z:work",
+            "protocol_version": "2.0.0",
+            "zone": "z:private",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
             "capabilities_requested": mapped
@@ -108,6 +109,18 @@ async fn setup_configure(connector: &mut GmailConnector, base_url: &str) {
         }))
         .await
         .expect("configure should succeed");
+}
+
+fn invoke_request(
+    operation: &str,
+    input: serde_json::Value,
+    token: CapabilityToken,
+) -> serde_json::Value {
+    json!({
+        "type": "invoke", "id": "gmail-integration",
+        "connector_id": "fcp.gmail", "zone_id": "z:private",
+        "operation": operation, "input": input, "capability_token": token,
+    })
 }
 
 fn message_response(id: &str, thread_id: &str) -> serde_json::Value {
@@ -666,6 +679,8 @@ async fn invoke_list_labels_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "list-labels",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.list_labels",
             "input": {},
             "capability_token": token
@@ -698,6 +713,8 @@ async fn invoke_get_message_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "get-message",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.get_message",
             "input": {"message_id": "msg42"},
             "capability_token": token
@@ -735,7 +752,7 @@ async fn attachment_invoke_is_bound_to_both_ids_and_host_credentials() {
         CapabilityToken::from_raw(
             CapabilityTokenBuilder::new()
                 .capability_id(capability)
-                .zone_id("z:work")
+                .zone_id("z:private")
                 .principal("user:test")
                 .operations(&[granted_operation])
                 .issuer("node:test")
@@ -767,7 +784,7 @@ async fn attachment_invoke_is_bound_to_both_ids_and_host_credentials() {
     ] {
         let token = make_token(capability, granted_operation, resource, target);
         let result = connector
-            .handle_invoke(json!({"operation":operation, "input":input, "capability_token":token}))
+            .handle_invoke(invoke_request(operation, input.clone(), token))
             .await;
         assert!(
             result.is_err(),
@@ -782,7 +799,7 @@ async fn attachment_invoke_is_bound_to_both_ids_and_host_credentials() {
         instance,
     );
     let result = connector
-        .handle_invoke(json!({"operation":operation, "input":input, "capability_token":token}))
+        .handle_invoke(invoke_request(operation, input, token))
         .await
         .unwrap();
     assert_eq!(result, json!({"attachment":{"size":2,"data":"-_8"}}));
@@ -813,6 +830,8 @@ async fn invoke_send_message_accepts_structured_fields() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "send-message",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.send_message",
             "input": {
                 "to": "recipient@example.com",
@@ -849,6 +868,8 @@ async fn invoke_create_draft_accepts_structured_fields() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "create-draft",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.create_draft",
             "input": {
                 "to": "recipient@example.com",
@@ -886,6 +907,8 @@ async fn invoke_trash_message_through_connector() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "trash-message",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.trash_message",
             "input": {"message_id": "msg-to-trash"},
             "capability_token": token
@@ -908,6 +931,8 @@ async fn wrong_capability_rejected() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "wrong-capability",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.get_message",
             "input": {"message_id": "msg1"},
             "capability_token": token
@@ -929,6 +954,8 @@ async fn missing_required_field_returns_invalid_request() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "missing-message-id",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.get_message",
             "input": {},
             "capability_token": token
@@ -954,6 +981,8 @@ async fn invoke_modify_message_rejects_malformed_label_arrays() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "modify-message",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.modify_message",
             "input": {
                 "message_id": "msg1",
@@ -1046,6 +1075,8 @@ async fn invoke_history(
 ) -> Result<serde_json::Value, FcpError> {
     connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "sync-history",
+            "connector_id": "fcp.gmail", "zone_id": "z:private",
             "operation": "gmail.sync_history",
             "input": input,
             "capability_token": generate_valid_token(key, connector, "gmail.sync_history"),
