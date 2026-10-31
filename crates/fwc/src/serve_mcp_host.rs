@@ -1,4 +1,4 @@
-//! Bind one MCP tool call to one host invocation and its cancellation authority.
+//! Resolve owner-cancellation authority and bind MCP calls to host invocations.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ mod tests;
 
 #[derive(Args, Clone, Debug, Default, Serialize)]
 pub(crate) struct CancellationArgs {
-    /// Optional host.cancel-self token for the same principal and zone as tool calls.
+    /// Owner's host.cancel-self capability without a holder-node binding.
     #[arg(
         long,
         value_name = "TOKEN",
@@ -37,7 +37,7 @@ pub(crate) struct CancellationArgs {
     #[serde(skip_serializing)]
     cancel_capability_token: Option<String>,
 
-    /// Read a host.cancel-self token from a bounded base64, JSON, or raw CBOR file.
+    /// Read the owner's host.cancel-self capability from a base64, JSON, or raw CBOR file (64 KiB maximum).
     #[arg(long, value_name = "PATH", conflicts_with = "cancel_capability_token")]
     cancel_capability_token_file: Option<PathBuf>,
 }
@@ -49,38 +49,38 @@ impl CancellationArgs {
             self.cancel_capability_token_file.as_deref(),
         ) {
             (None, None) => return Ok(None),
-            (Some(_), Some(_)) => bail!("Specify one MCP cancellation capability source"),
+            (Some(_), Some(_)) => bail!("Specify one cancellation capability source"),
             (Some(raw), None) => {
                 ensure!(
                     raw.len() <= MAX_CANCELLATION_TOKEN_BYTES,
-                    "MCP cancellation capability exceeds the 64 KiB limit"
+                    "Cancellation capability exceeds the 64 KiB limit"
                 );
                 parse_capability_token_str(raw, "--cancel-capability-token")
             }
             (None, Some(path)) => {
                 let file = std::fs::File::open(path)
-                    .map_err(|_| anyhow::anyhow!("Cannot open MCP cancellation capability file"))?;
+                    .map_err(|_| anyhow::anyhow!("Cannot open cancellation capability file"))?;
                 let mut bytes = zeroize::Zeroizing::new(Vec::new());
                 file.take((MAX_CANCELLATION_TOKEN_BYTES + 1) as u64)
                     .read_to_end(&mut bytes)
-                    .map_err(|_| anyhow::anyhow!("Cannot read MCP cancellation capability file"))?;
+                    .map_err(|_| anyhow::anyhow!("Cannot read cancellation capability file"))?;
                 ensure!(
                     bytes.len() <= MAX_CANCELLATION_TOKEN_BYTES,
-                    "MCP cancellation capability exceeds the 64 KiB limit"
+                    "Cancellation capability exceeds the 64 KiB limit"
                 );
                 parse_capability_token_bytes(&bytes, "--cancel-capability-token-file")
             }
         }
-        .map_err(|_| anyhow::anyhow!("Invalid MCP cancellation capability encoding"))?;
+        .map_err(|_| anyhow::anyhow!("Invalid cancellation capability encoding"))?;
         let claims = token
             .raw()
             .claims_unverified()
-            .map_err(|_| anyhow::anyhow!("Invalid MCP cancellation capability claims"))?;
+            .map_err(|_| anyhow::anyhow!("Invalid cancellation capability claims"))?;
         // These checks only reject inconsistent inputs. The selected host still
         // verifies signature, persisted issuance, expiry, revocation and owner.
         ensure!(
             claims.get_capability_id() == Some("host.cancel-self"),
-            "MCP remote cancellation requires a host.cancel-self capability"
+            "Owner-scoped cancellation requires a host.cancel-self capability"
         );
         ensure!(
             claims.get_holder_node().is_none(),

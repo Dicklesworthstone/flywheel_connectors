@@ -184,6 +184,7 @@ mod health;
 mod history;
 #[allow(dead_code)] // History replay, clone, and input-override flows.
 mod history_replay;
+mod host_cancellation;
 #[allow(dead_code)] // Host integration test harness with archetype fixtures.
 mod host_harness;
 #[allow(dead_code)] // Host integration: discovery, config, lifecycle test matrix.
@@ -2813,6 +2814,9 @@ struct CancelArgs {
     /// Return partial results if available.
     #[arg(long, default_value_t = false)]
     return_partial: bool,
+
+    #[command(flatten)]
+    cancellation: serve_mcp_host::CancellationArgs,
 }
 
 #[derive(Args, Debug, Serialize)]
@@ -5867,8 +5871,19 @@ impl HostAdminClient {
         })
     }
 
-    fn cancel(&self, request: &HostCancellationRequest) -> Result<HostCancellationResponse> {
-        self.post_json("/rpc/cancel", request)
+    fn cancel(
+        &self,
+        request: &HostCancellationRequest,
+    ) -> std::result::Result<HostCancellationResponse, host_cancellation::CancellationFailure> {
+        // Mesh owner cancellation has a five-second host forwarding deadline.
+        // Keep the caller's request bounded while allowing its response to arrive.
+        host_cancellation::submit(
+            &self.client,
+            &self.base_url,
+            &request.operation_id,
+            request,
+            Duration::from_secs(10),
+        )
     }
 
     fn events(&self, request: &HostEventQueryRequest) -> Result<HostEventQueryResponse> {
@@ -21206,7 +21221,9 @@ fn cancellation_operator_guidance(
 ) -> (String, Vec<String>) {
     match outcome {
         fcp_host::CancellationOutcome::Cancelled => (
-            format!("Cancelled live operation `{operation_id}` via `fcp-host`."),
+            format!(
+                "The host accepted cancellation for operation `{operation_id}`. Execution and cleanup may still be settling; provider effects are not known to have been rolled back."
+            ),
             vec![
                 format!("fwc watch {operation_id} --host {host}"),
                 "fwc history --limit 10".to_owned(),
@@ -27093,6 +27110,45 @@ fn cancel_dispatch(args: &CancelArgs, explicit_host: Option<&str>) -> Result<Dis
             ],
         ));
     };
+    if args.operation_id.trim().is_empty()
+        || args.operation_id.len() > 512
+        || args.operation_id.chars().any(char::is_control)
+    {
+        return Ok(cancellation_failure_dispatch(
+            "",
+            &host.endpoint,
+            "invalid-cancellation-operation-id",
+            "The operation ID must be nonempty, contain no control characters, and fit within 512 bytes.",
+            CliExitCode::Validation,
+            false,
+            None,
+        ));
+    }
+    let capability_token = match args.cancellation.resolve() {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return Ok(cancellation_failure_dispatch(
+                &args.operation_id,
+                &host.endpoint,
+                "missing-cancellation-capability",
+                "Owner cancellation requires an explicit host.cancel-self capability. Pass --cancel-capability-token-file or --cancel-capability-token.",
+                CliExitCode::PolicyDenied,
+                false,
+                None,
+            ));
+        }
+        Err(_) => {
+            return Ok(cancellation_failure_dispatch(
+                &args.operation_id,
+                &host.endpoint,
+                "invalid-cancellation-capability",
+                "The cancellation capability must be readable, bounded, well-formed, scoped to host.cancel-self, and unbound to a holder node.",
+                CliExitCode::Validation,
+                false,
+                None,
+            ));
+        }
+    };
     let client = HostAdminClient::new(&host.endpoint)?;
 
     let reason = match args.reason.as_str() {
@@ -27224,9 +27280,18 @@ fn cancel_dispatch(args: &CancelArgs, explicit_host: Option<&str>) -> Result<Dis
         reason,
         cleanup,
         return_partial: args.return_partial,
-        capability_token: None,
+        capability_token: Some(capability_token),
     };
-    let response = client.cancel(&request)?;
+    let response = match client.cancel(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(cancellation_submission_failure(
+                &args.operation_id,
+                &host.endpoint,
+                error,
+            ));
+        }
+    };
     let exit_code = if matches!(response.outcome, fcp_host::CancellationOutcome::Failed) {
         CliExitCode::Connector
     } else {
@@ -27247,7 +27312,15 @@ fn cancel_dispatch(args: &CancelArgs, explicit_host: Option<&str>) -> Result<Dis
         "command": "cancel",
         "source": "host-admin-api",
         "message": message,
-        "request": request,
+        "authorization": {"mode": "owner-scoped-capability"},
+        "cancellation_acknowledged": live_host_mutated,
+        // Allowlist the request projection: its capability is authority, not output.
+        "request": {
+            "operation_id": request.operation_id,
+            "reason": request.reason,
+            "cleanup": request.cleanup,
+            "return_partial": request.return_partial,
+        },
         "response": response,
         "next_actions": next_actions,
     });
@@ -27268,6 +27341,111 @@ fn cancel_dispatch(args: &CancelArgs, explicit_host: Option<&str>) -> Result<Dis
         envelope.inject_into(&mut payload);
     }
     Ok(DispatchOutcome { payload, exit_code })
+}
+
+fn cancellation_submission_failure(
+    operation_id: &str,
+    host: &str,
+    failure: host_cancellation::CancellationFailure,
+) -> DispatchOutcome {
+    use host_cancellation::CancellationFailure;
+
+    let (error_type, message, exit_code, http_status) = match failure {
+        CancellationFailure::Http(status @ (401 | 403)) => (
+            "cancel-request-denied",
+            "The host denied owner cancellation. Verify the host.cancel-self capability and its ownership of the original operation; execution may still be active.",
+            CliExitCode::PolicyDenied,
+            Some(status),
+        ),
+        CancellationFailure::Http(404) => (
+            "cancel-operation-unavailable",
+            "The host did not find a cancellable operation for this capability. This does not establish whether the original operation had effects or is still being admitted.",
+            CliExitCode::Transport,
+            Some(404),
+        ),
+        CancellationFailure::Http(status) => (
+            "cancel-outcome-unknown",
+            "The host did not acknowledge owner cancellation. The original operation may still be active or have effects.",
+            CliExitCode::Transport,
+            Some(status),
+        ),
+        CancellationFailure::Timeout => (
+            "cancel-outcome-unknown",
+            "The cancellation request exceeded its response deadline. The original operation may still be active or have effects.",
+            CliExitCode::Transport,
+            None,
+        ),
+        CancellationFailure::Transport => (
+            "cancel-outcome-unknown",
+            "The host cancellation response could not be read. The original operation may still be active or have effects.",
+            CliExitCode::Transport,
+            None,
+        ),
+        CancellationFailure::ResponseTooLarge => (
+            "cancel-outcome-unknown",
+            "The host cancellation response exceeded the 1 MiB limit. Acknowledgement and any partial results are unavailable; the original operation may have effects.",
+            CliExitCode::Transport,
+            None,
+        ),
+        CancellationFailure::InvalidResponse => (
+            "cancel-outcome-unknown",
+            "The host returned an invalid cancellation response or a response for another operation. Cancellation is unconfirmed and the original operation may have effects.",
+            CliExitCode::Transport,
+            None,
+        ),
+    };
+    cancellation_failure_dispatch(
+        operation_id,
+        host,
+        error_type,
+        message,
+        exit_code,
+        true,
+        http_status,
+    )
+}
+
+fn cancellation_failure_dispatch(
+    operation_id: &str,
+    host: &str,
+    error_type: &str,
+    message: &str,
+    exit_code: CliExitCode,
+    submission_attempted: bool,
+    http_status: Option<u16>,
+) -> DispatchOutcome {
+    let next_actions = if submission_attempted {
+        vec![
+            format!("fwc invocation {operation_id} --host {host}"),
+            "Inspect the original invocation with the host's separate inspection credentials before deciding whether to retry that operation. Cancellation does not authorize replay."
+                .to_owned(),
+        ]
+    } else {
+        vec![format!(
+            "fwc cancel {operation_id} --host {host} --cancel-capability-token-file <cancel-self-token>"
+        )]
+    };
+    DispatchOutcome {
+        payload: json!({
+            "status": "error",
+            "command": "cancel",
+            "source": "host-admin-api",
+            "operation_id": operation_id,
+            "host": host,
+            "authorization": {"mode": "owner-scoped-capability"},
+            "submission_attempted": submission_attempted,
+            "cancellation_acknowledged": false,
+            "execution_outcome": "unknown",
+            "error": {
+                "type": error_type,
+                "message": message,
+                "http_status": http_status,
+                "recoverable": true,
+            },
+            "next_actions": next_actions,
+        }),
+        exit_code,
+    }
 }
 
 #[allow(clippy::option_if_let_else)]
@@ -34410,6 +34588,8 @@ fn enrich_unknown_guide_command(payload: &mut Value, command: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    mod cancel_cli;
+
     use crate::supply_chain_cmd::{SignArgs, SupplyChainArgs, SupplyChainCommand};
     use crate::truth::RequiredTruthSource;
 
@@ -36861,6 +37041,21 @@ max_state_replication_staleness_secs = 120
         let token = super::CapabilityToken::test_token();
         base64::engine::general_purpose::STANDARD
             .encode(token.raw().to_cbor().expect("test token should encode"))
+    }
+
+    fn test_cancel_capability_token_arg() -> String {
+        let claims = super::CapabilityToken::test_token()
+            .raw()
+            .claims_unverified()
+            .unwrap()
+            .subject("test-principal")
+            .capability_id("host.cancel-self")
+            .operations(&["host.cancel-self"]);
+        let key = Ed25519SigningKey::generate();
+        let token = super::CapabilityToken::from_raw(
+            fcp_crypto::cose::CoseToken::sign(&key, &claims).unwrap(),
+        );
+        serde_json::to_string(&token).unwrap()
     }
 
     fn test_tagged_capability_token_bytes() -> Vec<u8> {
@@ -53253,6 +53448,7 @@ depends_on = ["missing"]
 
     #[test]
     fn execute_cancel_host_success() {
+        let capability_token = test_cancel_capability_token_arg();
         let cancel_response = serde_json::to_value(fcp_host::CancellationResponse {
             operation_id: "op-test-12345".to_owned(),
             outcome: fcp_host::CancellationOutcome::Cancelled,
@@ -53269,11 +53465,19 @@ depends_on = ["missing"]
         .expect("cancel response should serialize");
 
         let (host, server) = spawn_mock_host(
-            StdBTreeMap::from([("POST /rpc/cancel".to_owned(), cancel_response)]),
+            StdBTreeMap::from([("POST /rpc/cancel-self".to_owned(), cancel_response)]),
             1,
         );
-        let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "--host", &host, "cancel", "op-test-12345"]);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "cancel",
+            "op-test-12345",
+            "--cancel-capability-token",
+            &capability_token,
+        ]);
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Success.into());
@@ -53292,12 +53496,22 @@ depends_on = ["missing"]
         assert_eq!(payload["response"]["operation_id"], "op-test-12345");
         assert_eq!(payload["response"]["outcome"], "cancelled");
         assert_eq!(payload["request"]["operation_id"], "op-test-12345");
+        assert!(payload["request"].get("capability_token").is_none());
+        assert_eq!(payload["cancellation_acknowledged"], true);
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("accepted cancellation")
+        );
+        assert!(!payload.to_string().contains(&capability_token));
         assert_evidence_handle(&payload, "cancel-request");
         assert_evidence_handle(&payload, "cancel-outcome");
     }
 
     #[test]
     fn execute_cancel_host_failure_reports_contract() {
+        let capability_token = test_cancel_capability_token_arg();
         let cancel_response = serde_json::to_value(fcp_host::CancellationResponse {
             operation_id: "op-test-999".to_owned(),
             outcome: fcp_host::CancellationOutcome::Failed,
@@ -53314,11 +53528,19 @@ depends_on = ["missing"]
         .expect("cancel response should serialize");
 
         let (host, server) = spawn_mock_host(
-            StdBTreeMap::from([("POST /rpc/cancel".to_owned(), cancel_response)]),
+            StdBTreeMap::from([("POST /rpc/cancel-self".to_owned(), cancel_response)]),
             1,
         );
-        let (exit_code, payload) =
-            execute_json(&["fwc", "--json", "--host", &host, "cancel", "op-test-999"]);
+        let (exit_code, payload) = execute_json(&[
+            "fwc",
+            "--json",
+            "--host",
+            &host,
+            "cancel",
+            "op-test-999",
+            "--cancel-capability-token",
+            &capability_token,
+        ]);
 
         server.join().expect("mock host thread should complete");
         assert_eq!(exit_code, CliExitCode::Connector.into());
@@ -53336,12 +53558,15 @@ depends_on = ["missing"]
         );
         assert_eq!(payload["response"]["operation_id"], "op-test-999");
         assert_eq!(payload["response"]["outcome"], "failed");
+        assert_eq!(payload["cancellation_acknowledged"], false);
+        assert!(payload["request"].get("capability_token").is_none());
         assert_evidence_handle(&payload, "cancel-request");
         assert_evidence_handle(&payload, "cancel-outcome");
     }
 
     #[test]
     fn execute_cancel_host_too_late_reports_completed_operation() {
+        let capability_token = test_cancel_capability_token_arg();
         let cancel_response = serde_json::to_value(fcp_host::CancellationResponse {
             operation_id: "op-test-too-late".to_owned(),
             outcome: fcp_host::CancellationOutcome::TooLate,
@@ -53353,7 +53578,7 @@ depends_on = ["missing"]
         .expect("cancel response should serialize");
 
         let (host, server) = spawn_mock_host(
-            StdBTreeMap::from([("POST /rpc/cancel".to_owned(), cancel_response)]),
+            StdBTreeMap::from([("POST /rpc/cancel-self".to_owned(), cancel_response)]),
             1,
         );
         let (exit_code, payload) = execute_json(&[
@@ -53363,6 +53588,8 @@ depends_on = ["missing"]
             &host,
             "cancel",
             "op-test-too-late",
+            "--cancel-capability-token",
+            &capability_token,
         ]);
 
         server.join().expect("mock host thread should complete");
@@ -53384,6 +53611,7 @@ depends_on = ["missing"]
         );
         assert_eq!(payload["response"]["operation_id"], "op-test-too-late");
         assert_eq!(payload["response"]["outcome"], "too_late");
+        assert_eq!(payload["cancellation_acknowledged"], false);
         assert_evidence_handle(&payload, "cancel-request");
         assert_evidence_handle(&payload, "cancel-outcome");
         assert_eq!(payload["next_actions"][0], "fwc history --limit 10");
@@ -57209,6 +57437,7 @@ require_attestation_types = ["in-toto"]"#,
             cleanup: "best-effort".to_owned(),
             cleanup_timeout_ms: None,
             return_partial: false,
+            cancellation: super::serve_mcp_host::CancellationArgs::default(),
         };
         let outcome = super::cancel_dispatch(&args, None).expect("dispatch should not fail");
         let payload: Value =

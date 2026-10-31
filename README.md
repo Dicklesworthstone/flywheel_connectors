@@ -1276,6 +1276,24 @@ MCP `notifications/cancelled` cancels the matching active call. Closing the inpu
 
 Host cancellation is best effort: acknowledgement means the cancellation request was accepted, and does not prove that provider effects were rolled back. Without the optional cancellation capability, an already dispatched host operation can continue until its normal deadline. Transport failures also signal cancellation; because portable blocking stdin cannot be interrupted, an output failure is returned after the input reader next unblocks.
 
+### Cancel a Live Operation
+
+Use the original host request ID from invocation output and a dedicated `host.cancel-self` capability belonging to that operation's owner:
+
+```bash
+fwc cancel REQUEST_ID --host http://127.0.0.1:8787 \
+    --cancel-capability-token-file cancel-self.token
+
+# Preserve available partial results and request full cleanup
+fwc cancel REQUEST_ID --host http://127.0.0.1:8787 \
+    --cancel-capability-token-file cancel-self.token \
+    --return-partial --cleanup full --cleanup-timeout-ms 30000
+```
+
+`fwc cancel` submits one authenticated request to the host's owner-scoped cancellation endpoint. The host verifies the capability and the original operation's owner, including when it must forward cancellation to the original mesh executor. Missing, malformed, oversized, or holder-bound credentials are rejected before submission. The command accepts the same bounded token encodings as MCP cancellation, and its output excludes the token and token-file path.
+
+The command waits at most ten seconds for a response and reads at most 1 MiB, including any partial results. It verifies that the acknowledgement belongs to the requested operation. Rejected or unreadable responses retain the original request ID and report cancellation as unconfirmed; they never cause invocation replay. `Cancelled` and `Pending` outcomes acknowledge cancellation intent. They do not establish that provider execution or cleanup has finished. `TooLate` reports that the operation already completed.
+
 ---
 
 ## Workspace Crate Reference
