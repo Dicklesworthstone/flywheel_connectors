@@ -45,7 +45,7 @@ impl GoogleCalendarConnectorAdapter {
     fn new() -> Self {
         Self {
             connector: GoogleCalendarConnector::new(),
-            id: ConnectorId::from_static("google-calendar"),
+            id: ConnectorId::from_static("fcp.google-calendar"),
         }
     }
 }
@@ -74,17 +74,8 @@ impl FcpConnector for GoogleCalendarConnectorAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => {
-                let status = payload
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                match status {
-                    "healthy" => HealthSnapshot::ready(),
-                    "not_configured" => HealthSnapshot::degraded("not_configured"),
-                    other => HealthSnapshot::degraded(format!("gcal_status:{other}")),
-                }
-            }
+            Ok(payload) => serde_json::from_value(payload)
+                .unwrap_or_else(|error| HealthSnapshot::error(format!("invalid health: {error}"))),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -147,12 +138,10 @@ impl FcpConnector for GoogleCalendarConnectorAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("failed to serialize invoke: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -223,9 +212,8 @@ fn handshake_request(
             .collect(),
         host: None,
         transport_caps: None,
-        // The connector honors requested_instance_id and verifies with
-        // verify_bound; pin it to the test instance so the token's INSTANCE_ID
-        // claim matches (instance-binding pattern, commit 16171621d).
+        // This is a preference. Successful invocations must use the actual
+        // instance reported after the connector establishes its session.
         requested_instance_id: Some(instance_id),
     }
 }
@@ -252,9 +240,7 @@ fn build_token(
         .zone_id("z:work")
         .principal("user:test")
         .operations(operations)
-        // dja9u typestate ratchet: connector verifies with verify_bound, which
-        // requires an INSTANCE_ID claim; bind to the test instance
-        // (instance-binding pattern, commit 16171621d).
+        // Bind to the actual session instance reported by the connector.
         .target_instance(instance_id)
         .issuer("node:test")
         .validity(now, now + ChronoDuration::hours(1))
@@ -273,7 +259,7 @@ fn invoke_request(
     InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::from("gcal-e2e"),
-        connector_id: ConnectorId::from_static("google-calendar"),
+        connector_id: ConnectorId::from_static("fcp.google-calendar"),
         operation: OperationId::from_static(operation),
         zone_id: ZoneId::work(),
         input,
@@ -444,23 +430,12 @@ async fn gcal_happy_path_connector_suite_passes() {
         &["gcal.read"],
         instance_id.clone(),
     );
-    let token = build_token(
-        &signing_key,
-        instance_id.as_str(),
-        "gcal.read",
-        &["gcal.get_event"],
-    );
-    let invoke = invoke_request(
-        "gcal.get_event",
-        json!({ "calendar_id": "primary", "event_id": "event_e2e_123" }),
-        token,
-    );
 
     let suite = ConnectorSuite {
         test_name: "gcal_happy_path".to_string(),
         config: gcal_config(&mock.base_url()),
         handshake,
-        invoke: Some(invoke),
+        invoke: None,
         invoke_expectations: InvokeExpectations {
             expect_error: false,
             expect_decision_receipt: false,
@@ -478,16 +453,23 @@ async fn gcal_happy_path_connector_suite_passes() {
         .expect("connector suite run");
 
     assert!(report.passed, "happy path should pass: {report:#?}");
-    let invoke_entry = report
-        .logs
-        .iter()
-        .find(|entry| entry.context.get("operation") == Some(&json!("invoke")))
-        .expect("invoke entry");
-    assert_eq!(invoke_entry.result, "pass");
-    assert_eq!(
-        invoke_entry.context.get("invoke_status"),
-        Some(&json!(format!("{:?}", InvokeStatus::Ok)))
+    let token = build_token(
+        &signing_key,
+        connector.connector.instance_id(),
+        "gcal.read",
+        &["gcal.get_event"],
     );
+    let invoke = invoke_request(
+        "gcal.get_event",
+        json!({ "calendar_id": "primary", "event_id": "event_e2e_123" }),
+        token,
+    );
+    let response = connector
+        .invoke(invoke)
+        .await
+        .expect("authorized native invoke");
+    assert_eq!(response.status, InvokeStatus::Ok);
+    assert_eq!(response.result.unwrap()["event"]["id"], "event_e2e_123");
     let received = mock.received_requests().await;
     assert_eq!(
         received.len(),

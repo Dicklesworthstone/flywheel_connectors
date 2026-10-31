@@ -616,7 +616,7 @@ fn validate_created_event(event: Event, expected_id: Option<&str>) -> GCalResult
     Ok(event)
 }
 
-fn validate_create_event_id(event_id: &str) -> GCalResult<()> {
+pub(crate) fn validate_create_event_id(event_id: &str) -> GCalResult<()> {
     if !(5..=1024).contains(&event_id.len())
         || !event_id
             .bytes()

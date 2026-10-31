@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use fcp_google_discovery::{
     ServiceAliasRegistry,
@@ -9,11 +10,12 @@ use fcp_google_discovery::{
     provisioning::load_default_google_provisioning_bundle,
 };
 use fcp_prelude::{
-    AgentHint, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken, CapabilityVerifier,
-    ConnectorId, EventCaps, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
-    IdempotencyClass, Introspection, OperationId, OperationInfo, RiskLevel, SafetyTier,
-    SelfCheckReport, SessionId, SimulateRequest, SimulateResponse,
+    AgentHint, BaseConnector, CapabilityId, ConnectorId, EventCaps, FcpError, FcpResult,
+    HandshakeRequest, HealthSnapshot, HealthState, IdempotencyClass, Introspection, InvokeRequest,
+    InvokeResponse, OperationId, OperationInfo, RiskLevel, SafetyTier, SelfCheckReport,
+    SimulateRequest, SimulateResponse, ZoneId,
 };
+use fcp_sdk::prelude::StandaloneSession;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -100,6 +102,7 @@ use crate::{
 };
 
 const MANIFEST_TOML: &str = include_str!("../manifest.toml");
+const MAX_INVOKE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Validated configuration for the Google Calendar connector.
 struct GoogleCalendarConfig {
@@ -299,8 +302,10 @@ pub struct GoogleCalendarConnector {
     base: Arc<BaseConnector>,
     config: Option<GoogleCalendarConfig>,
     client: Option<GoogleCalendarClient>,
-    verifier: Option<CapabilityVerifier>,
-    session_id: Option<SessionId>,
+    authority: Option<StandaloneSession>,
+    bound_zone: Option<ZoneId>,
+    started_at: Instant,
+    stopped: bool,
 }
 
 impl GoogleCalendarConnector {
@@ -309,19 +314,31 @@ impl GoogleCalendarConnector {
     pub fn new() -> Self {
         Self {
             base: Arc::new(BaseConnector::new(ConnectorId::from_static(
-                "google-calendar",
+                "fcp.google-calendar",
             ))),
             config: None,
             client: None,
-            verifier: None,
-            session_id: None,
+            authority: None,
+            bound_zone: None,
+            started_at: Instant::now(),
+            stopped: false,
         }
     }
 
     /// Connector instance ID used for bound capability-token verification.
     #[must_use]
     pub fn instance_id(&self) -> &str {
-        self.base.instance_id.as_str()
+        self.authority.as_ref().map_or_else(
+            || self.base.instance_id.as_str(),
+            |authority| authority.instance_id().as_str(),
+        )
+    }
+
+    fn invalidate_authority(&mut self) {
+        if let Some(authority) = &mut self.authority {
+            authority.invalidate();
+        }
+        self.base.set_handshaken(false);
     }
 
     #[must_use]
@@ -340,6 +357,16 @@ impl GoogleCalendarConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        // Replacing credentials invalidates all prior tokens, including when
+        // the replacement configuration is rejected before client creation.
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        self.bound_zone = None;
+        self.stopped = false;
+        if let Some(client) = self.client.take() {
+            client.shutdown();
+        }
         let config = GoogleCalendarConfig::from_params(&params).await?;
 
         let client = GoogleCalendarClient::new_with_auth(config.auth.clone())
@@ -378,80 +405,97 @@ impl GoogleCalendarConnector {
         &mut self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
+        self.invalidate_authority();
+        if self.config.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
         let req: HandshakeRequest =
             serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
                 code: 1003,
                 message: format!("Invalid handshake request: {e}"),
             })?;
-
-        if let Some(requested_instance_id) = req.requested_instance_id {
-            let base = Arc::get_mut(&mut self.base).ok_or_else(|| FcpError::Internal {
-                message: "Google Calendar base connector was shared before handshake".into(),
-            })?;
-            base.instance_id = requested_instance_id;
+        if self
+            .bound_zone
+            .as_ref()
+            .is_some_and(|zone| zone != &req.zone)
+        {
+            return Err(FcpError::CapabilityDenied {
+                capability: "gcal.handshake".into(),
+                reason: "Reconfigure before binding Calendar credentials to another zone".into(),
+            });
         }
-
-        self.verifier = Some(CapabilityVerifier::new(
-            req.host_public_key,
-            req.zone.clone(),
-            self.base.instance_id.clone(),
-        ));
-
-        let session_id = SessionId::new();
-        self.session_id = Some(session_id.clone());
-        self.base.set_handshaken(true);
-
-        let capabilities_granted: Vec<CapabilityGrant> = req
-            .capabilities_requested
-            .into_iter()
-            .map(|cap| CapabilityGrant {
-                capability: cap,
-                operation: None,
-            })
-            .collect();
-
-        let response = HandshakeResponse {
-            status: "accepted".into(),
-            capabilities_granted,
-            session_id,
-            manifest_hash: Self::manifest_hash(),
-            nonce: req.nonce,
-            event_caps: Some(EventCaps {
-                streaming: false,
-                replay: false,
-                min_buffer_events: 100,
-                requires_ack: false,
-            }),
-            auth_caps: None,
-            op_catalog_hash: None,
-        };
-
-        serde_json::to_value(response).map_err(|e| FcpError::Internal {
+        let zone = req.zone.clone();
+        let mut authority = StandaloneSession::new(MANIFEST_TOML)?;
+        let mut response = authority.handshake(req)?;
+        response.event_caps = Some(EventCaps {
+            streaming: false,
+            replay: false,
+            min_buffer_events: 0,
+            requires_ack: false,
+        });
+        let mut result = serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
-        })
+        })?;
+        // A preferred host identifier is not an authority generation. Always
+        // disclose the SDK's actual, freshly rotated binding for token issuance.
+        result["instance_id"] = json!(authority.instance_id());
+        result["connector_id"] = json!("fcp.google-calendar");
+        result["protocol_version"] = json!("2.0");
+        self.authority = Some(authority);
+        self.bound_zone = Some(zone);
+        self.base.set_handshaken(true);
+        Ok(result)
     }
 
-    /// Handle health check.
+    /// Handle health check using the canonical native-host response schema.
     ///
     /// # Errors
     /// Returns [`FcpError`] if the health status cannot be determined.
     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {
-        let configured = self.client.is_some();
+        let configured = self.config.is_some() && self.client.is_some();
+        let handshaken = self
+            .authority
+            .as_ref()
+            .is_some_and(StandaloneSession::is_established);
+        let status = if self.stopped {
+            HealthState::Stopping
+        } else if configured && handshaken {
+            HealthState::Ready
+        } else if configured {
+            HealthState::Degraded {
+                reason: "No negotiated capability authority".into(),
+            }
+        } else {
+            HealthState::Starting
+        };
         let metrics = self.base.metrics();
-        let mut health = json!({
-            "status": if configured { "healthy" } else { "not_configured" },
+        let mut details = json!({
+            "connector_id": "fcp.google-calendar",
+            "instance_id": self.instance_id(),
+            "configured": configured,
+            "handshaken": handshaken,
+            "zone_id": self.bound_zone,
             "metrics": {
                 "requests_total": metrics.requests_total,
                 "requests_error": metrics.requests_error,
             }
         });
         if let Some(config) = &self.config {
-            health["auth_mode"] = json!(google_auth_redacted_label(&config.auth));
-            health["base_url"] = json!(config.base_url);
-            health["service_identity"] = json!(config.service_identity);
-            health["required_scopes"] = json!(config.required_scopes);
+            details["auth_mode"] = json!(google_auth_redacted_label(&config.auth));
+            details["base_url"] = json!(config.base_url);
+            details["service_identity"] = json!(config.service_identity);
+            details["required_scopes"] = json!(config.required_scopes);
         }
-        Ok(health)
+        serde_json::to_value(HealthSnapshot {
+            status,
+            uptime_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            load: None,
+            details: Some(details),
+            rate_limit: None,
+        })
+        .map_err(|e| FcpError::Internal {
+            message: format!("Failed to serialize health: {e}"),
+        })
     }
 
     /// Handle doctor readiness check.
@@ -709,8 +753,8 @@ impl GoogleCalendarConnector {
                         "type": "object",
                         "properties": {
                             "events": { "type": "array" },
-                            "next_page_token": { "type": "string" },
-                            "summary": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "summary": { "type": ["string", "null"] }
                         }
                     }),
                     "gcal.read",
@@ -918,7 +962,7 @@ impl GoogleCalendarConnector {
                         "type": "object",
                         "properties": {
                             "events": { "type": "array" },
-                            "next_page_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] }
                         }
                     }),
                     "gcal.read",
@@ -981,8 +1025,8 @@ impl GoogleCalendarConnector {
                         "type": "object",
                         "properties": {
                             "events": { "type": "array" },
-                            "next_page_token": { "type": "string" },
-                            "next_sync_token": { "type": "string" }
+                            "next_page_token": { "type": ["string", "null"] },
+                            "next_sync_token": { "type": ["string", "null"] }
                         }
                     }),
                     "gcal.read",
@@ -1026,8 +1070,32 @@ impl GoogleCalendarConnector {
                 code: 1003,
                 message: format!("Invalid simulate request: {e}"),
             })?;
-
-        let response = SimulateResponse::allowed(req.id);
+        let checked = (|| {
+            self.base.check_ready()?;
+            if req.r#type != "simulate" || req.id.0.is_empty() {
+                return Err(FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Simulation requires type simulate and a non-empty ID".into(),
+                });
+            }
+            validate_calendar_input(req.operation.as_str(), &req.input)?;
+            let resources = calendar_resource_uris(req.operation.as_str(), &req.input)?;
+            self.authority
+                .as_ref()
+                .ok_or(FcpError::NotHandshaken)?
+                .authorize(
+                    &req.connector_id,
+                    &req.zone_id,
+                    &req.operation,
+                    req.capability_token,
+                    &resources,
+                )?;
+            Ok(())
+        })();
+        let response = match checked {
+            Ok(()) => SimulateResponse::allowed(req.id),
+            Err(error) => SimulateResponse::denied(req.id, error.to_string(), error.error_code()),
+        };
         serde_json::to_value(response).map_err(|e| FcpError::Internal {
             message: format!("Failed to serialize response: {e}"),
         })
@@ -1047,61 +1115,25 @@ impl GoogleCalendarConnector {
         &self,
         params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
-        let operation =
-            params
-                .get("operation")
-                .and_then(|v| v.as_str())
-                .ok_or(FcpError::InvalidRequest {
-                    code: 1003,
-                    message: "Missing operation".into(),
-                })?;
-
-        let input = params.get("input").cloned().unwrap_or(json!({}));
-
-        let token_value = params
-            .get("capability_token")
-            .ok_or(FcpError::InvalidRequest {
+        let request: InvokeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
                 code: 1003,
-                message: "Missing capability_token".into(),
+                message: "Invalid FCP invoke request".into(),
             })?;
-
-        let token: CapabilityToken =
-            serde_json::from_value(token_value.clone()).map_err(|e| FcpError::InvalidRequest {
+        self.base.check_ready()?;
+        if request.deadline_ms == Some(0) {
+            return Err(FcpError::InvalidRequest {
                 code: 1003,
-                message: format!("Invalid capability_token format: {e}"),
-            })?;
-
-        let op_id: OperationId = operation.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid operation ID format".into(),
-        })?;
-        let intro = self.handle_introspect().await?;
-        let cap_str = intro
-            .get("operations")
-            .and_then(|ops| ops.as_array())
-            .and_then(|ops| {
-                ops.iter()
-                    .find(|o| o.get("id").and_then(|id| id.as_str()) == Some(operation))
-            })
-            .and_then(|op| op.get("capability"))
-            .and_then(|cap| cap.as_str())
-            .ok_or_else(|| FcpError::OperationNotGranted {
-                operation: operation.into(),
-            })?;
-
-        let cap_id: CapabilityId = cap_str.parse().map_err(|_| FcpError::InvalidRequest {
-            code: 1003,
-            message: "Invalid capability ID format".into(),
-        })?;
-
-        if let Some(verifier) = &self.verifier {
-            // dja9u.1.b: typestate handoff via verify_bound.
-            let _bound = verifier.verify_bound(token, &cap_id, &op_id, &[])?;
-        } else {
-            return Err(FcpError::NotConfigured);
+                message: "Invocation deadline has expired".into(),
+            });
         }
-
-        match operation {
+        let operation = request.operation.as_str();
+        validate_calendar_input(operation, &request.input)?;
+        let resources = calendar_resource_uris(operation, &request.input)?;
+        let authority = self.authority.as_ref().ok_or(FcpError::NotHandshaken)?;
+        let admission = authority.admit_bounded(&request, &resources, MAX_INVOKE_RESPONSE_BYTES)?;
+        let input = request.input;
+        let result = match operation {
             "gcal.list_calendars" => self.invoke_list_calendars().await,
             "gcal.get_event" => self.invoke_get_event(input).await,
             "gcal.list_events" => self.invoke_list_events(input).await,
@@ -1116,7 +1148,15 @@ impl GoogleCalendarConnector {
             _ => Err(FcpError::OperationNotGranted {
                 operation: operation.into(),
             }),
-        }
+        };
+        // Settle the same complete envelope the JSONL adapter returns. A failed
+        // provider call retains its reservation because effects may be unknown.
+        let response = match &result {
+            Ok(value) => InvokeResponse::ok(request.id, value.clone()),
+            Err(error) => InvokeResponse::error(request.id, error.clone()),
+        };
+        admission.finish_response(&response)?;
+        result
     }
 
     // ── Operation implementations ─────────────────────────────────
@@ -1342,7 +1382,12 @@ impl GoogleCalendarConnector {
         _params: serde_json::Value,
     ) -> FcpResult<serde_json::Value> {
         info!("Google Calendar connector shutting down");
-        if let Some(client) = &self.client {
+        self.invalidate_authority();
+        self.base.set_configured(false);
+        self.config = None;
+        self.bound_zone = None;
+        self.stopped = true;
+        if let Some(client) = self.client.take() {
             client.shutdown();
         }
         Ok(json!({ "status": "shutdown" }))
@@ -1356,6 +1401,155 @@ impl Default for GoogleCalendarConnector {
 }
 
 // ── Helper functions ──────────────────────────────────────────────
+
+/// Resource identities follow the exact calendar/event IDs sent to Google.
+/// Encoding each segment prevents separators and wildcard characters in an ID
+/// from being interpreted as a different authorization resource.
+fn calendar_resource_uris(operation: &str, input: &serde_json::Value) -> FcpResult<Vec<String>> {
+    let calendar_uri = |calendar_id: &str| {
+        format!(
+            "gcal://calendars/{}",
+            percent_encoding::utf8_percent_encode(calendar_id, percent_encoding::NON_ALPHANUMERIC),
+        )
+    };
+    match operation {
+        "gcal.list_calendars" => Ok(vec!["gcal://calendars".into()]),
+        "gcal.freebusy" => {
+            let items = calendar_freebusy_items(input)?;
+            Ok(items.iter().map(|item| calendar_uri(&item.id)).collect())
+        }
+        "gcal.get_calendar" => Ok(vec![calendar_uri(calendar_identifier(
+            input,
+            "calendar_id",
+        )?)]),
+        "gcal.list_events" | "gcal.sync_events" | "gcal.create_event" | "gcal.quick_add" => {
+            let calendar = calendar_uri(calendar_identifier(input, "calendar_id")?);
+            Ok(vec![format!("{calendar}/events")])
+        }
+        "gcal.get_event"
+        | "gcal.update_event"
+        | "gcal.delete_event"
+        | "gcal.list_event_instances" => {
+            let calendar = calendar_uri(calendar_identifier(input, "calendar_id")?);
+            let event = percent_encoding::utf8_percent_encode(
+                calendar_identifier(input, "event_id")?,
+                percent_encoding::NON_ALPHANUMERIC,
+            );
+            Ok(vec![format!("{calendar}/events/{event}")])
+        }
+        _ => Err(FcpError::OperationNotGranted {
+            operation: operation.into(),
+        }),
+    }
+}
+
+fn calendar_identifier<'a>(input: &'a serde_json::Value, field: &str) -> FcpResult<&'a str> {
+    let value = require_str(input, field)?;
+    validate_calendar_identifier(value, field)?;
+    Ok(value)
+}
+
+fn validate_calendar_identifier(value: &str, field: &str) -> FcpResult<()> {
+    if value.trim().is_empty() || matches!(value, "." | "..") || value.chars().any(char::is_control)
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: format!(
+                "Field {field} must be a non-empty resource identifier without dot segments or controls"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn calendar_freebusy_items(input: &serde_json::Value) -> FcpResult<Vec<FreeBusyRequestItem>> {
+    let raw = input.get("items").ok_or_else(|| FcpError::InvalidRequest {
+        code: 1003,
+        message: "Missing required field: items".into(),
+    })?;
+    let items: Vec<FreeBusyRequestItem> =
+        serde_json::from_value(raw.clone()).map_err(|_| FcpError::InvalidRequest {
+            code: 1003,
+            message: "Field items must be an array of calendar ID objects".into(),
+        })?;
+    if items.is_empty() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Free/busy requires at least one calendar".into(),
+        });
+    }
+    for item in &items {
+        validate_calendar_identifier(&item.id, "items.id")?;
+    }
+    Ok(items)
+}
+
+fn validate_calendar_input(operation: &str, input: &serde_json::Value) -> FcpResult<()> {
+    if !input.is_object() {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Calendar input must be an object".into(),
+        });
+    }
+    match operation {
+        "gcal.list_calendars" => return Ok(()),
+        "gcal.freebusy" => {
+            require_str(input, "time_min")?;
+            require_str(input, "time_max")?;
+            calendar_freebusy_items(input)?;
+            return Ok(());
+        }
+        "gcal.get_calendar" | "gcal.list_events" | "gcal.sync_events" => {
+            calendar_identifier(input, "calendar_id")?;
+        }
+        "gcal.get_event" | "gcal.delete_event" | "gcal.list_event_instances" => {
+            calendar_identifier(input, "calendar_id")?;
+            calendar_identifier(input, "event_id")?;
+        }
+        "gcal.update_event" => {
+            calendar_identifier(input, "calendar_id")?;
+            calendar_identifier(input, "event_id")?;
+            event_update_patch(input)?;
+        }
+        "gcal.create_event" => {
+            calendar_identifier(input, "calendar_id")?;
+            for field in ["summary", "start", "end"] {
+                require_str(input, field)?;
+            }
+            event_update_patch(input)?;
+            if input.get("event_id").is_some() {
+                let event_id = calendar_identifier(input, "event_id")?;
+                crate::client::validate_create_event_id(event_id)
+                    .map_err(|error| error.to_fcp_error())?;
+            }
+        }
+        "gcal.quick_add" => {
+            calendar_identifier(input, "calendar_id")?;
+            require_str(input, "text")?;
+        }
+        _ => {
+            return Err(FcpError::OperationNotGranted {
+                operation: operation.into(),
+            });
+        }
+    }
+    for field in ["time_min", "time_max", "page_token", "sync_token"] {
+        if input.get(field).is_some() {
+            require_str(input, field)?;
+        }
+    }
+    if let Some(value) = input.get("max_results")
+        && !value
+            .as_u64()
+            .is_some_and(|number| u32::try_from(number).is_ok())
+    {
+        return Err(FcpError::InvalidRequest {
+            code: 1003,
+            message: "Field max_results must be an unsigned 32-bit integer".into(),
+        });
+    }
+    Ok(())
+}
 
 /// Build a sparse provider patch without converting absent fields to null or
 /// empty arrays. In particular, a title-only update must not remove guests.
@@ -1441,7 +1635,13 @@ fn op_info(
         risk_level,
         description: None,
         rate_limit: None,
-        requires_approval: None,
+        requires_approval: Some(match id {
+            "gcal.create_event" | "gcal.update_event" | "gcal.quick_add" => {
+                fcp_prelude::ApprovalMode::Policy
+            }
+            "gcal.delete_event" => fcp_prelude::ApprovalMode::Interactive,
+            _ => fcp_prelude::ApprovalMode::None,
+        }),
         safety_tier,
         idempotency,
         ai_hints,
@@ -1454,7 +1654,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use fcp_crypto::cose::CapabilityTokenBuilder;
     use fcp_crypto::ed25519::Ed25519SigningKey;
-    use fcp_prelude::CapabilityConstraints;
+    use fcp_prelude::{CapabilityConstraints, CapabilityToken};
 
     #[test]
     fn event_patch_preserves_omission_and_wraps_only_supplied_times() {
@@ -1587,9 +1787,13 @@ mod tests {
     #[fcp_async_core::runtime::test]
     async fn test_handshake() {
         let mut connector = GoogleCalendarConnector::new();
+        connector
+            .handle_configure(json!({ "token": "fixture-token" }))
+            .await
+            .unwrap();
         let result = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": vec![0u8; 32],
                 "nonce": vec![0u8; 32],
@@ -1599,6 +1803,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["status"], "accepted");
+        assert_eq!(result["instance_id"], connector.instance_id());
+        assert_eq!(result["connector_id"], "fcp.google-calendar");
+        let health: HealthSnapshot =
+            serde_json::from_value(connector.handle_health().await.unwrap()).unwrap();
+        assert!(health.is_ready());
     }
 
     #[test]
@@ -1618,7 +1827,9 @@ mod tests {
     async fn test_health_not_configured() {
         let connector = GoogleCalendarConnector::new();
         let result = connector.handle_health().await.unwrap();
-        assert_eq!(result["status"], "not_configured");
+        let health: HealthSnapshot = serde_json::from_value(result).unwrap();
+        assert!(matches!(health.status, HealthState::Starting));
+        assert_eq!(health.details.unwrap()["configured"], false);
     }
 
     #[fcp_async_core::runtime::test]
@@ -1628,22 +1839,25 @@ mod tests {
         let signing_key = Ed25519SigningKey::generate();
         let verifying_key = signing_key.verifying_key();
 
-        connector
+        let handshake_error = connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
-                "capabilities_requested": ["gcal.list_calendars"]
+                "capabilities_requested": ["gcal.read"]
             }))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(handshake_error, FcpError::NotConfigured));
 
         let token =
             generate_valid_token(&signing_key, connector.instance_id(), "gcal.list_calendars");
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "unconfigured",
+                "connector_id": "fcp.google-calendar", "zone_id": "z:work",
                 "operation": "gcal.list_calendars",
                 "input": {},
                 "capability_token": token
@@ -1670,7 +1884,7 @@ mod tests {
 
         connector
             .handle_handshake(json!({
-                "protocol_version": "1.0.0",
+                "protocol_version": "2.0.0",
                 "zone": "z:work",
                 "host_public_key": verifying_key.to_bytes(),
                 "nonce": vec![0u8; 32],
@@ -1683,6 +1897,8 @@ mod tests {
 
         let result = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "missing-field",
+                "connector_id": "fcp.google-calendar", "zone_id": "z:work",
                 "operation": "gcal.get_event",
                 "input": {},
                 "capability_token": token
@@ -1894,10 +2110,13 @@ mod tests {
             .await
             .unwrap();
         let health = connector.handle_health().await.unwrap();
-        assert_eq!(health["status"], "healthy");
-        assert_eq!(health["auth_mode"], "google_auth:bearer:redacted");
-        assert!(health["base_url"].as_str().is_some());
-        assert_eq!(health["service_identity"], "calendar:v3");
+        assert_eq!(health["status"]["state"], "degraded");
+        assert_eq!(
+            health["details"]["auth_mode"],
+            "google_auth:bearer:redacted"
+        );
+        assert!(health["details"]["base_url"].as_str().is_some());
+        assert_eq!(health["details"]["service_identity"], "calendar:v3");
     }
 
     #[fcp_async_core::runtime::test]
@@ -2446,8 +2665,8 @@ mod tests {
         let c = GoogleCalendarConnector::default();
         assert!(c.config.is_none());
         assert!(c.client.is_none());
-        assert!(c.verifier.is_none());
-        assert!(c.session_id.is_none());
+        assert!(c.authority.is_none());
+        assert!(c.bound_zone.is_none());
     }
 
     #[test]

@@ -5,15 +5,15 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:d28babba7e619e2f444b4910923091948b660e74d1dfd44a74e996152776d7b7"
+interface_hash = "blake3-256:fcp.interface.v2:f2295fee7762e1dfa7d1a2c79330d200d1da62cd1ba57359715172847aa069e6"
 
 [connector]
 id = "fcp.google-calendar"
 name = "Google Calendar Connector"
 version = "0.1.0"
 description = "FCP connector for Google Calendar (events, calendars, free/busy)"
-archetypes = ["operational", "streaming"]
-format = "wasi"
+archetypes = ["operational"]
+format = "native"
 status = "proven"
 
 [connector.state]
@@ -213,7 +213,7 @@ capability = "gcal.delete"
 risk_level = "high"
 safety_tier = "risky"
 requires_approval = "interactive"
-idempotency = "strict"
+idempotency = "none"
 
 [provides.operations."gcal.delete_event".input_schema]
 required = ["calendar_id", "event_id"]
@@ -224,10 +224,11 @@ type = "string"
 type = "string"
 
 [provides.operations."gcal.delete_event".output_schema]
-required = ["deleted"]
+required = ["status"]
 type = "object"
-[provides.operations."gcal.delete_event".output_schema.properties.deleted]
-type = "boolean"
+[provides.operations."gcal.delete_event".output_schema.properties.status]
+type = "string"
+const = "deleted"
 
 [provides.operations."gcal.delete_event".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -269,12 +270,22 @@ type = "string"
 type = "string"
 [provides.operations."gcal.list_events".input_schema.properties.time_max]
 type = "string"
+[provides.operations."gcal.list_events".input_schema.properties.max_results]
+type = "integer"
+minimum = 0
+maximum = 4294967295
+[provides.operations."gcal.list_events".input_schema.properties.page_token]
+type = "string"
 
 [provides.operations."gcal.list_events".output_schema]
-required = ["items"]
+required = ["events"]
 type = "object"
-[provides.operations."gcal.list_events".output_schema.properties.items]
+[provides.operations."gcal.list_events".output_schema.properties.events]
 type = "array"
+[provides.operations."gcal.list_events".output_schema.properties.next_page_token]
+type = ["string", "null"]
+[provides.operations."gcal.list_events".output_schema.properties.summary]
+type = ["string", "null"]
 
 [provides.operations."gcal.list_events".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -312,9 +323,9 @@ required = []
 type = "object"
 
 [provides.operations."gcal.list_calendars".output_schema]
-required = ["items"]
+required = ["calendars"]
 type = "object"
-[provides.operations."gcal.list_calendars".output_schema.properties.items]
+[provides.operations."gcal.list_calendars".output_schema.properties.calendars]
 type = "array"
 
 [provides.operations."gcal.list_calendars".network_constraints]
@@ -414,7 +425,7 @@ type = "object"
 [provides.operations."gcal.list_event_instances".output_schema.properties.events]
 type = "array"
 [provides.operations."gcal.list_event_instances".output_schema.properties.next_page_token]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."gcal.list_event_instances".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -553,9 +564,9 @@ type = "object"
 [provides.operations."gcal.sync_events".output_schema.properties.events]
 type = "array"
 [provides.operations."gcal.sync_events".output_schema.properties.next_page_token]
-type = "string"
+type = ["string", "null"]
 [provides.operations."gcal.sync_events".output_schema.properties.next_sync_token]
-type = "string"
+type = ["string", "null"]
 
 [provides.operations."gcal.sync_events".network_constraints]
 host_allow = ["www.googleapis.com"]
@@ -581,9 +592,9 @@ related = ["gcal.list_events"]
 # ── Events ──────────────────────────────────────────────────────
 
 [event_caps]
-streaming = true
+streaming = false
 replay = false
-min_buffer_events = 50
+min_buffer_events = 0
 
 # ── Sandbox ─────────────────────────────────────────────────────
 

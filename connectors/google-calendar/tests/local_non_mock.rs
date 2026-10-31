@@ -220,12 +220,15 @@ fn header_value_contains(headers: &str, expected_name: &str, expected_value: &st
 
 fn handshake_req(host_public_key: [u8; 32], instance_id: &InstanceId) -> HandshakeRequest {
     HandshakeRequest {
-        protocol_version: "1.0.0".into(),
+        protocol_version: "2.0.0".into(),
         zone: ZoneId::work(),
         zone_dir: None,
         host_public_key,
         nonce: [31_u8; 32],
-        capabilities_requested: vec![CapabilityId::from_static(READ_CAPABILITY)],
+        capabilities_requested: vec![
+            CapabilityId::from_static(READ_CAPABILITY),
+            CapabilityId::from_static(WRITE_CAPABILITY),
+        ],
         host: None,
         transport_caps: None,
         requested_instance_id: Some(instance_id.clone()),
@@ -290,6 +293,7 @@ async fn setup_connector(
         .await
         .expect("handshake connector");
 
+    let instance_id = connector.instance_id().parse().expect("actual instance ID");
     (connector, signing_key, instance_id)
 }
 
@@ -313,8 +317,9 @@ async fn local_non_mock_list_calendars_uses_calendar_request_boundary() {
     let (connector, signing_key, instance_id) = setup_connector(fixture.base_url()).await;
 
     let health = connector.handle_health().await.expect("health response");
-    assert_eq!(health["status"], "healthy");
-    assert_eq!(health["service_identity"], "calendar:v3");
+    assert_eq!(health["status"]["state"], "ready");
+    assert_eq!(health["details"]["service_identity"], "calendar:v3");
+    assert_eq!(health["details"]["instance_id"], instance_id.as_str());
 
     let doctor = connector.handle_doctor().await.expect("doctor response");
     assert_eq!(doctor["status"], "healthy");
@@ -330,6 +335,8 @@ async fn local_non_mock_list_calendars_uses_calendar_request_boundary() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-list",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": OP_LIST_CALENDARS,
             "input": {},
             "capability_token": capability_token(
@@ -430,6 +437,8 @@ async fn local_non_mock_create_event_posts_calendar_event_body() {
 
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-create",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": OP_CREATE_EVENT,
             "input": create_event_input(),
             "capability_token": capability_token(
@@ -503,6 +512,8 @@ async fn local_non_mock_wrong_capability_fails_before_loopback_egress() {
 
     let error = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "loopback-denied",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": OP_CREATE_EVENT,
             "input": create_event_input(),
             "capability_token": capability_token(

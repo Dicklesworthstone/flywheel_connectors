@@ -1,6 +1,6 @@
 # Google Calendar Connector V3 Contract
 
-> **Status**: PROVEN runtime contract documented with manifest/runtime drift called out
+> **Status**: Native host lifecycle, scoped invocation, and Calendar operations implemented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/google_calendar_connector_verification.sh`
@@ -50,22 +50,36 @@ Important runtime truths the contract preserves:
 - Without `event_id`, event creation retains fail-closed retry behavior. Ambiguous unkeyed writes and quick-add results return nonretryable errors so an outer invocation cannot silently create another event. Requests rejected before transmission or rate-limited without execution retain their safe retry behavior.
 - Calendar IDs, event IDs, query values, quick-add text, sync tokens, and page tokens are percent-encoded before provider calls.
 - Provider 401, 404, 429 with `Retry-After`, retryable transport/5xx classes, malformed JSON, and API error bodies map into typed connector and FCP errors.
-- Handshake installs a `CapabilityVerifier`.
-- `invoke` resolves the requested operation's capability from runtime introspection and verifies a bound capability token before provider execution.
+- Handshake establishes an SDK `StandaloneSession` from the bundled manifest, intersects requested capabilities with declared operation capabilities, and reports the actual fresh instance ID for token issuance.
+- `invoke` validates a complete typed FCP request, negotiated capability, connector and zone binding, signed token, and the resources derived from the Calendar input before provider execution.
 
-## Drift Visible In This Checkout
+## Native Host Contract
 
-This README documents the runtime truth and keeps current drift visible:
+The executable serves the shared bounded JSONL protocol. Health responses deserialize directly as `HealthSnapshot`; invocation results deserialize as `InvokeResponse` and retain the inner invocation request ID. The connector identity is `fcp.google-calendar` in the manifest, native responses, and capability target checks.
 
-- Runtime `BaseConnector` ID is `google-calendar`, while the manifest connector ID is `fcp.google-calendar`.
-- Runtime handshake returns a SHA-256 hash of the bundled `manifest.toml`.
-- Manifest `event_caps.streaming = true`, but runtime handshake reports `streaming = false`, runtime introspection has no events, and no watch/channel flow is implemented.
-- Runtime `simulate` returns allowed for any syntactically valid `SimulateRequest`; it does not validate operation inventory, readiness, input schema, capability, or capability token.
-- Manifest output names for list/delete operations drift from runtime output names. Runtime `list_events` returns `events`, `next_page_token`, and `summary`; runtime `delete_event` returns `status: deleted`.
-- Runtime `handle_shutdown` shuts down the client runtime but does not clear config, client, verifier, session, or configured/handshaken flags.
-- The dedicated tracked verification shell script is `scripts/e2e/google_calendar_connector_verification.sh`.
+Configure before handshaking. Each handshake rotates the actual instance, including when the host repeats a preferred ID. The host must read `instance_id` from the handshake response or health details and bind subsequently issued tokens to that instance. Reconfiguration, failed handshakes, and shutdown invalidate the previous authority. Switching the zone bound to configured credentials requires reconfiguration.
 
-A follow-up parity bead should align simulation, manifest/runtime event capability, output schemas, interface proof, and shutdown state reset.
+Health is ready only after configuration and handshake. Credential-reference mode can be lifecycle-ready while `self_check` reports `credential_injection_required`; the host remains responsible for materializing the credential. Shutdown clears configuration and closes the client, and the transport stops after shutdown. EOF also closes the connector lifecycle.
+
+The manifest identifies a native, request-response connector without event streaming. Its list/delete output schemas describe the provider adapter's actual results: `calendars`, `events`, and `status: deleted`. Runtime introspection preserves the manifest's policy approval requirement for create/update/quick-add and interactive approval requirement for delete.
+
+`simulate` performs the same input, lifecycle, target, zone, negotiated-grant, signature, instance, resource, and current call-budget checks without sending provider requests or spending a call. It is a preview; a concurrent invocation can consume capacity before a later call.
+
+Provider invocations atomically charge signed call limits and reserve a bounded response allowance before dispatch. Byte accounting covers compact JSON of the complete typed FCP request and response, with a 16 MiB local response ceiling, and settles unused bytes only for a completed success. Failed or interrupted work retains its reservation because its outcome can be unknown. The host continues to enforce approvals, revocation, holder proofs, transport/provider byte limits, and deployment-wide policy.
+
+### Resource Scope
+
+Authorization derives these resource URIs from the operation input. Each Calendar/event ID is percent-encoded as one path segment; IDs containing separators or wildcard characters cannot broaden a grant.
+
+| Operation family | Required resource |
+|------------------|-------------------|
+| List calendars | `gcal://calendars` |
+| Get calendar | `gcal://calendars/{calendar_id}` |
+| List/sync/create events and quick add | `gcal://calendars/{calendar_id}/events` |
+| Get/update/delete event and list recurring instances | `gcal://calendars/{calendar_id}/events/{event_id}` |
+| Free/busy | `gcal://calendars/{calendar_id}` for **every** calendar in `items` |
+
+For example, a grant for `gcal://calendars/primary/events/evt001` authorizes that event alone. Free/busy rejects the whole request before egress if any requested calendar is outside the grant or matches a deny rule. Empty identifiers, bare dot segments, and control characters are rejected before admission.
 
 ## First-Slice Scope
 
@@ -75,7 +89,7 @@ The current Google Calendar README slice documents the existing runtime surface:
 - Calendar service selection and scope-trigger handling
 - Calendar base URL policy and loopback test allowance
 - calendar list/get, event list/get/create/update/delete, quick add, freebusy, recurring instances, and incremental sync
-- bound capability-token verification during invoke
+- session-bound capability and resource verification with atomic call and byte accounting during invoke
 - provider error mapping, retry behavior, redaction posture, and health behavior
 - lifecycle, doctor, health, self-check, introspection, simulation, invoke, and shutdown surfaces
 - deterministic WireMock tests and direct proof commands
@@ -157,7 +171,7 @@ These are excluded on purpose:
 - configuration, client state, auth mode, base URL, service identity, required scopes, and request counters
 - operation metadata with capability, risk, safety tier, idempotency, schemas, and AI hints
 - bound capability-token verification during `invoke`
-- current simulation behavior, which is permissive
+- simulation of current authorization without provider access or budget consumption
 - provider-backed self-check through `users/me/calendarList?maxResults=1` when credentials are materialized
 - degraded self-check for secretless credential references
 - redacted auth labels and typed provider/FCP error mapping
@@ -167,7 +181,9 @@ The deterministic integration evidence is anchored on connector-local tests cove
 - calendar list/get, event list/get/create/delete, quick add, freebusy, recurring instances, and calendar lookup
 - 401, 404, 429, retryable transport/server classes, JSON errors, and FCP error mapping
 - base URL validation, localhost loopback allowance, redaction, credential-reference configuration, and self-check behavior
-- invoke rejection for wrong capability, unknown operation, missing fields, and pre-provider capability verification
+- typed native JSONL lifecycle and invocation response compatibility
+- invoke rejection for wrong target, zone, capability, instance, operation, input, and resource before provider access
+- resource-scoped finite grants, simulation without spending calls, multi-calendar free/busy denial, and authority invalidation across lifecycle changes
 
 ## Source Notes
 

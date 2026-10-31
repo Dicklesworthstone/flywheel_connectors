@@ -58,19 +58,26 @@ async fn setup_handshake(
     capabilities: &[&str],
 ) -> InstanceId {
     let verifying_key = signing_key.verifying_key();
-    let instance_id = InstanceId::new();
+    let capabilities: std::collections::BTreeSet<&str> = capabilities
+        .iter()
+        .map(|operation| match *operation {
+            "gcal.create_event" | "gcal.update_event" | "gcal.quick_add" => "gcal.write",
+            "gcal.delete_event" => "gcal.delete",
+            "gcal.read" | "gcal.write" | "gcal.delete" => *operation,
+            _ => "gcal.read",
+        })
+        .collect();
     connector
         .handle_handshake(json!({
-            "protocol_version": "1.0.0",
+            "protocol_version": "2.0.0",
             "zone": "z:work",
             "host_public_key": verifying_key.to_bytes(),
             "nonce": vec![0u8; 32],
-            "capabilities_requested": capabilities,
-            "requested_instance_id": instance_id.as_str()
+            "capabilities_requested": capabilities
         }))
         .await
         .unwrap();
-    instance_id
+    connector.instance_id().parse().unwrap()
 }
 
 async fn setup_configure(connector: &mut GoogleCalendarConnector, api_url: &str) {
@@ -81,6 +88,283 @@ async fn setup_configure(connector: &mut GoogleCalendarConnector, api_url: &str)
         }))
         .await
         .unwrap();
+}
+
+fn native_request(
+    operation: &str,
+    input: serde_json::Value,
+    token: CapabilityToken,
+) -> serde_json::Value {
+    json!({
+        "type": "invoke",
+        "id": "native-calendar-request",
+        "connector_id": "fcp.google-calendar",
+        "zone_id": "z:work",
+        "operation": operation,
+        "input": input,
+        "capability_token": token
+    })
+}
+
+fn scoped_token(
+    signing_key: &Ed25519SigningKey,
+    instance_id: &str,
+    operation: &str,
+    capability: &str,
+    constraints: &CapabilityConstraints,
+) -> CapabilityToken {
+    let now = Utc::now();
+    let mut cbor = Vec::new();
+    ciborium::into_writer(constraints, &mut cbor).unwrap();
+    CapabilityToken::from_raw(
+        CapabilityTokenBuilder::new()
+            .capability_id(capability)
+            .zone_id("z:work")
+            .target_instance(instance_id)
+            .principal("user:native-calendar")
+            .operations(&[operation])
+            .issuer("node:native-calendar")
+            .token_id(b"calendar-scoped-grant")
+            .validity(now, now + chrono::Duration::hours(1))
+            .try_constraints_cbor(&cbor)
+            .unwrap()
+            .sign(signing_key)
+            .unwrap(),
+    )
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_session_binds_resource_and_meters_calls_without_spending_simulations() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/calendars/primary/events/evt001"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(event_json("evt001", "Scoped event")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut connector = GoogleCalendarConnector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    let instance = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let token = scoped_token(
+        &key,
+        instance.as_str(),
+        "gcal.get_event",
+        "gcal.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["gcal://calendars/primary/events/evt001".into()],
+            max_calls: Some(1),
+            max_bytes: Some(64 * 1024),
+            ..Default::default()
+        },
+    );
+    let mut request = native_request(
+        "gcal.get_event",
+        json!({ "calendar_id": "primary", "event_id": "evt001" }),
+        token,
+    );
+    let mut simulation = request.clone();
+    simulation["type"] = json!("simulate");
+    for _ in 0..2 {
+        assert_eq!(
+            connector.handle_simulate(simulation.clone()).await.unwrap()["would_succeed"],
+            true
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let result = connector.handle_invoke(request.clone()).await.unwrap();
+    assert_eq!(result["event"]["id"], "evt001");
+
+    request["id"] = json!("second-calendar-attempt");
+    assert!(matches!(
+        connector.handle_invoke(request).await.unwrap_err(),
+        FcpError::CapabilityDenied { .. }
+    ));
+    let preview = connector.handle_simulate(simulation).await.unwrap();
+    assert_eq!(preview["would_succeed"], false);
+    assert!(preview["denial_code"].is_string());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[fcp_async_core::runtime::test]
+async fn native_session_rejects_cross_target_zone_grant_and_freebusy_scope_before_egress() {
+    let server = MockServer::start().await;
+    let mut connector = GoogleCalendarConnector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    let instance = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let token = scoped_token(
+        &key,
+        instance.as_str(),
+        "gcal.get_event",
+        "gcal.read",
+        &CapabilityConstraints {
+            resource_allow: vec!["gcal://calendars/primary/events/evt001".into()],
+            ..Default::default()
+        },
+    );
+    let request = native_request(
+        "gcal.get_event",
+        json!({ "calendar_id": "primary", "event_id": "evt001" }),
+        token,
+    );
+    for (field, value) in [
+        ("connector_id", "fcp.gmail"),
+        ("zone_id", "z:private"),
+        ("type", "simulate"),
+        ("id", ""),
+    ] {
+        let mut invalid = request.clone();
+        invalid[field] = json!(value);
+        assert!(connector.handle_invoke(invalid).await.is_err(), "{field}");
+    }
+    let mut different_event = request;
+    different_event["input"]["event_id"] = json!("evt002");
+    assert!(matches!(
+        connector.handle_invoke(different_event).await.unwrap_err(),
+        FcpError::ResourceNotAllowed { .. }
+    ));
+
+    let unnegotiated = scoped_token(
+        &key,
+        instance.as_str(),
+        "gcal.quick_add",
+        "gcal.write",
+        &CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        connector
+            .handle_invoke(native_request(
+                "gcal.quick_add",
+                json!({ "calendar_id": "primary", "text": "Review tomorrow at noon" }),
+                unnegotiated,
+            ))
+            .await
+            .unwrap_err(),
+        FcpError::CapabilityDenied { .. }
+    ));
+
+    let input = json!({
+        "time_min": "2026-03-02T00:00:00Z",
+        "time_max": "2026-03-03T00:00:00Z",
+        "items": [{ "id": "primary" }, { "id": "private-calendar" }]
+    });
+    for constraints in [
+        CapabilityConstraints {
+            resource_allow: vec!["gcal://calendars/primary".into()],
+            ..Default::default()
+        },
+        CapabilityConstraints {
+            resource_allow: vec!["*".into()],
+            resource_deny: vec!["gcal://calendars/private%2Dcalendar".into()],
+            ..Default::default()
+        },
+    ] {
+        let token = scoped_token(
+            &key,
+            instance.as_str(),
+            "gcal.freebusy",
+            "gcal.read",
+            &constraints,
+        );
+        assert!(matches!(
+            connector
+                .handle_invoke(native_request("gcal.freebusy", input.clone(), token))
+                .await
+                .unwrap_err(),
+            FcpError::ResourceNotAllowed { .. }
+        ));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn invalid_handshake_reconfigure_and_shutdown_revoke_previous_calendar_authority() {
+    let server = MockServer::start().await;
+    let mut connector = GoogleCalendarConnector::new();
+    let key = Ed25519SigningKey::generate();
+    setup_configure(&mut connector, &server.uri()).await;
+    let first = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let first_request = native_request(
+        "gcal.list_calendars",
+        json!({}),
+        generate_valid_token(&key, &first, "gcal.list_calendars"),
+    );
+    let second = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    assert_ne!(first, second);
+    assert!(connector.handle_invoke(first_request).await.is_err());
+    let second_request = native_request(
+        "gcal.list_calendars",
+        json!({}),
+        generate_valid_token(&key, &second, "gcal.list_calendars"),
+    );
+    assert!(
+        connector
+            .handle_handshake(json!({ "protocol_version": "2.0.0" }))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        connector.handle_invoke(second_request).await.unwrap_err(),
+        FcpError::NotHandshaken
+    ));
+    let third = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let third_request = native_request(
+        "gcal.list_calendars",
+        json!({}),
+        generate_valid_token(&key, &third, "gcal.list_calendars"),
+    );
+    assert!(
+        connector
+            .handle_handshake(json!({
+                "protocol_version": "2.0.0", "zone": "z:private",
+                "host_public_key": key.verifying_key().to_bytes(),
+                "nonce": vec![1u8; 32], "capabilities_requested": ["gcal.read"]
+            }))
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        connector.handle_invoke(third_request).await.unwrap_err(),
+        FcpError::NotHandshaken
+    ));
+    let fourth = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let fourth_request = native_request(
+        "gcal.list_calendars",
+        json!({}),
+        generate_valid_token(&key, &fourth, "gcal.list_calendars"),
+    );
+    assert!(connector.handle_configure(json!({})).await.is_err());
+    assert!(matches!(
+        connector.handle_invoke(fourth_request).await.unwrap_err(),
+        FcpError::NotConfigured
+    ));
+    let health = connector.handle_health().await.unwrap();
+    assert_eq!(health["details"]["configured"], false);
+    assert_eq!(health["details"]["handshaken"], false);
+
+    setup_configure(&mut connector, &server.uri()).await;
+    let final_instance = setup_handshake(&mut connector, &key, &["gcal.read"]).await;
+    let final_request = native_request(
+        "gcal.list_calendars",
+        json!({}),
+        generate_valid_token(&key, &final_instance, "gcal.list_calendars"),
+    );
+    connector.handle_shutdown(json!({})).await.unwrap();
+    assert!(matches!(
+        connector.handle_invoke(final_request).await.unwrap_err(),
+        FcpError::NotConfigured
+    ));
+    assert_eq!(
+        connector.handle_health().await.unwrap()["status"]["state"],
+        "stopping"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 fn event_json(id: &str, summary: &str) -> serde_json::Value {
@@ -840,12 +1124,14 @@ async fn invoke_list_calendars_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.list_calendars"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.list_calendars"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.list_calendars");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "list-calendars",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.list_calendars",
             "input": {},
             "capability_token": token
@@ -868,12 +1154,14 @@ async fn invoke_get_event_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_event"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.get_event");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "get-event",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.get_event",
             "input": {
                 "calendar_id": "primary",
@@ -902,11 +1190,13 @@ async fn invoke_keyed_create_sends_event_id_and_private_marker() {
         .await;
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.create_event");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "keyed-create",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.create_event",
             "input": {
                 "calendar_id": "primary", "event_id": "a0v09", "summary": "Meeting",
@@ -928,8 +1218,8 @@ async fn invoke_create_rejects_invalid_event_ids_without_writes() {
     let server = MockServer::start().await;
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     for event_id in [
         json!(null),
         json!(42),
@@ -940,6 +1230,8 @@ async fn invoke_create_rejects_invalid_event_ids_without_writes() {
         let token = generate_valid_token(&signing_key, &instance_id, "gcal.create_event");
         let error = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "invalid-create-id",
+                "connector_id": "fcp.google-calendar", "zone_id": "z:work",
                 "operation": "gcal.create_event",
                 "input": {
                     "calendar_id": "primary", "event_id": event_id, "summary": "Meeting",
@@ -959,8 +1251,8 @@ async fn invoke_create_rejects_invalid_event_fields_without_writes() {
     let server = MockServer::start().await;
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.create_event"]).await;
     for invalid in [
         json!({"summary": null}),
         json!({"description": 42}),
@@ -982,6 +1274,8 @@ async fn invoke_create_rejects_invalid_event_fields_without_writes() {
         let token = generate_valid_token(&signing_key, &instance_id, "gcal.create_event");
         let error = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "invalid-create-fields",
+                "connector_id": "fcp.google-calendar", "zone_id": "z:work",
                 "operation": "gcal.create_event", "input": input, "capability_token": token
             }))
             .await
@@ -1008,11 +1302,13 @@ async fn invoke_update_event_preserves_unspecified_fields() {
 
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "update-event",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.update_event",
             "input": {
                 "calendar_id": "primary", "event_id": "evt123",
@@ -1047,11 +1343,13 @@ async fn invoke_update_event_can_explicitly_clear_attendees() {
 
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
     connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "clear-attendees",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.update_event",
             "input": {
                 "calendar_id": "primary", "event_id": "evt123",
@@ -1068,8 +1366,8 @@ async fn invoke_update_event_rejects_invalid_fields_without_writes() {
     let server = MockServer::start().await;
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.update_event"]).await;
 
     for invalid in [
         json!({}),
@@ -1087,6 +1385,8 @@ async fn invoke_update_event_rejects_invalid_fields_without_writes() {
         let token = generate_valid_token(&signing_key, &instance_id, "gcal.update_event");
         let error = connector
             .handle_invoke(json!({
+                "type": "invoke", "id": "invalid-update-fields",
+                "connector_id": "fcp.google-calendar", "zone_id": "z:work",
                 "operation": "gcal.update_event", "input": input,
                 "capability_token": token
             }))
@@ -1112,12 +1412,14 @@ async fn invoke_delete_event_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.delete_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.delete_event"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.delete_event");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "delete-event",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.delete_event",
             "input": {
                 "calendar_id": "primary",
@@ -1136,12 +1438,14 @@ async fn invoke_wrong_capability_rejected() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.read"]).await;
     setup_configure(&mut connector, "http://localhost:1").await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.read"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.read");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "wrong-capability",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.create_event",
             "input": {
                 "calendar_id": "primary",
@@ -1159,12 +1463,14 @@ async fn invoke_unknown_operation_rejected() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.nonexistent"]).await;
     setup_configure(&mut connector, "http://localhost:1").await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.nonexistent"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.nonexistent");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "unknown-operation",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.nonexistent",
             "input": {},
             "capability_token": token
@@ -1185,13 +1491,15 @@ async fn invoke_missing_required_field_rejected() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_event"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_event"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.get_event");
     // Missing event_id
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "missing-event",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.get_event",
             "input": { "calendar_id": "primary" },
             "capability_token": token
@@ -1266,12 +1574,14 @@ async fn invoke_freebusy_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.freebusy"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.freebusy"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.freebusy");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "freebusy",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.freebusy",
             "input": {
                 "time_min": "2026-03-02T00:00:00Z",
@@ -1293,12 +1603,14 @@ async fn invoke_freebusy_missing_fields() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.freebusy"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.freebusy"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.freebusy");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "missing-freebusy",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.freebusy",
             "input": {},
             "capability_token": token
@@ -1359,13 +1671,15 @@ async fn invoke_list_event_instances_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
+    setup_configure(&mut connector, &server.uri()).await;
     let instance_id =
         setup_handshake(&mut connector, &signing_key, &["gcal.list_event_instances"]).await;
-    setup_configure(&mut connector, &server.uri()).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.list_event_instances");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "event-instances",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.list_event_instances",
             "input": {
                 "calendar_id": "primary",
@@ -1445,12 +1759,14 @@ async fn invoke_get_calendar_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_calendar"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_calendar"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.get_calendar");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "get-calendar",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.get_calendar",
             "input": { "calendar_id": "primary" },
             "capability_token": token
@@ -1469,12 +1785,14 @@ async fn invoke_get_calendar_missing_field() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_calendar"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.get_calendar"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.get_calendar");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "missing-calendar",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.get_calendar",
             "input": {},
             "capability_token": token
@@ -1506,12 +1824,14 @@ async fn invoke_quick_add_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.quick_add"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.quick_add"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.quick_add");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "quick-add",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.quick_add",
             "input": {
                 "calendar_id": "primary",
@@ -1652,12 +1972,14 @@ async fn invoke_sync_events_initial_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.sync_events");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "initial-sync",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.sync_events",
             "input": { "calendar_id": "primary" },
             "capability_token": token
@@ -1684,12 +2006,14 @@ async fn invoke_sync_events_incremental_through_connector() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.sync_events");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "incremental-sync",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.sync_events",
             "input": {
                 "calendar_id": "primary",
@@ -1711,12 +2035,14 @@ async fn invoke_sync_events_missing_calendar_id() {
     let mut connector = GoogleCalendarConnector::new();
     let signing_key = Ed25519SigningKey::generate();
 
-    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
     setup_configure(&mut connector, &server.uri()).await;
+    let instance_id = setup_handshake(&mut connector, &signing_key, &["gcal.sync_events"]).await;
 
     let token = generate_valid_token(&signing_key, &instance_id, "gcal.sync_events");
     let result = connector
         .handle_invoke(json!({
+            "type": "invoke", "id": "invalid-sync",
+            "connector_id": "fcp.google-calendar", "zone_id": "z:work",
             "operation": "gcal.sync_events",
             "input": {},
             "capability_token": token

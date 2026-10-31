@@ -15,7 +15,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-const CONNECTOR_ID: &str = "google-calendar";
+const CONNECTOR_ID: &str = "fcp.google-calendar";
 const OP_LIST_EVENTS: &str = "gcal.list_events";
 const CAP_READ: &str = "gcal.read";
 const CALENDAR_ID: &str = "primary";
@@ -58,11 +58,8 @@ impl FcpConnector for GoogleCalendarAdapter {
 
     async fn health(&self) -> HealthSnapshot {
         match self.connector.handle_health().await {
-            Ok(payload) => match payload.get("status").and_then(serde_json::Value::as_str) {
-                Some("healthy") => HealthSnapshot::ready(),
-                Some(other) => HealthSnapshot::degraded(format!("gcal_status:{other}")),
-                None => HealthSnapshot::error("gcal_status:missing".to_string()),
-            },
+            Ok(payload) => serde_json::from_value(payload)
+                .unwrap_or_else(|error| HealthSnapshot::error(format!("invalid health: {error}"))),
             Err(err) => HealthSnapshot::error(err.to_string()),
         }
     }
@@ -119,12 +116,10 @@ impl FcpConnector for GoogleCalendarAdapter {
     }
 
     async fn invoke(&self, req: InvokeRequest) -> fcp_core::FcpResult<InvokeResponse> {
-        let request_id = req.id;
-        let params = json!({
-            "operation": req.operation.as_str(),
-            "input": req.input,
-            "capability_token": req.capability_token,
-        });
+        let request_id = req.id.clone();
+        let params = serde_json::to_value(req).map_err(|error| FcpError::Internal {
+            message: format!("failed to serialize invoke: {error}"),
+        })?;
         let value = self.connector.handle_invoke(params).await?;
         Ok(InvokeResponse::ok(request_id, value))
     }
@@ -219,6 +214,25 @@ async fn connector_suite_happy_path_lists_events() {
 
     let signing_key = Ed25519SigningKey::generate();
     let instance_id = InstanceId::new();
+    let suite = ConnectorSuite {
+        test_name: "google_calendar_list_events_happy_path".to_string(),
+        config: json!({
+            "token": "ya29_test_calendar",
+            "base_url": format!("{}/calendar/v3", server.uri()),
+        }),
+        handshake: handshake_request(signing_key.verifying_key().to_bytes(), instance_id),
+        invoke: None,
+        invoke_expectations: InvokeExpectations::default(),
+    };
+
+    let mut connector = GoogleCalendarAdapter::new();
+    let mut runner = E2eRunner::new("fcp-google-calendar");
+    let report = runner
+        .run_connector_suite(&mut connector, suite)
+        .await
+        .expect("connector suite run");
+
+    // The host signs to the instance returned by the completed handshake.
     let invoke = InvokeRequest {
         r#type: "invoke".to_string(),
         id: RequestId::new("google-calendar-connector-suite"),
@@ -229,7 +243,7 @@ async fn connector_suite_happy_path_lists_events() {
             "calendar_id": CALENDAR_ID,
             "max_results": 2
         }),
-        capability_token: build_token(&signing_key, instance_id.as_str()),
+        capability_token: build_token(&signing_key, connector.connector.instance_id()),
         holder_proof: None,
         context: None,
         idempotency_key: None,
@@ -240,23 +254,14 @@ async fn connector_suite_happy_path_lists_events() {
         approval_tokens: Vec::new(),
     };
 
-    let suite = ConnectorSuite {
-        test_name: "google_calendar_list_events_happy_path".to_string(),
-        config: json!({
-            "token": "ya29_test_calendar",
-            "base_url": format!("{}/calendar/v3", server.uri()),
-        }),
-        handshake: handshake_request(signing_key.verifying_key().to_bytes(), instance_id.clone()),
-        invoke: Some(invoke),
-        invoke_expectations: InvokeExpectations::default(),
-    };
-
-    let mut connector = GoogleCalendarAdapter::new();
-    let mut runner = E2eRunner::new("fcp-google-calendar");
-    let report = runner
-        .run_connector_suite(&mut connector, suite)
+    let response = connector
+        .invoke(invoke)
         .await
-        .expect("connector suite run");
+        .expect("authorized native invoke");
+    assert_eq!(
+        response.result.unwrap()["events"].as_array().unwrap().len(),
+        2
+    );
 
     for entry in &report.logs {
         println!(
