@@ -59,6 +59,10 @@ const DEFAULT_IN_FLIGHT_MAX: u64 = 8;
 const MAX_IN_FLIGHT_MAX: u64 = 1024;
 const DEFAULT_SIGNATURE_TOLERANCE_SECONDS: i64 = 300;
 const MAX_SIGNATURE_TOLERANCE_SECONDS: i64 = 24 * 60 * 60;
+const MAX_RATE_LIMIT_CLIENTS: usize = 4096;
+const MAX_INGRESS_HEADERS: usize = 100;
+const MAX_INGRESS_HEADER_BYTES: usize = 32 * 1024;
+const MAX_CLIENT_ID_BYTES: usize = 1024;
 const MANIFEST: &str = include_str!("../manifest.toml");
 const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -243,9 +247,24 @@ struct RateWindow {
 
 #[derive(Debug, Default)]
 struct IngressState {
-    authenticated_rate: HashMap<String, RateWindow>,
-    unauthenticated_rate: HashMap<String, RateWindow>,
-    in_flight: HashMap<String, u64>,
+    authenticated_rate: RateWindows,
+    unauthenticated_rate: RateWindows,
+    in_flight: HashMap<[u8; 32], u64>,
+}
+
+#[derive(Debug)]
+struct RateWindows {
+    clients: HashMap<[u8; 32], RateWindow>,
+    next_expiry_ms: u64,
+}
+
+impl Default for RateWindows {
+    fn default() -> Self {
+        Self {
+            clients: HashMap::new(),
+            next_expiry_ms: u64::MAX,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,12 +291,38 @@ impl IngressState {
         config: &WebhookReceiverConfig,
         now_ms: u64,
     ) -> Result<Value, WebhookReceiverError> {
-        let map = if stage == "authenticated" {
+        let windows = if stage == "authenticated" {
             &mut self.authenticated_rate
         } else {
             &mut self.unauthenticated_rate
         };
-        let window = map.entry(key.to_string()).or_insert(RateWindow {
+        let key = *blake3::hash(key.as_bytes()).as_bytes();
+        if !windows.clients.contains_key(&key) && windows.clients.len() >= MAX_RATE_LIMIT_CLIENTS {
+            // Never evict a live window: rotating client IDs must not reset a
+            // sender's allowance. Once full, sweep only when expiry can free
+            // space so rejected traffic cannot force repeated full scans.
+            if now_ms >= windows.next_expiry_ms {
+                windows.clients.retain(|_, window| {
+                    now_ms.saturating_sub(window.window_start_ms) < config.rate_limit_window_ms
+                });
+                windows.next_expiry_ms = windows
+                    .clients
+                    .values()
+                    .map(|window| {
+                        window
+                            .window_start_ms
+                            .saturating_add(config.rate_limit_window_ms)
+                    })
+                    .min()
+                    .unwrap_or(u64::MAX);
+            }
+            if windows.clients.len() >= MAX_RATE_LIMIT_CLIENTS {
+                return Err(WebhookReceiverError::CapacityExceeded {
+                    message: format!("{stage} webhook rate-limit client capacity exhausted"),
+                });
+            }
+        }
+        let window = windows.clients.entry(key).or_insert(RateWindow {
             count: 0,
             window_start_ms: now_ms,
         });
@@ -285,11 +330,16 @@ impl IngressState {
             window.count = 0;
             window.window_start_ms = now_ms;
         }
+        windows.next_expiry_ms = windows.next_expiry_ms.min(
+            window
+                .window_start_ms
+                .saturating_add(config.rate_limit_window_ms),
+        );
         window.count = window.count.saturating_add(1);
         let limited = window.count > config.rate_limit_max;
         let snapshot = json!({
             "stage": stage,
-            "key_hash": redacted_hash(key),
+            "key_hash": hex::encode(key),
             "count": window.count,
             "max": config.rate_limit_max,
             "window_ms": config.rate_limit_window_ms,
@@ -308,23 +358,30 @@ impl IngressState {
         key: &str,
         config: &WebhookReceiverConfig,
     ) -> Result<u64, WebhookReceiverError> {
-        let current = self.in_flight.get(key).copied().unwrap_or(0);
+        let key = *blake3::hash(key.as_bytes()).as_bytes();
+        let current = self.in_flight.get(&key).copied().unwrap_or(0);
+        if current == 0 && self.in_flight.len() >= MAX_RATE_LIMIT_CLIENTS {
+            return Err(WebhookReceiverError::CapacityExceeded {
+                message: "webhook ingest in-flight client capacity exhausted".into(),
+            });
+        }
         if current >= config.in_flight_max {
             return Err(WebhookReceiverError::CapacityExceeded {
                 message: "webhook ingest in-flight limit exceeded".into(),
             });
         }
         let next = current + 1;
-        self.in_flight.insert(key.to_string(), next);
+        self.in_flight.insert(key, next);
         Ok(next)
     }
 
     fn release(&mut self, key: &str) {
-        let Some(current) = self.in_flight.get_mut(key) else {
+        let key = *blake3::hash(key.as_bytes()).as_bytes();
+        let Some(current) = self.in_flight.get_mut(&key) else {
             return;
         };
         if *current <= 1 {
-            self.in_flight.remove(key);
+            self.in_flight.remove(&key);
         } else {
             *current -= 1;
         }
@@ -445,7 +502,8 @@ impl WebhookReceiverConnector {
         response.event_caps = Some(EventCaps {
             streaming: false,
             replay: true,
-            min_buffer_events: crate::client::MAX_EVENTS_PER_ENDPOINT as u32,
+            // Byte-budget eviction can remove all history for an endpoint.
+            min_buffer_events: 0,
             requires_ack: false,
         });
         let mut result = serde_json::to_value(&response).map_err(|_| FcpError::Internal {
@@ -478,7 +536,11 @@ impl WebhookReceiverConnector {
             .as_ref()
             .is_some_and(StandaloneSession::is_established);
         let instance_id = self.authority.as_ref().map(StandaloneSession::instance_id);
-        let status = if configured && handshaken {
+        let status = if configured && handshaken && self.store.replay_capacity_remaining() == 0 {
+            HealthState::Degraded {
+                reason: "Webhook replay protection is full; new deliveries are refused".into(),
+            }
+        } else if configured && handshaken {
             HealthState::Ready
         } else if configured {
             HealthState::Degraded {
@@ -495,6 +557,7 @@ impl WebhookReceiverConnector {
                 "configured": configured,
                 "handshaken": handshaken,
                 "instance_id": instance_id,
+                "storage": self.storage_health(),
             })),
             rate_limit: None,
         };
@@ -509,6 +572,12 @@ impl WebhookReceiverConnector {
             "errors": self.error_count.load(Ordering::Relaxed),
             "endpoints": self.store.endpoint_count(),
             "events": self.store.total_event_count(),
+            "storage": self.storage_health(),
+            "ingress_clients": {
+                "authenticated": self.ingress_state.authenticated_rate.clients.len(),
+                "unauthenticated": self.ingress_state.unauthenticated_rate.clients.len(),
+                "max_per_stage": MAX_RATE_LIMIT_CLIENTS,
+            },
             "public_base_url": self.config.as_ref().map(|config| config.public_base_url.clone()),
             "ingress_listener_status": INGRESS_LISTENER_STATUS,
             "ingress_listener_message": INGRESS_LISTENER_MESSAGE,
@@ -543,6 +612,16 @@ impl WebhookReceiverConnector {
             name: "store_initialized".into(),
             passed: true,
             message: None,
+            critical: true,
+        });
+        checks.push(DoctorCheck {
+            name: "replay_capacity".into(),
+            passed: self.store.replay_capacity_remaining() > 0,
+            message: Some(format!(
+                "{} replay identities retained; {} remaining. Exhaustion refuses new deliveries without forgetting accepted identities.",
+                self.store.replay_event_count(),
+                self.store.replay_capacity_remaining(),
+            )),
             critical: true,
         });
 
@@ -620,6 +699,14 @@ impl WebhookReceiverConnector {
         };
 
         let readiness = config.provisioning_readiness(&self.store);
+        if self.store.replay_capacity_remaining() == 0 {
+            let mut report = SelfCheckReport::failed(
+                "replay_capacity_exhausted",
+                "New deliveries are refused because replay protection is full",
+            );
+            report.details = Some(json!({ "storage": self.storage_health() }));
+            return Self::serialize_self_check_report(report);
+        }
         if !readiness.public_base_url_accepted {
             let mut report = SelfCheckReport::failed(
                 "public_base_url_invalid",
@@ -656,6 +743,19 @@ impl WebhookReceiverConnector {
         );
         report.details = Some(json!({ "provisioning": readiness }));
         Self::serialize_self_check_report(report)
+    }
+
+    fn storage_health(&self) -> Value {
+        json!({
+            "durable": false,
+            "retained_event_bytes": self.store.retained_event_bytes(),
+            "max_retained_event_bytes": crate::client::MAX_RETAINED_EVENT_BYTES_TOTAL,
+            "max_retained_event_bytes_per_endpoint": crate::client::MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT,
+            "replay_identities": self.store.replay_event_count(),
+            "replay_capacity_remaining": self.store.replay_capacity_remaining(),
+            "max_replay_identities": crate::client::MAX_REPLAY_IDS_TOTAL,
+            "replay_exhausted_endpoints": self.store.replay_exhausted_endpoint_count(),
+        })
     }
 
     /// Handle the `introspect` method.
@@ -1106,8 +1206,14 @@ impl WebhookReceiverConnector {
             .map(str::to_string)
             .or_else(|| optional_ingest_source_ip(input).ok().flatten())
             .unwrap_or_else(|| "unknown-client".into());
+        if client_key.len() > MAX_CLIENT_ID_BYTES {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: format!("client identity exceeds {MAX_CLIENT_ID_BYTES} bytes"),
+            });
+        }
         let rate_key = format!("{path}:{client_key}");
-        let now_ms = now_ms();
+        // Fixed-window accounting must not stall after a wall-clock correction.
+        let now_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let unauthenticated_rate =
             self.ingress_state
@@ -1162,7 +1268,7 @@ impl WebhookReceiverConnector {
             endpoint_id: endpoint.endpoint_id.clone(),
             received_at,
             headers: redacted_event_headers(headers, endpoint),
-            payload: body.payload.clone(),
+            payload: body.payload,
             signature_valid: true,
             source_ip: source_ip.clone(),
         };
@@ -1329,15 +1435,34 @@ fn parse_headers(
             message: "headers must be an object of HTTP header strings".into(),
         })?;
     let mut parsed = BTreeMap::new();
+    if headers.len() > MAX_INGRESS_HEADERS {
+        return Err(WebhookReceiverError::PayloadTooLarge {
+            message: format!("webhook headers exceed {MAX_INGRESS_HEADERS} entries"),
+        });
+    }
+    let mut total_bytes = 0_usize;
     for (key, value) in headers {
         let value = value
             .as_str()
             .ok_or_else(|| WebhookReceiverError::InvalidInput {
                 message: format!("header `{key}` must be a string"),
-            })?
-            .trim()
-            .to_string();
-        parsed.insert(key.to_ascii_lowercase(), value);
+            })?;
+        total_bytes = total_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+        if total_bytes > MAX_INGRESS_HEADER_BYTES {
+            return Err(WebhookReceiverError::PayloadTooLarge {
+                message: format!("webhook headers exceed {MAX_INGRESS_HEADER_BYTES} bytes"),
+            });
+        }
+        if parsed
+            .insert(key.to_ascii_lowercase(), value.trim().to_string())
+            .is_some()
+        {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "HTTP header names must be unique ignoring case".into(),
+            });
+        }
     }
     Ok(parsed)
 }
@@ -1392,22 +1517,20 @@ fn ingest_body(
             .as_str()
             .ok_or_else(|| WebhookReceiverError::InvalidInput {
                 message: "body must be a JSON string".into(),
-            })?
-            .to_string();
+            })?;
         let body_bytes = raw_body.len();
         if body_bytes > max_bytes {
             return Err(WebhookReceiverError::PayloadTooLarge {
                 message: format!("webhook body exceeds maximum size of {max_bytes} bytes"),
             });
         }
-        let payload = serde_json::from_str(&raw_body).map_err(|error| {
-            WebhookReceiverError::InvalidInput {
+        let payload =
+            serde_json::from_str(raw_body).map_err(|error| WebhookReceiverError::InvalidInput {
                 message: format!("webhook body is not valid JSON: {error}"),
-            }
-        })?;
+            })?;
         return Ok(IngestBody {
             payload,
-            raw_body,
+            raw_body: raw_body.to_string(),
             body_bytes,
         });
     }
@@ -1993,7 +2116,10 @@ fn webhook_event_caps() -> serde_json::Value {
     json!({
         "streaming": false,
         "replay": true,
-        "min_buffer_events": crate::client::MAX_EVENTS_PER_ENDPOINT,
+        "min_buffer_events": 0,
+        "max_buffer_events_per_endpoint": crate::client::MAX_EVENTS_PER_ENDPOINT,
+        "max_retained_event_bytes": crate::client::MAX_RETAINED_EVENT_BYTES_TOTAL,
+        "max_retained_event_bytes_per_endpoint": crate::client::MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT,
         "host_forwarded_ingress_operation": WEBHOOK_EVENTS_INGEST_OPERATION,
         "native_listener": false,
     })
@@ -2398,6 +2524,115 @@ fn operations_info() -> Vec<OperationInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_capacity_preserves_live_windows_and_reclaims_expired_clients() {
+        let config = WebhookReceiverConfig::from_params(&json!({
+            "rate_limit_max": 1,
+            "rate_limit_window_ms": 1000,
+        }))
+        .unwrap();
+        let mut ingress = IngressState::default();
+        ingress
+            .enforce_rate_limit("unauthenticated", "first", &config, 100)
+            .unwrap();
+        for client in 1..MAX_RATE_LIMIT_CLIENTS {
+            ingress
+                .enforce_rate_limit("unauthenticated", &format!("client-{client}"), &config, 200)
+                .unwrap();
+        }
+        assert!(matches!(
+            ingress.enforce_rate_limit("unauthenticated", "overflow", &config, 1099),
+            Err(WebhookReceiverError::CapacityExceeded { .. })
+        ));
+        assert!(matches!(
+            ingress.enforce_rate_limit("unauthenticated", "client-1", &config, 1099),
+            Err(WebhookReceiverError::CapacityExceeded { .. })
+        ));
+        assert_eq!(
+            ingress.unauthenticated_rate.clients.len(),
+            MAX_RATE_LIMIT_CLIENTS
+        );
+
+        // Only the first client's window expired. The others must retain
+        // their consumed allowance when the new client takes its place.
+        ingress
+            .enforce_rate_limit("unauthenticated", "overflow", &config, 1100)
+            .unwrap();
+        assert_eq!(
+            ingress.unauthenticated_rate.clients.len(),
+            MAX_RATE_LIMIT_CLIENTS
+        );
+        assert!(
+            ingress
+                .enforce_rate_limit("unauthenticated", "client-1", &config, 1100)
+                .is_err()
+        );
+        assert!(
+            ingress
+                .enforce_rate_limit("unauthenticated", "another", &config, 1100)
+                .is_err()
+        );
+        ingress
+            .enforce_rate_limit("unauthenticated", "client-1", &config, 1200)
+            .unwrap();
+        ingress
+            .enforce_rate_limit("unauthenticated", "another", &config, 1200)
+            .unwrap();
+        assert!(ingress.unauthenticated_rate.clients.len() < MAX_RATE_LIMIT_CLIENTS);
+
+        // Authentication stages have independent allowances and capacity.
+        ingress
+            .enforce_rate_limit("authenticated", "client-1", &config, 1200)
+            .unwrap();
+        assert_eq!(ingress.authenticated_rate.clients.len(), 1);
+    }
+
+    #[test]
+    fn ingress_headers_are_bounded_and_reject_case_aliases() {
+        let aliases = json!({"headers": {
+            "X-Signature": "one",
+            "x-signature": "two",
+        }});
+        assert!(matches!(
+            parse_headers(&aliases),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        let oversized = json!({"headers": { "x-test": "x".repeat(MAX_INGRESS_HEADER_BYTES) }});
+        assert!(matches!(
+            parse_headers(&oversized),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        let headers: serde_json::Map<String, Value> = (0..=MAX_INGRESS_HEADERS)
+            .map(|index| (format!("x-header-{index}"), json!("value")))
+            .collect();
+        assert!(matches!(
+            parse_headers(&json!({"headers": headers})),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        let valid =
+            parse_headers(&json!({"headers": {"Content-Type": " application/json "}})).unwrap();
+        assert_eq!(valid["content-type"], "application/json");
+    }
+
+    #[test]
+    fn in_flight_clients_are_bounded_and_released() {
+        let config = WebhookReceiverConfig::from_params(&json!({ "in_flight_max": 1 })).unwrap();
+        let mut ingress = IngressState::default();
+        for client in 0..MAX_RATE_LIMIT_CLIENTS {
+            ingress
+                .try_acquire(&format!("client-{client}"), &config)
+                .unwrap();
+        }
+        assert!(ingress.try_acquire("new", &config).is_err());
+        assert!(ingress.try_acquire("client-0", &config).is_err());
+        ingress.release("client-0");
+        assert_eq!(ingress.try_acquire("new", &config).unwrap(), 1);
+        assert_eq!(ingress.in_flight.len(), MAX_RATE_LIMIT_CLIENTS);
+        ingress.release("new");
+        ingress.release("new");
+        assert_eq!(ingress.in_flight.len(), MAX_RATE_LIMIT_CLIENTS - 1);
+    }
 
     #[test]
     fn require_str_present() {

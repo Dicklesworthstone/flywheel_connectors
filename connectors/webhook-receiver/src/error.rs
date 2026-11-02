@@ -64,6 +64,12 @@ pub enum WebhookReceiverError {
     #[error("Store capacity exceeded: {message}")]
     CapacityExceeded { message: String },
 
+    /// Replay protection is full; waiting cannot safely free accepted identities.
+    #[error(
+        "Webhook replay protection capacity exhausted for endpoint {endpoint_id} (limit {limit}); new deliveries require operator recovery"
+    )]
+    ReplayCapacityExceeded { endpoint_id: String, limit: usize },
+
     /// Internal error
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -84,6 +90,7 @@ impl WebhookReceiverError {
             | Self::MethodNotAllowed { .. }
             | Self::UnsupportedMediaType { .. }
             | Self::PayloadTooLarge { .. }
+            | Self::ReplayCapacityExceeded { .. }
             | Self::Json(_)
             | Self::Internal { .. } => false,
         }
@@ -184,6 +191,13 @@ impl WebhookReceiverError {
                 status_code: Some(429),
                 retryable: true,
                 retry_after: self.retry_after(),
+            },
+            Self::ReplayCapacityExceeded { .. } => FcpError::External {
+                service: "webhook-receiver".into(),
+                message: self.to_string(),
+                status_code: Some(507),
+                retryable: false,
+                retry_after: None,
             },
             Self::Internal { message } => FcpError::Internal {
                 message: message.clone(),
@@ -445,6 +459,26 @@ mod tests {
             }
             other => panic!("expected External, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_capacity_exhaustion_is_nonretryable_and_requires_recovery() {
+        let error = WebhookReceiverError::ReplayCapacityExceeded {
+            endpoint_id: "ep_full".into(),
+            limit: 100_000,
+        };
+        assert!(!error.is_retryable());
+        assert_eq!(error.retry_after(), None);
+        assert!(error.to_string().contains("operator recovery"));
+        assert!(matches!(
+            error.to_fcp_error(),
+            FcpError::External {
+                status_code: Some(507),
+                retryable: false,
+                retry_after: None,
+                ..
+            }
+        ));
     }
 
     #[test]

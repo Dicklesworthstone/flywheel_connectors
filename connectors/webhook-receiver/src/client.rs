@@ -5,7 +5,8 @@
 //! buffers received events.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 
 use chrono::{DateTime, Utc};
 use tracing::debug;
@@ -21,6 +22,27 @@ pub const MAX_ENDPOINTS: usize = 100;
 /// Maximum number of events stored per endpoint.
 pub const MAX_EVENTS_PER_ENDPOINT: usize = 1000;
 
+/// Maximum distinct delivery IDs retained for one endpoint's lifetime.
+///
+/// Replay identities are never evicted to admit a new delivery.
+pub const MAX_REPLAY_IDS_PER_ENDPOINT: usize = 100_000;
+
+/// Maximum distinct delivery IDs retained across all registered endpoints.
+///
+/// Fixed 32-byte digests bound the identity payload to 3.2 MB; hash-table
+/// allocation overhead is additional. The shared ceiling prevents every
+/// endpoint from independently allocating the full replay budget.
+pub const MAX_REPLAY_IDS_TOTAL: usize = 100_000;
+
+/// Maximum UTF-8 byte length of a delivery ID.
+pub const MAX_EVENT_ID_BYTES: usize = 1024;
+
+/// Maximum serialized event bytes retained for one endpoint.
+pub const MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT: usize = 16 * 1024 * 1024;
+
+/// Maximum serialized event bytes retained across all endpoints.
+pub const MAX_RETAINED_EVENT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
 /// Default limit for recent events query.
 pub const DEFAULT_EVENTS_LIMIT: usize = 50;
 
@@ -30,6 +52,44 @@ pub const MAX_EVENTS_LIMIT: usize = 100;
 /// Default public base URL used before the connector is explicitly configured.
 pub const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8080";
 
+#[derive(Debug)]
+struct RetainedEvent {
+    event: WebhookEvent,
+    serialized_bytes: usize,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct EventBuffer {
+    events: VecDeque<RetainedEvent>,
+    serialized_bytes: usize,
+}
+
+impl EventBuffer {
+    fn evict_oldest(&mut self) {
+        if let Some(event) = self.events.pop_front() {
+            self.serialized_bytes -= event.serialized_bytes;
+        }
+    }
+}
+
+/// Measure retained payloads without allocating a second copy of their JSON.
+#[derive(Default)]
+struct SerializedSize {
+    bytes: usize,
+}
+
+impl Write for SerializedSize {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// In-memory store for webhook endpoints and received events.
 #[derive(Debug)]
 pub struct WebhookStore {
@@ -38,12 +98,16 @@ pub struct WebhookStore {
     /// Registered endpoints, keyed by `endpoint_id`.
     endpoints: HashMap<String, WebhookEndpoint>,
     /// Events per endpoint, keyed by `endpoint_id`.
-    events: HashMap<String, Vec<WebhookEvent>>,
-    /// All seen event IDs per endpoint, keyed by `endpoint_id`.
+    events: HashMap<String, EventBuffer>,
+    /// Digests of all seen event IDs per endpoint, keyed by `endpoint_id`.
     ///
     /// This stays independent from the bounded event body buffer so replay
     /// protection remains fail-closed even after old event bodies are evicted.
-    event_ids: HashMap<String, HashSet<String>>,
+    /// A digest collision is treated as a duplicate, conservatively denying
+    /// a new delivery rather than permitting any previously accepted replay.
+    event_ids: HashMap<String, HashSet<[u8; 32]>>,
+    /// Monotonic arrival order, independent of caller-supplied event timestamps.
+    next_event_sequence: u64,
 }
 
 impl WebhookStore {
@@ -54,6 +118,7 @@ impl WebhookStore {
             endpoints: HashMap::new(),
             events: HashMap::new(),
             event_ids: HashMap::new(),
+            next_event_sequence: 0,
         }
     }
 
@@ -133,7 +198,8 @@ impl WebhookStore {
 
         self.endpoints
             .insert(endpoint.endpoint_id.clone(), endpoint.clone());
-        self.events.insert(endpoint.endpoint_id.clone(), Vec::new());
+        self.events
+            .insert(endpoint.endpoint_id.clone(), EventBuffer::default());
         self.event_ids
             .insert(endpoint.endpoint_id.clone(), HashSet::new());
 
@@ -173,7 +239,10 @@ impl WebhookStore {
         self.endpoints
             .values()
             .map(|ep| {
-                let event_count = self.events.get(&ep.endpoint_id).map_or(0, Vec::len);
+                let event_count = self
+                    .events
+                    .get(&ep.endpoint_id)
+                    .map_or(0, |buffer| buffer.events.len());
                 EndpointSummary::from_endpoint(ep, event_count)
             })
             .collect()
@@ -206,31 +275,89 @@ impl WebhookStore {
 
     /// Record a received webhook event.
     pub fn record_event(&mut self, event: WebhookEvent) -> WebhookReceiverResult<()> {
-        let endpoint_id = event.endpoint_id.clone();
-        let event_id = event.event_id.clone();
-        if !self.endpoints.contains_key(&endpoint_id) {
-            return Err(WebhookReceiverError::EndpointNotFound { endpoint_id });
+        if !self.endpoints.contains_key(&event.endpoint_id) {
+            return Err(WebhookReceiverError::EndpointNotFound {
+                endpoint_id: event.endpoint_id,
+            });
         }
-
-        // Fail closed on duplicate delivery IDs for the same endpoint.
-        // Replay protection must outlive the bounded event body buffer, so
-        // dedup state is stored separately from recent event retention.
-        let event_ids = self.event_ids.entry(endpoint_id.clone()).or_default();
-        if !event_ids.insert(event_id.clone()) {
-            return Err(WebhookReceiverError::DuplicateEvent {
-                endpoint_id,
-                event_id,
+        if event.event_id.len() > MAX_EVENT_ID_BYTES {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: format!("Webhook delivery ID exceeds {MAX_EVENT_ID_BYTES} bytes"),
             });
         }
 
-        let events = self.events.entry(endpoint_id).or_default();
-
-        // Evict oldest events if at capacity
-        if events.len() >= MAX_EVENTS_PER_ENDPOINT {
-            events.remove(0);
+        let event_digest = *blake3::hash(event.event_id.as_bytes()).as_bytes();
+        let event_ids = self.event_ids.get(&event.endpoint_id);
+        // Report known duplicates even when replay capacity is exhausted.
+        // No identity or retained body is evicted to make room for a new ID.
+        if event_ids.is_some_and(|ids| ids.contains(&event_digest)) {
+            return Err(WebhookReceiverError::DuplicateEvent {
+                endpoint_id: event.endpoint_id,
+                event_id: event.event_id,
+            });
+        }
+        if event_ids.map_or(0, HashSet::len) >= MAX_REPLAY_IDS_PER_ENDPOINT
+            || self.replay_event_count() >= MAX_REPLAY_IDS_TOTAL
+        {
+            return Err(WebhookReceiverError::ReplayCapacityExceeded {
+                endpoint_id: event.endpoint_id,
+                limit: MAX_REPLAY_IDS_PER_ENDPOINT.min(MAX_REPLAY_IDS_TOTAL),
+            });
         }
 
-        events.push(event);
+        let mut serialized_size = SerializedSize::default();
+        serde_json::to_writer(&mut serialized_size, &event)?;
+        let serialized_bytes = serialized_size.bytes;
+        if serialized_bytes > MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT {
+            return Err(WebhookReceiverError::PayloadTooLarge {
+                message: format!(
+                    "Serialized webhook event exceeds the {MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT}-byte retention limit"
+                ),
+            });
+        }
+        let sequence = self.next_event_sequence;
+        let next_sequence =
+            sequence
+                .checked_add(1)
+                .ok_or_else(|| WebhookReceiverError::Internal {
+                    message: "Webhook event arrival sequence exhausted".into(),
+                })?;
+
+        // Every fallible admission check precedes retention changes. Evict only
+        // event bodies, retaining independent replay digests for the namespace.
+        let buffer = self.events.entry(event.endpoint_id.clone()).or_default();
+        while buffer.events.len() >= MAX_EVENTS_PER_ENDPOINT
+            || buffer.serialized_bytes > MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT - serialized_bytes
+        {
+            buffer.evict_oldest();
+        }
+        while self.retained_event_bytes() > MAX_RETAINED_EVENT_BYTES_TOTAL - serialized_bytes {
+            // The byte total is derived from these buffers; a positive total
+            // always has a nonempty buffer. Arrival sequence prevents supplied
+            // timestamps from controlling eviction across endpoints.
+            if let Some(oldest) = self
+                .events
+                .values_mut()
+                .filter(|buffer| !buffer.events.is_empty())
+                .min_by_key(|buffer| buffer.events.front().map(|event| event.sequence))
+            {
+                oldest.evict_oldest();
+            }
+        }
+
+        self.event_ids
+            .entry(event.endpoint_id.clone())
+            .or_default()
+            .insert(event_digest);
+        let buffer = self.events.entry(event.endpoint_id.clone()).or_default();
+        buffer.serialized_bytes += serialized_bytes;
+        buffer.events.push_back(RetainedEvent {
+            event,
+            serialized_bytes,
+            sequence,
+        });
+        self.next_event_sequence = next_sequence;
+
         Ok(())
     }
 
@@ -252,12 +379,15 @@ impl WebhookStore {
             }
         }
 
-        let mut all_events: Vec<WebhookEvent> = if let Some(eid) = endpoint_id {
-            self.events
-                .get(eid)
-                .map_or_else(Vec::new, |evts| evts.clone())
+        let mut all_events: Vec<&WebhookEvent> = if let Some(eid) = endpoint_id {
+            self.events.get(eid).map_or_else(Vec::new, |buffer| {
+                buffer.events.iter().map(|entry| &entry.event).collect()
+            })
         } else {
-            self.events.values().flat_map(|v| v.clone()).collect()
+            self.events
+                .values()
+                .flat_map(|buffer| buffer.events.iter().map(|entry| &entry.event))
+                .collect()
         };
 
         // Filter by since_ts if provided
@@ -271,7 +401,8 @@ impl WebhookStore {
         // Apply limit
         all_events.truncate(limit);
 
-        Ok(all_events)
+        // Large payloads are copied only after filtering, ordering and limiting.
+        Ok(all_events.into_iter().cloned().collect())
     }
 
     /// Get the number of registered endpoints.
@@ -290,7 +421,64 @@ impl WebhookStore {
 
     /// Get the total number of stored events.
     pub fn total_event_count(&self) -> usize {
-        self.events.values().map(Vec::len).sum()
+        self.events.values().map(|buffer| buffer.events.len()).sum()
+    }
+
+    /// Distinct replay identities retained across all endpoints.
+    #[must_use]
+    pub fn replay_event_count(&self) -> usize {
+        self.event_ids.values().map(HashSet::len).sum()
+    }
+
+    /// Remaining shared capacity for previously unseen delivery identities.
+    #[must_use]
+    pub fn replay_capacity_remaining(&self) -> usize {
+        MAX_REPLAY_IDS_TOTAL.saturating_sub(self.replay_event_count())
+    }
+
+    /// Active endpoints unable to accept a previously unseen delivery identity.
+    ///
+    /// Shared exhaustion blocks every active endpoint, including empty ones.
+    #[must_use]
+    pub fn replay_exhausted_endpoint_count(&self) -> usize {
+        if self.replay_capacity_remaining() == 0 {
+            return self.active_endpoint_count();
+        }
+        self.endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint.active
+                    && self
+                        .event_ids
+                        .get(&endpoint.endpoint_id)
+                        .is_some_and(|ids| ids.len() >= MAX_REPLAY_IDS_PER_ENDPOINT)
+            })
+            .count()
+    }
+
+    /// Distinct replay identities retained for an existing endpoint.
+    pub fn endpoint_replay_event_count(&self, endpoint_id: &str) -> WebhookReceiverResult<usize> {
+        self.get_endpoint(endpoint_id)?;
+        Ok(self.event_ids.get(endpoint_id).map_or(0, HashSet::len))
+    }
+
+    /// Serialized event bytes retained across all endpoints, excluding allocator
+    /// overhead, replay identities and endpoint configuration.
+    #[must_use]
+    pub fn retained_event_bytes(&self) -> usize {
+        self.events
+            .values()
+            .map(|buffer| buffer.serialized_bytes)
+            .sum()
+    }
+
+    /// Serialized event bytes retained for an existing endpoint.
+    pub fn endpoint_retained_event_bytes(&self, endpoint_id: &str) -> WebhookReceiverResult<usize> {
+        self.get_endpoint(endpoint_id)?;
+        Ok(self
+            .events
+            .get(endpoint_id)
+            .map_or(0, |buffer| buffer.serialized_bytes))
     }
 
     /// Clear all endpoints and events.
@@ -298,6 +486,7 @@ impl WebhookStore {
         self.endpoints.clear();
         self.events.clear();
         self.event_ids.clear();
+        self.next_event_sequence = 0;
     }
 }
 
@@ -676,6 +865,230 @@ mod tests {
                 endpoint_id,
                 event_id,
             } if endpoint_id == &ep.endpoint_id && event_id == "evt_replay"
+        ));
+    }
+
+    #[test]
+    fn replay_capacity_blocks_new_ids_without_evicting_known_ids() {
+        let mut store = WebhookStore::new();
+        let first = store
+            .create_endpoint("/first".into(), "secret".into(), vec![])
+            .unwrap();
+        let second = store
+            .create_endpoint("/second".into(), "secret".into(), vec![])
+            .unwrap();
+        let unused = store
+            .create_endpoint("/unused".into(), "secret".into(), vec![])
+            .unwrap();
+
+        for index in 0..MAX_REPLAY_IDS_TOTAL {
+            let endpoint = if index % 2 == 0 { &first } else { &second };
+            let mut event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+            event.event_id = format!("delivery-{index}");
+            store.record_event(event).unwrap();
+        }
+        assert_eq!(store.replay_event_count(), MAX_REPLAY_IDS_TOTAL);
+        assert_eq!(store.replay_capacity_remaining(), 0);
+        assert_eq!(store.replay_exhausted_endpoint_count(), 3);
+        assert_eq!(
+            store
+                .endpoint_replay_event_count(&unused.endpoint_id)
+                .unwrap(),
+            0
+        );
+        let retained_count = store.total_event_count();
+        let retained_bytes = store.retained_event_bytes();
+
+        for endpoint in [&first, &second, &unused] {
+            let event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+            assert!(matches!(
+                store.record_event(event),
+                Err(WebhookReceiverError::ReplayCapacityExceeded { .. })
+            ));
+        }
+        // A secret change does not discard replay identities or create room.
+        store
+            .rotate_endpoint_secret(&first.endpoint_id, "new-secret".into())
+            .unwrap();
+        let mut replay = WebhookEvent::new(first.endpoint_id.clone(), json!({}), true, None);
+        replay.event_id = "delivery-0".into();
+        assert!(matches!(
+            store.record_event(replay),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert_eq!(store.replay_event_count(), MAX_REPLAY_IDS_TOTAL);
+        assert_eq!(store.total_event_count(), retained_count);
+        assert_eq!(store.retained_event_bytes(), retained_bytes);
+
+        store.delete_endpoint(&first.endpoint_id).unwrap();
+        assert_eq!(store.replay_event_count(), MAX_REPLAY_IDS_TOTAL / 2);
+        assert_eq!(store.replay_exhausted_endpoint_count(), 0);
+        assert!(store.retained_event_bytes() < retained_bytes);
+        store
+            .record_event(WebhookEvent::new(unused.endpoint_id, json!({}), true, None))
+            .unwrap();
+        let mut replay = WebhookEvent::new(second.endpoint_id, json!({}), true, None);
+        replay.event_id = "delivery-1".into();
+        assert!(matches!(
+            store.record_event(replay),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+
+        store.clear();
+        assert_eq!(store.replay_event_count(), 0);
+        assert_eq!(store.replay_capacity_remaining(), MAX_REPLAY_IDS_TOTAL);
+        assert_eq!(store.replay_exhausted_endpoint_count(), 0);
+        assert_eq!(store.retained_event_bytes(), 0);
+        assert_eq!(store.total_event_count(), 0);
+    }
+
+    #[test]
+    fn event_id_limit_counts_bytes_and_rejects_without_changing_state() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/events".into(), "secret".into(), vec![])
+            .unwrap();
+        let mut event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+        event.event_id = "é".repeat(MAX_EVENT_ID_BYTES / 2);
+        store.record_event(event).unwrap();
+        let retained_bytes = store.retained_event_bytes();
+
+        let mut event = WebhookEvent::new(endpoint.endpoint_id, json!({}), true, None);
+        event.event_id = "é".repeat(MAX_EVENT_ID_BYTES / 2 + 1);
+        assert!(matches!(
+            store.record_event(event),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        assert_eq!(store.replay_event_count(), 1);
+        assert_eq!(store.total_event_count(), 1);
+        assert_eq!(store.retained_event_bytes(), retained_bytes);
+    }
+
+    fn sized_event(endpoint_id: &str, event_id: &str, size: usize) -> WebhookEvent {
+        let mut event = WebhookEvent::new(endpoint_id.into(), json!({"value": ""}), true, None);
+        event.event_id = event_id.into();
+        let empty_size = serde_json::to_vec(&event).unwrap().len();
+        event.payload["value"] = json!("x".repeat(size.checked_sub(empty_size).unwrap()));
+        event
+    }
+
+    #[test]
+    fn retained_byte_accounting_includes_encoded_headers_ids_and_payload() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/events".into(), "secret".into(), vec![])
+            .unwrap();
+        let mut event = WebhookEvent::new(
+            endpoint.endpoint_id.clone(),
+            json!({"text": "é\n\"", "values": [1, true, null]}),
+            true,
+            Some("127.0.0.1".into()),
+        );
+        event
+            .headers
+            .insert("x-event".into(), "quoted\"header".into());
+        let expected_size = serde_json::to_vec(&event).unwrap().len();
+        store.record_event(event).unwrap();
+        assert_eq!(store.retained_event_bytes(), expected_size);
+        assert_eq!(
+            store
+                .endpoint_retained_event_bytes(&endpoint.endpoint_id)
+                .unwrap(),
+            expected_size
+        );
+        assert!(store.endpoint_replay_event_count("unknown").is_err());
+        assert!(store.endpoint_retained_event_bytes("unknown").is_err());
+    }
+
+    #[test]
+    fn endpoint_byte_retention_evicts_bodies_but_preserves_replay_protection() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/events".into(), "secret".into(), vec![])
+            .unwrap();
+        let half_limit = MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT / 2;
+        store
+            .record_event(sized_event(&endpoint.endpoint_id, "first", half_limit))
+            .unwrap();
+        store
+            .record_event(sized_event(&endpoint.endpoint_id, "second", half_limit))
+            .unwrap();
+        assert_eq!(
+            store.retained_event_bytes(),
+            MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT
+        );
+
+        let third = sized_event(&endpoint.endpoint_id, "third", 1024);
+        store.record_event(third).unwrap();
+        assert_eq!(store.total_event_count(), 2);
+        assert_eq!(store.retained_event_bytes(), half_limit + 1024);
+        assert_eq!(store.replay_event_count(), 3);
+        let mut replay = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+        replay.event_id = "first".into();
+        assert!(matches!(
+            store.record_event(replay),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+
+        let oversized = sized_event(
+            &endpoint.endpoint_id,
+            "oversized",
+            MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT + 1,
+        );
+        assert!(matches!(
+            store.record_event(oversized),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        assert_eq!(store.total_event_count(), 2);
+        assert_eq!(store.retained_event_bytes(), half_limit + 1024);
+        assert_eq!(store.replay_event_count(), 3);
+        let replacement = sized_event(&endpoint.endpoint_id, "oversized", 512);
+        store.record_event(replacement).unwrap();
+        assert_eq!(store.replay_event_count(), 4);
+    }
+
+    #[test]
+    fn global_byte_retention_evicts_by_arrival_order_and_keeps_other_endpoints() {
+        let mut store = WebhookStore::new();
+        let mut endpoint_ids = Vec::new();
+        let count = MAX_RETAINED_EVENT_BYTES_TOTAL / MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT + 1;
+        for index in 0..count {
+            let endpoint = store
+                .create_endpoint(format!("/events-{index}"), "secret".into(), vec![])
+                .unwrap();
+            let mut event = sized_event(
+                &endpoint.endpoint_id,
+                "delivery",
+                MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT,
+            );
+            // A far-future supplied timestamp cannot pin the first arrival.
+            if index == 0 {
+                event.received_at += chrono::Duration::days(30);
+            }
+            store.record_event(event).unwrap();
+            endpoint_ids.push(endpoint.endpoint_id);
+            assert!(store.retained_event_bytes() <= MAX_RETAINED_EVENT_BYTES_TOTAL);
+        }
+        assert_eq!(store.retained_event_bytes(), MAX_RETAINED_EVENT_BYTES_TOTAL);
+        assert_eq!(store.total_event_count(), count - 1);
+        assert_eq!(
+            store
+                .endpoint_retained_event_bytes(&endpoint_ids[0])
+                .unwrap(),
+            0
+        );
+        for endpoint_id in &endpoint_ids[1..] {
+            assert_eq!(
+                store.endpoint_retained_event_bytes(endpoint_id).unwrap(),
+                MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT
+            );
+        }
+        assert_eq!(store.replay_event_count(), count);
+        let mut replay = WebhookEvent::new(endpoint_ids[0].clone(), json!({}), true, None);
+        replay.event_id = "delivery".into();
+        assert!(matches!(
+            store.record_event(replay),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
         ));
     }
 

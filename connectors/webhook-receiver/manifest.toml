@@ -556,7 +556,7 @@ related = ["webhook.endpoints.list"]
 [event_caps]
 streaming = false
 replay = true
-min_buffer_events = 1000
+min_buffer_events = 0
 
 [sandbox]
 profile = "strict"

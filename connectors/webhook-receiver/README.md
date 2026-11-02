@@ -112,6 +112,11 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Host-forwarded ingress operation: `webhook.events.ingest`.
 - Endpoint limit: `100`.
 - Event retention limit: `1000` events per endpoint.
+- Retained event data is also capped at `16 MiB` per endpoint and `64 MiB` across the connector, measured as serialized complete events. These are data budgets; allocator and parsed-JSON overhead are additional. The oldest arrivals are evicted when either budget is reached.
+- Event-body eviction never removes replay protection. Delivery IDs are limited to `1024` UTF-8 bytes and retained as fixed BLAKE3 digests, with a shared ceiling of `100000` identities. A new ID at capacity returns a nonretryable `507`; previously accepted IDs still return duplicate `409`.
+- Health, doctor, and self-check expose replay exhaustion. Do not automatically clear or reconfigure the receiver to recover capacity: that would discard its replay history. Endpoint replacement requires an explicit operator continuity plan.
+- Recent-event queries select and limit borrowed records before copying payloads. A query no longer copies the entire store to return a small result.
+- Shared byte eviction may remove every retained body for an endpoint, so `min_buffer_events` is `0`; the `1000` count is a ceiling, not a minimum guarantee.
 - Recent-events limit defaults to `50` and is capped at `100`.
 - Endpoint paths must start with `/`.
 - Endpoint paths must be unique among active endpoints.
@@ -132,6 +137,8 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Allowed source filters support exact IP and CIDR matches.
 - Source IP is read from `source_ip`, `remote_addr`, or `client_ip`.
 - Client rate keys combine endpoint path and `client_id`, source IP, or `unknown-client`.
+- Client identities are capped at `1024` bytes, and each authentication stage retains at most `4096` fixed-size client-key digests. Live rate windows are never evicted to admit a new client; expired windows are reclaimed using monotonic time.
+- Headers are capped at `100` entries and `32 KiB` of names and values. Case-insensitive duplicate header names are rejected before signature verification.
 - Rate limiting is applied before and after signature verification.
 - Body timeout/cancellation inputs reject the ingest as timed out.
 - Duplicate events are rejected per endpoint/event ID with a conflict response.
@@ -190,6 +197,7 @@ These are excluded on purpose:
 `doctor()`, `health()`, `self_check()`, `simulate()`, and `introspect()` are part of the public closeout contract. They surface:
 
 - configured/unconfigured state, session ID, endpoint counts, event counts, ingress state, request counters, and error counters
+- serialized retained bytes, replay-identity usage, remaining replay capacity, exhausted endpoints, and bounded rate-client counts
 - local/public base URL policy and clearing of prior state on reconfiguration
 - degraded readiness for local URLs, no native listener, and unbound gateway ingress
 - typed introspection with operations, schemas, capability IDs, risk levels, safety tiers, idempotency, event caps, and ingress metadata
