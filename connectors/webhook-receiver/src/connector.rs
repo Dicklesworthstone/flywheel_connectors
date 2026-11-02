@@ -63,6 +63,7 @@ const MAX_RATE_LIMIT_CLIENTS: usize = 4096;
 const MAX_INGRESS_HEADERS: usize = 100;
 const MAX_INGRESS_HEADER_BYTES: usize = 32 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 1024;
+const MAX_FORM_FIELDS: usize = 1024;
 const MANIFEST: &str = include_str!("../manifest.toml");
 const MAX_INVOKE_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -1247,7 +1248,11 @@ impl WebhookReceiverConnector {
         in_flight_count: u64,
         now_ms: u64,
     ) -> Result<serde_json::Value, WebhookReceiverError> {
-        let body = ingest_body(input, config.max_body_bytes)?;
+        let body = ingest_body(
+            input,
+            config.max_body_bytes,
+            endpoint.provider == WebhookProvider::Twilio && is_form_content_type(headers),
+        )?;
         let signature = verify_endpoint_signature(
             endpoint,
             headers,
@@ -1505,6 +1510,7 @@ fn validate_ingest_content_type(
 fn ingest_body(
     input: &serde_json::Value,
     max_bytes: usize,
+    form_encoded: bool,
 ) -> Result<IngestBody, WebhookReceiverError> {
     if optional_usize_field(input, "body_size_bytes")?.is_some_and(|size| size > max_bytes) {
         return Err(WebhookReceiverError::PayloadTooLarge {
@@ -1516,7 +1522,7 @@ fn ingest_body(
         let raw_body = value
             .as_str()
             .ok_or_else(|| WebhookReceiverError::InvalidInput {
-                message: "body must be a JSON string".into(),
+                message: "body must be a string containing the raw webhook body".into(),
             })?;
         let body_bytes = raw_body.len();
         if body_bytes > max_bytes {
@@ -1524,10 +1530,13 @@ fn ingest_body(
                 message: format!("webhook body exceeds maximum size of {max_bytes} bytes"),
             });
         }
-        let payload =
+        let payload = if form_encoded {
+            parse_twilio_form_body(raw_body)?
+        } else {
             serde_json::from_str(raw_body).map_err(|error| WebhookReceiverError::InvalidInput {
                 message: format!("webhook body is not valid JSON: {error}"),
-            })?;
+            })?
+        };
         return Ok(IngestBody {
             payload,
             raw_body: raw_body.to_string(),
@@ -1535,13 +1544,16 @@ fn ingest_body(
         });
     }
 
-    let payload =
-        input
-            .get("payload")
-            .cloned()
-            .ok_or_else(|| WebhookReceiverError::InvalidInput {
-                message: "Missing required body or payload field".into(),
-            })?;
+    let payload = input
+        .get("payload")
+        .ok_or_else(|| WebhookReceiverError::InvalidInput {
+            message: "Missing required body or payload field".into(),
+        })?;
+    let payload = if form_encoded {
+        twilio_form_payload(sorted_twilio_params(payload)?)
+    } else {
+        payload.clone()
+    };
     let raw_body =
         serde_json::to_string(&payload).map_err(|error| WebhookReceiverError::Internal {
             message: format!("Failed to serialize webhook payload: {error}"),
@@ -1557,6 +1569,85 @@ fn ingest_body(
         raw_body,
         body_bytes,
     })
+}
+
+fn is_form_content_type(headers: &BTreeMap<String, String>) -> bool {
+    header_value(headers, "content-type")
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
+fn parse_twilio_form_body(raw_body: &str) -> Result<Value, WebhookReceiverError> {
+    let mut fields = Vec::new();
+    for field in raw_body.split('&').filter(|field| !field.is_empty()) {
+        if fields.len() >= MAX_FORM_FIELDS {
+            return Err(WebhookReceiverError::PayloadTooLarge {
+                message: format!("Twilio form exceeds {MAX_FORM_FIELDS} fields"),
+            });
+        }
+        let (name, value) = field.split_once('=').unwrap_or((field, ""));
+        fields.push((decode_form_component(name)?, decode_form_component(value)?));
+    }
+    Ok(twilio_form_payload(fields))
+}
+
+fn decode_form_component(value: &str) -> Result<String, WebhookReceiverError> {
+    let bytes = value.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'%' {
+            if bytes
+                .get(offset + 1)
+                .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                || bytes
+                    .get(offset + 2)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit())
+            {
+                return Err(WebhookReceiverError::InvalidInput {
+                    message: "Twilio form contains an invalid percent escape".into(),
+                });
+            }
+            offset += 3;
+        } else {
+            offset += 1;
+        }
+    }
+    let plus_decoded = value.replace('+', " ");
+    percent_encoding::percent_decode_str(&plus_decoded)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| WebhookReceiverError::InvalidInput {
+            message: "Twilio form contains invalid UTF-8".into(),
+        })
+}
+
+/// Store exactly the canonical name/value set covered by Twilio's signature.
+/// Repeated values are sorted and deduplicated, as in Twilio's SDK validator.
+fn twilio_form_payload(mut fields: Vec<(String, String)>) -> Value {
+    fields.sort();
+    fields.dedup();
+    let mut payload = serde_json::Map::new();
+    for (name, value) in fields {
+        match payload.entry(name) {
+            serde_json::map::Entry::Vacant(entry) => {
+                entry.insert(Value::String(value));
+            }
+            serde_json::map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if let Value::Array(values) = existing {
+                    values.push(Value::String(value));
+                } else {
+                    let first = std::mem::take(existing);
+                    *existing = Value::Array(vec![first, Value::String(value)]);
+                }
+            }
+        }
+    }
+    Value::Object(payload)
 }
 
 fn optional_ingest_source_ip(
@@ -1789,17 +1880,91 @@ fn verify_twilio_signature(
         .map_err(|_| WebhookReceiverError::Unauthorized {
             message: "Twilio signature is not valid base64".into(),
         })?;
-    let params = input.get("params").unwrap_or(&body.payload);
-    let sorted = sorted_twilio_params(params)?;
     let url = optional_str(input, "url")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(endpoint.url.as_str());
-    validate_twilio_url(url)?;
+    let parsed_url = validate_twilio_url(url)?;
+    let endpoint_url = validate_twilio_url(&endpoint.url)?;
+    if parsed_url.scheme() != endpoint_url.scheme()
+        || parsed_url.host_str() != endpoint_url.host_str()
+        || parsed_url.port_or_known_default() != endpoint_url.port_or_known_default()
+        || parsed_url.path() != endpoint_url.path()
+    {
+        return Err(WebhookReceiverError::Unauthorized {
+            message: "Twilio request URL does not match the configured endpoint".into(),
+        });
+    }
     let mut data_to_sign = url.to_string();
-    for (key, value) in sorted {
-        data_to_sign.push_str(&key);
-        data_to_sign.push_str(&value);
+    if is_form_content_type(headers) {
+        // Content-Type is not signed. A JSON request signs only its URL, so
+        // accepting that URL as an empty form would bypass its body hash.
+        if parsed_url
+            .query_pairs()
+            .any(|(name, _)| name == "bodySHA256")
+        {
+            return Err(WebhookReceiverError::Unauthorized {
+                message: "Twilio form request must not contain a JSON bodySHA256".into(),
+            });
+        }
+        let sorted = sorted_twilio_params(&body.payload)?;
+        if let Some(params) = input.get("params")
+            && sorted_twilio_params(params)? != sorted
+        {
+            return Err(WebhookReceiverError::Unauthorized {
+                message: "Twilio params do not match the webhook payload".into(),
+            });
+        }
+        for (key, value) in sorted {
+            data_to_sign.push_str(&key);
+            data_to_sign.push_str(&value);
+        }
+    } else {
+        // Twilio JSON signatures authenticate the full URL, whose bodySHA256
+        // query value binds the exact raw bytes. JSON fields are not POST form
+        // parameters and must never substitute for that body hash.
+        if input.get("body").and_then(Value::as_str).is_none() {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "Twilio JSON verification requires the raw body".into(),
+            });
+        }
+        if input
+            .get("params")
+            .is_some_and(|params| params.as_object().is_none_or(|params| !params.is_empty()))
+        {
+            return Err(WebhookReceiverError::InvalidInput {
+                message: "Twilio JSON verification does not accept form params".into(),
+            });
+        }
+        let mut hashes = parsed_url
+            .query_pairs()
+            .filter(|(name, _)| name == "bodySHA256");
+        let (_, encoded_hash) =
+            hashes
+                .next()
+                .ok_or_else(|| WebhookReceiverError::Unauthorized {
+                    message: "Twilio JSON request is missing bodySHA256".into(),
+                })?;
+        if hashes.next().is_some() {
+            return Err(WebhookReceiverError::Unauthorized {
+                message: "Twilio JSON request has ambiguous bodySHA256 values".into(),
+            });
+        }
+        if encoded_hash.len() != 64 {
+            return Err(WebhookReceiverError::Unauthorized {
+                message: "Twilio bodySHA256 must contain exactly 64 hexadecimal characters".into(),
+            });
+        }
+        let provided_hash =
+            hex::decode(encoded_hash.as_ref()).map_err(|_| WebhookReceiverError::Unauthorized {
+                message: "Twilio bodySHA256 is not valid hexadecimal".into(),
+            })?;
+        let actual_hash = Sha256::digest(body.raw_body.as_bytes());
+        if provided_hash.len() != actual_hash.len() || !ct_eq(&provided_hash, &actual_hash) {
+            return Err(WebhookReceiverError::Unauthorized {
+                message: "Twilio JSON body hash verification failed".into(),
+            });
+        }
     }
     let expected = hmac_sha1(&endpoint.signing_secret, data_to_sign.as_bytes())?;
     if provided.len() != expected.len() || !ct_eq(&provided, &expected) {
@@ -1924,34 +2089,80 @@ fn sorted_twilio_params(
         .ok_or_else(|| WebhookReceiverError::InvalidInput {
             message: "Twilio payload must be an object of form fields".into(),
         })?;
-    let mut sorted = Vec::with_capacity(params.len());
-    for (field, value) in params {
-        sorted.push((field.clone(), twilio_param_value_to_string(field, value)?));
+    if params.len() > MAX_FORM_FIELDS {
+        return Err(WebhookReceiverError::PayloadTooLarge {
+            message: format!("Twilio form exceeds {MAX_FORM_FIELDS} fields"),
+        });
     }
-    sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut sorted = Vec::with_capacity(params.len());
+    let mut remaining_bytes = MAX_BODY_BYTES;
+    for (field, value) in params {
+        let values = if let Value::Array(values) = value {
+            if values.is_empty() {
+                return Err(WebhookReceiverError::InvalidInput {
+                    message: "Twilio repeated form fields must not be empty arrays".into(),
+                });
+            }
+            values.as_slice()
+        } else {
+            std::slice::from_ref(value)
+        };
+        if values.len() > MAX_FORM_FIELDS.saturating_sub(sorted.len()) {
+            return Err(WebhookReceiverError::PayloadTooLarge {
+                message: format!("Twilio form exceeds {MAX_FORM_FIELDS} fields"),
+            });
+        }
+        for value in values {
+            // Repeated values duplicate the field name in the signed input.
+            // Bound that expansion before cloning names or string values,
+            // including for the optional, otherwise unbounded params alias.
+            remaining_bytes = remaining_bytes.checked_sub(field.len()).ok_or_else(|| {
+                WebhookReceiverError::PayloadTooLarge {
+                    message: format!("Twilio canonical form exceeds {MAX_BODY_BYTES} bytes"),
+                }
+            })?;
+            let value = twilio_param_value_to_string(field, value, remaining_bytes)?;
+            remaining_bytes -= value.len();
+            sorted.push((field.clone(), value));
+        }
+    }
+    sorted.sort();
+    sorted.dedup();
     Ok(sorted)
 }
 
 fn twilio_param_value_to_string(
     field: &str,
     value: &serde_json::Value,
+    max_bytes: usize,
 ) -> Result<String, WebhookReceiverError> {
-    match value {
-        serde_json::Value::String(value) => Ok(value.clone()),
-        serde_json::Value::Number(value) => Ok(value.to_string()),
-        serde_json::Value::Bool(value) => Ok(value.to_string()),
-        serde_json::Value::Null => Ok(String::new()),
+    if value.as_str().is_some_and(|value| value.len() > max_bytes) {
+        return Err(WebhookReceiverError::PayloadTooLarge {
+            message: format!("Twilio canonical form exceeds {MAX_BODY_BYTES} bytes"),
+        });
+    }
+    let value = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => String::new(),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Err(WebhookReceiverError::InvalidInput {
+            return Err(WebhookReceiverError::InvalidInput {
                 message: format!(
                     "Twilio webhook params field `{field}` must be a scalar string, number, boolean, or null"
                 ),
-            })
+            });
         }
+    };
+    if value.len() > max_bytes {
+        return Err(WebhookReceiverError::PayloadTooLarge {
+            message: format!("Twilio canonical form exceeds {MAX_BODY_BYTES} bytes"),
+        });
     }
+    Ok(value)
 }
 
-fn validate_twilio_url(url: &str) -> Result<(), WebhookReceiverError> {
+fn validate_twilio_url(url: &str) -> Result<Url, WebhookReceiverError> {
     let parsed = Url::parse(url).map_err(|error| WebhookReceiverError::InvalidInput {
         message: format!("invalid Twilio webhook url: {error}"),
     })?;
@@ -1975,7 +2186,7 @@ fn validate_twilio_url(url: &str) -> Result<(), WebhookReceiverError> {
             message: "Twilio webhook url must not include a fragment".into(),
         });
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn event_id_for_ingest(
@@ -2012,6 +2223,13 @@ fn event_id_for_ingest(
         "SmsSid",
         "CallSid",
     ] {
+        // A Twilio resource can emit multiple status callbacks. Its SID is
+        // not a delivery identity, so it must not suppress later statuses.
+        if endpoint.provider == WebhookProvider::Twilio
+            && matches!(field, "MessageSid" | "SmsSid" | "CallSid")
+        {
+            continue;
+        }
         if let Some(value) = payload
             .get(field)
             .and_then(value_to_event_id_component)
@@ -2020,9 +2238,22 @@ fn event_id_for_ingest(
             return Ok(value);
         }
     }
+    // Form signatures cover a canonical parameter set, not its wire order
+    // or percent-escape spelling. Use that same set to deduplicate retries.
+    let canonical_form =
+        if endpoint.provider == WebhookProvider::Twilio && is_form_content_type(headers) {
+            Some(serde_json::to_string(payload).map_err(|error| {
+                WebhookReceiverError::Internal {
+                    message: format!("Failed to serialize Twilio delivery identity: {error}"),
+                }
+            })?)
+        } else {
+            None
+        };
+    let fingerprint_body = canonical_form.as_deref().unwrap_or(raw_body);
     Ok(format!(
         "evt_{}",
-        redacted_hash(&format!("{}:{raw_body}", endpoint.endpoint_id))
+        redacted_hash(&format!("{}:{fingerprint_body}", endpoint.endpoint_id))
     ))
 }
 
@@ -2457,11 +2688,11 @@ fn operations_info() -> Vec<OperationInfo> {
                 "properties": {
                     "method": { "type": "string", "description": "HTTP method accepted by the host or gateway adapter; POST is required" },
                     "path": { "type": "string", "description": "Webhook request path to route to a registered endpoint" },
-                    "url": { "type": "string", "description": "Full public URL used by Twilio signature verification; defaults to endpoint URL" },
+                    "url": { "type": "string", "description": "Exact externally visible request URL; Twilio must match the configured endpoint destination" },
                     "headers": { "type": "object", "description": "HTTP headers after host canonicalization" },
-                    "body": { "type": "string", "description": "Raw JSON body exactly as signed by the provider" },
-                    "payload": { "type": "object", "description": "Already parsed JSON payload when raw body is unavailable" },
-                    "params": { "type": "object", "description": "Twilio form params used for X-Twilio-Signature validation" },
+                    "body": { "type": "string", "description": "Raw JSON or Twilio form body string exactly as received" },
+                    "payload": { "type": "object", "description": "Parsed payload fallback; raw body is required for Twilio JSON verification" },
+                    "params": { "type": "object", "description": "Optional Twilio form fields; must match the authenticated payload" },
                     "source_ip": { "type": "string", "description": "Client IP resolved by the host adapter for allowlist enforcement" },
                     "client_id": { "type": "string", "description": "Rate-limit key component chosen by the host adapter" },
                     "delivery_id": { "type": "string", "description": "Stable provider delivery ID used for replay suppression" },
@@ -2524,6 +2755,253 @@ fn operations_info() -> Vec<OperationInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TWILIO_FORM_URL: &str = "https://example.com/myapp.php?foo=1&bar=2";
+    const TWILIO_FORM_BODY: &str = "CallSid=CA1234567890ABCDE&Caller=%2B14158675310&Digits=1234&From=%2B14158675310&To=%2B18005551212";
+    const TWILIO_FORM_SIGNATURE: &str = "L/OH5YylLD5NRKLltdqwSvS0BnU=";
+    const TWILIO_JSON_BODY: &str = "{\"CallSid\":\"CA123\",\"text\":\"hello\"}\n";
+    const TWILIO_JSON_URL: &str = "https://example.com/twilio?bodySHA256=68a14dcded4795acd68ffbd71343b19bb3d210267a488c66ecb52f41e5cc453b";
+    const TWILIO_JSON_SIGNATURE: &str = "IpXwHS3LnYu8UbfkceUMkviFkO4=";
+
+    fn twilio_test_endpoint(path: &str) -> WebhookEndpoint {
+        WebhookEndpoint::new(
+            path.into(),
+            "12345".into(),
+            Vec::new(),
+            "https://example.com",
+            WebhookProvider::Twilio,
+            "X-Twilio-Signature".into(),
+            "twilio-hmac-sha1".into(),
+        )
+    }
+
+    fn twilio_test_headers(content_type: &str, signature: &str) -> BTreeMap<String, String> {
+        parse_headers(&json!({"headers": {
+            "Content-Type": content_type,
+            "X-Twilio-Signature": signature,
+        }}))
+        .unwrap()
+    }
+
+    #[test]
+    fn twilio_native_form_matches_published_signature_vector() {
+        // Known-answer vector from https://www.twilio.com/docs/usage/security.
+        let input = json!({"url": TWILIO_FORM_URL, "body": TWILIO_FORM_BODY});
+        let headers = twilio_test_headers(
+            "application/x-www-form-urlencoded; charset=UTF-8",
+            TWILIO_FORM_SIGNATURE,
+        );
+        let body = ingest_body(&input, 4096, true).unwrap();
+        assert_eq!(body.body_bytes, TWILIO_FORM_BODY.len());
+        assert_eq!(
+            body.payload,
+            json!({
+                "CallSid": "CA1234567890ABCDE", "Caller": "+14158675310",
+                "Digits": "1234", "From": "+14158675310", "To": "+18005551212",
+            })
+        );
+        let proof =
+            verify_twilio_signature(&twilio_test_endpoint("/myapp.php"), &headers, &body, &input)
+                .unwrap();
+        assert_eq!(proof.provider, "twilio");
+    }
+
+    #[test]
+    fn twilio_repeated_fields_use_the_authenticated_canonical_values() {
+        // Independently generated with Python's hmac/hashlib, not this verifier.
+        let input = json!({
+            "url": "https://example.com/twilio?foo=1",
+            "body": "Tag=z&Body=Hello+World%21&Tag=a&Tag=z&To=%2B1555",
+            "params": {"Body": "Hello World!", "Tag": ["z", "a", "z"], "To": "+1555"},
+        });
+        let headers = twilio_test_headers(
+            "application/x-www-form-urlencoded",
+            "2OYKE/ZgQ63cMs42qYt7Y87XHos=",
+        );
+        let body = ingest_body(&input, 4096, true).unwrap();
+        assert_eq!(
+            body.payload,
+            json!({"Body": "Hello World!", "Tag": ["a", "z"], "To": "+1555"})
+        );
+        verify_twilio_signature(&twilio_test_endpoint("/twilio"), &headers, &body, &input).unwrap();
+    }
+
+    #[test]
+    fn twilio_signed_params_cannot_authorize_a_different_stored_payload() {
+        let signed_payload = parse_twilio_form_body(TWILIO_FORM_BODY).unwrap();
+        let mut input = json!({
+            "url": TWILIO_FORM_URL,
+            "payload": signed_payload,
+            "params": signed_payload,
+        });
+        let endpoint = twilio_test_endpoint("/myapp.php");
+        let headers =
+            twilio_test_headers("application/x-www-form-urlencoded", TWILIO_FORM_SIGNATURE);
+        let body = ingest_body(&input, 4096, true).unwrap();
+        verify_twilio_signature(&endpoint, &headers, &body, &input).unwrap();
+
+        input["payload"]["Digits"] = json!("9999");
+        let body = ingest_body(&input, 4096, true).unwrap();
+        assert!(matches!(
+            verify_twilio_signature(&endpoint, &headers, &body, &input),
+            Err(WebhookReceiverError::Unauthorized { .. })
+        ));
+        input.as_object_mut().unwrap().remove("params");
+        assert!(matches!(
+            verify_twilio_signature(&endpoint, &headers, &body, &input),
+            Err(WebhookReceiverError::Unauthorized { .. })
+        ));
+    }
+
+    #[test]
+    fn twilio_json_authenticates_the_exact_raw_bytes() {
+        // SHA256 and HMAC fixture generated independently with Python stdlib.
+        let input = json!({"url": TWILIO_JSON_URL, "body": TWILIO_JSON_BODY});
+        let headers = twilio_test_headers("application/json", TWILIO_JSON_SIGNATURE);
+        let endpoint = twilio_test_endpoint("/twilio");
+        let body = ingest_body(&input, 4096, false).unwrap();
+        verify_twilio_signature(&endpoint, &headers, &body, &input).unwrap();
+
+        let changed = json!({"url": TWILIO_JSON_URL, "body": TWILIO_JSON_BODY.trim_end()});
+        let changed_body = ingest_body(&changed, 4096, false).unwrap();
+        assert_eq!(changed_body.payload, body.payload);
+        assert!(matches!(
+            verify_twilio_signature(&endpoint, &headers, &changed_body, &changed),
+            Err(WebhookReceiverError::Unauthorized { .. })
+        ));
+    }
+
+    #[test]
+    fn twilio_json_requires_raw_body_and_one_valid_hash_without_form_params() {
+        let endpoint = twilio_test_endpoint("/twilio");
+        let headers = twilio_test_headers("application/json", TWILIO_JSON_SIGNATURE);
+        let no_raw = json!({
+            "url": TWILIO_JSON_URL, "payload": {"CallSid": "CA123", "text": "hello"},
+        });
+        let body = ingest_body(&no_raw, 4096, false).unwrap();
+        assert!(matches!(
+            verify_twilio_signature(&endpoint, &headers, &body, &no_raw),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        let params = json!({
+            "url": TWILIO_JSON_URL, "body": TWILIO_JSON_BODY, "params": {"text": "hello"},
+        });
+        let body = ingest_body(&params, 4096, false).unwrap();
+        assert!(matches!(
+            verify_twilio_signature(&endpoint, &headers, &body, &params),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        for url in [
+            "https://example.com/twilio".to_string(),
+            format!("{TWILIO_JSON_URL}&bodySHA256=00"),
+            format!("https://example.com/twilio?bodySHA256={}", "z".repeat(64)),
+            "https://example.com/twilio?bodySHA256=00".to_string(),
+        ] {
+            let input = json!({"url": url, "body": TWILIO_JSON_BODY});
+            let body = ingest_body(&input, 4096, false).unwrap();
+            assert!(matches!(
+                verify_twilio_signature(&endpoint, &headers, &body, &input),
+                Err(WebhookReceiverError::Unauthorized { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn twilio_json_signature_cannot_be_replayed_as_an_empty_form() {
+        let endpoint = twilio_test_endpoint("/twilio");
+        let headers =
+            twilio_test_headers("application/x-www-form-urlencoded", TWILIO_JSON_SIGNATURE);
+        for raw_body in ["", "="] {
+            let input = json!({"url": TWILIO_JSON_URL, "body": raw_body});
+            let body = ingest_body(&input, 4096, true).unwrap();
+            let error = verify_twilio_signature(&endpoint, &headers, &body, &input).unwrap_err();
+            assert!(matches!(error, WebhookReceiverError::Unauthorized { .. }));
+            assert!(error.to_string().contains("bodySHA256"));
+        }
+    }
+
+    #[test]
+    fn twilio_valid_signature_is_bound_to_the_configured_destination() {
+        let input = json!({"url": TWILIO_FORM_URL, "body": TWILIO_FORM_BODY});
+        let body = ingest_body(&input, 4096, true).unwrap();
+        let headers =
+            twilio_test_headers("application/x-www-form-urlencoded", TWILIO_FORM_SIGNATURE);
+        let mut endpoint = twilio_test_endpoint("/myapp.php");
+        for destination in [
+            "https://example.com/other-route",
+            "https://other.example/myapp.php",
+            "http://example.com/myapp.php",
+            "https://example.com:8443/myapp.php",
+        ] {
+            endpoint.url = destination.into();
+            assert!(matches!(
+                verify_twilio_signature(&endpoint, &headers, &body, &input),
+                Err(WebhookReceiverError::Unauthorized { .. })
+            ));
+        }
+        endpoint.url = "https://example.com:443/myapp.php".into();
+        verify_twilio_signature(&endpoint, &headers, &body, &input).unwrap();
+    }
+
+    #[test]
+    fn twilio_form_rejects_invalid_encoding_and_bounded_input_expansion() {
+        for body in ["Body=%", "Body=%0", "Body=%GG", "Body=%FF"] {
+            assert!(matches!(
+                parse_twilio_form_body(body),
+                Err(WebhookReceiverError::InvalidInput { .. })
+            ));
+        }
+        assert_eq!(
+            parse_twilio_form_body("Body=caf%C3%A9+%2B&Empty=&Bare").unwrap(),
+            json!({"Body": "café +", "Empty": "", "Bare": ""})
+        );
+        assert!(matches!(
+            ingest_body(&json!({"body": "Body=long"}), 3, true),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            parse_twilio_form_body(&"a=1&".repeat(MAX_FORM_FIELDS + 1)),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        let key = "x".repeat(MAX_BODY_BYTES / MAX_FORM_FIELDS + 1);
+        let mut expanded = serde_json::Map::new();
+        expanded.insert(key, json!(vec![""; MAX_FORM_FIELDS]));
+        assert!(matches!(
+            sorted_twilio_params(&Value::Object(expanded)),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            sorted_twilio_params(&json!({"Tag": []})),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn twilio_delivery_ids_preserve_status_changes_and_deduplicate_equivalent_forms() {
+        let endpoint = twilio_test_endpoint("/twilio");
+        let headers = twilio_test_headers("application/x-www-form-urlencoded", "unused");
+        let identity = |raw: &str| {
+            let payload = parse_twilio_form_body(raw).unwrap();
+            event_id_for_ingest(&json!({}), &headers, &payload, &endpoint, raw).unwrap()
+        };
+        let queued = identity("MessageSid=SM123&MessageStatus=queued");
+        let equivalent = identity("MessageStatus=%71ueued&MessageSid=SM123&MessageSid=SM123");
+        let delivered = identity("MessageSid=SM123&MessageStatus=delivered");
+        assert_eq!(queued, equivalent);
+        assert_ne!(queued, delivered);
+        assert_ne!(queued, "SM123");
+        assert_eq!(
+            event_id_for_ingest(
+                &json!({"delivery_id": "trusted-delivery"}),
+                &headers,
+                &json!({"MessageSid": "SM123"}),
+                &endpoint,
+                "",
+            )
+            .unwrap(),
+            "trusted-delivery"
+        );
+    }
 
     #[test]
     fn rate_limit_capacity_preserves_live_windows_and_reclaims_expired_clients() {

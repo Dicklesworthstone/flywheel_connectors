@@ -5,7 +5,7 @@ min_mesh_version = "2.0.0"
 min_protocol = "fcp2-sym/2.0"
 protocol_features = []
 max_datagram_bytes = 65000
-interface_hash = "blake3-256:fcp.interface.v2:9790ee77b413395692d4fda8fd004e6e0bb49b0a4f9d2aa6769e2388c8c8d020"
+interface_hash = "blake3-256:fcp.interface.v2:130b6f72dc6c68742b6dc58621de9a13a8655f32bd47d32346b28ffbfeeae20c"
 
 [connector]
 id = "fcp.webhook-receiver"
@@ -360,7 +360,7 @@ required = [
 type = "object"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.body]
-description = "Raw JSON body exactly as signed by the provider"
+description = "Raw JSON or Twilio form body string exactly as received"
 type = "string"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.body_size_bytes]
@@ -392,7 +392,7 @@ description = "HTTP method accepted by the host or gateway adapter; POST is requ
 type = "string"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.params]
-description = "Twilio form params used for X-Twilio-Signature validation"
+description = "Optional Twilio form fields; must match the authenticated payload"
 type = "object"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.path]
@@ -400,7 +400,7 @@ description = "Webhook request path to route to a registered endpoint"
 type = "string"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.payload]
-description = "Already parsed JSON payload when raw body is unavailable"
+description = "Parsed payload fallback; raw body is required for Twilio JSON verification"
 type = "object"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.source_ip]
@@ -408,7 +408,7 @@ description = "Client IP resolved by the host adapter for allowlist enforcement"
 type = "string"
 
 [provides.operations."webhook.events.ingest".input_schema.properties.url]
-description = "Full public URL used by Twilio signature verification; defaults to endpoint URL"
+description = "Exact externally visible request URL; Twilio must match the configured endpoint destination"
 type = "string"
 
 [provides.operations."webhook.events.ingest".output_schema]

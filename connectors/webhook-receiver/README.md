@@ -153,14 +153,22 @@ The current Webhook Receiver README slice documents the existing runtime surface
 | github | `X-Hub-Signature-256` | `hmac-sha256` | Hex HMAC over raw body, optional `sha256=` prefix accepted |
 | stripe | `Stripe-Signature` | `stripe-signature-v1` | Uses `t=` and `v1=` fields, signs `{timestamp}.{raw_body}`, enforces tolerance |
 | slack | `X-Slack-Signature` | `slack-signature-v0` | Requires `X-Slack-Request-Timestamp`, signs `v0:{timestamp}:{raw_body}`, enforces tolerance |
-| twilio | `X-Twilio-Signature` | `twilio-hmac-sha1` | Base64 HMAC-SHA1 over URL plus sorted form parameters |
+| twilio | `X-Twilio-Signature` | `twilio-hmac-sha1` | Form: Base64 HMAC-SHA1 over the exact URL plus sorted field names and values. JSON: HMAC-SHA1 over the exact URL, with its `bodySHA256` binding the raw body. |
+
+Twilio adapters should pass the original body and externally visible URL. The URL's scheme, host, effective port, and path must match the configured endpoint; query parameters remain part of the exact signed URL. Configure `public_base_url` to the provider-visible origin when a reverse proxy is involved.
+
+Native form bodies decode percent escapes and `+` spaces with strict UTF-8 validation. Repeated values are sorted and deduplicated to match Twilio's signing rules; stored fields are strings or arrays of distinct strings. An optional `params` object must describe that same authenticated field set and cannot replace a different body or payload. Form intake accepts at most `1024` fields and bounds the expanded canonical signing data to `16 MiB` before copying repeated names and values; the configured body-size limit still applies.
+
+Twilio JSON intake requires `body` with the exact original bytes and exactly one valid `bodySHA256` query parameter. Reserializing the same JSON value changes its hash. Nonempty form `params` are rejected for JSON, and a form request containing `bodySHA256` is rejected so changing Content-Type cannot bypass body authentication.
 
 Event ID precedence:
 
 - input fields: `delivery_id`, `event_id`, `request_id`
 - headers: `X-GitHub-Delivery`, `X-Request-ID`, `Stripe-Request-Id`, `X-Slack-Request-Id`
-- payload fields: `id`, `event_id`, `eventId`, `delivery_id`, `MessageSid`, `SmsSid`, `CallSid`
-- fallback: `evt_` plus a redacted hash of endpoint ID and raw body
+- payload fields: `id`, `event_id`, `eventId`, `delivery_id`; `MessageSid`, `SmsSid`, and `CallSid` are also considered for non-Twilio providers
+- fallback: `evt_` plus a redacted hash of endpoint ID and raw body; Twilio forms use the normalized authenticated payload so equivalent field ordering and percent escapes deduplicate
+
+Twilio resource SIDs identify a message or call, not an individual delivery. Without an explicit delivery ID, successive status callbacks for one SID receive distinct IDs when their payload changes, while equivalent retries remain duplicates.
 
 ## Operation Inventory
 

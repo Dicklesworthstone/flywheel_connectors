@@ -45,5 +45,6 @@ sha2.workspace = true
 subtle.workspace = true
 hex.workspace = true
 blake3.workspace = true
+percent-encoding.workspace = true
 
 [dev-dependencies]

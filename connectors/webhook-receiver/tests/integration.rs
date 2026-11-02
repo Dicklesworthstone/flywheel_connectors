@@ -1203,6 +1203,260 @@ async fn events_ingest_accepts_twilio_signature() {
     assert_eq!(accepted["event"]["event_id"], "delivery-twilio");
 }
 
+#[fcp_async_core::runtime::test]
+async fn events_ingest_twilio_raw_form_matches_official_signature_vector() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://example.com"
+    }))
+    .await;
+    let created = create_endpoint(&mut c, "/myapp.php", "twilio", "12345").await;
+    let endpoint_id = created["endpoint_id"].as_str().unwrap();
+    // Fixed vector from Twilio's request-validation example, independent of
+    // the signing helper used by the other integration fixtures.
+    let accepted = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.ingest",
+            "input": {
+                "method": "POST",
+                "path": "/myapp.php",
+                "url": "https://example.com/myapp.php?foo=1&bar=2",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Twilio-Signature": "L/OH5YylLD5NRKLltdqwSvS0BnU="
+                },
+                "body": "CallSid=CA1234567890ABCDE&Caller=%2B14158675310&Digits=1234&From=%2B14158675310&To=%2B18005551212"
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["status_code"], 202);
+    assert_eq!(accepted["event"]["provider"], "twilio");
+
+    let recent = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.recent",
+            "input": {"endpoint_id": endpoint_id}
+        }))
+        .await
+        .unwrap();
+    let events = recent["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["signature_valid"], true);
+    assert_eq!(
+        events[0]["payload"],
+        json!({
+            "CallSid": "CA1234567890ABCDE",
+            "Caller": "+14158675310",
+            "Digits": "1234",
+            "From": "+14158675310",
+            "To": "+18005551212"
+        })
+    );
+    assert!(events[0]["headers"].get("x-twilio-signature").is_none());
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_ingest_twilio_rejects_signed_params_for_a_different_payload() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://example.com"
+    }))
+    .await;
+    let created = create_endpoint(&mut c, "/twilio", "twilio", "12345").await;
+    let endpoint_id = created["endpoint_id"].as_str().unwrap();
+    let url = "https://example.com/twilio";
+    let signature = hmac_sha1_base64("12345", &format!("{url}BodybenignMessageSidSM123"));
+
+    for (field, value) in [
+        ("body", json!("Body=malicious&MessageSid=SM123")),
+        (
+            "payload",
+            json!({"Body": "malicious", "MessageSid": "SM123"}),
+        ),
+    ] {
+        let mut request = json!({
+            "operation_id": "webhook.events.ingest",
+            "input": {
+                "method": "POST",
+                "path": "/twilio",
+                "url": url,
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Twilio-Signature": signature
+                },
+                "params": {"Body": "benign", "MessageSid": "SM123"}
+            }
+        });
+        request["input"][field] = value;
+        assert_external_status(c.handle_invoke(request).await, 401);
+    }
+
+    let recent = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.recent",
+            "input": {"endpoint_id": endpoint_id}
+        }))
+        .await
+        .unwrap();
+    assert!(recent["events"].as_array().unwrap().is_empty());
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_ingest_twilio_json_binds_raw_bytes_and_rejects_content_type_switches() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://example.com"
+    }))
+    .await;
+    let created = create_endpoint(&mut c, "/twilio", "twilio", "12345").await;
+    let endpoint_id = created["endpoint_id"].as_str().unwrap();
+    let raw_body = "{\"CallSid\":\"CA123\",\"text\":\"hello\"}\n";
+    let url = "https://example.com/twilio?bodySHA256=68a14dcded4795acd68ffbd71343b19bb3d210267a488c66ecb52f41e5cc453b";
+    let signature = "IpXwHS3LnYu8UbfkceUMkviFkO4=";
+    let accepted = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.ingest",
+            "input": {
+                "method": "POST",
+                "path": "/twilio",
+                "url": url,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Twilio-Signature": signature
+                },
+                "body": raw_body
+            }
+        }))
+        .await
+        .unwrap();
+    assert_eq!(accepted["status_code"], 202);
+
+    for (content_type, body) in [
+        ("application/json", raw_body.trim_end()),
+        (
+            "application/json",
+            "{\"CallSid\":\"CA123\",\"text\":\"tampered\"}\n",
+        ),
+        ("application/x-www-form-urlencoded", ""),
+        ("application/x-www-form-urlencoded", "="),
+    ] {
+        assert_external_status(
+            c.handle_invoke(json!({
+                "operation_id": "webhook.events.ingest",
+                "input": {
+                    "method": "POST",
+                    "path": "/twilio",
+                    "url": url,
+                    "headers": {
+                        "Content-Type": content_type,
+                        "X-Twilio-Signature": signature
+                    },
+                    "body": body
+                }
+            }))
+            .await,
+            401,
+        );
+    }
+
+    let recent = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.recent",
+            "input": {"endpoint_id": endpoint_id}
+        }))
+        .await
+        .unwrap();
+    let events = recent["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["payload"],
+        json!({"CallSid": "CA123", "text": "hello"})
+    );
+    assert_eq!(events[0]["event_id"], accepted["event"]["event_id"]);
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form_retries() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://example.com"
+    }))
+    .await;
+    let created = create_endpoint(&mut c, "/twilio", "twilio", "12345").await;
+    let endpoint_id = created["endpoint_id"].as_str().unwrap();
+    let url = "https://example.com/twilio";
+    let mut delivery_ids = Vec::new();
+
+    for status in ["sent", "delivered"] {
+        let signature = hmac_sha1_base64(
+            "12345",
+            &format!("{url}MessageSidSM123MessageStatus{status}To+15551234567"),
+        );
+        let accepted = c
+            .handle_invoke(json!({
+                "operation_id": "webhook.events.ingest",
+                "input": {
+                    "method": "POST",
+                    "path": "/twilio",
+                    "url": url,
+                    "headers": {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-Twilio-Signature": signature
+                    },
+                    "body": format!("MessageSid=SM123&MessageStatus={status}&To=%2B15551234567")
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(accepted["status_code"], 202);
+        delivery_ids.push(accepted["event"]["event_id"].as_str().unwrap().to_string());
+    }
+    assert_ne!(delivery_ids[0], delivery_ids[1]);
+
+    // Parameter order, escape spelling, and duplicate identical values are
+    // unsigned distinctions in Twilio's canonical form signature.
+    let retry_signature = hmac_sha1_base64(
+        "12345",
+        &format!("{url}MessageSidSM123MessageStatusdeliveredTo+15551234567"),
+    );
+    assert_external_status(
+        c.handle_invoke(json!({
+            "operation_id": "webhook.events.ingest",
+            "input": {
+                "method": "POST",
+                "path": "/twilio",
+                "url": url,
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Twilio-Signature": retry_signature
+                },
+                "body": "To=%2b15551234567&MessageStatus=delivered&MessageSid=SM123&MessageStatus=delivered"
+            }
+        }))
+        .await,
+        409,
+    );
+
+    let recent = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.recent",
+            "input": {"endpoint_id": endpoint_id}
+        }))
+        .await
+        .unwrap();
+    let events = recent["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["payload"]["MessageSid"] == "SM123")
+    );
+    let mut statuses = events
+        .iter()
+        .map(|event| event["payload"]["MessageStatus"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    statuses.sort_unstable();
+    assert_eq!(statuses, vec!["delivered", "sent"]);
+}
+
 // -- Unknown operation / Simulate --
 
 #[fcp_async_core::runtime::test]

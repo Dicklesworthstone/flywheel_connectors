@@ -371,12 +371,12 @@ impl WebhookStore {
         let limit = limit.unwrap_or(DEFAULT_EVENTS_LIMIT).min(MAX_EVENTS_LIMIT);
 
         // If endpoint_id is specified, validate it exists
-        if let Some(eid) = endpoint_id {
-            if !self.endpoints.contains_key(eid) {
-                return Err(WebhookReceiverError::EndpointNotFound {
-                    endpoint_id: eid.into(),
-                });
-            }
+        if let Some(eid) = endpoint_id
+            && !self.endpoints.contains_key(eid)
+        {
+            return Err(WebhookReceiverError::EndpointNotFound {
+                endpoint_id: eid.into(),
+            });
         }
 
         let mut all_events: Vec<&WebhookEvent> = if let Some(eid) = endpoint_id {
