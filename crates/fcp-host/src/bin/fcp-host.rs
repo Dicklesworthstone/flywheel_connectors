@@ -2283,12 +2283,15 @@ fn validate_production_prewarm_policy(config: &ConnectorConfig) -> HostResult<()
     }
 }
 
-async fn build_registry_entry(
-    config: ConnectorConfig,
-    resilience: Arc<ResilienceLayer>,
-    capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
-) -> HostResult<RegistryEntry> {
-    validate_production_prewarm_policy(&config)?;
+/// Validate operator-owned configuration without starting or configuring a runtime.
+///
+/// Preview callers intentionally do not test executable availability, connector RPCs,
+/// or runtime health: those checks belong to an actual apply.
+fn validate_registry_config(
+    config: &ConnectorConfig,
+) -> HostResult<ManifestOperationConstraintCatalog> {
+    connector_summary_from_config(config)?;
+    validate_production_prewarm_policy(config)?;
     validate_runtime_network_claim(
         &config.id,
         config.runtime_network_enforcement,
@@ -2296,9 +2299,18 @@ async fn build_registry_entry(
         &config.operation_network_constraints,
         config.config.as_ref(),
     )?;
-    let manifest_constraints = load_manifest_operation_constraints(&config)?;
+    let manifest_constraints = load_manifest_operation_constraints(config)?;
     let hrw_routing = current_hrw_lease_routing_config()?;
-    enforce_hrw_singleton_writer_launch_route(&config, hrw_routing.as_ref())?;
+    enforce_hrw_singleton_writer_launch_route(config, hrw_routing.as_ref())?;
+    Ok(manifest_constraints)
+}
+
+async fn build_registry_entry(
+    config: ConnectorConfig,
+    resilience: Arc<ResilienceLayer>,
+    capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
+) -> HostResult<RegistryEntry> {
+    let manifest_constraints = validate_registry_config(&config)?;
     let connector =
         ConnectorRuntime::spawn(config.clone(), resilience, capability_verifying_key).await?;
     Ok(RegistryEntry {
@@ -2325,16 +2337,70 @@ struct RegistryState {
     connectors: HashMap<ConnectorId, RegistryEntry>,
 }
 
-struct PreparedRegistryApply {
+struct RegistryConfigPlan {
     next_configs: HashMap<ConnectorId, ConnectorConfig>,
-    replacement_entries: HashMap<ConnectorId, RegistryEntry>,
+    replacement_ids: Vec<ConnectorId>,
     added: Vec<String>,
     updated: Vec<String>,
     removed: Vec<String>,
     unchanged: Vec<String>,
 }
 
-impl PreparedRegistryApply {
+impl RegistryConfigPlan {
+    fn new(
+        current_configs: &HashMap<ConnectorId, ConnectorConfig>,
+        configs: Vec<ConnectorConfig>,
+    ) -> HostResult<Self> {
+        let mut next_configs = HashMap::new();
+        for config in configs {
+            let connector_id: ConnectorId = config.id.parse().map_err(|err| {
+                HostError::InvalidFilter(format!("invalid connector id '{}': {err}", config.id))
+            })?;
+            if next_configs.insert(connector_id.clone(), config).is_some() {
+                return Err(HostError::InvalidFilter(format!(
+                    "duplicate connector id in managed inventory: {connector_id}"
+                )));
+            }
+        }
+
+        let mut replacement_ids = Vec::new();
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        let mut unchanged = Vec::new();
+        for (connector_id, config) in &next_configs {
+            match current_configs.get(connector_id) {
+                Some(current) if current == config => unchanged.push(connector_id.to_string()),
+                Some(_) => {
+                    replacement_ids.push(connector_id.clone());
+                    updated.push(connector_id.to_string());
+                }
+                None => {
+                    replacement_ids.push(connector_id.clone());
+                    added.push(connector_id.to_string());
+                }
+            }
+        }
+        let mut removed = current_configs
+            .keys()
+            .filter(|connector_id| !next_configs.contains_key(*connector_id))
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>();
+        replacement_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        added.sort();
+        updated.sort();
+        removed.sort();
+        unchanged.sort();
+
+        Ok(Self {
+            next_configs,
+            replacement_ids,
+            added,
+            updated,
+            removed,
+            unchanged,
+        })
+    }
+
     fn changed(&self) -> bool {
         !(self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty())
     }
@@ -2348,6 +2414,11 @@ impl PreparedRegistryApply {
             registry_version,
         }
     }
+}
+
+struct PreparedRegistryApply {
+    plan: RegistryConfigPlan,
+    replacement_entries: HashMap<ConnectorId, RegistryEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2542,10 +2613,10 @@ impl SubprocessRegistry {
         })
     }
 
-    async fn prepare_configs(
+    async fn plan_configs(
         &self,
         configs: Vec<ConnectorConfig>,
-    ) -> HostResult<PreparedRegistryApply> {
+    ) -> HostResult<RegistryConfigPlan> {
         let current_configs = {
             let state = self.state.read().await;
             state
@@ -2555,64 +2626,27 @@ impl SubprocessRegistry {
                 .collect::<HashMap<_, _>>()
         };
 
-        let mut next_configs = HashMap::new();
-        for config in configs {
-            let connector_id: ConnectorId = config.id.parse().map_err(|err| {
-                HostError::InvalidFilter(format!("invalid connector id '{}': {err}", config.id))
-            })?;
-            if next_configs.insert(connector_id.clone(), config).is_some() {
-                return Err(HostError::InvalidFilter(format!(
-                    "duplicate connector id in managed inventory: {connector_id}"
-                )));
-            }
-        }
+        RegistryConfigPlan::new(&current_configs, configs)
+    }
 
+    async fn prepare_configs(
+        &self,
+        configs: Vec<ConnectorConfig>,
+    ) -> HostResult<PreparedRegistryApply> {
+        let plan = self.plan_configs(configs).await?;
         let mut replacement_entries = HashMap::new();
-        let mut added = Vec::new();
-        let mut updated = Vec::new();
-        let mut unchanged = Vec::new();
-
-        for (connector_id, config) in &next_configs {
-            match current_configs.get(connector_id) {
-                Some(current) if current == config => {
-                    unchanged.push(connector_id.to_string());
-                }
-                Some(_) => {
-                    let entry = build_registry_entry(
-                        config.clone(),
-                        Arc::clone(&self.resilience),
-                        self.capability_verifying_key,
-                    )
-                    .await?;
-                    replacement_entries.insert(connector_id.clone(), entry);
-                    updated.push(connector_id.to_string());
-                }
-                None => {
-                    let entry = build_registry_entry(
-                        config.clone(),
-                        Arc::clone(&self.resilience),
-                        self.capability_verifying_key,
-                    )
-                    .await?;
-                    replacement_entries.insert(connector_id.clone(), entry);
-                    added.push(connector_id.to_string());
-                }
-            }
+        for connector_id in &plan.replacement_ids {
+            let entry = build_registry_entry(
+                plan.next_configs[connector_id].clone(),
+                Arc::clone(&self.resilience),
+                self.capability_verifying_key,
+            )
+            .await?;
+            replacement_entries.insert(connector_id.clone(), entry);
         }
-
-        let removed = current_configs
-            .keys()
-            .filter(|connector_id| !next_configs.contains_key(*connector_id))
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>();
-
         Ok(PreparedRegistryApply {
-            next_configs,
+            plan,
             replacement_entries,
-            added,
-            updated,
-            removed,
-            unchanged,
         })
     }
 
@@ -2620,8 +2654,11 @@ impl SubprocessRegistry {
         &self,
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
-        let prepared = self.prepare_configs(configs).await?;
-        Ok(prepared.report(self.version.load(Ordering::SeqCst)))
+        let plan = self.plan_configs(configs).await?;
+        for connector_id in &plan.replacement_ids {
+            validate_registry_config(&plan.next_configs[connector_id])?;
+        }
+        Ok(plan.report(self.version.load(Ordering::SeqCst)))
     }
 
     async fn apply_configs(
@@ -2629,12 +2666,12 @@ impl SubprocessRegistry {
         configs: Vec<ConnectorConfig>,
     ) -> HostResult<ConnectorInventoryApplyReport> {
         let mut prepared = self.prepare_configs(configs).await?;
-        let changed = prepared.changed();
+        let changed = prepared.plan.changed();
 
         let mut state = self.state.write().await;
         let mut current_entries = std::mem::take(&mut state.connectors);
         let mut next_entries = HashMap::new();
-        let next_configs = std::mem::take(&mut prepared.next_configs);
+        let next_configs = std::mem::take(&mut prepared.plan.next_configs);
         for (connector_id, _config) in next_configs {
             if let Some(entry) = prepared.replacement_entries.remove(&connector_id) {
                 next_entries.insert(connector_id, entry);
@@ -2655,7 +2692,7 @@ impl SubprocessRegistry {
             self.version.load(Ordering::SeqCst)
         };
 
-        Ok(prepared.report(registry_version))
+        Ok(prepared.plan.report(registry_version))
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
@@ -30547,6 +30584,213 @@ done"#;
         .await
         .expect("registry introspection should not hang");
         assert!(introspection.is_some());
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_preview_does_not_require_an_executable_or_mutate_inventory() {
+        let directory = tempfile::tempdir().expect("preview test directory");
+        let mut config = dispatcher_test_config("fcp.test.preview-missing:utility:1.0.0");
+        config.binary = directory
+            .path()
+            .join("missing-connector")
+            .display()
+            .to_string();
+        config.config = Some(json!({"endpoint": "https://example.invalid"}));
+        let registry = SubprocessRegistry::from_configs(Vec::new(), None)
+            .await
+            .expect("empty registry");
+
+        let preview = registry
+            .preview_configs(vec![config.clone()])
+            .await
+            .expect("static preview must not launch or configure a connector");
+        assert_eq!(preview.added, vec![config.id.clone()]);
+        assert_eq!(preview.registry_version, 1);
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version.load(Ordering::SeqCst), 1);
+
+        let error = registry
+            .apply_configs(vec![config])
+            .await
+            .expect_err("actual apply must still require a runnable executable");
+        assert!(error.to_string().contains("spawn failed"), "{error}");
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn registry_preview_plan_reports_all_changes_without_runtime_preparation() {
+        let unchanged = dispatcher_test_config("fcp.test.preview-unchanged:utility:1.0.0");
+        let old = dispatcher_test_config("fcp.test.preview-updated:utility:1.0.0");
+        let removed = dispatcher_test_config("fcp.test.preview-removed:utility:1.0.0");
+        let added_a = dispatcher_test_config("fcp.test.preview-added-a:utility:1.0.0");
+        let added_b = dispatcher_test_config("fcp.test.preview-added-b:utility:1.0.0");
+        let mut updated = old.clone();
+        updated.config = Some(json!({"changed": true}));
+        let current = [unchanged.clone(), old, removed.clone()]
+            .into_iter()
+            .map(|config| (config.id.parse().expect("connector id"), config))
+            .collect::<HashMap<_, _>>();
+        let plan = RegistryConfigPlan::new(
+            &current,
+            vec![
+                added_b.clone(),
+                updated.clone(),
+                unchanged.clone(),
+                added_a.clone(),
+            ],
+        )
+        .expect("plan inventory changes without executing dispatcher-test");
+
+        assert!(plan.changed());
+        let report = plan.report(7);
+        assert_eq!(report.added, vec![added_a.id.clone(), added_b.id.clone()]);
+        assert_eq!(report.updated, vec![updated.id.clone()]);
+        assert_eq!(report.removed, vec![removed.id]);
+        assert_eq!(report.unchanged, vec![unchanged.id]);
+        assert_eq!(report.registry_version, 7);
+        assert_eq!(
+            plan.replacement_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec![added_a.id, added_b.id, updated.id],
+        );
+
+        let no_change = RegistryConfigPlan::new(&current, current.values().cloned().collect())
+            .expect("unchanged inventory");
+        assert!(!no_change.changed());
+        assert!(no_change.replacement_ids.is_empty());
+    }
+
+    #[test]
+    fn registry_preview_plan_rejects_duplicate_and_invalid_connector_ids() {
+        let config = dispatcher_test_config("fcp.test.preview-duplicate:utility:1.0.0");
+        let error = RegistryConfigPlan::new(&HashMap::new(), vec![config.clone(), config.clone()])
+            .err()
+            .expect("duplicate connector ids must be rejected");
+        assert!(error.to_string().contains("duplicate connector id"));
+
+        let mut invalid = config;
+        invalid.id = "not a connector id".to_string();
+        let error = RegistryConfigPlan::new(&HashMap::new(), vec![invalid])
+            .err()
+            .expect("invalid connector ids must be rejected");
+        assert!(error.to_string().contains("invalid connector id"));
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_preview_preserves_static_configuration_validation() {
+        let directory = tempfile::tempdir().expect("preview validation directory");
+        let registry = SubprocessRegistry::from_configs(Vec::new(), None)
+            .await
+            .expect("empty registry");
+        let base = dispatcher_test_config("fcp.test.preview-invalid:utility:1.0.0");
+        let mut bad_version = base.clone();
+        bad_version.version = Some("not-semver".to_string());
+        let mut bad_prewarm = base.clone();
+        bad_prewarm.prewarm.strategy = PrewarmStrategy::Zygote;
+        let mut bad_network_claim = base.clone();
+        bad_network_claim.runtime_network_enforcement = RuntimeNetworkEnforcement::WasiSandbox;
+        let mut bad_manifest = base;
+        bad_manifest.manifest_path =
+            Some(directory.path().join("missing.toml").display().to_string());
+
+        for (config, expected) in [
+            (bad_version, "invalid version"),
+            (bad_prewarm, "zygote"),
+            (bad_network_claim, "non-empty allowed_operations"),
+            (bad_manifest, "failed to read manifest"),
+        ] {
+            let error = registry
+                .preview_configs(vec![config])
+                .await
+                .expect_err("static invalid configuration must still be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(registry.inventory().await.is_empty());
+        assert_eq!(registry.version.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_preview_does_not_execute_a_connector_startup_side_effect() {
+        let directory = tempfile::tempdir().expect("preview sentinel directory");
+        let sentinel = directory.path().join("connector started");
+        let mut config = dispatcher_test_config("fcp.test.preview-sentinel:utility:1.0.0");
+        config.binary = "/bin/sh".to_string();
+        config.args = vec![
+            "-c".to_string(),
+            "printf started > \"$1\"".to_string(),
+            "registry-preview-sentinel".to_string(),
+            sentinel.display().to_string(),
+        ];
+        let registry = SubprocessRegistry::from_configs(Vec::new(), None)
+            .await
+            .expect("empty registry");
+
+        registry
+            .preview_configs(vec![config.clone()])
+            .await
+            .expect("sentinel preview");
+        assert!(
+            !sentinel.exists(),
+            "preview must not execute the connector binary"
+        );
+
+        let applied = registry
+            .apply_configs(vec![config])
+            .await
+            .expect("actual apply");
+        assert_eq!(applied.registry_version, 2);
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read(&sentinel).is_ok_and(|bytes| bytes == b"started") {
+                fcp_async_core::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual apply must execute the same startup command");
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn registry_preview_inventory_handler_keeps_file_and_live_state_unchanged() {
+        let directory = tempfile::tempdir().expect("inventory preview directory");
+        let inventory_path = directory.path().join("connectors.json");
+        let state = test_app_state_with_connectors_file(
+            Vec::new(),
+            inventory_path.clone(),
+            Arc::new(HostAdminStateStore::new()),
+        )
+        .await;
+        let before = std::fs::read(&inventory_path).expect("initial inventory file");
+        let mut config = dispatcher_test_config("fcp.test.preview-handler:utility:1.0.0");
+        config.binary = directory
+            .path()
+            .join("missing-connector")
+            .display()
+            .to_string();
+
+        let Json(response) = connector_inventory_apply_handler(
+            State(Arc::clone(&state)),
+            Json(ConnectorInventoryMutationRequest {
+                kind: ConnectorInventoryMutationKind::Install,
+                dry_run: true,
+                connector: config.clone(),
+            }),
+        )
+        .await
+        .expect("dry-run install must not launch the nonexistent connector");
+
+        assert!(response.dry_run);
+        assert_eq!(response.apply.added, vec![config.id]);
+        assert_eq!(response.apply.registry_version, 1);
+        assert_eq!(response.inventory_size, 1);
+        assert!(state.registry.inventory().await.is_empty());
+        assert_eq!(state.registry.version.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(&inventory_path).expect("inventory file"),
+            before
+        );
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
