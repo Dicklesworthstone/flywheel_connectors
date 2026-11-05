@@ -113,7 +113,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Endpoint limit: `100`.
 - Event retention limit: `1000` events per endpoint.
 - Retained event data is also capped at `16 MiB` per endpoint and `64 MiB` across the connector, measured as serialized complete events. These are data budgets; allocator and parsed-JSON overhead are additional. The oldest arrivals are evicted when either budget is reached.
-- Event-body eviction never removes replay protection. Delivery IDs are limited to `1024` UTF-8 bytes and retained as fixed BLAKE3 digests, with a shared ceiling of `100000` identities. A new ID at capacity returns a nonretryable `507`; previously accepted IDs still return duplicate `409`.
+- Event-body eviction never removes replay protection. Public delivery IDs are limited to `1024` UTF-8 bytes. Each accepted delivery retains at most two `32`-byte BLAKE3 digests: its public ID and its authenticated replay identity. The limit is `100000` accepted deliveries per endpoint and across the connector, for at most `6.4 MB` of digest data plus hash-table overhead. New deliveries at capacity return a nonretryable `507`; previously accepted public IDs or authenticated identities still return duplicate `409`.
 - Health, doctor, and self-check expose replay exhaustion. Do not automatically clear or reconfigure the receiver to recover capacity: that would discard its replay history. Endpoint replacement requires an explicit operator continuity plan.
 - Recent-event queries select and limit borrowed records before copying payloads. A query no longer copies the entire store to return a small result.
 - Shared byte eviction may remove every retained body for an endpoint, so `min_buffer_events` is `0`; the `1000` count is a ceiling, not a minimum guarantee.
@@ -141,7 +141,7 @@ The current Webhook Receiver README slice documents the existing runtime surface
 - Headers are capped at `100` entries and `32 KiB` of names and values. Case-insensitive duplicate header names are rejected before signature verification.
 - Rate limiting is applied before and after signature verification.
 - Body timeout/cancellation inputs reject the ingest as timed out.
-- Duplicate events are rejected per endpoint/event ID with a conflict response.
+- Duplicate events are rejected per endpoint when either the public event ID or authenticated replay identity has already been accepted.
 - Stored headers redact the endpoint signature header plus authorization, cookie, signature, secret, and token-style headers.
 - Recent-event output hashes source IPs before returning them.
 
@@ -161,7 +161,7 @@ Native form bodies decode percent escapes and `+` spaces with strict UTF-8 valid
 
 Twilio JSON intake requires `body` with the exact original bytes and exactly one valid `bodySHA256` query parameter. Reserializing the same JSON value changes its hash. Nonempty form `params` are rejected for JSON, and a form request containing `bodySHA256` is rejected so changing Content-Type cannot bypass body authentication.
 
-Event ID precedence:
+Public event ID precedence:
 
 - input fields: `delivery_id`, `event_id`, `request_id`
 - headers: `X-GitHub-Delivery`, `X-Request-ID`, `Stripe-Request-Id`, `X-Slack-Request-Id`
@@ -169,6 +169,12 @@ Event ID precedence:
 - fallback: `evt_` plus a redacted hash of endpoint ID and raw body; Twilio forms use the normalized authenticated payload so equivalent field ordering and percent escapes deduplicate
 
 Twilio resource SIDs identify a message or call, not an individual delivery. Without an explicit delivery ID, successive status callbacks for one SID receive distinct IDs when their payload changes, while equivalent retries remain duplicates.
+
+Replay checks also use a separate identity derived after successful signature verification. Input delivery/request IDs and the listed transport headers remain public metadata; changing or removing them cannot make previously accepted authenticated content new. Reusing a public ID still returns `409`, even when authenticated content differs.
+
+For generic, GitHub, Stripe, and Slack, the authenticated identity hashes the exact raw body. Stripe and Slack timestamps are excluded, so a retry re-signed at another valid timestamp remains a duplicate. Identical authenticated content is conservatively treated as the same delivery within an endpoint, even if a sender assigns a fresh public ID.
+
+For Twilio, the identity hashes the exact verified signing string: signed URL/query plus canonical form fields, or the signed JSON URL carrying its validated body hash. Equivalent form encodings and ambiguous name/value boundaries that produce the same signed bytes are duplicates. A different signed URL/query may distinguish callbacks, but public-ID checks still apply; the fallback public ID does not include that URL/query.
 
 ## Operation Inventory
 

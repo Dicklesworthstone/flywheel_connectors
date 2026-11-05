@@ -3030,6 +3030,142 @@ mod tests {
     }
 
     #[test]
+    fn verified_body_replay_is_rejected_by_store_after_public_id_or_timestamp_changes() {
+        for provider in [
+            WebhookProvider::Generic,
+            WebhookProvider::GitHub,
+            WebhookProvider::Stripe,
+            WebhookProvider::Slack,
+        ] {
+            let mut store = WebhookStore::new();
+            let endpoint = store
+                .create_endpoint_profile(
+                    "/replay".into(),
+                    "secret".into(),
+                    Vec::new(),
+                    provider,
+                    provider.default_signature_header().into(),
+                    provider.default_signature_algorithm().into(),
+                )
+                .unwrap();
+            let record =
+                |store: &mut WebhookStore, raw_body: &str, delivery_id: &str, timestamp: i64| {
+                    let input = json!({"body": raw_body, "delivery_id": delivery_id});
+                    let mut headers = json!({"Content-Type": "application/json"});
+                    let data_to_sign = match provider {
+                        WebhookProvider::Generic | WebhookProvider::GitHub => raw_body.to_string(),
+                        WebhookProvider::Stripe => format!("{timestamp}.{raw_body}"),
+                        WebhookProvider::Slack => format!("v0:{timestamp}:{raw_body}"),
+                        WebhookProvider::Twilio => unreachable!(),
+                    };
+                    let signature =
+                        hex::encode(hmac_sha256("secret", data_to_sign.as_bytes()).unwrap());
+                    headers[endpoint.signature_header.as_str()] = match provider {
+                        WebhookProvider::Generic | WebhookProvider::GitHub => json!(signature),
+                        WebhookProvider::Stripe => json!(format!("t={timestamp},v1={signature}")),
+                        WebhookProvider::Slack => json!(format!("v0={signature}")),
+                        WebhookProvider::Twilio => unreachable!(),
+                    };
+                    if provider == WebhookProvider::Slack {
+                        headers["X-Slack-Request-Timestamp"] = json!(timestamp.to_string());
+                    }
+                    let headers = parse_headers(&json!({"headers": headers})).unwrap();
+                    let body = ingest_body(&input, 4096, false).unwrap();
+                    let proof =
+                        verify_endpoint_signature(&endpoint, &headers, &body, &input, 300).unwrap();
+                    let mut event = WebhookEvent::new(
+                        endpoint.endpoint_id.clone(),
+                        body.payload.clone(),
+                        true,
+                        None,
+                    );
+                    event.event_id =
+                        event_id_for_ingest(&input, &headers, &body.payload, &endpoint, raw_body)
+                            .unwrap();
+                    assert_eq!(event.event_id, delivery_id);
+                    store.record_authenticated_event(event, proof.replay_digest)
+                };
+            let timestamp = now_unix_seconds();
+            let body = r#"{"event_id":"signed-event","value":1}"#;
+            record(&mut store, body, "original", timestamp).unwrap();
+            assert!(matches!(
+                record(&mut store, body, "changed-public-id", timestamp),
+                Err(WebhookReceiverError::DuplicateEvent { .. })
+            ));
+            assert!(matches!(
+                record(&mut store, body, "resigned-retry", timestamp - 1),
+                Err(WebhookReceiverError::DuplicateEvent { .. })
+            ));
+            record(
+                &mut store,
+                r#"{"event_id":"signed-event","value":2}"#,
+                "distinct-body",
+                timestamp,
+            )
+            .unwrap();
+            assert_eq!(store.total_event_count(), 2);
+            assert_eq!(store.replay_event_count(), 2);
+        }
+    }
+
+    #[test]
+    fn verified_twilio_replay_uses_signed_bytes_and_query_at_store_admission() {
+        let mut store = WebhookStore::new();
+        store.set_public_base_url("https://example.com");
+        let endpoint = store
+            .create_endpoint_profile(
+                "/twilio".into(),
+                "12345".into(),
+                Vec::new(),
+                WebhookProvider::Twilio,
+                "X-Twilio-Signature".into(),
+                "twilio-hmac-sha1".into(),
+            )
+            .unwrap();
+        let record = |store: &mut WebhookStore, url: &str, raw_body: &str, delivery_id: &str| {
+            // These fixtures all authenticate the form suffix ABC, even when
+            // their parsed field boundaries or percent encodings differ.
+            let signature =
+                STANDARD.encode(hmac_sha1("12345", format!("{url}ABC").as_bytes()).unwrap());
+            let headers = twilio_test_headers("application/x-www-form-urlencoded", &signature);
+            let input = json!({"url": url, "body": raw_body, "delivery_id": delivery_id});
+            let body = ingest_body(&input, 4096, true).unwrap();
+            let proof = verify_endpoint_signature(&endpoint, &headers, &body, &input, 300).unwrap();
+            let mut event = WebhookEvent::new(
+                endpoint.endpoint_id.clone(),
+                body.payload.clone(),
+                true,
+                None,
+            );
+            event.event_id =
+                event_id_for_ingest(&input, &headers, &body.payload, &endpoint, raw_body).unwrap();
+            assert_eq!(event.event_id, delivery_id);
+            store.record_authenticated_event(event, proof.replay_digest)
+        };
+        let url = "https://example.com/twilio";
+        record(&mut store, url, "A=BC", "original").unwrap();
+        assert!(matches!(
+            record(&mut store, url, "AB=C", "changed-boundary"),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert!(matches!(
+            record(&mut store, url, "A=%42C&A=BC", "changed-encoding"),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        // Signed query context can distinguish callbacks; public IDs remain
+        // independently checked, so the second context receives a fresh ID.
+        record(
+            &mut store,
+            &format!("{url}?callback=second"),
+            "A=BC",
+            "second-query",
+        )
+        .unwrap();
+        assert_eq!(store.total_event_count(), 2);
+        assert_eq!(store.replay_event_count(), 2);
+    }
+
+    #[test]
     fn rate_limit_capacity_preserves_live_windows_and_reclaims_expired_clients() {
         let config = WebhookReceiverConfig::from_params(&json!({
             "rate_limit_max": 1,
