@@ -29,9 +29,10 @@ pub const MAX_REPLAY_IDS_PER_ENDPOINT: usize = 100_000;
 
 /// Maximum distinct delivery IDs retained across all registered endpoints.
 ///
-/// Fixed 32-byte digests bound the identity payload to 3.2 MB; hash-table
-/// allocation overhead is additional. The shared ceiling prevents every
-/// endpoint from independently allocating the full replay budget.
+/// Each accepted delivery retains at most two 32-byte digests: its public ID
+/// and its authenticated content identity. This bounds identity payloads to
+/// 6.4 MB; hash-table allocation overhead is additional. The shared ceiling
+/// prevents every endpoint from independently allocating the full budget.
 pub const MAX_REPLAY_IDS_TOTAL: usize = 100_000;
 
 /// Maximum UTF-8 byte length of a delivery ID.
@@ -106,6 +107,12 @@ pub struct WebhookStore {
     /// A digest collision is treated as a duplicate, conservatively denying
     /// a new delivery rather than permitting any previously accepted replay.
     event_ids: HashMap<String, HashSet<[u8; 32]>>,
+    /// Authenticated delivery digests, independent of unsigned public event IDs.
+    ///
+    /// Each successful admission adds at most one digest alongside one public
+    /// ID, so the existing delivery capacity bounds both indexes. Neither index
+    /// is changed on a failed admission or pruned when event bodies are evicted.
+    authenticated_deliveries: HashMap<String, HashSet<[u8; 32]>>,
     /// Monotonic arrival order, independent of caller-supplied event timestamps.
     next_event_sequence: u64,
 }
@@ -118,6 +125,7 @@ impl WebhookStore {
             endpoints: HashMap::new(),
             events: HashMap::new(),
             event_ids: HashMap::new(),
+            authenticated_deliveries: HashMap::new(),
             next_event_sequence: 0,
         }
     }
@@ -202,6 +210,8 @@ impl WebhookStore {
             .insert(endpoint.endpoint_id.clone(), EventBuffer::default());
         self.event_ids
             .insert(endpoint.endpoint_id.clone(), HashSet::new());
+        self.authenticated_deliveries
+            .insert(endpoint.endpoint_id.clone(), HashSet::new());
 
         Ok(endpoint)
     }
@@ -230,6 +240,7 @@ impl WebhookStore {
         }
         self.events.remove(endpoint_id);
         self.event_ids.remove(endpoint_id);
+        self.authenticated_deliveries.remove(endpoint_id);
         debug!(endpoint_id = %endpoint_id, "Deleted webhook endpoint");
         Ok(())
     }
@@ -275,6 +286,27 @@ impl WebhookStore {
 
     /// Record a received webhook event.
     pub fn record_event(&mut self, event: WebhookEvent) -> WebhookReceiverResult<()> {
+        self.record_event_inner(event, None)
+    }
+
+    /// Admit a verified delivery, checking both its public ID and authenticated
+    /// identity before changing replay indexes or retained event bodies.
+    ///
+    /// The digest must come from successful provider signature verification;
+    /// transport IDs and other unsigned metadata must never contribute to it.
+    pub(crate) fn record_authenticated_event(
+        &mut self,
+        event: WebhookEvent,
+        replay_digest: [u8; 32],
+    ) -> WebhookReceiverResult<()> {
+        self.record_event_inner(event, Some(replay_digest))
+    }
+
+    fn record_event_inner(
+        &mut self,
+        event: WebhookEvent,
+        replay_digest: Option<[u8; 32]>,
+    ) -> WebhookReceiverResult<()> {
         if !self.endpoints.contains_key(&event.endpoint_id) {
             return Err(WebhookReceiverError::EndpointNotFound {
                 endpoint_id: event.endpoint_id,
@@ -290,7 +322,13 @@ impl WebhookStore {
         let event_ids = self.event_ids.get(&event.endpoint_id);
         // Report known duplicates even when replay capacity is exhausted.
         // No identity or retained body is evicted to make room for a new ID.
-        if event_ids.is_some_and(|ids| ids.contains(&event_digest)) {
+        if event_ids.is_some_and(|ids| ids.contains(&event_digest))
+            || replay_digest.is_some_and(|digest| {
+                self.authenticated_deliveries
+                    .get(&event.endpoint_id)
+                    .is_some_and(|digests| digests.contains(&digest))
+            })
+        {
             return Err(WebhookReceiverError::DuplicateEvent {
                 endpoint_id: event.endpoint_id,
                 event_id: event.event_id,
@@ -349,6 +387,12 @@ impl WebhookStore {
             .entry(event.endpoint_id.clone())
             .or_default()
             .insert(event_digest);
+        if let Some(digest) = replay_digest {
+            self.authenticated_deliveries
+                .entry(event.endpoint_id.clone())
+                .or_default()
+                .insert(digest);
+        }
         let buffer = self.events.entry(event.endpoint_id.clone()).or_default();
         buffer.serialized_bytes += serialized_bytes;
         buffer.events.push_back(RetainedEvent {
@@ -486,6 +530,7 @@ impl WebhookStore {
         self.endpoints.clear();
         self.events.clear();
         self.event_ids.clear();
+        self.authenticated_deliveries.clear();
         self.next_event_sequence = 0;
     }
 }
@@ -791,6 +836,58 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_replay_checks_both_identities_without_claiming_failed_attempts() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/authenticated".into(), "secret".into(), vec![])
+            .unwrap();
+        let mut original = WebhookEvent::new(
+            endpoint.endpoint_id.clone(),
+            json!({"value": 1}),
+            true,
+            None,
+        );
+        original.event_id = "original".into();
+        store
+            .record_authenticated_event(original.clone(), [1; 32])
+            .unwrap();
+        let retained_bytes = store.retained_event_bytes();
+
+        let mut renamed = original.clone();
+        renamed.event_id = "renamed".into();
+        assert!(matches!(
+            store.record_authenticated_event(renamed.clone(), [1; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        // A new authenticated identity cannot reuse an existing public ID.
+        assert!(matches!(
+            store.record_authenticated_event(original.clone(), [2; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert_eq!(store.replay_event_count(), 1);
+        assert_eq!(
+            store.authenticated_deliveries[&endpoint.endpoint_id].len(),
+            1
+        );
+        assert_eq!(store.retained_event_bytes(), retained_bytes);
+
+        // Neither failed duplicate may consume its previously unseen identity.
+        store.record_authenticated_event(renamed, [2; 32]).unwrap();
+        assert_eq!(store.replay_event_count(), 2);
+        assert_eq!(
+            store.authenticated_deliveries[&endpoint.endpoint_id].len(),
+            2
+        );
+
+        let other = store
+            .create_endpoint("/other".into(), "secret".into(), vec![])
+            .unwrap();
+        original.endpoint_id = other.endpoint_id;
+        store.record_authenticated_event(original, [1; 32]).unwrap();
+        assert_eq!(store.total_event_count(), 3);
+    }
+
+    #[test]
     fn record_event_evicts_oldest_at_capacity() {
         let mut store = WebhookStore::new();
         let ep = store
@@ -823,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn record_event_duplicate_event_id_still_rejected_after_original_evicted() {
+    fn record_event_replay_identities_survive_original_body_eviction() {
         let mut store = WebhookStore::new();
         let ep = store
             .create_endpoint("/hooks/test".into(), "s".into(), vec![])
@@ -832,7 +929,7 @@ mod tests {
         let mut original =
             WebhookEvent::new(ep.endpoint_id.clone(), json!({"index": 0}), true, None);
         original.event_id = "evt_replay".into();
-        store.record_event(original).unwrap();
+        store.record_authenticated_event(original, [7; 32]).unwrap();
 
         for i in 1..=MAX_EVENTS_PER_ENDPOINT {
             let mut event =
@@ -866,6 +963,13 @@ mod tests {
                 event_id,
             } if endpoint_id == &ep.endpoint_id && event_id == "evt_replay"
         ));
+        let mut renamed = WebhookEvent::new(ep.endpoint_id, json!({"index": 0}), true, None);
+        renamed.event_id = "changed-unsigned-delivery-id".into();
+        assert!(matches!(
+            store.record_authenticated_event(renamed, [7; 32]),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert_eq!(store.replay_event_count(), MAX_EVENTS_PER_ENDPOINT + 1);
     }
 
     #[test]
@@ -885,7 +989,8 @@ mod tests {
             let endpoint = if index % 2 == 0 { &first } else { &second };
             let mut event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
             event.event_id = format!("delivery-{index}");
-            store.record_event(event).unwrap();
+            let digest = *blake3::hash(event.event_id.as_bytes()).as_bytes();
+            store.record_authenticated_event(event, digest).unwrap();
         }
         assert_eq!(store.replay_event_count(), MAX_REPLAY_IDS_TOTAL);
         assert_eq!(store.replay_capacity_remaining(), 0);
@@ -902,10 +1007,24 @@ mod tests {
         for endpoint in [&first, &second, &unused] {
             let event = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
             assert!(matches!(
-                store.record_event(event),
+                store.record_authenticated_event(event, [9; 32]),
                 Err(WebhookReceiverError::ReplayCapacityExceeded { .. })
             ));
         }
+        let mut renamed = WebhookEvent::new(first.endpoint_id.clone(), json!({}), true, None);
+        renamed.event_id = "changed-delivery-id".into();
+        assert!(matches!(
+            store.record_authenticated_event(renamed, *blake3::hash(b"delivery-0").as_bytes()),
+            Err(WebhookReceiverError::DuplicateEvent { .. })
+        ));
+        assert_eq!(
+            store
+                .authenticated_deliveries
+                .values()
+                .map(HashSet::len)
+                .sum::<usize>(),
+            MAX_REPLAY_IDS_TOTAL
+        );
         // A secret change does not discard replay identities or create room.
         store
             .rotate_endpoint_secret(&first.endpoint_id, "new-secret".into())
@@ -922,10 +1041,18 @@ mod tests {
 
         store.delete_endpoint(&first.endpoint_id).unwrap();
         assert_eq!(store.replay_event_count(), MAX_REPLAY_IDS_TOTAL / 2);
+        assert!(
+            !store
+                .authenticated_deliveries
+                .contains_key(&first.endpoint_id)
+        );
         assert_eq!(store.replay_exhausted_endpoint_count(), 0);
         assert!(store.retained_event_bytes() < retained_bytes);
         store
-            .record_event(WebhookEvent::new(unused.endpoint_id, json!({}), true, None))
+            .record_authenticated_event(
+                WebhookEvent::new(unused.endpoint_id, json!({}), true, None),
+                [9; 32],
+            )
             .unwrap();
         let mut replay = WebhookEvent::new(second.endpoint_id, json!({}), true, None);
         replay.event_id = "delivery-1".into();
@@ -936,6 +1063,7 @@ mod tests {
 
         store.clear();
         assert_eq!(store.replay_event_count(), 0);
+        assert!(store.authenticated_deliveries.is_empty());
         assert_eq!(store.replay_capacity_remaining(), MAX_REPLAY_IDS_TOTAL);
         assert_eq!(store.replay_exhausted_endpoint_count(), 0);
         assert_eq!(store.retained_event_bytes(), 0);
@@ -970,6 +1098,67 @@ mod tests {
         let empty_size = serde_json::to_vec(&event).unwrap().len();
         event.payload["value"] = json!("x".repeat(size.checked_sub(empty_size).unwrap()));
         event
+    }
+
+    #[test]
+    fn authenticated_admission_errors_preserve_both_replay_indexes_and_retention() {
+        let mut store = WebhookStore::new();
+        let endpoint = store
+            .create_endpoint("/atomic".into(), "secret".into(), vec![])
+            .unwrap();
+        store
+            .record_authenticated_event(sized_event(&endpoint.endpoint_id, "first", 512), [1; 32])
+            .unwrap();
+
+        let mut invalid_id = WebhookEvent::new(endpoint.endpoint_id.clone(), json!({}), true, None);
+        invalid_id.event_id = "x".repeat(MAX_EVENT_ID_BYTES + 1);
+        assert!(matches!(
+            store.record_authenticated_event(invalid_id, [2; 32]),
+            Err(WebhookReceiverError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            store.record_authenticated_event(
+                WebhookEvent::new("missing-endpoint".into(), json!({}), true, None),
+                [2; 32],
+            ),
+            Err(WebhookReceiverError::EndpointNotFound { .. })
+        ));
+        let oversized = sized_event(
+            &endpoint.endpoint_id,
+            "retry",
+            MAX_RETAINED_EVENT_BYTES_PER_ENDPOINT + 1,
+        );
+        assert!(matches!(
+            store.record_authenticated_event(oversized, [2; 32]),
+            Err(WebhookReceiverError::PayloadTooLarge { .. })
+        ));
+        store.next_event_sequence = u64::MAX;
+        assert!(matches!(
+            store.record_authenticated_event(
+                sized_event(&endpoint.endpoint_id, "retry", 512),
+                [2; 32]
+            ),
+            Err(WebhookReceiverError::Internal { .. })
+        ));
+        assert_eq!(store.replay_event_count(), 1);
+        assert_eq!(
+            store.authenticated_deliveries[&endpoint.endpoint_id].len(),
+            1
+        );
+        assert_eq!(store.total_event_count(), 1);
+        assert_eq!(store.retained_event_bytes(), 512);
+
+        store.next_event_sequence = 1;
+        store
+            .record_authenticated_event(sized_event(&endpoint.endpoint_id, "retry", 512), [2; 32])
+            .unwrap();
+        assert_eq!(store.replay_event_count(), 2);
+        assert_eq!(
+            store.authenticated_deliveries[&endpoint.endpoint_id].len(),
+            2
+        );
+        assert_eq!(store.total_event_count(), 2);
+        assert_eq!(store.retained_event_bytes(), 1024);
     }
 
     #[test]

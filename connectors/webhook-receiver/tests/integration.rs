@@ -871,6 +871,128 @@ async fn events_ingest_duplicate_delivery_is_rejected_without_recording_second_e
 }
 
 #[fcp_async_core::runtime::test]
+async fn events_ingest_authenticated_body_cannot_be_replayed_with_unsigned_ids() {
+    let mut c = setup_connector().await;
+    let body = r#"{"event_id":"signed-event","type":"changed"}"#;
+    let timestamp = unix_seconds();
+
+    for provider in ["generic", "github", "stripe", "slack"] {
+        let path = format!("/hooks/replay-{provider}");
+        let created = create_endpoint(&mut c, &path, provider, "secret").await;
+        let signed_headers = |timestamp: i64| match provider {
+            "generic" => json!({
+                "Content-Type": "application/json",
+                "X-Signature": hmac_sha256_hex("secret", body)
+            }),
+            "github" => json!({
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": format!("sha256={}", hmac_sha256_hex("secret", body))
+            }),
+            "stripe" => json!({
+                "Content-Type": "application/json",
+                "Stripe-Signature": format!(
+                    "t={timestamp},v1={}",
+                    hmac_sha256_hex("secret", &format!("{timestamp}.{body}"))
+                )
+            }),
+            "slack" => json!({
+                "Content-Type": "application/json",
+                "X-Slack-Request-Timestamp": timestamp.to_string(),
+                "X-Slack-Signature": format!(
+                    "v0={}",
+                    hmac_sha256_hex("secret", &format!("v0:{timestamp}:{body}"))
+                )
+            }),
+            _ => unreachable!(),
+        };
+        // Failed verification must not claim either replay identity.
+        assert_external_status(
+            ingest(
+                &mut c,
+                &path,
+                json!({"Content-Type": "application/json"}),
+                body,
+                "original",
+            )
+            .await,
+            401,
+        );
+        let accepted = ingest(&mut c, &path, signed_headers(timestamp), body, "original")
+            .await
+            .unwrap();
+        assert_eq!(accepted["event"]["event_id"], "original");
+        assert!(
+            accepted["ingest_log"]["signature"]
+                .get("replay_digest")
+                .is_none()
+        );
+
+        let input = json!({
+            "path": path,
+            "headers": signed_headers(timestamp),
+            "body": body
+        });
+        for field in ["delivery_id", "event_id", "request_id"] {
+            let mut attempt = input.clone();
+            attempt[field] = json!(format!("changed-{field}"));
+            assert_external_status(
+                c.handle_invoke(json!({
+                    "operation_id": "webhook.events.ingest", "input": attempt
+                }))
+                .await,
+                409,
+            );
+        }
+        for header in [
+            "X-GitHub-Delivery",
+            "X-Request-ID",
+            "Stripe-Request-Id",
+            "X-Slack-Request-Id",
+        ] {
+            let mut attempt = input.clone();
+            attempt["headers"][header] = json!(format!("changed-{header}"));
+            assert_external_status(
+                c.handle_invoke(json!({
+                    "operation_id": "webhook.events.ingest", "input": attempt
+                }))
+                .await,
+                409,
+            );
+        }
+        // Removing all unsigned aliases must not revive the signed payload ID.
+        assert_external_status(
+            c.handle_invoke(json!({
+                "operation_id": "webhook.events.ingest", "input": input
+            }))
+            .await,
+            409,
+        );
+        if matches!(provider, "stripe" | "slack") {
+            assert_external_status(
+                ingest(
+                    &mut c,
+                    &path,
+                    signed_headers(timestamp - 1),
+                    body,
+                    "resigned-retry",
+                )
+                .await,
+                409,
+            );
+        }
+        let recent = c
+            .handle_invoke(json!({
+                "operation_id": "webhook.events.recent",
+                "input": {"endpoint_id": created["endpoint_id"]}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(recent["events"].as_array().unwrap().len(), 1);
+        assert_eq!(recent["events"][0]["event_id"], "original");
+    }
+}
+
+#[fcp_async_core::runtime::test]
 async fn events_ingest_missing_signature_is_rejected_without_recording_event() {
     let mut c = setup_connector().await;
     let created = create_endpoint(&mut c, "/hooks/auth", "generic", "secret").await;
@@ -1330,6 +1452,24 @@ async fn events_ingest_twilio_json_binds_raw_bytes_and_rejects_content_type_swit
         .unwrap();
     assert_eq!(accepted["status_code"], 202);
 
+    assert_external_status(
+        c.handle_invoke(json!({
+            "operation_id": "webhook.events.ingest",
+            "input": {
+                "path": "/twilio",
+                "url": url,
+                "delivery_id": "changed-unsigned-json-delivery-id",
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Twilio-Signature": signature
+                },
+                "body": raw_body
+            }
+        }))
+        .await,
+        409,
+    );
+
     for (content_type, body) in [
         ("application/json", raw_body.trim_end()),
         (
@@ -1372,6 +1512,69 @@ async fn events_ingest_twilio_json_binds_raw_bytes_and_rejects_content_type_swit
         json!({"CallSid": "CA123", "text": "hello"})
     );
     assert_eq!(events[0]["event_id"], accepted["event"]["event_id"]);
+}
+
+#[fcp_async_core::runtime::test]
+async fn events_ingest_twilio_replay_identity_matches_signed_form_bytes_and_url() {
+    let mut c = setup_connector_with_config(json!({
+        "public_base_url": "https://example.com"
+    }))
+    .await;
+    let created = create_endpoint(&mut c, "/twilio", "twilio", "12345").await;
+    let url = "https://example.com/twilio";
+    let mut input = json!({
+        "path": "/twilio",
+        "url": url,
+        "delivery_id": "original",
+        "headers": {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Twilio-Signature": hmac_sha1_base64("12345", &format!("{url}ABC"))
+        },
+        "body": "A=BC"
+    });
+    c.handle_invoke(json!({"operation_id": "webhook.events.ingest", "input": input}))
+        .await
+        .unwrap();
+
+    // Both field-boundary changes and equivalent form encodings authenticate
+    // the exact same concatenated bytes. Neither may create a new replay key.
+    for (index, body) in ["AB=C", "A=%42C&A=BC"].into_iter().enumerate() {
+        input["body"] = json!(body);
+        input["delivery_id"] = json!(format!("changed-unsigned-id-{index}"));
+        assert_external_status(
+            c.handle_invoke(json!({"operation_id": "webhook.events.ingest", "input": input}))
+                .await,
+            409,
+        );
+    }
+
+    // A different signed query may represent a distinct callback. Public-ID
+    // deduplication still applies independently, so give it a distinct ID.
+    let other_url = format!("{url}?callback=second");
+    input["url"] = json!(other_url);
+    input["body"] = json!("A=BC");
+    input["delivery_id"] = json!("second-query");
+    input["headers"]["X-Twilio-Signature"] =
+        json!(hmac_sha1_base64("12345", &format!("{other_url}ABC")));
+    c.handle_invoke(json!({"operation_id": "webhook.events.ingest", "input": input}))
+        .await
+        .unwrap();
+
+    let recent = c
+        .handle_invoke(json!({
+            "operation_id": "webhook.events.recent",
+            "input": {"endpoint_id": created["endpoint_id"]}
+        }))
+        .await
+        .unwrap();
+    assert_eq!(recent["events"].as_array().unwrap().len(), 2);
+    assert!(
+        recent["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["payload"] == json!({"A": "BC"}))
+    );
 }
 
 #[fcp_async_core::runtime::test]
@@ -1424,6 +1627,7 @@ async fn events_ingest_twilio_accepts_status_changes_but_rejects_equivalent_form
                 "method": "POST",
                 "path": "/twilio",
                 "url": url,
+                "delivery_id": "changed-unsigned-status-delivery-id",
                 "headers": {
                     "Content-Type": "application/x-www-form-urlencoded",
                     "X-Twilio-Signature": retry_signature

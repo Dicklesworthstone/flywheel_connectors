@@ -282,6 +282,9 @@ struct SignatureProof {
     header: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<i64>,
+    /// Replay authority comes only from successfully authenticated bytes.
+    #[serde(skip)]
+    replay_digest: [u8; 32],
 }
 
 impl IngressState {
@@ -1277,7 +1280,8 @@ impl WebhookReceiverConnector {
             signature_valid: true,
             source_ip: source_ip.clone(),
         };
-        self.store.record_event(event)?;
+        self.store
+            .record_authenticated_event(event, signature.replay_digest)?;
 
         Ok(json!({
             "accepted": true,
@@ -1785,6 +1789,10 @@ fn verify_hmac_sha256_signature(
         algorithm: endpoint.signature_algorithm.clone(),
         header: endpoint.signature_header.clone(),
         timestamp: None,
+        replay_digest: blake3::derive_key(
+            "fcp.webhook-receiver.authenticated-body.v1",
+            body.raw_body.as_bytes(),
+        ),
     })
 }
 
@@ -1817,6 +1825,12 @@ fn verify_stripe_signature(
         algorithm: endpoint.signature_algorithm.clone(),
         header: endpoint.signature_header.clone(),
         timestamp: Some(parsed.timestamp),
+        // Providers can re-sign a retry at a new timestamp. Its authenticated
+        // body remains the same delivery even when transport metadata changes.
+        replay_digest: blake3::derive_key(
+            "fcp.webhook-receiver.authenticated-body.v1",
+            body.raw_body.as_bytes(),
+        ),
     })
 }
 
@@ -1861,6 +1875,10 @@ fn verify_slack_signature(
         algorithm: endpoint.signature_algorithm.clone(),
         header: endpoint.signature_header.clone(),
         timestamp: Some(timestamp),
+        replay_digest: blake3::derive_key(
+            "fcp.webhook-receiver.authenticated-body.v1",
+            body.raw_body.as_bytes(),
+        ),
     })
 }
 
@@ -1977,6 +1995,14 @@ fn verify_twilio_signature(
         algorithm: endpoint.signature_algorithm.clone(),
         header: endpoint.signature_header.clone(),
         timestamp: None,
+        // Hash the exact verified string, including the signed URL/query.
+        // Twilio concatenates form names and values without separators; JSON
+        // serialization would incorrectly distinguish ambiguous field splits.
+        // For JSON, the verified URL's bodySHA256 binds the exact raw body.
+        replay_digest: blake3::derive_key(
+            "fcp.webhook-receiver.twilio-signed-data.v1",
+            data_to_sign.as_bytes(),
+        ),
     })
 }
 
