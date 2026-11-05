@@ -3138,7 +3138,7 @@ struct PipeArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Include intermediate output from the source operation.
+    /// Include intermediate output from the source operation, including on failure.
     #[arg(long)]
     include_intermediate: bool,
 }
@@ -29391,8 +29391,26 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
             "The source output could not produce valid target input; the target was not attempted.",
         );
         outcome.payload["mapping_errors"] = json!(mapped.errors);
-        outcome.payload["validation_errors"] = json!(errors);
-        outcome.payload["intermediate"] = source_output;
+        // Validator messages and suggestions can quote mapped source values.
+        // Keep the default diagnostics useful without exposing those values.
+        outcome.payload["validation_errors"] = if args.include_intermediate {
+            json!(errors)
+        } else {
+            json!(
+                errors
+                    .iter()
+                    .map(|error| json!({
+                        "path": error["path"],
+                        "type": "target-schema-mismatch",
+                        "message": "Target input does not satisfy this field's schema.",
+                        "suggestion": "Check the target schema; use --include-intermediate for detailed diagnostics.",
+                    }))
+                    .collect::<Vec<_>>()
+            )
+        };
+        if args.include_intermediate {
+            outcome.payload["intermediate"] = source_output;
+        }
         outcome.payload["execution"] = json!({
             "idempotency_key": run_key,
             "source": source_result.evidence,
@@ -29424,7 +29442,9 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
                 "idempotency_key": run_key,
                 "source": source_result.evidence,
             });
-            outcome.payload["intermediate"] = source_output;
+            if args.include_intermediate {
+                outcome.payload["intermediate"] = source_output;
+            }
             return Ok(outcome);
         }
     };
@@ -29462,7 +29482,7 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
     } else if let Some(output) = target_result.output {
         payload["result"] = output;
     }
-    if args.include_intermediate || !target_result.exit_code.is_success() {
+    if args.include_intermediate {
         payload["intermediate"] = source_output;
     }
     CommandEnvelope::new(CommandAvailability::LiveRuntime, "pipe").inject_into(&mut payload);
@@ -49059,23 +49079,28 @@ deny_ptrace = true
     }
 
     #[test]
-    fn execute_pipe_stops_after_each_failure_without_sending_the_next_stage() {
-        for failure in [
+    fn execute_pipe_failures_stop_dispatch_and_respect_intermediate_opt_in() {
+        for (failure, include_intermediate) in [
             "source-denied",
             "source-error",
             "missing-path",
             "wrong-type",
             "target-denied",
             "target-error",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|failure| [false, true].map(|include| (failure, include)))
+        {
             let temp_dir = tempfile::tempdir().expect("pipe tempdir");
             let _history = super::install_test_history_path(temp_dir.path().join("history.jsonl"));
             let token = test_capability_token_arg();
             let source_output = if failure == "wrong-type" {
-                json!({"title": 17})
+                json!({"title": 17, "private_note": "private-source-field"})
             } else {
-                json!({"title": "An issue"})
+                json!({"title": "An issue", "private_note": "private-source-field"})
             };
+            let mut source_response = mock_invoke_response_json(source_output.clone());
+            source_response["receipt_id"] = json!(fcp_core::ObjectId::from_bytes([0x71; 32]));
             let provider_error = serde_json::to_value(InvokeResponse::error(
                 RequestId::random(),
                 fcp_core::FcpError::Internal {
@@ -49094,7 +49119,7 @@ deny_ptrace = true
                     if failure == "source-error" {
                         provider_error.clone()
                     } else {
-                        mock_invoke_response_json(source_output.clone())
+                        source_response.clone()
                     },
                 ));
             }
@@ -49109,7 +49134,7 @@ deny_ptrace = true
             }
             let expected_requests = routes.len();
             let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
-            let (exit_code, payload) = execute_json(&[
+            let mut args = vec![
                 "fwc",
                 "--json",
                 "--host",
@@ -49129,7 +49154,13 @@ deny_ptrace = true
                 &token,
                 "--capability-token",
                 &token,
-            ]);
+                "--idempotency-key",
+                "pipe-output-visibility",
+            ];
+            if include_intermediate {
+                args.push("--include-intermediate");
+            }
+            let (exit_code, payload) = execute_json(&args);
             server.join().expect("mock host thread should complete");
             let expected_exit = if failure.ends_with("denied") {
                 CliExitCode::PolicyDenied
@@ -49140,13 +49171,155 @@ deny_ptrace = true
             };
             assert_eq!(exit_code, expected_exit.into(), "{failure}: {payload}");
             assert_ne!(exit_code, CliExitCode::Success.into());
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests, "{failure}");
             assert_eq!(
-                request_log.lock().unwrap().len(),
-                expected_requests,
-                "{failure}"
+                payload["execution"]["idempotency_key"],
+                "pipe-output-visibility"
             );
             if !failure.starts_with("source-") {
+                let source = &payload["execution"]["source"];
+                let source_request: Value = serde_json::from_str(&requests[4].1).unwrap();
+                assert_eq!(source["request_id"], source_request["id"]);
+                assert_eq!(source["idempotency_key"], source_request["idempotency_key"]);
+                assert_eq!(source["status"], "ok");
+                assert_eq!(source["invoke_attempted"], true);
+                assert_eq!(source["response"]["id"], source_request["id"]);
+                assert_eq!(source["response"]["status"], source_response["status"]);
+                assert_eq!(
+                    source["response"]["receipt_id"],
+                    source_response["receipt_id"]
+                );
+                assert!(source["response"].get("result").is_none());
+            }
+            if failure.starts_with("target-") {
+                let target = &payload["execution"]["target"];
+                let target_preflight: Value = serde_json::from_str(&requests[5].1).unwrap();
+                assert_eq!(target["request_id"], target_preflight["request_id"]);
+                assert!(target["idempotency_key"].is_string());
+                assert_eq!(target["invoke_attempted"], failure == "target-error");
+                if failure == "target-denied" {
+                    assert_eq!(target["status"], "denied");
+                    assert_eq!(target["preflight"]["allowed"], false);
+                } else {
+                    assert_eq!(target["status"], "error");
+                    assert!(target["response"]["error"].is_object());
+                }
+            } else {
+                assert!(payload["execution"].get("target").is_none());
+            }
+            if include_intermediate && !failure.starts_with("source-") {
                 assert_eq!(payload["intermediate"], source_output, "{failure}");
+            } else {
+                assert!(
+                    payload.get("intermediate").is_none(),
+                    "{failure}: {payload}"
+                );
+                assert!(!payload.to_string().contains("private-source-field"));
+            }
+        }
+    }
+
+    #[test]
+    fn execute_pipe_validation_diagnostics_require_intermediate_opt_in() {
+        for (source_value, field_schema) in [
+            (json!("mapped-source-secret"), json!({"type": "array"})),
+            (json!("mapped-source-secret"), json!({"type": "number"})),
+            (
+                json!(-741_896_527_431_i64),
+                json!({"type": "number", "minimum": 0}),
+            ),
+            (
+                json!(741_896_527_431_i64),
+                json!({"type": "number", "maximum": 0}),
+            ),
+        ] {
+            let sensitive_value = source_value
+                .as_str()
+                .map_or_else(|| source_value.to_string(), str::to_owned);
+            for include_intermediate in [false, true] {
+                let temp_dir = tempfile::tempdir().expect("pipe tempdir");
+                let _history =
+                    super::install_test_history_path(temp_dir.path().join("history.jsonl"));
+                let token = test_capability_token_arg();
+                let source_output = json!({"title": source_value});
+                let receipt_id = json!(fcp_core::ObjectId::from_bytes([0x73; 32]));
+                let mut source_response = mock_invoke_response_json(source_output.clone());
+                source_response["receipt_id"] = receipt_id.clone();
+                let mut routes = pipe_mock_catalog(false);
+                routes[2].1["tools"][0]["input_schema"]["properties"]["text"] =
+                    field_schema.clone();
+                routes.extend([
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ),
+                    ("POST /rpc/invoke".to_owned(), source_response),
+                ]);
+                let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+                let mut args = vec![
+                    "fwc",
+                    "--json",
+                    "--host",
+                    &host,
+                    "pipe",
+                    "github.search_issues",
+                    "slack.post_message",
+                    "--input",
+                    r#"{"query":"open"}"#,
+                    "--map",
+                    "title -> text",
+                    "--source-capability-token",
+                    &token,
+                    "--capability-token",
+                    &token,
+                    "--idempotency-key",
+                    "pipe-validation-visibility",
+                ];
+                if include_intermediate {
+                    args.push("--include-intermediate");
+                }
+                let (exit_code, payload) = execute_json(&args);
+                server.join().expect("mock host thread should complete");
+                assert_eq!(exit_code, CliExitCode::Validation.into(), "{payload}");
+                assert_eq!(payload["stage"], "mapping");
+                assert_eq!(payload["error"]["type"], "invalid-target-input");
+                assert_eq!(payload["mapping_errors"], json!([]));
+                let diagnostics = payload["validation_errors"].as_array().unwrap();
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0]["path"], "text");
+                if include_intermediate {
+                    assert_eq!(payload["intermediate"], source_output);
+                    assert!(
+                        payload["validation_errors"]
+                            .to_string()
+                            .contains(&sensitive_value)
+                    );
+                } else {
+                    assert!(payload.get("intermediate").is_none());
+                    assert!(!payload.to_string().contains(&sensitive_value), "{payload}");
+                    assert_eq!(diagnostics[0]["type"], "target-schema-mismatch");
+                    assert_eq!(
+                        diagnostics[0]["message"],
+                        "Target input does not satisfy this field's schema."
+                    );
+                }
+                let requests = request_log.lock().unwrap();
+                assert_eq!(requests.len(), 5);
+                let source_request: Value = serde_json::from_str(&requests[4].1).unwrap();
+                let source = &payload["execution"]["source"];
+                assert_eq!(source["request_id"], source_request["id"]);
+                assert_eq!(source["idempotency_key"], source_request["idempotency_key"]);
+                assert_eq!(source["status"], "ok");
+                assert_eq!(source["invoke_attempted"], true);
+                assert_eq!(source["response"]["id"], source_request["id"]);
+                assert_eq!(source["response"]["receipt_id"], receipt_id);
+                assert!(source["response"].get("result").is_none());
+                assert!(payload["execution"].get("target").is_none());
+                assert_eq!(
+                    payload["execution"]["idempotency_key"],
+                    "pipe-validation-visibility"
+                );
             }
         }
     }
