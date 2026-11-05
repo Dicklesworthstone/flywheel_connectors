@@ -3125,8 +3125,9 @@ struct PipeArgs {
     #[arg(long)]
     target_lease_seq: Option<u64>,
 
-    /// Stable key for deliberately retrying this pipe. Each stage gets its own derived key.
-    #[arg(long)]
+    /// Run namespace for intentional retries; each stage has a payload-independent key.
+    /// Reusing a key does not authorize replay of uncertain effects.
+    #[arg(long, value_name = "KEY", value_parser = parse_workflow_idempotency_key)]
     idempotency_key: Option<String>,
 
     /// Target capability and approvals. Approval tokens are checked separately for each stage.
@@ -28977,6 +28978,7 @@ struct PipeStageOutcome {
     exit_code: CliExitCode,
     evidence: Value,
     output: Option<Value>,
+    failure: Option<DispatchOutcome>,
 }
 
 /// Execute one literal JSON input through the same admission and invoke routes
@@ -28991,17 +28993,22 @@ fn execute_pipe_stage(
     auth: &ResolvedLiveAuth,
     run_key: &str,
     lease_seq: Option<u64>,
+    mode: PipelinePlanMode,
     preflight_only: bool,
 ) -> Result<PipeStageOutcome> {
-    let request_id = derive_live_request_id(
+    // Retrying a stage preserves its effect identity even if the source input
+    // or mapped output changes. The host then detects a conflicting effect.
+    let (request_id, idempotency_key) = workflow_step_identity(
+        "pipe",
+        "pipe",
+        mode,
+        run_key,
+        stage,
         resolved.connector.summary.id.as_str(),
         &resolved.operation.name,
         zone,
         input,
-        Some(run_key),
-        Some(stage),
     )?;
-    let idempotency_key = (!preflight_only).then(|| request_id.to_string());
     let request = build_live_invoke_request(
         resolved.connector.summary.id.as_str(),
         &resolved.operation.name,
@@ -29013,7 +29020,16 @@ fn execute_pipe_stage(
         lease_seq,
         None,
     )?;
-    let preflight = client.preflight(&HostPreflightRequest {
+    let mut evidence = json!({
+        "stage": stage,
+        "connector_id": resolved.connector.summary.id.as_str(),
+        "operation": resolved.operation.name,
+        "request_id": request_id.to_string(),
+        "idempotency_key": idempotency_key,
+        "lease_seq": lease_seq,
+        "invoke_attempted": false,
+    });
+    let preflight = match client.preflight(&HostPreflightRequest {
         holder_proof: request.holder_proof.clone(),
         request_id: request_id.clone(),
         connector_id: request.connector_id.clone(),
@@ -29024,17 +29040,35 @@ fn execute_pipe_stage(
         lease_seq,
         capability_token: Some(auth.capability_token.clone()),
         approval_tokens: auth.approval_tokens.clone(),
-    })?;
+    }) {
+        Ok(preflight) => preflight,
+        Err(_) => {
+            evidence["status"] = json!("error");
+            evidence["reason"] = json!("preflight-unavailable");
+            let mut failure = pipe_error(
+                stage,
+                "pipe-preflight-unavailable",
+                "The host did not return a usable preflight response. This stage was not invoked; inspect any earlier stage evidence before repeating the pipe.",
+            );
+            failure.exit_code = CliExitCode::Transport;
+            failure.payload["phase"] = json!("preflight");
+            failure.payload["request_id"] = json!(request_id.to_string());
+            failure.payload["invoke_attempted"] = json!(false);
+            failure.payload["automatic_retry_allowed"] = json!(false);
+            failure.payload["error"]["recoverable"] = json!(false);
+            let mut envelope = CommandEnvelope::new(CommandAvailability::Unavailable, "pipe");
+            envelope.recoverable = false;
+            envelope.inject_into(&mut failure.payload);
+            return Ok(PipeStageOutcome {
+                exit_code: failure.exit_code,
+                evidence,
+                output: None,
+                failure: Some(failure),
+            });
+        }
+    };
     let preflight_value = serde_json::to_value(&preflight)?;
-    let mut evidence = json!({
-        "stage": stage,
-        "connector_id": resolved.connector.summary.id.as_str(),
-        "operation": resolved.operation.name,
-        "request_id": request_id.to_string(),
-        "idempotency_key": idempotency_key,
-        "lease_seq": lease_seq,
-        "preflight": preflight_value,
-    });
+    evidence["preflight"] = preflight_value.clone();
     if !preflight.allowed {
         evidence["status"] = json!("denied");
         let _ = append_history_entry(
@@ -29052,6 +29086,7 @@ fn execute_pipe_stage(
             exit_code: CliExitCode::PolicyDenied,
             evidence,
             output: None,
+            failure: None,
         });
     }
     if preflight_only {
@@ -29060,10 +29095,39 @@ fn execute_pipe_stage(
             exit_code: CliExitCode::Success,
             evidence,
             output: None,
+            failure: None,
         });
     }
+    evidence["invoke_attempted"] = json!(true);
     let started = std::time::Instant::now();
-    let response = client.invoke(&request)?;
+    let response = match client.invoke(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            let failure = error
+                .downcast_ref::<invocation_cmd::InvokeOutcomeUnknown>()
+                .map_or_else(
+                    || {
+                        invocation_cmd::InvokeOutcomeUnknown::from_request(
+                            &request,
+                            &client.endpoint,
+                            &error,
+                        )
+                        .dispatch("pipe")
+                    },
+                    |unknown| unknown.dispatch("pipe"),
+                );
+            evidence["status"] = json!("outcome_unknown");
+            evidence["reason"] = json!("invoke-outcome-unknown");
+            evidence["automatic_retry_allowed"] = json!(false);
+            evidence["inspection"] = failure.payload["inspection"].clone();
+            return Ok(PipeStageOutcome {
+                exit_code: failure.exit_code,
+                evidence,
+                output: None,
+                failure: Some(failure),
+            });
+        }
+    };
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let response_value = serde_json::to_value(&response)?;
     let success = response.status == InvokeStatus::Ok;
@@ -29097,6 +29161,7 @@ fn execute_pipe_stage(
         },
         evidence,
         output: success.then_some(response.result).flatten(),
+        failure: None,
     })
 }
 
@@ -29250,6 +29315,11 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
         .idempotency_key
         .clone()
         .unwrap_or_else(|| RequestId::random().to_string());
+    let mode = if args.dry_run {
+        PipelinePlanMode::DryRun
+    } else {
+        PipelinePlanMode::Run
+    };
     let source_result = match execute_pipe_stage(
         &client,
         &source,
@@ -29259,15 +29329,30 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
         &source_auth,
         &run_key,
         args.source_lease_seq,
+        mode,
         false,
     ) {
         Ok(result) => result,
-        Err(error) => {
-            let mut outcome = pipe_error("source", "source-transport-error", error.to_string());
+        Err(_) => {
+            let mut outcome = pipe_error(
+                "source",
+                "source-transport-error",
+                "The source stage could not complete. The target was not attempted; inspect host history before repeating the pipe.",
+            );
             outcome.exit_code = CliExitCode::Transport;
+            outcome.payload["automatic_retry_allowed"] = json!(false);
+            outcome.payload["execution"] = json!({"idempotency_key": run_key});
             return Ok(outcome);
         }
     };
+    if let Some(mut failure) = source_result.failure {
+        failure.payload["stage"] = json!("source");
+        failure.payload["execution"] = json!({
+            "idempotency_key": run_key,
+            "source": source_result.evidence,
+        });
+        return Ok(failure);
+    }
     if !source_result.exit_code.is_success() {
         return Ok(DispatchOutcome {
             payload: json!({
@@ -29275,7 +29360,10 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
                 "command": "pipe",
                 "stage": "source",
                 "source": "host-admin-api",
-                "execution": { "source": source_result.evidence },
+                "execution": {
+                    "idempotency_key": run_key,
+                    "source": source_result.evidence,
+                },
             }),
             exit_code: source_result.exit_code,
         });
@@ -29287,7 +29375,10 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
             "The source returned no output; the target was not attempted.",
         );
         outcome.exit_code = CliExitCode::Connector;
-        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        outcome.payload["execution"] = json!({
+            "idempotency_key": run_key,
+            "source": source_result.evidence,
+        });
         return Ok(outcome);
     };
     let mapped = pipe::apply_mapping(&source_output, &mapping);
@@ -29302,7 +29393,10 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
         outcome.payload["mapping_errors"] = json!(mapped.errors);
         outcome.payload["validation_errors"] = json!(errors);
         outcome.payload["intermediate"] = source_output;
-        outcome.payload["execution"] = json!({"source": source_result.evidence});
+        outcome.payload["execution"] = json!({
+            "idempotency_key": run_key,
+            "source": source_result.evidence,
+        });
         return Ok(outcome);
     }
     let target_result = match execute_pipe_stage(
@@ -29314,17 +29408,38 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
         &target_auth,
         &run_key,
         args.target_lease_seq,
+        mode,
         args.dry_run,
     ) {
         Ok(result) => result,
-        Err(error) => {
-            let mut outcome = pipe_error("target", "target-transport-error", error.to_string());
+        Err(_) => {
+            let mut outcome = pipe_error(
+                "target",
+                "target-transport-error",
+                "The target stage could not complete. Inspect the retained source evidence and host history before repeating the pipe.",
+            );
             outcome.exit_code = CliExitCode::Transport;
-            outcome.payload["execution"] = json!({"source": source_result.evidence});
+            outcome.payload["automatic_retry_allowed"] = json!(false);
+            outcome.payload["execution"] = json!({
+                "idempotency_key": run_key,
+                "source": source_result.evidence,
+            });
             outcome.payload["intermediate"] = source_output;
             return Ok(outcome);
         }
     };
+    if let Some(mut failure) = target_result.failure {
+        failure.payload["stage"] = json!("target");
+        failure.payload["execution"] = json!({
+            "idempotency_key": run_key,
+            "source": source_result.evidence,
+            "target": target_result.evidence,
+        });
+        if args.include_intermediate {
+            failure.payload["intermediate"] = source_output;
+        }
+        return Ok(failure);
+    }
     let mut payload = json!({
         "status": if target_result.exit_code.is_success() {
             "ok"
@@ -29336,7 +29451,11 @@ fn pipe_dispatch(args: &PipeArgs, explicit_host: Option<&str>) -> Result<Dispatc
         "zone": zone,
         "plan": plan,
         "source": "host-admin-api",
-        "execution": { "source": source_result.evidence, "target": target_result.evidence },
+        "execution": {
+            "idempotency_key": run_key,
+            "source": source_result.evidence,
+            "target": target_result.evidence,
+        },
     });
     if args.dry_run {
         payload["plan"]["preview_input"] = mapped.output;
@@ -48666,6 +48785,277 @@ deny_ptrace = true
             target_preflight["holder_proof"],
             target_invoke["holder_proof"]
         );
+    }
+
+    #[test]
+    fn execute_pipe_run_identity_separates_new_work_from_explicit_retries() {
+        let tempdir = TempDir::new().unwrap();
+        let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+        let token = test_capability_token_arg();
+        let mut runs = Vec::new();
+        for (run_key, query, title, dry_run) in [
+            (None, "open", "same result", false),
+            (None, "open", "same result", false),
+            (Some("pipe-run-1"), "open", "same result", false),
+            (Some("pipe-run-1"), "open", "same result", false),
+            (Some("pipe-run-1"), "changed", "changed result", false),
+            (Some("pipe-run-1"), "open", "same result", true),
+        ] {
+            let mut routes = pipe_mock_catalog(false);
+            routes.extend([
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+                (
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"title": title})),
+                ),
+                (
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ),
+            ]);
+            if !dry_run {
+                routes.push((
+                    "POST /rpc/invoke".to_owned(),
+                    mock_invoke_response_json(json!({"delivered": true})),
+                ));
+            }
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let mut args = vec![
+                "fwc".to_owned(),
+                "--json".to_owned(),
+                "--host".to_owned(),
+                host,
+                "pipe".to_owned(),
+                "github.search_issues".to_owned(),
+                "slack.post_message".to_owned(),
+                "--input".to_owned(),
+                json!({"query": query}).to_string(),
+                "--map".to_owned(),
+                "title -> text".to_owned(),
+                "--source-capability-token".to_owned(),
+                token.clone(),
+                "--capability-token".to_owned(),
+                token.clone(),
+            ];
+            if let Some(run_key) = run_key {
+                args.extend(["--idempotency-key".to_owned(), run_key.to_owned()]);
+            }
+            if dry_run {
+                args.push("--dry-run".to_owned());
+            }
+            let (exit_code, payload) =
+                execute_json(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            server.join().expect("pipe mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Success.into(), "{payload}");
+            let reported_key = payload["execution"]["idempotency_key"]
+                .as_str()
+                .expect("every pipe execution reports its namespace")
+                .to_owned();
+            if let Some(run_key) = run_key {
+                assert_eq!(reported_key, run_key);
+            }
+            let requests = request_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route == "POST /rpc/invoke")
+                .map(|(_, body)| serde_json::from_str::<super::InvokeRequest>(body).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), if dry_run { 1 } else { 2 });
+            if dry_run {
+                assert!(payload["execution"]["source"]["idempotency_key"].is_null());
+                assert!(payload["execution"]["target"]["idempotency_key"].is_null());
+                assert_eq!(payload["execution"]["target"]["invoke_attempted"], false);
+            }
+            runs.push((reported_key, requests));
+        }
+
+        assert_ne!(runs[0].0, runs[1].0);
+        for stage in 0..2 {
+            assert_ne!(runs[0].1[stage].id, runs[1].1[stage].id);
+            assert_ne!(
+                runs[0].1[stage].idempotency_key,
+                runs[1].1[stage].idempotency_key
+            );
+            assert_eq!(runs[2].1[stage].id, runs[3].1[stage].id);
+            assert_eq!(
+                runs[2].1[stage].idempotency_key,
+                runs[3].1[stage].idempotency_key
+            );
+            runs[2].1[stage].validate_idempotency_key().unwrap();
+
+            let original = &runs[2].1[stage];
+            let changed = &runs[4].1[stage];
+            assert_ne!(original.input, changed.input);
+            assert_ne!(original.id, changed.id);
+            assert_eq!(original.idempotency_key, changed.idempotency_key);
+            let binding = |request| {
+                fcp_host::InvocationIdempotency::from_request(request, "pipe-test-principal")
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(
+                binding(original).scope_digest,
+                binding(changed).scope_digest
+            );
+            assert_ne!(
+                binding(original).effect_digest,
+                binding(changed).effect_digest
+            );
+        }
+        assert_ne!(runs[2].1[0].idempotency_key, runs[2].1[1].idempotency_key);
+        assert_ne!(runs[2].1[0].id, runs[5].1[0].id);
+        assert!(runs[5].1[0].idempotency_key.is_none());
+    }
+
+    #[test]
+    fn execute_pipe_retains_stage_identity_when_host_responses_fail() {
+        for (stage, phase, disconnected) in [
+            ("source", "preflight", false),
+            ("target", "preflight", false),
+            ("source", "invoke", false),
+            ("target", "invoke", false),
+            ("source", "invoke", true),
+            ("target", "invoke", true),
+        ] {
+            let tempdir = TempDir::new().unwrap();
+            let _history = super::install_test_history_path(tempdir.path().join("history.jsonl"));
+            let token = test_capability_token_arg();
+            let mut routes = pipe_mock_catalog(false);
+            if stage == "target" {
+                routes.extend([
+                    (
+                        "POST /rpc/preflight".to_owned(),
+                        mock_preflight_response_json(true),
+                    ),
+                    (
+                        "POST /rpc/invoke".to_owned(),
+                        mock_invoke_response_json(json!({"title": "private-source-result"})),
+                    ),
+                ]);
+            }
+            if phase == "invoke" {
+                routes.push((
+                    "POST /rpc/preflight".to_owned(),
+                    mock_preflight_response_json(true),
+                ));
+            }
+            // Closing the listener after preflight exercises a real failed
+            // invoke connection; the other cases return malformed host JSON.
+            if !disconnected {
+                routes.push((
+                    format!("POST /rpc/{phase}"),
+                    json!({"invalid_response": "private-reflected-diagnostic"}),
+                ));
+            }
+            let expected_requests = routes.len();
+            let (host, server, request_log) = spawn_mock_host_sequence_with_body_log(routes);
+            let (exit_code, payload) = execute_json(&[
+                "fwc",
+                "--json",
+                "--host",
+                &host,
+                "pipe",
+                "github.search_issues",
+                "slack.post_message",
+                "--input",
+                r#"{"query":"private-pipe-input"}"#,
+                "--map",
+                "title -> text",
+                "--source-capability-token",
+                &token,
+                "--capability-token",
+                &token,
+                "--idempotency-key",
+                "pipe-response-failure",
+            ]);
+            server.join().expect("pipe mock host should finish");
+            assert_eq!(exit_code, CliExitCode::Transport.into(), "{payload}");
+            assert_eq!(payload["stage"], stage);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(
+                payload["execution"]["idempotency_key"],
+                "pipe-response-failure"
+            );
+            assert!(!payload.to_string().contains("private-reflected-diagnostic"));
+            assert!(!payload.to_string().contains(&token));
+            let evidence = &payload["execution"][stage];
+            assert!(evidence["idempotency_key"].is_string());
+            let requests = request_log.lock().unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            let last_request: Value = serde_json::from_str(&requests.last().unwrap().1).unwrap();
+            let request_id = if phase == "invoke" && !disconnected {
+                &last_request["id"]
+            } else {
+                &last_request["request_id"]
+            };
+            assert_eq!(payload["request_id"], *request_id);
+            assert_eq!(evidence["request_id"], *request_id);
+
+            if phase == "invoke" {
+                assert_eq!(payload["error"]["type"], "invoke-outcome-unknown");
+                assert_eq!(payload["outcome"], "outcome_unknown");
+                assert_eq!(payload["availability"]["availability"], "unknown");
+                assert_eq!(payload["inspection"]["operation_id"], *request_id);
+                assert_eq!(payload["inspection"]["host_endpoint"], host);
+                assert_eq!(evidence["status"], "outcome_unknown");
+                assert_eq!(evidence["invoke_attempted"], true);
+                assert!(!payload.to_string().contains("private-pipe-input"));
+                assert!(!payload.to_string().contains("private-source-result"));
+                if !disconnected {
+                    assert_eq!(evidence["idempotency_key"], last_request["idempotency_key"]);
+                }
+            } else {
+                assert_eq!(payload["error"]["type"], "pipe-preflight-unavailable");
+                assert_eq!(payload["phase"], "preflight");
+                assert_eq!(evidence["status"], "error");
+                assert_eq!(evidence["invoke_attempted"], false);
+                assert!(payload.get("outcome").is_none());
+            }
+            if stage == "target" {
+                assert_eq!(payload["execution"]["source"]["status"], "ok");
+                assert_eq!(payload["execution"]["source"]["invoke_attempted"], true);
+                let source_request: Value = serde_json::from_str(&requests[4].1).unwrap();
+                assert_eq!(
+                    payload["execution"]["source"]["request_id"],
+                    source_request["id"]
+                );
+                assert!(
+                    payload["execution"]["source"]["response"]
+                        .get("result")
+                        .is_none()
+                );
+            } else {
+                assert!(payload["execution"].get("target").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pipe_run_namespace_rejects_invalid_keys() {
+        for key in [
+            "".to_owned(),
+            " \t".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(129),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "fwc",
+                    "pipe",
+                    "github.search_issues",
+                    "slack.post_message",
+                    "--map",
+                    "title -> text",
+                    "--idempotency-key",
+                    &key,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]
