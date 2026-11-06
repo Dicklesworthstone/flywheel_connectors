@@ -1,17 +1,20 @@
 //! Keychain-first credential store for connector authentication.
 //!
 //! Prefers the OS keychain via the `keyring` crate and falls back to an
-//! encrypted file at `~/.fwc/credentials.enc` when no supported keychain
-//! service is available. Credentials are never written in plaintext and are
-//! always redacted in display output.
+//! encrypted file at `~/.fwc/credentials.enc` only when an independent secret
+//! key is configured through `FWC_CREDENTIAL_STORE_KEY_FILE`. A missing
+//! keychain never authorizes encryption with public machine metadata.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -155,6 +158,25 @@ const NONCE_LEN: usize = 12;
 const KEYCHAIN_SERVICE_NAME: &str = "fwc-credentials";
 /// Synthetic keychain entry that stores the connector-id index.
 const KEYCHAIN_INDEX_ENTRY: &str = "__fwc_index__";
+/// External secret, provisioned independently of the encrypted credential file.
+const FILE_KEY_ENV: &str = "FWC_CREDENTIAL_STORE_KEY_FILE";
+
+enum FileEncryptionKey {
+    Supplied(Zeroizing<[u8; KEY_LEN]>),
+    ConfiguredFile(Option<PathBuf>),
+}
+
+impl FileEncryptionKey {
+    fn resolve(&self) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+        match self {
+            Self::Supplied(key) => Ok(Zeroizing::new(**key)),
+            Self::ConfiguredFile(Some(path)) => read_file_key(path),
+            Self::ConfiguredFile(None) => Err(format!(
+                "encrypted credential storage requires an independent secret key; configure {FILE_KEY_ENV} with a private 32-byte key file or restore the OS keychain. Legacy machine-identity-encrypted files are not opened automatically; re-import their credentials into a securely keyed store"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackendPreference {
@@ -219,29 +241,51 @@ impl KeychainClient for NativeKeychainClient {
     }
 }
 
-/// Derive an encryption key from machine identity.
-///
-/// Uses a combination of username and home directory path as the identity
-/// source, then derives a 256-bit key via SHA-256.
-fn derive_key() -> [u8; KEY_LEN] {
-    use sha2::{Digest, Sha256};
-
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown-user".to_string());
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"fwc-credential-store-v1:");
-    hasher.update(user.as_bytes());
-    hasher.update(b":");
-    hasher.update(home.as_bytes());
-
-    let result = hasher.finalize();
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&result);
-    key
+/// Read a provisioned key without deriving secret material from public data.
+fn read_file_key(path: &Path) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
+    if !std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect credential encryption key: {e}"))?
+        .is_file()
+    {
+        return Err(
+            "credential encryption key must be a regular file, not a symlink or device".to_owned(),
+        );
+    }
+    let file =
+        File::open(path).map_err(|e| format!("failed to open credential encryption key: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect credential encryption key: {e}"))?;
+    if !metadata.is_file() {
+        return Err("credential encryption key must be a regular file".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("credential encryption key must not be accessible to group or other users (use mode 0600 or 0400)".to_owned());
+        }
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(129)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read credential encryption key: {e}"))?;
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    if bytes.len() == KEY_LEN {
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+    if bytes.len() <= 128
+        && let Ok(encoded) = std::str::from_utf8(&bytes)
+        && encoded.trim().len() == KEY_LEN * 2
+        && hex::decode_to_slice(encoded.trim(), key.as_mut()).is_ok()
+    {
+        return Ok(key);
+    }
+    Err(
+        "credential encryption key must contain exactly 32 raw bytes or 64 hexadecimal digits"
+            .to_owned(),
+    )
 }
 
 /// Encrypt plaintext with ChaCha20-Poly1305.
@@ -297,7 +341,7 @@ fn decrypt(data: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>, String> {
 /// Credential store with a keychain-first backend and encrypted-file fallback.
 pub struct CredentialStore {
     path: PathBuf,
-    key: [u8; KEY_LEN],
+    key: FileEncryptionKey,
     backend_preference: BackendPreference,
     keychain_service: String,
     keychain_client: Option<Arc<dyn KeychainClient>>,
@@ -316,7 +360,9 @@ impl CredentialStore {
         let path = PathBuf::from(home).join(".fwc").join("credentials.enc");
         Self {
             path,
-            key: derive_key(),
+            key: FileEncryptionKey::ConfiguredFile(
+                std::env::var_os(FILE_KEY_ENV).map(PathBuf::from),
+            ),
             backend_preference: BackendPreference::PreferKeychain,
             keychain_service: KEYCHAIN_SERVICE_NAME.to_owned(),
             keychain_client: Some(Arc::new(NativeKeychainClient)),
@@ -327,7 +373,7 @@ impl CredentialStore {
     pub fn new(path: impl Into<PathBuf>, key: [u8; KEY_LEN]) -> Self {
         Self {
             path: path.into(),
-            key,
+            key: FileEncryptionKey::Supplied(Zeroizing::new(key)),
             backend_preference: BackendPreference::FileOnly,
             keychain_service: KEYCHAIN_SERVICE_NAME.to_owned(),
             keychain_client: None,
@@ -342,7 +388,7 @@ impl CredentialStore {
     ) -> Self {
         Self {
             path: path.into(),
-            key,
+            key: FileEncryptionKey::Supplied(Zeroizing::new(key)),
             backend_preference: BackendPreference::PreferKeychain,
             keychain_service: KEYCHAIN_SERVICE_NAME.to_owned(),
             keychain_client: Some(keychain_client),
@@ -501,7 +547,7 @@ impl CredentialStore {
         tracing::warn!(
             keychain_service = %self.keychain_service,
             error = %error,
-            "OS keychain unavailable, using encrypted file store."
+            "OS keychain unavailable; encrypted file fallback requires an independent secret key."
         );
     }
 
@@ -511,20 +557,59 @@ impl CredentialStore {
         }
         let encrypted = std::fs::read(&self.path)
             .map_err(|e| format!("failed to read credential store: {e}"))?;
-        let plaintext = decrypt(&encrypted, &self.key)?;
+        let key = self.key.resolve()?;
+        let plaintext = Zeroizing::new(decrypt(&encrypted, &key)?);
         serde_json::from_slice(&plaintext).map_err(|e| format!("credential store corrupted: {e}"))
     }
 
     fn save_file_data(&self, data: &StoreData) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
+        // Resolve the independent key before creating any fallback artifacts.
+        let key = self.key.resolve()?;
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create credential store directory: {e}"))?;
         }
-        let plaintext = serde_json::to_vec(data)
-            .map_err(|e| format!("failed to serialize credentials: {e}"))?;
-        let encrypted = encrypt(&plaintext, &self.key)?;
-        std::fs::write(&self.path, encrypted)
-            .map_err(|e| format!("failed to write credential store: {e}"))
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(data)
+                .map_err(|e| format!("failed to serialize credentials: {e}"))?,
+        );
+        let encrypted = encrypt(&plaintext, &key)?;
+        let temporary = self
+            .path
+            .with_extension(format!("enc.{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|e| format!("failed to create encrypted credential replacement: {e}"))?;
+        file.write_all(&encrypted)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("failed to persist encrypted credential replacement: {e}"))?;
+        drop(file);
+        std::fs::rename(&temporary, &self.path)
+            .map_err(|e| format!("failed to publish encrypted credential replacement: {e}"))?;
+        #[cfg(unix)]
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| {
+                    format!("credential replacement published, but directory sync failed: {e}")
+                })?;
+        }
+        Ok(())
     }
 
     fn add_to_file(&self, credential: Credential) -> Result<(), String> {
@@ -1639,6 +1724,156 @@ mod tests {
         let loaded = store.get("github").unwrap().unwrap();
         assert_eq!(loaded.get_field("token"), Some("ghp_abc123def456"));
         assert_eq!(store.list_ids().unwrap(), vec!["github"]);
+    }
+
+    #[test]
+    fn unavailable_keychain_without_independent_key_never_writes_credentials() {
+        let mut store = temp_keychain_store(Arc::new(MockKeychainClient::unavailable()));
+        store.key = FileEncryptionKey::ConfiguredFile(None);
+        let error = store
+            .add(Credential::new("github", sample_fields(), None))
+            .unwrap_err();
+        assert!(error.contains(FILE_KEY_ENV));
+        assert!(!error.contains("ghp_abc123def456"));
+        assert!(!store.path().exists());
+        assert!(!store.path().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn available_keychain_does_not_require_or_create_a_file_key() {
+        let mut store = temp_keychain_store(Arc::new(MockKeychainClient::available()));
+        store.key = FileEncryptionKey::ConfiguredFile(None);
+        store
+            .add(Credential::new("github", sample_fields(), None))
+            .unwrap();
+        assert_eq!(
+            store.get("github").unwrap().unwrap().get_field("token"),
+            Some("ghp_abc123def456")
+        );
+        assert_eq!(store.list_ids().unwrap(), vec!["github"]);
+        assert!(store.remove("github").unwrap());
+        assert!(!store.path().exists());
+    }
+
+    fn write_private_key(path: &Path, bytes: &[u8]) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path).unwrap().write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn independently_keyed_fallback_survives_reopen_and_rejects_another_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("independent.key");
+        write_private_key(&key_path, &test_key());
+        let path = temp.path().join("credentials.enc");
+        let mut store = CredentialStore::new(&path, [0; KEY_LEN]);
+        store.key = FileEncryptionKey::ConfiguredFile(Some(key_path.clone()));
+        store
+            .add(Credential::new("github", sample_fields(), None))
+            .unwrap();
+        let encrypted = std::fs::read(&path).unwrap();
+        assert!(
+            !encrypted
+                .windows(b"ghp_abc123def456".len())
+                .any(|part| part == b"ghp_abc123def456")
+        );
+        let mut reopened = CredentialStore::new(&path, [0; KEY_LEN]);
+        reopened.key = FileEncryptionKey::ConfiguredFile(Some(key_path));
+        assert_eq!(
+            reopened.get("github").unwrap().unwrap().get_field("token"),
+            Some("ghp_abc123def456")
+        );
+        let wrong = CredentialStore::new(&path, [99; KEY_LEN]);
+        assert!(wrong.get("github").is_err());
+        assert!(
+            wrong
+                .add(Credential::new("slack", sample_fields(), None))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), encrypted);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn file_keys_accept_raw_or_hex_and_reject_malformed_or_oversized_input() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, contents, valid) in [
+            ("raw", test_key().to_vec(), true),
+            (
+                "hex",
+                format!("{}\n", hex::encode(test_key())).into_bytes(),
+                true,
+            ),
+            ("short", b"not-a-secret-key".to_vec(), false),
+            ("invalid-hex", vec![b'g'; 64], false),
+            ("oversized", vec![b'0'; 4096], false),
+        ] {
+            let path = temp.path().join(name);
+            write_private_key(&path, &contents);
+            let result = read_file_key(&path);
+            if valid {
+                assert_eq!(*result.unwrap(), test_key());
+            } else {
+                assert!(result.is_err(), "{name}");
+            }
+        }
+        assert!(read_file_key(temp.path()).is_err());
+        assert!(read_file_key(&temp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn missing_file_key_preserves_existing_ciphertext_and_never_uses_machine_identity() {
+        let store = temp_store();
+        store
+            .add(Credential::new("github", sample_fields(), None))
+            .unwrap();
+        let encrypted = std::fs::read(store.path()).unwrap();
+        let mut unconfigured = CredentialStore::new(store.path(), test_key());
+        unconfigured.key = FileEncryptionKey::ConfiguredFile(None);
+        assert!(
+            unconfigured
+                .get("github")
+                .unwrap_err()
+                .contains(FILE_KEY_ENV)
+        );
+        assert!(unconfigured.list().is_err());
+        assert!(
+            unconfigured
+                .add(Credential::new("slack", sample_fields(), None))
+                .is_err()
+        );
+        assert!(unconfigured.remove("github").is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), encrypted);
+        assert!(store.get("github").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_keys_reject_public_permissions_and_symbolic_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        write_private_key(&path, &test_key());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_file_key(&path).unwrap_err().contains("0600"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(*read_file_key(&path).unwrap(), test_key());
+        let alias = temp.path().join("alias");
+        symlink(&path, &alias).unwrap();
+        assert!(read_file_key(&alias).is_err());
     }
 
     #[test]

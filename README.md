@@ -1145,6 +1145,21 @@ Admin API routes expose pool inspection and mutation; SDK extensions let connect
 
 `fwc` is the sole supported CLI for the Flywheel connector workspace. It provides 50+ commands across discovery, lifecycle, invocation, intent compilation, and workflow management. Output defaults to TOON, a token-efficient format optimized for AI agent consumption.
 
+### Local credential storage
+
+`fwc auth add` prefers the operating system keychain. Encrypted-file fallback
+at `~/.fwc/credentials.enc` requires an independently provisioned secret key:
+set `FWC_CREDENTIAL_STORE_KEY_FILE` to a regular file containing 32 random bytes
+or 64 hexadecimal digits. On Unix, the key file must have mode `0600` or `0400`;
+symbolic links are rejected. Keep the key separate from the encrypted store and
+its backups. A working OS keychain does not require this setting.
+
+If the keychain is unavailable and no key is configured, credential writes fail
+without creating a fallback file. Files encrypted by the old username/home-path
+key derivation are not opened automatically: preserve the old file and re-import
+the credentials into the OS keychain or a new store using an independent key.
+Credential-file replacements are encrypted, synced, and atomically published.
+
 ### Quick Start
 
 ```bash
@@ -1981,6 +1996,7 @@ Proof anchors for deployment claims:
 |----------|-------------|---------|
 | `FWC_FORMAT` | Default output format (`toon`, `json`, `table`, `csv`, `markdown`) | `toon` |
 | `FWC_HOST` | Default `fcp-host` endpoint URL (`fwc` consults this first) | None (requires `--host` or context) |
+| `FWC_CREDENTIAL_STORE_KEY_FILE` | Private file with an independent 32-byte raw or 64-digit hex encryption key for local credential-file fallback | None (file writes fail closed without it) |
 | `FCP_HOST_ENDPOINT` | Alternate name for the `fcp-host` endpoint URL (`fwc` consults this second) | None |
 | `FCP_HOST_BIND` | `fcp-host` listen address (also used by `fwc` as a third fallback for endpoint resolution) | `127.0.0.1:8787` |
 | `FCP_HOST_CONNECTORS_FILE` | Live connector inventory file mutated by `fcp-host` | None |
