@@ -614,6 +614,7 @@ impl SubprocessConnector {
         // A warm checkout can wait for health checks before falling back to a
         // cold worker. Do not launch a binary/env whose authority was replaced.
         if let Some(termination) = termination {
+            termination.require_current_deployment()?;
             termination.require_current_inventory()?;
         }
         let mut runner = ConnectorProcessRunner::spawn(&config.binary, &config.args, &config.env)
@@ -1351,10 +1352,12 @@ impl NativeWarmPoolConnector {
         request: InvokeRequest,
         termination: &WarmPoolTermination,
     ) -> HostResult<InvokeResponse> {
+        termination.invocation.require_current_deployment()?;
         termination.invocation.require_current_inventory()?;
         let checkout = self
             .checkout_with_termination(&request.zone_id, Some(&termination.invocation))
             .await?;
+        termination.invocation.require_current_deployment()?;
         termination.invocation.require_current_inventory()?;
         if termination.is_cancel_requested() {
             return Err(HostError::RegistryError(
@@ -1871,13 +1874,14 @@ impl WasiConnector {
     }
 
     async fn invoke(&self, request: InvokeRequest) -> HostResult<InvokeResponse> {
-        self.invoke_with_inventory_fence(request, None).await
+        self.invoke_with_dispatch_guards(request, None, None).await
     }
 
-    async fn invoke_with_inventory_fence(
+    async fn invoke_with_dispatch_guards(
         &self,
         request: InvokeRequest,
         inventory_fence: Option<&InventoryDispatchFence>,
+        deployment_guard: Option<&deployment_evidence::DeploymentDispatchGuard>,
     ) -> HostResult<InvokeResponse> {
         let request_id = request.id.to_string();
         let (runner, wasi_config) =
@@ -1906,8 +1910,14 @@ impl WasiConnector {
 
         // Loading/validation can be expensive. Recheck before instantiation
         // can execute guest code, without retaining a registry map lock.
+        let deployment_permit = deployment_guard
+            .map(deployment_evidence::DeploymentDispatchGuard::refresh)
+            .transpose()?;
         if let Some(fence) = inventory_fence {
             fence.require_current()?;
+        }
+        if let Some(permit) = deployment_permit {
+            permit.require_current()?;
         }
         let result = runner
             .execute(&validated.component, &wasi_config.args)

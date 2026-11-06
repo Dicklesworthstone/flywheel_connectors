@@ -39,7 +39,9 @@ pub(super) async fn revalidate_dispatch_authority(
     request: &fcp_kernel::InvokeRequest,
 ) -> HostResult<()> {
     let generation = state.registry.version.load(Ordering::SeqCst);
-    dispatch_authority::revalidate(state, request, generation).await
+    dispatch_authority::revalidate(state, request, generation)
+        .await
+        .map(|_| ())
 }
 
 #[must_use]
@@ -642,13 +644,22 @@ async fn dispatch(
         async move {
             // Admission may have waited for durable storage and runtime selection.
             // Revalidate without spending another quota permit, before any IO.
-            dispatch_authority::revalidate(state, &request, registry_generation).await?;
+            let tier = dispatch_authority::revalidate(state, &request, registry_generation).await?;
             super::recheck_admitted_holder_proof(state, &request)?;
             state.registry.require_generation(registry_generation)?;
             if Instant::now() >= deadline {
                 return Err(HostError::Unavailable(
                     "invocation deadline expired before connector dispatch".to_string(),
                 ));
+            }
+            let deployment_guard = super::deployment_evidence::DeploymentDispatchGuard::new(
+                state.deployment_evidence.clone(),
+                request.zone_id.clone(),
+                tier,
+            );
+            if let Some(capture) = native_capture.as_ref() {
+                // Warm-pool captures share this same logical invocation state.
+                capture.bind_deployment_guard(deployment_guard.clone());
             }
             dispatch_started.store(true, std::sync::atomic::Ordering::SeqCst);
             match runtime {
@@ -663,7 +674,11 @@ async fn dispatch(
                 }
                 super::ConnectorRuntime::Wasi(wasi) => {
                     let fence = state.registry.inventory_fence(registry_generation);
-                    let operation = wasi.invoke_with_inventory_fence(request, Some(&fence));
+                    let operation = wasi.invoke_with_dispatch_guards(
+                        request,
+                        Some(&fence),
+                        Some(&deployment_guard),
+                    );
                     match wasi_capture {
                         Some(capture) => capture.invoke(operation).await,
                         None => operation.await,

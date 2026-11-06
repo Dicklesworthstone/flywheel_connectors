@@ -22,6 +22,7 @@ use futures_util::future::{Either, select};
 
 use super::{
     CONNECTOR_RPC_IO_TIMEOUT, ConnectorProcessRunner, ConnectorRpcRequest, InventoryDispatchFence,
+    deployment_evidence::DeploymentDispatchGuard,
 };
 
 #[path = "native_invocation.rs"]
@@ -71,6 +72,7 @@ struct RpcState {
     cancel_requested: bool,
     transport_retired: bool,
     inventory_rejected: bool,
+    deployment_rejected: bool,
 }
 
 /// One physical request, never a lookup of whichever command is running now.
@@ -79,6 +81,7 @@ pub(super) struct NativeRpc {
     deadline: Instant,
     state: Arc<Mutex<RpcState>>,
     inventory_fence: Option<InventoryDispatchFence>,
+    deployment_guard: Option<DeploymentDispatchGuard>,
     // Notification only: selection and settlement still consult the state lock.
     cancellation: CancellationToken,
 }
@@ -102,8 +105,10 @@ impl NativeRpc {
                 cancel_requested: false,
                 transport_retired: false,
                 inventory_rejected: false,
+                deployment_rejected: false,
             })),
             inventory_fence: None,
+            deployment_guard: None,
             cancellation: CancellationToken::new(),
         }
     }
@@ -145,9 +150,24 @@ impl NativeRpc {
     }
 
     /// Linearizes actor selection against queue abandonment, expiration and
-    /// inventory publication. Already active work is never revoked by this gate.
+    /// inventory publication and live deployment authority. Already active work
+    /// is never revoked by this gate.
     #[must_use]
     pub(super) fn try_begin(&self) -> bool {
+        {
+            let state = self.state.lock().expect("native RPC state lock");
+            if !matches!(state.phase, RpcPhase::Queued) {
+                return false;
+            }
+        }
+        // Filesystem reads and signature verification must never hold the
+        // ownership mutex: cancellation and settlement remain independently
+        // available while the observer file/verifier is being consulted.
+        let deployment_permit = self
+            .deployment_guard
+            .as_ref()
+            .map(DeploymentDispatchGuard::refresh)
+            .transpose();
         let mut state = self.state.lock().expect("native RPC state lock");
         if !matches!(state.phase, RpcPhase::Queued) {
             return false;
@@ -162,6 +182,16 @@ impl NativeRpc {
             return false;
         }
         if state.cancel_requested || Instant::now() >= self.deadline {
+            state.phase = RpcPhase::Settled;
+            return false;
+        }
+        // Acquiring the selection mutex can itself wait. Recheck the exact
+        // authenticated monotonic deadline immediately before becoming Active.
+        if !deployment_permit
+            .as_ref()
+            .is_ok_and(|permit| permit.as_ref().is_none_or(|permit| permit.is_current()))
+        {
+            state.deployment_rejected = true;
             state.phase = RpcPhase::Settled;
             return false;
         }
@@ -246,15 +276,19 @@ impl NativeRpc {
     }
 
     pub(super) fn stop_error(&self) -> std::io::Error {
-        if self
-            .state
-            .lock()
-            .expect("native RPC state lock")
-            .inventory_rejected
-        {
+        let (inventory_rejected, deployment_rejected) = {
+            let state = self.state.lock().expect("native RPC state lock");
+            (state.inventory_rejected, state.deployment_rejected)
+        };
+        if inventory_rejected {
             std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "connector inventory changed after admission; queued RPC was not dispatched",
+            )
+        } else if deployment_rejected {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "deployment authority expired or was withdrawn; queued RPC was not dispatched",
             )
         } else if Instant::now() >= self.deadline {
             std::io::Error::new(
@@ -411,6 +445,7 @@ struct InvocationCommands {
 struct InvocationState {
     deadline: Instant,
     inventory_fence: OnceLock<InventoryDispatchFence>,
+    deployment_guard: OnceLock<DeploymentDispatchGuard>,
     commands: Mutex<InvocationCommands>,
     cancellation: CancellationToken,
     waiter_finished: AtomicBool,
@@ -431,6 +466,7 @@ impl NativeInvocationTermination {
             state: Arc::new(InvocationState {
                 deadline,
                 inventory_fence: OnceLock::new(),
+                deployment_guard: OnceLock::new(),
                 commands: Mutex::new(InvocationCommands {
                     stop_requested: false,
                     rpcs: Vec::new(),
@@ -457,6 +493,22 @@ impl NativeInvocationTermination {
             .inventory_fence
             .get()
             .map_or(Ok(()), InventoryDispatchFence::require_current)
+    }
+
+    /// Bind the resolved operation tier before any session or effect ticket is
+    /// created. Every ticket then rereads the observer's live evidence.
+    pub(super) fn bind_deployment_guard(&self, guard: DeploymentDispatchGuard) {
+        assert!(
+            self.state.deployment_guard.set(guard).is_ok(),
+            "native invocation deployment requirements cannot be rebound"
+        );
+    }
+
+    pub(super) fn require_current_deployment(&self) -> HostResult<()> {
+        if let Some(guard) = self.state.deployment_guard.get() {
+            guard.refresh()?.require_current()?;
+        }
+        Ok(())
     }
 
     pub(super) fn bind_registration(
@@ -502,6 +554,7 @@ impl NativeInvocationTermination {
         };
         let mut rpc = NativeRpc::new(deadline);
         rpc.inventory_fence = self.state.inventory_fence.get().cloned();
+        rpc.deployment_guard = self.state.deployment_guard.get().cloned();
         let mut commands = self.state.commands.lock().expect("native invocation lock");
         let cancel = commands.stop_requested
             || self.state.waiter_finished.load(Ordering::SeqCst)
@@ -638,6 +691,159 @@ impl Drop for NativeInvocationWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deployment_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<crate::deployment_evidence::DeploymentEvidenceService>,
+        fcp_crypto::ed25519::Ed25519SigningKey,
+    ) {
+        let directory = tempfile::tempdir().expect("deployment queue fixture");
+        let path = directory.path().join("evidence.json");
+        let key = fcp_crypto::ed25519::Ed25519SigningKey::generate();
+        let service = Arc::new(
+            crate::deployment_evidence::DeploymentEvidenceService::new(
+                "host-queued-rpc".to_owned(),
+                fcp_core::ZoneId::work(),
+                key.verifying_key(),
+                path.clone(),
+                fcp_host::MIN_HEALTHY_MESH_PEERS_FOR_ACTIVE,
+            )
+            .expect("deployment evidence service"),
+        );
+        (directory, path, service, key)
+    }
+
+    fn publish_deployment_fixture(
+        path: &std::path::Path,
+        service: &crate::deployment_evidence::DeploymentEvidenceService,
+        key: &fcp_crypto::ed25519::Ed25519SigningKey,
+        generation: u64,
+    ) {
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let evidence = fcp_host::SignedDeploymentEvidence::sign(
+            service.challenge(),
+            fcp_host::MeshQuorumSignals::fully_active(2),
+            generation,
+            now,
+            now + 30_000,
+            key,
+        )
+        .expect("signed deployment observation");
+        std::fs::write(path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn deployment_withdrawal_rejects_queued_tickets_without_revoking_active_work() {
+        for active_method in ["handshake", "invoke"] {
+            let (directory, path, service, key) = deployment_fixture();
+            publish_deployment_fixture(&path, &service, &key, 1);
+            let invocation =
+                NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            invocation.bind_deployment_guard(DeploymentDispatchGuard::new(
+                Some(Arc::clone(&service)),
+                fcp_core::ZoneId::work(),
+                fcp_core::SafetyTier::Risky,
+            ));
+            let active = invocation.register_rpc_for_method(active_method);
+            assert!(active.try_begin());
+            let queued = invocation.register_rpc_for_method("invoke");
+
+            std::fs::rename(&path, directory.path().join("withdrawn.json")).unwrap();
+            assert!(invocation.require_current_deployment().is_err());
+            assert!(!active.try_begin(), "selection never reopens active work");
+            assert!(active.is_active());
+            assert!(!active.is_cancelled());
+            assert!(active.try_settle_reply());
+            assert!(!active.transport_retired());
+            assert!(!invocation.is_cancel_requested());
+            assert!(!queued.try_begin());
+            assert!(queued.is_settled());
+            assert_eq!(
+                queued.stop_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(
+                queued
+                    .stop_error()
+                    .to_string()
+                    .contains("deployment authority")
+            );
+
+            // An earlier session ticket cannot authorize a later effect after
+            // the independent observer has withdrawn its evidence.
+            let later = invocation.register_rpc_for_method("invoke");
+            assert!(!later.try_begin());
+            assert!(later.is_settled());
+            publish_deployment_fixture(&path, &service, &key, 2);
+            let fresh = NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+            fresh.bind_deployment_guard(DeploymentDispatchGuard::new(
+                Some(service),
+                fcp_core::ZoneId::work(),
+                fcp_core::SafetyTier::Risky,
+            ));
+            let next = fresh.register_rpc_for_method("invoke");
+            assert!(next.try_begin());
+            assert!(next.try_settle_reply());
+        }
+    }
+
+    #[test]
+    fn malformed_deployment_replacement_rejects_every_session_and_effect_ticket() {
+        let (_directory, path, service, key) = deployment_fixture();
+        publish_deployment_fixture(&path, &service, &key, 1);
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        invocation.bind_deployment_guard(DeploymentDispatchGuard::new(
+            Some(service),
+            fcp_core::ZoneId::work(),
+            fcp_core::SafetyTier::Risky,
+        ));
+        invocation.require_current_deployment().unwrap();
+        let tickets = [
+            "configure",
+            "introspect",
+            "handshake",
+            "health",
+            "invoke",
+            "simulate",
+        ]
+        .map(|method| invocation.register_rpc_for_method(method));
+        std::fs::write(&path, b"malformed replacement").unwrap();
+        for ticket in tickets {
+            assert!(!ticket.try_begin());
+            assert!(ticket.is_settled());
+            assert_eq!(
+                ticket.stop_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(!invocation.is_cancel_requested());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn deployment_withdrawal_refuses_warm_fallback_before_process_spawn() {
+        let invocation =
+            NativeInvocationTermination::new(invocation_deadline(Instant::now(), None));
+        invocation.bind_deployment_guard(DeploymentDispatchGuard::new(
+            None,
+            fcp_core::ZoneId::work(),
+            fcp_core::SafetyTier::Risky,
+        ));
+        let config = crate::tests::dispatcher_test_config("fcp.test.expired-warm:utility:1.0.0");
+        let error = crate::SubprocessConnector::spawn_with_placement_and_termination(
+            config,
+            Arc::new(crate::ResilienceLayer::default()),
+            None,
+            crate::PlacementOperationClass::BulkPrewarm,
+            Some(&invocation),
+        )
+        .await
+        .err()
+        .expect("withdrawn deployment must be rejected before launching an executable");
+        assert!(error.to_string().contains("deployment evidence"), "{error}");
+        assert!(!invocation.is_cancel_requested());
+    }
 
     #[test]
     fn inventory_publication_rejects_queued_tickets_without_revoking_active_work() {

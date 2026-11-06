@@ -13,7 +13,7 @@
 //! Evaluation and must never fall back to a previously accepted classification.
 //! Normal capability, policy, approval, placement and lease checks still apply.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fcp_crypto::{
     aead::XChaCha20Nonce,
@@ -286,6 +286,51 @@ impl DeploymentEvidenceVerifier {
         now_ms: u64,
     ) -> Result<DeploymentClassification, DeploymentEvidenceError> {
         self.evaluate_at(evidence, now_ms, Instant::now())
+    }
+
+    /// Authenticate one freshly read snapshot and retain its monotonic deadline.
+    ///
+    /// Runtime activation must check the returned deadline again after acquiring
+    /// its selection lock. The deadline uses this verifier's clock floor, so a
+    /// backward wall-clock adjustment or repeated submillisecond evaluations
+    /// cannot extend the signed observation. It does not permit reusing a cached
+    /// snapshot: callers must still reread evidence before each activation to
+    /// observe withdrawal or replacement.
+    ///
+    /// # Errors
+    /// Returns the same evidence failures as [`Self::evaluate`], or rejects an
+    /// expiration that cannot be represented by the process-monotonic clock.
+    pub fn evaluate_with_deadline(
+        &mut self,
+        evidence: &SignedDeploymentEvidence,
+        now_ms: u64,
+    ) -> Result<(DeploymentClassification, Instant), DeploymentEvidenceError> {
+        self.evaluate_with_deadline_at(evidence, now_ms, Instant::now())
+    }
+
+    fn evaluate_with_deadline_at(
+        &mut self,
+        evidence: &SignedDeploymentEvidence,
+        wall_now_ms: u64,
+        monotonic_now: Instant,
+    ) -> Result<(DeploymentClassification, Instant), DeploymentEvidenceError> {
+        let classification = self.evaluate_at(evidence, wall_now_ms, monotonic_now)?;
+        let floor = self
+            .clock_floor
+            .as_ref()
+            .ok_or(DeploymentEvidenceError::Expired)?;
+        let remaining_from_floor = evidence
+            .expires_at_ms
+            .checked_sub(floor.epoch_ms)
+            .ok_or(DeploymentEvidenceError::Expired)?;
+        // Anchor at the clock floor itself. Adding a rounded remaining duration
+        // to monotonic_now would otherwise gain up to a millisecond per reread.
+        let deadline = floor
+            .observed_at
+            .checked_add(Duration::from_millis(remaining_from_floor))
+            .filter(|deadline| *deadline > monotonic_now)
+            .ok_or(DeploymentEvidenceError::Expired)?;
+        Ok((classification, deadline))
     }
 
     fn evaluate_at(
@@ -928,6 +973,68 @@ mod tests {
             NOW + 60_000,
         );
         assert!(verifier.evaluate_at(&renewed, NOW, expired_instant).is_ok());
+    }
+
+    #[test]
+    fn dispatch_deadline_retains_the_clock_floor_after_wall_clock_rollback() {
+        let mut verifier = verifier();
+        let evidence = active(&verifier, 1);
+        let instant = Instant::now();
+        let (classification, deadline) = verifier
+            .evaluate_with_deadline_at(&evidence, NOW, instant)
+            .expect("fresh observation");
+        assert_eq!(classification.mode, DeploymentMode::MeshActive);
+        assert_eq!(
+            deadline,
+            instant + Duration::from_millis(MAX_DEPLOYMENT_EVIDENCE_LIFETIME_MS)
+        );
+        let (_, after_rollback) = verifier
+            .evaluate_with_deadline_at(&evidence, 0, instant + Duration::from_secs(29))
+            .expect("rollback must preserve the remaining monotonic lifetime");
+        assert_eq!(after_rollback, deadline);
+        assert_eq!(
+            verifier.evaluate_with_deadline_at(&evidence, NOW, deadline),
+            Err(DeploymentEvidenceError::Expired)
+        );
+    }
+
+    #[test]
+    fn dispatch_deadline_does_not_gain_submillisecond_time_when_reread() {
+        let mut verifier = verifier();
+        let evidence = active(&verifier, 1);
+        let instant = Instant::now();
+        let (_, deadline) = verifier
+            .evaluate_with_deadline_at(&evidence, NOW, instant)
+            .expect("initial observation");
+        for elapsed in [1, 999, 1234, 29_999_999] {
+            let (_, reread_deadline) = verifier
+                .evaluate_with_deadline_at(&evidence, NOW, instant + Duration::from_micros(elapsed))
+                .expect("observation remains fresh before its exact deadline");
+            assert_eq!(reread_deadline, deadline);
+        }
+    }
+
+    #[test]
+    fn dispatch_deadline_shortens_after_a_forward_wall_clock_adjustment() {
+        let mut verifier = verifier();
+        let evidence = active(&verifier, 1);
+        let instant = Instant::now();
+        let (_, original) = verifier
+            .evaluate_with_deadline_at(&evidence, NOW, instant)
+            .expect("initial observation");
+        let (_, shortened) = verifier
+            .evaluate_with_deadline_at(&evidence, NOW + 20_000, instant + Duration::from_secs(1))
+            .expect("forward adjustment keeps only ten seconds of authority");
+        assert_eq!(shortened, instant + Duration::from_secs(11));
+        assert!(shortened < original);
+        let (_, after_rollback) = verifier
+            .evaluate_with_deadline_at(&evidence, NOW, instant + Duration::from_secs(2))
+            .expect("subsequent rollback cannot restore the lost lifetime");
+        assert_eq!(after_rollback, shortened);
+        assert_eq!(
+            verifier.evaluate_with_deadline_at(&evidence, NOW, shortened),
+            Err(DeploymentEvidenceError::Expired)
+        );
     }
 
     #[test]

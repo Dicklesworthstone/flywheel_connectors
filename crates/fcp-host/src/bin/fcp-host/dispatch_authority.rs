@@ -12,7 +12,8 @@ use fcp_crypto::ed25519::Ed25519VerifyingKey;
 use fcp_host::{CapabilityTokenVerifyRequest, HostError, HostResult};
 use fcp_kernel::InvokeRequest;
 use fcp_prelude::{
-    ApprovalMode, Decision, PolicySimulationInput, TransportMode, simulate_policy_decision,
+    ApprovalMode, Decision, PolicySimulationInput, SafetyTier, TransportMode,
+    simulate_policy_decision,
 };
 
 use super::super::{
@@ -102,7 +103,7 @@ pub(super) async fn revalidate(
     state: &AppState,
     request: &InvokeRequest,
     admitted_generation: u64,
-) -> HostResult<()> {
+) -> HostResult<SafetyTier> {
     state.registry.require_generation(admitted_generation)?;
     check_current_token(state, request)?;
     let inventory = state
@@ -220,7 +221,8 @@ pub(super) async fn revalidate(
     enforce_live_deployment_tier(state, request, tool.safety_tier)
         .map_err(|_| refusal("current deployment does not permit this operation tier"))?;
     require_live_times(&claims, chrono::Utc::now().timestamp())?;
-    state.registry.require_generation(admitted_generation)
+    state.registry.require_generation(admitted_generation)?;
+    Ok(tool.safety_tier)
 }
 
 #[cfg(test)]

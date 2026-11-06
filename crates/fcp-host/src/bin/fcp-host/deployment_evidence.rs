@@ -144,24 +144,108 @@ impl DeploymentEvidenceService {
         if zone != &self.zone_id {
             return classify_deployment_mode(MeshQuorumSignals::single_host_evaluation());
         }
-        let evaluated = (|| {
-            let bytes = read_bounded(&self.evidence_file).ok()?;
-            let evidence: SignedDeploymentEvidence = serde_json::from_slice(&bytes).ok()?;
-            let mut verifier = self.verifier.lock().ok()?;
-            let now_ms = u64::try_from(Utc::now().timestamp_millis()).ok()?;
-            let authenticated = verifier.evaluate(&evidence, now_ms).ok()?;
-            // Only authenticated, fresh signals may reach this configurable
-            // classifier. Pin the same operator threshold used at startup.
-            Some(fcp_host::classify_deployment_mode_with_min_peers(
+        self.classification_with_deadline(zone)
+            .map(|(classification, _)| classification)
+            .unwrap_or_else(|| DeploymentClassification {
+                mode: DeploymentMode::Evaluation,
+                signals: MeshQuorumSignals::single_host_evaluation(),
+                reason: DeploymentClassificationReason::SignedSignalsRejected,
+            })
+    }
+
+    fn classification_with_deadline(
+        &self,
+        zone: &ZoneId,
+    ) -> Option<(DeploymentClassification, Instant)> {
+        if zone != &self.zone_id {
+            return None;
+        }
+        let bytes = read_bounded(&self.evidence_file).ok()?;
+        let evidence: SignedDeploymentEvidence = serde_json::from_slice(&bytes).ok()?;
+        let mut verifier = self.verifier.lock().ok()?;
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).ok()?;
+        let (authenticated, deadline) = verifier.evaluate_with_deadline(&evidence, now_ms).ok()?;
+        // Only authenticated, fresh signals may reach this configurable
+        // classifier. Pin the same operator threshold used at startup.
+        Some((
+            fcp_host::classify_deployment_mode_with_min_peers(
                 authenticated.signals,
                 self.min_healthy_peers,
-            ))
-        })();
-        evaluated.unwrap_or_else(|| DeploymentClassification {
-            mode: DeploymentMode::Evaluation,
-            signals: MeshQuorumSignals::single_host_evaluation(),
-            reason: DeploymentClassificationReason::SignedSignalsRejected,
-        })
+            ),
+            deadline,
+        ))
+    }
+}
+
+/// The deployment requirements of one admitted operation, retained across queue
+/// and session waits. This retains a verifier, never an accepted observation.
+#[derive(Clone)]
+pub(super) struct DeploymentDispatchGuard {
+    service: Option<Arc<DeploymentEvidenceService>>,
+    zone: ZoneId,
+    tier: SafetyTier,
+}
+
+impl DeploymentDispatchGuard {
+    pub(super) fn new(
+        service: Option<Arc<DeploymentEvidenceService>>,
+        zone: ZoneId,
+        tier: SafetyTier,
+    ) -> Self {
+        Self {
+            service,
+            zone,
+            tier,
+        }
+    }
+
+    /// Read and authenticate outside runtime ownership/map locks. The returned
+    /// permit is only for the immediately following activation, not later RPCs.
+    pub(super) fn refresh(&self) -> HostResult<DeploymentDispatchPermit> {
+        let evaluation = classify_deployment_mode(MeshQuorumSignals::single_host_evaluation());
+        if admit_safety_tier(&evaluation, self.tier).is_ok() {
+            // Operations admitted in Evaluation do not borrow expiring health
+            // authority merely because an observer happens to be configured.
+            return Ok(DeploymentDispatchPermit { deadline: None });
+        }
+        let (classification, deadline) = self
+            .service
+            .as_ref()
+            .and_then(|service| service.classification_with_deadline(&self.zone))
+            .ok_or_else(dispatch_refused)?;
+        admit_safety_tier(&classification, self.tier).map_err(|_| dispatch_refused())?;
+        let permit = DeploymentDispatchPermit {
+            deadline: Some(deadline),
+        };
+        permit.require_current()?;
+        Ok(permit)
+    }
+}
+
+fn dispatch_refused() -> HostError {
+    HostError::PreflightFailed(
+        "current deployment evidence does not permit the queued operation tier".to_owned(),
+    )
+}
+
+/// A time bound from the just-authenticated observation. Keeping this small
+/// permits the final expiry check while holding the runtime's selection lock.
+pub(super) struct DeploymentDispatchPermit {
+    deadline: Option<Instant>,
+}
+
+impl DeploymentDispatchPermit {
+    pub(super) fn is_current(&self) -> bool {
+        self.deadline
+            .is_none_or(|deadline| Instant::now() < deadline)
+    }
+
+    pub(super) fn require_current(&self) -> HostResult<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(dispatch_refused())
+        }
     }
 }
 
@@ -343,5 +427,99 @@ mod tests {
             service.classification(&ZoneId::work()).mode,
             DeploymentMode::MeshActive
         );
+    }
+
+    #[test]
+    fn dispatch_guard_observes_withdrawal_replacement_and_generation_rollback() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let key = Ed25519SigningKey::generate();
+        let service = Arc::new(service(directory.path().join("evidence.json"), &key));
+        let guard = DeploymentDispatchGuard::new(
+            Some(Arc::clone(&service)),
+            ZoneId::work(),
+            SafetyTier::Risky,
+        );
+        assert!(guard.refresh().is_err());
+        let first = publish(&service, &key, 1, MeshQuorumSignals::fully_active(2));
+        guard.refresh().expect("fresh authenticated deployment");
+
+        let withdrawn = directory.path().join("withdrawn-evidence.json");
+        std::fs::rename(&service.evidence_file, &withdrawn).expect("withdraw evidence");
+        assert!(guard.refresh().is_err(), "must reread the configured file");
+        std::fs::write(&service.evidence_file, b"invalid replacement")
+            .expect("replace evidence with malformed content");
+        assert!(guard.refresh().is_err());
+        publish(
+            &service,
+            &key,
+            2,
+            MeshQuorumSignals::single_host_evaluation(),
+        );
+        assert!(guard.refresh().is_err(), "authenticated downgrade must win");
+        std::fs::write(&service.evidence_file, first).expect("restore stale active generation");
+        assert!(
+            guard.refresh().is_err(),
+            "old active authority cannot return"
+        );
+        publish(&service, &key, 3, MeshQuorumSignals::fully_active(2));
+        guard
+            .refresh()
+            .expect("fresh later generation restores authority");
+    }
+
+    #[test]
+    fn dispatch_guard_preserves_zone_tier_and_operator_thresholds() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let key = Ed25519SigningKey::generate();
+        let service = Arc::new(
+            DeploymentEvidenceService::new(
+                "host-dispatch-test".to_owned(),
+                ZoneId::work(),
+                key.verifying_key(),
+                directory.path().join("evidence.json"),
+                3,
+            )
+            .expect("three-peer policy"),
+        );
+        let risky = DeploymentDispatchGuard::new(
+            Some(Arc::clone(&service)),
+            ZoneId::work(),
+            SafetyTier::Risky,
+        );
+        publish(&service, &key, 1, MeshQuorumSignals::fully_active(2));
+        assert!(risky.refresh().is_err());
+        publish(&service, &key, 2, MeshQuorumSignals::fully_active(3));
+        risky.refresh().expect("operator threshold satisfied");
+        for (zone, tier) in [
+            (ZoneId::owner(), SafetyTier::Risky),
+            (ZoneId::work(), SafetyTier::Forbidden),
+        ] {
+            assert!(
+                DeploymentDispatchGuard::new(Some(Arc::clone(&service)), zone, tier)
+                    .refresh()
+                    .is_err()
+            );
+        }
+        assert!(
+            DeploymentDispatchGuard::new(None, ZoneId::work(), SafetyTier::Risky)
+                .refresh()
+                .is_err()
+        );
+        DeploymentDispatchGuard::new(None, ZoneId::work(), SafetyTier::Safe)
+            .refresh()
+            .expect("Evaluation still permits Safe operations")
+            .require_current()
+            .expect("Safe operations do not depend on a health lease");
+    }
+
+    #[test]
+    fn dispatch_permit_expires_before_runtime_selection() {
+        let permit = DeploymentDispatchPermit {
+            deadline: Some(Instant::now()),
+        };
+        assert!(!permit.is_current());
+        assert!(permit.require_current().is_err());
+        let permanent = DeploymentDispatchPermit { deadline: None };
+        assert!(permanent.require_current().is_ok());
     }
 }
