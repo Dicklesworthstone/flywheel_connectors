@@ -280,6 +280,9 @@ pub struct MatchResult {
     pub reason: String,
     /// Rendered action inputs (only if matched).
     pub rendered_inputs: Option<BTreeMap<String, String>>,
+    /// Structured rendering failure, when a matching action exceeds its bounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_error: Option<RenderError>,
 }
 
 /// Outcome of rule execution.
@@ -298,6 +301,8 @@ pub enum ExecutionOutcome {
     DryRun,
     /// Rule matched but the event has already been processed.
     Duplicate,
+    /// Rule matched, but its rendered action inputs exceed their resource bound.
+    InputRejected,
     /// Rule did not match.
     NoMatch,
     /// Rule is disabled.
@@ -313,6 +318,7 @@ impl fmt::Display for ExecutionOutcome {
             Self::CircuitBroken => f.write_str("circuit_broken"),
             Self::DryRun => f.write_str("dry_run"),
             Self::Duplicate => f.write_str("duplicate"),
+            Self::InputRejected => f.write_str("input_rejected"),
             Self::NoMatch => f.write_str("no_match"),
             Self::Disabled => f.write_str("disabled"),
         }
@@ -633,33 +639,99 @@ fn evaluate_match_expr(event: &IncomingEvent, expr: &str) -> bool {
         .any(|pattern| value.contains(pattern.trim()))
 }
 
+/// Maximum total UTF-8 bytes in the keys and values of one rendered action.
+pub const MAX_RENDERED_INPUT_BYTES: usize = 1024 * 1024;
+
+/// A rendering failure that prevents an action from being dispatched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RenderError {
+    /// The complete rendered action would exceed its byte budget.
+    ByteLimitExceeded {
+        /// Maximum permitted UTF-8 bytes across all input keys and values.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ByteLimitExceeded { limit } => {
+                write!(f, "rendered action inputs exceed the {limit} byte limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+fn charge_render_bytes(remaining: &mut usize, bytes: usize) -> Result<(), RenderError> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .ok_or(RenderError::ByteLimitExceeded {
+            limit: MAX_RENDERED_INPUT_BYTES,
+        })?;
+    Ok(())
+}
+
+fn append_rendered(
+    output: &mut String,
+    value: &str,
+    remaining: &mut usize,
+) -> Result<(), RenderError> {
+    charge_render_bytes(remaining, value.len())?;
+    output.push_str(value);
+    Ok(())
+}
+
 /// Render template strings with event data.
 ///
 /// Replaces `{{event.data.field}}`, `{{event.connector}}`, and
 /// `{{event.event_type}}` in one pass over the original template. Inserted data
 /// is always literal, even if it contains template syntax. The optional
 /// `truncate(N)` filter counts Unicode scalar values rather than UTF-8 bytes.
-pub fn render_template(template: &str, event: &IncomingEvent) -> String {
-    let mut result = String::with_capacity(template.len());
+///
+/// # Errors
+///
+/// Returns [`RenderError`] before appending any expansion that would exceed
+/// [`MAX_RENDERED_INPUT_BYTES`]. Oversized output is never silently truncated.
+pub fn render_template(template: &str, event: &IncomingEvent) -> Result<String, RenderError> {
+    let mut remaining_bytes = MAX_RENDERED_INPUT_BYTES;
+    render_template_with_budget(template, event, &mut remaining_bytes)
+}
+
+fn render_template_with_budget(
+    template: &str,
+    event: &IncomingEvent,
+    remaining_bytes: &mut usize,
+) -> Result<String, RenderError> {
+    // Allocate only for accepted output. A long template can consist entirely
+    // of missing fields, so reserving its source length would bypass the shared
+    // output budget across otherwise empty input values.
+    let mut result = String::new();
     let mut remaining = template;
 
     while let Some(start) = remaining.find("{{") {
-        result.push_str(&remaining[..start]);
+        append_rendered(&mut result, &remaining[..start], remaining_bytes)?;
         let after_open = &remaining[start + 2..];
         let Some(end) = after_open.find("}}") else {
-            result.push_str(&remaining[start..]);
-            return result;
+            append_rendered(&mut result, &remaining[start..], remaining_bytes)?;
+            return Ok(result);
         };
         let expression = after_open[..end].trim();
         let literal = &remaining[start..start + end + 4];
         remaining = &after_open[end + 2..];
 
         match expression {
-            "event.connector" => result.push_str(&event.connector),
-            "event.event_type" => result.push_str(&event.event_type),
+            "event.connector" => {
+                append_rendered(&mut result, &event.connector, remaining_bytes)?;
+            }
+            "event.event_type" => {
+                append_rendered(&mut result, &event.event_type, remaining_bytes)?;
+            }
             _ => {
                 let Some(data_expression) = expression.strip_prefix("event.data.") else {
-                    result.push_str(literal);
+                    append_rendered(&mut result, literal, remaining_bytes)?;
                     continue;
                 };
                 let (field, filter) = data_expression
@@ -669,7 +741,7 @@ pub fn render_template(template: &str, event: &IncomingEvent) -> String {
                     });
                 let value = event.data.get(field).map_or("", String::as_str);
                 let Some(filter) = filter else {
-                    result.push_str(value);
+                    append_rendered(&mut result, value, remaining_bytes)?;
                     continue;
                 };
                 let Some(limit) = filter
@@ -681,29 +753,37 @@ pub fn render_template(template: &str, event: &IncomingEvent) -> String {
                     continue;
                 };
                 if let Some((boundary, _)) = value.char_indices().nth(limit) {
-                    result.push_str(&value[..boundary]);
-                    result.push_str("...");
+                    append_rendered(&mut result, &value[..boundary], remaining_bytes)?;
+                    append_rendered(&mut result, "...", remaining_bytes)?;
                 } else {
-                    result.push_str(value);
+                    append_rendered(&mut result, value, remaining_bytes)?;
                 }
             }
         }
     }
 
-    result.push_str(remaining);
-    result
+    append_rendered(&mut result, remaining, remaining_bytes)?;
+    Ok(result)
 }
 
-/// Render all action inputs with event data.
+/// Render all action inputs with event data under one shared byte budget.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] if the combined UTF-8 bytes in all input keys and
+/// rendered values would exceed [`MAX_RENDERED_INPUT_BYTES`].
 pub fn render_action_inputs(
     action: &RuleAction,
     event: &IncomingEvent,
-) -> BTreeMap<String, String> {
-    action
-        .input
-        .iter()
-        .map(|(k, v)| (k.clone(), render_template(v, event)))
-        .collect()
+) -> Result<BTreeMap<String, String>, RenderError> {
+    let mut remaining_bytes = MAX_RENDERED_INPUT_BYTES;
+    let mut inputs = BTreeMap::new();
+    for (key, template) in &action.input {
+        charge_render_bytes(&mut remaining_bytes, key.len())?;
+        let value = render_template_with_budget(template, event, &mut remaining_bytes)?;
+        inputs.insert(key.clone(), value);
+    }
+    Ok(inputs)
 }
 
 // ── Rule Evaluation ───────────────────────────────────────────────
@@ -761,6 +841,7 @@ fn evaluate_rule_internal(
                 matched: false,
                 reason: "rule is disabled".to_string(),
                 rendered_inputs: None,
+                validation_error: None,
             },
         );
     }
@@ -774,6 +855,7 @@ fn evaluate_rule_internal(
                 matched: false,
                 reason: "event does not match trigger".to_string(),
                 rendered_inputs: None,
+                validation_error: None,
             },
         );
     }
@@ -790,12 +872,27 @@ fn evaluate_rule_internal(
                 matched: true,
                 reason: "event already dispatched for this rule".to_string(),
                 rendered_inputs: None,
+                validation_error: None,
             },
         );
     }
 
     // Render inputs
-    let rendered = render_action_inputs(&rule.action, event);
+    let rendered = match render_action_inputs(&rule.action, event) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return (
+                ExecutionOutcome::InputRejected,
+                MatchResult {
+                    rule_name,
+                    matched: true,
+                    reason: error.to_string(),
+                    rendered_inputs: None,
+                    validation_error: Some(error),
+                },
+            );
+        }
+    };
 
     // Check circuit breaker
     if !circuit_breaker.allows_execution() {
@@ -806,6 +903,7 @@ fn evaluate_rule_internal(
                 matched: true,
                 reason: "circuit breaker is open".to_string(),
                 rendered_inputs: Some(rendered),
+                validation_error: None,
             },
         );
     }
@@ -822,6 +920,7 @@ fn evaluate_rule_internal(
                     rule.throttle.max, rule.throttle.window
                 ),
                 rendered_inputs: Some(rendered),
+                validation_error: None,
             },
         );
     }
@@ -835,6 +934,7 @@ fn evaluate_rule_internal(
                 matched: true,
                 reason: "dry run — would execute".to_string(),
                 rendered_inputs: Some(rendered),
+                validation_error: None,
             },
         );
     }
@@ -846,6 +946,7 @@ fn evaluate_rule_internal(
             matched: true,
             reason: "matched; awaiting authorized dispatch".to_string(),
             rendered_inputs: Some(rendered),
+            validation_error: None,
         },
     )
 }
@@ -1459,21 +1560,21 @@ mod tests {
     #[test]
     fn template_simple_replacement() {
         let event = sample_event();
-        let result = render_template("Hello {{event.data.user}}", &event);
+        let result = render_template("Hello {{event.data.user}}", &event).unwrap();
         assert_eq!(result, "Hello alice");
     }
 
     #[test]
     fn template_connector_replacement() {
         let event = sample_event();
-        let result = render_template("From {{event.connector}}", &event);
+        let result = render_template("From {{event.connector}}", &event).unwrap();
         assert_eq!(result, "From slack");
     }
 
     #[test]
     fn template_event_type_replacement() {
         let event = sample_event();
-        let result = render_template("Type: {{event.event_type}}", &event);
+        let result = render_template("Type: {{event.event_type}}", &event).unwrap();
         assert_eq!(result, "Type: message.new");
     }
 
@@ -1483,28 +1584,29 @@ mod tests {
         let result = render_template(
             "{{event.data.user}} in #{{event.data.channel}}: {{event.data.text}}",
             &event,
-        );
+        )
+        .unwrap();
         assert_eq!(result, "alice in #general: Found a bug in login");
     }
 
     #[test]
     fn template_no_placeholders() {
         let event = sample_event();
-        let result = render_template("plain text", &event);
+        let result = render_template("plain text", &event).unwrap();
         assert_eq!(result, "plain text");
     }
 
     #[test]
     fn template_truncate_filter() {
         let event = sample_event();
-        let result = render_template("{{event.data.text | truncate(10)}}", &event);
+        let result = render_template("{{event.data.text | truncate(10)}}", &event).unwrap();
         assert_eq!(result, "Found a bu...");
     }
 
     #[test]
     fn template_truncate_no_truncation_needed() {
         let event = IncomingEvent::new("slack", "message.new").with_data("text", "short");
-        let result = render_template("{{event.data.text | truncate(80)}}", &event);
+        let result = render_template("{{event.data.text | truncate(80)}}", &event).unwrap();
         assert_eq!(result, "short");
     }
 
@@ -1514,11 +1616,11 @@ mod tests {
             .with_data("a", "{{event.data.secret}}")
             .with_data("secret", "must not be substituted");
         assert_eq!(
-            render_template("{{event.data.a}}", &event),
+            render_template("{{event.data.a}}", &event).unwrap(),
             "{{event.data.secret}}"
         );
         assert_eq!(
-            render_template("{{event.connector}} / {{event.event_type}}", &event),
+            render_template("{{event.connector}} / {{event.event_type}}", &event).unwrap(),
             "{{event.data.secret}} / {{event.data.secret}}"
         );
     }
@@ -1527,27 +1629,30 @@ mod tests {
     fn template_self_referential_data_does_not_reenter_the_parser() {
         let expression = "{{event.data.text | truncate(100)}}";
         let event = IncomingEvent::new("slack", "message.new").with_data("text", expression);
-        assert_eq!(render_template(expression, &event), expression);
-        assert_eq!(render_template("{{event.data.text}}", &event), expression);
+        assert_eq!(render_template(expression, &event).unwrap(), expression);
+        assert_eq!(
+            render_template("{{event.data.text}}", &event).unwrap(),
+            expression
+        );
     }
 
     #[test]
     fn template_truncate_uses_unicode_boundaries() {
         let event = IncomingEvent::new("slack", "message.new").with_data("text", "é🧵猫");
         assert_eq!(
-            render_template("{{event.data.text | truncate(1)}}", &event),
+            render_template("{{event.data.text | truncate(1)}}", &event).unwrap(),
             "é..."
         );
         assert_eq!(
-            render_template("{{event.data.text | truncate(2)}}", &event),
+            render_template("{{event.data.text | truncate(2)}}", &event).unwrap(),
             "é🧵..."
         );
         assert_eq!(
-            render_template("{{event.data.text | truncate(3)}}", &event),
+            render_template("{{event.data.text | truncate(3)}}", &event).unwrap(),
             "é🧵猫"
         );
         assert_eq!(
-            render_template("{{event.data.text | truncate(0)}}", &event),
+            render_template("{{event.data.text | truncate(0)}}", &event).unwrap(),
             "..."
         );
     }
@@ -1556,14 +1661,15 @@ mod tests {
     fn template_unclosed_expression_and_unknown_namespace_remain_literal() {
         let event = sample_event();
         assert_eq!(
-            render_template("π {{other.value}} {{event.data.text", &event),
+            render_template("π {{other.value}} {{event.data.text", &event).unwrap(),
             "π {{other.value}} {{event.data.text"
         );
         assert_eq!(
             render_template(
                 "{{ event.data.user }}: {{event.data.text | unknown}}",
                 &event
-            ),
+            )
+            .unwrap(),
             "alice: "
         );
     }
@@ -1574,9 +1680,154 @@ mod tests {
     fn render_inputs() {
         let event = sample_event();
         let action = sample_action();
-        let rendered = render_action_inputs(&action, &event);
+        let rendered = render_action_inputs(&action, &event).unwrap();
         assert_eq!(rendered["title"], "Bug: Found a bug in login");
         assert_eq!(rendered["body"], "From alice");
+    }
+
+    #[test]
+    fn template_expansion_rejects_amplification() {
+        let event =
+            IncomingEvent::new("slack", "message.new").with_data("text", "x".repeat(128 * 1024));
+        let template = "{{event.data.text}}".repeat(10_000);
+        assert_eq!(
+            render_template(&template, &event),
+            Err(RenderError::ByteLimitExceeded {
+                limit: MAX_RENDERED_INPUT_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_expansions_do_not_retain_template_sized_allocations() {
+        let event = IncomingEvent::new("slack", "message.new");
+        let template = "{{event.data.missing}}".repeat(10_000);
+        let rendered = render_template(&template, &event).unwrap();
+        assert!(rendered.is_empty());
+        assert_eq!(rendered.capacity(), 0);
+    }
+
+    #[test]
+    fn template_byte_limit_accepts_exact_boundary() {
+        let event = IncomingEvent::new("slack", "message.new")
+            .with_data("text", "x".repeat(MAX_RENDERED_INPUT_BYTES));
+        assert_eq!(
+            render_template("{{event.data.text}}", &event)
+                .unwrap()
+                .len(),
+            MAX_RENDERED_INPUT_BYTES
+        );
+        assert!(render_template("{{event.data.text}}x", &event).is_err());
+        assert!(render_template("x{{event.data.text}}", &event).is_err());
+    }
+
+    #[test]
+    fn template_literal_branches_share_byte_limit() {
+        let event = sample_event();
+        let literal = "x".repeat(MAX_RENDERED_INPUT_BYTES);
+        assert_eq!(render_template(&literal, &event).unwrap(), literal);
+        assert!(render_template(&format!("{literal}x"), &event).is_err());
+        assert!(render_template(&format!("{literal}{{{{unknown}}}}"), &event).is_err());
+        assert!(render_template(&format!("{literal}{{{{unclosed"), &event).is_err());
+    }
+
+    #[test]
+    fn template_byte_budget_counts_utf8_bytes() {
+        let event = IncomingEvent::new("slack", "message.new")
+            .with_data("text", "é".repeat(MAX_RENDERED_INPUT_BYTES / 2));
+        let rendered = render_template("{{event.data.text}}", &event).unwrap();
+        assert_eq!(rendered.len(), MAX_RENDERED_INPUT_BYTES);
+        assert_eq!(rendered.chars().count(), MAX_RENDERED_INPUT_BYTES / 2);
+        assert!(render_template("{{event.data.text}}é", &event).is_err());
+    }
+
+    #[test]
+    fn rejected_expansion_is_not_appended() {
+        let mut output = "prefix".to_string();
+        let mut remaining = 2;
+        assert!(append_rendered(&mut output, "oversized", &mut remaining).is_err());
+        assert_eq!(output, "prefix");
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn rendered_fields_share_one_action_budget() {
+        let event = IncomingEvent::new("slack", "message.new")
+            .with_data("text", "x".repeat(MAX_RENDERED_INPUT_BYTES / 2));
+        let first =
+            RuleAction::new("github", "create_issue").with_input("a", "{{event.data.text}}");
+        let second =
+            RuleAction::new("github", "create_issue").with_input("b", "{{event.data.text}}");
+        assert!(render_action_inputs(&first, &event).is_ok());
+        assert!(render_action_inputs(&second, &event).is_ok());
+        let combined = first.with_input("b", "{{event.data.text}}");
+        assert!(render_action_inputs(&combined, &event).is_err());
+    }
+
+    #[test]
+    fn rendered_keys_consume_the_action_budget() {
+        let event = IncomingEvent::new("slack", "message.new")
+            .with_data("text", "x".repeat(MAX_RENDERED_INPUT_BYTES - 3));
+        let action =
+            RuleAction::new("github", "create_issue").with_input("key", "{{event.data.text}}");
+        let rendered = render_action_inputs(&action, &event).unwrap();
+        assert_eq!(
+            rendered["key"].len() + "key".len(),
+            MAX_RENDERED_INPUT_BYTES
+        );
+        let action = action.with_input("z", "");
+        assert!(render_action_inputs(&action, &event).is_err());
+        let oversized_key = RuleAction::new("github", "create_issue")
+            .with_input("x".repeat(MAX_RENDERED_INPUT_BYTES + 1), "");
+        assert!(render_action_inputs(&oversized_key, &event).is_err());
+    }
+
+    #[test]
+    fn rejected_input_is_typed_and_does_not_consume_dispatch_state() {
+        let mut rule = sample_rule();
+        rule.action = RuleAction::new("github", "create_issue")
+            .with_input("title", "{{event.data.text}}".repeat(12));
+        let event = IncomingEvent::new("slack", "message.new")
+            .with_event_id("rejected-event")
+            .with_data("text", format!("bug{}", "x".repeat(128 * 1024)));
+        let throttle = ThrottleState::new(&rule.name);
+        let circuit = CircuitBreaker::default();
+        let dedup = RuleDedupCache::new();
+        let before = serde_json::to_value((&throttle, &circuit)).unwrap();
+
+        for dry_run in [true, false] {
+            let (outcome, result) =
+                evaluate_rule_with_dedup(&rule, &event, &throttle, &circuit, &dedup, dry_run);
+            assert_eq!(outcome, ExecutionOutcome::InputRejected);
+            assert_eq!(outcome.to_string(), "input_rejected");
+            assert!(result.matched);
+            assert!(result.rendered_inputs.is_none());
+            assert_eq!(
+                result.validation_error,
+                Some(RenderError::ByteLimitExceeded {
+                    limit: MAX_RENDERED_INPUT_BYTES,
+                })
+            );
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(json["validation_error"]["type"], "byte_limit_exceeded");
+            assert_eq!(json["validation_error"]["limit"], MAX_RENDERED_INPUT_BYTES);
+            assert_eq!(serde_json::to_value((&throttle, &circuit)).unwrap(), before);
+            assert!(dedup.is_empty());
+        }
+
+        rule.action = RuleAction::new("github", "create_issue").with_input("title", "ok");
+        let (outcome, result) =
+            evaluate_rule_with_dedup(&rule, &event, &throttle, &circuit, &dedup, false);
+        assert_eq!(outcome, ExecutionOutcome::Ready);
+        assert!(result.validation_error.is_none());
+        assert!(
+            !serde_json::to_value(&result)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("validation_error")
+        );
+        assert!(dedup.is_empty());
     }
 
     // ── ThrottleState ─────────────────────────────────────────────
@@ -2124,6 +2375,7 @@ mod tests {
                 "title".to_string(),
                 "Bug report".to_string(),
             )])),
+            validation_error: None,
         };
         let s = format_match_result(&result);
         assert!(s.starts_with('✓'));
@@ -2137,6 +2389,7 @@ mod tests {
             matched: false,
             reason: "no match".to_string(),
             rendered_inputs: None,
+            validation_error: None,
         };
         let s = format_match_result(&result);
         assert!(s.starts_with('✗'));
@@ -2426,6 +2679,7 @@ mod tests {
             matched: true,
             reason: "ok".to_string(),
             rendered_inputs: Some(BTreeMap::from([("k".to_string(), "v".to_string())])),
+            validation_error: None,
         };
         let json = serde_json::to_value(&mr).unwrap();
         assert_eq!(json["rule_name"], "r1");
@@ -2440,6 +2694,7 @@ mod tests {
             matched: false,
             reason: "no match".to_string(),
             rendered_inputs: None,
+            validation_error: None,
         };
         let json = serde_json::to_value(&mr).unwrap();
         assert!(json["rendered_inputs"].is_null());
@@ -2456,6 +2711,7 @@ mod tests {
             ExecutionOutcome::CircuitBroken,
             ExecutionOutcome::DryRun,
             ExecutionOutcome::Duplicate,
+            ExecutionOutcome::InputRejected,
             ExecutionOutcome::NoMatch,
             ExecutionOutcome::Disabled,
         ];
@@ -2704,21 +2960,21 @@ mod tests {
     #[test]
     fn template_missing_field_replaced_with_empty() {
         let event = sample_event();
-        let result = render_template("Value: {{event.data.missing}}", &event);
+        let result = render_template("Value: {{event.data.missing}}", &event).unwrap();
         assert_eq!(result, "Value: ");
     }
 
     #[test]
     fn template_truncate_exact_length() {
         let event = IncomingEvent::new("slack", "message.new").with_data("text", "12345");
-        let result = render_template("{{event.data.text | truncate(5)}}", &event);
+        let result = render_template("{{event.data.text | truncate(5)}}", &event).unwrap();
         assert_eq!(result, "12345");
     }
 
     #[test]
     fn template_truncate_zero() {
         let event = sample_event();
-        let result = render_template("{{event.data.text | truncate(0)}}", &event);
+        let result = render_template("{{event.data.text | truncate(0)}}", &event).unwrap();
         assert_eq!(result, "...");
     }
 
@@ -2728,7 +2984,8 @@ mod tests {
         let result = render_template(
             "Alert from {{event.connector}}: [{{event.event_type}}] {{event.data.text}}",
             &event,
-        );
+        )
+        .unwrap();
         assert_eq!(
             result,
             "Alert from slack: [message.new] Found a bug in login"
@@ -2738,7 +2995,7 @@ mod tests {
     #[test]
     fn template_empty_template() {
         let event = sample_event();
-        let result = render_template("", &event);
+        let result = render_template("", &event).unwrap();
         assert_eq!(result, "");
     }
 
@@ -2748,7 +3005,7 @@ mod tests {
     fn render_inputs_empty_action() {
         let event = sample_event();
         let action = RuleAction::new("github", "create_issue");
-        let rendered = render_action_inputs(&action, &event);
+        let rendered = render_action_inputs(&action, &event).unwrap();
         assert!(rendered.is_empty());
     }
 
@@ -2758,7 +3015,7 @@ mod tests {
         let action = RuleAction::new("github", "create_issue")
             .with_input("alpha", "{{event.data.user}}")
             .with_input("beta", "{{event.data.channel}}");
-        let rendered = render_action_inputs(&action, &event);
+        let rendered = render_action_inputs(&action, &event).unwrap();
         assert_eq!(rendered.len(), 2);
         assert_eq!(rendered["alpha"], "alice");
         assert_eq!(rendered["beta"], "general");
@@ -3055,6 +3312,7 @@ mod tests {
             matched: true,
             reason: "matched".to_string(),
             rendered_inputs: Some(BTreeMap::new()),
+            validation_error: None,
         };
         let s = format_match_result(&result);
         assert!(!s.contains("Inputs:"));
@@ -3070,6 +3328,7 @@ mod tests {
             matched: true,
             reason: "ok".to_string(),
             rendered_inputs: Some(inputs),
+            validation_error: None,
         };
         let s = format_match_result(&result);
         assert!(s.contains("alpha: one"));
